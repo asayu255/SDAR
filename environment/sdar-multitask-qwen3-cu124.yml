@@ -1,0 +1,49 @@
+name: sdar-multitask-qwen3-cu124
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - wheel
+  - ninja
+  - packaging>=20.0
+  - numpy=1.26.4
+  - pandas
+  - pyarrow>=19.0.0
+  - openjdk=11
+  - mkl
+  - faiss-cpu
+  - pytorch=2.6.0
+  - torchvision=0.21.0
+  - torchaudio=2.6.0
+  - pytorch-cuda=12.4
+  - pip:
+      - -c requirements/sdar-multitask-qwen3-cu124.lock.txt
+      - accelerate
+      - codetiming
+      - datasets
+      - dill
+      - hydra-core
+      - liger-kernel
+      - peft
+      - pybind11
+      - pylatexenc
+      - ray[default]
+      - tensordict
+      - torchdata
+      - transformers
+      - wandb
+      - uvicorn
+      - fastapi
+      - qwen-vl-utils[decord]
+      - gymnasium
+      - stable-baselines3
+      - alfworld
+      - gym
+      - flash-attn --no-build-isolation
+      - vllm
+      - -e .
