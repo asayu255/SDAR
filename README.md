@@ -53,6 +53,95 @@ Log in to Weights & Biases if you use WandB logging (scripts pass `trainer.logge
 export WANDB_API_KEY=your_key_here
 ```
 
+### SDAR multitask Qwen3 branch
+
+Use this section for the `codex/sdar-multitask-qwen3` branch, which trains ALFWorld, Search, and WebShop together with balanced task batches.
+
+| Branch | Training env | Retriever env | Model | Data | Script | Validation tag |
+| --- | --- | --- | --- | --- | --- | --- |
+| `codex/sdar-multitask-qwen3` | `sdar-multitask-qwen3-cu124` | `sdar-retriever-cu124` | `Qwen/Qwen3-1.7B-Instruct` | `~/data/verl-agent/sdar_multitask` | `examples/sdar_trainer/run_multitask_qwen3_1_7b_instruct.sh` | `sdar-multitask-qwen3-cu124-v0.1` after smoke validation |
+
+Create the training environment from the repo root:
+
+```bash
+git checkout codex/sdar-multitask-qwen3
+conda env create -f environment/sdar-multitask-qwen3-cu124.yml
+conda activate sdar-multitask-qwen3-cu124
+
+python -m pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+python -m pip install -e agent_system/environments/env_package/search/third_party
+```
+
+This branch intentionally does not install from the top-level `requirements.txt` for the multitask environment: that file pins `tensordict<=0.6.2`, while `setup.py` requires `tensordict>=0.8.0,<=0.10.0,!=0.9.0`. The curated constraints live in `requirements/sdar-multitask-qwen3-cu124.lock.txt`.
+
+The CUDA 12.4 lock uses `torch==2.6.0` and `vllm==0.8.5`. Although the base README previously mentioned `vllm==0.11.0`, upstream `vllm==0.11.0` requires `torch==2.8.0`, so it is not compatible with the CUDA 12.4 / torch 2.6.0 stack used here.
+
+Install task assets once:
+
+```bash
+alfworld-download -f
+
+cd agent_system/environments/env_package/webshop/webshop
+./setup.sh -d all
+cd ../../../../../..
+```
+
+Prepare Search-R1 data and the balanced multitask parquet files:
+
+```bash
+python examples/data_preprocess/preprocess_search_r1_dataset.py
+python -m examples.data_preprocess.prepare_sdar_multitask \
+    --search_dir "$HOME/data/searchR1_processed_direct" \
+    --local_dir "$HOME/data/verl-agent/sdar_multitask" \
+    --total_training_steps 150 \
+    --per_task_batch_size 16 \
+    --val_per_task_size 128
+```
+
+Create and run the retrieval server in its separate environment:
+
+```bash
+conda env create -f environment/sdar-retriever-cu124.yml
+conda activate sdar-retriever-cu124
+
+local_dir=~/data/searchR1
+python examples/search/searchr1_download.py --local_dir "$local_dir"
+cat "$local_dir"/part_* > "$local_dir"/e5_Flat.index
+gzip -d "$local_dir"/wiki-18.jsonl.gz
+bash examples/search/retriever/retrieval_launch.sh > retrieval_server.log
+```
+
+Run the full multitask trainer from another shell in the training environment:
+
+```bash
+conda activate sdar-multitask-qwen3-cu124
+bash examples/sdar_trainer/run_multitask_qwen3_1_7b_instruct.sh
+```
+
+For a minimal smoke run, keep the retriever server running and override the heavy defaults:
+
+```bash
+conda activate sdar-multitask-qwen3-cu124
+bash examples/sdar_trainer/run_multitask_qwen3_1_7b_instruct.sh \
+    trainer.total_training_steps=1 \
+    trainer.total_epochs=1 \
+    trainer.test_freq=1 \
+    data.train_batch_size=3 \
+    data.val_batch_size=3 \
+    data.task_balance.per_task_batch_size=1 \
+    env.multitask.val_per_task_batch_size=1 \
+    env.rollout.n=1 \
+    trainer.n_gpus_per_node=1 \
+    trainer.logger=['console']
+```
+
+Smoke validation should show `TaskBalancedSampler` with `tasks=['alfworld', 'search', 'webshop']`, initialize all three environment managers, and emit task-specific validation metrics such as `alfworld_success_rate`, `search_success_rate`, and `webshop_success_rate`. After that passes on the target GPU host, tag the validated commit:
+
+```bash
+git tag sdar-multitask-qwen3-cu124-v0.1
+git push origin sdar-multitask-qwen3-cu124-v0.1
+```
+
 ### Install Supported Environments
 
 #### 1. ALFWorld
@@ -156,6 +245,7 @@ All scripts live under `examples/` and assume the repo root as working directory
 bash examples/sdar_trainer/run_alfworld_3b.sh
 bash examples/sdar_trainer/run_search_3b.sh
 bash examples/sdar_trainer/run_webshop_3b.sh
+bash examples/sdar_trainer/run_multitask_qwen3_1_7b_instruct.sh
 ```
 
 ### Merge checkpoints
