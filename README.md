@@ -83,7 +83,7 @@ alfworld-download -f
 
 cd agent_system/environments/env_package/webshop/webshop
 ./setup.sh -d all
-cd ../../../../../..
+cd -
 ```
 
 Prepare Search-R1 data and the balanced multitask parquet files:
