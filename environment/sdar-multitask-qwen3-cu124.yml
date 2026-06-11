@@ -44,6 +44,5 @@ dependencies:
       - stable-baselines3
       - alfworld
       - gym
-      - flash-attn --no-build-isolation
       - vllm
       - -e .
