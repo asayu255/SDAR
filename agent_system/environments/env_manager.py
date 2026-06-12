@@ -919,10 +919,17 @@ def make_envs(config):
                 "multitask train batch mismatch: "
                 f"{train_per_task_batch_size} * {len(tasks)} != {config.data.train_batch_size}"
             )
-        if val_per_task_batch_size * len(tasks) != int(config.data.val_batch_size):
+        # Validation supports two layouts:
+        #   - per-task batches: val_batch_size == val_per_task_batch_size, the task-sorted
+        #     test parquet yields one single-task batch per task (each task is evaluated
+        #     in its own rollout pass)
+        #   - mixed batch: val_batch_size == val_per_task_batch_size * len(tasks)
+        val_batch_size = int(config.data.val_batch_size)
+        if val_batch_size not in (val_per_task_batch_size, val_per_task_batch_size * len(tasks)):
             raise ValueError(
-                "multitask val batch mismatch: "
-                f"{val_per_task_batch_size} * {len(tasks)} != {config.data.val_batch_size}"
+                "multitask val batch mismatch: val_batch_size must be "
+                f"{val_per_task_batch_size} (per-task validation batches) or "
+                f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
             )
 
         envs = _build_multitask_manager(

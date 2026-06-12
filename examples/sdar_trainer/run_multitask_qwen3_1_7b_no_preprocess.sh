@@ -12,7 +12,10 @@ skill_all=false
 per_task_batch_size=16
 train_data_size=48
 val_per_task_size=128
-val_data_size=384
+# val_data_size == val_per_task_size: the task-sorted test parquet then yields one
+# single-task batch per task, so each task is validated in its own rollout pass
+# (no mixed-task validation batch).
+val_data_size=$val_per_task_size
 group_size=8
 total_training_steps=150
 model_path="Qwen/Qwen3-1.7B"
