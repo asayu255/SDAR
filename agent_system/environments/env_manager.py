@@ -752,19 +752,33 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
                 merged[idx] = value
         return merged
 
+    @staticmethod
+    def _slice_optional_batch(value, indices):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value[indices]
+        if isinstance(value, np.ndarray):
+            return value[indices]
+        return [value[idx] for idx in indices]
+
     def success_evaluator(self, *args, **kwargs) -> Dict[str, np.ndarray]:
         total_infos = kwargs["total_infos"]
         total_batch_list = kwargs["total_batch_list"]
+        episode_rewards = kwargs.get("episode_rewards")
+        episode_lengths = kwargs.get("episode_lengths")
         success = defaultdict(list)
 
         for task, indices in self._task_indices.items():
             task_total_infos = [total_infos[idx] for idx in indices]
             task_total_batch_list = [total_batch_list[idx] for idx in indices]
+            task_episode_rewards = self._slice_optional_batch(episode_rewards, indices)
+            task_episode_lengths = self._slice_optional_batch(episode_lengths, indices)
             task_success = self.managers[task].success_evaluator(
                 total_infos=task_total_infos,
                 total_batch_list=task_total_batch_list,
-                episode_rewards=kwargs.get("episode_rewards"),
-                episode_lengths=kwargs.get("episode_lengths"),
+                episode_rewards=task_episode_rewards,
+                episode_lengths=task_episode_lengths,
             )
             success["success_rate"].extend(task_success["success_rate"].tolist())
             success[f"{task}_success_rate"].extend(task_success["success_rate"].tolist())
