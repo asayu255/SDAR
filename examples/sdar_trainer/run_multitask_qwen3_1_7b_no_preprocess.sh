@@ -24,12 +24,12 @@ export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
 
-python3 -m examples.data_preprocess.prepare_sdar_multitask \
-    --search_dir "$HOME/data/searchR1_processed_direct" \
-    --local_dir "$HOME/data/verl-agent/sdar_multitask" \
-    --total_training_steps "$total_training_steps" \
-    --per_task_batch_size "$per_task_batch_size" \
-    --val_per_task_size "$val_per_task_size"
+# python3 -m examples.data_preprocess.prepare_sdar_multitask \
+#    --search_dir "$HOME/data/searchR1_processed_direct" \
+#    --local_dir "$HOME/data/verl-agent/sdar_multitask" \
+#    --total_training_steps "$total_training_steps" \
+#    --per_task_batch_size "$per_task_batch_size" \
+#    --val_per_task_size "$val_per_task_size"
 
 python3 -m verl.trainer.main_sdar \
     algorithm.adv_estimator=grpo \
