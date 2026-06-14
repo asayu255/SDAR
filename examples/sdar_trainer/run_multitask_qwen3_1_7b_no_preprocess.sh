@@ -12,10 +12,7 @@ skill_all=false
 per_task_batch_size=16
 train_data_size=48
 val_per_task_size=128
-# val_data_size == val_per_task_size: the task-sorted test parquet then yields one
-# single-task batch per task, so each task is validated in its own rollout pass
-# (no mixed-task validation batch).
-val_data_size=$val_per_task_size
+val_data_size=384
 group_size=8
 total_training_steps=150
 model_path="Qwen/Qwen3-1.7B"
@@ -64,7 +61,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -100,7 +97,7 @@ python3 -m verl.trainer.main_sdar \
     trainer.n_gpus_per_node=4 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=25 \
     trainer.test_freq=5 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=150 \
