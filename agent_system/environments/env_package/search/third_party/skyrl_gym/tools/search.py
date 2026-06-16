@@ -12,8 +12,8 @@ from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.co
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DEFAULT_TIMEOUT = 30
-MAX_RETRIES = 10
+DEFAULT_TIMEOUT = 5
+MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1
 
 
