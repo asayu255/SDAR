@@ -53,7 +53,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=192 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -97,7 +97,7 @@ python3 -m verl.trainer.main_sdar \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_sdar_multitask' \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
