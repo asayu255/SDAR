@@ -287,6 +287,52 @@ class TrajectoryCollector:
         )
         return gen_batch_output
 
+    def _scatter_active_to_full(
+            self,
+            active_output: DataProto,
+            active_idx: np.ndarray,
+            batch_size: int,
+            ) -> DataProto:
+        """
+        Expand a generation output that was produced for the active trajectories
+        only back to the full batch size, so it can be unioned with the full-size
+        batch and recorded per environment.
+
+        Rows that were skipped (already-finished trajectories) are filled with
+        padding tokens for token tensors and zeros otherwise, and with a copy of an
+        arbitrary active value for non-tensor fields. These rows always carry
+        active_masks=False and are dropped by gather_rollout_data(), so their
+        contents never affect training; the fillers exist only to keep tensor
+        shapes valid and decoding harmless.
+        """
+        active_idx_t = torch.as_tensor(active_idx, dtype=torch.long)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        token_like_keys = {"responses", "input_ids", "prompts"}
+
+        full_tensors = {}
+        if active_output.batch is not None:
+            for key, tensor in active_output.batch.items():
+                fill_value = pad_token_id if key in token_like_keys else 0
+                full_tensor = tensor.new_full((batch_size,) + tuple(tensor.shape[1:]), fill_value)
+                full_tensor[active_idx_t] = tensor
+                full_tensors[key] = full_tensor
+
+        full_non_tensors = {}
+        for key, val in active_output.non_tensor_batch.items():
+            full_val = np.empty((batch_size,) + val.shape[1:], dtype=val.dtype)
+            if len(val) > 0:
+                full_val[:] = val[0]
+            full_val[active_idx] = val
+            full_non_tensors[key] = full_val
+
+        return DataProto.from_dict(
+            tensors=full_tensors,
+            non_tensors=full_non_tensors if full_non_tensors else None,
+            meta_info=active_output.meta_info,
+        )
+
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -337,6 +383,17 @@ class TrajectoryCollector:
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
 
+            # Phase-1 throughput optimization: only generate for trajectories that
+            # are still active. Steps belonging to already-finished trajectories
+            # carry active_masks=False and are discarded by gather_rollout_data(),
+            # so generating them is pure wasted GPU compute. This waste is large in
+            # the multitask setting where e.g. search episodes finish within a few
+            # turns while the loop keeps running up to alfworld's max_steps. As
+            # episodes finish, the vLLM generation batch shrinks accordingly.
+            if not active_masks.any():
+                break
+            active_idx = np.nonzero(active_masks)[0]
+
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -354,11 +411,20 @@ class TrajectoryCollector:
 
             batch_input.meta_info = gen_batch.meta_info
 
+            # Restrict generation to active trajectories only; done rows are filled
+            # back in afterwards (and dropped downstream via active_masks).
+            generate_all = len(active_idx) == batch_size
+            active_batch_input = batch_input if generate_all else batch_input[active_idx]
+
             # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
+            batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             # # unpad
-            batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+
+            # Scatter active outputs back to the full batch size for union/recording.
+            batch_output = active_batch_output if generate_all else \
+                self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
