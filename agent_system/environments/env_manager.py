@@ -15,6 +15,7 @@
 
 from typing import List, Tuple, Dict, Union, Any
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import numpy as np
 from functools import partial
@@ -649,10 +650,31 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         task_obs = {}
         task_infos = {}
 
+        task_kwargs_by_task = {}
         for task, items in task_to_items.items():
             indices, task_kwargs = zip(*items)
             self._task_indices[task] = list(indices)
-            obs, infos = self.managers[task].reset(list(task_kwargs))
+            task_kwargs_by_task[task] = list(task_kwargs)
+
+        # Reset all task managers concurrently (env construction/reset is
+        # I/O-bound), mirroring the parallel step() so the rollout doesn't
+        # serialize per-task startup.
+        reset_results = {}
+        if len(task_kwargs_by_task) == 1:
+            (task, task_kwargs), = task_kwargs_by_task.items()
+            reset_results[task] = self.managers[task].reset(task_kwargs)
+        else:
+            with ThreadPoolExecutor(max_workers=len(task_kwargs_by_task)) as executor:
+                futures = {
+                    executor.submit(self.managers[task].reset, task_kwargs): task
+                    for task, task_kwargs in task_kwargs_by_task.items()
+                }
+                for future in as_completed(futures):
+                    reset_results[futures[future]] = future.result()
+
+        for task in task_kwargs_by_task:
+            indices = self._task_indices[task]
+            obs, infos = reset_results[task]
             for info in infos:
                 info["task_name"] = task
             self._task_steps[task] = 0
@@ -675,6 +697,8 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         task_dones = {}
         task_infos = {}
 
+        # Tasks that still need a real environment step (others are short-circuited).
+        active_tasks = {}
         for task, indices in self._task_indices.items():
             if self._task_done[task].all() or self._task_steps[task] >= self.task_max_steps[task]:
                 task_obs[task] = self._last_obs_by_task[task]
@@ -682,9 +706,29 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
                 task_dones[task] = np.ones(len(indices), dtype=bool)
                 task_infos[task] = self._done_infos(task)
                 continue
+            active_tasks[task] = [text_actions[idx] for idx in indices]
 
-            actions = [text_actions[idx] for idx in indices]
-            obs, rewards, dones, infos = self.managers[task].step(actions)
+        # Step active tasks concurrently. Each manager.step is independent and
+        # I/O-bound (HTTP for search, Ray/subprocess IPC for alfworld/webshop),
+        # so threads overlap them and the per-turn barrier becomes ~max(task)
+        # instead of sum(task). Bookkeeping below runs in the main thread to
+        # avoid races on the shared state dicts.
+        stepped = {}
+        if len(active_tasks) == 1:
+            (task, actions), = active_tasks.items()
+            stepped[task] = self.managers[task].step(actions)
+        elif active_tasks:
+            with ThreadPoolExecutor(max_workers=len(active_tasks)) as executor:
+                futures = {
+                    executor.submit(self.managers[task].step, actions): task
+                    for task, actions in active_tasks.items()
+                }
+                for future in as_completed(futures):
+                    stepped[futures[future]] = future.result()
+
+        for task in active_tasks:
+            indices = self._task_indices[task]
+            obs, rewards, dones, infos = stepped[task]
             rewards = np.asarray(rewards).reshape(-1)
             dones = np.asarray(dones).reshape(-1).astype(bool)
 
