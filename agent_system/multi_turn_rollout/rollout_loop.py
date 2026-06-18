@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 import torch
 import numpy as np
 from verl import DataProto
+from verl.utils import gpu_profiler
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
@@ -25,6 +28,65 @@ from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+# Opt-in per-turn rollout timing. When off (default) the loop is unchanged and
+# adds only a few cheap perf_counter() reads. Set ROLLOUT_TURN_TIMING=1 to print,
+# at the end of every rollout, a per-turn breakdown of where the gen phase spends
+# wall time (preproc / generate / decode / env.step) plus the GPU SM utilization
+# measured *during* generate_sequences (GEN-UTIL). Pairs with GPU_PROFILER=1.
+_ROLLOUT_TURN_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _now():
+    return time.perf_counter()
+
+
+def _print_turn_timing(records):
+    """Pretty-print the per-turn breakdown collected during one rollout."""
+    if not records:
+        return
+    header = (
+        f"{'turn':>4}{'active':>8}{'preproc':>9}{'gen':>9}{'decode':>9}"
+        f"{'envstep':>9}{'total':>9}{'genGPU%':>9}"
+    )
+    lines = ["[rollout-turn-timing] per-turn breakdown (seconds); GPU busy only during 'gen'", header, "-" * len(header)]
+    tot = {k: 0.0 for k in ("preproc", "gen", "decode", "envstep", "total")}
+    full_util, shrunk_util = [], []
+    first_active = records[0]["active"]
+    for r in records:
+        total = r["preproc"] + r["gen"] + r["decode"] + r["envstep"]
+        for k in ("preproc", "gen", "decode", "envstep"):
+            tot[k] += r[k]
+        tot["total"] += total
+        gu = r["gen_util"]
+        gu_s = f"{gu:.0f}" if gu is not None else "-"
+        lines.append(
+            f"{r['turn']:>4}{r['active']:>8}{r['preproc']:>9.2f}{r['gen']:>9.2f}"
+            f"{r['decode']:>9.2f}{r['envstep']:>9.2f}{total:>9.2f}{gu_s:>9}"
+        )
+        if gu is not None:
+            (full_util if r["active"] >= first_active else shrunk_util).append(gu)
+    lines.append("-" * len(header))
+    lines.append(
+        f"{'TOTAL':>4}{'':>8}{tot['preproc']:>9.1f}{tot['gen']:>9.1f}"
+        f"{tot['decode']:>9.1f}{tot['envstep']:>9.1f}{tot['total']:>9.1f}"
+    )
+    cpu_glue = tot["preproc"] + tot["decode"] + tot["envstep"]
+    if tot["total"] > 0:
+        lines.append(
+            f"SHARE  gen(GPU-busy)={100*tot['gen']/tot['total']:.1f}%  "
+            f"cpu-glue(preproc+decode+envstep, GPU-idle)={100*cpu_glue/tot['total']:.1f}%"
+        )
+    fa = sum(full_util) / len(full_util) if full_util else None
+    sa = sum(shrunk_util) / len(shrunk_util) if shrunk_util else None
+    lines.append(
+        f"GEN-UTIL  full_batch(active>={first_active})="
+        f"{f'{fa:.0f}%' if fa is not None else '-'}   "
+        f"shrunk(active<{first_active})={f'{sa:.0f}%' if sa is not None else '-'}   "
+        f"(full~shrunk => not batch-underfed; full>>shrunk => alfworld plateau underfeed)"
+    )
+    print("\n".join(lines), flush=True)
+
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -379,6 +441,7 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        _turn_records = [] if _ROLLOUT_TURN_TIMING else None
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -393,6 +456,7 @@ class TrajectoryCollector:
             if not active_masks.any():
                 break
             active_idx = np.nonzero(active_masks)[0]
+            _m0 = _now()
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
@@ -410,6 +474,7 @@ class TrajectoryCollector:
             )
 
             batch_input.meta_info = gen_batch.meta_info
+            _m_preproc = _now()  # end of CPU preprocess (tokenize/pop)
 
             # Restrict generation to active trajectories only; done rows are filled
             # back in afterwards (and dropped downstream via active_masks).
@@ -418,9 +483,12 @@ class TrajectoryCollector:
 
             # pad to be divisible by dp_size
             batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
+            _gw0 = gpu_profiler.now()
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+            _gw1 = gpu_profiler.now()
             # # unpad
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            _m_gen = _now()  # end of GPU generation window
 
             # Scatter active outputs back to the full batch size for union/recording.
             batch_output = active_batch_output if generate_all else \
@@ -432,10 +500,23 @@ class TrajectoryCollector:
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-            
-            next_obs, rewards, dones, infos = envs.step(text_actions)
+            _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
 
-            
+            next_obs, rewards, dones, infos = envs.step(text_actions)
+            _m_env = _now()  # end of env.step (CPU / HTTP / IPC)
+
+            if _turn_records is not None:
+                _turn_records.append({
+                    "turn": _step,
+                    "active": int(len(active_idx)),
+                    "preproc": _m_preproc - _m0,
+                    "gen": _m_gen - _m_preproc,
+                    "decode": _m_decode - _m_gen,
+                    "envstep": _m_env - _m_decode,
+                    "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
+                })
+
+
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
             if len(dones.shape) == 2:
@@ -474,14 +555,17 @@ class TrajectoryCollector:
             # Break if all environments are done
             if is_done.all():
                 break
-        
+
+        if _turn_records is not None:
+            _print_turn_timing(_turn_records)
+
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
                     total_batch_list=total_batch_list,
-                    episode_rewards=episode_rewards, 
+                    episode_rewards=episode_rewards,
                     episode_lengths=episode_lengths,
                     )
-        
+
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
     
     def dynamic_multi_turn_loop(

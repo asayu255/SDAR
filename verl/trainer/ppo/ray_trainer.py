@@ -404,8 +404,14 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     Yields:
         None: This is a context manager that yields control back to the code block.
     """
-    with Timer(name=name, logger=None) as timer:
-        yield
+    from verl.utils import gpu_profiler
+
+    gpu_profiler.push_phase(name)
+    try:
+        with Timer(name=name, logger=None) as timer:
+            yield
+    finally:
+        gpu_profiler.pop_phase(name)
     if name not in timing_raw:
         timing_raw[name] = 0
     timing_raw[name] += timer.last
