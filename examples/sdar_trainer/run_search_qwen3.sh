@@ -11,8 +11,8 @@ skill_all=false
 
 experiment_name="sdar_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 
-train_data_size=128
-val_data_size=512
+train_data_size=16
+val_data_size=128
 group_size=8
 
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
@@ -34,7 +34,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -68,10 +68,10 @@ python3 -m verl.trainer.main_sdar \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_search' \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=25 \
     trainer.test_freq=150 \
-    trainer.total_training_steps=150 \
+    trainer.total_training_steps=300 \
     trainer.val_before_train=False $@
