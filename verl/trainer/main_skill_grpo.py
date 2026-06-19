@@ -220,9 +220,9 @@ class SkillTrajectoryCollector:
     def preprocess_single_sample(self, item, gen_batch, obs):
         return self._collector.preprocess_single_sample(item, gen_batch, obs)
 
-    def preprocess_batch(self, gen_batch, obs):
+    def preprocess_batch(self, gen_batch, obs, active_mask=None):
         obs = self._inject_skills_into_obs(obs)
-        return self._collector.preprocess_batch(gen_batch, obs)
+        return self._collector.preprocess_batch(gen_batch, obs, active_mask=active_mask)
 
     def vanilla_multi_turn_loop(self, gen_batch, actor_rollout_wg, envs):
         return self._collector.vanilla_multi_turn_loop(gen_batch, actor_rollout_wg, envs)
@@ -245,9 +245,9 @@ class SkillTrajectoryCollector:
         # Temporarily replace the inner collector's preprocess_batch
         original_preprocess_batch = self._collector.preprocess_batch
 
-        def skill_preprocess_batch(gen_batch, obs):
+        def skill_preprocess_batch(gen_batch, obs, active_mask=None):
             obs = self._inject_skills_into_obs(obs)
-            return original_preprocess_batch(gen_batch, obs)
+            return original_preprocess_batch(gen_batch, obs, active_mask=active_mask)
 
         self._collector.preprocess_batch = skill_preprocess_batch
         try:

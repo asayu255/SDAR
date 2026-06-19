@@ -36,6 +36,16 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 # measured *during* generate_sequences (GEN-UTIL). Pairs with GPU_PROFILER=1.
 _ROLLOUT_TURN_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Accuracy-safe throughput optimization: skip the (expensive) prompt tokenization
+# for trajectories that are already finished. Finished rows are excluded from
+# generation (batch_input[active_idx]) and dropped by gather_rollout_data()
+# (active_masks=False), so their token contents are never consumed for training.
+# Active rows go through the *unchanged* preprocess_single_sample(), so their
+# generation input — and therefore every training number — is byte-for-byte
+# identical to the un-optimized path. Set ROLLOUT_SKIP_DONE_PREPROC=0 to restore
+# the original full-batch preprocessing (for A/B accuracy verification).
+_ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _now():
     return time.perf_counter()
@@ -252,37 +262,108 @@ class TrajectoryCollector:
         
         return row_dict
 
+    def _placeholder_single_sample(self, item, gen_batch, obs, template):
+        """Cheap stand-in for an already-finished trajectory's row.
+
+        Reproduces only the *cheap* metadata that preprocess_single_sample sets
+        (dict lookups, no apply_chat_template / tokenization) and fills the
+        model-input tensors (input_ids/attention_mask/position_ids) with padding
+        cloned from `template` — an already-processed active row — so the shapes
+        and dtypes match exactly for collate. These rows are excluded from
+        generation and dropped by gather_rollout_data(), so their token contents
+        are never consumed; only shape-consistency matters here.
+        """
+        obs_texts = obs.get('text', None)
+        obs_anchors = obs.get('anchor', None)
+        obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
+        obs_text = obs_texts[item] if obs_texts is not None else None
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        row_dict = {
+            'input_ids': torch.full_like(template['input_ids'], pad_token_id),
+            'attention_mask': torch.zeros_like(template['attention_mask']),
+            'position_ids': torch.zeros_like(template['position_ids']),
+            'raw_prompt_ids': [pad_token_id],
+            'anchor_obs': _obs_anchor,
+            'index': item,
+            'data_source': gen_batch.non_tensor_batch['data_source'][item],
+        }
+        if 'task_name' in gen_batch.non_tensor_batch:
+            row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]
+        if self.config.data.get('return_raw_chat', False):
+            chat = np.array([{"content": obs_text if obs_text is not None else '', "role": "user"}])
+            row_dict['raw_prompt'] = chat.tolist()
+        return row_dict
+
     def preprocess_batch(
         self,
-        gen_batch: DataProto, 
-        obs: Dict, 
+        gen_batch: DataProto,
+        obs: Dict,
+        active_mask: np.ndarray = None,
     ) -> DataProto:
         """
         Process a batch of observation samples, converting environment observations into model-processable format.
-        
+
         Parameters:
             gen_batch (DataProto): Batch data containing original prompts
             obs (Dict): Environment observation dictionary
                 - 'text' (None or List[str]): Text observation data
                 - 'image' (np.ndarray or torch.Tensor): Image observation data
                 - 'anchor' (None or Any): Anchor observation without any histories or additional info. (for GiGPO only).
-        
+            active_mask (np.ndarray or None): Boolean mask of trajectories still
+                active. When provided, only active rows are fully tokenized; finished
+                rows get a cheap placeholder (see _placeholder_single_sample). When
+                None, every row is fully processed (original behavior). Active rows
+                are processed identically either way, so generation is unaffected.
+
         Returns:
             DataProto: Contains processed batch data with preserved metadata
         """
         batch_size = len(gen_batch.batch['input_ids'])
-        processed_samples = []
-        
-        # Process each sample in parallel
-        for item in range(batch_size):
-            # Extract per-sample observations
-            processed = self.preprocess_single_sample(
-                item=item,
-                gen_batch=gen_batch,
-                obs=obs,
-            )
-            processed_samples.append(processed)
-        
+
+        # Decide which rows need full tokenization. Falling back to "all active"
+        # (None / all-True / multimodal) reproduces the original code path exactly.
+        skip_done = (
+            active_mask is not None
+            and not bool(active_mask.all())
+            and obs.get('image', None) is None  # multimodal rows always fully processed
+        )
+
+        processed_samples = [None] * batch_size
+
+        if not skip_done:
+            for item in range(batch_size):
+                processed_samples[item] = self.preprocess_single_sample(
+                    item=item,
+                    gen_batch=gen_batch,
+                    obs=obs,
+                )
+        else:
+            # Full tokenization for active rows (unchanged path); the first such
+            # row becomes the shape/dtype template for finished-row placeholders.
+            template = None
+            for item in range(batch_size):
+                if active_mask[item]:
+                    processed_samples[item] = self.preprocess_single_sample(
+                        item=item,
+                        gen_batch=gen_batch,
+                        obs=obs,
+                    )
+                    if template is None:
+                        template = processed_samples[item]
+            for item in range(batch_size):
+                if not active_mask[item]:
+                    processed_samples[item] = self._placeholder_single_sample(
+                        item=item,
+                        gen_batch=gen_batch,
+                        obs=obs,
+                        template=template,
+                    )
+
         # Aggregate batch data
         batch = collate_fn(processed_samples)
         
@@ -458,7 +539,8 @@ class TrajectoryCollector:
             active_idx = np.nonzero(active_masks)[0]
             _m0 = _now()
 
-            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
+            _pre_active_mask = active_masks if _ROLLOUT_SKIP_DONE_PREPROC else None
+            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
