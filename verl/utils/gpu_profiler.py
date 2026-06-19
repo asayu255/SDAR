@@ -58,6 +58,7 @@ __all__ = [
     "push_phase",
     "pop_phase",
     "mean_util_between",
+    "per_gpu_util_between",
     "now",
     "report_and_reset",
 ]
@@ -254,16 +255,34 @@ class _Sampler:
             with self._lock:
                 phase = self._current_phase()
                 self._samples.append((t, dt, phase, per_gpu))
-                sm_vals = [g["sm_util"] for g in per_gpu if g.get("sm_util") is not None]
-                if sm_vals:
-                    self._util_trace.append((t, sum(sm_vals) / len(sm_vals)))
+                # store per-GPU sm so callers can see data-parallel imbalance
+                per_gpu_sm = [g.get("sm_util") for g in per_gpu]
+                self._util_trace.append((t, per_gpu_sm))
 
     def mean_util_between(self, t0, t1):
+        """Mean (across GPUs and time) SM util in [t0, t1]."""
         with self._lock:
-            vals = [u for (ts, u) in self._util_trace if t0 <= ts <= t1]
-        if not vals:
+            window = [vals for (ts, vals) in self._util_trace if t0 <= ts <= t1]
+        flat = [v for vals in window for v in vals if v is not None]
+        if not flat:
             return None
-        return sum(vals) / len(vals)
+        return sum(flat) / len(flat)
+
+    def per_gpu_util_between(self, t0, t1):
+        """Per-GPU mean SM util in [t0, t1] as a list (one entry per GPU).
+
+        Lets callers see data-parallel load imbalance (e.g. a mixed-task batch
+        that lands different tasks on different GPUs)."""
+        with self._lock:
+            window = [vals for (ts, vals) in self._util_trace if t0 <= ts <= t1]
+        if not window:
+            return None
+        n = max(len(vals) for vals in window)
+        out = []
+        for gi in range(n):
+            col = [vals[gi] for vals in window if gi < len(vals) and vals[gi] is not None]
+            out.append((sum(col) / len(col)) if col else None)
+        return out
 
     # -- reporting --------------------------------------------------------- #
     def report_and_reset(self, label=""):
@@ -325,6 +344,12 @@ def mean_util_between(t0, t1):
     if not enabled() or _sampler is None:
         return None
     return _sampler.mean_util_between(t0, t1)
+
+
+def per_gpu_util_between(t0, t1):
+    if not enabled() or _sampler is None:
+        return None
+    return _sampler.per_gpu_util_between(t0, t1)
 
 
 def report_and_reset(label=""):

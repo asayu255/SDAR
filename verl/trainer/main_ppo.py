@@ -260,6 +260,9 @@ class TaskBalancedSampler:
         self.seed = int(seed)
         self._epoch = 0
         self._np = np
+        # Fix1: interleave tasks within each batch (round-robin) so the
+        # data-parallel split of the generation batch is task-balanced.
+        self._interleave = os.environ.get("TASK_BALANCE_INTERLEAVE", "0").strip().lower() in ("1", "true", "yes", "on")
 
     def __iter__(self):
         rng = self._np.random.RandomState(self.seed + self._epoch)
@@ -276,8 +279,17 @@ class TaskBalancedSampler:
         for batch_idx in range(self.num_batches):
             start = batch_idx * self.per_task_batch_size
             end = start + self.per_task_batch_size
-            for task in self.tasks:
-                yield from task_indices[task][start:end]
+            if self._interleave:
+                # Round-robin task layout: alf0, search0, webshop0, alf1, ...
+                # -> each DP chunk gets an equal task mix. Reordering only; the
+                # sample set and the GRPO groups (formed later by uid) are
+                # unchanged, so training is unaffected.
+                for i in range(self.per_task_batch_size):
+                    for task in self.tasks:
+                        yield task_indices[task][start + i]
+            else:
+                for task in self.tasks:
+                    yield from task_indices[task][start:end]
 
     def __len__(self):
         return self.num_batches * self.per_task_batch_size * len(self.tasks)

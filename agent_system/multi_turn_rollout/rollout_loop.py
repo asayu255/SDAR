@@ -55,22 +55,47 @@ _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").st
 # OFF reproduces the current per-turn behavior exactly.
 _ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Fix2: generate each task's active sub-batch in its own generate_sequences call
+# (instead of one mixed-task call). Homogeneous response-length distributions per
+# call reduce the straggler collapse that mixing short (search) and long
+# (alfworld) tasks causes, and each call's data-parallel split is task-balanced.
+# Same per-sequence sampling -> accuracy unchanged (distributional). Opt-in.
+_ROLLOUT_PER_TASK_GEN = os.environ.get("ROLLOUT_PER_TASK_GEN", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _now():
     return time.perf_counter()
 
 
+def _fmt_per_gpu(vals):
+    if not vals:
+        return "-"
+    return "/".join(f"{v:.0f}" if v is not None else "-" for v in vals)
+
+
 def _print_turn_timing(records):
-    """Pretty-print the per-turn breakdown collected during one rollout."""
+    """Pretty-print the per-turn breakdown collected during one rollout.
+
+    Columns added for the Fix1/Fix2 isolation study:
+      genGPU%(gN)  per-GPU SM util during the turn's generation. The spread
+                   between GPUs reveals data-parallel load imbalance from mixing
+                   tasks across the DP split -> Fix1 (interleaved layout) should
+                   shrink it on the mixed-task turns.
+    A per-task generation summary is printed when Fix2 (per-task generate) is on,
+    showing each task's own gen time and util -> isolates Fix2's straggler fix.
+    """
     if not records:
         return
     header = (
         f"{'turn':>4}{'active':>8}{'preproc':>9}{'gen':>9}{'decode':>9}"
-        f"{'envstep':>9}{'total':>9}{'genGPU%':>9}"
+        f"{'envstep':>9}{'total':>9}{'genGPU%':>9}{'  perGPU%':>12}"
     )
     lines = ["[rollout-turn-timing] per-turn breakdown (seconds); GPU busy only during 'gen'", header, "-" * len(header)]
     tot = {k: 0.0 for k in ("preproc", "gen", "decode", "envstep", "total")}
     full_util, shrunk_util = [], []
+    dp_spreads = []  # per-turn max-min across GPUs during gen (DP imbalance)
+    # per-task aggregation (Fix2): task -> [gen_time_sum, util_samples, per_gpu_samples]
+    task_agg = {}
     first_active = records[0]["active"]
     for r in records:
         total = r["preproc"] + r["gen"] + r["decode"] + r["envstep"]
@@ -79,12 +104,25 @@ def _print_turn_timing(records):
         tot["total"] += total
         gu = r["gen_util"]
         gu_s = f"{gu:.0f}" if gu is not None else "-"
+        pg = r.get("gen_util_per_gpu")
+        pg_s = _fmt_per_gpu(pg)
         lines.append(
             f"{r['turn']:>4}{r['active']:>8}{r['preproc']:>9.2f}{r['gen']:>9.2f}"
-            f"{r['decode']:>9.2f}{r['envstep']:>9.2f}{total:>9.2f}{gu_s:>9}"
+            f"{r['decode']:>9.2f}{r['envstep']:>9.2f}{total:>9.2f}{gu_s:>9}{pg_s:>12}"
         )
         if gu is not None:
             (full_util if r["active"] >= first_active else shrunk_util).append(gu)
+        if pg:
+            present = [v for v in pg if v is not None]
+            if len(present) >= 2:
+                dp_spreads.append(max(present) - min(present))
+        for tr in (r.get("task_gen") or []):
+            agg = task_agg.setdefault(tr["task"], {"gen": 0.0, "util": [], "pg": []})
+            agg["gen"] += tr["gen"]
+            if tr.get("gen_util") is not None:
+                agg["util"].append(tr["gen_util"])
+            if tr.get("gen_util_per_gpu"):
+                agg["pg"].append(tr["gen_util_per_gpu"])
     lines.append("-" * len(header))
     lines.append(
         f"{'TOTAL':>4}{'':>8}{tot['preproc']:>9.1f}{tot['gen']:>9.1f}"
@@ -104,6 +142,30 @@ def _print_turn_timing(records):
         f"shrunk(active<{first_active})={f'{sa:.0f}%' if sa is not None else '-'}   "
         f"(full~shrunk => not batch-underfed; full>>shrunk => alfworld plateau underfeed)"
     )
+    # Fix1 metric: data-parallel imbalance (lower is better; Fix1 should reduce it)
+    if dp_spreads:
+        mean_spread = sum(dp_spreads) / len(dp_spreads)
+        lines.append(
+            f"DP-IMBALANCE  mean |maxGPU-minGPU| during gen = {mean_spread:.1f} pp "
+            f"(lower=better; Fix1 interleave should shrink this on mixed turns)"
+        )
+    # Fix2 metric: per-task generation util (each task's own homogeneous batch)
+    if task_agg:
+        lines.append("PER-TASK GEN (Fix2)  task: gen_s  util%  perGPU%")
+        for task, agg in task_agg.items():
+            u = sum(agg["util"]) / len(agg["util"]) if agg["util"] else None
+            # average per-GPU across turns
+            pg_mean = None
+            if agg["pg"]:
+                n = max(len(x) for x in agg["pg"])
+                pg_mean = [
+                    (lambda c: sum(c) / len(c) if c else None)([x[i] for x in agg["pg"] if i < len(x) and x[i] is not None])
+                    for i in range(n)
+                ]
+            lines.append(
+                f"  {task:<10} {agg['gen']:>7.1f}  "
+                f"{f'{u:.0f}' if u is not None else '-':>4}  {_fmt_per_gpu(pg_mean)}"
+            )
     print("\n".join(lines), flush=True)
 
 
@@ -485,6 +547,60 @@ class TrajectoryCollector:
             meta_info=active_output.meta_info,
         )
 
+    def _scatter_per_task_to_full(
+            self,
+            per_task_outputs,
+            batch_size: int,
+            ) -> DataProto:
+        """Merge per-task generation outputs (Fix2) into one full-size batch.
+
+        per_task_outputs: list of (global_idx_array, DataProto) — each from a
+        separate per-task generate_sequences call. Tensors are right-padded to the
+        max length across calls (vLLM normally pads responses to a fixed
+        response_length, so this is usually a no-op) and scattered to their global
+        rows. Rows not produced by any task (already-finished trajectories) keep
+        padding/zeros and are dropped downstream via active_masks, exactly like
+        _scatter_active_to_full. Per-sequence outputs are identical to the union
+        path; only the batching of the generate calls differs.
+        """
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        token_like_keys = {"responses", "input_ids", "prompts"}
+
+        ref_out = per_task_outputs[0][1]
+
+        full_tensors = {}
+        if ref_out.batch is not None:
+            for key in ref_out.batch.keys():
+                max_last = max(out.batch[key].shape[-1] for _, out in per_task_outputs)
+                sample = ref_out.batch[key]
+                fill_value = pad_token_id if key in token_like_keys else 0
+                full_shape = (batch_size,) + tuple(sample.shape[1:-1]) + (max_last,)
+                full_tensor = sample.new_full(full_shape, fill_value)
+                for idx_arr, out in per_task_outputs:
+                    t = out.batch[key]
+                    if t.shape[-1] < max_last:  # right-pad to common length
+                        pad_shape = tuple(t.shape[:-1]) + (max_last - t.shape[-1],)
+                        t = torch.cat([t, t.new_full(pad_shape, fill_value)], dim=-1)
+                    full_tensor[torch.as_tensor(idx_arr, dtype=torch.long)] = t
+                full_tensors[key] = full_tensor
+
+        full_non_tensors = {}
+        for key, val in ref_out.non_tensor_batch.items():
+            full_val = np.empty((batch_size,) + val.shape[1:], dtype=val.dtype)
+            if len(val) > 0:
+                full_val[:] = val[0]
+            for idx_arr, out in per_task_outputs:
+                full_val[idx_arr] = out.non_tensor_batch[key]
+            full_non_tensors[key] = full_val
+
+        return DataProto.from_dict(
+            tensors=full_tensors,
+            non_tensors=full_non_tensors if full_non_tensors else None,
+            meta_info=ref_out.meta_info,
+        )
+
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -532,6 +648,7 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
         _turn_records = [] if _ROLLOUT_TURN_TIMING else None
+        _task_names = gen_batch.non_tensor_batch.get('task_name', None)
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -570,20 +687,51 @@ class TrajectoryCollector:
             # Restrict generation to active trajectories only; done rows are filled
             # back in afterwards (and dropped downstream via active_masks).
             generate_all = len(active_idx) == batch_size
-            active_batch_input = batch_input if generate_all else batch_input[active_idx]
 
-            # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
-            _gw0 = gpu_profiler.now()
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
-            _gw1 = gpu_profiler.now()
-            # # unpad
-            active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
-            _m_gen = _now()  # end of GPU generation window
+            _task_gen_records = None
+            if _ROLLOUT_PER_TASK_GEN and _task_names is not None:
+                # Fix2: one generate call per task over that task's active rows.
+                task_groups = {}
+                for gi in active_idx:
+                    task_groups.setdefault(str(_task_names[gi]), []).append(int(gi))
+                per_task_out = []
+                _task_gen_records = [] if _turn_records is not None else None
+                _gw0 = gpu_profiler.now()
+                for _t, _idxs in task_groups.items():
+                    _idx_arr = np.array(_idxs, dtype=np.int64)
+                    _sub_in = batch_input[_idx_arr]
+                    _sub_padded, _sub_pad = pad_dataproto_to_divisor(_sub_in, actor_rollout_wg.world_size)
+                    _tw0 = gpu_profiler.now()
+                    _sub_out_padded = actor_rollout_wg.generate_sequences(_sub_padded)
+                    _tw1 = gpu_profiler.now()
+                    _sub_out = unpad_dataproto(_sub_out_padded, pad_size=_sub_pad)
+                    per_task_out.append((_idx_arr, _sub_out))
+                    if _task_gen_records is not None:
+                        _task_gen_records.append({
+                            "task": _t,
+                            "active": len(_idxs),
+                            "gen": _tw1 - _tw0,
+                            "gen_util": gpu_profiler.mean_util_between(_tw0, _tw1),
+                            "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_tw0, _tw1),
+                        })
+                _gw1 = gpu_profiler.now()
+                batch_output = self._scatter_per_task_to_full(per_task_out, batch_size)
+                _m_gen = _now()
+            else:
+                active_batch_input = batch_input if generate_all else batch_input[active_idx]
 
-            # Scatter active outputs back to the full batch size for union/recording.
-            batch_output = active_batch_output if generate_all else \
-                self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
+                # pad to be divisible by dp_size
+                batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
+                _gw0 = gpu_profiler.now()
+                batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+                _gw1 = gpu_profiler.now()
+                # # unpad
+                active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+                _m_gen = _now()  # end of GPU generation window
+
+                # Scatter active outputs back to the full batch size for union/recording.
+                batch_output = active_batch_output if generate_all else \
+                    self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
@@ -605,6 +753,8 @@ class TrajectoryCollector:
                     "decode": _m_decode - _m_gen,
                     "envstep": _m_env - _m_decode,
                     "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
+                    "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
+                    "task_gen": _task_gen_records,
                 })
 
 
