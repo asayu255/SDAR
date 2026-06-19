@@ -27,8 +27,17 @@ param_offload=${PARAM_OFFLOAD:-True}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-True}
 ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-8}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
+
+# Run knobs (override via env instead of appending CLI args, which would collide
+# with the keys this script already sets and make Hydra error on duplicates).
+seed=${SEED:-0}
+test_freq=${TEST_FREQ:-5}
+total_epochs=${TOTAL_EPOCHS:-150}
+search_url=${SEARCH_URL:-http://0.0.0.0:8000/retrieve}
+max_model_len=${MAX_MODEL_LEN:-4608}
+skills_root=${SKILLS_ROOT:-skills}
 model_path="Qwen/Qwen3-1.7B"
-experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
+experiment_name="${EXPERIMENT_NAME:-sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}}"
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -73,6 +82,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.fsdp_config.param_offload=$param_offload \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$optimizer_offload \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
+    actor_rollout_ref.rollout.max_model_len=$max_model_len \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -88,17 +98,17 @@ python3 -m verl.trainer.main_sdar \
     algorithm.use_kl_in_reward=False \
     +algorithm.sdar.sdar_coef=$sdar_coef \
     +algorithm.sdar.gate_beta=$gate_beta \
-    +algorithm.sdar.skills_dir=skills/alfworld \
-    +algorithm.sdar.skills_dirs.alfworld=skills/alfworld \
-    +algorithm.sdar.skills_dirs.search=skills/search \
-    +algorithm.sdar.skills_dirs.webshop=skills/webshop \
+    +algorithm.sdar.skills_dir=$skills_root/alfworld \
+    +algorithm.sdar.skills_dirs.alfworld=$skills_root/alfworld \
+    +algorithm.sdar.skills_dirs.search=$skills_root/search \
+    +algorithm.sdar.skills_dirs.webshop=$skills_root/webshop \
     +algorithm.sdar.skill_all=$skill_all \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=$seed \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=$group_size \
-    env.search.search_url='http://0.0.0.0:8000/retrieve' \
+    env.search.search_url="$search_url" \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
@@ -113,7 +123,7 @@ python3 -m verl.trainer.main_sdar \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.save_freq=25 \
-    trainer.test_freq=5 \
+    trainer.test_freq=$test_freq \
     trainer.total_training_steps=$total_training_steps \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=$total_epochs \
     trainer.val_before_train=True $@
