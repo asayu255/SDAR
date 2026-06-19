@@ -15,6 +15,18 @@ val_per_task_size=128
 val_data_size=384
 group_size=8
 total_training_steps=150
+
+# Throughput knobs. Defaults reproduce the current behavior exactly; override via
+# env to use the "80GB-headroom" throughput mode (training phases are already
+# ~97% util / compute-bound, so expect modest gains here; the retriever fix is
+# the bigger lever). Accuracy notes:
+#   PARAM_OFFLOAD=False        -> bit-identical (FSDP placement only)
+#   OPTIMIZER_OFFLOAD=False    -> same algorithm, not bit-identical (Adam CPU->GPU)
+#   *_MICRO_PER_GPU larger     -> same algorithm, not bit-identical (grad-accum grouping)
+param_offload=${PARAM_OFFLOAD:-True}
+optimizer_offload=${OPTIMIZER_OFFLOAD:-True}
+ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-8}
+log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 model_path="Qwen/Qwen3-1.7B"
 experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 
@@ -53,14 +65,14 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.model.use_fused_kernels=True \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=240 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_per_gpu \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$param_offload \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$optimizer_offload \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -68,8 +80,8 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
+    actor_rollout_ref.ref.fsdp_config.param_offload=$param_offload \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
