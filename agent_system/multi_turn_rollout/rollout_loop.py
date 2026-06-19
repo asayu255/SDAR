@@ -47,6 +47,14 @@ _ROLLOUT_TURN_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower(
 # set ROLLOUT_SKIP_DONE_PREPROC=0 to restore full-batch preprocessing for A/B.
 _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").strip().lower() in ("1", "true", "yes", "on")
 
+# Keep vLLM awake for the whole rollout instead of waking/sleeping (and re-syncing
+# the frozen actor weights) every turn. See ActorRolloutRefWorker.begin_rollout_
+# session(). Accuracy-safe: identical frozen weights are used on every turn, so the
+# generated tokens are unchanged; only the per-turn weight-sync / wake / sleep
+# overhead is removed (and vLLM's prefix cache can persist across turns). Opt-in;
+# OFF reproduces the current per-turn behavior exactly.
+_ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _now():
     return time.perf_counter()
@@ -742,22 +750,31 @@ class TrajectoryCollector:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
             
         # Initial observations from the environment
-        if self.config.algorithm.filter_groups.enable and is_train:
-            # Dynamic Sampling (for DAPO and Dynamic GiGPO)
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
-                self.dynamic_multi_turn_loop(
-                gen_batch=gen_batch,
-                actor_rollout_wg=actor_rollout_wg,
-                envs=envs,
-            )
-        else:
-            # Vanilla Sampling   
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
-                self.vanilla_multi_turn_loop(
-                gen_batch=gen_batch,
-                actor_rollout_wg=actor_rollout_wg,
-                envs=envs,
-            )
+        # Open one vLLM session for the whole rollout (opt-in). end_rollout_session
+        # runs in finally so the engine is always returned to its slept/offloaded
+        # state before the post-rollout (gather/teacher/train) phases.
+        if _ROLLOUT_KEEP_VLLM_AWAKE:
+            actor_rollout_wg.begin_rollout_session()
+        try:
+            if self.config.algorithm.filter_groups.enable and is_train:
+                # Dynamic Sampling (for DAPO and Dynamic GiGPO)
+                total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+                    self.dynamic_multi_turn_loop(
+                    gen_batch=gen_batch,
+                    actor_rollout_wg=actor_rollout_wg,
+                    envs=envs,
+                )
+            else:
+                # Vanilla Sampling
+                total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+                    self.vanilla_multi_turn_loop(
+                    gen_batch=gen_batch,
+                    actor_rollout_wg=actor_rollout_wg,
+                    envs=envs,
+                )
+        finally:
+            if _ROLLOUT_KEEP_VLLM_AWAKE:
+                actor_rollout_wg.end_rollout_session()
         assert len(total_batch_list) == len(total_episode_rewards)
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)

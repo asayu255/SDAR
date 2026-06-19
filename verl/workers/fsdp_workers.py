@@ -652,21 +652,68 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
+        # ROLLOUT_KEEP_VLLM_AWAKE session mode: when begin_rollout_session() has
+        # entered the sharding manager for the whole multi-turn rollout, skip the
+        # per-turn __enter__/__exit__ (which would re-sync the *unchanged* actor
+        # weights to vLLM and sleep/wake the engine on every turn). The actor
+        # weights are frozen during a rollout, so a single sync at session start
+        # produces the identical weights for every turn -> generation is unchanged.
+        # Only the per-turn data sharding (preprocess/postprocess) still runs.
+        if getattr(self, "_rollout_session_active", False):
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
-            
-            log_gpu_memory_usage("After rollout generation", logger=logger)
-
             output = self.rollout_sharding_manager.postprocess_data(output)
+        else:
+            with self.rollout_sharding_manager:
+                log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+
+                prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+                log_gpu_memory_usage("After rollout generation", logger=logger)
+
+                output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
 
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def begin_rollout_session(self):
+        """Open the rollout sharding manager once for an entire multi-turn rollout.
+
+        Without this, generate_sequences() re-enters the sharding manager every
+        turn, which re-gathers the FSDP state_dict, re-syncs the full model weights
+        to vLLM, and wakes/sleeps the engine — ~50x per rollout, all redundant
+        because the actor weights are frozen during a rollout. Hoisting the
+        enter/exit to the rollout boundary keeps vLLM awake and the weights synced
+        once. Accuracy-safe: identical (frozen) weights are used on every turn, so
+        the generated tokens are unchanged. No-op unless the vLLM sharding manager
+        is in use. Paired with end_rollout_session() in a finally block.
+        """
+        assert self._is_rollout
+        from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
+
+        if not isinstance(self.rollout_sharding_manager, FSDPVLLMShardingManager):
+            return
+        if getattr(self, "_rollout_session_active", False):
+            return
+        self.rollout_sharding_manager.__enter__()
+        self._rollout_session_active = True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def end_rollout_session(self):
+        """Close the sharding manager opened by begin_rollout_session(), restoring
+        exactly the post-generation state of the non-session path (sleep/offload
+        vLLM, restore RNG + train mode, empty cache)."""
+        if not getattr(self, "_rollout_session_active", False):
+            return
+        self._rollout_session_active = False
+        self.rollout_sharding_manager.__exit__(None, None, None)
+
 
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
