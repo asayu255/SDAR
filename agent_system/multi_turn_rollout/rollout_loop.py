@@ -36,16 +36,16 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 # measured *during* generate_sequences (GEN-UTIL). Pairs with GPU_PROFILER=1.
 _ROLLOUT_TURN_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# Accuracy-safe but EMPIRICALLY NEUTRAL: skipping finished-row tokenization does
-# not reduce preproc, because preproc is dominated by the per-turn full-batch
-# assembly (collate / DataProto construction) and prompt length, not by how many
-# rows are tokenized (a fast tokenizer makes per-row cost negligible). Measured:
-# preproc 95.5s -> 104.7s (slightly worse from placeholder overhead). Kept for
-# reference / a future active-only batch refactor but DEFAULT OFF. Active rows
-# always go through the unchanged preprocess_single_sample(), so when enabled the
-# generation input — and every training number — stays byte-for-byte identical.
-# Set ROLLOUT_SKIP_DONE_PREPROC=1 to re-enable.
-_ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "0").strip().lower() in ("1", "true", "yes", "on")
+# Accuracy-safe throughput optimization: skip the prompt tokenization for already
+# finished trajectories. Finished rows are excluded from generation
+# (batch_input[active_idx]) and dropped by gather_rollout_data() (active_masks=
+# False), so their tokens are never consumed. Active rows go through the
+# *unchanged* preprocess_single_sample(), so the generation input — and every
+# training number — is byte-for-byte identical to the un-optimized path.
+# NOTE: an earlier "measured neutral" conclusion was invalid — that run had not
+# pulled this code, so the optimization was never actually exercised. Default ON;
+# set ROLLOUT_SKIP_DONE_PREPROC=0 to restore full-batch preprocessing for A/B.
+_ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _now():
