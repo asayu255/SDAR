@@ -16,7 +16,7 @@ sdar_coef=0.01
 gate_beta=5.0
 skill_all=false
 
-experiment_name="sdar_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
+experiment_name="${EXPERIMENT_NAME:-sdar_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}}"
 
 train_data_size=15
 val_data_size=126
@@ -38,7 +38,7 @@ max_model_len=${MAX_MODEL_LEN:-4608}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.5}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
-use_fused_kernels=${USE_FUSED_KERNELS:-True}
+use_fused_kernels=${USE_FUSED_KERNELS:-False}
 model_path=${MODEL_PATH:-Qwen/Qwen3-1.7B}
 
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
