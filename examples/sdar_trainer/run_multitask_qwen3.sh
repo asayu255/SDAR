@@ -18,7 +18,33 @@ val_per_task_size=126
 val_data_size=$val_per_task_size
 group_size=8
 total_training_steps=300
+# Shared seed for the search data subset (prepare) and the dataloader shuffle
+# (data.seed -> TaskBalancedSampler). Single-task runs use the dataloader default
+# (data.seed=1); set it explicitly here so the search周回 is reproducible and the
+# seed handling is consistent rather than relying on an implicit default.
+seed=1
 model_path="Qwen/Qwen3-1.7B"
+
+# --- Fair-comparison alignment with the single-task baselines -----------------
+# This is a joint multitask run (one shared model/optimizer over alfworld+search+
+# webshop); per-task metrics will NOT reproduce single-task values because every
+# step mixes the three tasks' gradients (task transfer is inherent to multitask
+# learning). The goal here is fair COMPARISON conditions, which already hold:
+#   - per-task hyperparameters (max_prompt_length/truncation/max_steps/
+#     history_length/kl_loss_coef/invalid_action_penalty/val_kwargs) match the
+#     single-task scripts via the *_by_task / task_overrides / multitask.* keys.
+#   - env-driven tasks (alfworld/webshop) sample identical game instances: the env
+#     build seeds match the single-task runs (train seed=0, val seed=1000,
+#     env_num=15/126, group_n=8/1); the parquet rows are placeholders (the prompt
+#     is built from env observations, not the parquet).
+#   - each task contributes 15 prompts x group 8 per step over 300 steps. The
+#     alfworld/webshop train parquets are 15 placeholder rows that the dataloader
+#     cycles (data.task_balance.num_batches) just like the single-task runs wrap
+#     their 15-row parquet; the real, fresh game instances come from the env.
+#   - search: train = uniform random 4500 (no repeat) from the full pool, val =
+#     leading 126 rows of test.parquet (same fixed population the single-task
+#     val_dataloader(shuffle=False) uses). See prepare_sdar_multitask.py.
+# -----------------------------------------------------------------------------
 experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 
 export ALFWORLD_DATA=$HOME/data/alfworld
@@ -33,7 +59,8 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --total_training_steps "$total_training_steps" \
     --per_task_batch_size "$per_task_batch_size" \
     --env_train_per_task_size "$per_task_batch_size" \
-    --val_per_task_size "$val_per_task_size"
+    --val_per_task_size "$val_per_task_size" \
+    --seed "$seed"
 
 python3 -m verl.trainer.main_sdar \
     algorithm.adv_estimator=grpo \
@@ -41,6 +68,7 @@ python3 -m verl.trainer.main_sdar \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
+    data.seed=$seed \
     data.max_prompt_length=4096 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \

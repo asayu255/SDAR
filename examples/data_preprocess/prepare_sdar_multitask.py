@@ -19,7 +19,13 @@ def _sample_dataframe(df: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
     replace = len(df) < size
     if replace:
         logger.warning("Sampling %s rows with replacement from %s available rows.", size, len(df))
-    return df.sample(n=size, replace=replace, random_state=seed).reset_index(drop=True)
+    # Pick a uniform random subset (same budget/distribution as the single-task
+    # RandomSampler), then restore the original row order so ordering is decided
+    # solely by the dataloader's TaskBalancedSampler at train time. This avoids a
+    # double shuffle (prep-time + dataloader) and mirrors the single-task path,
+    # which shuffles exactly once.
+    sampled = df.sample(n=size, replace=replace, random_state=seed)
+    return sampled.sort_index().reset_index(drop=True)
 
 
 def _dummy_task_dataframe(task_name: str, split: str, size: int) -> pd.DataFrame:
@@ -87,8 +93,20 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
             f"Search parquet not found: {path}. Run examples.data_preprocess.preprocess_search_r1_dataset first."
         )
 
-    sampled = _sample_dataframe(pd.read_parquet(path), size=size, seed=seed)
-    rows = [_process_search_row(row, split=split, idx=idx) for idx, (_, row) in enumerate(sampled.iterrows())]
+    full = pd.read_parquet(path)
+    if split == "test":
+        # Match the single-task search baseline: run_search_qwen3.sh validates with
+        # val_dataloader(shuffle=False), which consumes the first val_batch_size rows of
+        # test.parquet. Take the leading `size` rows deterministically so the multitask
+        # search validation is computed over the same fixed population (fair metric comparison).
+        if len(full) < size:
+            raise ValueError(f"search test parquet has {len(full)} rows but {size} were requested.")
+        selected = full.head(size).reset_index(drop=True)
+    else:
+        # Train: uniform random subset without replacement (same budget/distribution as the
+        # single-task RandomSampler). Ordering is left to the dataloader's TaskBalancedSampler.
+        selected = _sample_dataframe(full, size=size, seed=seed)
+    rows = [_process_search_row(row, split=split, idx=idx) for idx, (_, row) in enumerate(selected.iterrows())]
     return pd.DataFrame(rows)
 
 
