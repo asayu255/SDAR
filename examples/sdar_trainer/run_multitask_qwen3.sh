@@ -70,7 +70,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
@@ -85,7 +85,7 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
@@ -124,4 +124,4 @@ python3 -m verl.trainer.main_sdar \
     trainer.test_freq=150 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=300 \
-    trainer.val_before_train=True $@
+    trainer.val_before_train=False $@
