@@ -48,6 +48,8 @@ class SDARTaskRunner:
             config.actor_rollout_ref.actor.use_sdar_loss = True
             config.actor_rollout_ref.actor.sdar_loss_coef = sdar_cfg.get("sdar_coef", 0.1)
             config.actor_rollout_ref.actor.sdar_gate_beta = sdar_cfg.get("gate_beta", 5.0)
+            if sdar_cfg.get("kl_loss_coef_by_task", None) is not None:
+                config.actor_rollout_ref.actor.kl_loss_coef_by_task = sdar_cfg.get("kl_loss_coef_by_task")
 
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,

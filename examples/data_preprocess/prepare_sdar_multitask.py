@@ -19,7 +19,13 @@ def _sample_dataframe(df: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
     replace = len(df) < size
     if replace:
         logger.warning("Sampling %s rows with replacement from %s available rows.", size, len(df))
-    return df.sample(n=size, replace=replace, random_state=seed).reset_index(drop=True)
+    # Pick a uniform random subset (same budget/distribution as the single-task
+    # RandomSampler), then restore the original row order so ordering is decided
+    # solely by the dataloader's TaskBalancedSampler at train time. This avoids a
+    # double shuffle (prep-time + dataloader) and mirrors the single-task path,
+    # which shuffles exactly once.
+    sampled = df.sample(n=size, replace=replace, random_state=seed)
+    return sampled.sort_index().reset_index(drop=True)
 
 
 def _dummy_task_dataframe(task_name: str, split: str, size: int) -> pd.DataFrame:
@@ -87,20 +93,32 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
             f"Search parquet not found: {path}. Run examples.data_preprocess.preprocess_search_r1_dataset first."
         )
 
-    sampled = _sample_dataframe(pd.read_parquet(path), size=size, seed=seed)
-    rows = [_process_search_row(row, split=split, idx=idx) for idx, (_, row) in enumerate(sampled.iterrows())]
+    full = pd.read_parquet(path)
+    if split == "test":
+        # Match the single-task search baseline: run_search_qwen3.sh validates with
+        # val_dataloader(shuffle=False), which consumes the first val_batch_size rows of
+        # test.parquet. Take the leading `size` rows deterministically so the multitask
+        # search validation is computed over the same fixed population (fair metric comparison).
+        if len(full) < size:
+            raise ValueError(f"search test parquet has {len(full)} rows but {size} were requested.")
+        selected = full.head(size).reset_index(drop=True)
+    else:
+        # Train: uniform random subset without replacement (same budget/distribution as the
+        # single-task RandomSampler). Ordering is left to the dataloader's TaskBalancedSampler.
+        selected = _sample_dataframe(full, size=size, seed=seed)
+    rows = [_process_search_row(row, split=split, idx=idx) for idx, (_, row) in enumerate(selected.iterrows())]
     return pd.DataFrame(rows)
 
 
-def _build_split(search_dir: str, split: str, per_task_size: int, seed: int) -> pd.DataFrame:
+def _build_split(search_dir: str, split: str, per_task_size_by_task: dict[str, int], seed: int) -> pd.DataFrame:
     frames = [
-        _dummy_task_dataframe("alfworld", split, per_task_size),
-        _search_dataframe(search_dir, split, per_task_size, seed),
-        _dummy_task_dataframe("webshop", split, per_task_size),
+        _dummy_task_dataframe("alfworld", split, per_task_size_by_task["alfworld"]),
+        _search_dataframe(search_dir, split, per_task_size_by_task["search"], seed),
+        _dummy_task_dataframe("webshop", split, per_task_size_by_task["webshop"]),
     ]
     df = pd.concat(frames, ignore_index=True)
     counts = df["task_name"].value_counts().to_dict()
-    expected = {task: per_task_size for task in TASKS}
+    expected = {task: per_task_size_by_task[task] for task in TASKS}
     if counts != expected:
         raise RuntimeError(f"Unexpected multitask counts for {split}: got {counts}, expected {expected}")
     return df
@@ -110,11 +128,19 @@ def main():
     local_dir = os.path.expanduser(args.local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
-    train_per_task_size = args.total_training_steps * args.per_task_batch_size
-    split_sizes = {"train": train_per_task_size, "test": args.val_per_task_size}
+    search_train_size = args.total_training_steps * args.per_task_batch_size
+    env_train_size = args.env_train_per_task_size or args.per_task_batch_size
+    split_sizes = {
+        "train": {
+            "alfworld": env_train_size,
+            "search": search_train_size,
+            "webshop": env_train_size,
+        },
+        "test": {task: args.val_per_task_size for task in TASKS},
+    }
 
-    for split, per_task_size in split_sizes.items():
-        df = _build_split(args.search_dir, split, per_task_size, seed=args.seed)
+    for split, per_task_size_by_task in split_sizes.items():
+        df = _build_split(args.search_dir, split, per_task_size_by_task, seed=args.seed)
         output_path = os.path.join(local_dir, f"{split}.parquet")
         df.to_parquet(output_path, index=False)
         logger.info("Saved %s rows to %s with task counts %s", len(df), output_path, df["task_name"].value_counts().to_dict())
@@ -137,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--total_training_steps", default=150, type=int)
     parser.add_argument("--per_task_batch_size", default=16, type=int)
+    parser.add_argument("--env_train_per_task_size", default=None, type=int)
     parser.add_argument("--val_per_task_size", default=128, type=int)
     parser.add_argument("--seed", default=1, type=int)
     args = parser.parse_args()

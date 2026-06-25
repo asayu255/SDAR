@@ -75,3 +75,5 @@ python3 -m verl.trainer.main_sdar \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.val_before_train=False $@
+
+ #trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_search \

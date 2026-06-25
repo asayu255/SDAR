@@ -872,10 +872,20 @@ def _get_multitask_per_task_batch_size(config, tasks: List[str], is_train: bool)
     return int(per_task_batch_size)
 
 
-def _copy_config_for_task(config, env_name: str, max_steps: int):
+def _get_multitask_task_history_length(config, task: str):
+    multitask_cfg = config.env.get("multitask", {})
+    configured = _plain_container(multitask_cfg.get("history_length", {}))
+    if isinstance(configured, dict) and task in configured:
+        return int(configured[task])
+    return config.env.history_length
+
+
+def _copy_config_for_task(config, env_name: str, max_steps: int, task: str = None):
     task_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     task_config.env.env_name = env_name
     task_config.env.max_steps = max_steps
+    if task is not None:
+        task_config.env.history_length = _get_multitask_task_history_length(config, task)
     return task_config
 
 
@@ -888,7 +898,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
 
             alf_config_path = os.path.join(os.path.dirname(__file__), "env_package/alfworld/configs/config_tw.yaml")
             env_kwargs = {"eval_dataset": config.env.alfworld.eval_dataset}
-            task_config = _copy_config_for_task(config, "alfworld/AlfredTWEnv", task_max_steps[task])
+            task_config = _copy_config_for_task(config, "alfworld/AlfredTWEnv", task_max_steps[task], task=task)
             _envs = build_alfworld_envs(
                 alf_config_path,
                 seed,
@@ -902,7 +912,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
         elif task == "search":
             from agent_system.environments.env_package.search import build_search_envs, search_projection
 
-            task_config = _copy_config_for_task(config, "search", task_max_steps[task])
+            task_config = _copy_config_for_task(config, "search", task_max_steps[task], task=task)
             _envs = build_search_envs(
                 seed=seed,
                 env_num=per_task_batch_size,
@@ -927,7 +937,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
                 "file_path": file_path,
                 "attr_path": attr_path,
             }
-            task_config = _copy_config_for_task(config, "Webshop", task_max_steps[task])
+            task_config = _copy_config_for_task(config, "Webshop", task_max_steps[task], task=task)
             _envs = build_webshop_envs(
                 seed=seed,
                 env_num=per_task_batch_size,

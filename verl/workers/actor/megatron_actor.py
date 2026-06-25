@@ -38,7 +38,7 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.debug.profile import Profiler
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
@@ -269,6 +269,8 @@ class MegatronPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            if "kl_loss_coef" in data.batch:
+                select_keys.append("kl_loss_coef")
         data = data.select(batch_keys=select_keys)
         return data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
@@ -373,10 +375,20 @@ class MegatronPPOActor(BasePPOActor):
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
-
-                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    kl_loss_coef = data.get("kl_loss_coef", None)
+                    if kl_loss_coef is None:
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                    else:
+                        weighted_kl_loss = agg_loss_with_sample_weights(
+                            loss_mat=kld,
+                            loss_mask=response_mask,
+                            sample_weights=kl_loss_coef,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                        policy_loss = policy_loss + weighted_kl_loss
+                        metrics["actor/kl_coef"] = kl_loss_coef.float().mean().detach().item()
                     metrics["actor/kl_loss"] = kl_loss.detach().item()
-                    metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                 # return loss and stats
                 stats.update(

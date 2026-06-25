@@ -720,6 +720,63 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    @staticmethod
+    def _normalize_task_name(task_name):
+        if task_name is None:
+            return None
+        task_name = str(task_name).lower()
+        if "alfworld" in task_name:
+            return "alfworld"
+        if "webshop" in task_name:
+            return "webshop"
+        if "search" in task_name:
+            return "search"
+        return task_name
+
+    def _validation_task_name(self, batch: DataProto):
+        task_names = batch.non_tensor_batch.get("task_name", None)
+        if task_names is None:
+            env_kwargs = batch.non_tensor_batch.get("env_kwargs", None)
+            if env_kwargs is not None:
+                task_names = [
+                    item.get("task_name") if isinstance(item, dict) else None
+                    for item in env_kwargs
+                ]
+        if task_names is None:
+            return None
+
+        normalized = {self._normalize_task_name(task_name) for task_name in task_names}
+        normalized.discard(None)
+        if len(normalized) > 1:
+            raise ValueError(
+                "Task-specific validation kwargs require single-task validation batches, "
+                f"got mixed tasks: {sorted(normalized)}"
+            )
+        return next(iter(normalized), None)
+
+    def _validation_kwargs_for_batch(self, batch: DataProto):
+        val_kwargs = self.config.actor_rollout_ref.rollout.val_kwargs
+        kwargs = {
+            "do_sample": val_kwargs.do_sample,
+            "temperature": val_kwargs.temperature,
+        }
+
+        by_task = self.config.actor_rollout_ref.rollout.get("val_kwargs_by_task", None)
+        if not by_task:
+            return kwargs
+        if OmegaConf.is_config(by_task):
+            by_task = OmegaConf.to_container(by_task, resolve=True)
+
+        task_name = self._validation_task_name(batch)
+        if task_name is None:
+            return kwargs
+        task_kwargs = by_task.get(task_name, {})
+        if "do_sample" in task_kwargs:
+            kwargs["do_sample"] = bool(task_kwargs["do_sample"])
+        if "temperature" in task_kwargs:
+            kwargs["temperature"] = float(task_kwargs["temperature"])
+        return kwargs
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -769,9 +826,9 @@ class RayPPOTrainer:
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
+            test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # # pad to be divisible by dp_size

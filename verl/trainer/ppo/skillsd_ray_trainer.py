@@ -61,6 +61,47 @@ class SkillSDRayTrainer(RLSDRayTrainer):
             return 0.0
         return self.sdl_lambda * (1.0 - step / self.sdl_warmdown_steps)
 
+    @staticmethod
+    def _normalize_task_name(task_name):
+        if task_name is None:
+            return None
+        task_name = str(task_name).lower()
+        if "alfworld" in task_name:
+            return "alfworld"
+        if "webshop" in task_name:
+            return "webshop"
+        if "search" in task_name:
+            return "search"
+        return task_name
+
+    def _task_kl_loss_coef_tensor(self, batch: DataProto):
+        from omegaconf import OmegaConf
+
+        coef_by_task = self.config.actor_rollout_ref.actor.get("kl_loss_coef_by_task", None)
+        if not coef_by_task:
+            return None
+        if OmegaConf.is_config(coef_by_task):
+            coef_by_task = OmegaConf.to_container(coef_by_task, resolve=True)
+
+        fallback = float(self.config.actor_rollout_ref.actor.kl_loss_coef)
+        task_names = batch.non_tensor_batch.get("task_name", None)
+        if task_names is None:
+            env_kwargs = batch.non_tensor_batch.get("env_kwargs", None)
+            if env_kwargs is not None:
+                task_names = [
+                    item.get("task_name") if isinstance(item, dict) else None
+                    for item in env_kwargs
+                ]
+
+        if task_names is None:
+            return torch.full((len(batch),), fallback, dtype=torch.float32)
+
+        coefs = []
+        for task_name in task_names:
+            task = self._normalize_task_name(task_name)
+            coefs.append(float(coef_by_task.get(task, fallback)))
+        return torch.tensor(coefs, dtype=torch.float32)
+
     def fit(self):
         """
         The training loop of SkillSD. Identical to RLSD except:
@@ -289,6 +330,9 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            kl_loss_coef = self._task_kl_loss_coef_tensor(batch)
+                            if kl_loss_coef is not None:
+                                batch.batch["kl_loss_coef"] = kl_loss_coef
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

@@ -238,6 +238,7 @@ class TaskBalancedSampler:
         self.per_task_batch_size = int(cfg.get("per_task_batch_size", 0))
         if self.per_task_batch_size <= 0:
             raise ValueError("data.task_balance.per_task_batch_size must be a positive integer.")
+        requested_num_batches = cfg.get("num_batches", None)
 
         expected_batch_size = self.per_task_batch_size * len(self.tasks)
         if int(batch_size) != expected_batch_size:
@@ -255,7 +256,10 @@ class TaskBalancedSampler:
         if missing:
             raise ValueError(f"Not enough samples to build one balanced batch for tasks: {missing}")
 
-        self.num_batches = min(len(indices) // self.per_task_batch_size for indices in self.task_to_indices.values())
+        available_batches = min(len(indices) // self.per_task_batch_size for indices in self.task_to_indices.values())
+        self.num_batches = int(requested_num_batches) if requested_num_batches is not None else available_batches
+        if self.num_batches <= 0:
+            raise ValueError("data.task_balance.num_batches must be a positive integer when configured.")
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self._epoch = 0
@@ -264,6 +268,16 @@ class TaskBalancedSampler:
         # data-parallel split of the generation batch is task-balanced.
         self._interleave = os.environ.get("TASK_BALANCE_INTERLEAVE", "0").strip().lower() in ("1", "true", "yes", "on")
 
+    def _indices_for_required_size(self, indices, required: int, rng):
+        indices = list(indices)
+        output = []
+        while len(output) < required:
+            epoch_indices = list(indices)
+            if self.shuffle:
+                rng.shuffle(epoch_indices)
+            output.extend(epoch_indices)
+        return output[:required]
+
     def __iter__(self):
         rng = self._np.random.RandomState(self.seed + self._epoch)
         self._epoch += 1
@@ -271,10 +285,7 @@ class TaskBalancedSampler:
         task_indices = {}
         required = self.num_batches * self.per_task_batch_size
         for task, indices in self.task_to_indices.items():
-            indices = list(indices)
-            if self.shuffle:
-                rng.shuffle(indices)
-            task_indices[task] = indices[:required]
+            task_indices[task] = self._indices_for_required_size(indices, required, rng)
 
         for batch_idx in range(self.num_batches):
             start = batch_idx * self.per_task_batch_size

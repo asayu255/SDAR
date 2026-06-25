@@ -428,6 +428,32 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
+def agg_loss_with_sample_weights(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+    loss_agg_mode: str,
+):
+    """Aggregate loss with one scalar weight per sample."""
+    weights = sample_weights.to(device=loss_mat.device, dtype=loss_mat.dtype).view(-1)
+    token_weights = weights.view(-1, 1)
+    if loss_agg_mode == "token-mean":
+        loss = torch.sum(loss_mat * loss_mask * token_weights) / torch.sum(loss_mask)
+    elif loss_agg_mode == "seq-mean-token-sum":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        loss = torch.mean(seq_losses * weights)
+    elif loss_agg_mode == "seq-mean-token-mean":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)
+        loss = torch.mean(seq_losses * weights)
+    elif loss_agg_mode == "seq-mean-token-sum-norm":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        loss = torch.sum(seq_losses * weights) / loss_mask.shape[-1]
+    else:
+        raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+    return loss
+
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,

@@ -34,6 +34,15 @@ from verl.utils.model import compute_position_id_with_mask
 logger = logging.getLogger(__name__)
 
 
+def _left_pad_tensor(tensor: torch.Tensor, target_len: int, pad_value) -> torch.Tensor:
+    pad_len = target_len - tensor.shape[-1]
+    if pad_len <= 0:
+        return tensor
+    pad_shape = (*tensor.shape[:-1], pad_len)
+    pad = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((pad, tensor), dim=-1)
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -56,7 +65,18 @@ def collate_fn(data_list: list[dict]) -> dict:
             else:
                 non_tensors[key].append(val)
 
+    pad_token_ids = [data.get("pad_token_id", 0) if data.get("pad_token_id", 0) is not None else 0 for data in data_list]
     for key, val in tensors.items():
+        if key in {"input_ids", "attention_mask", "position_ids"} and len({tensor.shape[-1] for tensor in val}) > 1:
+            max_len = max(tensor.shape[-1] for tensor in val)
+            padded = []
+            for tensor, pad_token_id in zip(val, pad_token_ids):
+                if key == "input_ids":
+                    pad_value = int(pad_token_id)
+                else:
+                    pad_value = 0
+                padded.append(_left_pad_tensor(tensor, max_len, pad_value))
+            val = padded
         tensors[key] = torch.stack(val, dim=0)
 
     for key, val in non_tensors.items():
@@ -103,6 +123,7 @@ class RLHFDataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.task_overrides = self._normalize_task_overrides(config.get("task_overrides", {}))
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -117,6 +138,52 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
+
+    @staticmethod
+    def _normalize_task_name(task_name):
+        if task_name is None:
+            return None
+        task_name = str(task_name).lower()
+        if "alfworld" in task_name:
+            return "alfworld"
+        if "webshop" in task_name:
+            return "webshop"
+        if "search" in task_name:
+            return "search"
+        return task_name
+
+    @staticmethod
+    def _normalize_task_overrides(task_overrides):
+        from omegaconf import OmegaConf
+
+        if task_overrides is None:
+            return {}
+        if OmegaConf.is_config(task_overrides):
+            task_overrides = OmegaConf.to_container(task_overrides, resolve=True)
+        return dict(task_overrides)
+
+    def _task_name_from_example(self, example: dict):
+        task_name = example.get("task_name")
+        if task_name is None:
+            env_kwargs = example.get("env_kwargs")
+            if isinstance(env_kwargs, dict):
+                task_name = env_kwargs.get("task_name")
+        return self._normalize_task_name(task_name)
+
+    def _task_config_value(self, example: dict, key: str, default):
+        task_name = self._task_name_from_example(example)
+        if task_name is None:
+            return default
+        task_cfg = self.task_overrides.get(task_name, {})
+        if not isinstance(task_cfg, dict):
+            return default
+        return task_cfg.get(key, default)
+
+    def _max_prompt_length_for_example(self, example: dict):
+        return int(self._task_config_value(example, "max_prompt_length", self.max_prompt_length))
+
+    def _truncation_for_example(self, example: dict):
+        return self._task_config_value(example, "truncation", self.truncation)
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -140,9 +207,9 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self._max_prompt_length_for_example(doc),
                 num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                desc=f"Filtering prompts longer than configured max_prompt_length tokens",
             )
 
             print(f"filter dataset len: {len(self.dataframe)}")
@@ -183,6 +250,8 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
+        max_prompt_length = self._max_prompt_length_for_example(row_dict)
+        truncation = self._truncation_for_example(row_dict)
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
@@ -226,10 +295,10 @@ class RLHFDataset(Dataset):
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_length=self.max_prompt_length,
+            max_length=max_prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
-            truncation=self.truncation,
+            truncation=truncation,
         )
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
@@ -259,19 +328,20 @@ class RLHFDataset(Dataset):
         row_dict["position_ids"] = position_ids[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
-            if self.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
-            elif self.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
-            elif self.truncation == "middle":
-                left_half = self.max_prompt_length // 2
-                right_half = self.max_prompt_length - left_half
+        if len(raw_prompt_ids) > max_prompt_length:
+            if truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-max_prompt_length :]
+            elif truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: max_prompt_length]
+            elif truncation == "middle":
+                left_half = max_prompt_length // 2
+                right_half = max_prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-            elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+            elif truncation == "error":
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
+        row_dict["pad_token_id"] = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         # encode prompts without chat template
         if self.return_raw_chat:
             row_dict["raw_prompt"] = messages

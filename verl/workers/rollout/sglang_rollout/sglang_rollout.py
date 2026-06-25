@@ -535,7 +535,7 @@ class SGLangRollout(BaseRollout):
             kwargs = dict(
                 top_k=self.config.val_kwargs.top_k,
                 top_p=self.config.val_kwargs.top_p,
-                temperature=self.config.val_kwargs.temperature,
+                temperature=prompts.meta_info.get("temperature", self.config.val_kwargs.temperature),
                 n=1,  # if validate, already repeat in ray_trainer
             )
 
@@ -773,7 +773,7 @@ class SGLangRollout(BaseRollout):
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
+                "temperature": kwargs.get("temperature", self.config.val_kwargs.temperature),
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
         kwargs["max_new_tokens"] = max_new_tokens
@@ -813,6 +813,8 @@ class SGLangRollout(BaseRollout):
         # Async rollout with tools support
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        if is_validate and "temperature" in prompts.meta_info:
+            kwargs = {**kwargs, "temperature": prompts.meta_info["temperature"]}
         tgt_device = prompts.batch["input_ids"].device
         if self._tp_rank == 0:
             req_list = self._preprocess_prompt_to_async_rollout_requests(

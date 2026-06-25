@@ -74,6 +74,6 @@ python3 -m verl.trainer.main_sdar \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.save_freq=25 \
-    trainer.test_freq=5 \
+    trainer.test_freq=50 \
     trainer.total_epochs=300 \
     trainer.val_before_train=True $@
