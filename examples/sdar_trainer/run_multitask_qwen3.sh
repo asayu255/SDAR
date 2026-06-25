@@ -25,6 +25,31 @@ total_training_steps=300
 seed=1
 model_path="Qwen/Qwen3-1.7B"
 
+# --- Throughput knobs (opt-in; defaults preserve the fair-comparison alignment) -
+# The 3-task speedup mechanisms live in code (async rollout / TASK_BALANCE_INTERLEAVE
+# / prefix caching) and are active independently of this script. These knobs expose
+# the throughput-mode toggles that the old no_preprocess run used. Defaults below
+# reproduce this script's accuracy-aligned behavior exactly; override via env to
+# trade bit-identity for throughput. Accuracy notes:
+#   PARAM_OFFLOAD=True          -> bit-identical (FSDP placement only)
+#   OPTIMIZER_OFFLOAD=True      -> same algorithm, not bit-identical (Adam CPU<->GPU)
+#   *_MICRO_PER_GPU larger      -> same algorithm, not bit-identical (grad-accum grouping)
+#   USE_FUSED_KERNELS=True      -> not bit-identical (fused kernel path)
+#   ENABLE_CHUNKED_PREFILL=True -> not bit-identical (prefill scheduling)
+# max_model_len defaults to prompt(4096)+response(512)=4608: it bounds the vLLM KV
+# cache to exactly what is needed and truncates no valid sequence, so it is a pure
+# speedup and is on by default. prefix caching is already the code default (output
+# -safe deterministic reuse) and is kept on.
+param_offload=${PARAM_OFFLOAD:-False}
+optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
+ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-10}
+log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
+use_fused_kernels=${USE_FUSED_KERNELS:-False}
+enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
+enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
+max_model_len=${MAX_MODEL_LEN:-4608}
+# -----------------------------------------------------------------------------
+
 # --- Fair-comparison alignment with the single-task baselines -----------------
 # This is a joint multitask run (one shared model/optimizer over alfworld+search+
 # webshop); per-task metrics will NOT reproduce single-task values because every
@@ -89,21 +114,23 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=False \
+    actor_rollout_ref.model.use_fused_kernels=$use_fused_kernels \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_per_gpu \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$param_offload \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$optimizer_offload \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
+    actor_rollout_ref.rollout.max_model_len=$max_model_len \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.enable_chunked_prefill=$enable_chunked_prefill \
+    +actor_rollout_ref.rollout.enable_prefix_caching=$enable_prefix_caching \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
@@ -112,7 +139,7 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
