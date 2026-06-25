@@ -32,6 +32,7 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --local_dir "$HOME/data/verl-agent/sdar_multitask" \
     --total_training_steps "$total_training_steps" \
     --per_task_batch_size "$per_task_batch_size" \
+    --env_train_per_task_size "$per_task_batch_size" \
     --val_per_task_size "$val_per_task_size"
 
 python3 -m verl.trainer.main_sdar \
@@ -47,6 +48,7 @@ python3 -m verl.trainer.main_sdar \
     data.return_raw_chat=True \
     data.task_balance.enable=True \
     data.task_balance.per_task_batch_size=$per_task_batch_size \
+    data.task_balance.num_batches=$total_training_steps \
     data.task_balance.tasks=[alfworld,search,webshop] \
     +data.task_overrides.alfworld.max_prompt_length=2048 \
     +data.task_overrides.alfworld.truncation='error' \

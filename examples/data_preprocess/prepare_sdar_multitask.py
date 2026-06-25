@@ -92,15 +92,15 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
     return pd.DataFrame(rows)
 
 
-def _build_split(search_dir: str, split: str, per_task_size: int, seed: int) -> pd.DataFrame:
+def _build_split(search_dir: str, split: str, per_task_size_by_task: dict[str, int], seed: int) -> pd.DataFrame:
     frames = [
-        _dummy_task_dataframe("alfworld", split, per_task_size),
-        _search_dataframe(search_dir, split, per_task_size, seed),
-        _dummy_task_dataframe("webshop", split, per_task_size),
+        _dummy_task_dataframe("alfworld", split, per_task_size_by_task["alfworld"]),
+        _search_dataframe(search_dir, split, per_task_size_by_task["search"], seed),
+        _dummy_task_dataframe("webshop", split, per_task_size_by_task["webshop"]),
     ]
     df = pd.concat(frames, ignore_index=True)
     counts = df["task_name"].value_counts().to_dict()
-    expected = {task: per_task_size for task in TASKS}
+    expected = {task: per_task_size_by_task[task] for task in TASKS}
     if counts != expected:
         raise RuntimeError(f"Unexpected multitask counts for {split}: got {counts}, expected {expected}")
     return df
@@ -110,11 +110,19 @@ def main():
     local_dir = os.path.expanduser(args.local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
-    train_per_task_size = args.total_training_steps * args.per_task_batch_size
-    split_sizes = {"train": train_per_task_size, "test": args.val_per_task_size}
+    search_train_size = args.total_training_steps * args.per_task_batch_size
+    env_train_size = args.env_train_per_task_size or args.per_task_batch_size
+    split_sizes = {
+        "train": {
+            "alfworld": env_train_size,
+            "search": search_train_size,
+            "webshop": env_train_size,
+        },
+        "test": {task: args.val_per_task_size for task in TASKS},
+    }
 
-    for split, per_task_size in split_sizes.items():
-        df = _build_split(args.search_dir, split, per_task_size, seed=args.seed)
+    for split, per_task_size_by_task in split_sizes.items():
+        df = _build_split(args.search_dir, split, per_task_size_by_task, seed=args.seed)
         output_path = os.path.join(local_dir, f"{split}.parquet")
         df.to_parquet(output_path, index=False)
         logger.info("Saved %s rows to %s with task counts %s", len(df), output_path, df["task_name"].value_counts().to_dict())
@@ -137,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--total_training_steps", default=150, type=int)
     parser.add_argument("--per_task_batch_size", default=16, type=int)
+    parser.add_argument("--env_train_per_task_size", default=None, type=int)
     parser.add_argument("--val_per_task_size", default=128, type=int)
     parser.add_argument("--seed", default=1, type=int)
     args = parser.parse_args()
