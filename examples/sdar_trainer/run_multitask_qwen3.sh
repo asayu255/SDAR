@@ -9,15 +9,15 @@ sdar_coef=0.01
 gate_beta=5.0
 skill_all=false
 
-per_task_batch_size=16
-train_data_size=48
-val_per_task_size=128
+per_task_batch_size=15
+train_data_size=45
+val_per_task_size=126
 # val_data_size == val_per_task_size: the task-sorted test parquet then yields one
 # single-task batch per task, so each task is validated in its own rollout pass
 # (no mixed-task validation batch).
-val_data_size=$val_per_task_size
+val_data_size=378
 group_size=8
-total_training_steps=150
+total_training_steps=300
 model_path="Qwen/Qwen3-1.7B"
 experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 
@@ -55,8 +55,8 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=True \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-    actor_rollout_ref.actor.ppo_mini_batch_size=240 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=60 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -102,8 +102,8 @@ python3 -m verl.trainer.main_sdar \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=5 \
+    trainer.save_freq=25 \
+    trainer.test_freq=150 \
     trainer.total_training_steps=$total_training_steps \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=300 \
     trainer.val_before_train=True $@
