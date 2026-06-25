@@ -15,7 +15,7 @@ val_per_task_size=126
 # val_data_size == val_per_task_size: the task-sorted test parquet then yields one
 # single-task batch per task, so each task is validated in its own rollout pass
 # (no mixed-task validation batch).
-val_data_size=378
+val_data_size=$val_per_task_size
 group_size=8
 total_training_steps=300
 model_path="Qwen/Qwen3-1.7B"
@@ -48,6 +48,12 @@ python3 -m verl.trainer.main_sdar \
     data.task_balance.enable=True \
     data.task_balance.per_task_batch_size=$per_task_batch_size \
     data.task_balance.tasks=[alfworld,search,webshop] \
+    +data.task_overrides.alfworld.max_prompt_length=2048 \
+    +data.task_overrides.alfworld.truncation='error' \
+    +data.task_overrides.search.max_prompt_length=4096 \
+    +data.task_overrides.search.truncation='left' \
+    +data.task_overrides.webshop.max_prompt_length=4096 \
+    +data.task_overrides.webshop.truncation='error' \
     +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -70,6 +76,12 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample=True \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature=0 \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
+    +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
@@ -82,6 +94,7 @@ python3 -m verl.trainer.main_sdar \
     +algorithm.sdar.skills_dirs.alfworld=skills/alfworld \
     +algorithm.sdar.skills_dirs.search=skills/search \
     +algorithm.sdar.skills_dirs.webshop=skills/webshop \
+    +algorithm.sdar.kl_loss_coef_by_task='{alfworld:0.01,search:0.001,webshop:0.01}' \
     +algorithm.sdar.skill_all=$skill_all \
     env.env_name=multitask \
     env.seed=0 \
@@ -93,6 +106,9 @@ python3 -m verl.trainer.main_sdar \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
     env.multitask.max_steps.webshop=15 \
+    +env.multitask.history_length.alfworld=2 \
+    +env.multitask.history_length.search=4 \
+    +env.multitask.history_length.webshop=2 \
     env.multitask.val_per_task_batch_size=$val_per_task_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \

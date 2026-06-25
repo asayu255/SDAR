@@ -29,7 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -326,6 +326,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            if "kl_loss_coef" in data.batch:
+                select_keys.append("kl_loss_coef")
         if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False):
             select_keys.append("teacher_log_probs")
         batch = data.select(batch_keys=select_keys).batch
@@ -423,10 +425,20 @@ class DataParallelPPOActor(BasePPOActor):
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        kl_loss_coef = data.get("kl_loss_coef", None)
+                        if kl_loss_coef is None:
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        else:
+                            weighted_kl_loss = agg_loss_with_sample_weights(
+                                loss_mat=kld,
+                                loss_mask=response_mask,
+                                sample_weights=kl_loss_coef,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            policy_loss = policy_loss + weighted_kl_loss
+                            metrics["actor/kl_coef"] = kl_loss_coef.float().mean().detach().item()
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.get("use_sdl_loss", False):
                         from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
