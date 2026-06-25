@@ -13,7 +13,7 @@ experiment_name="sdar_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${ski
 
 train_data_size=15
 val_data_size=126
-group_size=32
+group_size=8
 
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
@@ -35,7 +35,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -73,7 +73,7 @@ python3 -m verl.trainer.main_sdar \
     trainer.nnodes=1 \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
-    trainer.total_training_steps=300 \
+    trainer.total_training_steps=450 \
     trainer.val_before_train=False $@
 
  #trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_search \
