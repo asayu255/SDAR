@@ -66,6 +66,10 @@ actor_rollout_ref:
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
+    pg_loss_coef: 1.0 # scale of the policy-gradient loss; set 0 for pure distillation (OPD)
+    use_teacher_kl_loss: False # OPD: distill from a per-task teacher via KL on on-policy responses
+    teacher_kl_loss_coef: 1.0 # OPD: weight of the teacher KL term
+    teacher_kl_loss_type: low_var_kl # OPD: KL estimator (low_var_kl / kl / abs / mse)
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size

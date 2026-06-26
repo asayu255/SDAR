@@ -321,14 +321,22 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        pg_loss_coef = self.config.get("pg_loss_coef", 1.0)
+        use_teacher_kl_loss = self.config.get("use_teacher_kl_loss", False)
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        # advantages / old_log_probs are only needed by the policy-gradient (and SDL) paths.
+        # Pure teacher-KL distillation (pg_loss_coef==0) does not produce them, so don't require them.
+        if pg_loss_coef != 0:
+            select_keys += ["old_log_probs", "advantages"]
+        elif self.config.get("use_sdl_loss", False):
+            select_keys.append("old_log_probs")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
             if "kl_loss_coef" in data.batch:
                 select_keys.append("kl_loss_coef")
-        if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False):
+        if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or use_teacher_kl_loss:
             select_keys.append("teacher_log_probs")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -375,9 +383,6 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
@@ -399,19 +404,26 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                    if pg_loss_coef != 0:
+                        old_log_prob = data["old_log_probs"]
+                        advantages = data["advantages"]
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                    else:
+                        # Pure teacher-KL distillation: no policy-gradient signal.
+                        old_log_prob = data.get("old_log_probs", None)
+                        zero = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+                        pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
 
-                    pg_loss_coef = self.config.get("pg_loss_coef", 1.0)
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -470,6 +482,21 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics.update(sdar_metrics)
                         metrics["sdar/coef"] = sdar_coef
 
+                    if use_teacher_kl_loss:
+                        # On-policy distillation: KL between student and a (per-task) teacher,
+                        # evaluated on the student's own on-policy responses. Only the student
+                        # log-probs carry gradients; teacher_log_probs are detached upstream.
+                        teacher_log_probs = data["teacher_log_probs"]
+                        teacher_kld = kl_penalty(
+                            logprob=log_prob,
+                            ref_logprob=teacher_log_probs,
+                            kl_penalty=self.config.get("teacher_kl_loss_type", "low_var_kl"),
+                        )
+                        teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
+                        policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                        metrics["actor/teacher_kl_loss"] = teacher_kl_loss.detach().item()
+                        metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
