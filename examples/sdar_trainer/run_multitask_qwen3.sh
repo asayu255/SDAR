@@ -42,7 +42,7 @@ model_path="Qwen/Qwen3-1.7B"
 # -safe deterministic reuse) and is kept on.
 param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
-ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-10}
+ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
@@ -101,7 +101,7 @@ python3 -m verl.trainer.main_sdar \
     data.return_raw_chat=True \
     data.task_balance.enable=True \
     data.task_balance.per_task_batch_size=$per_task_batch_size \
-    data.task_balance.num_batches=$total_training_steps \
+    +data.task_balance.num_batches=$total_training_steps \
     data.task_balance.tasks=[alfworld,search,webshop] \
     +data.task_overrides.alfworld.max_prompt_length=2048 \
     +data.task_overrides.alfworld.truncation='error' \
@@ -175,6 +175,7 @@ python3 -m verl.trainer.main_sdar \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
+    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=$total_training_steps \
