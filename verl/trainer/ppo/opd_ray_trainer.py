@@ -23,6 +23,7 @@ from omegaconf import open_dict
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.protocol import DataProtoConfig
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import (
@@ -214,6 +215,13 @@ class OPDRayTrainer(RayPPOTrainer):
             if not idxs:
                 continue
             sub = batch.select_idxs(idxs)
+            # Task slices are not generally divisible by the teacher group's world
+            # size, so enable auto-padding: the DP_COMPUTE_PROTO dispatch then pads
+            # the input to a multiple of world_size and unpads the output back to
+            # len(idxs). Copy meta_info first so we don't mutate the parent batch
+            # (select_idxs shares the parent's meta_info dict by reference).
+            sub.meta_info = dict(sub.meta_info)
+            sub.meta_info[DataProtoConfig.auto_padding_key] = True
             out = wg.compute_ref_log_prob(sub)
             lp = out.batch["ref_log_prob"]
             for j, i in enumerate(idxs):
