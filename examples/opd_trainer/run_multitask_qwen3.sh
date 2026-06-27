@@ -7,9 +7,9 @@ num_cpus_per_env_worker=0.1
 # OPD (On-Policy Distillation) hyperparameters
 # Per-task single-task RL teacher checkpoints. Each sample is distilled from the
 # teacher matching its task_name. Override via env vars.
-teacher_alfworld=${TEACHER_ALFWORLD:-/path/to/alfworld_rl_teacher}
-teacher_search=${TEACHER_SEARCH:-/path/to/search_rl_teacher}
-teacher_webshop=${TEACHER_WEBSHOP:-/path/to/webshop_rl_teacher}
+teacher_alfworld=${TEACHER_ALFWORLD:-/opt/home/ohara/checkpoints/teachers/alfworld_step300}
+teacher_search=${TEACHER_SEARCH:-/opt/home/ohara/checkpoints/teachers/search_step300}
+teacher_webshop=${TEACHER_WEBSHOP:-/opt/home/ohara/checkpoints/teachers/webshop_step300}
 opd_kl_loss_coef=${OPD_KL_LOSS_COEF:-1.0}
 opd_kl_loss_type=${OPD_KL_LOSS_TYPE:-low_var_kl}
 
