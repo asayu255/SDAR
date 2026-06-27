@@ -329,6 +329,11 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch.batch["teacher_log_probs"] = teacher_log_probs
 
                     with _timer("update_actor", timing_raw):
+                        # update_policy scales the student logits by this temperature to
+                        # match the rollout sampling distribution. The standard loop gets
+                        # it from compute_log_prob; the thin OPD loop skips that step, so
+                        # set it explicitly (same value compute_log_prob would set).
+                        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
