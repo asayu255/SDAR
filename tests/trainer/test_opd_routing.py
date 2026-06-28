@@ -18,7 +18,7 @@ torch = pytest.importorskip("torch")
 
 try:
     from verl import DataProto
-    from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+    from verl.trainer.ppo.core_algos import agg_loss, kl_penalty, topk_kl_per_token
 except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
 
@@ -144,3 +144,41 @@ def test_pure_distillation_loss_equals_teacher_kl():
     policy_loss = policy_loss + tkl * teacher_kl_coef
 
     assert policy_loss.item() == pytest.approx(tkl.item())
+
+
+# --------------------------------------------------------------------------- #
+# Dense top-k (+tail) reverse-KL math
+# --------------------------------------------------------------------------- #
+def _logsoftmax_at(logits, ids):
+    lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+    return logits.gather(-1, ids) - lse
+
+
+def test_topk_kl_zero_for_identical_distributions():
+    torch.manual_seed(0)
+    bs, resp, V, k = 2, 3, 50, 8
+    logits = torch.randn(bs, resp, V)
+    vals, ids = torch.topk(logits, k, dim=-1)
+    lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+    topk_lp = vals - lse  # same teacher & student distribution
+    kl = topk_kl_per_token(topk_lp.clone(), topk_lp.clone())
+    assert torch.allclose(kl, torch.zeros_like(kl), atol=1e-5)
+
+
+def test_topk_kl_nonnegative_and_student_only_gradient():
+    torch.manual_seed(1)
+    bs, resp, V, k = 2, 4, 60, 10
+    s_logits = torch.randn(bs, resp, V, requires_grad=True)
+    t_logits = torch.randn(bs, resp, V)
+
+    # Teacher's top-k support; student log-probs gathered at the SAME ids.
+    _, t_ids = torch.topk(t_logits, k, dim=-1)
+    teacher_topk = _logsoftmax_at(t_logits, t_ids)  # leaf, no grad
+    student_topk = _logsoftmax_at(s_logits, t_ids)  # carries grad
+
+    kl = topk_kl_per_token(student_topk, teacher_topk)
+    assert torch.all(kl >= -1e-5)  # reverse KL >= 0 up to tail approximation
+
+    kl.sum().backward()
+    assert s_logits.grad is not None
+    assert t_logits.grad is None  # teacher provides no gradient

@@ -11,7 +11,10 @@ teacher_alfworld=${TEACHER_ALFWORLD:-/opt/home/ohara/checkpoints/teachers/alfwor
 teacher_search=${TEACHER_SEARCH:-/opt/home/ohara/checkpoints/teachers/search_step300}
 teacher_webshop=${TEACHER_WEBSHOP:-/opt/home/ohara/checkpoints/teachers/webshop_step300}
 opd_kl_loss_coef=${OPD_KL_LOSS_COEF:-1.0}
+# KL form: single-token estimator (low_var_kl / kl / mse / abs) or dense
+# top-k+tail reverse KL (topk_kl). For top-20 set OPD_KL_LOSS_TYPE=topk_kl.
 opd_kl_loss_type=${OPD_KL_LOSS_TYPE:-low_var_kl}
+opd_topk=${OPD_TOPK:-20}  # support size for topk_kl
 
 per_task_batch_size=15
 train_data_size=45
@@ -120,6 +123,7 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.teacher_paths.webshop=$teacher_webshop \
     +algorithm.opd.kl_loss_coef=$opd_kl_loss_coef \
     +algorithm.opd.kl_loss_type=$opd_kl_loss_type \
+    +algorithm.opd.topk=$opd_topk \
     env.env_name=multitask \
     env.seed=0 \
     env.max_steps=50 \

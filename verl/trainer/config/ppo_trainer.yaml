@@ -69,7 +69,8 @@ actor_rollout_ref:
     pg_loss_coef: 1.0 # scale of the policy-gradient loss; set 0 for pure distillation (OPD)
     use_teacher_kl_loss: False # OPD: distill from a per-task teacher via KL on on-policy responses
     teacher_kl_loss_coef: 1.0 # OPD: weight of the teacher KL term
-    teacher_kl_loss_type: low_var_kl # OPD: KL estimator (low_var_kl / kl / abs / mse)
+    teacher_kl_loss_type: low_var_kl # OPD: KL form: single-token (low_var_kl / kl / abs / mse) or dense top-k (topk_kl)
+    teacher_kl_topk: 20 # OPD: support size for topk_kl (dense top-k + tail-bucket reverse KL)
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size

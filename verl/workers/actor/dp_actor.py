@@ -29,7 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -73,12 +73,22 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            topk_out: optional top-k output for distillation KL. None unless
+                topk_k or topk_ids is given. When ``topk_k`` is set (teacher mode):
+                a tuple (topk_logprob, topk_ids) each (bs, response_len, k), where
+                topk_logprob are full-vocab log-softmax values at the model's own
+                top-k ids. When ``topk_ids`` is given (student mode): a tensor
+                (bs, response_len, k) of this model's full-vocab log-softmax values
+                gathered at the provided ids (carries gradient).
         """
+        topk_out = None
+        if (topk_k is not None or topk_ids is not None) and self.use_fused_kernels:
+            raise NotImplementedError("top-k KL forward is not supported with fused kernels")
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch:
@@ -155,7 +165,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy:
+                    if calculate_entropy or topk_k is not None or topk_ids is not None:
+                        # top-k KL reads logits_rmpad after this call, so don't mutate it.
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -203,6 +214,31 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
+                # top-k distillation log-probs (teacher: own top-k; student: gather at given ids)
+                if topk_k is not None or topk_ids is not None:
+                    if self.use_fused_kernels or self.use_ulysses_sp:
+                        raise NotImplementedError("top-k KL forward is not supported with fused kernels or ulysses SP")
+                    lse = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)  # (total_nnz, 1)
+                    if topk_k is not None:
+                        tvals, tids = torch.topk(logits_rmpad, k=topk_k, dim=-1)  # (total_nnz, k)
+                        # Use float32 for pad_input: bf16 cannot represent vocab ids
+                        # (>256) exactly, and float32 keeps log-probs precise.
+                        t_lp_rmpad = (tvals - lse).float()
+                        full_t_lp = pad_input(t_lp_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+                        full_t_id = pad_input(tids.float(), indices=indices, batch=batch_size, seqlen=seqlen)
+                        topk_out = (
+                            full_t_lp[:, -response_length - 1 : -1, :],
+                            full_t_id[:, -response_length - 1 : -1, :].round().long(),
+                        )
+                    else:
+                        k = topk_ids.size(-1)
+                        full_ids = torch.zeros((batch_size, seqlen, k), dtype=torch.long, device=logits_rmpad.device)
+                        full_ids[:, -response_length - 1 : -1, :] = topk_ids
+                        ids_rmpad = index_first_axis(rearrange(full_ids, "b s k -> (b s) k"), indices)  # (total_nnz, k)
+                        s_lp_rmpad = (logits_rmpad.gather(-1, ids_rmpad) - lse).float()  # (total_nnz, k), keeps grad
+                        full_s_lp = pad_input(s_lp_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+                        topk_out = full_s_lp[:, -response_length - 1 : -1, :]
+
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
@@ -229,7 +265,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+                    if topk_k is not None or topk_ids is not None:
+                        lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (bsz, response_length, 1)
+                        if topk_k is not None:
+                            tvals, tids = torch.topk(logits, k=topk_k, dim=-1)
+                            topk_out = ((tvals - lse).float(), tids.long())
+                        else:
+                            topk_out = (logits.gather(-1, topk_ids) - lse).float()
+
+            return entropy, log_probs, topk_out
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -296,7 +340,7 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs, _ = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -314,6 +358,54 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_topk_log_prob(self, data: DataProto, topk_k: int):
+        """Teacher-side: per response token, the teacher's top-k token ids and the
+        teacher's full-vocab log-softmax values at those ids.
+
+        Returns:
+            topk_logprob: (bs, response_length, k)
+            topk_ids:     (bs, response_length, k) int64
+        """
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        batch = data.select(batch_keys=select_keys).batch
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        assert not has_multi_modal_inputs, "top-k KL is not supported for multi-modal inputs"
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        else:
+            micro_batches = batch.split(micro_batch_size)
+
+        topk_logprob_lst = []
+        topk_ids_lst = []
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                _, _, topk_out = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=False, topk_k=topk_k)
+            tlp, tids = topk_out
+            topk_logprob_lst.append(tlp)
+            topk_ids_lst.append(tids)
+
+        topk_logprob = torch.concat(topk_logprob_lst, dim=0)
+        topk_ids = torch.concat(topk_ids_lst, dim=0)
+        if use_dynamic_bsz:
+            indices = list(itertools.chain.from_iterable(indices))
+            assert len(indices) == topk_logprob.size(0), f"{len(indices)} vs. {topk_logprob.size()}"
+            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+            topk_logprob = topk_logprob[revert_indices]
+            topk_ids = topk_ids[revert_indices]
+
+        return topk_logprob, topk_ids
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -323,6 +415,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         pg_loss_coef = self.config.get("pg_loss_coef", 1.0)
         use_teacher_kl_loss = self.config.get("use_teacher_kl_loss", False)
+        teacher_kl_loss_type = self.config.get("teacher_kl_loss_type", "low_var_kl")
+        teacher_topk_kl = use_teacher_kl_loss and teacher_kl_loss_type == "topk_kl"
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         # advantages / old_log_probs are only needed by the policy-gradient (and SDL) paths.
         # Pure teacher-KL distillation (pg_loss_coef==0) does not produce them, so don't require them.
@@ -336,8 +430,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
             if "kl_loss_coef" in data.batch:
                 select_keys.append("kl_loss_coef")
-        if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or use_teacher_kl_loss:
+        if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or (use_teacher_kl_loss and not teacher_topk_kl):
             select_keys.append("teacher_log_probs")
+        if teacher_topk_kl:
+            select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -394,7 +490,8 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
+                    entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -485,13 +582,20 @@ class DataParallelPPOActor(BasePPOActor):
                     if use_teacher_kl_loss:
                         # On-policy distillation: KL between student and a (per-task) teacher,
                         # evaluated on the student's own on-policy responses. Only the student
-                        # log-probs carry gradients; teacher_log_probs are detached upstream.
-                        teacher_log_probs = data["teacher_log_probs"]
-                        teacher_kld = kl_penalty(
-                            logprob=log_prob,
-                            ref_logprob=teacher_log_probs,
-                            kl_penalty=self.config.get("teacher_kl_loss_type", "low_var_kl"),
-                        )
+                        # log-probs carry gradients; teacher values are detached upstream.
+                        if teacher_topk_kl:
+                            # Dense reverse KL over the teacher's top-k support (+ tail bucket).
+                            teacher_kld = topk_kl_per_token(
+                                student_topk_logprob=student_topk_logprobs,
+                                teacher_topk_logprob=data["teacher_topk_logprobs"],
+                            )
+                        else:
+                            # Single-sampled-token estimator (low_var_kl / kl / mse / abs).
+                            teacher_kld = kl_penalty(
+                                logprob=log_prob,
+                                ref_logprob=data["teacher_log_probs"],
+                                kl_penalty=teacher_kl_loss_type,
+                            )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef

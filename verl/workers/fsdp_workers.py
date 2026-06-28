@@ -793,6 +793,34 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_ref_topk_log_prob(self, data: DataProto):
+        """Teacher-side top-k log-probs for OPD distillation: per response token,
+        the teacher's top-k token ids and the teacher's full-vocab log-softmax at
+        those ids. ``topk_k`` is taken from data.meta_info (default 20)."""
+        assert self._is_ref
+        data = data.to(get_torch_device().current_device())
+
+        topk_k = int(data.meta_info.get("topk_k", 20))
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            topk_logprob, topk_ids = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k)
+            output = DataProto.from_dict(
+                tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
+            self.ref_policy.actor_module._handle.reshard(True)
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         # only support save and load ckpt for actor

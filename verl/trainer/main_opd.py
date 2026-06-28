@@ -59,6 +59,8 @@ class OPDTaskRunner:
             config.actor_rollout_ref.actor.use_teacher_kl_loss = True
             config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
             config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
+            # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
+            config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
             config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
             config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
             config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

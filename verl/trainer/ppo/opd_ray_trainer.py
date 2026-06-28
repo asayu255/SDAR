@@ -103,6 +103,11 @@ class OPDRayTrainer(RayPPOTrainer):
         # Pure-distillation invariants (also enforced by main_opd config injection).
         assert not self.use_reference_policy, "OPD must not create a reference-policy worker"
         self.teacher_wg = {}
+        # Distillation KL mode: "topk_kl" uses dense top-k (+tail) KL; otherwise a
+        # single-sampled-token estimator (low_var_kl / kl / ...).
+        actor_cfg = self.config.actor_rollout_ref.actor
+        self.teacher_topk_kl = actor_cfg.get("teacher_kl_loss_type", "low_var_kl") == "topk_kl"
+        self.teacher_kl_topk = int(actor_cfg.get("teacher_kl_topk", 20))
 
     # ------------------------------------------------------------------ #
     # Worker setup: actor_rollout (+ optional critic/rm) + N teachers.
@@ -194,12 +199,17 @@ class OPDRayTrainer(RayPPOTrainer):
     # ------------------------------------------------------------------ #
     # Per-task teacher routing.
     # ------------------------------------------------------------------ #
-    def compute_teacher_log_probs(self, batch: DataProto) -> torch.Tensor:
-        """Route each sample to its task's teacher and gather log-probs in batch order.
+    def compute_teacher_log_probs(self, batch: DataProto) -> None:
+        """Route each sample to its task's teacher and write the distillation
+        signal into ``batch.batch`` in original order.
 
         The student's exact (prompt, response) is fed to the teacher — no skill
-        prepend. ``compute_ref_log_prob`` is ``DP_COMPUTE_PROTO``-dispatched, so
-        per-task slices are padded/un-padded to the DP world size automatically.
+        prepend. The teacher call is ``DP_COMPUTE_PROTO``-dispatched; per-task
+        slices are auto-padded to the DP world size and unpadded on return.
+
+        - default (single-token estimator): sets ``teacher_log_probs`` (bs, resp).
+        - top-k mode: sets ``teacher_topk_logprobs`` and ``teacher_topk_ids``
+          (bs, resp, k), the teacher's top-k log-softmax and ids per token.
         """
         task_names = batch.non_tensor_batch.get("task_name", None)
         assert task_names is not None, "OPD requires task_name on every sample for teacher routing"
@@ -207,8 +217,14 @@ class OPDRayTrainer(RayPPOTrainer):
 
         bs = batch.batch["responses"].size(0)
         resp_len = batch.batch["responses"].size(1)
-        teacher_log_probs = torch.zeros((bs, resp_len), dtype=torch.float32)
         seen = [False] * bs
+
+        if self.teacher_topk_kl:
+            k = self.teacher_kl_topk
+            teacher_topk_logprobs = torch.zeros((bs, resp_len, k), dtype=torch.float32)
+            teacher_topk_ids = torch.zeros((bs, resp_len, k), dtype=torch.long)
+        else:
+            teacher_log_probs = torch.zeros((bs, resp_len), dtype=torch.float32)
 
         for task, wg in self.teacher_wg.items():
             idxs = [i for i, t in enumerate(normalized) if t == task]
@@ -216,17 +232,27 @@ class OPDRayTrainer(RayPPOTrainer):
                 continue
             sub = batch.select_idxs(idxs)
             # Task slices are not generally divisible by the teacher group's world
-            # size, so enable auto-padding: the DP_COMPUTE_PROTO dispatch then pads
-            # the input to a multiple of world_size and unpads the output back to
-            # len(idxs). Copy meta_info first so we don't mutate the parent batch
-            # (select_idxs shares the parent's meta_info dict by reference).
+            # size, so enable auto-padding: the DP dispatch pads the input to a
+            # multiple of world_size and unpads the output back to len(idxs). Copy
+            # meta_info first so we don't mutate the parent batch (select_idxs
+            # shares the parent's meta_info dict by reference).
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info[DataProtoConfig.auto_padding_key] = True
-            out = wg.compute_ref_log_prob(sub)
-            lp = out.batch["ref_log_prob"]
-            for j, i in enumerate(idxs):
-                teacher_log_probs[i] = lp[j]
-                seen[i] = True
+            if self.teacher_topk_kl:
+                sub.meta_info["topk_k"] = k
+                out = wg.compute_ref_topk_log_prob(sub)
+                tlp = out.batch["teacher_topk_logprobs"]
+                tid = out.batch["teacher_topk_ids"]
+                for j, i in enumerate(idxs):
+                    teacher_topk_logprobs[i] = tlp[j]
+                    teacher_topk_ids[i] = tid[j]
+                    seen[i] = True
+            else:
+                out = wg.compute_ref_log_prob(sub)
+                lp = out.batch["ref_log_prob"]
+                for j, i in enumerate(idxs):
+                    teacher_log_probs[i] = lp[j]
+                    seen[i] = True
 
         if not all(seen):
             missing = sorted({normalized[i] for i in range(bs) if not seen[i]})
@@ -234,7 +260,12 @@ class OPDRayTrainer(RayPPOTrainer):
                 f"No teacher configured for task_name(s) {missing}; "
                 f"available teachers: {sorted(self.teacher_wg.keys())}"
             )
-        return teacher_log_probs
+
+        if self.teacher_topk_kl:
+            batch.batch["teacher_topk_logprobs"] = teacher_topk_logprobs
+            batch.batch["teacher_topk_ids"] = teacher_topk_ids
+        else:
+            batch.batch["teacher_log_probs"] = teacher_log_probs
 
     # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
@@ -325,8 +356,8 @@ class OPDRayTrainer(RayPPOTrainer):
 
                     # ---- Per-task teacher forward pass (the only training signal) ----
                     with _timer("teacher_forward", timing_raw):
-                        teacher_log_probs = self.compute_teacher_log_probs(batch)
-                        batch.batch["teacher_log_probs"] = teacher_log_probs
+                        # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
+                        self.compute_teacher_log_probs(batch)
 
                     with _timer("update_actor", timing_raw):
                         # update_policy scales the student logits by this temperature to
