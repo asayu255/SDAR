@@ -759,6 +759,45 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_actor_topk_log_prob(self, data: DataProto):
+        """Actor-side top-k log-probs (off-policy distillation, Stage 1).
+
+        Identical signal to ``compute_ref_topk_log_prob`` but evaluated by the
+        *actor* model (used when a frozen teacher is loaded as an actor_rollout
+        worker so it can both generate trajectories and score its own top-k).
+        Per response token: the model's top-k token ids and its full-vocab
+        log-softmax at those ids. ``topk_k`` comes from data.meta_info (default 20).
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(get_torch_device().current_device())
+
+        topk_k = int(data.meta_info.get("topk_k", 20))
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            topk_logprob, topk_ids = self.actor.compute_topk_log_prob(data=data, topk_k=topk_k)
+            output = DataProto.from_dict(
+                tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
