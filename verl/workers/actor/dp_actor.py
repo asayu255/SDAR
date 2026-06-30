@@ -602,6 +602,17 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/teacher_kl_loss"] = teacher_kl_loss.detach().item()
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
+                    if self.config.get("use_sft_loss", False):
+                        # Off-policy SFT / behaviour cloning: maximize the student's
+                        # log-prob of the (teacher-generated) response tokens, i.e.
+                        # cross-entropy / NLL on hard targets. This is the degenerate
+                        # (one-hot teacher) limit of the teacher-KL distillation.
+                        sft_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        sft_coef = self.config.get("sft_loss_coef", 1.0)
+                        policy_loss = policy_loss + sft_loss * sft_coef
+                        metrics["actor/sft_loss"] = sft_loss.detach().item()
+                        metrics["actor/sft_coef"] = sft_coef
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)

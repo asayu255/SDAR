@@ -91,6 +91,9 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         task = gen_cfg.task
         out_dir = gen_cfg.out_dir
         topk = int(gen_cfg.get("topk", self.config.actor_rollout_ref.actor.get("teacher_kl_topk", 20)))
+        # SFT (hard-target) only needs the teacher token sequences, so the teacher
+        # top-k forward pass can be skipped (gen.collect_topk=False).
+        collect_topk = bool(gen_cfg.get("collect_topk", True))
         # Optional cap on collected trajectories; default: one pass over the loader.
         target = gen_cfg.get("num_trajectories", None)
         target = int(target) if target else None
@@ -116,17 +119,18 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                 gen_out = adjust_batch(self.config, gen_out)
                 gen_out.batch["response_mask"] = compute_response_mask(gen_out)
 
-                # Teacher scores its own top-k over the generated responses.
-                topk_in = gen_out.select(
-                    batch_keys=["responses", "input_ids", "attention_mask", "position_ids"]
-                )
-                topk_in.meta_info = dict(topk_in.meta_info)
-                topk_in.meta_info["topk_k"] = topk
-                # Per-call batch is not generally divisible by the DP world size.
-                topk_in.meta_info[DataProtoConfig.auto_padding_key] = True
-                topk_out = self.actor_rollout_wg.compute_actor_topk_log_prob(topk_in)
-                gen_out.batch["teacher_topk_logprobs"] = topk_out.batch["teacher_topk_logprobs"]
-                gen_out.batch["teacher_topk_ids"] = topk_out.batch["teacher_topk_ids"]
+                # Teacher scores its own top-k over the generated responses (KD only).
+                if collect_topk:
+                    topk_in = gen_out.select(
+                        batch_keys=["responses", "input_ids", "attention_mask", "position_ids"]
+                    )
+                    topk_in.meta_info = dict(topk_in.meta_info)
+                    topk_in.meta_info["topk_k"] = topk
+                    # Per-call batch is not generally divisible by the DP world size.
+                    topk_in.meta_info[DataProtoConfig.auto_padding_key] = True
+                    topk_out = self.actor_rollout_wg.compute_actor_topk_log_prob(topk_in)
+                    gen_out.batch["teacher_topk_logprobs"] = topk_out.batch["teacher_topk_logprobs"]
+                    gen_out.batch["teacher_topk_ids"] = topk_out.batch["teacher_topk_ids"]
 
                 # Backfill task_name if the rollout dropped it (single-task generation).
                 if "task_name" not in gen_out.non_tensor_batch:
@@ -169,18 +173,23 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert not self.use_reference_policy, "off-policy OPD must not create a reference-policy worker"
-        opd_cfg = self.config.algorithm.get("opd", {})
-        self.teacher_data_dir = opd_cfg.get("teacher_data_dir", None)
-        assert self.teacher_data_dir is not None, (
-            "off-policy OPD requires algorithm.opd.teacher_data_dir "
-            "(directory of Stage-1 <task>.pt files)"
-        )
+        self.teacher_data_dir = self._resolve_data_dir()
         # Per-step, per-task trajectory count == OPD's per-task prompts * group size,
         # so the update batch matches OPD's update dynamics.
         per_task_prompts = int(self.config.data.task_balance.per_task_batch_size)
         group_size = int(self.config.env.rollout.n)
         self.per_task_traj_per_step = per_task_prompts * group_size
         self._load_offpolicy_data()
+
+    def _resolve_data_dir(self):
+        """Directory of Stage-1 ``<task>.pt`` files. Overridable by subclasses
+        (e.g. SFT reads ``algorithm.sft.data_dir``)."""
+        data_dir = self.config.algorithm.get("opd", {}).get("teacher_data_dir", None)
+        assert data_dir is not None, (
+            "off-policy OPD requires algorithm.opd.teacher_data_dir "
+            "(directory of Stage-1 <task>.pt files)"
+        )
+        return data_dir
 
     def _load_offpolicy_data(self):
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
