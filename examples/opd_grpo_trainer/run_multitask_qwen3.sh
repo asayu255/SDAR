@@ -33,7 +33,7 @@ model_path="Qwen/Qwen3-1.7B"
 # --- Throughput knobs (opt-in; same defaults as the SDAR multitask script) ------
 param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
-ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-10}
+ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
