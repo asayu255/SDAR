@@ -26,8 +26,10 @@ total_training_steps=300
 seed=1
 model_path="Qwen/Qwen3-1.7B"
 
-# Stage-1 teacher dataset: how many trajectories to collect per task. The fixed
-# off-policy pool is reused (reshuffled) across the $total_training_steps steps.
+# Stage-1 teacher dataset: how many whole trajectories (episodes, not turn-rows)
+# to collect per task. Each training step draws per_task_batch_size*group_size
+# (15*8=120) trajectories/task from this fixed pool, reshuffled/recycled across
+# the $total_training_steps steps. Keep this >= 120 to avoid intra-step repeats.
 gen_traj_per_task=${GEN_TRAJ_PER_TASK:-2400}
 teacher_traj_dir=${TEACHER_TRAJ_DIR:-$HOME/data/verl-agent/sdar_multitask/teacher_traj}
 

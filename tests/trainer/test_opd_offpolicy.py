@@ -2,10 +2,12 @@
 
 Covered (CPU-only; Ray / workers are bypassed):
 * the fixed teacher dataset round-trips through ``DataProto.save_to_disk`` and
-  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` with correct per-task indexing;
+  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` with correct per-task /
+  per-trajectory indexing;
 * ``OffPolicyOPDRayTrainer._offpolicy_batch_iter`` yields the right number of
-  task-balanced steps, each with ``per_task_traj_per_step`` rows per task drawn
-  from the matching task;
+  task-balanced steps, each drawing ``per_task_traj_per_step`` WHOLE trajectories
+  per task (all of a trajectory's turn-rows kept together), matching OPD's
+  per-step trajectory count;
 * the top-k teacher-KL math (``topk_kl_per_token``) is the *same* one OPD uses:
   zero when the student matches the teacher, positive when it does not.
 
@@ -27,15 +29,23 @@ except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
 
 
-def _make_task_proto(task, n, resp_len=4, k=3):
-    """A minimal teacher-trajectory DataProto for one task."""
+def _make_task_proto(task, n_traj, turns_per_traj=1, resp_len=4, k=3, uid_offset=0):
+    """A teacher-trajectory DataProto for one task: ``n_traj`` trajectories, each
+    contributing ``turns_per_traj`` turn-rows that share a single traj_uid."""
+    n = n_traj * turns_per_traj
+    traj_uids = []
+    for j in range(n_traj):
+        traj_uids += [f"{task}-{uid_offset + j}"] * turns_per_traj
     return DataProto.from_dict(
         tensors={
             "responses": torch.zeros((n, resp_len), dtype=torch.long),
             "teacher_topk_logprobs": torch.full((n, resp_len, k), -1.0),
             "teacher_topk_ids": torch.zeros((n, resp_len, k), dtype=torch.long),
         },
-        non_tensors={"task_name": np.array([task] * n, dtype=object)},
+        non_tensors={
+            "task_name": np.array([task] * n, dtype=object),
+            "traj_uid": np.array(traj_uids, dtype=object),
+        },
     )
 
 
@@ -45,57 +55,71 @@ def _bare_trainer():
     return object.__new__(OffPolicyOPDRayTrainer)
 
 
-def test_load_offpolicy_data_concats_and_indexes_per_task(tmp_path):
-    _make_task_proto("alfworld", 5).save_to_disk(str(tmp_path / "alfworld.pt"))
-    _make_task_proto("search", 3).save_to_disk(str(tmp_path / "search.pt"))
-    _make_task_proto("webshop", 4).save_to_disk(str(tmp_path / "webshop.pt"))
-
-    trainer = _bare_trainer()
+def _load_from(tmp_path, trainer):
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
 
-    assert len(trainer.offpolicy_data) == 12
-    sizes = {t: len(idx) for t, idx in trainer._task_to_indices.items()}
-    assert sizes == {"alfworld": 5, "search": 3, "webshop": 4}
-    # Every index for a task must actually point at that task's rows.
-    task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
-    for task, idx in trainer._task_to_indices.items():
-        assert all(task_names[i] == task for i in idx)
 
+def test_load_offpolicy_data_groups_rows_by_trajectory(tmp_path):
+    # alfworld: 5 trajectories x 3 turns; search: 3 x 1; webshop: 4 x 2.
+    _make_task_proto("alfworld", 5, turns_per_traj=3).save_to_disk(str(tmp_path / "alfworld.pt"))
+    _make_task_proto("search", 3, turns_per_traj=1).save_to_disk(str(tmp_path / "search.pt"))
+    _make_task_proto("webshop", 4, turns_per_traj=2).save_to_disk(str(tmp_path / "webshop.pt"))
 
-def test_offpolicy_batch_iter_is_task_balanced(tmp_path):
     trainer = _bare_trainer()
-    trainer.offpolicy_data = DataProto.concat(
-        [_make_task_proto("alfworld", 10), _make_task_proto("search", 10), _make_task_proto("webshop", 10)]
-    )
+    _load_from(tmp_path, trainer)
+
+    assert len(trainer.offpolicy_data) == 5 * 3 + 3 * 1 + 4 * 2
+    traj_counts = {t: len(v) for t, v in trainer._task_to_trajs.items()}
+    assert traj_counts == {"alfworld": 5, "search": 3, "webshop": 4}
+    # Each trajectory's row-index group must have the expected number of turn-rows,
+    # and all its rows belong to that task.
     task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
-    trainer._task_to_indices = {
-        t: np.where(task_names == t)[0] for t in ("alfworld", "search", "webshop")
-    }
-    trainer.per_task_traj_per_step = 4
-    trainer.total_training_steps = 6
+    expected_turns = {"alfworld": 3, "search": 1, "webshop": 2}
+    for task, traj_rows in trainer._task_to_traj_rows.items():
+        for uid, rows in traj_rows.items():
+            assert len(rows) == expected_turns[task]
+            assert all(task_names[r] == task for r in rows)
+
+
+def test_offpolicy_batch_iter_draws_whole_trajectories_task_balanced(tmp_path):
+    # 6 trajectories/task, 2 turns each.
+    _make_task_proto("alfworld", 6, turns_per_traj=2).save_to_disk(str(tmp_path / "alfworld.pt"))
+    _make_task_proto("search", 6, turns_per_traj=2).save_to_disk(str(tmp_path / "search.pt"))
+    _make_task_proto("webshop", 6, turns_per_traj=2).save_to_disk(str(tmp_path / "webshop.pt"))
+
+    trainer = _bare_trainer()
+    _load_from(tmp_path, trainer)
+    trainer.per_task_traj_per_step = 3  # trajectories per task per step
+    trainer.total_training_steps = 5
     trainer.config = OmegaConf.create({"data": {"seed": 1}})
 
     steps = list(trainer._offpolicy_batch_iter())
-    assert len(steps) == 6
+    assert len(steps) == 5
     for batch in steps:
-        assert len(batch) == 4 * 3  # per_task_traj_per_step * num_tasks
+        # 3 trajectories * 2 turns * 3 tasks = 18 turn-rows.
+        assert len(batch) == 3 * 2 * 3
         counts = {}
         for t in batch.non_tensor_batch["task_name"]:
             counts[t] = counts.get(t, 0) + 1
-        assert counts == {"alfworld": 4, "search": 4, "webshop": 4}
+        assert counts == {"alfworld": 6, "search": 6, "webshop": 6}
+        # Whole trajectories: every drawn traj_uid appears with all its turn-rows.
+        uid_counts = {}
+        for u in batch.non_tensor_batch["traj_uid"]:
+            uid_counts[u] = uid_counts.get(u, 0) + 1
+        assert all(c == 2 for c in uid_counts.values())
+        assert len(uid_counts) == 3 * 3  # 3 trajectories per task * 3 tasks
 
 
-def test_pool_recycles_when_drawing_more_than_available():
-    """Drawing more per step than a task's pool size must still succeed
+def test_trajectory_pool_recycles_when_drawing_more_than_available(tmp_path):
+    """Drawing more trajectories per step than a task's pool must still succeed
     (pool reshuffled + recycled) and stay balanced."""
+    _make_task_proto("alfworld", 3, turns_per_traj=2).save_to_disk(str(tmp_path / "alfworld.pt"))
+    _make_task_proto("search", 3, turns_per_traj=2).save_to_disk(str(tmp_path / "search.pt"))
+
     trainer = _bare_trainer()
-    trainer.offpolicy_data = DataProto.concat(
-        [_make_task_proto("alfworld", 3), _make_task_proto("search", 3)]
-    )
-    task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
-    trainer._task_to_indices = {t: np.where(task_names == t)[0] for t in ("alfworld", "search")}
-    trainer.per_task_traj_per_step = 5  # > 3 available per task
+    _load_from(tmp_path, trainer)
+    trainer.per_task_traj_per_step = 5  # > 3 trajectories available per task
     trainer.total_training_steps = 2
     trainer.config = OmegaConf.create({"data": {"seed": 7}})
 
@@ -105,7 +129,8 @@ def test_pool_recycles_when_drawing_more_than_available():
         counts = {}
         for t in batch.non_tensor_batch["task_name"]:
             counts[t] = counts.get(t, 0) + 1
-        assert counts == {"alfworld": 5, "search": 5}
+        # 5 trajectories * 2 turns per task.
+        assert counts == {"alfworld": 10, "search": 10}
 
 
 def test_topk_teacher_kl_matches_opd_loss():
@@ -113,7 +138,6 @@ def test_topk_teacher_kl_matches_opd_loss():
     strictly positive when the student diverges."""
     bs, resp_len, k = 2, 3, 4
     teacher = torch.log_softmax(torch.randn(bs, resp_len, k), dim=-1)
-    # Normalize so the (top-k + tail) buckets are a valid distribution sub-mass.
     teacher = teacher - 1.0  # leave tail mass; values stay valid log-probs
 
     matched = topk_kl_per_token(student_topk_logprob=teacher.clone(), teacher_topk_logprob=teacher)

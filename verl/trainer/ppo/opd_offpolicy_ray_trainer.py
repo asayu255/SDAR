@@ -91,12 +91,14 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         task = gen_cfg.task
         out_dir = gen_cfg.out_dir
         topk = int(gen_cfg.get("topk", self.config.actor_rollout_ref.actor.get("teacher_kl_topk", 20)))
-        # Optional cap on collected trajectories; default: one pass over the loader.
+        # Optional cap on the number of unique trajectories to collect; default:
+        # one pass over the loader.
         target = gen_cfg.get("num_trajectories", None)
         target = int(target) if target else None
 
         self.global_steps = 0
         collected = []
+        seen_trajs = set()
         n_collected = 0
         os.makedirs(out_dir, exist_ok=True)
 
@@ -139,9 +141,14 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                 keep = gen_out.select(batch_keys=tensor_keys, non_tensor_batch_keys=non_tensor_keys)
                 keep = keep.to("cpu")
                 collected.append(keep)
-                n_collected += len(keep)
+                if "traj_uid" in keep.non_tensor_batch:
+                    seen_trajs.update(keep.non_tensor_batch["traj_uid"].tolist())
+                    n_collected = len(seen_trajs)
+                else:
+                    n_collected = sum(len(c) for c in collected)
                 self.global_steps += 1
-                print(f"[OPD-offpolicy gen][{task}] collected {n_collected} trajectories")
+                print(f"[OPD-offpolicy gen][{task}] collected {n_collected} trajectories "
+                      f"({sum(len(c) for c in collected)} turn-rows)")
 
                 if target is not None and n_collected >= target:
                     break
@@ -152,7 +159,8 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         data = DataProto.concat(collected)
         out_path = os.path.join(out_dir, f"{task}.pt")
         data.save_to_disk(out_path)
-        print(f"[OPD-offpolicy gen][{task}] saved {len(data)} trajectories -> {out_path}")
+        print(f"[OPD-offpolicy gen][{task}] saved {n_collected} trajectories "
+              f"({len(data)} turn-rows) -> {out_path}")
         return out_path
 
 
@@ -175,8 +183,9 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             "off-policy OPD requires algorithm.opd.teacher_data_dir "
             "(directory of Stage-1 <task>.pt files)"
         )
-        # Per-step, per-task trajectory count == OPD's per-task prompts * group size,
-        # so the update batch matches OPD's update dynamics.
+        # Per-step, per-task TRAJECTORY count == OPD's per-task prompts * group size
+        # (15 * 8 = 120). Each step draws this many whole trajectories per task and
+        # expands them to all their turn-rows, matching OPD's per-step composition.
         per_task_prompts = int(self.config.data.task_balance.per_task_batch_size)
         group_size = int(self.config.env.rollout.n)
         self.per_task_traj_per_step = per_task_prompts * group_size
@@ -189,23 +198,40 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self.offpolicy_data = DataProto.concat(parts)
         task_names = self.offpolicy_data.non_tensor_batch["task_name"]
         normalized = np.array([self._normalize_task_name(t) for t in task_names])
-        self._task_to_indices = {
-            task: np.where(normalized == task)[0] for task in sorted(set(normalized.tolist()))
+        assert "traj_uid" in self.offpolicy_data.non_tensor_batch, (
+            "off-policy dataset must carry traj_uid for trajectory-level sampling"
+        )
+        traj_uids = self.offpolicy_data.non_tensor_batch["traj_uid"]
+        # Group row indices by trajectory within each task, so a step can draw whole
+        # trajectories (all their turn-rows) exactly like OPD's per-step rollout.
+        self._task_to_traj_rows = {}  # task -> {traj_uid: np.ndarray(row_idx)}
+        self._task_to_trajs = {}      # task -> np.ndarray(traj_uid) sampling population
+        for task in sorted(set(normalized.tolist())):
+            traj_to_rows = {}
+            for ridx in np.where(normalized == task)[0]:
+                traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
+            self._task_to_traj_rows[task] = {u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()}
+            self._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
+        sizes = {
+            t: (len(self._task_to_trajs[t]), int(sum(len(r) for r in self._task_to_traj_rows[t].values())))
+            for t in self._task_to_trajs
         }
-        sizes = {t: len(idx) for t, idx in self._task_to_indices.items()}
-        print(f"[OPD-offpolicy] loaded {len(self.offpolicy_data)} trajectories from {len(files)} files; per-task sizes: {sizes}")
-        for task, idx in self._task_to_indices.items():
-            assert len(idx) > 0, f"no trajectories for task {task}"
+        print(f"[OPD-offpolicy] loaded {len(self.offpolicy_data)} rows from {len(files)} files; "
+              f"per-task (trajectories, rows): {sizes}")
+        for task, trajs in self._task_to_trajs.items():
+            assert len(trajs) > 0, f"no trajectories for task {task}"
 
     def _offpolicy_batch_iter(self):
-        """Yield one task-balanced DataProto per training step (with replacement
-        across epochs: pools are reshuffled and recycled when exhausted)."""
+        """Yield one task-balanced DataProto per training step. Each step draws
+        ``per_task_traj_per_step`` whole trajectories per task (all their turn-rows),
+        matching OPD's per-step trajectory count. Trajectory pools are reshuffled and
+        recycled across steps (replay)."""
         seed = int(self.config.data.get("seed", 1))
         rng = np.random.default_rng(seed)
-        pools = {t: rng.permutation(idx) for t, idx in self._task_to_indices.items()}
+        pools = {t: rng.permutation(trajs) for t, trajs in self._task_to_trajs.items()}
         cursors = {t: 0 for t in pools}
 
-        def _draw(task, n):
+        def _draw_trajs(task, n):
             out = []
             while len(out) < n:
                 pool = pools[task]
@@ -214,15 +240,16 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 out.extend(pool[c : c + take].tolist())
                 cursors[task] = c + take
                 if cursors[task] >= len(pool):
-                    pools[task] = rng.permutation(self._task_to_indices[task])
+                    pools[task] = rng.permutation(self._task_to_trajs[task])
                     cursors[task] = 0
             return out
 
         for _ in range(self.total_training_steps):
-            sel = []
+            rows = []
             for task in pools:
-                sel.extend(_draw(task, self.per_task_traj_per_step))
-            yield self.offpolicy_data.select_idxs(sel)
+                for uid in _draw_trajs(task, self.per_task_traj_per_step):
+                    rows.extend(self._task_to_traj_rows[task][uid].tolist())
+            yield self.offpolicy_data.select_idxs(rows)
 
     def fit(self):
         from omegaconf import OmegaConf
