@@ -48,6 +48,36 @@ use_fused_kernels=${USE_FUSED_KERNELS:-False}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
 max_model_len=${MAX_MODEL_LEN:-4608}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
+# CUDA-graph decode (mechanism B). The passthrough already exists in
+# vllm_rollout_spmd (enforce_eager=False is set below); capture sizes only take
+# effect on a vLLM V1 engine — under the V0 engine CompilationConfig is ignored,
+# which is why this stays opt-in. Example:
+#   VLLM_USE_V1=1 CUDAGRAPH_CAPTURE_SIZES='[8,16,32,64,128,256,384]' bash ...
+# Sampling-distribution-preserving (same class as prefix caching), not
+# bit-identical. Leave both unset to reproduce the current engine behavior.
+cudagraph_capture_sizes=${CUDAGRAPH_CAPTURE_SIZES:-}
+if [ -n "${VLLM_USE_V1:-}" ]; then
+    export VLLM_USE_V1
+fi
+extra_rollout_args=()
+if [ -n "$cudagraph_capture_sizes" ]; then
+    extra_rollout_args+=("+actor_rollout_ref.rollout.cudagraph_capture_sizes=$cudagraph_capture_sizes")
+fi
+# -----------------------------------------------------------------------------
+
+# --- Rollout/trainer overlap mechanisms (opt-in, env-var driven; live in code) --
+# These pair with ROLLOUT_KEEP_VLLM_AWAKE / ROLLOUT_SKIP_DONE_PREPROC /
+# TASK_BALANCE_INTERLEAVE from the earlier speedup work:
+#   ROLLOUT_PREFETCH_LOGPROB=1        A: prefetch old_log_prob for finished
+#                                        trajectories while env.step runs
+#                                        (chunk via ROLLOUT_PREFETCH_LOGPROB_CHUNK)
+#   ENV_RESET_PREFETCH=1              C: overlap next rollout's envs.reset with
+#                                        the GPU training phases
+#   SEARCH_QUERY_CACHE=1              D: cache deterministic retriever lookups
+#   ROLLOUT_PREPROC_WORKERS=8         E: parallel prompt tokenization
+#   ROLLOUT_DECODE_ACTIVE_ONLY=1      E: decode generated rows only (default on)
+#   ROLLOUT_COMPACT_RECORD=1          E: skip recording finished rows (default on)
 # -----------------------------------------------------------------------------
 
 # --- Fair-comparison alignment with the single-task baselines -----------------
@@ -128,7 +158,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.rollout.max_model_len=$max_model_len \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
     actor_rollout_ref.rollout.enable_chunked_prefill=$enable_chunked_prefill \
     +actor_rollout_ref.rollout.enable_prefix_caching=$enable_prefix_caching \
     actor_rollout_ref.rollout.enforce_eager=False \
@@ -180,4 +210,4 @@ python3 -m verl.trainer.main_sdar \
     trainer.test_freq=150 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=300 \
-    trainer.val_before_train=False $@
+    trainer.val_before_train=False "${extra_rollout_args[@]}" $@

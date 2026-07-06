@@ -1,9 +1,11 @@
 import json
 import logging
+import os
 import requests
 import uuid
 import time
 import threading
+from collections import OrderedDict
 from typing import Tuple, Optional, Any, Dict
 from urllib.parse import urlparse
 
@@ -15,6 +17,15 @@ logger.setLevel(logging.INFO)
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 10
 INITIAL_RETRY_DELAY = 1
+
+# Cache retrieval results per (url, topk, query). RL rollouts re-issue the same
+# search query many times (identical questions across GRPO group members and
+# across epochs of the same subset), and the retriever is deterministic for a
+# fixed index, so a hit returns the byte-identical observation while skipping
+# the HTTP round trip. Only successful lookups are cached (errors are retried
+# normally). Opt-in: SEARCH_QUERY_CACHE=1; size cap via SEARCH_QUERY_CACHE_SIZE.
+_QUERY_CACHE_ENABLED = os.environ.get("SEARCH_QUERY_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+_QUERY_CACHE_MAX_SIZE = int(os.environ.get("SEARCH_QUERY_CACHE_SIZE", "100000"))
 
 
 def call_search_api(
@@ -142,6 +153,27 @@ class SearchToolGroup(ToolGroup):
     _session_pool = {}
     _session_lock = threading.Lock()
 
+    # Class-level LRU query cache shared across all env instances (all envs of a
+    # run query the same retriever index).
+    _query_cache: "OrderedDict[tuple, str]" = OrderedDict()
+    _query_cache_lock = threading.Lock()
+
+    @classmethod
+    def _query_cache_get(cls, key):
+        with cls._query_cache_lock:
+            result = cls._query_cache.get(key)
+            if result is not None:
+                cls._query_cache.move_to_end(key)
+            return result
+
+    @classmethod
+    def _query_cache_put(cls, key, value):
+        with cls._query_cache_lock:
+            cls._query_cache[key] = value
+            cls._query_cache.move_to_end(key)
+            while len(cls._query_cache) > _QUERY_CACHE_MAX_SIZE:
+                cls._query_cache.popitem(last=False)
+
     @classmethod
     def _get_shared_session(cls, base_url: str) -> requests.Session:
         """Get or create a shared session for the given base URL"""
@@ -185,6 +217,12 @@ class SearchToolGroup(ToolGroup):
             return ""
 
         query = query.strip()
+
+        cache_key = (self.search_url, self.topk, query) if _QUERY_CACHE_ENABLED else None
+        if cache_key is not None:
+            cached = self._query_cache_get(cache_key)
+            if cached is not None:
+                return cached
 
         try:
             api_response, error_msg = call_search_api(
@@ -241,6 +279,10 @@ class SearchToolGroup(ToolGroup):
                     metadata["total_results"] = 0
                     if self.log_requests:
                         logger.info("Batch search: No results found")
+                if cache_key is not None:
+                    # Cache only successful lookups (incl. deterministic empty
+                    # results); errors keep hitting the API.
+                    self._query_cache_put(cache_key, result_text)
             except Exception as e:
                 error_msg = f"Error processing search results: {e}"
                 result_text = json.dumps({"result": error_msg})

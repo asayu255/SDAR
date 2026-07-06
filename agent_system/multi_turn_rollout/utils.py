@@ -20,6 +20,7 @@ from typing import List, Tuple, Dict
 import math
 from PIL import Image
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch
@@ -81,6 +82,76 @@ def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 * 
         image = image.convert('RGB')
 
     return image
+
+
+def compute_log_prob_with_prefetch(actor_rollout_wg, batch: DataProto, prefetched: Dict, temperature=None) -> DataProto:
+    """old_log_prob phase that reuses per-row results prefetched during rollout.
+
+    `prefetched` maps (traj_uid, turn_step) -> (old_log_probs_row, entropys_row),
+    produced by TrajectoryCollector._prefetch_pending_log_probs with the same
+    frozen actor weights this phase would use. Rows found in the map are filled
+    from it; the remaining rows are computed by the normal
+    actor_rollout_wg.compute_log_prob on a padded sub-batch. Duplicated rows
+    (adjust_batch mode="copy") share a key and receive the same value, exactly as
+    recomputation would produce. Falls back to the full computation whenever the
+    prefetched rows cannot be used verbatim.
+    """
+    if not prefetched:
+        return actor_rollout_wg.compute_log_prob(batch)
+
+    non_tensor = batch.non_tensor_batch
+    if "traj_uid" not in non_tensor or "turn_step" not in non_tensor:
+        return actor_rollout_wg.compute_log_prob(batch)
+
+    response_length = batch.batch["responses"].shape[1]
+    sample_log_probs, sample_entropys = next(iter(prefetched.values()))
+    if sample_log_probs.shape[-1] != response_length:
+        print(
+            "[prefetch-logprob] response length mismatch "
+            f"({sample_log_probs.shape[-1]} vs {response_length}); recomputing all rows."
+        )
+        return actor_rollout_wg.compute_log_prob(batch)
+
+    keys = [
+        (non_tensor["traj_uid"][i], int(non_tensor["turn_step"][i]))
+        for i in range(len(batch))
+    ]
+    missing_idx = [i for i, key in enumerate(keys) if key not in prefetched]
+    if len(missing_idx) == len(keys):
+        return actor_rollout_wg.compute_log_prob(batch)
+
+    if missing_idx:
+        sub_batch = batch.select_idxs(missing_idx)
+        sub_padded, pad_size = pad_dataproto_to_divisor(sub_batch, actor_rollout_wg.world_size)
+        computed = actor_rollout_wg.compute_log_prob(sub_padded)
+        computed = unpad_dataproto(computed, pad_size=pad_size)
+        log_probs_dtype = computed.batch["old_log_probs"].dtype
+        entropys_dtype = computed.batch["entropys"].dtype
+        meta_info = computed.meta_info
+    else:
+        computed = None
+        log_probs_dtype = sample_log_probs.dtype
+        entropys_dtype = sample_entropys.dtype
+        meta_info = {} if temperature is None else {"temperature": temperature}
+
+    full_log_probs = torch.zeros((len(batch), response_length), dtype=log_probs_dtype)
+    full_entropys = torch.zeros((len(batch), response_length), dtype=entropys_dtype)
+    for i, key in enumerate(keys):
+        if key in prefetched:
+            row_log_probs, row_entropys = prefetched[key]
+            full_log_probs[i] = row_log_probs
+            full_entropys[i] = row_entropys
+    if computed is not None:
+        missing_t = torch.as_tensor(missing_idx, dtype=torch.long)
+        full_log_probs[missing_t] = computed.batch["old_log_probs"].to(log_probs_dtype)
+        full_entropys[missing_t] = computed.batch["entropys"].to(entropys_dtype)
+
+    prefetched_count = len(keys) - len(missing_idx)
+    print(f"[prefetch-logprob] reused {prefetched_count}/{len(keys)} rows from rollout prefetch")
+    return DataProto.from_dict(
+        tensors={"old_log_probs": full_log_probs, "entropys": full_entropys},
+        meta_info=meta_info,
+    )
 
 
 def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
