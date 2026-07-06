@@ -151,6 +151,9 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                     batch_dict = next(batch_iter, None)
                     if batch_dict is None:
                         break
+                # Reset the pre-peek dataloader snapshot each step; it is set
+                # again below if this step peeks ahead (see _save_checkpoint).
+                self._pre_peek_dataloader_state = None
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -191,6 +194,12 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                         and not is_last_step
                         and not self.config.algorithm.filter_groups.enable
                     ):
+                        # Snapshot the dataloader state before peeking: the peeked
+                        # batch is trained on the NEXT step, so a checkpoint saved
+                        # this step must record the pre-peek position or a resumed
+                        # run would skip that batch (see _save_checkpoint).
+                        if hasattr(self.train_dataloader, "state_dict"):
+                            self._pre_peek_dataloader_state = self.train_dataloader.state_dict()
                         peeked_batch_dict = next(batch_iter, None)
                         if peeked_batch_dict is not None and "env_kwargs" in peeked_batch_dict:
                             # Same repeat the next multi_turn_loop applies to its

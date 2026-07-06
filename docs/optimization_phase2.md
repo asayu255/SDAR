@@ -55,8 +55,20 @@ knob reproduces the Phase 1 behavior exactly when unset.
   (`ROLLOUT_TURN_TIMING=1`) shows the envstep bucket absorbing the prefetch.
 - **A accounting**: prefetched GPU time is attributed to the `gen` timer, so
   expect `gen` to rise and `old_log_prob` to fall; judge by step wall time.
+- **A + multimodal**: prefetch is disabled whenever the collector has a
+  `processor` (vision models). The prefetch sub-batch carries only the four
+  token tensors; computing log probs without `multi_modal_inputs` would merge
+  wrong values, so those runs always use the trainer's full-batch path.
 - **C + dynamic sampling**: reset prefetch is disabled when
   `algorithm.filter_groups.enable` (dynamic sampling re-resets within a step).
+- **C + checkpoint resume**: the peeked batch is trained on the *next* step, so
+  `RLSDRayTrainer._save_checkpoint` saves the pre-peek `StatefulDataLoader`
+  state; a resumed run replays the peeked batch instead of skipping it,
+  matching the no-prefetch data order exactly.
+- **Threaded env.step (A)**: running `envs.step` in a background thread drives
+  the search env's asyncio loop from a non-main thread — the same pattern the
+  Phase 1 multitask manager already uses for its concurrent per-task stepping
+  (sequential use of the loop from one thread at a time).
 - **D**: only enable against a deterministic retriever (fixed index, no
   sampling); the cache returns byte-identical observations on hits.
 

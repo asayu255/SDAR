@@ -183,6 +183,25 @@ class RLSDRayTrainer(RayPPOTrainer):
             return 0.0
         return self.rlsd_lambda_init * (1.0 - step / self.rlsd_lambda_warmdown_steps)
 
+    def _save_checkpoint(self):
+        """Same as the base trainer, except when ENV_RESET_PREFETCH has peeked
+        one dataloader batch ahead this step. The peeked batch has only had its
+        env_kwargs used for the background env reset — it is trained on the
+        *next* step — so the checkpoint must record the pre-peek dataloader
+        position; saving the live (post-peek) state would make a resumed run
+        skip that batch entirely.
+        """
+        pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
+        if pre_peek_state is None:
+            return super()._save_checkpoint()
+        # Shadow the bound state_dict with the pre-peek snapshot for the
+        # duration of the base save (which calls train_dataloader.state_dict()).
+        self.train_dataloader.state_dict = lambda: pre_peek_state
+        try:
+            return super()._save_checkpoint()
+        finally:
+            del self.train_dataloader.state_dict
+
     def fit(self):
         """
         The training loop of RLSD, extending the standard PPO/GRPO loop
@@ -224,6 +243,9 @@ class RLSDRayTrainer(RayPPOTrainer):
                     batch_dict = next(batch_iter, None)
                     if batch_dict is None:
                         break
+                # Reset the pre-peek dataloader snapshot each step; it is set
+                # again below if this step peeks ahead (see _save_checkpoint).
+                self._pre_peek_dataloader_state = None
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -264,6 +286,12 @@ class RLSDRayTrainer(RayPPOTrainer):
                         and not is_last_step
                         and not self.config.algorithm.filter_groups.enable
                     ):
+                        # Snapshot the dataloader state before peeking: the peeked
+                        # batch is trained on the NEXT step, so a checkpoint saved
+                        # this step must record the pre-peek position or a resumed
+                        # run would skip that batch (see _save_checkpoint).
+                        if hasattr(self.train_dataloader, "state_dict"):
+                            self._pre_peek_dataloader_state = self.train_dataloader.state_dict()
                         peeked_batch_dict = next(batch_iter, None)
                         if peeked_batch_dict is not None and "env_kwargs" in peeked_batch_dict:
                             next_env_kwargs = np.repeat(
