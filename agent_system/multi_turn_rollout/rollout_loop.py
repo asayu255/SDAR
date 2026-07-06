@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 import numpy as np
 from verl import DataProto
@@ -55,6 +59,74 @@ _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").st
 # OFF reproduces the current per-turn behavior exactly.
 _ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Parallelize the per-row prompt tokenization (apply_chat_template + tokenize) of
+# preprocess_batch across a thread pool. HF fast tokenizers release the GIL in
+# their Rust encode path, and every row is processed by an *identical, independent*
+# call, so the outputs are byte-for-byte the same as the sequential loop — only
+# wall time changes. Each worker thread uses its own deepcopy of the tokenizer
+# because HF fast tokenizers mutate internal truncation/padding state per call and
+# are not safe to share across threads. 0 (default) keeps the sequential loop;
+# multimodal batches always fall back to sequential (processor thread-safety is
+# not established).
+_ROLLOUT_PREPROC_WORKERS = int(os.environ.get("ROLLOUT_PREPROC_WORKERS", "0"))
+
+# Decode only the rows that were actually generated this turn. Finished rows'
+# scattered filler is all pad tokens, which batch_decode(skip_special_tokens=True)
+# already renders as '' — so filling '' directly gives the same env input while
+# skipping the wasted decode of pad-only rows (2/3 of the batch during the
+# alfworld tail). Default ON; set ROLLOUT_DECODE_ACTIVE_ONLY=0 for A/B.
+_ROLLOUT_DECODE_ACTIVE_ONLY = os.environ.get("ROLLOUT_DECODE_ACTIVE_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Do not record per-turn rows for already-finished trajectories. Those rows carry
+# active_masks=False and are dropped by gather_rollout_data() anyway; because a
+# trajectory's active rows always form a prefix of its turn list, the enumerate-
+# based turn_step and the "last active entry" scans in success_evaluator /
+# filter_group_data see identical data. Saves the per-turn dict materialization
+# and memory for the inactive 2/3 of the batch during the multitask tail.
+# Default ON; set ROLLOUT_COMPACT_RECORD=0 for A/B.
+_ROLLOUT_COMPACT_RECORD = os.environ.get("ROLLOUT_COMPACT_RECORD", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Prefetch old_log_prob for trajectories that already finished, overlapped with
+# env.step: each turn, envs.step() (CPU/HTTP/IPC — GPU idle) runs in a background
+# thread while the driver issues actor_rollout_wg.compute_log_prob() on a bounded
+# chunk of finished-trajectory rows. The actor weights are frozen for the whole
+# rollout and are exactly the weights the trainer's old_log_prob phase would use
+# after it, so the prefetched values are computed by the same function on the
+# same weights and the same rows — only earlier. Accuracy class: same standard as
+# vLLM batch-composition changes (the micro-batch grouping differs from the
+# monolithic phase; per-row results are computed independently under rmpad).
+# Rows not prefetched by rollout end are computed by the trainer as usual.
+# Opt-in; OFF reproduces the current serial behavior exactly.
+_ROLLOUT_PREFETCH_LOGPROB = os.environ.get("ROLLOUT_PREFETCH_LOGPROB", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Rows per prefetch call. Sized so one compute_log_prob chunk roughly fits inside
+# one env.step window; leftovers roll over to later turns (the alfworld tail has
+# ~35 such windows). Too large a chunk extends the turn past env.step — the work
+# is still subtracted from the old_log_prob phase, but the overlap is lost.
+_ROLLOUT_PREFETCH_LOGPROB_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_LOGPROB_CHUNK", "64"))
+
+
+def _env_kwargs_equal(a, b) -> bool:
+    """Compare two env_kwargs sequences (None or sequence of per-env dicts)."""
+    if a is None or b is None:
+        return a is None and b is None
+    a = list(a) if not isinstance(a, list) else a
+    b = list(b) if not isinstance(b, list) else b
+    if len(a) != len(b):
+        return False
+    for item_a, item_b in zip(a, b):
+        if item_a is item_b:
+            continue
+        if not isinstance(item_a, dict) or not isinstance(item_b, dict) or item_a.keys() != item_b.keys():
+            return False
+        for key in item_a:
+            va, vb = item_a[key], item_b[key]
+            if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+                if not np.array_equal(np.asarray(va), np.asarray(vb)):
+                    return False
+            elif va != vb:
+                return False
+    return True
 
 
 def _now():
@@ -148,12 +220,71 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        # ROLLOUT_PREPROC_WORKERS: lazily-built thread pool + per-thread tokenizer
+        # clones (HF fast tokenizers are not safe to share across threads).
+        self._preproc_executor = None
+        self._preproc_local = threading.local()
+        # ROLLOUT_PREFETCH_LOGPROB state: rows of finished trajectories waiting for
+        # a prefetched compute_log_prob, and the per-row results keyed by
+        # (traj_uid, turn_step). Cleared at the start of every multi_turn_loop.
+        self._logprob_prefetch_enabled = False
+        self._logprob_pending = []
+        self._prefetched_log_probs = {}
+        self._env_step_executor = None
+        # ENV_RESET_PREFETCH state: one outstanding background envs.reset, launched
+        # by the trainer between rollouts (see prefetch_env_reset).
+        self._env_reset_prefetch = None
+        self._env_reset_executor = None
+
+    def _get_preproc_executor(self) -> ThreadPoolExecutor:
+        if self._preproc_executor is None:
+            self._preproc_executor = ThreadPoolExecutor(max_workers=_ROLLOUT_PREPROC_WORKERS)
+        return self._preproc_executor
+
+    def _thread_tokenizer(self):
+        tokenizer = getattr(self._preproc_local, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = copy.deepcopy(self.tokenizer)
+            self._preproc_local.tokenizer = tokenizer
+        return tokenizer
+
+    def _run_full_preprocess(self, items: List[int], gen_batch: DataProto, obs: Dict) -> Dict[int, dict]:
+        """Run preprocess_single_sample over `items`, optionally in parallel.
+
+        The parallel path calls the *same* function with per-thread tokenizer
+        clones, so every row's output is identical to the sequential loop.
+        Multimodal batches always use the sequential path.
+        """
+        use_threads = (
+            _ROLLOUT_PREPROC_WORKERS > 1
+            and len(items) > 1
+            and obs.get('image', None) is None
+        )
+        if not use_threads:
+            return {
+                item: self.preprocess_single_sample(item=item, gen_batch=gen_batch, obs=obs)
+                for item in items
+            }
+        executor = self._get_preproc_executor()
+        futures = {
+            item: executor.submit(
+                self._preprocess_single_sample_threadsafe, item, gen_batch, obs
+            )
+            for item in items
+        }
+        return {item: future.result() for item, future in futures.items()}
+
+    def _preprocess_single_sample_threadsafe(self, item: int, gen_batch: DataProto, obs: Dict):
+        return self.preprocess_single_sample(
+            item=item, gen_batch=gen_batch, obs=obs, tokenizer=self._thread_tokenizer()
+        )
 
     def preprocess_single_sample(
         self,
         item: int,
         gen_batch: DataProto,
         obs: Dict,
+        tokenizer=None,
     ):
         """
         Process a single observation sample, organizing environment observations (text and/or images) 
@@ -168,6 +299,8 @@ class TrajectoryCollector:
             dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
 
+        if tokenizer is None:
+            tokenizer = self.tokenizer
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
@@ -202,7 +335,7 @@ class TrajectoryCollector:
         }])
         
         # Apply chat template
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(
+        prompt_with_chat_template = tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
             tokenize=False,
@@ -239,9 +372,9 @@ class TrajectoryCollector:
             raw_prompt = prompt_with_chat_template
         
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
-                                                                            tokenizer=self.tokenizer,
+                                                                            tokenizer=tokenizer,
                                                                             max_length=self.config.data.max_prompt_length,
-                                                                            pad_token_id=self.tokenizer.pad_token_id,
+                                                                            pad_token_id=tokenizer.pad_token_id,
                                                                             left_pad=True,
                                                                             truncation=self.config.data.truncation,)
         
@@ -267,7 +400,7 @@ class TrajectoryCollector:
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        raw_prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.config.data.max_prompt_length:
             if self.config.data.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
@@ -373,25 +506,18 @@ class TrajectoryCollector:
         processed_samples = [None] * batch_size
 
         if not skip_done:
-            for item in range(batch_size):
-                processed_samples[item] = self.preprocess_single_sample(
-                    item=item,
-                    gen_batch=gen_batch,
-                    obs=obs,
-                )
+            full_items = list(range(batch_size))
+            processed = self._run_full_preprocess(full_items, gen_batch, obs)
+            for item in full_items:
+                processed_samples[item] = processed[item]
         else:
             # Full tokenization for active rows (unchanged path); the first such
             # row becomes the shape/dtype template for finished-row placeholders.
-            template = None
-            for item in range(batch_size):
-                if active_mask[item]:
-                    processed_samples[item] = self.preprocess_single_sample(
-                        item=item,
-                        gen_batch=gen_batch,
-                        obs=obs,
-                    )
-                    if template is None:
-                        template = processed_samples[item]
+            active_items = [item for item in range(batch_size) if active_mask[item]]
+            processed = self._run_full_preprocess(active_items, gen_batch, obs)
+            template = processed[active_items[0]] if active_items else None
+            for item in active_items:
+                processed_samples[item] = processed[item]
             for item in range(batch_size):
                 if not active_mask[item]:
                     processed_samples[item] = self._placeholder_single_sample(
@@ -513,6 +639,78 @@ class TrajectoryCollector:
             meta_info=active_output.meta_info,
         )
 
+    def _prefetch_pending_log_probs(self, actor_rollout_wg):
+        """Run compute_log_prob on a bounded chunk of finished-trajectory rows.
+
+        Called while envs.step() runs in a background thread. Uses the same
+        frozen actor weights and the same per-row tensors the trainer's
+        old_log_prob phase would use, so each row's result is the value that
+        phase would have produced; the trainer then computes only the rows that
+        were not prefetched (see compute_log_prob_with_prefetch).
+        """
+        chunk = self._logprob_pending[:_ROLLOUT_PREFETCH_LOGPROB_CHUNK]
+        if not chunk:
+            return
+        del self._logprob_pending[:len(chunk)]
+        keys = [key for key, _ in chunk]
+        rows = [row for _, row in chunk]
+        tensors = {
+            name: torch.stack([row[name] for row in rows])
+            for name in ("input_ids", "attention_mask", "position_ids", "responses")
+        }
+        sub = DataProto.from_dict(tensors=tensors)
+        sub_padded, pad_size = pad_dataproto_to_divisor(sub, actor_rollout_wg.world_size)
+        output = actor_rollout_wg.compute_log_prob(sub_padded)
+        output = unpad_dataproto(output, pad_size=pad_size)
+        log_probs = output.batch["old_log_probs"]
+        entropys = output.batch["entropys"]
+        for j, key in enumerate(keys):
+            self._prefetched_log_probs[key] = (log_probs[j], entropys[j])
+
+    def take_prefetched_log_probs(self) -> Dict:
+        """Hand the prefetched (traj_uid, turn_step) -> (old_log_probs, entropys)
+        rows to the trainer and clear them. Empty unless ROLLOUT_PREFETCH_LOGPROB
+        was on during the last multi_turn_loop."""
+        prefetched = self._prefetched_log_probs
+        self._prefetched_log_probs = {}
+        return prefetched
+
+    def prefetch_env_reset(self, envs: EnvironmentManagerBase, env_kwargs):
+        """Launch envs.reset() for the *next* rollout in a background thread.
+
+        Called by the trainer right after a rollout's data has been collected
+        (envs are idle from then until the next rollout), so the reset — pure
+        CPU / subprocess work such as alfworld game loading — overlaps the GPU
+        training phases. The next multi_turn_loop on the same `envs` object
+        consumes the result instead of calling reset again; reset is still
+        executed exactly once per rollout, so stateful env schedules (alfworld's
+        game-file iterator) advance identically to the serial order.
+        """
+        if self._env_reset_prefetch is not None:
+            raise RuntimeError("prefetch_env_reset called while a prefetched reset is still pending.")
+        if self._env_reset_executor is None:
+            self._env_reset_executor = ThreadPoolExecutor(max_workers=1)
+        self._env_reset_prefetch = {
+            "envs_id": id(envs),
+            "kwargs": env_kwargs,
+            "future": self._env_reset_executor.submit(envs.reset, env_kwargs),
+        }
+
+    def _reset_envs(self, envs: EnvironmentManagerBase, env_kwargs):
+        """Consume a matching prefetched reset, or reset synchronously."""
+        pending = self._env_reset_prefetch
+        if pending is not None and pending["envs_id"] == id(envs):
+            self._env_reset_prefetch = None
+            if not _env_kwargs_equal(pending["kwargs"], env_kwargs):
+                # The prefetched reset already advanced stateful env schedules;
+                # resetting again would silently change the sampled episodes.
+                raise RuntimeError(
+                    "Prefetched env reset consumed with mismatched env_kwargs; "
+                    "disable ENV_RESET_PREFETCH or fix the trainer-side prefetch."
+                )
+            return pending["future"].result()
+        return envs.reset(kwargs=env_kwargs)
+
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -536,8 +734,9 @@ class TrajectoryCollector:
 
         batch_size = len(gen_batch.batch)
 
-        # Initial observations from the environment
-        obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
+        # Initial observations from the environment (uses a trainer-prefetched
+        # reset when one is pending for this env manager, see prefetch_env_reset)
+        obs, infos = self._reset_envs(envs, gen_batch.non_tensor_batch.pop('env_kwargs', None))
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
         assert len(gen_batch.batch) == lenght_obs, f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
@@ -617,11 +816,34 @@ class TrajectoryCollector:
             batch.non_tensor_batch['traj_uid'] = traj_uid
 
             batch = batch.union(batch_output)
-            
-            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+
+            if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:
+                text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+            else:
+                # Decode only the generated rows; finished rows' scattered filler
+                # is pad-only, which batch_decode(skip_special_tokens=True) would
+                # render as '' anyway.
+                active_actions = self.tokenizer.batch_decode(
+                    active_batch_output.batch['responses'], skip_special_tokens=True
+                )
+                text_actions = [''] * batch_size
+                for pos, idx in enumerate(active_idx):
+                    text_actions[idx] = active_actions[pos]
             _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
 
-            next_obs, rewards, dones, infos = envs.step(text_actions)
+            if self._logprob_prefetch_enabled and self._logprob_pending:
+                # Overlap: envs.step (CPU/HTTP/IPC, GPU idle) runs in a background
+                # thread while the GPU prefetches old_log_prob for finished
+                # trajectories. The prefetch call returns before the next
+                # generate_sequences is issued, so it never contends with
+                # generation on the worker actors.
+                if self._env_step_executor is None:
+                    self._env_step_executor = ThreadPoolExecutor(max_workers=1)
+                env_future = self._env_step_executor.submit(envs.step, text_actions)
+                self._prefetch_pending_log_probs(actor_rollout_wg)
+                next_obs, rewards, dones, infos = env_future.result()
+            else:
+                next_obs, rewards, dones, infos = envs.step(text_actions)
             _m_env = _now()  # end of env.step (CPU / HTTP / IPC)
 
             if _turn_records is not None:
@@ -663,12 +885,28 @@ class TrajectoryCollector:
             batch_list: list[dict] = to_list_of_dict(batch)
 
             for i in range(batch_size):
+                if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
+                    # Finished trajectories' rows carry active_masks=False and are
+                    # dropped by gather_rollout_data(); skip materializing them.
+                    # Active rows form a prefix of each trajectory's list, so the
+                    # enumerate-based turn_step and the last-active-entry scans in
+                    # success_evaluator / filter_group_data are unchanged.
+                    continue
                 total_batch_list[i].append(batch_list[i])
                 total_infos[i].append(infos[i])
 
             # Update done states
+            newly_done = np.logical_and(active_masks, dones)
             is_done = np.logical_or(is_done, dones)
-                
+
+            if self._logprob_prefetch_enabled:
+                # Trajectories that finished this turn now have all their rows
+                # final; queue them for prefetched old_log_prob on later turns.
+                for i in np.nonzero(newly_done)[0]:
+                    for step_idx, row in enumerate(total_batch_list[i]):
+                        if row['active_masks']:
+                            self._logprob_pending.append(((traj_uid[i], step_idx), row))
+
             # Update observations for next step
             obs = next_obs
 
@@ -777,7 +1015,14 @@ class TrajectoryCollector:
         """
         if is_train:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
-            
+
+        # Log-prob prefetch only makes sense for training rollouts (validation
+        # never computes old_log_prob). State is cleared per rollout; anything
+        # still pending at the end is simply computed by the trainer as usual.
+        self._logprob_prefetch_enabled = _ROLLOUT_PREFETCH_LOGPROB and is_train
+        self._logprob_pending = []
+        self._prefetched_log_probs = {}
+
         # Initial observations from the environment
         # Open one vLLM session for the whole rollout (opt-in). end_rollout_session
         # runs in finally so the engine is always returned to its slept/offloaded
