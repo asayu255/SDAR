@@ -1017,9 +1017,15 @@ class TrajectoryCollector:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
 
         # Log-prob prefetch only makes sense for training rollouts (validation
-        # never computes old_log_prob). State is cleared per rollout; anything
-        # still pending at the end is simply computed by the trainer as usual.
-        self._logprob_prefetch_enabled = _ROLLOUT_PREFETCH_LOGPROB and is_train
+        # never computes old_log_prob). Multimodal runs are excluded: the
+        # prefetch sub-batch carries only the four token tensors, so it would
+        # compute log probs without multi_modal_inputs and merge WRONG values —
+        # the trainer's full-batch path (which passes multi_modal_inputs) must
+        # handle those rows. State is cleared per rollout; anything still
+        # pending at the end is simply computed by the trainer as usual.
+        self._logprob_prefetch_enabled = (
+            _ROLLOUT_PREFETCH_LOGPROB and is_train and self.processor is None
+        )
         self._logprob_pending = []
         self._prefetched_log_probs = {}
 
