@@ -37,7 +37,14 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
 )
 
-from agent_system.multi_turn_rollout import adjust_batch
+from agent_system.multi_turn_rollout import adjust_batch, compute_log_prob_with_prefetch
+
+# Overlap envs.reset() for the next rollout with this step's GPU training phases.
+# The reset is pure CPU / subprocess / HTTP work and the env managers are idle
+# between rollouts; the reset still runs exactly once per rollout and in the same
+# order, so stateful env schedules (alfworld's game-file iterator) are unchanged.
+# Opt-in; see TrajectoryCollector.prefetch_env_reset.
+_ENV_RESET_PREFETCH = os.environ.get("ENV_RESET_PREFETCH", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 class SkillSDRayTrainer(RLSDRayTrainer):
@@ -134,7 +141,16 @@ class SkillSDRayTrainer(RLSDRayTrainer):
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            batch_iter = iter(self.train_dataloader)
+            peeked_batch_dict = None
+            while True:
+                if peeked_batch_dict is not None:
+                    batch_dict = peeked_batch_dict
+                    peeked_batch_dict = None
+                else:
+                    batch_dict = next(batch_iter, None)
+                    if batch_dict is None:
+                        break
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -167,6 +183,24 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                             is_train=True,
                         )
 
+                    # The train envs are idle from here until the next rollout;
+                    # kick off their reset for the next step in a background
+                    # thread so it overlaps the GPU training phases below.
+                    if (
+                        _ENV_RESET_PREFETCH
+                        and not is_last_step
+                        and not self.config.algorithm.filter_groups.enable
+                    ):
+                        peeked_batch_dict = next(batch_iter, None)
+                        if peeked_batch_dict is not None and "env_kwargs" in peeked_batch_dict:
+                            # Same repeat the next multi_turn_loop applies to its
+                            # gen_batch (repeat(n, interleave=True) on non-tensors
+                            # is an element-wise np.repeat).
+                            next_env_kwargs = np.repeat(
+                                peeked_batch_dict["env_kwargs"], self.config.env.rollout.n
+                            )
+                            self.traj_collector.prefetch_env_reset(self.envs, next_env_kwargs)
+
                     del batch
                     batch = gen_batch_output
 
@@ -189,7 +223,15 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # Reuse any per-row log probs prefetched during the rollout
+                        # (ROLLOUT_PREFETCH_LOGPROB); computes everything normally
+                        # when nothing was prefetched.
+                        old_log_prob = compute_log_prob_with_prefetch(
+                            self.actor_rollout_wg,
+                            batch,
+                            self.traj_collector.take_prefetched_log_probs(),
+                            temperature=self.config.actor_rollout_ref.rollout.temperature,
+                        )
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode

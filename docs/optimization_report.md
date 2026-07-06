@@ -138,3 +138,12 @@ bash examples/sdar_trainer/run_multitask_qwen3_1_7b_no_preprocess.sh vllm
   with other work to push it higher.
 - `update_actor` (≈46% of step) and `teacher_forward` are compute-bound at ~97%;
   no accuracy-safe wall-time left there.
+
+---
+
+## 9. Phase 2 (follow-up branch)
+
+The deferred headroom above is partially claimed by the Phase 2 mechanisms
+(finished-trajectory log-prob prefetch, env-reset prefetch, retriever query
+cache, parallel tokenization, active-only decode/record, CUDA-graph knobs) —
+see `docs/optimization_phase2.md`.
