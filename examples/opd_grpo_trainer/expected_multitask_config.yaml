@@ -16,13 +16,12 @@
 #   - To change a setting intentionally: edit the run script AND this file in
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
-# ---- distillation loss (the knob that caused the original low_var_kl mishap) --
-"algorithm.opd.kl_loss_type": low_var_kl
+"algorithm.opd.kl_loss_type": topk_kl
 "algorithm.opd.kl_loss_coef": 1.0
 "algorithm.opd.topk": 20
 # effective values after main_opd_grpo's injection into the actor config
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
-"actor_rollout_ref.actor.teacher_kl_loss_type": low_var_kl
+"actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 
@@ -73,7 +72,7 @@
 
 # ---- environment ------------------------------------------------------------------
 "env.env_name": multitask
-"env.seed": 0
+"env.seed": 1
 "env.max_steps": 50
 "env.history_length": 4
 "env.rollout.n": 8
@@ -100,4 +99,4 @@
 "trainer.project_name": verl_agent_opd_grpo_multitask
 # experiment_name is pinned so the KL type embedded in the name can never go
 # stale relative to the actual loss config above.
-"trainer.experiment_name": opd_grpo_multitask_qwen3_1.7b_pg1.0_coef1.0_low_var_kl
+"trainer.experiment_name": sdar_multitask_opd_grpo_qwen3_1.7b

@@ -106,10 +106,10 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.teacher_paths.search=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +algorithm.opd.teacher_paths.webshop=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
     +algorithm.opd.kl_loss_coef=1.0 \
-    +algorithm.opd.kl_loss_type=low_var_kl \
+    +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
@@ -126,7 +126,7 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_grpo_multitask' \
-    trainer.experiment_name=opd_grpo_multitask_qwen3_1.7b_pg1.0_coef1.0_low_var_kl \
+    trainer.experiment_name=sdar_multitask_opd_grpo_qwen3_1.7b \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
