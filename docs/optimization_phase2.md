@@ -30,12 +30,18 @@ knob reproduces the Phase 1 behavior exactly when unset.
   `vanilla_multi_turn_loop`, `take_prefetched_log_probs`) +
   `agent_system/multi_turn_rollout/utils.py::compute_log_prob_with_prefetch` +
   the `old_log_prob` phase in `verl/trainer/ppo/skillsd_ray_trainer.py` /
-  `rlsd_ray_trainer.py`.
+  `rlsd_ray_trainer.py` / `opd_grpo_ray_trainer.py` (this branch's production
+  loop). Pure OPD (`opd_ray_trainer.py`) has no `old_log_prob` phase, so leave
+  `ROLLOUT_PREFETCH_LOGPROB` off for `main_opd` — the prefetched values would
+  never be consumed.
 - B: knobs in `examples/sdar_trainer/run_multitask_qwen3.sh` (the
   `cudagraph_capture_sizes` passthrough already exists in
-  `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py`).
+  `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py`). The flattened
+  OPD+GRPO script takes these as trailing Hydra overrides instead (e.g.
+  `VLLM_USE_V1=1 bash run_multitask_qwen3.sh '+actor_rollout_ref.rollout.cudagraph_capture_sizes=[8,16,32,64,128,256,384]'`).
 - C: `TrajectoryCollector.prefetch_env_reset` / `_reset_envs` + the peek-ahead
-  loop in both trainers' `fit()`.
+  loop in the skillsd / rlsd / opd_grpo trainers' `fit()` (with the pre-peek
+  dataloader snapshot used by their `_save_checkpoint` overrides).
 - D: `agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py`.
 - E: `preprocess_batch` / `_run_full_preprocess`, the decode and record blocks
   of `vanilla_multi_turn_loop`.
