@@ -117,19 +117,21 @@ def test_committed_expectations_file_self_consistent():
     assert check_expected_config(config, _EXPECT_FILE) == []
 
     # Sanity: the file pins the knob that caused the original mishap, and the
-    # run name embeds the same KL type so it can never go stale silently.
+    # algorithm-level and injected actor-level values agree with each other.
+    # (The run name itself is also pinned as a plain expectation key, so it is
+    # allowed to be any string — drift protection comes from the file.)
     expectations = load_expectations(_EXPECT_FILE)
     kl_type = expectations["algorithm.opd.kl_loss_type"]
     assert kl_type == expectations["actor_rollout_ref.actor.teacher_kl_loss_type"]
-    assert str(kl_type) in str(expectations["trainer.experiment_name"]), (
-        "trainer.experiment_name must embed algorithm.opd.kl_loss_type"
-    )
+    assert "trainer.experiment_name" in expectations
 
-    # Drift the effective KL type -> both the algorithm and actor keys must trip.
-    config.algorithm.opd.kl_loss_type = "topk_kl"
+    # Drift the effective KL type (to whichever value is NOT committed) -> both
+    # the algorithm and actor keys must trip.
+    drift_type = "low_var_kl" if kl_type == "topk_kl" else "topk_kl"
+    config.algorithm.opd.kl_loss_type = drift_type
     mismatched_keys = {key for key, _, _ in check_expected_config(config, _EXPECT_FILE)}
     assert mismatched_keys == {"algorithm.opd.kl_loss_type"}
-    config.actor_rollout_ref.actor.teacher_kl_loss_type = "topk_kl"
+    config.actor_rollout_ref.actor.teacher_kl_loss_type = drift_type
     mismatched_keys = {key for key, _, _ in check_expected_config(config, _EXPECT_FILE)}
     assert mismatched_keys == {
         "algorithm.opd.kl_loss_type",

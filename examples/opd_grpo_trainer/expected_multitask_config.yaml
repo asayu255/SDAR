@@ -97,6 +97,6 @@
 # ---- run identity ------------------------------------------------------------------
 "trainer.total_training_steps": 300
 "trainer.project_name": verl_agent_opd_grpo_multitask
-# experiment_name is pinned so the KL type embedded in the name can never go
-# stale relative to the actual loss config above.
+# experiment_name is pinned as part of the run identity: renaming (or reusing a
+# name for a different config) requires touching this file next to the knobs.
 "trainer.experiment_name": sdar_multitask_opd_grpo_qwen3_1.7b
