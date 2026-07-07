@@ -67,6 +67,17 @@ class SFTMultiTaskTaskRunner:
             config.actor_rollout_ref.actor.use_sdar_loss = False
             config.algorithm.use_kl_in_reward = False                # reward never shapes the loss
 
+        # Fail-fast intent check: validate the EFFECTIVE config (after the
+        # injection above) against the version-controlled expectations file.
+        from verl.utils.expected_config import enforce_expected_config
+
+        expect_file = config.trainer.get("expected_config", None)
+        assert expect_file is not None, (
+            "multitask SFT requires +trainer.expected_config=<expectations yaml> "
+            "(see examples/sft_trainer/expected_multitask_sft_config.yaml)"
+        )
+        enforce_expected_config(config, expect_file, tag="sft expected-config")
+
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),

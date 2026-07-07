@@ -73,6 +73,20 @@ class OPDGenTaskRunner:
         task = gen_cfg.task
         out_dir = gen_cfg.out_dir
 
+        # Fail-fast intent check: validate the composed config BEFORE the
+        # single-task restriction below (which rewrites tasks / batch sizes /
+        # model.path per invocation and filters the parquet on disk). The
+        # expectations file pins only task-agnostic knobs, which the
+        # restriction does not touch.
+        from verl.utils.expected_config import enforce_expected_config
+
+        expect_file = config.trainer.get("expected_config", None)
+        assert expect_file is not None, (
+            "Stage-1 generation requires +trainer.expected_config=<expectations yaml> "
+            "(see examples/sft_trainer/expected_multitask_sft_gen_config.yaml)"
+        )
+        enforce_expected_config(config, expect_file, tag="offpolicy-gen expected-config")
+
         # ---- Restrict everything to this single task; teacher drives the rollout. ----
         per_task_batch_size = int(config.data.task_balance.per_task_batch_size)
         with open_dict(config):
