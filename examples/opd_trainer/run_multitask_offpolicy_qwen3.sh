@@ -36,12 +36,13 @@ teacher_traj_dir=${TEACHER_TRAJ_DIR:-$HOME/data/verl-agent/sdar_multitask/teache
 # --- Throughput knobs (opt-in; same defaults as the OPD/SDAR multitask scripts) ---
 param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
-ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-10}
+ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
 max_model_len=${MAX_MODEL_LEN:-4608}
+search_url=${SEARCH_URL:-http://100.86.45.31:8001/retrieve}
 # -----------------------------------------------------------------------------
 
 experiment_name="opd_offpolicy_multitask_qwen3_1.7b_coef${opd_kl_loss_coef}_${opd_kl_loss_type}${opd_topk}"
@@ -113,7 +114,7 @@ common_args=(
     env.max_steps=50
     env.history_length=4
     env.rollout.n=$group_size
-    env.search.search_url='http://0.0.0.0:8000/retrieve'
+    env.search.search_url=$search_url
     env.multitask.tasks=[alfworld,search,webshop]
     env.multitask.max_steps.alfworld=50
     env.multitask.max_steps.search=4
