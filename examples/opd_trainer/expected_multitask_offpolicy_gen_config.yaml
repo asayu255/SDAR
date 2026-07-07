@@ -1,0 +1,56 @@
+# Expected effective config for Stage 1 of off-policy multitask distillation:
+# the frozen per-task teacher generating the fixed trajectory + top-k dataset.
+#
+# main_opd_offpolicy_gen validates the composed Hydra config against every key
+# below BEFORE its single-task restriction (which rewrites tasks / batch sizes /
+# model.path per invocation, and filters the parquet on disk) — so validation
+# runs before any side effect, and only TASK-AGNOSTIC knobs are pinned here.
+# These knobs define the teacher DATASET (its size, sampling temperature,
+# episode caps, seeds), i.e. the scientific identity of everything Stage 2
+# trains on.
+#
+# Rules: same as the other expectations files — scientific knobs only, no
+# performance knobs, no $HOME-derived or per-task values (gen.task,
+# gen.teacher_path, filtered parquet paths, per-task experiment names).
+
+# ---- dataset size / scoring ------------------------------------------------------
+"gen.num_trajectories": 2400
+"gen.topk": 20
+
+# ---- prompts / episode shape (identical to the on-policy OPD run) -----------------
+"data.train_batch_size": 15
+"data.val_batch_size": 15
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.per_task_batch_size": 15
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment / sampling --------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 0
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+"actor_rollout_ref.rollout.temperature": 1.0
+
+# ---- generation-run behavior (no training, no checkpoints, no validation) ---------
+"trainer.total_training_steps": 300
+"trainer.total_epochs": 300
+"trainer.save_freq": -1
+"trainer.test_freq": -1
+"trainer.val_before_train": false
+"trainer.project_name": verl_agent_opd_offpolicy_multitask
