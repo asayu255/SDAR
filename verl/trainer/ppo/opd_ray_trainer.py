@@ -14,6 +14,7 @@ so the teachers live on CPU and only ride to GPU during log-prob computation.
 """
 
 import copy
+import os
 from pprint import pprint
 
 import numpy as np
@@ -41,6 +42,13 @@ from verl.trainer.ppo.reward import compute_reward
 from verl.utils.metric import reduce_metrics
 
 from agent_system.multi_turn_rollout import adjust_batch
+
+# Overlap envs.reset() for the next rollout with this step's GPU training phases.
+# The reset is pure CPU / subprocess / HTTP work and the env managers are idle
+# between rollouts; the reset still runs exactly once per rollout and in the same
+# order, so stateful env schedules (alfworld's game-file iterator) are unchanged.
+# Opt-in; see TrajectoryCollector.prefetch_env_reset.
+_ENV_RESET_PREFETCH = os.environ.get("ENV_RESET_PREFETCH", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def compute_opd_data_metrics(batch: DataProto) -> dict:
@@ -196,6 +204,25 @@ class OPDRayTrainer(RayPPOTrainer):
                 worker_group=self.actor_rollout_wg,
             )
 
+    def _save_checkpoint(self):
+        """Same as the base trainer, except when ENV_RESET_PREFETCH has peeked
+        one dataloader batch ahead this step. The peeked batch has only had its
+        env_kwargs used for the background env reset — it is trained on the
+        *next* step — so the checkpoint must record the pre-peek dataloader
+        position; saving the live (post-peek) state would make a resumed run
+        skip that batch entirely.
+        """
+        pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
+        if pre_peek_state is None:
+            return super()._save_checkpoint()
+        # Shadow the bound state_dict with the pre-peek snapshot for the
+        # duration of the base save (which calls train_dataloader.state_dict()).
+        self.train_dataloader.state_dict = lambda: pre_peek_state
+        try:
+            return super()._save_checkpoint()
+        finally:
+            del self.train_dataloader.state_dict
+
     # ------------------------------------------------------------------ #
     # Per-task teacher routing.
     # ------------------------------------------------------------------ #
@@ -298,7 +325,19 @@ class OPDRayTrainer(RayPPOTrainer):
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            batch_iter = iter(self.train_dataloader)
+            peeked_batch_dict = None
+            while True:
+                if peeked_batch_dict is not None:
+                    batch_dict = peeked_batch_dict
+                    peeked_batch_dict = None
+                else:
+                    batch_dict = next(batch_iter, None)
+                    if batch_dict is None:
+                        break
+                # Reset the pre-peek dataloader snapshot each step; it is set
+                # again below if this step peeks ahead (see _save_checkpoint).
+                self._pre_peek_dataloader_state = None
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -330,6 +369,30 @@ class OPDRayTrainer(RayPPOTrainer):
                             envs=self.envs,
                             is_train=True,
                         )
+
+                    # The train envs are idle from here until the next rollout;
+                    # kick off their reset for the next step in a background
+                    # thread so it overlaps the GPU training phases below.
+                    if (
+                        _ENV_RESET_PREFETCH
+                        and not is_last_step
+                        and not self.config.algorithm.filter_groups.enable
+                    ):
+                        # Snapshot the dataloader state before peeking: the peeked
+                        # batch is trained on the NEXT step, so a checkpoint saved
+                        # this step must record the pre-peek position or a resumed
+                        # run would skip that batch (see _save_checkpoint).
+                        if hasattr(self.train_dataloader, "state_dict"):
+                            self._pre_peek_dataloader_state = self.train_dataloader.state_dict()
+                        peeked_batch_dict = next(batch_iter, None)
+                        if peeked_batch_dict is not None and "env_kwargs" in peeked_batch_dict:
+                            # Same repeat the next multi_turn_loop applies to its
+                            # gen_batch (repeat(n, interleave=True) on non-tensors
+                            # is an element-wise np.repeat).
+                            next_env_kwargs = np.repeat(
+                                peeked_batch_dict["env_kwargs"], self.config.env.rollout.n
+                            )
+                            self.traj_collector.prefetch_env_reset(self.envs, next_env_kwargs)
 
                     del batch
                     batch = gen_batch_output

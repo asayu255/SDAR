@@ -1,0 +1,104 @@
+# Expected effective config for the pure-OPD multitask run.
+#
+# This file is the machine-readable INTENT of the experiment. main_opd
+# validates the composed Hydra config against every key below AFTER its own
+# config injection (verl/utils/expected_config.py) and aborts on any mismatch,
+# so a wrong default / typo'd override / shadowed injection fails in seconds
+# instead of producing a mislabeled multi-hour run.
+#
+# Rules:
+#   - Keys are dotted paths into the composed config; values are the expected
+#     effective values.
+#   - Only SCIENTIFIC knobs live here (they define what the experiment *is*).
+#     Performance knobs (micro batch sizes, offload, prefix caching,
+#     max_model_len, gpu_memory_utilization, ...) are intentionally NOT listed
+#     so machine tuning never requires touching this file. $HOME-derived data
+#     paths are also not pinned (machine-dependent).
+#   - To change a setting intentionally: edit the run script AND this file in
+#     the same commit. A run-script-only edit will (by design) refuse to start.
+
+# ---- distillation loss (the knob that caused the original low_var_kl mishap) --
+"algorithm.opd.kl_loss_type": low_var_kl
+"algorithm.opd.kl_loss_coef": 1.0
+"algorithm.opd.topk": 20
+# effective values after main_opd's injection into the actor config
+"actor_rollout_ref.actor.use_teacher_kl_loss": true
+"actor_rollout_ref.actor.teacher_kl_loss_type": low_var_kl
+"actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
+"actor_rollout_ref.actor.teacher_kl_topk": 20
+
+# ---- pure-distillation invariants (no other signal enters the loss) -----------
+"algorithm.adv_estimator": grpo
+"algorithm.use_kl_in_reward": false
+"actor_rollout_ref.actor.pg_loss_coef": 0
+"actor_rollout_ref.actor.use_kl_loss": false
+"actor_rollout_ref.actor.entropy_coeff": 0
+"actor_rollout_ref.actor.use_sdl_loss": false
+"actor_rollout_ref.actor.use_sdar_loss": false
+"actor_rollout_ref.actor.use_invalid_action_penalty": true
+"actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
+"actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
+  alfworld: 0.1
+  search: 0.01
+  webshop: 0.1
+
+# ---- teachers -------------------------------------------------------------------
+"algorithm.opd.teacher_paths.alfworld": /opt/home/ohara/checkpoints/teachers/alfworld_step300
+"algorithm.opd.teacher_paths.search": /opt/home/ohara/checkpoints/teachers/search_step300
+"algorithm.opd.teacher_paths.webshop": /opt/home/ohara/checkpoints/teachers/webshop_step300
+
+# ---- model / optimization -------------------------------------------------------
+"actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
+"actor_rollout_ref.actor.optim.lr": 1.0e-6
+"actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
+"actor_rollout_ref.actor.ppo_mini_batch_size": 60
+
+# ---- data -----------------------------------------------------------------------
+"data.train_batch_size": 45
+"data.val_batch_size": 126
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.enable": true
+"data.task_balance.per_task_batch_size": 15
+"data.task_balance.num_batches": 300
+"data.task_balance.tasks": [alfworld, search, webshop]
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment ------------------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 0
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.tasks": [alfworld, search, webshop]
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+"env.multitask.val_per_task_batch_size": 126
+
+# ---- rollout sampling / validation protocol ----------------------------------------
+"actor_rollout_ref.rollout.temperature": 1.0
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
+
+# ---- run identity ------------------------------------------------------------------
+"trainer.total_training_steps": 300
+"trainer.project_name": verl_agent_opd_multitask
+# experiment_name is pinned as part of the run identity: renaming (or reusing a
+# name for a different config) requires touching this file next to the knobs.
+"trainer.experiment_name": opd_multitask_qwen3_1.7b_coef1.0_low_var_kl
