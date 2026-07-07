@@ -69,12 +69,27 @@ class OPDGRPOTaskRunner:
             config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
             # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
             config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
-            # GRPO policy-gradient weight (default 1.0; overridable via the run script).
-            config.actor_rollout_ref.actor.pg_loss_coef = opd_cfg.get("pg_loss_coef", 1.0)
+            # pg_loss_coef is taken directly from actor_rollout_ref.actor.pg_loss_coef
+            # (the run script sets it there). It used to be re-injected from
+            # algorithm.opd.pg_loss_coef — which the script never sets — silently
+            # overriding the script's value with 1.0; that injection is removed.
             # No reference-KL term and no SDL/SDAR distillation paths.
             config.actor_rollout_ref.actor.use_kl_loss = False
             config.actor_rollout_ref.actor.use_sdl_loss = False
             config.actor_rollout_ref.actor.use_sdar_loss = False
+
+        # Fail-fast intent check: validate the EFFECTIVE config (after the
+        # injection above) against the version-controlled expectations file.
+        # Required — a run without a pinned intent is exactly how the
+        # low_var_kl-instead-of-topk_kl mishap happened.
+        from verl.utils.expected_config import enforce_expected_config
+
+        expect_file = config.trainer.get("expected_config", None)
+        assert expect_file is not None, (
+            "OPD+GRPO requires +trainer.expected_config=<expectations yaml> "
+            "(see examples/opd_grpo_trainer/expected_multitask_config.yaml)"
+        )
+        enforce_expected_config(config, expect_file, tag="opd-grpo expected-config")
 
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,
