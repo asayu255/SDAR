@@ -19,10 +19,9 @@
 
 # ---- SFT loss (hard-target sibling of the off-policy top-k teacher-KL) ---------
 "algorithm.sft.loss_coef": 1.0
-# Epochs the fixed teacher pool is reused (standard SFT; TAID's SFT baseline=5).
-# The effective Stage-2 step count is derived at runtime from num_epochs and the
-# pool size (MultiTaskSFTTrainer.__init__), so trainer.total_training_steps below
-# is a nominal data/config bound, not the Stage-2 step count.
+# Epochs the fixed teacher pool is intended to be reused (standard SFT; TAID's
+# SFT baseline=5). Stage 2 keeps trainer.total_training_steps fixed at 300; the
+# Stage-1 pool size is chosen so 300 steps draws each trajectory about 5 times.
 "algorithm.sft.num_epochs": 5
 # effective values after main_sft_multitask's injection into the actor config
 "actor_rollout_ref.actor.use_sft_loss": true

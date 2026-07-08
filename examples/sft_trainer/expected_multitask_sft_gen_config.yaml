@@ -15,7 +15,7 @@
 # gen.teacher_path, filtered parquet paths, per-task experiment names).
 
 # ---- dataset size / content ---------------------------------------------------------
-"gen.num_trajectories": 2400
+"gen.num_trajectories": 7200
 "gen.collect_topk": false
 
 # ---- prompts / episode shape (identical to the OPD / offline-KD runs) --------------

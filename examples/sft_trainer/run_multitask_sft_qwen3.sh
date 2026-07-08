@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=alfworld \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=2400 \
+    +gen.num_trajectories=7200 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -133,7 +133,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=search \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=2400 \
+    +gen.num_trajectories=7200 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -212,7 +212,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=webshop \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=2400 \
+    +gen.num_trajectories=7200 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -374,8 +374,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
-# NOTE: Stage 2 (SFT) reuses the fixed teacher pool for algorithm.sft.num_epochs
-# epochs; MultiTaskSFTTrainer derives the effective step count from the pool size
-# and num_epochs (see its __init__), so trainer.total_training_steps=300 above is
-# the nominal data/config bound, NOT the Stage-2 step count. test_freq is lowered
-# accordingly so validation still runs a few times within the shorter run.
+# NOTE: Stage 2 (SFT) keeps trainer.total_training_steps fixed at 300. With
+# per_task_batch_size=15 and env.rollout.n=8, each step draws 15*8=120
+# trajectories/task; 7200 Stage-1 trajectories/task therefore gives
+# 300 * 120 / 7200 = 5 epochs of fixed-pool reuse.
