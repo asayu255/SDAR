@@ -78,6 +78,18 @@ def test_resolve_data_dir_reads_sft_namespace():
         trainer._resolve_data_dir()
 
 
+def test_epoch_to_step_conversion():
+    # total_steps == num_epochs * ceil(max_pool / per_task_traj_per_step).
+    # e.g. pool=2400 trajectories/task, 120 trajectories/step, 5 epochs -> 100 steps
+    #   (each trajectory reused ~5 times, standard SFT).
+    assert MultiTaskSFTTrainer._steps_per_epoch(2400, 120) == 20
+    assert 5 * MultiTaskSFTTrainer._steps_per_epoch(2400, 120) == 100
+    # non-divisible pools round up so the whole pool is covered each epoch
+    assert MultiTaskSFTTrainer._steps_per_epoch(2401, 120) == 21
+    # a pool smaller than one step's draw still yields at least 1 step/epoch
+    assert MultiTaskSFTTrainer._steps_per_epoch(10, 120) == 1
+
+
 def test_load_and_balanced_iter_on_topk_free_data(tmp_path):
     # 6 trajectories/task, 2 turns each; NO teacher top-k fields (SFT data).
     _make_sft_task_proto("alfworld", 6, turns_per_traj=2).save_to_disk(str(tmp_path / "alfworld.pt"))

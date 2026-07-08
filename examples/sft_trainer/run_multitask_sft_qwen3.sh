@@ -354,6 +354,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.nnodes=1 \
     +algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
     +algorithm.sft.loss_coef=1.0 \
+    +algorithm.sft.num_epochs=5 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample=True \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature=0 \
@@ -369,7 +370,12 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.experiment_name=sft_multitask_qwen3_1.7b_coef1.0 \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_sft_multitask \
     trainer.save_freq=25 \
-    trainer.test_freq=150 \
+    trainer.test_freq=25 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
+# NOTE: Stage 2 (SFT) reuses the fixed teacher pool for algorithm.sft.num_epochs
+# epochs; MultiTaskSFTTrainer derives the effective step count from the pool size
+# and num_epochs (see its __init__), so trainer.total_training_steps=300 above is
+# the nominal data/config bound, NOT the Stage-2 step count. test_freq is lowered
+# accordingly so validation still runs a few times within the shorter run.
