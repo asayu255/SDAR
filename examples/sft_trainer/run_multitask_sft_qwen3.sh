@@ -84,7 +84,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.model.use_fused_kernels=False \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
