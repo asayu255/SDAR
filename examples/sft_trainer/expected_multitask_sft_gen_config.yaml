@@ -36,7 +36,7 @@
 
 # ---- environment / sampling --------------------------------------------------------
 "env.env_name": multitask
-"env.seed": 0
+"env.seed": 1
 "env.max_steps": 50
 "env.history_length": 4
 "env.rollout.n": 8
