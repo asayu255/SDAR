@@ -32,6 +32,13 @@ set -x
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   e.g.  ROLLOUT_KEEP_VLLM_AWAKE=1 ENV_RESET_PREFETCH=1 bash run_multitask_qwen3.sh
+#
+# Dynamic (token-budget) micro-batching is wired below but OFF by default so the
+# fixed-batch objective is unchanged. It packs micro-batches to a token budget
+# (helps when the topk_kl backward forces tiny fixed micro-batches). Enable via a
+# trailing override; dynamic_bsz_token_scale=True keeps token-mean exact
+# (token-weighted, grouping-invariant) rather than the sample-count reweighting:
+#   e.g.  bash run_multitask_qwen3.sh actor_rollout_ref.actor.use_dynamic_bsz=True
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -83,6 +90,9 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
+    actor_rollout_ref.actor.use_dynamic_bsz=False \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
+    +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.pg_loss_coef=1.0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -90,6 +100,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -105,6 +116,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
