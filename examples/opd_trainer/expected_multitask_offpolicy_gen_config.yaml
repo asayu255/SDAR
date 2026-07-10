@@ -14,7 +14,10 @@
 # gen.teacher_path, filtered parquet paths, per-task experiment names).
 
 # ---- dataset size / scoring ------------------------------------------------------
-"gen.num_trajectories": 2400
+# Pool sized so Stage 2 = 300 steps x 5 epochs: 300 * (per_task_batch_size 15 *
+# env.rollout.n 8 = 120 traj/step) / 5 epochs = 7200 trajectories/task. Stage 2
+# keeps trainer.total_training_steps=300, so a 7200 pool is reused ~5 times.
+"gen.num_trajectories": 7200
 "gen.topk": 20
 
 # ---- prompts / episode shape (identical to the on-policy OPD run) -----------------
