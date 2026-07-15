@@ -81,7 +81,10 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.model.use_fused_kernels=False \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.use_dynamic_bsz=False \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
+    +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.pg_loss_coef=0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -89,6 +92,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -103,7 +107,8 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
@@ -113,10 +118,10 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.teacher_paths.search=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +algorithm.opd.teacher_paths.webshop=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
     +algorithm.opd.kl_loss_coef=1.0 \
-    +algorithm.opd.kl_loss_type=low_var_kl \
+    +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
@@ -133,7 +138,7 @@ python3 -m verl.trainer.main_opd \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_multitask' \
-    trainer.experiment_name=opd_multitask_qwen3_1.7b_coef1.0_low_var_kl \
+    trainer.experiment_name=opd_multitask_qwen3_1.7b_coef1.0_topk_kl \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \

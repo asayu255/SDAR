@@ -417,6 +417,14 @@ class DataParallelPPOActor(BasePPOActor):
         use_teacher_kl_loss = self.config.get("use_teacher_kl_loss", False)
         teacher_kl_loss_type = self.config.get("teacher_kl_loss_type", "low_var_kl")
         teacher_topk_kl = use_teacher_kl_loss and teacher_kl_loss_type == "topk_kl"
+        # Exact token-mean under dynamic bsz: scale each micro-batch by its valid-token
+        # share of the mini-batch (token-weighted) instead of by sample count, so the
+        # objective is grouping-invariant and matches the true global token-mean.
+        dynamic_bsz_token_scale = (
+            self.config.use_dynamic_bsz
+            and self.config.get("dynamic_bsz_token_scale", False)
+            and self.config.loss_agg_mode == "token-mean"
+        )
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         # advantages / old_log_probs are only needed by the policy-gradient (and SDL) paths.
         # Pure teacher-KL distillation (pg_loss_coef==0) does not produce them, so don't require them.
@@ -451,6 +459,13 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
+                # Total valid response tokens in this mini-batch (for exact token-mean
+                # scaling under dynamic bsz). Same mask rule as the per-micro loss below.
+                minibatch_valid_tokens = None
+                if dynamic_bsz_token_scale:
+                    _resp_len = mini_batch["responses"].size(1)
+                    _mb_mask = mini_batch["loss_mask"][:, -_resp_len:] if multi_turn else mini_batch["attention_mask"][:, -_resp_len:]
+                    minibatch_valid_tokens = float(_mb_mask.sum().clamp(min=1))
                 if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
@@ -603,8 +618,18 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
                     if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        if minibatch_valid_tokens is not None:
+                            # Exact global token-mean: policy_loss is a token-mean
+                            # (denominator = this micro-batch's valid tokens), so
+                            # policy_loss * micro_valid_tokens = token-sum, and dividing
+                            # by the mini-batch's total valid tokens makes the per-token
+                            # weight independent of how tokens were grouped into
+                            # micro-batches (unlike the sample-count factor below).
+                            micro_valid_tokens = response_mask.sum()
+                            loss = policy_loss * (micro_valid_tokens / minibatch_valid_tokens)
+                        else:
+                            # relative to the dynamic bsz (sample-count reweighting)
+                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
