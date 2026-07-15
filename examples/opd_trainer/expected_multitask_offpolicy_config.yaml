@@ -69,7 +69,7 @@
 
 # ---- environment (validation rollouts) ---------------------------------------------
 "env.env_name": multitask
-"env.seed": 0
+"env.seed": 1
 "env.max_steps": 50
 "env.history_length": 4
 "env.rollout.n": 8
@@ -96,4 +96,4 @@
 "trainer.project_name": verl_agent_opd_offpolicy_multitask
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
 # name for a different config) requires touching this file next to the knobs.
-"trainer.experiment_name": opd_offpolicy_multitask_qwen3_1.7b_coef1.0_topk_kl20
+"trainer.experiment_name": sdar_multitask_offline_qwen3_1.7b

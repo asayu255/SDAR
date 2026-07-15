@@ -372,7 +372,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     trainer.experiment_name=opd_offpolicy_multitask_qwen3_1.7b_coef1.0_topk_kl20 \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask \
     trainer.save_freq=25 \
-    trainer.test_freq=25 \
+    trainer.test_freq=50 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
