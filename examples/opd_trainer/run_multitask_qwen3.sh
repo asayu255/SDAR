@@ -138,7 +138,7 @@ python3 -m verl.trainer.main_opd \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_multitask' \
-    trainer.experiment_name=opd_multitask_qwen3_1.7b_coef1.0_topk_kl \
+    trainer.experiment_name=opd_multitask_qwen3_1.7b \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
