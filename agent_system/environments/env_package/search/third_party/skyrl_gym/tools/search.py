@@ -17,6 +17,17 @@ logger.setLevel(logging.INFO)
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 10
 INITIAL_RETRY_DELAY = 1
+# Upper bound (seconds) for the backoff delay, so indefinite retries do not grow
+# the wait without limit. Override with SEARCH_MAX_RETRY_DELAY.
+MAX_RETRY_DELAY = int(os.environ.get("SEARCH_MAX_RETRY_DELAY", "30"))
+
+# When enabled (default), connection/timeout errors -- the retriever is
+# unreachable or not started yet (e.g. "[Errno 113] No route to host") -- are
+# retried indefinitely until the service becomes reachable again, instead of
+# giving up after MAX_RETRIES. Other errors (4xx, JSON decode, 5xx) still stop
+# after MAX_RETRIES. Set SEARCH_WAIT_FOR_SERVICE=0 to restore the old bounded
+# behavior. NOTE: if the retriever never comes back, callers block forever.
+WAIT_FOR_SERVICE = os.environ.get("SEARCH_WAIT_FOR_SERVICE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Cache retrieval results per (url, topk, query). RL rollouts re-issue the same
 # search query many times (identical questions across GRPO group members and
@@ -67,11 +78,13 @@ def call_search_api(
         should_close_session = False
 
     last_error = None
-    for attempt in range(MAX_RETRIES):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             if log_requests:
                 logger.info(
-                    f"{log_prefix}Attempt {attempt + 1}/{MAX_RETRIES}: Calling search API at {retrieval_service_url}"
+                    f"{log_prefix}Attempt {attempt}: Calling search API at {retrieval_service_url}"
                 )
             response = session.post(
                 retrieval_service_url,
@@ -82,20 +95,21 @@ def call_search_api(
 
             # Check for Gateway Timeout (504) and other server errors for retrying
             if response.status_code in [500, 502, 503, 504]:
-                last_error = f"{log_prefix}API Request Error: Server Error ({response.status_code}) on attempt {attempt + 1}/{MAX_RETRIES}"
+                last_error = f"{log_prefix}API Request Error: Server Error ({response.status_code}) on attempt {attempt}"
                 logger.warning(last_error)
-                if attempt < MAX_RETRIES - 1:
-                    delay = INITIAL_RETRY_DELAY * (attempt + 1)
+                if attempt < MAX_RETRIES:
+                    delay = min(INITIAL_RETRY_DELAY * attempt, MAX_RETRY_DELAY)
                     logger.info(f"{log_prefix}Retrying after {delay} seconds...")
                     time.sleep(delay)
-                continue
+                    continue
+                break
 
             # Check for other HTTP errors (e.g., 4xx)
             response.raise_for_status()
 
             # If successful (status code 2xx)
             if log_requests:
-                logger.info(f"{log_prefix}Search API call successful on attempt {attempt + 1}")
+                logger.info(f"{log_prefix}Search API call successful on attempt {attempt}")
 
             # Close session if we created it
             if should_close_session:
@@ -103,22 +117,20 @@ def call_search_api(
 
             return response.json(), None
 
-        except requests.exceptions.ConnectionError as e:
-            last_error = f"{log_prefix}Connection Error: {e}"
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Retriever is unreachable / not started yet. Retry indefinitely while
+            # WAIT_FOR_SERVICE is enabled, otherwise fall back to MAX_RETRIES.
+            if isinstance(e, requests.exceptions.Timeout):
+                last_error = f"{log_prefix}Timeout Error: {e}"
+            else:
+                last_error = f"{log_prefix}Connection Error: {e}"
             logger.warning(last_error)
-            if attempt < MAX_RETRIES - 1:
-                delay = INITIAL_RETRY_DELAY * (attempt + 1)
+            if WAIT_FOR_SERVICE or attempt < MAX_RETRIES:
+                delay = min(INITIAL_RETRY_DELAY * attempt, MAX_RETRY_DELAY)
                 logger.info(f"{log_prefix}Retrying after {delay} seconds...")
                 time.sleep(delay)
-            continue
-        except requests.exceptions.Timeout as e:
-            last_error = f"{log_prefix}Timeout Error: {e}"
-            logger.warning(last_error)
-            if attempt < MAX_RETRIES - 1:
-                delay = INITIAL_RETRY_DELAY * (attempt + 1)
-                logger.info(f"{log_prefix}Retrying after {delay} seconds...")
-                time.sleep(delay)
-            continue
+                continue
+            break
         except requests.exceptions.RequestException as e:
             last_error = f"{log_prefix}API Request Error: {e}"
             break  # Exit retry loop on other request errors
@@ -131,7 +143,7 @@ def call_search_api(
             break  # Exit retry loop on other unexpected errors
 
     # If we reach here, all attempts failed
-    logger.error(f"{log_prefix}API Request Failed after {MAX_RETRIES} attempts: {last_error}")
+    logger.error(f"{log_prefix}API Request Failed after {attempt} attempts: {last_error}")
 
     # Close session if we created it
     if should_close_session:
