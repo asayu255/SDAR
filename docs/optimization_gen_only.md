@@ -48,7 +48,7 @@ workload at all.
 
 ## 2. New gen-only mechanisms, ranked
 
-### G1 — Run the three tasks concurrently, 1 GPU each (est. 2.5–3× wall)
+### G1 — Run the three tasks concurrently, 1 GPU each (est. 2.5–3× wall) — **IMPLEMENTED**
 
 Today: `alfworld(3 GPU) → search(3 GPU) → webshop(3 GPU)`, sequential.
 `tensor_model_parallel_size=1` already, so each GPU holds a complete engine and
@@ -64,21 +64,35 @@ longer waits on the other two. Also removes the cross-GPU collective in every
 `generate_sequences` dispatch and makes DP imbalance structurally impossible
 (one task per device — Phase 1's ④ solved the same problem the hard way).
 
-Caveats, all real:
-- KV cache: 120 concurrent sequences on one GPU. At alfworld's actual prompt
-  length (`max_prompt_length=2048`) ≈ 114 KB/token × ~2000 tokens ≈ 230 MB per
-  sequence → ~27 GB (est.). Needs G3 (`gpu_memory_utilization`) and G4
-  (per-task `max_model_len`), or vLLM will preempt and you lose the win.
+Shipped in `run_multitask_offpolicy_qwen3_gen_only.sh`: each block is prefixed
+`CUDA_VISIBLE_DEVICES=<i> RAY_ADDRESS=local RAY_TMPDIR=/tmp/ray_gen_<task>`,
+carries `trainer.n_gpus_per_node=1`, redirects to
+`teacher_traj/gen_<task>.log`, and backgrounds; the script waits on all three
+PIDs, prints a per-task exit-status summary and exits non-zero if any failed.
+
+Ray isolation matters more than the port collisions suggest: without
+`RAY_ADDRESS=local` a later `ray.init()` can attach to a sibling's cluster,
+which then reports 0 free GPUs and hangs until
+`ray_wait_register_center_timeout`. `include_dashboard=False` removes the
+default-port race, and `object_store_memory` is pinned because the default
+("30% of *available* memory") is racy when three instances start at once and
+can overflow `/dev/shm`.
+
+Remaining caveats:
+- KV cache: 120 concurrent sequences on one GPU. At alfworld's per-turn prompt
+  length ≈ 114 KB/token × ~2000 tokens ≈ 230 MB per sequence → ~27 GB (est.),
+  against 48 GB at `gpu_memory_utilization=0.6` on an 80 GB card. search, whose
+  retrieved passages make the longest prompts, is the one to watch. Symptom to
+  look for in the vLLM logs: preemption / "cache full". The knobs are G3 —
+  read it first, the obvious move there is wrong.
 - CPU/RAM: 3 env fleets alive at once (alfworld game loading is the heavy one),
   and the search task hits the retriever alone rather than sharing a window.
-- Ray: three `ray.init()` instances on one host. Give each a distinct
-  `RAY_TMPDIR`/temp dir so the GCS/dashboard ports and object store do not
-  collide.
 
 Accuracy class: not bit-identical (DP world size changes vLLM batch
-composition), same distribution-preserving class as ③.
-Side benefit: `adjust_batch`'s divisor drops from `lcm(16·3, 5·3)=240` to
-`lcm(16,5)=80`, so fewer duplicated rows (see G6).
+composition), same distribution-preserving class as ③. One dataset-visible
+side effect: `adjust_batch`'s divisor drops from `lcm(16·3, 5·3)=240` to
+`lcm(16,5)=80`, so a different (smaller) number of duplicated turn-rows is
+padded into each `<task>.pt` — see G6, which removes the duplication entirely.
 
 ### G2 — Enlarge the generation batch (est. 1.5–2.5× on alfworld)
 
@@ -120,26 +134,57 @@ Accuracy class: distribution-preserving (③-class). Trajectory count, prompt
 pool coverage and sampling temperature are unchanged; only which prompts share
 a batch changes.
 
-### G3 — `gpu_memory_utilization` 0.6 → 0.80–0.85
+### G3 — KV headroom: cut the top-k micro-batch *before* raising `gpu_memory_utilization`
 
 0.6 is inherited from the *training* script, where the same GPU must also hold
-FSDP gradients, Adam state and `update_actor` activations. In gen-only none of
-those exist. The non-vLLM resident set is the FSDP shard (fp32, ~2.3 GB/GPU at
-world size 3; ~6.8 GB at world size 1) plus the top-k forward's activations.
+FSDP gradients, Adam state and `update_actor` activations, none of which exist
+in gen-only — which makes "just raise it to 0.85" the obvious move. **It is the
+wrong one, and it will OOM.**
 
-Everything freed goes to KV cache → more concurrent sequences → this is what
-makes G1 and G2 land instead of preempting.
+What actually bounds the non-vLLM budget is the top-k forward. With
+`use_remove_padding=True`, `_forward_micro_batch` materializes `logits_rmpad`
+of shape `(nnz, vocab)` before taking the top-k
+(`dp_actor.py:218-231`). At `log_prob_micro_batch_size_per_gpu=16` and ~2560
+tokens per row that is 40 960 × 151 936 × 2 B ≈ **12.4 GB for the logits
+alone**, plus the `logsumexp`/`topk` temporaries and the model itself.
 
-### G4 — Per-task `max_model_len` (est. 1.8× KV capacity for alfworld)
+And G1 makes this *worse*, not better: at world size 1 the FSDP shard is the
+full fp32 model (~6.8 GB) rather than a third of it (~2.3 GB). So the peak
+non-vLLM working set is roughly 12.4 + 6.8 ≈ 19 GB — against the 32 GB that
+`gpu_memory_utilization=0.6` leaves on an 80 GB card. At 0.85 it would have
+12 GB and fail.
 
-`max_model_len=4608` is `4096 + 512`, sized for search/webshop. But alfworld's
-`task_overrides` cap its prompt at 2048, and Stage 1 runs **one task per
-process** — so alfworld can run at `max_model_len=2560`. vLLM sizes its
-per-sequence block budget from this, so alfworld gets ~1.8× the concurrency at
-the same memory. alfworld is the task with the longest tail, so this is the
-task where concurrency matters most.
+The correct order is therefore:
+1. Lower `log_prob_micro_batch_size_per_gpu` (16 → 4 puts the logits at
+   ~3.1 GB). The top-k forward is compute-bound; 4 × 2560 ≈ 10 k tokens still
+   saturates a 1.7B forward, so this costs little.
+2. *Then* raise `gpu_memory_utilization`, using the headroom that freed.
 
-Pure speedup, truncates nothing (the task's own prompt cap is 2048).
+Both are ③-class (micro-batch grouping / KV sizing; per-row results
+unchanged). Measure the peak with `GPU_PROFILER=1` rather than trusting the
+arithmetic above — it is an estimate from tensor shapes, not an observation.
+
+### G4 — Per-task `max_model_len` — **do not apply as first described**
+
+The idea was: `max_model_len=4608` is sized for search/webshop, alfworld's
+`task_overrides` cap its prompt at 2048, and Stage 1 runs one task per process,
+so alfworld could run at 2560 and get ~1.8× the KV concurrency.
+
+**This is unsafe.** The `task_overrides` apply only to the initial dataset
+load. The *per-turn* prompt rebuild inside the rollout tokenizes against the
+global `self.config.data.max_prompt_length` = 4096
+(`rollout_loop.py:376` and the truncation branch at `:404-414`), not the task
+override. So an alfworld turn prompt may legitimately reach 4096 tokens, and a
+2560-token engine would reject or truncate it.
+
+verl does not catch this for you: `vllm_rollout_spmd.py:143` takes
+`max_model_len` verbatim and only asserts the *model's* context length against
+`prompt_length + response_length`.
+
+To make this mechanism available, the per-turn tokenization would have to
+become task-aware (use the same override the dataset used). Until then the only
+safe version is to measure the actual per-turn prompt-length distribution and
+set `max_model_len` above its maximum with margin.
 
 ### G5 — Invert ⑤: `actor.fsdp_config.param_offload=True` for gen
 
@@ -318,22 +363,26 @@ export SEARCH_QUERY_CACHE=1          # D (search block only; needs a fixed index
 # ②/E2/E3 default on; ③ already passed as a Hydra arg
 ```
 
-and change these Hydra args (performance-only, not in the expectations file):
+**Done.** G1 — three tasks concurrently at `trainer.n_gpus_per_node=1`, one
+`CUDA_VISIBLE_DEVICES` each, per-task Ray isolation and logs, `&` + `wait` with
+per-task exit statuses.
 
-```
-actor_rollout_ref.rollout.gpu_memory_utilization=0.85     # G3 (was 0.6)
-actor_rollout_ref.actor.fsdp_config.param_offload=True    # G5 (was False)
-actor_rollout_ref.rollout.max_model_len=2560              # G4, alfworld block only
-```
+**Next, and only with a profile in hand (G3, in this order).** Lower
+`actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu` 16 → 4, *then*
+raise `actor_rollout_ref.rollout.gpu_memory_utilization` from 0.6. Doing the
+second without the first OOMs the top-k forward — read G3.
 
-**Next (script-only, biggest win).** G1: three tasks concurrently at
-`trainer.n_gpus_per_node=1`, one `CUDA_VISIBLE_DEVICES` each, distinct
-`RAY_TMPDIR`, `&` + `wait`.
+**Cheap and independent.**
+`actor_rollout_ref.actor.fsdp_config.param_offload=True` (G5, bit-identical):
+returns ~6.8 GB/GPU at world size 1 to the KV cache for the whole rollout, since
+`fsdp_vllm.py:200-203` offloads the shard immediately after syncing weights into
+vLLM and `compute_actor_topk_log_prob` reloads it only for its own forward.
 
 **Then (needs an expectations-file edit).** G2: `per_task_batch_size=30`,
 `num_batches=150`.
 
 **Then (code).** G9 (bit-identical, smallest diff) → G8 → G7 → storage (§3).
+G4 needs a code change first — see G4.
 
 **Separately, as scientific decisions.** G6 (removes duplicated rows from the
 Stage-2 dataset) and G10 (changes the KD targets).
