@@ -10,15 +10,14 @@ set -x
 # plus a retriever round trip per turn).
 #
 # Split out of run_multitask_offpolicy_qwen3.sh, which runs data prep + Stage 1
-# + Stage 2 back to back. The three python3 blocks below are byte-identical to
-# that script's Stage-1 blocks, so both entry points generate the same dataset.
-# Companion scripts:
-#   prepare_multitask_data.sh                  — data prep only (run this first)
-#   run_multitask_offpolicy_qwen3_nogen.sh     — Stage 2 only, on the .pt files
-#                                                this script produces
+# + Stage 2 back to back. This script keeps that script's data prep and Stage-1
+# blocks byte-identical and drops only Stage 2, so it is self-contained: run it
+# on a clean machine and it builds the prompt parquets and then the full teacher
+# dataset. Stage 2 then runs from run_multitask_offpolicy_qwen3_nogen.sh on the
+# .pt files produced here.
 #
-# Prerequisites:
-#   * train.parquet / test.parquet exist (prepare_multitask_data.sh)
+# Prerequisites (everything else this script makes itself):
+#   * the preprocessed SearchR1 corpus at --search_dir below
 #   * the three teacher checkpoints exist at the +gen.teacher_path below
 #   * the retriever is up at SEARCH_URL (the search task calls it every turn)
 #   * ALFWORLD_DATA points at the alfworld data
@@ -45,6 +44,16 @@ set -x
 # per_task_batch_size 15 * env.rollout.n 8 = 120 trajectories/task/step over 300
 # steps, so a 36000 pool is consumed exactly once with no replay.
 #
+# Generation reaches that number in exactly one pass of its own prompt pool.
+# Every gen step turns data.train_batch_size 15 prompts into 15 * env.rollout.n 8
+# = 120 trajectories, so 36000 takes 300 steps per task:
+#   search   4500 real prompts / 15 = 300 batches = 1 epoch, no prompt reused
+#   alfworld 15 placeholder rows = 1 batch/epoch x trainer.total_epochs 300 = 300
+#   webshop  same as alfworld (their variety is fresh episodes, not prompts)
+# Both counts land on 300 with nothing to spare, so keep --total_training_steps,
+# --per_task_batch_size, env.rollout.n and trainer.total_epochs consistent if you
+# change any of them.
+#
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1  SEARCH_QUERY_CACHE=1  ROLLOUT_PREPROC_WORKERS=8
@@ -58,6 +67,24 @@ export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
+
+# Data prep — same prompts/tasks as the on-policy OPD run. These literals are
+# cross-checked by the expectations files (per_task_batch_size=15,
+# val_per_task_size=126, total_training_steps=300, seed=1).
+# Deterministic (--seed 1) and idempotent: rerunning overwrites train.parquet /
+# test.parquet with byte-identical content, so it is safe to leave in place when
+# rerunning generation. It is pure pandas — no GPU, Ray, env or model download —
+# and finishes in seconds; its INFO logs are swallowed because importing
+# verl.utils.hdfs_io sets a WARN level before logging.basicConfig runs, so an
+# empty console here means success, not a no-op.
+python3 -m examples.data_preprocess.prepare_sdar_multitask \
+    --search_dir "$HOME/data/searchR1_processed_direct" \
+    --local_dir "$HOME/data/verl-agent/sdar_multitask" \
+    --total_training_steps 300 \
+    --per_task_batch_size 15 \
+    --env_train_per_task_size 15 \
+    --val_per_task_size 126 \
+    --seed 1
 
 # ===================== Stage 1: teacher trajectory generation =====================
 python3 -m verl.trainer.main_opd_offpolicy_gen \
