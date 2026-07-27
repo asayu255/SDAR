@@ -208,9 +208,14 @@ row count, so it adapts when rows are short instead of always paying the
 worst-case micro-batch count. It was tried and backed out in favour of the
 simpler row bound; it remains the option if the micro_bs=4 slowdown matters.
 
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set alongside: a large
-transient next to vLLM's large permanent reservation fragments badly, and the
-OOM traces showed 8–14 GiB stranded as "reserved but unallocated".
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — which the torch OOM message
+itself recommends, and which would target the 8–14 GiB the traces showed
+stranded as "reserved but unallocated" — **cannot be used here**. vLLM's
+`CuMemAllocator`, the sleep/wake memory pool this config relies on, asserts the
+option is unset and refuses to build the engine
+(`vllm/device_allocator/cumem.py:146`, pytorch/pytorch#147851). At micro_bs=4
+the allocations are ~2.6 GiB rather than 12–17 GiB, small enough that
+fragmentation is not the binding issue anyway.
 
 Accuracy: micro-batch grouping only — each row's forward is independent under
 `flash_attn_varlen` — so ③-class, not bit-identical.

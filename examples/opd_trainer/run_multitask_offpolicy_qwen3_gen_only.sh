@@ -102,12 +102,13 @@ set -x
 #   ENV_RESET_PREFETCH       — not wired into TeacherTrajectoryGenerator.generate();
 #     setting it here would do nothing.
 
-# The top-k forward allocates (nnz, vocab) twice in bf16 and vLLM holds its KV
-# through it (free_cache_engine=False), so the allocator sees a large transient
-# next to a large permanent reservation. expandable_segments keeps that from
-# fragmenting into "reserved but unallocated" (the OOM traces showed 8-14 GiB
-# stranded that way). Recommended by the torch OOM message itself.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. The
+# torch OOM message recommends it, but vLLM's CuMemAllocator — which this config
+# uses for the sleep/wake memory pool — asserts it is unset and refuses to build
+# the engine (vllm/device_allocator/cumem.py:146,
+# pytorch/pytorch#147851). The top-k peak is bounded by the micro-batch size
+# above instead, and at micro_bs=4 the allocations are ~2.6 GiB rather than
+# 12-17 GiB, which is small enough that fragmentation is not the binding issue.
 
 export ROLLOUT_KEEP_VLLM_AWAKE=1   # (1) one vLLM weight-sync per rollout, not per turn
 export ROLLOUT_PREPROC_WORKERS=8   # (E1) parallel prompt tokenization, bit-identical
