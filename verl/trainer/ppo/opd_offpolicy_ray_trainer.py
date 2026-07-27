@@ -104,53 +104,75 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                gen_batch = _build_gen_batch(batch)
-                del batch
+                # Phase timing. The names matter beyond the printed seconds: _timer
+                # pushes each name as a gpu_profiler phase, and the profiler's
+                # background sampler is started lazily by that first push — so
+                # without this instrumentation GPU_PROFILER=1 is a silent no-op for
+                # Stage 1 and ROLLOUT_TURN_TIMING's genGPU%/DP columns stay empty.
+                # Popping "step" (gpu_profiler's default GPU_PROFILER_BOUNDARY) is
+                # what emits the per-step utilization report.
+                timing_raw = {}
+                reached_target = False
+                with _timer("step", timing_raw):
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    gen_batch = _build_gen_batch(batch)
+                    del batch
 
-                # Teacher generates the trajectories (is_train=True -> repeat by env.rollout.n).
-                gen_out = self.traj_collector.multi_turn_loop(
-                    gen_batch=gen_batch,
-                    actor_rollout_wg=self.actor_rollout_wg,
-                    envs=self.envs,
-                    is_train=True,
-                )
-                gen_out = adjust_batch(self.config, gen_out)
-                gen_out.batch["response_mask"] = compute_response_mask(gen_out)
+                    # Teacher generates the trajectories (is_train=True -> repeat by env.rollout.n).
+                    with _timer("gen", timing_raw):
+                        gen_out = self.traj_collector.multi_turn_loop(
+                            gen_batch=gen_batch,
+                            actor_rollout_wg=self.actor_rollout_wg,
+                            envs=self.envs,
+                            is_train=True,
+                        )
+                    gen_out = adjust_batch(self.config, gen_out)
+                    gen_out.batch["response_mask"] = compute_response_mask(gen_out)
 
-                # Teacher scores its own top-k over the generated responses.
-                topk_in = gen_out.select(
-                    batch_keys=["responses", "input_ids", "attention_mask", "position_ids"]
-                )
-                topk_in.meta_info = dict(topk_in.meta_info)
-                topk_in.meta_info["topk_k"] = topk
-                # Per-call batch is not generally divisible by the DP world size.
-                topk_in.meta_info[DataProtoConfig.auto_padding_key] = True
-                topk_out = self.actor_rollout_wg.compute_actor_topk_log_prob(topk_in)
-                gen_out.batch["teacher_topk_logprobs"] = topk_out.batch["teacher_topk_logprobs"]
-                gen_out.batch["teacher_topk_ids"] = topk_out.batch["teacher_topk_ids"]
+                    # Teacher scores its own top-k over the generated responses.
+                    with _timer("teacher_topk", timing_raw):
+                        topk_in = gen_out.select(
+                            batch_keys=["responses", "input_ids", "attention_mask", "position_ids"]
+                        )
+                        topk_in.meta_info = dict(topk_in.meta_info)
+                        topk_in.meta_info["topk_k"] = topk
+                        # Per-call batch is not generally divisible by the DP world size.
+                        topk_in.meta_info[DataProtoConfig.auto_padding_key] = True
+                        topk_out = self.actor_rollout_wg.compute_actor_topk_log_prob(topk_in)
+                        gen_out.batch["teacher_topk_logprobs"] = topk_out.batch["teacher_topk_logprobs"]
+                        gen_out.batch["teacher_topk_ids"] = topk_out.batch["teacher_topk_ids"]
 
-                # Backfill task_name if the rollout dropped it (single-task generation).
-                if "task_name" not in gen_out.non_tensor_batch:
-                    gen_out.non_tensor_batch["task_name"] = np.array(
-                        [task] * len(gen_out), dtype=object
-                    )
+                    # Backfill task_name if the rollout dropped it (single-task generation).
+                    if "task_name" not in gen_out.non_tensor_batch:
+                        gen_out.non_tensor_batch["task_name"] = np.array(
+                            [task] * len(gen_out), dtype=object
+                        )
 
-                tensor_keys = [k for k in _SAVE_TENSOR_KEYS if k in gen_out.batch]
-                non_tensor_keys = [k for k in _SAVE_NON_TENSOR_KEYS if k in gen_out.non_tensor_batch]
-                keep = gen_out.select(batch_keys=tensor_keys, non_tensor_batch_keys=non_tensor_keys)
-                keep = keep.to("cpu")
-                collected.append(keep)
-                if "traj_uid" in keep.non_tensor_batch:
-                    seen_trajs.update(keep.non_tensor_batch["traj_uid"].tolist())
-                    n_collected = len(seen_trajs)
-                else:
-                    n_collected = sum(len(c) for c in collected)
-                self.global_steps += 1
-                print(f"[OPD-offpolicy gen][{task}] collected {n_collected} trajectories "
-                      f"({sum(len(c) for c in collected)} turn-rows)")
+                    with _timer("collect", timing_raw):
+                        tensor_keys = [k for k in _SAVE_TENSOR_KEYS if k in gen_out.batch]
+                        non_tensor_keys = [k for k in _SAVE_NON_TENSOR_KEYS if k in gen_out.non_tensor_batch]
+                        keep = gen_out.select(batch_keys=tensor_keys, non_tensor_batch_keys=non_tensor_keys)
+                        keep = keep.to("cpu")
+                        collected.append(keep)
+                    if "traj_uid" in keep.non_tensor_batch:
+                        seen_trajs.update(keep.non_tensor_batch["traj_uid"].tolist())
+                        n_collected = len(seen_trajs)
+                    else:
+                        n_collected = sum(len(c) for c in collected)
+                    self.global_steps += 1
+                    if target is not None and n_collected >= target:
+                        reached_target = True
 
-                if target is not None and n_collected >= target:
+                # Printed after the "step" timer closes so its total is available.
+                print(f"[OPD-offpolicy gen][{task}] step {self.global_steps} "
+                      f"collected {n_collected} trajectories "
+                      f"({sum(len(c) for c in collected)} turn-rows)  "
+                      f"[step {timing_raw.get('step', 0):.1f}s = "
+                      f"gen {timing_raw.get('gen', 0):.1f}s + "
+                      f"topk {timing_raw.get('teacher_topk', 0):.1f}s + "
+                      f"collect {timing_raw.get('collect', 0):.1f}s]", flush=True)
+
+                if reached_target:
                     break
             else:
                 continue

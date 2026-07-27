@@ -393,9 +393,21 @@ Stage-2 dataset) and G10 (changes the KD targets).
 
 Stage 1 has no profile on this branch; every "est." above should be replaced.
 
+`TeacherTrajectoryGenerator.generate()` is instrumented with `_timer` phases
+**`step` / `gen` / `teacher_topk` / `collect`**, and each step prints its own
+breakdown. That instrumentation is what makes the profiler work at all here:
+`gpu_profiler`'s sampler is started lazily by the first `push_phase()`, which
+only `_timer` issues, and popping `step` (its default
+`GPU_PROFILER_BOUNDARY`) is what emits the per-step utilization report. Before
+it existed, `GPU_PROFILER=1` was a silent no-op for Stage 1 and
+`ROLLOUT_TURN_TIMING`'s `genGPU%` / `DP-IMBALANCE` columns printed `-`.
+
 1. Baseline: `GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1`, alfworld,
    `+gen.num_trajectories=1200` (10 steps). Record: step wall, gen wall,
    top-k-phase wall, `envs.step` wall, gen SM%, and vLLM preemption counts.
+   The `step = gen + topk + collect` line gives the first three directly, and
+   is the number to check G7 against (how much of `teacher_topk` is
+   overlappable) and G3 against (whether `collect` is growing as RAM fills).
 2. The KPI is **wall time per 1000 trajectories**, not SM%. Phase 1 §5 already
    proved these move in opposite directions here (removing waste *lowers* util
    and *raises* throughput); gen amplifies that.
