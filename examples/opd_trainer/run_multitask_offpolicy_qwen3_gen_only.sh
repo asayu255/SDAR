@@ -54,13 +54,30 @@ set -x
 # --per_task_batch_size, env.rollout.n and trainer.total_epochs consistent if you
 # change any of them.
 #
-# Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
-# code, not in the expectations files — see docs/optimization_phase2.md):
-#   ROLLOUT_KEEP_VLLM_AWAKE=1  SEARCH_QUERY_CACHE=1  ROLLOUT_PREPROC_WORKERS=8
-#   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
-#    ROLLOUT_COMPACT_RECORD default to on; they speed up the teacher rollouts)
-#   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
-#   generation has no old_log_prob phase and no per-step train rollout.
+# Throughput mechanisms (process env vars, accuracy-preserving; they live in
+# code, not in the expectations files, so they are not scientific knobs — see
+# docs/optimization_phase2.md for the mechanisms and docs/optimization_gen_only.md
+# for why each one is on or off *for generation specifically*). Exported below
+# rather than left to the caller: generation is the hours-long stage, and every
+# knob enabled here is either bit-identical or in the same
+# distribution-preserving class as prefix caching.
+#
+# NOT enabled, with the gen-only reason:
+#   TASK_BALANCE_INTERLEAVE  — no-op. It only reorders rows ACROSS tasks, and
+#     Stage 1 restricts task_balance.tasks to a single task.
+#   ROLLOUT_PREFETCH_LOGPROB — generation has no old_log_prob phase. (The
+#     analogous win is prefetching the top-k forward; not implemented yet.)
+#   ENV_RESET_PREFETCH       — not wired into TeacherTrajectoryGenerator.generate();
+#     setting it here would do nothing.
+
+export ROLLOUT_KEEP_VLLM_AWAKE=1   # (1) one vLLM weight-sync per rollout, not per turn
+export ROLLOUT_PREPROC_WORKERS=8   # (E1) parallel prompt tokenization, bit-identical
+export SEARCH_QUERY_CACHE=1        # (D) reuse retriever hits; needs a deterministic
+                                   #     (fixed-index) retriever. Only the search
+                                   #     block below issues queries at all.
+# ROLLOUT_SKIP_DONE_PREPROC (2) / ROLLOUT_DECODE_ACTIVE_ONLY (E2) /
+# ROLLOUT_COMPACT_RECORD (E3) default to on; all three speed up the alfworld tail.
+# enable_prefix_caching (3) is passed as a Hydra arg in each block below.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
