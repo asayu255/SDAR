@@ -61,23 +61,30 @@ set -x
 # --per_task_batch_size, env.rollout.n and trainer.total_epochs consistent if you
 # change any of them.
 #
-# TOP-K FORWARD MEMORY — why log_prob_use_dynamic_bsz=True below.
+# TOP-K FORWARD MEMORY — why log_prob_micro_batch_size_per_gpu is 4, not 16.
 # compute_topk_log_prob's forward materializes logits_rmpad of shape
 # (nnz, vocab=151936) in bf16 and then torch.logsumexp allocates a second tensor
 # of the same shape, so the transient peak is ~2 * nnz * 151936 * 2 bytes.
-# log_prob_micro_batch_size_per_gpu bounds ROWS, not tokens, so that peak moves
-# with the task's sequence length and the setting is not portable across tasks:
-# at micro_bs=16, search averaged 2727 tok/row (12.35 GiB allocations, OOM at
-# step 82) and webshop 3841 tok/row (17.39 GiB, OOM at step 1). On a 47.5 GiB
-# card, vLLM holds 0.6 * 47.5 = 28.5 GiB and the FSDP fp32 shard ~2.1 GiB, which
-# leaves ~16.9 GiB.
-# log_prob_use_dynamic_bsz packs micro-batches by TOKEN count instead
-# (rearrange_micro_batches, with the ordering reverted afterwards), so
-# log_prob_max_token_len_per_gpu=8192 pins the peak at ~4.6 GiB for every task
-# regardless of sequence length. 16384 (~9.3 GiB) is the faster setting if 8192
-# turns out to be over-cautious. Accuracy: micro-batch grouping only — each row's
-# forward is independent under flash_attn_varlen — so this is the same
-# distribution-preserving class as prefix caching, not bit-identical.
+# At micro_bs=16 that overflowed a 47.5 GiB card in the real run:
+#   search   2727 tok/row -> 12.35 GiB per tensor, 24.7 GiB peak -> OOM at step 82
+#   webshop  3841 tok/row -> 17.39 GiB per tensor, 34.8 GiB peak -> OOM at step 1
+# Budget: vLLM takes gpu_memory_utilization 0.6 * 47.5 = 28.5 GiB and holds its
+# KV THROUGH this forward (free_cache_engine=False, so it is not reclaimable),
+# the FSDP fp32 shard is ~2.1 GiB, leaving ~16.9 GiB.
+#
+# micro_bs=4 puts the peak at 8.7 GiB for webshop's rows and 10.4 GiB even in the
+# worst case where every row is the full 4608 tokens, so it fits for all three
+# tasks with margin. The cost is 4x more micro-batches in the top-k phase, which
+# was ~35% of a search step (~15 s of ~42 s), so expect a modest step increase.
+#
+# gpu_memory_utilization is deliberately NOT lowered: it cannot fix this on its
+# own (even 0.4 leaves only 26.4 GiB, short of webshop's 34.8 GiB peak at
+# micro_bs=16) and it would shrink the KV cache that the rollout — the larger
+# part of the step — depends on.
+#
+# Accuracy: micro-batch grouping only, and each row's forward is independent
+# under flash_attn_varlen, so this is the same distribution-preserving class as
+# prefix caching, not bit-identical.
 #
 # Throughput mechanisms (process env vars, accuracy-preserving; they live in
 # code, not in the expectations files, so they are not scientific knobs — see
@@ -176,9 +183,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -258,9 +263,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -340,9 +343,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \

@@ -157,7 +157,7 @@ Accuracy class: distribution-preserving (③-class). Trajectory count, prompt
 pool coverage and sampling temperature are unchanged; only which prompts share
 a batch changes.
 
-### G3 — Bound the top-k forward by TOKENS — **FIXED (this was a live OOM)**
+### G3 — Shrink the top-k micro-batch — **FIXED (this was a live OOM)**
 
 0.6 is inherited from the *training* script, where the same GPU must also hold
 FSDP gradients, Adam state and `update_actor` activations, none of which exist
@@ -184,24 +184,39 @@ against a budget of `47.5 − 0.6·47.5 (vLLM) − 2.1 (FSDP fp32 shard) ≈ 16.
 — and `free_cache_engine=False` means vLLM holds its KV *through* the top-k
 forward, so that reservation is not reclaimable.
 
-**Fix: pack by token count.** `log_prob_use_dynamic_bsz=True` +
-`log_prob_max_token_len_per_gpu=8192` routes the forward through
-`rearrange_micro_batches` (ordering reverted afterwards via `revert_indices`),
-pinning the peak at ~4.6 GiB for every task regardless of sequence length.
-16384 (~9.3 GiB) is the faster setting if 8192 proves over-cautious. The budget
-must be ≥ the padded sequence length — `rearrange_micro_batches` asserts
-`max_token_len >= 4608`.
+**Fix: `log_prob_micro_batch_size_per_gpu` 16 → 4.** That puts the peak at
+8.7 GiB for webshop's rows and 10.4 GiB even in the worst case where every row
+is the full 4608 tokens, so it fits for all three tasks inside the ~16.9 GiB
+budget. The cost is 4× more micro-batches in the top-k phase, which was ~35% of
+a search step (~15 s of ~42 s), so expect a modest step increase.
 
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set alongside it: a large
+| micro_bs | peak at webshop's 3841 tok/row | peak at worst case 4608 tok/row |
+|---|---|---|
+| 16 (shipped) | 34.8 GiB | 41.7 GiB |
+| 8 | 17.4 GiB | 20.9 GiB |
+| **4** | **8.7 GiB** | **10.4 GiB** |
+| 2 | 4.3 GiB | 5.2 GiB |
+
+**`gpu_memory_utilization` cannot fix this on its own.** Lowering it to 0.4
+leaves 26.4 GiB, still short of webshop's 34.8 GiB peak at micro_bs=16 — and it
+would shrink the KV cache the rollout depends on, which is the larger part of
+the step. It is the wrong knob for a transient that is 2–3× the entire budget.
+
+A token-budgeted alternative (`log_prob_use_dynamic_bsz=True` +
+`log_prob_max_token_len_per_gpu`) bounds `nnz` directly rather than through a
+row count, so it adapts when rows are short instead of always paying the
+worst-case micro-batch count. It was tried and backed out in favour of the
+simpler row bound; it remains the option if the micro_bs=4 slowdown matters.
+
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set alongside: a large
 transient next to vLLM's large permanent reservation fragments badly, and the
 OOM traces showed 8–14 GiB stranded as "reserved but unallocated".
 
 Accuracy: micro-batch grouping only — each row's forward is independent under
 `flash_attn_varlen` — so ③-class, not bit-identical.
 
-Only **after** this is `gpu_memory_utilization` worth raising, and the headroom
-it can claim is now ~12 GiB rather than the ~5 GiB the old row-bounded
-configuration left free.
+Only **after** this is `gpu_memory_utilization` worth *raising*, and the
+headroom it could claim is now ~6 GiB (16.9 available − 10.4 worst-case peak).
 
 ### G4 — Per-task `max_model_len` — **do not apply as first described**
 
@@ -426,9 +441,10 @@ plus `+gen.shard_every_steps=10` (§3) and the `_timer` instrumentation (§6).
 reverted — see G1 for why concurrency loses when one task dominates the wall.
 
 **Applied (G3, after a real OOM).**
-`log_prob_use_dynamic_bsz=True` + `log_prob_max_token_len_per_gpu=8192` +
+`log_prob_micro_batch_size_per_gpu=4` (was 16) +
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Raising
-`gpu_memory_utilization` is only safe *after* this — read G3.
+`gpu_memory_utilization` is only safe *after* this, and lowering it does not fix
+the OOM — read G3.
 
 **Cheap and independent.**
 `actor_rollout_ref.actor.fsdp_config.param_offload=True` (G5, bit-identical):
