@@ -399,12 +399,17 @@ pid_webshop=$!
 # ===================== wait for all three tasks =====================
 # Collect each exit status separately so a single failure is attributable and
 # the other two tasks still run to completion (their .pt is already written).
-wait $pid_alfworld
-status_alfworld=$?
-wait $pid_search
-status_search=$?
-wait $pid_webshop
-status_webshop=$?
+#
+# A task whose block above is commented out for a partial rerun leaves its PID
+# variable unset. Guard on that: bare `wait` with no argument waits for EVERY
+# background job and returns 0, which would report a task that never ran as a
+# success. Report it as "skipped" instead.
+status_alfworld=skipped
+status_search=skipped
+status_webshop=skipped
+[ -n "${pid_alfworld:-}" ] && { wait "$pid_alfworld"; status_alfworld=$?; }
+[ -n "${pid_search:-}" ]   && { wait "$pid_search";   status_search=$?; }
+[ -n "${pid_webshop:-}" ]  && { wait "$pid_webshop";  status_webshop=$?; }
 
 set +x
 echo "================ Stage 1 summary ================"
@@ -413,7 +418,12 @@ echo "search    exit=$status_search  log=$HOME/data/verl-agent/sdar_multitask/te
 echo "webshop   exit=$status_webshop  log=$HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_webshop.log"
 echo "================================================"
 
-if [ "$status_alfworld" -ne 0 ] || [ "$status_search" -ne 0 ] || [ "$status_webshop" -ne 0 ]; then
+stage1_failed=0
+[ "$status_alfworld" = skipped ] || [ "$status_alfworld" = 0 ] || stage1_failed=1
+[ "$status_search"   = skipped ] || [ "$status_search"   = 0 ] || stage1_failed=1
+[ "$status_webshop"  = skipped ] || [ "$status_webshop"  = 0 ] || stage1_failed=1
+
+if [ "$stage1_failed" -ne 0 ]; then
     echo "Stage 1 FAILED for at least one task. Fix it, then rerun this script with"
     echo "the blocks of the tasks that already produced their <task>.pt commented out."
     exit 1
