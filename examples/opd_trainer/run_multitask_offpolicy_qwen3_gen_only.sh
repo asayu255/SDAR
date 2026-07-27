@@ -4,7 +4,11 @@ set -x
 #
 # Each task's frozen single-task RL teacher rolls out in its own environment and
 # scores its own top-20 over what it generated, writing
-#   $HOME/data/verl-agent/sdar_multitask/teacher_traj/<task>.pt
+#   $HOME/data/verl-agent/sdar_multitask/teacher_traj/<task>_0000.pt, _0001.pt, ...
+# (+gen.shard_every_steps=10 below; Stage 2 globs *.pt in that directory, so the
+# shard count does not matter to it. shard_every_steps=0 restores a single
+# <task>.pt, but then the whole run is buffered in RAM and concatenated at the
+# end — ~198 GB for alfworld, ~400 GB at the concat peak.)
 # This is the expensive stage: 36000 trajectories x 3 tasks, with a full
 # multi-turn rollout per step (alfworld up to 50 turns, webshop 15, search 4
 # plus a retriever round trip per turn).
@@ -22,10 +26,13 @@ set -x
 #   * the retriever is up at SEARCH_URL (the search task calls it every turn)
 #   * ALFWORLD_DATA points at the alfworld data
 #
-# Each task saves its own .pt as soon as that task reaches its target, so a
+# Each task writes its shards as it goes and is independent of the others, so a
 # failure in a later task does not lose the tasks that already finished — rerun
-# this script with the finished blocks commented out. Note that a rerun of a
-# task OVERWRITES its existing <task>.pt.
+# this script with the finished blocks commented out. Note that rerunning a task
+# DELETES its existing <task>_NNNN.pt (and any legacy <task>.pt) before it
+# starts: Stage 2 globs the directory, so a leftover shard from a longer previous
+# run would otherwise be concatenated into the new dataset. A task that died
+# part-way therefore restarts from step 1, not from its last shard.
 #
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block, NO ${VAR:-default} fallback, NO
@@ -54,6 +61,24 @@ set -x
 # --per_task_batch_size, env.rollout.n and trainer.total_epochs consistent if you
 # change any of them.
 #
+# TOP-K FORWARD MEMORY — why log_prob_use_dynamic_bsz=True below.
+# compute_topk_log_prob's forward materializes logits_rmpad of shape
+# (nnz, vocab=151936) in bf16 and then torch.logsumexp allocates a second tensor
+# of the same shape, so the transient peak is ~2 * nnz * 151936 * 2 bytes.
+# log_prob_micro_batch_size_per_gpu bounds ROWS, not tokens, so that peak moves
+# with the task's sequence length and the setting is not portable across tasks:
+# at micro_bs=16, search averaged 2727 tok/row (12.35 GiB allocations, OOM at
+# step 82) and webshop 3841 tok/row (17.39 GiB, OOM at step 1). On a 47.5 GiB
+# card, vLLM holds 0.6 * 47.5 = 28.5 GiB and the FSDP fp32 shard ~2.1 GiB, which
+# leaves ~16.9 GiB.
+# log_prob_use_dynamic_bsz packs micro-batches by TOKEN count instead
+# (rearrange_micro_batches, with the ordering reverted afterwards), so
+# log_prob_max_token_len_per_gpu=8192 pins the peak at ~4.6 GiB for every task
+# regardless of sequence length. 16384 (~9.3 GiB) is the faster setting if 8192
+# turns out to be over-cautious. Accuracy: micro-batch grouping only — each row's
+# forward is independent under flash_attn_varlen — so this is the same
+# distribution-preserving class as prefix caching, not bit-identical.
+#
 # Throughput mechanisms (process env vars, accuracy-preserving; they live in
 # code, not in the expectations files, so they are not scientific knobs — see
 # docs/optimization_phase2.md for the mechanisms and docs/optimization_gen_only.md
@@ -69,6 +94,13 @@ set -x
 #     analogous win is prefetching the top-k forward; not implemented yet.)
 #   ENV_RESET_PREFETCH       — not wired into TeacherTrajectoryGenerator.generate();
 #     setting it here would do nothing.
+
+# The top-k forward allocates (nnz, vocab) twice in bf16 and vLLM holds its KV
+# through it (free_cache_engine=False), so the allocator sees a large transient
+# next to a large permanent reservation. expandable_segments keeps that from
+# fragmenting into "reserved but unallocated" (the OOM traces showed 8-14 GiB
+# stranded that way). Recommended by the torch OOM message itself.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export ROLLOUT_KEEP_VLLM_AWAKE=1   # (1) one vLLM weight-sync per rollout, not per turn
 export ROLLOUT_PREPROC_WORKERS=8   # (E1) parallel prompt tokenization, bit-identical
@@ -145,6 +177,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -225,6 +259,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -305,6 +341,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \

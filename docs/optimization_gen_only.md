@@ -10,9 +10,9 @@ compute-bound training phases. Stage-1 generation is a *different workload* and
 several of their conclusions invert here.
 
 Numbers below marked "est." are analytic estimates from the config and the
-model shape (Qwen3-1.7B, 28 layers, 8 KV heads × 128) — this branch carries no
-Stage-1 profile yet. §6 is the measurement plan that turns them into measured
-values.
+model shape (Qwen3-1.7B, 28 layers, 8 KV heads × 128). G3 is the exception: its
+numbers come from two real OOMs on 47.5 GiB cards and are measured. §6 is the
+measurement plan for the rest.
 
 ---
 
@@ -157,35 +157,51 @@ Accuracy class: distribution-preserving (③-class). Trajectory count, prompt
 pool coverage and sampling temperature are unchanged; only which prompts share
 a batch changes.
 
-### G3 — KV headroom: cut the top-k micro-batch *before* raising `gpu_memory_utilization`
+### G3 — Bound the top-k forward by TOKENS — **FIXED (this was a live OOM)**
 
 0.6 is inherited from the *training* script, where the same GPU must also hold
 FSDP gradients, Adam state and `update_actor` activations, none of which exist
-in gen-only — which makes "just raise it to 0.85" the obvious move. **It is the
-wrong one, and it will OOM.**
+in gen-only — which makes "just raise `gpu_memory_utilization` to 0.85" the
+obvious move. It is the wrong one, and the real run proved the point in the
+harsher direction: the config **as shipped** OOMed.
 
-What actually bounds the non-vLLM budget is the top-k forward. With
-`use_remove_padding=True`, `_forward_micro_batch` materializes `logits_rmpad`
-of shape `(nnz, vocab)` before taking the top-k
-(`dp_actor.py:218-231`). At `log_prob_micro_batch_size_per_gpu=16` and ~2560
-tokens per row that is 40 960 × 151 936 × 2 B ≈ **12.4 GB for the logits
-alone**, plus the `logsumexp`/`topk` temporaries and the model itself.
+What bounds the non-vLLM budget is the top-k forward. With
+`use_remove_padding=True`, `_forward_micro_batch` materializes `logits_rmpad` of
+shape `(nnz, vocab)` in bf16, and `torch.logsumexp` then allocates a second
+tensor of the same shape (`dp_actor.py:218-231`), so the transient peak is
+`~2 · nnz · 151936 · 2 B`.
 
-On the 3-GPU layout the FSDP shard adds ~2.3 GB, so the peak non-vLLM working
-set is roughly 12.4 + 2.3 ≈ 15 GB — against the 32 GB that
-`gpu_memory_utilization=0.6` leaves on an 80 GB card. At 0.85 it would have
-12 GB and fail. (G1 would have made this worse still: at world size 1 the shard
-is the whole fp32 model, ~6.8 GB.)
+The trap is that `log_prob_micro_batch_size_per_gpu` bounds **rows**, not
+tokens, so the peak scales with each task's sequence length and no single row
+count is portable across tasks. Observed on 47.5 GiB cards at micro_bs=16:
 
-The correct order is therefore:
-1. Lower `log_prob_micro_batch_size_per_gpu` (16 → 4 puts the logits at
-   ~3.1 GB). The top-k forward is compute-bound; 4 × 2560 ≈ 10 k tokens still
-   saturates a 1.7B forward, so this costs little.
-2. *Then* raise `gpu_memory_utilization`, using the headroom that freed.
+| task | tokens/row | single allocation | outcome |
+|---|---|---|---|
+| search | 2727 | 12.35 GiB | OOM at step 82 |
+| webshop | 3841 | 17.39 GiB | OOM at step 1 |
 
-Both are ③-class (micro-batch grouping / KV sizing; per-row results
-unchanged). Measure the peak with `GPU_PROFILER=1` rather than trusting the
-arithmetic above — it is an estimate from tensor shapes, not an observation.
+against a budget of `47.5 − 0.6·47.5 (vLLM) − 2.1 (FSDP fp32 shard) ≈ 16.9 GiB`
+— and `free_cache_engine=False` means vLLM holds its KV *through* the top-k
+forward, so that reservation is not reclaimable.
+
+**Fix: pack by token count.** `log_prob_use_dynamic_bsz=True` +
+`log_prob_max_token_len_per_gpu=8192` routes the forward through
+`rearrange_micro_batches` (ordering reverted afterwards via `revert_indices`),
+pinning the peak at ~4.6 GiB for every task regardless of sequence length.
+16384 (~9.3 GiB) is the faster setting if 8192 proves over-cautious. The budget
+must be ≥ the padded sequence length — `rearrange_micro_batches` asserts
+`max_token_len >= 4608`.
+
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set alongside it: a large
+transient next to vLLM's large permanent reservation fragments badly, and the
+OOM traces showed 8–14 GiB stranded as "reserved but unallocated".
+
+Accuracy: micro-batch grouping only — each row's forward is independent under
+`flash_attn_varlen` — so ③-class, not bit-identical.
+
+Only **after** this is `gpu_memory_utilization` worth raising, and the headroom
+it can claim is now ~12 GiB rather than the ~5 GiB the old row-bounded
+configuration left free.
 
 ### G4 — Per-task `max_model_len` — **do not apply as first described**
 
@@ -409,10 +425,10 @@ plus `+gen.shard_every_steps=10` (§3) and the `_timer` instrumentation (§6).
 **Layout: unchanged (sequential, 3 GPUs per task).** G1 was implemented and
 reverted — see G1 for why concurrency loses when one task dominates the wall.
 
-**Next, and only with a profile in hand (G3, in this order).** Lower
-`actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu` 16 → 4, *then*
-raise `actor_rollout_ref.rollout.gpu_memory_utilization` from 0.6. Doing the
-second without the first OOMs the top-k forward — read G3.
+**Applied (G3, after a real OOM).**
+`log_prob_use_dynamic_bsz=True` + `log_prob_max_token_len_per_gpu=8192` +
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Raising
+`gpu_memory_utilization` is only safe *after* this — read G3.
 
 **Cheap and independent.**
 `actor_rollout_ref.actor.fsdp_config.param_offload=True` (G5, bit-identical):
