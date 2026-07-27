@@ -22,46 +22,10 @@ set -x
 #   * the retriever is up at SEARCH_URL (the search task calls it every turn)
 #   * ALFWORLD_DATA points at the alfworld data
 #
-# The three tasks run CONCURRENTLY, one GPU each (alfworld->GPU0, search->GPU1,
-# webshop->GPU2), instead of sequentially on 3 GPUs each. They are fully
-# independent — separate processes, separate frozen teachers, separate envs,
-# separate output .pt — so the only thing the old sequential layout bought was
-# 3-way data parallelism within a task, and that is the cheap axis here:
-# tensor_model_parallel_size is 1, so each GPU already holds a complete engine,
-# and 1.7B decode is weight-bandwidth bound, so going from 40 to 120
-# trajectories per GPU costs far less than a third of the wall time. See
-# docs/optimization_gen_only.md (G1).
-#
-# What to watch when tuning: per-GPU KV-cache demand triples. If the vLLM logs
-# show preemption / "cache full", that is where the win is going. The companion
-# knobs are gpu_memory_utilization and log_prob_micro_batch_size_per_gpu — see
-# the note in docs/optimization_gen_only.md (G3) before touching either; they
-# are deliberately left at their sequential-run values here so this change is
-# the parallelization alone.
-#
-# NOTE ON THE PRODUCED DATASET: world size 3 -> 1 changes adjust_batch's
-# divisor from lcm(16*3, 5*3)=240 to lcm(16, 5)=80, so a different (smaller)
-# number of duplicated turn-rows is padded into each <task>.pt. The trajectory
-# count, prompts, sampling temperature and episode caps are unchanged.
-#
-# Each task saves its own .pt as soon as that task reaches its target, and a
-# failure in one task does not touch the other two — rerun this script with the
-# finished blocks commented out. Note that a rerun of a task OVERWRITES its
-# existing <task>.pt. Per-task stdout/stderr goes to
-#   $HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_<task>.log
-# because three concurrent runs would otherwise interleave on the console; the
-# script waits for all three and exits non-zero if any of them failed.
-#
-# Ray isolation (three ray.init() on one host):
-#   RAY_ADDRESS=local           force a fresh local instance instead of possibly
-#                               attaching to a sibling's cluster (which would
-#                               then see 0 free GPUs and hang until
-#                               ray_wait_register_center_timeout)
-#   RAY_TMPDIR=...              separate session/socket trees per task
-#   +ray_init.include_dashboard=False   no race for the default dashboard port
-#   +ray_init.object_store_memory=...   pin the split explicitly; the default
-#                               ("30% of AVAILABLE memory") is racy when three
-#                               instances start at once and can overflow /dev/shm
+# Each task saves its own .pt as soon as that task reaches its target, so a
+# failure in a later task does not lose the tasks that already finished — rerun
+# this script with the finished blocks commented out. Note that a rerun of a
+# task OVERWRITES its existing <task>.pt.
 #
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block, NO ${VAR:-default} fallback, NO
@@ -140,11 +104,6 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --seed 1
 
 # ===================== Stage 1: teacher trajectory generation =====================
-# The three blocks below launch concurrently, one GPU each, and are waited on at
-# the bottom of the script.
-mkdir -p $HOME/data/verl-agent/sdar_multitask/teacher_traj
-
-CUDA_VISIBLE_DEVICES=0 RAY_ADDRESS=local RAY_TMPDIR=/tmp/ray_gen_alfworld \
 python3 -m verl.trainer.main_opd_offpolicy_gen \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
     +gen.task=alfworld \
@@ -213,7 +172,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +env.multitask.history_length.webshop=2 \
     env.multitask.val_per_task_batch_size=126 \
     env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.logger=['console'] \
@@ -223,13 +182,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     trainer.total_epochs=300 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.val_before_train=False \
-    +ray_init.include_dashboard=False \
-    +ray_init.object_store_memory=8000000000 \
-    > $HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_alfworld.log 2>&1 &
-pid_alfworld=$!
+    trainer.val_before_train=False
 
-CUDA_VISIBLE_DEVICES=1 RAY_ADDRESS=local RAY_TMPDIR=/tmp/ray_gen_search \
 python3 -m verl.trainer.main_opd_offpolicy_gen \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
     +gen.task=search \
@@ -298,7 +252,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +env.multitask.history_length.webshop=2 \
     env.multitask.val_per_task_batch_size=126 \
     env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.logger=['console'] \
@@ -308,13 +262,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     trainer.total_epochs=300 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.val_before_train=False \
-    +ray_init.include_dashboard=False \
-    +ray_init.object_store_memory=8000000000 \
-    > $HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_search.log 2>&1 &
-pid_search=$!
+    trainer.val_before_train=False
 
-CUDA_VISIBLE_DEVICES=2 RAY_ADDRESS=local RAY_TMPDIR=/tmp/ray_gen_webshop \
 python3 -m verl.trainer.main_opd_offpolicy_gen \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
     +gen.task=webshop \
@@ -383,7 +332,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +env.multitask.history_length.webshop=2 \
     env.multitask.val_per_task_batch_size=126 \
     env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.logger=['console'] \
@@ -393,45 +342,4 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     trainer.total_epochs=300 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.val_before_train=False \
-    +ray_init.include_dashboard=False \
-    +ray_init.object_store_memory=8000000000 \
-    > $HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_webshop.log 2>&1 &
-pid_webshop=$!
-
-# ===================== wait for all three tasks =====================
-# Collect each exit status separately so a single failure is attributable and
-# the other two tasks still run to completion (their .pt is already written).
-#
-# A task whose block above is commented out for a partial rerun leaves its PID
-# variable unset. Guard on that: bare `wait` with no argument waits for EVERY
-# background job and returns 0, which would report a task that never ran as a
-# success. Report it as "skipped" instead.
-status_alfworld=skipped
-status_search=skipped
-status_webshop=skipped
-[ -n "${pid_alfworld:-}" ] && { wait "$pid_alfworld"; status_alfworld=$?; }
-[ -n "${pid_search:-}" ]   && { wait "$pid_search";   status_search=$?; }
-[ -n "${pid_webshop:-}" ]  && { wait "$pid_webshop";  status_webshop=$?; }
-
-set +x
-echo "================ Stage 1 summary ================"
-echo "alfworld  exit=$status_alfworld  log=$HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_alfworld.log"
-echo "search    exit=$status_search  log=$HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_search.log"
-echo "webshop   exit=$status_webshop  log=$HOME/data/verl-agent/sdar_multitask/teacher_traj/gen_webshop.log"
-echo "================================================"
-
-stage1_failed=0
-[ "$status_alfworld" = skipped ] || [ "$status_alfworld" = 0 ] || stage1_failed=1
-[ "$status_search"   = skipped ] || [ "$status_search"   = 0 ] || stage1_failed=1
-[ "$status_webshop"  = skipped ] || [ "$status_webshop"  = 0 ] || stage1_failed=1
-
-if [ "$stage1_failed" -ne 0 ]; then
-    echo "Stage 1 FAILED for at least one task. Fix it, then rerun this script with"
-    echo "the blocks of the tasks that already produced their <task>.pt commented out."
-    exit 1
-fi
-
-echo "Stage 1 complete: alfworld.pt / search.pt / webshop.pt are in"
-echo "  $HOME/data/verl-agent/sdar_multitask/teacher_traj"
-echo "Stage 2 next: bash examples/opd_trainer/run_multitask_offpolicy_qwen3_nogen.sh"
+    trainer.val_before_train=False

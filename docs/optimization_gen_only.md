@@ -41,58 +41,80 @@ Three structural facts drive everything below:
 3. **The three tasks are independent processes with independent models.** The
    script runs them back to back on 3 GPUs each; nothing couples them.
 
-Fact 3 is the largest single lever and it does not exist in the training
-workload at all.
+Fact 3 looks like the largest single lever and is the one that does not exist
+in the training workload at all — but it does not pay off here; see G1 for the
+arithmetic. Facts 1 and 2 are what the adopted mechanisms rest on.
 
 ---
 
 ## 2. New gen-only mechanisms, ranked
 
-### G1 — Run the three tasks concurrently, 1 GPU each (est. 2.5–3× wall) — **IMPLEMENTED**
+### G1 — Run the three tasks concurrently, 1 GPU each — **NOT ADOPTED (reverted)**
 
-Today: `alfworld(3 GPU) → search(3 GPU) → webshop(3 GPU)`, sequential.
-`tensor_model_parallel_size=1` already, so each GPU holds a complete engine and
-the 3-way split is pure data parallelism.
+The idea: today Stage 1 runs `alfworld(3 GPU) → search(3 GPU) → webshop(3 GPU)`
+sequentially. `tensor_model_parallel_size=1` already, so each GPU holds a
+complete engine and the 3-way split is pure data parallelism; the three tasks
+are independent processes. So run all three at once, one GPU each.
 
-Instead run all three at once, one GPU per task (`trainer.n_gpus_per_node=1`,
-`CUDA_VISIBLE_DEVICES=<i>`, `&` + `wait`).
+This was implemented (`0771d52`, `963c176`) and **reverted**. The original
+speedup claim rested on "1.7B decode is weight-bandwidth bound, so 40 → 120
+trajectories per GPU costs far less than 3×". That reasoning is wrong for this
+workload: gen is **prefill-dominated**, not decode-dominated. Every turn
+re-prefills the whole history (up to `data.max_prompt_length`) and emits a
+short action, and prefill is compute-bound and scales ~linearly with concurrent
+sequences. Tripling the per-GPU sequence count roughly triples the per-task GPU
+time. (The mechanism-B row in §4 already said gen is prefill-heavy — the two
+statements were inconsistent.)
 
-Why this is nearly free: per-GPU trajectory count goes 40 → 120, but 1.7B
-decode is **weight-bandwidth bound**, so the per-token cost of a decode step is
-almost flat in batch size over this range. Meanwhile the wall time of a task no
-longer waits on the other two. Also removes the cross-GPU collective in every
-`generate_sequences` dispatch and makes DP imbalance structurally impossible
-(one task per device — Phase 1's ④ solved the same problem the hard way).
+**Break-even.** Per task `i`, let `T_i` be its wall in the sequential 3-GPU
+layout and `g` the GPU-busy fraction of it. Concurrently on one GPU the GPU work
+takes ~3× while the CPU glue (`envs.step`, tokenization) does not stretch, so
+each task takes ~`(1 + 2g)·T_i` and the three overlap:
 
-Shipped in `run_multitask_offpolicy_qwen3_gen_only.sh`: each block is prefixed
-`CUDA_VISIBLE_DEVICES=<i> RAY_ADDRESS=local RAY_TMPDIR=/tmp/ray_gen_<task>`,
-carries `trainer.n_gpus_per_node=1`, redirects to
-`teacher_traj/gen_<task>.log`, and backgrounds; the script waits on all three
-PIDs, prints a per-task exit-status summary and exits non-zero if any failed.
+```
+speedup = ΣT_i / ((1 + 2g) · T_max)        r = T_max / ΣT_i
+        = 1 / ((1 + 2g) · r)
+```
 
-Ray isolation matters more than the port collisions suggest: without
-`RAY_ADDRESS=local` a later `ray.init()` can attach to a sibling's cluster,
-which then reports 0 free GPUs and hangs until
-`ray_wait_register_center_timeout`. `include_dashboard=False` removes the
-default-port race, and `object_store_memory` is pinned because the default
-("30% of *available* memory") is racy when three instances start at once and
-can overflow `/dev/shm`.
+| `r` (the dominant task's share) | break-even `g` | speedup at `g = 0.6` |
+|---|---|---|
+| 0.7 (alfworld dominates) | `g ≤ 0.21` | 0.65× — **1.5× slower** |
+| 0.5 | `g ≤ 0.5` | 0.91× |
+| 0.33 (balanced) | always wins | 1.36× |
 
-Remaining caveats:
-- KV cache: 120 concurrent sequences on one GPU. At alfworld's per-turn prompt
-  length ≈ 114 KB/token × ~2000 tokens ≈ 230 MB per sequence → ~27 GB (est.),
-  against 48 GB at `gpu_memory_utilization=0.6` on an 80 GB card. search, whose
-  retrieved passages make the longest prompts, is the one to watch. Symptom to
-  look for in the vLLM logs: preemption / "cache full". The knobs are G3 —
-  read it first, the obvious move there is wrong.
-- CPU/RAM: 3 env fleets alive at once (alfworld game loading is the heavy one),
-  and the search task hits the retriever alone rather than sharing a window.
+With per-task caps of alfworld 50 / webshop 15 / search 4 turns, `r ≈ 0.7` is
+the realistic case, so concurrency only pays if the GPU is busy less than ~21%
+of the gen wall. Phase 1 measured gen SM ≈ 57%, so it is not.
 
-Accuracy class: not bit-identical (DP world size changes vLLM batch
-composition), same distribution-preserving class as ③. One dataset-visible
-side effect: `adjust_batch`'s divisor drops from `lcm(16·3, 5·3)=240` to
-`lcm(16,5)=80`, so a different (smaller) number of duplicated turn-rows is
-padded into each `<task>.pt` — see G6, which removes the duplication entirely.
+The general form of the error: when per-GPU throughput scales linearly with
+GPUs, total GPU-seconds is conserved and rearranging tasks across devices
+cannot help. Parallelizing only wins by filling *idle*, and the sequential
+layout already gives every task all three GPUs.
+
+**What would make it pay.** `(1 + 2g)` is an upper bound: in the alfworld tail
+(turns 16–50) the active set shrinks and the GPUs are underfed, so there the
+3× factor does not apply and another task's work would genuinely fill idle.
+Whether that is enough is exactly the `g` above, and it is now measurable —
+`ROLLOUT_TURN_TIMING=1` prints
+
+```
+SHARE  gen(GPU-busy)=XX%  cpu-glue(preproc+decode+envstep, GPU-idle)=YY%
+```
+
+and `r` follows from comparing the three tasks' step times. The decisive
+experiment is ~30 minutes: alfworld at `+gen.num_trajectories=1200` on 1 GPU
+versus on 3 GPUs, comparing step wall.
+
+If it is ever revived, the concurrency machinery in those two commits is worth
+reusing: per-task `CUDA_VISIBLE_DEVICES`, per-task logs, PID/exit-status
+collection, and the Ray isolation — `RAY_ADDRESS=local` (without it a later
+`ray.init()` can attach to a sibling's cluster, see 0 free GPUs and hang until
+`ray_wait_register_center_timeout`), per-task `RAY_TMPDIR`,
+`include_dashboard=False`, and a pinned `object_store_memory` (the default
+"30% of *available* memory" is racy with three simultaneous inits and can
+overflow `/dev/shm`). Note also that world size 3 → 1 changes `adjust_batch`'s
+divisor from `lcm(16·3, 5·3)=240` to `lcm(16,5)=80`, so the number of
+duplicated turn-rows written into each `<task>.pt` changes — see G6.
 
 ### G2 — Enlarge the generation batch (est. 1.5–2.5× on alfworld)
 
@@ -121,8 +143,9 @@ No data-prep change is needed: alfworld/webshop have 15 placeholder rows and
 
 Costs: env instances are `per_task_batch_size × env.rollout.n`, so 60 → **480
 alfworld env instances** (CPU, RAM, game files) and 480 concurrent sequences of
-KV. Combines with G1 only up to what one GPU's KV can hold — pick the pair
-together, e.g. G1 + `per_task_batch_size=30`.
+KV, all on the 3-GPU sequential layout (40 → 160 sequences per GPU). Unlike
+G1 this does not trade GPU parallelism away: it feeds the *same* three GPUs a
+larger batch, which is exactly what the underfed alfworld tail needs.
 
 Requires editing `expected_multitask_offpolicy_gen_config.yaml` in the same
 commit (`data.train_batch_size`, `data.task_balance.per_task_batch_size` are
@@ -148,11 +171,11 @@ of shape `(nnz, vocab)` before taking the top-k
 tokens per row that is 40 960 × 151 936 × 2 B ≈ **12.4 GB for the logits
 alone**, plus the `logsumexp`/`topk` temporaries and the model itself.
 
-And G1 makes this *worse*, not better: at world size 1 the FSDP shard is the
-full fp32 model (~6.8 GB) rather than a third of it (~2.3 GB). So the peak
-non-vLLM working set is roughly 12.4 + 6.8 ≈ 19 GB — against the 32 GB that
+On the 3-GPU layout the FSDP shard adds ~2.3 GB, so the peak non-vLLM working
+set is roughly 12.4 + 2.3 ≈ 15 GB — against the 32 GB that
 `gpu_memory_utilization=0.6` leaves on an 80 GB card. At 0.85 it would have
-12 GB and fail.
+12 GB and fail. (G1 would have made this worse still: at world size 1 the shard
+is the whole fp32 model, ~6.8 GB.)
 
 The correct order is therefore:
 1. Lower `log_prob_micro_batch_size_per_gpu` (16 → 4 puts the logits at
@@ -308,9 +331,9 @@ Stage 2's `DataProto.concat` over the three tasks' files works at all.
 
 36000 alfworld trajectories × an assumed ~20 turn-rows each ≈ 720 k rows ≈
 **198 GB**, held entirely in a Python list first and then *doubled* at peak by
-`DataProto.concat`. search (4 turns) ≈ 40 GB, webshop ≈ 80 GB. **G1 makes this
-worse, not better**: the three tasks used to accumulate one at a time, so peak
-RAM was the largest task; concurrently it is their sum.
+`DataProto.concat`. search (4 turns) ≈ 40 GB, webshop ≈ 80 GB. The sequential
+layout at least accumulates one task at a time, so peak RAM is the largest task
+rather than their sum — one more reason G1 was the wrong trade.
 
 Cheap, additive fixes:
 - `teacher_topk_ids` → int32 (vocab 151 936 ≪ 2³¹): −41 KB/row.
@@ -352,7 +375,7 @@ recommendation.
 | ④ | task interleave | `TASK_BALANCE_INTERLEAVE=1` | **N !** | **No-op.** Stage 1 restricts `task_balance.tasks` to a single task (`main_opd_offpolicy_gen.py:98`), and the interleave only reorders *across* tasks (`main_ppo.py:298-303`). Leave unset. |
 | ⑤ | param offload off | `actor.fsdp_config.param_offload` | **INVERT !** | Training wants `False`; gen wants **`True`** — see G5. |
 | A | log-prob prefetch | `ROLLOUT_PREFETCH_LOGPROB=1` | **N** | Correct as the script says: no `old_log_prob` phase. Replace with G7 (top-k prefetch). |
-| B | CUDA-graph decode | `CUDAGRAPH_CAPTURE_SIZES` | **measure** | The Phase-1/2 note that this needs `VLLM_USE_V1=1` is stale for the pinned `vllm==0.11.0`, which has no V0 engine. Capture sizes should cover the *gen* batch sizes, which are much larger than training's if G1/G2 are on. Gen is also more prefill-heavy than training (every turn re-prefills the history, responses are short), so expect less from decode graphs here — measure before adopting. |
+| B | CUDA-graph decode | `CUDAGRAPH_CAPTURE_SIZES` | **measure** | The Phase-1/2 note that this needs `VLLM_USE_V1=1` is stale for the pinned `vllm==0.11.0`, which has no V0 engine. Capture sizes should cover the *gen* batch sizes, which are much larger than training's if G2 is on. Gen is also more prefill-heavy than training (every turn re-prefills the history, responses are short), so expect less from decode graphs here — measure before adopting. |
 | C | env-reset prefetch | `ENV_RESET_PREFETCH=1` | **N (port)** | Not wired into the generator — see G8. Setting the env var today does nothing. |
 | D | retriever query cache | `SEARCH_QUERY_CACHE=1` | **Y (search only)** | High hit rate: the 8 GRPO group members share a question, so turn-1 queries repeat 8×. Requires a deterministic retriever (fixed index). Useless for alfworld/webshop. |
 | E1 | parallel tokenization | `ROLLOUT_PREPROC_WORKERS=8` | **Y** | Bit-identical, and preproc is a larger share of a gen step than of a training step (no training phases to hide behind). |
@@ -372,7 +395,7 @@ worker is created under grpo + `use_kl_in_reward=False`), and
 
 ## 5. Recommended configuration
 
-**Now (no code change).** Add to the script:
+**Applied.** In the run script:
 
 ```bash
 export ROLLOUT_KEEP_VLLM_AWAKE=1     # ①
@@ -381,9 +404,10 @@ export SEARCH_QUERY_CACHE=1          # D (search block only; needs a fixed index
 # ②/E2/E3 default on; ③ already passed as a Hydra arg
 ```
 
-**Done.** G1 — three tasks concurrently at `trainer.n_gpus_per_node=1`, one
-`CUDA_VISIBLE_DEVICES` each, per-task Ray isolation and logs, `&` + `wait` with
-per-task exit statuses.
+plus `+gen.shard_every_steps=10` (§3) and the `_timer` instrumentation (§6).
+
+**Layout: unchanged (sequential, 3 GPUs per task).** G1 was implemented and
+reverted — see G1 for why concurrency loses when one task dominates the wall.
 
 **Next, and only with a profile in hand (G3, in this order).** Lower
 `actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu` 16 → 4, *then*
@@ -392,7 +416,7 @@ second without the first OOMs the top-k forward — read G3.
 
 **Cheap and independent.**
 `actor_rollout_ref.actor.fsdp_config.param_offload=True` (G5, bit-identical):
-returns ~6.8 GB/GPU at world size 1 to the KV cache for the whole rollout, since
+returns ~2.3 GB/GPU (world size 3) to the KV cache for the whole rollout, since
 `fsdp_vllm.py:200-203` offloads the shard immediately after syncing weights into
 vLLM and `compute_actor_topk_log_prob` reloads it only for its own forward.
 
@@ -429,10 +453,10 @@ it existed, `GPU_PROFILER=1` was a silent no-op for Stage 1 and
 2. The KPI is **wall time per 1000 trajectories**, not SM%. Phase 1 §5 already
    proved these move in opposite directions here (removing waste *lowers* util
    and *raises* throughput); gen amplifies that.
-3. Watch vLLM's preemption / "cache full" log lines when adopting G1/G2/G3 —
+3. Watch vLLM's preemption / "cache full" log lines when adopting G2/G3 —
    the failure mode of over-subscribing KV is recompute thrash that looks like
    a plain slowdown.
-4. Accuracy gate for the ③-class mechanisms (G1, G2): the trajectory count,
+4. Accuracy gate for the ③-class mechanisms (G2): the trajectory count,
    per-task success rate and mean episode length of the generated pool should
    track the baseline within sampling noise. For G6/G10, gate on Stage 2:
    `sdar/teacher_gap` and the loss curve.
