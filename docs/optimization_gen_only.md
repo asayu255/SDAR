@@ -289,20 +289,28 @@ Worth a scoped experiment on a 1000-trajectory pool before committing.
 Not a speed mechanism, but it gates whether the run finishes at all, and the
 final `concat` + `save_to_disk` is real wall time.
 
-Per saved turn-row, at alfworld's shape (prompt 2048 + response 512 = 2560):
+Rows are padded to `data.max_prompt_length + data.max_response_length` =
+4096 + 512 = 4608 **for every task**. The per-task `max_prompt_length` override
+that caps alfworld at 2048 does not shrink this: it applies only to the initial
+dataset load, while the rollout's per-turn retokenization pads to the global
+value (`rollout_loop.py:376` → `torch_functional.py:360` →
+`postprocess_data(..., max_length)`). Same finding as G4, and it is also why
+Stage 2's `DataProto.concat` over the three tasks' files works at all.
 
 | Key | dtype | bytes/row |
 |---|---|---|
-| `input_ids`, `attention_mask`, `position_ids` | int64 × 2560 | 3 × 20.5 KB |
-| `prompts` | int64 × 2048 | 16.4 KB |
+| `input_ids`, `attention_mask`, `position_ids` | int64 × 4608 | 3 × 36.9 KB |
+| `prompts` | int64 × 4096 | 32.8 KB |
 | `responses`, `response_mask` | int64 × 512 | 2 × 4.1 KB |
 | `teacher_topk_logprobs` | fp32 × 512 × 20 | 41 KB |
 | `teacher_topk_ids` | int64 × 512 × 20 | 82 KB |
-| **total** | | **≈ 209 KB** |
+| **total** | | **≈ 275 KB** |
 
 36000 alfworld trajectories × an assumed ~20 turn-rows each ≈ 720 k rows ≈
-**150 GB in one `.pt`**, held entirely in a Python list first and then
-*doubled* at peak by `DataProto.concat`. search (4 turns) lands around 30 GB.
+**198 GB**, held entirely in a Python list first and then *doubled* at peak by
+`DataProto.concat`. search (4 turns) ≈ 40 GB, webshop ≈ 80 GB. **G1 makes this
+worse, not better**: the three tasks used to accumulate one at a time, so peak
+RAM was the largest task; concurrently it is their sum.
 
 Cheap, additive fixes:
 - `teacher_topk_ids` → int32 (vocab 151 936 ≪ 2³¹): −41 KB/row.
@@ -312,12 +320,22 @@ Cheap, additive fixes:
 - drop `position_ids` (recomputable from `attention_mask` at load) and
   `prompts` (a prefix of `input_ids`): −37 KB/row.
 
-Together ≈ 209 KB → ≈ 62 KB/row, a **3.4×** reduction.
+Together ≈ 275 KB → ≈ 128 KB/row, a **2.1×** reduction. None of these are
+implemented.
 
-- **Shard incrementally.** Write `<task>_shard{i}.pt` every N steps instead of
-  accumulating. Stage 2 already globs `*.pt`
-  (`opd_offpolicy_ray_trainer.py:195`), so sharded output loads with no Stage-2
-  change — and a crash stops costing the whole run.
+**Shard incrementally — IMPLEMENTED.** `+gen.shard_every_steps=N` (0 = the old
+single-file behavior; the run script sets 10) flushes the buffer to
+`<task>_{i:04d}.pt` every N steps and clears it, so peak RAM is one shard's
+worth instead of the whole run's, and the doubling `DataProto.concat` at the
+end is gone. Stage 2 needs no change — `_load_offpolicy_data` already globs
+`*.pt` in `teacher_data_dir`. A crash now costs at most N steps instead of
+everything.
+
+Because Stage 2 globs the directory, a rerun first deletes that task's own
+`<task>_[0-9]*.pt` and any legacy `<task>.pt` (logged per file): a stale shard
+from a longer previous run would otherwise be silently concatenated into the
+new dataset. This matches the existing contract that rerunning a task
+overwrites its output.
 
 ---
 

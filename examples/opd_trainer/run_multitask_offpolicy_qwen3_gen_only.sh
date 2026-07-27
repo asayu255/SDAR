@@ -152,6 +152,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.shard_every_steps=10 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \
@@ -236,6 +237,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.shard_every_steps=10 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \
@@ -320,6 +322,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.shard_every_steps=10 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \

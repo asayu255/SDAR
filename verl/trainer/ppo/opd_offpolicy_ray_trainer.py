@@ -96,11 +96,49 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         target = gen_cfg.get("num_trajectories", None)
         target = int(target) if target else None
 
+        # Incremental sharding. Without it every turn-row of the whole run is held
+        # in this actor's RAM until the end, and then DataProto.concat allocates a
+        # second full copy -- so the run can die at its very last step, after
+        # hours. Rows are padded to data.max_prompt_length + data.max_response_length
+        # for every task (the per-task max_prompt_length override applies only to
+        # the initial dataset load, not to the rollout's per-turn retokenization),
+        # which at 4096+512 and topk=20 is ~275 KB/row.
+        # shard_every_steps=0 keeps the single-file behavior.
+        shard_every = int(gen_cfg.get("shard_every_steps", 0) or 0)
+        shard_idx = 0
+        shard_paths = []
+
         self.global_steps = 0
         collected = []
         seen_trajs = set()
         n_collected = 0
+        n_rows_total = 0
         os.makedirs(out_dir, exist_ok=True)
+
+        if shard_every > 0:
+            # Stage 2 globs *.pt in this directory, so a stale shard left by a
+            # longer previous run (or a <task>.pt from a pre-sharding run) would be
+            # silently concatenated into the new dataset. Rerunning a task already
+            # overwrites its output, so clear this task's files first.
+            stale = sorted(glob.glob(os.path.join(out_dir, f"{task}_[0-9]*.pt")))
+            legacy = os.path.join(out_dir, f"{task}.pt")
+            if os.path.exists(legacy):
+                stale.append(legacy)
+            for path in stale:
+                print(f"[OPD-offpolicy gen][{task}] removing stale output {path}", flush=True)
+                os.remove(path)
+
+        def _flush_shard():
+            nonlocal collected, shard_idx
+            if not collected:
+                return
+            shard = DataProto.concat(collected)
+            path = os.path.join(out_dir, f"{task}_{shard_idx:04d}.pt")
+            shard.save_to_disk(path)
+            shard_paths.append(path)
+            print(f"[OPD-offpolicy gen][{task}] wrote shard {path} ({len(shard)} turn-rows)", flush=True)
+            collected = []
+            shard_idx += 1
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -154,11 +192,14 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                         keep = gen_out.select(batch_keys=tensor_keys, non_tensor_batch_keys=non_tensor_keys)
                         keep = keep.to("cpu")
                         collected.append(keep)
+                        n_rows_total += len(keep)
                     if "traj_uid" in keep.non_tensor_batch:
                         seen_trajs.update(keep.non_tensor_batch["traj_uid"].tolist())
                         n_collected = len(seen_trajs)
                     else:
-                        n_collected = sum(len(c) for c in collected)
+                        # No uid to deduplicate on; count turn-rows. Uses the running
+                        # total rather than the buffer, which sharding empties.
+                        n_collected = n_rows_total
                     self.global_steps += 1
                     if target is not None and n_collected >= target:
                         reached_target = True
@@ -166,17 +207,26 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                 # Printed after the "step" timer closes so its total is available.
                 print(f"[OPD-offpolicy gen][{task}] step {self.global_steps} "
                       f"collected {n_collected} trajectories "
-                      f"({sum(len(c) for c in collected)} turn-rows)  "
+                      f"({n_rows_total} turn-rows)  "
                       f"[step {timing_raw.get('step', 0):.1f}s = "
                       f"gen {timing_raw.get('gen', 0):.1f}s + "
                       f"topk {timing_raw.get('teacher_topk', 0):.1f}s + "
                       f"collect {timing_raw.get('collect', 0):.1f}s]", flush=True)
+
+                if shard_every > 0 and self.global_steps % shard_every == 0:
+                    _flush_shard()
 
                 if reached_target:
                     break
             else:
                 continue
             break
+
+        if shard_every > 0:
+            _flush_shard()  # remainder since the last flush
+            print(f"[OPD-offpolicy gen][{task}] saved {n_collected} trajectories "
+                  f"({n_rows_total} turn-rows) -> {len(shard_paths)} shards in {out_dir}")
+            return out_dir
 
         data = DataProto.concat(collected)
         out_path = os.path.join(out_dir, f"{task}.pt")
