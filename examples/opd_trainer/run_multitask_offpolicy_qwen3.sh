@@ -55,7 +55,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=alfworld \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.topk=20 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -134,7 +134,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=search \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.topk=20 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -213,7 +213,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=webshop \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.topk=20 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \

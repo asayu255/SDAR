@@ -14,10 +14,18 @@
 # gen.teacher_path, filtered parquet paths, per-task experiment names).
 
 # ---- dataset size / scoring ------------------------------------------------------
-# Pool sized so Stage 2 = 300 steps x 5 epochs: 300 * (per_task_batch_size 15 *
-# env.rollout.n 8 = 120 traj/step) / 5 epochs = 7200 trajectories/task. Stage 2
-# keeps trainer.total_training_steps=300, so a 7200 pool is reused ~5 times.
-"gen.num_trajectories": 7200
+# Pool sized so Stage 2 = 300 steps x 1 epoch: 300 * (per_task_batch_size 15 *
+# env.rollout.n 8 = 120 traj/step) = 36000 trajectories/task. Stage 2 keeps
+# trainer.total_training_steps=300, so every teacher trajectory is trained on
+# exactly once and the replay in _offpolicy_batch_iter never wraps around.
+#
+# Generation consumes its prompt pool exactly once as well: prepare_sdar_multitask
+# builds total_training_steps * per_task_batch_size = 4500 real search prompts,
+# and 4500 / 15 = 300 batches x 8 rollouts = 36000. alfworld / webshop have no
+# real prompts (15 placeholder rows); their variety comes from fresh episodes
+# drawn over trainer.total_epochs=300 passes of that 15-row loader, which is
+# exactly the 300 batches the 36000 target needs.
+"gen.num_trajectories": 36000
 "gen.topk": 20
 
 # ---- prompts / episode shape (identical to the on-policy OPD run) -----------------
