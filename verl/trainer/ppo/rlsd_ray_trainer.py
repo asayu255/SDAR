@@ -30,8 +30,10 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_data_metrics_by_task,
     compute_throughout_metrics,
     compute_timing_metrics,
+    task_row_indices,
 )
 from verl.utils.model import compute_position_id_with_mask
 
@@ -335,8 +337,7 @@ class RLSDRayTrainer(RayPPOTrainer):
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        old_log_prob_metrics = self._entropy_loss_metrics(batch, entropys, response_masks, loss_agg_mode)
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -428,6 +429,14 @@ class RLSDRayTrainer(RayPPOTrainer):
                         metrics["rlsd/teacher_student_gap_std"] = masked_mean(delta_t ** 2, response_mask).sqrt().item()
                         metrics["rlsd/lambda"] = current_lambda
                         metrics["rlsd/clip_eps"] = self.rlsd_clip_eps
+                        for task, rows in task_row_indices(batch).items():
+                            task_rows = torch.from_numpy(rows)
+                            task_delta_t, task_mask = delta_t[task_rows], response_mask[task_rows]
+                            metrics[f"rlsd/teacher_student_gap_mean/{task}"] = masked_mean(task_delta_t, task_mask).item()
+                            metrics[f"rlsd/teacher_student_gap_std/{task}"] = masked_mean(task_delta_t ** 2, task_mask).sqrt().item()
+
+                    # tag rows with their task so the actor can split its metrics
+                    self._attach_task_ids(batch)
 
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -473,6 +482,7 @@ class RLSDRayTrainer(RayPPOTrainer):
                     "training/epoch": epoch,
                 })
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics_by_task(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

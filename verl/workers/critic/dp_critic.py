@@ -27,6 +27,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
@@ -78,8 +79,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
-                    position_ids_rmpad =
-                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
                 else:
                     position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
 
@@ -183,6 +183,11 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
+        # so the losses below can also be reported per task. Absent in single-task runs.
+        task_id_names = data.meta_info.get("task_id_names", None)
+        if "task_ids" in data.batch.keys():
+            select_keys.append("task_ids")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -244,6 +249,31 @@ class DataParallelPPOCritic(BasePPOCritic):
                         loss = vf_loss / self.gradient_accumulation
 
                     loss.backward()
+
+                    task_ids = data.get("task_ids", None) if task_id_names else None
+                    if task_ids is not None:
+                        # Same value loss, re-aggregated over the rows of one task at a
+                        # time. Diagnostics only: nothing here touches the graph the
+                        # optimizer step above was built from.
+                        with torch.no_grad():
+                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                                task_response_mask = response_mask[rows]
+                                task_vf_loss, task_vf_clipfrac = core_algos.compute_value_loss(
+                                    vpreds=vpreds[rows],
+                                    values=values[rows],
+                                    returns=returns[rows],
+                                    response_mask=task_response_mask,
+                                    cliprange_value=self.config.cliprange_value,
+                                    loss_agg_mode=self.config.loss_agg_mode,
+                                )
+                                append_to_dict(
+                                    metrics,
+                                    {
+                                        f"critic/vf_loss/{task}": task_vf_loss.detach().item(),
+                                        f"critic/vf_clipfrac/{task}": task_vf_clipfrac.detach().item(),
+                                        f"critic/vpred_mean/{task}": masked_mean(vpreds[rows], task_response_mask).detach().item(),
+                                    },
+                                )
 
                     data = {
                         "critic/vf_loss": vf_loss.detach().item(),
