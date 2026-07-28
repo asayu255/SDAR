@@ -17,13 +17,22 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+# Every per-task metric is the overall metric name with the task appended as the
+# last path segment (e.g. "critic/score/mean" -> "critic/score/mean/alfworld"),
+# so the wandb panel that holds the overall metric also holds its per-task
+# breakdown.
+# Canonical multitask names. A raw task_name is matched by substring so that
+# dataset-specific spellings ("alfworld_eval", "webshop_train", ...) collapse to
+# the same bucket the trainers already route on.
+CANONICAL_TASK_NAMES = ("alfworld", "webshop", "search")
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
@@ -44,6 +53,113 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     from verl.utils.metric import reduce_metrics
 
     return reduce_metrics(metrics)
+
+
+def normalize_task_name(task_name: Any) -> Optional[str]:
+    """Map a raw ``task_name`` onto its canonical multitask bucket.
+
+    Returns ``None`` for a missing name, and the (lower-cased) name itself when
+    it matches none of the canonical tasks, so unknown tasks still get their own
+    metric bucket instead of being silently merged.
+    """
+    if task_name is None:
+        return None
+    task_name = str(task_name).lower()
+    for canonical in CANONICAL_TASK_NAMES:
+        if canonical in task_name:
+            return canonical
+    return task_name
+
+
+def get_task_names(batch: DataProto) -> Optional[np.ndarray]:
+    """Row-aligned canonical task names for a batch, or ``None`` when unavailable.
+
+    Single-task runs carry no ``task_name`` (nor ``env_kwargs['task_name']``), in
+    which case every caller falls back to logging only the overall metrics.
+    """
+    task_names = batch.non_tensor_batch.get("task_name", None)
+    if task_names is None:
+        env_kwargs = batch.non_tensor_batch.get("env_kwargs", None)
+        if env_kwargs is not None:
+            task_names = [item.get("task_name") if isinstance(item, dict) else None for item in env_kwargs]
+    if task_names is None:
+        return None
+
+    normalized = np.array([normalize_task_name(task_name) for task_name in task_names], dtype=object)
+    if all(task_name is None for task_name in normalized):
+        return None
+    return normalized
+
+
+def task_row_indices(batch: DataProto) -> Dict[str, np.ndarray]:
+    """Map each task present in the batch to the row indices belonging to it.
+
+    Rows without a usable task name are dropped (they belong to no task), and the
+    mapping is empty when the batch carries no task information at all.
+    """
+    task_names = get_task_names(batch)
+    if task_names is None:
+        return {}
+
+    indices: Dict[str, List[int]] = defaultdict(list)
+    for row, task_name in enumerate(task_names):
+        if task_name is None:
+            continue
+        indices[task_name].append(row)
+    return {task: np.array(rows, dtype=np.int64) for task, rows in sorted(indices.items())}
+
+
+def iter_task_row_masks(task_ids: "torch.Tensor", task_id_names: List[str]):
+    """Yield ``(task, row_mask)`` for every task present in a worker micro-batch.
+
+    The workers only see the integer ``task_ids`` column attached by
+    ``RayPPOTrainer._attach_task_ids``; ``task_id_names`` maps it back to the task
+    name. Ids outside that mapping (``-1`` for rows whose task name was missing)
+    are skipped.
+    """
+    if task_ids is None or not task_id_names:
+        return
+    for task_id in torch.unique(task_ids).tolist():
+        if task_id < 0 or task_id >= len(task_id_names):
+            continue
+        yield task_id_names[task_id], task_ids == task_id
+
+
+def with_task_suffix(metrics: Dict[str, Any], task: str) -> Dict[str, Any]:
+    """Rename metrics to their per-task variant, e.g. ``a/b`` -> ``a/b/{task}``."""
+    return {f"{name}/{task}": value for name, value in metrics.items()}
+
+
+def compute_metrics_by_task(batch: DataProto, metric_fn: Callable[[DataProto], Dict[str, Any]]) -> Dict[str, Any]:
+    """Run ``metric_fn`` on each single-task slice of the batch.
+
+    The same function that produces the overall metrics is re-run on the rows of
+    one task at a time, so every metric it reports gains a per-task counterpart
+    with identical semantics.
+    """
+    per_task_metrics = {}
+    for task, rows in task_row_indices(batch).items():
+        per_task_metrics.update(with_task_suffix(metric_fn(batch.select_idxs(rows)), task))
+    return per_task_metrics
+
+
+def _drop_batch_level_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop metrics that are batch-wide constants broadcast onto every row.
+
+    Success rates are computed by the env manager over the whole rollout and then
+    copied to every row, so slicing rows by task cannot recover a per-task value.
+    The multitask env manager already reports them per task as
+    ``episode/{task}_success_rate``.
+    """
+    return {name: value for name, value in metrics.items() if "success_rate" not in name}
+
+
+def compute_data_metrics_by_task(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
+    """Per-task breakdown of :func:`compute_data_metrics`."""
+    return compute_metrics_by_task(
+        batch,
+        lambda task_batch: _drop_batch_level_metrics(compute_data_metrics(task_batch, use_critic=use_critic)),
+    )
 
 
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
@@ -257,11 +373,23 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], n
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
-    return {
+    metrics = {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
+
+    # Per-task token counts / throughput share. The step time itself covers all
+    # tasks at once and cannot be attributed, so only the token-derived metrics
+    # are split; the per-task throughputs sum to the overall one.
+    token_num = np.asarray(batch.meta_info["global_token_num"])
+    if token_num.shape[0] == len(batch):  # row-aligned, so it can be split by task
+        for task, rows in task_row_indices(batch).items():
+            task_num_tokens = int(token_num[rows].sum())
+            metrics[f"perf/total_num_tokens/{task}"] = task_num_tokens
+            metrics[f"perf/throughput/{task}"] = task_num_tokens / (time * n_gpus)
+
+    return metrics
 
 
 def bootstrap_metric(
