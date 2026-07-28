@@ -165,8 +165,21 @@ def test_producer_exception_reaches_the_consumer(monkeypatch):
     assert seen == [0, 1, 2]
 
 
-def test_disabled_by_default_env(monkeypatch):
+def test_prefetch_knob_defaults_to_off(monkeypatch):
+    """An unset environment must reproduce the pre-existing behaviour exactly.
+
+    Exercises the parsing rule rather than ``mod._BATCH_PREFETCH``: that global
+    is read once at import, so its value reflects whatever the person running
+    the tests happens to have exported -- asserting on it fails on exactly the
+    machines where the knob is deliberately enabled.
+    """
     monkeypatch.delenv("OFFPOLICY_BATCH_PREFETCH", raising=False)
-    # The module-level flag is read at import; assert the default is off so an
-    # unset environment reproduces the pre-existing behaviour exactly.
-    assert mod._BATCH_PREFETCH is False or mod._BATCH_PREFETCH == 0
+    assert mod._env_flag("OFFPOLICY_BATCH_PREFETCH") is False
+
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("OFFPOLICY_BATCH_PREFETCH", value)
+        assert mod._env_flag("OFFPOLICY_BATCH_PREFETCH") is True, value
+
+    for value in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("OFFPOLICY_BATCH_PREFETCH", value)
+        assert mod._env_flag("OFFPOLICY_BATCH_PREFETCH") is False, value

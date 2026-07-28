@@ -69,11 +69,17 @@ _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
 _GEN_NON_TENSOR_KEYS = ["raw_prompt_ids", "data_source"]
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # Opt-in: overlap the driver-side batch preparation of step k+1 with step k's
 # update_actor. Bit-identical (see _prepared_batch_iter), but it keeps a second
 # prepared batch resident in driver memory, so it stays off by default -- these
 # runs already sit at a few hundred GB of host RAM for the trajectory pool.
-_BATCH_PREFETCH = os.environ.get("OFFPOLICY_BATCH_PREFETCH", "0").strip().lower() in ("1", "true", "yes", "on")
+# Read once at import, like the other rollout knobs in this tree, so the
+# mechanism cannot change halfway through a run.
+_BATCH_PREFETCH = _env_flag("OFFPOLICY_BATCH_PREFETCH")
 
 
 def _build_gen_batch(batch: DataProto) -> DataProto:
