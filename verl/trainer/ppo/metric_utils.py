@@ -192,6 +192,23 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
+def compute_trajectory_response_tokens(batch: DataProto) -> Optional[np.ndarray]:
+    """Generated tokens per trajectory, i.e. per sample rather than per turn.
+
+    A row of the batch is one env turn, so the row-level ``response_length`` is a
+    per-turn length. Summing the rows that share a ``traj_uid`` gives the tokens a
+    whole sample generated across its turns. Returns ``None`` when the batch
+    carries no trajectory ids.
+    """
+    traj_uid = batch.non_tensor_batch.get("traj_uid", None)
+    if not isinstance(traj_uid, np.ndarray) or traj_uid.shape[0] != len(batch):
+        return None
+
+    response_length = _compute_response_info(batch)["response_length"].cpu().numpy()
+    _, trajectory_of_row = np.unique(traj_uid, return_inverse=True)
+    return np.bincount(trajectory_of_row.reshape(-1), weights=response_length)
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -235,6 +252,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
     unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
+    trajectory_response_tokens = compute_trajectory_response_tokens(batch)
 
     if use_critic:
         values = batch.batch["values"]
@@ -294,7 +312,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             batch.non_tensor_batch["episode_lengths"][unique_idx].max().item(),
         "episode/length/min": 
             batch.non_tensor_batch["episode_lengths"][unique_idx].min().item(),
-        "episode/tool_call_count/mean": 
+        # tokens a whole trajectory generated (response_length above is per turn)
+        **(
+            {
+                "episode/response_tokens/mean": float(trajectory_response_tokens.mean()),
+                "episode/response_tokens/max": float(trajectory_response_tokens.max()),
+                "episode/response_tokens/min": float(trajectory_response_tokens.min()),
+            }
+            if trajectory_response_tokens is not None
+            else {}
+        ),
+        "episode/tool_call_count/mean":
             batch.non_tensor_batch["tool_callings"][unique_idx].mean().item(),
         # "episode/tool_call_count/max":
         #     batch.non_tensor_batch["tool_callings"][unique_idx].max().item(),
