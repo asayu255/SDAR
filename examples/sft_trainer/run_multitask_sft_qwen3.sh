@@ -106,7 +106,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.31:8001/retrieve' \
+    env.search.search_url='http://100.86.45.30:8000/retrieve' \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
