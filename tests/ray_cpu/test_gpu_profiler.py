@@ -181,6 +181,41 @@ def test_report_renders_both_scopes(capsys):
     assert "per step" in cumulative
 
 
+def test_missing_metric_placeholder_keeps_the_column_width():
+    # An nvidia-smi-backed host reports no PCIe and no NVLink. Three unpadded
+    # placeholders in a row render as "1736---" and shift every later column.
+    assert gp._fmt(None, ">9.0f") == "        -"
+    assert gp._fmt(None, ">8.1f") == "       -"
+    assert gp._fmt(12.0, ">8.1f") == "    12.0"
+    # The per-GPU list is joined with "/" and must stay unpadded.
+    assert gp._fmt(None, ".0f") == "-"
+
+
+def test_row_stays_aligned_when_a_backend_supplies_no_link_metrics(capsys):
+    no_link = [
+        {
+            "sm_util": BUSY,
+            "mem_bw_util": 41.0,
+            "mem_used_gb": 44.0,
+            "power_w": 232.0,
+            "sm_clock_mhz": 1740.0,
+            "pcie_tx_mb_s": None,
+            "pcie_rx_mb_s": None,
+            "nvlink_mb_s": None,
+        }
+        for _ in range(N_GPUS)
+    ]
+    by_phase = gp._accumulate([(0.1, 0.1, "update_actor", no_link, None)], N_GPUS)
+    gp._print_report(by_phase, N_GPUS, "step 0", 0.1)
+    out = capsys.readouterr().out.splitlines()
+
+    header = next(ln for ln in out if ln.lstrip().startswith("phase"))
+    row = next(ln for ln in out if ln.startswith("update_actor"))
+    assert "---" not in row
+    # The per-GPU column is the only ragged one, so compare up to where it starts.
+    assert len(row[: header.index("per-GPU")]) == header.index("per-GPU")
+
+
 def test_share_column_sums_to_one_hundred(capsys):
     by_phase = gp._accumulate(
         _samples([("update_actor", BUSY)] * 3 + [("save_checkpoint", IDLE)]), N_GPUS

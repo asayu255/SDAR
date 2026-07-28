@@ -77,9 +77,13 @@ Env vars
 
 import atexit
 import os
+import re
 import threading
 import time
 from collections import defaultdict
+
+# Leading alignment flag + field width of a format spec such as ">9.0f".
+_WIDTH_RE = re.compile(r"([<>^]?)(\d+)")
 
 __all__ = [
     "enabled",
@@ -309,11 +313,23 @@ def _make_host_sampler():
 
 def _make_backend():
     try:
-        return _NvmlBackend()
+        backend = _NvmlBackend()
+        print("[gpu-profiler] backend: NVML", flush=True)
+        return backend
     except Exception as e:  # pragma: no cover - depends on host
         nvml_err = e
     try:
-        return _SmiBackend()
+        backend = _SmiBackend()
+        # Say so loudly: the fallback silently drops two whole metrics, and a
+        # blank NVLink column otherwise reads as "no collective traffic"
+        # rather than "not measured".
+        print(
+            f"[gpu-profiler] backend: nvidia-smi fallback -- NVLink and PCIe "
+            f"throughput are NOT collected (NVML unavailable: {nvml_err}). "
+            f"Install nvidia-ml-py to enable them.",
+            flush=True,
+        )
+        return backend
     except Exception as e:  # pragma: no cover - depends on host
         print(f"[gpu-profiler] disabled: no NVML ({nvml_err}) and no nvidia-smi ({e})", flush=True)
         return None
@@ -686,7 +702,17 @@ _PHASE_ORDER = [
 
 
 def _fmt(v, spec):
-    return format(v, spec) if v is not None else "-"
+    if v is not None:
+        return format(v, spec)
+    # Pad the placeholder to the column width taken from the numeric spec.
+    # Returning a bare "-" collapses the column, and a run of unavailable
+    # metrics then renders as "1736---" with every later column shifted --
+    # which is exactly what an nvidia-smi-backed host (no PCIe, no NVLink)
+    # produces. Specs without a width (the per-GPU list) stay unpadded.
+    m = _WIDTH_RE.match(spec)
+    if not m:
+        return "-"
+    return format("-", f"{m.group(1) or '>'}{m.group(2)}")
 
 
 def _print_report(by_phase, n_gpus, label, interval, cumulative_steps=None):
