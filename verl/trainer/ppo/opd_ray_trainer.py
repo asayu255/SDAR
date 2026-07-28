@@ -29,6 +29,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import (
     _compute_response_info,
     compute_metrics_by_task,
+    compute_trajectory_response_tokens,
     compute_throughout_metrics,
     compute_timing_metrics,
 )
@@ -82,6 +83,12 @@ def compute_opd_data_metrics(batch: DataProto) -> dict:
                 metrics[f"episode/{k}"] = float(v[0])
         if "episode_rewards" in batch.non_tensor_batch:
             metrics["episode/reward/mean"] = float(batch.non_tensor_batch["episode_rewards"][unique_idx].mean())
+        # tokens a whole trajectory generated (response_length above is per turn)
+        trajectory_response_tokens = compute_trajectory_response_tokens(batch)
+        if trajectory_response_tokens is not None:
+            metrics["episode/response_tokens/mean"] = float(trajectory_response_tokens.mean())
+            metrics["episode/response_tokens/max"] = float(trajectory_response_tokens.max())
+            metrics["episode/response_tokens/min"] = float(trajectory_response_tokens.min())
 
     return metrics
 
