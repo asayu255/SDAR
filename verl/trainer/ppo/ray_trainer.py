@@ -47,9 +47,13 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_data_metrics_by_task,
     compute_throughout_metrics,
     compute_timing_metrics,
+    get_task_names,
+    normalize_task_name,
     process_validation_metrics,
+    task_row_indices,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -186,14 +190,18 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    sequence_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = torch.mean(sequence_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch["token_level_rewards"] = token_level_rewards
 
     metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+    # Same average, restricted to the rows of one task (the coefficient is a
+    # single global controller value, so it has no per-task counterpart).
+    for task, rows in task_row_indices(data).items():
+        metrics[f"actor/reward_kl_penalty/{task}"] = torch.mean(sequence_kl[torch.from_numpy(rows)], dim=0).item()
 
     return data, metrics
 
@@ -247,8 +255,11 @@ def apply_invalid_action_penalty(
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= penalty_coef * action_invalids
     
-    valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+    is_action_valid = data.non_tensor_batch['is_action_valid'].astype(np.float32)
+    valid_action_ratio = np.mean(is_action_valid).item()
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
+    for task, rows in task_row_indices(data).items():
+        metrics[f'episode/valid_action_ratio/{task}'] = np.mean(is_action_valid[rows]).item()
     return data, metrics
 
 def compute_response_mask(data: DataProto):
@@ -722,16 +733,40 @@ class RayPPOTrainer:
 
     @staticmethod
     def _normalize_task_name(task_name):
-        if task_name is None:
-            return None
-        task_name = str(task_name).lower()
-        if "alfworld" in task_name:
-            return "alfworld"
-        if "webshop" in task_name:
-            return "webshop"
-        if "search" in task_name:
-            return "search"
-        return task_name
+        return normalize_task_name(task_name)
+
+    @staticmethod
+    def _attach_task_ids(batch: DataProto):
+        """Tag every row with an integer task id for worker-side per-task metrics.
+
+        The workers only receive tensors from ``batch.batch``, so the string
+        ``task_name`` cannot travel with the batch into ``update_actor``. The id
+        column plus the ``task_id_names`` lookup in ``meta_info`` (both preserved
+        by chunking) let the actor split its loss metrics per task. Rows with no
+        task name get id ``-1`` and are skipped there.
+        """
+        task_names = get_task_names(batch)
+        if task_names is None:
+            return
+        names = sorted({task_name for task_name in task_names if task_name is not None})
+        name_to_id = {task_name: task_id for task_id, task_name in enumerate(names)}
+        batch.batch["task_ids"] = torch.tensor(
+            [name_to_id.get(task_name, -1) for task_name in task_names], dtype=torch.long
+        )
+        batch.meta_info["task_id_names"] = names
+
+    @staticmethod
+    def _entropy_loss_metrics(batch: DataProto, entropys, response_masks, loss_agg_mode) -> dict:
+        """``actor/entropy_loss`` plus the same aggregation restricted to each task."""
+        metrics = {
+            "actor/entropy_loss": agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode).detach().item(),
+        }
+        for task, rows in task_row_indices(batch).items():
+            task_rows = torch.from_numpy(rows)
+            metrics[f"actor/entropy_loss/{task}"] = (
+                agg_loss(loss_mat=entropys[task_rows], loss_mask=response_masks[task_rows], loss_agg_mode=loss_agg_mode).detach().item()
+            )
+        return metrics
 
     def _validation_task_name(self, batch: DataProto):
         task_names = batch.non_tensor_batch.get("task_name", None)
@@ -780,6 +815,7 @@ class RayPPOTrainer:
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
+        task_name_lst = []
         tool_calling_list = []
         traj_uid_list = []
         success_rate_dict = {}
@@ -863,6 +899,10 @@ class RayPPOTrainer:
 
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            batch_task_names = get_task_names(test_batch)
+            if batch_task_names is None:
+                batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
+            task_name_lst.append(batch_task_names)
             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
             # success rate
@@ -879,6 +919,7 @@ class RayPPOTrainer:
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
+        task_names = np.concatenate(task_name_lst, axis=0)
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
@@ -891,11 +932,23 @@ class RayPPOTrainer:
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
+        # evaluate test_score based on task (a task can span several data sources,
+        # e.g. search validates on nq / hotpotqa / ...; for the tasks whose data
+        # source is the task name this repeats the per-data-source value above)
+        task_reward = {}
+        for i in range(reward_tensor.shape[0]):
+            task_name = task_names[i]
+            if task_name is None:
+                continue
+            task_reward.setdefault(task_name, []).append(reward_tensor[i].item())
+
         # evaluate tool call based on data source
         # the values in tool_callings represent the tool call count for each trajectory; however, since the batch is expanded by step, we only need to take one value for each unique trajectories.
         data_source_tool_calling = {}
+        task_tool_calling = {}
         unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
         unique_data_sources = data_sources[unique_idx]
+        unique_task_names = task_names[unique_idx]
         unique_tool_callings = tool_callings[unique_idx]
 
         for i in range(unique_tool_callings.shape[0]):
@@ -904,14 +957,24 @@ class RayPPOTrainer:
                 data_source_tool_calling[data_source] = []
             data_source_tool_calling[data_source].append(unique_tool_callings[i].item())
 
+            task_name = unique_task_names[i]
+            if task_name is not None:
+                task_tool_calling.setdefault(task_name, []).append(unique_tool_callings[i].item())
+
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/{data_source}/test_score'] = np.mean(rewards)
+
+        for task_name, rewards in task_reward.items():
+            metric_dict[f'val/{task_name}/test_score'] = np.mean(rewards)
 
         for data_source, tool_calls in data_source_tool_calling.items():
             metric_dict[f'val/{data_source}/tool_call_count/mean'] = np.mean(tool_calls)
             # metric_dict[f'val/{data_source}/tool_call_count/max'] = np.max(tool_calls)
             # metric_dict[f'val/{data_source}/tool_call_count/min'] = np.min(tool_calls)
+
+        for task_name, tool_calls in task_tool_calling.items():
+            metric_dict[f'val/{task_name}/tool_call_count/mean'] = np.mean(tool_calls)
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
@@ -1290,8 +1353,7 @@ class RayPPOTrainer:
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        old_log_prob_metrics = self._entropy_loss_metrics(batch, entropys, response_masks, loss_agg_mode)
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -1384,6 +1446,9 @@ class RayPPOTrainer:
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                         )
 
+                    # tag rows with their task so the actor can split its metrics
+                    self._attach_task_ids(batch)
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -1438,6 +1503,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics_by_task(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
