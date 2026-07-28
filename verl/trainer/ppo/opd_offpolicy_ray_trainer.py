@@ -26,6 +26,8 @@ Two stages, sharing all data / env / config / teacher / loss machinery with OPD:
 
 import glob
 import os
+import queue
+import threading
 from pprint import pprint
 
 import numpy as np
@@ -66,6 +68,12 @@ _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 # Keys popped from the prompt batch to form the generation input (mirrors OPD).
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
 _GEN_NON_TENSOR_KEYS = ["raw_prompt_ids", "data_source"]
+
+# Opt-in: overlap the driver-side batch preparation of step k+1 with step k's
+# update_actor. Bit-identical (see _prepared_batch_iter), but it keeps a second
+# prepared batch resident in driver memory, so it stays off by default -- these
+# runs already sit at a few hundred GB of host RAM for the trajectory pool.
+_BATCH_PREFETCH = os.environ.get("OFFPOLICY_BATCH_PREFETCH", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _build_gen_batch(batch: DataProto) -> DataProto:
@@ -260,6 +268,96 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                     rows.extend(self._task_to_traj_rows[task][uid].tolist())
             yield self.offpolicy_data.select_idxs(rows)
 
+    def _prepare_batch(self, batch: DataProto):
+        """Everything between drawing a batch and dispatching it to the workers.
+
+        Pure driver-side CPU work: pad the per-step batch to a DP/micro-divisible
+        size (same as OPD's post-rollout adjust_batch), recompute response_mask,
+        reorder for token balance across DP ranks, and count tokens. Split out of
+        ``fit`` so it can also run on the prefetch thread; the balance statistics
+        are returned rather than written into a step's metrics dict, because
+        under prefetch that dict does not exist yet.
+        """
+        prep_metrics = {}
+        batch = adjust_batch(self.config, batch)
+        batch.batch["response_mask"] = compute_response_mask(batch)
+        if self.config.trainer.balance_batch:
+            self._balance_batch(batch, metrics=prep_metrics)
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        return batch, prep_metrics
+
+    def _prepared_batch_iter(self):
+        """Yield ``(batch, prep_metrics)`` ready to dispatch.
+
+        With ``OFFPOLICY_BATCH_PREFETCH=1`` the draw + _prepare_batch for step
+        k+1 runs on a background thread while step k is inside update_actor,
+        which is a blocking ray.get and therefore holds no GIL. That removes the
+        driver-side CPU window between steps (the profiler's "(idle/other)" and
+        "step" rows) from the critical path.
+
+        Bit-identical to the sequential path. Two invariants make that true and
+        both are load-bearing:
+
+        * ``adjust_batch`` draws its duplicate-row indices from the *global*
+          numpy RNG (``np.random.choice``), not a seeded local generator. This
+          producer is the only consumer of that stream on the driver -- the
+          validation path never calls adjust_batch, and the only other np.random
+          use in the trainer is a local ``RandomState(42)`` -- and it consumes it
+          strictly in step order, so the same indices are drawn as before.
+        * ``_offpolicy_batch_iter``'s own generator is advanced by this one
+          thread only, so its permutations are unchanged.
+
+        A depth of one is deliberate: the window being hidden is ~2s against a
+        ~600s step, so a deeper queue buys no further overlap and only holds
+        more batches in driver memory. The semaphore -- rather than relying on
+        the queue bound alone -- is what actually enforces that depth: a
+        maxsize=1 queue still lets the producer build a further batch while one
+        is queued, which would put three prepared batches in memory at once.
+        """
+        source = self._offpolicy_batch_iter()
+        if not _BATCH_PREFETCH:
+            for raw in source:
+                yield self._prepare_batch(raw)
+            return
+
+        queue_ = queue.Queue(maxsize=1)
+        room = threading.Semaphore(1)  # prepared batches allowed ahead of the consumer
+        _DONE = object()
+
+        def _produce():
+            try:
+                for raw in source:
+                    room.acquire()
+                    queue_.put(self._prepare_batch(raw))
+            except BaseException as e:  # surfaced below; never strand the consumer
+                queue_.put(e)
+            else:
+                queue_.put(_DONE)
+
+        thread = threading.Thread(target=_produce, name="offpolicy-batch-prefetch", daemon=True)
+        thread.start()
+        print("[offpolicy] batch prefetch enabled (depth=1)", flush=True)
+        try:
+            while True:
+                item = queue_.get()
+                # Released before the batch is used, so the next one is built
+                # during update_actor rather than after it.
+                room.release()
+                if item is _DONE:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            # Consumer stopped early (last step / exception): unblock a producer
+            # parked on put() or acquire() so the thread can unwind and drop its
+            # reference to the batch instead of pinning it.
+            room.release()
+            try:
+                queue_.get_nowait()
+            except queue.Empty:
+                pass
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -286,19 +384,17 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self.global_steps += 1
         last_val_metrics = None
 
-        for batch in self._offpolicy_batch_iter():
+        for batch, prep_metrics in self._prepared_batch_iter():
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
 
             with _timer("step", timing_raw):
-                # Pad the per-step batch to a DP/micro-divisible size (same as OPD's
-                # post-rollout adjust_batch), then recompute response_mask / token counts.
-                batch = adjust_batch(self.config, batch)
-                batch.batch["response_mask"] = compute_response_mask(batch)
-                if self.config.trainer.balance_batch:
-                    self._balance_batch(batch, metrics=metrics)
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                # Batch preparation (adjust_batch / response_mask / balance /
+                # token count) already happened in _prepared_batch_iter -- on the
+                # prefetch thread when it is enabled. Its balance statistics are
+                # folded in here so the logged global_seqlen/* are unchanged.
+                metrics.update(prep_metrics)
 
                 with _timer("update_actor", timing_raw):
                     # update_policy scales student logits by this temperature (same value
