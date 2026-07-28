@@ -26,6 +26,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics_by_task,
     compute_metrics_by_task,
     compute_throughout_metrics,
+    compute_trajectory_response_tokens,
     get_task_names,
     iter_task_row_masks,
     normalize_task_name,
@@ -33,9 +34,17 @@ from verl.trainer.ppo.metric_utils import (
 )
 
 
-def _make_batch(task_names, batch_size=None):
-    """A minimal rollout batch: 2 prompt tokens + 2 response tokens per row."""
+def _make_batch(task_names, batch_size=None, traj_uids=None, response_lengths=None):
+    """A minimal rollout batch: 2 prompt tokens + 2 response tokens per row.
+
+    ``traj_uids`` groups rows into trajectories (one row is one env turn), and
+    ``response_lengths`` sets how many of the 2 response tokens each row uses.
+    """
     n = batch_size if batch_size is not None else len(task_names)
+    attention_mask = torch.ones((n, 4), dtype=torch.long)
+    if response_lengths is not None:
+        for row, length in enumerate(response_lengths):
+            attention_mask[row, 2 + length :] = 0
     tensors = {
         "token_level_scores": torch.arange(2 * n, dtype=torch.float32).reshape(n, 2),
         "token_level_rewards": torch.arange(2 * n, dtype=torch.float32).reshape(n, 2) / 2,
@@ -43,10 +52,10 @@ def _make_batch(task_names, batch_size=None):
         "returns": torch.arange(2 * n, dtype=torch.float32).reshape(n, 2) / 8,
         "values": torch.arange(2 * n, dtype=torch.float32).reshape(n, 2) / 16,
         "responses": torch.zeros((n, 2), dtype=torch.long),
-        "attention_mask": torch.ones((n, 4), dtype=torch.long),
+        "attention_mask": attention_mask,
     }
     non_tensors = {
-        "traj_uid": np.array([f"traj-{i}" for i in range(n)], dtype=object),
+        "traj_uid": np.array(traj_uids if traj_uids is not None else [f"traj-{i}" for i in range(n)], dtype=object),
         "episode_rewards": np.arange(n, dtype=np.float32),
         "episode_lengths": np.arange(n, dtype=np.float32) + 1,
         "tool_callings": np.arange(n, dtype=np.float32) + 2,
@@ -237,6 +246,36 @@ class TestIterTaskRowMasks(unittest.TestCase):
         self.assertEqual(list(iter_task_row_masks(None, ["alfworld"])), [])
         self.assertEqual(list(iter_task_row_masks(torch.tensor([0, 0]), None)), [])
         self.assertEqual(list(iter_task_row_masks(torch.tensor([0, 0]), [])), [])
+
+
+class TestTrajectoryResponseTokens(unittest.TestCase):
+    """episode/response_tokens sums the per-turn rows of one trajectory."""
+
+    def setUp(self):
+        # two trajectories: alfworld spans 2 turns (2 + 1 tokens), webshop 1 turn (2 tokens)
+        self.batch = _make_batch(
+            ["alfworld", "alfworld", "webshop"],
+            traj_uids=["traj-a", "traj-a", "traj-b"],
+            response_lengths=[2, 1, 2],
+        )
+
+    def test_tokens_are_summed_over_the_turns_of_a_trajectory(self):
+        np.testing.assert_array_equal(compute_trajectory_response_tokens(self.batch), np.array([3.0, 2.0]))
+
+    def test_metric_is_over_trajectories_not_turns(self):
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertAlmostEqual(metrics["episode/response_tokens/mean"], 2.5)  # (3 + 2) / 2 trajectories
+        self.assertAlmostEqual(metrics["episode/response_tokens/max"], 3.0)
+        self.assertAlmostEqual(metrics["episode/response_tokens/min"], 2.0)
+        # the per-turn length is a different quantity: (2 + 1 + 2) / 3 rows
+        self.assertAlmostEqual(metrics["response_length/mean"], 5 / 3)
+
+    def test_metric_is_reported_per_task(self):
+        per_task = compute_data_metrics_by_task(self.batch, use_critic=False)
+
+        self.assertAlmostEqual(per_task["episode/response_tokens/mean/alfworld"], 3.0)
+        self.assertAlmostEqual(per_task["episode/response_tokens/mean/webshop"], 2.0)
 
 
 class TestComputeThroughputMetricsByTask(unittest.TestCase):

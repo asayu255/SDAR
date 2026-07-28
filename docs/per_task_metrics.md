@@ -30,8 +30,8 @@ they logged before — no per-task keys are emitted.
 Driver side (`verl/trainer/ppo/`):
 
 - everything in `compute_data_metrics` — `critic/score|rewards|advantages|returns|values`,
-  `response_length/*`, `prompt_length/*`, `episode/reward|length|tool_call_count`
-  (`compute_opd_data_metrics` for OPD)
+  `response_length/*`, `prompt_length/*`,
+  `episode/reward|length|response_tokens|tool_call_count`
 - `actor/entropy_loss`
 - `episode/valid_action_ratio`
 - `actor/reward_kl_penalty`
@@ -53,6 +53,18 @@ over the rows of one task:
 These re-aggregations run under `torch.no_grad()` on tensors that were already
 computed for the loss; they are diagnostics and do not change the objective, the
 gradients, or the optimizer step.
+
+## Turn-level vs sample-level lengths
+
+A row of the batch is one env turn, so `response_length/*` and `prompt_length/*`
+are **per-turn** token counts and `episode/length/*` is the **number of turns** in
+a trajectory. `episode/response_tokens/mean|max|min` is the sample-level length:
+the rows sharing a `traj_uid` are summed, giving the tokens one whole trajectory
+generated across its turns (`compute_trajectory_response_tokens`). It is split
+per task like every other row-derived metric.
+
+Prompt tokens are deliberately not summed the same way — every turn re-sends the
+history, so a trajectory total would count the same context many times over.
 
 ## What is not split
 
