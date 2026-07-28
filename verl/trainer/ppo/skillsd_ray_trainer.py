@@ -33,8 +33,11 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_data_metrics_by_task,
     compute_throughout_metrics,
     compute_timing_metrics,
+    normalize_task_name,
+    task_row_indices,
 )
 
 from agent_system.multi_turn_rollout import adjust_batch, compute_log_prob_with_prefetch
@@ -70,16 +73,7 @@ class SkillSDRayTrainer(RLSDRayTrainer):
 
     @staticmethod
     def _normalize_task_name(task_name):
-        if task_name is None:
-            return None
-        task_name = str(task_name).lower()
-        if "alfworld" in task_name:
-            return "alfworld"
-        if "webshop" in task_name:
-            return "webshop"
-        if "search" in task_name:
-            return "search"
-        return task_name
+        return normalize_task_name(task_name)
 
     def _task_kl_loss_coef_tensor(self, batch: DataProto):
         from omegaconf import OmegaConf
@@ -244,8 +238,7 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        old_log_prob_metrics = self._entropy_loss_metrics(batch, entropys, response_masks, loss_agg_mode)
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -325,6 +318,11 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                         metrics["skillsd/teacher_student_gap_mean"] = masked_mean(delta_t, response_mask).item()
                         metrics["skillsd/teacher_student_gap_std"] = masked_mean(delta_t ** 2, response_mask).sqrt().item()
                         metrics["skillsd/sdl_lambda"] = current_sdl_lambda
+                        for task, rows in task_row_indices(batch).items():
+                            task_rows = torch.from_numpy(rows)
+                            task_delta_t, task_mask = delta_t[task_rows], response_mask[task_rows]
+                            metrics[f"skillsd/teacher_student_gap_mean/{task}"] = masked_mean(task_delta_t, task_mask).item()
+                            metrics[f"skillsd/teacher_student_gap_std/{task}"] = masked_mean(task_delta_t ** 2, task_mask).sqrt().item()
 
                         # Save per-token gap data if SAVE_SDAR_DEBUG=1, at test_freq interval
                         if os.environ.get("SAVE_SDAR_DEBUG", "0") == "1" and \
@@ -371,6 +369,9 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                                     }
                                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                             print(f"[SDAR Debug] Saved per-token gap data to {save_path} ({bs} samples)")
+
+                    # tag rows with their task so the actor can split its metrics
+                    self._attach_task_ids(batch)
 
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -419,6 +420,7 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                     "training/epoch": epoch,
                 })
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics_by_task(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
