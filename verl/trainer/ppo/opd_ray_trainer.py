@@ -28,6 +28,7 @@ from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import (
     _compute_response_info,
+    compute_metrics_by_task,
     compute_throughout_metrics,
     compute_timing_metrics,
 )
@@ -83,6 +84,21 @@ def compute_opd_data_metrics(batch: DataProto) -> dict:
             metrics["episode/reward/mean"] = float(batch.non_tensor_batch["episode_rewards"][unique_idx].mean())
 
     return metrics
+
+
+def compute_opd_data_metrics_by_task(batch: DataProto) -> dict:
+    """Per-task breakdown of :func:`compute_opd_data_metrics`.
+
+    Success rates are dropped from the per-task slices: they are batch-wide
+    constants broadcast onto every row, and the multitask env manager already
+    reports them per task as ``episode/{task}_success_rate``.
+    """
+    return compute_metrics_by_task(
+        batch,
+        lambda task_batch: {
+            name: value for name, value in compute_opd_data_metrics(task_batch).items() if "success_rate" not in name
+        },
+    )
 
 
 class OPDRayTrainer(RayPPOTrainer):
@@ -360,6 +376,9 @@ class OPDRayTrainer(RayPPOTrainer):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
                         self.compute_teacher_log_probs(batch)
 
+                    # tag rows with their task so the actor can split its metrics
+                    self._attach_task_ids(batch)
+
                     with _timer("update_actor", timing_raw):
                         # update_policy scales the student logits by this temperature to
                         # match the rollout sampling distribution. The standard loop gets
@@ -402,6 +421,7 @@ class OPDRayTrainer(RayPPOTrainer):
                     "training/epoch": epoch,
                 })
                 metrics.update(compute_opd_data_metrics(batch=batch))
+                metrics.update(compute_opd_data_metrics_by_task(batch=batch))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

@@ -30,6 +30,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
+from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -434,6 +435,11 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("teacher_log_probs")
         if teacher_topk_kl:
             select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
+        # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
+        # so the loss metrics below can also be reported per task. Absent in single-task runs.
+        task_id_names = data.meta_info.get("task_id_names", None)
+        if "task_ids" in data.batch.keys():
+            select_keys.append("task_ids")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -474,6 +480,7 @@ class DataParallelPPOActor(BasePPOActor):
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
+                    task_ids = data.get("task_ids", None) if task_id_names else None
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
@@ -619,6 +626,76 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+
+                    if task_ids is not None:
+                        # Same losses, re-aggregated over the rows of one task at a
+                        # time. Diagnostics only: nothing here touches the graph the
+                        # optimizer step above was built from.
+                        with torch.no_grad():
+                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                                task_response_mask = response_mask[rows]
+                                task_metrics = {}
+
+                                if pg_loss_coef != 0:
+                                    task_pg_loss, task_pg_clipfrac, task_ppo_kl, task_pg_clipfrac_lower = policy_loss_fn(
+                                        old_log_prob=old_log_prob[rows],
+                                        log_prob=log_prob[rows],
+                                        advantages=advantages[rows],
+                                        response_mask=task_response_mask,
+                                        cliprange=clip_ratio,
+                                        cliprange_low=clip_ratio_low,
+                                        cliprange_high=clip_ratio_high,
+                                        clip_ratio_c=clip_ratio_c,
+                                        loss_agg_mode=loss_agg_mode,
+                                    )
+                                else:
+                                    task_pg_loss = task_pg_clipfrac = task_ppo_kl = task_pg_clipfrac_lower = zero
+                                task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
+                                task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
+                                task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
+                                task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
+
+                                if entropy_coeff != 0:
+                                    task_metrics[f"actor/entropy_loss/{task}"] = (
+                                        agg_loss(loss_mat=entropy[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    )
+
+                                if self.config.use_kl_loss:
+                                    task_metrics[f"actor/kl_loss/{task}"] = (
+                                        agg_loss(loss_mat=kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    )
+                                    if kl_loss_coef is not None:
+                                        task_metrics[f"actor/kl_coef/{task}"] = kl_loss_coef[rows].float().mean().detach().item()
+
+                                if self.config.get("use_sdl_loss", False):
+                                    from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
+
+                                    task_metrics[f"actor/sdl_loss/{task}"] = compute_sdl_loss(
+                                        student_log_probs=log_prob[rows],
+                                        teacher_log_probs=teacher_log_probs[rows],
+                                        old_log_probs=old_log_prob[rows],
+                                        response_mask=task_response_mask,
+                                        loss_agg_mode=loss_agg_mode,
+                                    ).detach().item()
+
+                                if self.config.get("use_sdar_loss", False):
+                                    from verl.trainer.ppo.sdar_utils import compute_sdar_loss
+
+                                    _, task_sdar_metrics = compute_sdar_loss(
+                                        student_log_probs=log_prob[rows],
+                                        teacher_log_probs=teacher_log_probs[rows],
+                                        response_mask=task_response_mask,
+                                        gate_beta=self.config.get("sdar_gate_beta", 5.0),
+                                        loss_agg_mode=loss_agg_mode,
+                                    )
+                                    task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
+
+                                if use_teacher_kl_loss:
+                                    task_metrics[f"actor/teacher_kl_loss/{task}"] = (
+                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    )
+
+                                append_to_dict(metrics, task_metrics)
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
