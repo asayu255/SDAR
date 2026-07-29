@@ -38,7 +38,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
 )
-from verl.trainer.ppo.opd_ray_trainer import compute_opd_data_metrics
+from verl.trainer.ppo.opd_ray_trainer import compute_opd_data_metrics, compute_opd_data_metrics_by_task
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _timer,
@@ -363,6 +363,9 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                     self._balance_batch(batch, metrics=metrics)
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                # tag rows with their task so the actor can split its metrics
+                self._attach_task_ids(batch)
+
                 with _timer("update_actor", timing_raw):
                     # update_policy scales student logits by this temperature (same value
                     # compute_log_prob would set); OPD sets it here for the thin loop too.
@@ -388,6 +391,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 "training/global_step": self.global_steps,
             })
             metrics.update(compute_opd_data_metrics(batch=batch))
+            metrics.update(compute_opd_data_metrics_by_task(batch=batch))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             n_gpus = self.resource_pool_manager.get_n_gpus()
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
