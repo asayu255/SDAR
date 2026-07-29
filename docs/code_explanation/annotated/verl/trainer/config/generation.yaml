@@ -1,0 +1,94 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+trainer:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  nnodes: 1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  n_gpus_per_node: 8
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+data:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  path: ~/data/rlhf/math/test.parquet
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  prompt_key: prompt
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  n_samples: 5
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  output_path: /opt/tiger/math_Qwen2-7B-Instruct.parquet
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  batch_size: 128
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+model:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  path: ~/models/Qwen2-7B-Instruct
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  external_lib: null
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+rollout:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  name: vllm
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  mode: sync # sync: LLM, async: AsyncLLM
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  temperature: 1.0
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  top_k: 50 # 0 for hf rollout, -1 for vllm rollout
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  top_p: 0.7
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  prompt_length: 1536
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  response_length: 512
+  # for vllm rollout
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  dtype: bfloat16 # should align with FSDP
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  gpu_memory_utilization: 0.5
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ignore_eos: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  enforce_eager: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  free_cache_engine: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  load_format: dummy_dtensor
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  tensor_model_parallel_size: 1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_num_batched_tokens: 8192
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_model_len: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_num_seqs: 1024
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  log_prob_micro_batch_size_per_gpu: 8
+  # for fire vllm rollout
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_fire_sampling: False # enable FIRE https://arxiv.org/abs/2410.21236
+  # for hf rollout
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  do_sample: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  disable_log_stats: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  enable_chunked_prefill: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  n: 1
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+actor:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  strategy: fsdp  # This is for backward-compatibility
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ulysses_sequence_parallel_size: 1 # sp size
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  fsdp_config:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fsdp_size: -1
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+ray_init:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.

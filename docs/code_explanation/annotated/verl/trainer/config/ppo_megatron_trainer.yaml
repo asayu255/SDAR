@@ -1,0 +1,615 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+data:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  tokenizer: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  train_files: ~/data/rlhf/gsm8k/train.parquet
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  val_files: ~/data/rlhf/gsm8k/test.parquet
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  prompt_key: prompt
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  reward_fn_key: data_source
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_prompt_length: 512
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_response_length: 512
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  train_batch_size: 1024
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  val_batch_size: null # DEPRECATED: Validation datasets are sent to inference engines as a whole batch, which will schedule the memory themselves
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  return_raw_chat: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  return_full_prompt: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  shuffle: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  filter_overlong_prompts_workers: 1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  truncation: error
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  trust_remote_code: False  # main_ppo will check this config to determine whether to use remote code for tokenizer
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  custom_cls:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      path: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      name: null
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+actor_rollout_ref:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  hybrid_engine: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    path: ~/models/deepseek-llm-7b-chat
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    external_lib: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    override_config:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      model_config: {}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      moe_config:
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        freeze_moe_router: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enable_gradient_checkpointing: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    gradient_checkpointing_kwargs:
+      ## Activation Checkpointing
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_method: null # 'uniform', 'block'; not used with 'selective'
+      # 'uniform' divides the total number of transformer layers and checkpoints the input activation of each chunk
+      # 'block' checkpoints the specified number of layers per pipeline stage at the specified granularity
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_granularity: null # 'selective' or 'full'
+      # 'full' will checkpoint the entire transformer layer and 'selective' only checkpoints memory intensive part of attention
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_num_layers: null # not used with 'selective'
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    trust_remote_code: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  actor:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    strategy: megatron  # This is for backward-compatibility
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ppo_mini_batch_size: 256
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ppo_micro_batch_size_per_gpu: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_dynamic_bsz: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_torch_compile: True # False to disable torch compile
+    # pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    clip_ratio: 0.2 # default value if clip_ratio_low and clip_ratio_high are not specified
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    clip_ratio_low: 0.2
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    clip_ratio_high: 0.2
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
+    # NOTE: "token-mean" is the default behavior
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    entropy_coeff: 0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_kl_loss: False # True for GRPO
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    kl_loss_coef: 0.001 # for grpo
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    kl_loss_type: low_var_kl # for grpo
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ppo_epochs: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    data_loader_seed: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    shuffle: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    optim:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      lr: 1e-6
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      clip_grad: 1.0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      min_lr_ratio: null   # only useful for warmup with cosine
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      warmup_style: constant  # select from constant/cosine
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      total_training_steps: -1  # must be override by program
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      weight_decay: 0.01
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    megatron:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      param_offload: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      grad_offload: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      optimizer_offload: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      tensor_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      expert_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      expert_tensor_parallel_size: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      pipeline_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      virtual_pipeline_model_parallel_size: null # change VPP interface for parallelism tests
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      context_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      sequence_parallel: True
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_distributed_optimizer: True
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_dist_checkpointing: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      dist_checkpointing_path: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      seed: 42
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      override_transformer_config: {} # additional transformer config like: num_layers_in_first(/last)_pipeline_stage
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    profile: # profile the actor model in `update_policy` 
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_profile: False # open it when you want to profile the actor model
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      profile_ranks: null # list, you can specify the ranks to profile
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      step_start: -1 # start step in update_policy 
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      step_end: -1 # end step 
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      save_path: null # the path to save the profile result
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    load_weight: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    checkpoint:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ref:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    strategy: megatron
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_torch_compile: ${actor_rollout_ref.actor.use_torch_compile}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    megatron:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      param_offload: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      tensor_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      expert_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      expert_tensor_parallel_size: None
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      pipeline_model_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      virtual_pipeline_model_parallel_size: null # change VPP interface for parallelism tests
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      context_parallel_size: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      sequence_parallel: True
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_distributed_optimizer: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_dist_checkpointing: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      dist_checkpointing_path: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      seed: ${actor_rollout_ref.actor.megatron.seed}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      override_transformer_config: ${actor_rollout_ref.actor.megatron.override_transformer_config}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    profile:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      use_profile: False
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      profile_ranks: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      step_start: -1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      step_end: -1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      save_path: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    load_weight: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_micro_batch_size_per_gpu: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  rollout:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    name: vllm
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    mode: sync # sync: LLM, async: AsyncLLM
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    temperature: 1.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    top_p: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    prompt_length: ${data.max_prompt_length}  # for xperf_gpt
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    response_length: ${data.max_response_length}
+    # for vllm rollout
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    dtype: bfloat16 # should align with FSDP
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    gpu_memory_utilization: 0.5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    ignore_eos: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enforce_eager: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    free_cache_engine: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    load_format: dummy_megatron
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    tensor_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_num_batched_tokens: 8192
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_model_len: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_num_seqs: 1024
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_micro_batch_size_per_gpu: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    disable_log_stats: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enable_chunked_prefill: False # could get higher throughput
+    # for hf rollout
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    do_sample: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    layer_name_map:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      qkv_layer_name: qkv
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      gate_proj_layer_name: gate_up
+    # number of responses (i.e. num sample times)
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    n: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    engine_kwargs: # inference engine parameters
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      vllm:
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      sglang:
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    val_kwargs:
+      # sampling parameters for validation
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      top_p: 1.0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      temperature: 0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      n: 1
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      do_sample: False # default eager for validation
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    multi_turn: 
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      max_turns: null  # null for no limit (default max_length // 3)
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      tool_config_path: null  # null for no tool
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      format: chatml  # chatml, more formats will be supported in the future
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+critic:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  rollout_n: ${actor_rollout_ref.rollout.n}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  strategy: megatron
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  optim:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    lr: 1e-5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    clip_grad: 1.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    min_lr_ratio: null   # only useful for warmup with cosine
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    warmup_style: constant  # select from constant/cosine
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    total_training_steps: -1  # must be override by program
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    weight_decay: 0.01
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    path: ~/models/deepseek-llm-7b-chat
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    override_config:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      model_config: {}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      moe_config:
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        freeze_moe_router: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    trust_remote_code: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enable_gradient_checkpointing: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    gradient_checkpointing_kwargs:
+      ## Activation Checkpointing
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_method: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_granularity: null
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      activations_checkpoint_num_layers: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  megatron:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    param_offload: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    grad_offload: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    optimizer_offload: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    tensor_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    expert_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    expert_tensor_parallel_size: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    pipeline_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    virtual_pipeline_model_parallel_size: null # change VPP interface for parallelism tests
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    context_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    sequence_parallel: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_distributed_optimizer: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_dist_checkpointing: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    dist_checkpointing_path: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    seed: ${actor_rollout_ref.actor.megatron.seed}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    override_transformer_config: ${actor_rollout_ref.actor.megatron.override_transformer_config}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  load_weight: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ppo_micro_batch_size_per_gpu: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ppo_max_token_len_per_gpu: 32768 # (${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  data_loader_seed: ${actor_rollout_ref.actor.data_loader_seed}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  shuffle: ${actor_rollout_ref.actor.shuffle}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  cliprange_value: 0.5
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  kl_ctrl:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    type: fixed
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    kl_coef: 0.001
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  loss_agg_mode: ${actor_rollout_ref.actor.loss_agg_mode}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  checkpoint:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+reward_model:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  enable: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  strategy: megatron
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  megatron:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    param_offload: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    tensor_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    expert_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    expert_tensor_parallel_size: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    pipeline_model_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    virtual_pipeline_model_parallel_size: null # change VPP interface for parallelism tests
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    context_parallel_size: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    sequence_parallel: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_distributed_optimizer: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    use_dist_checkpointing: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    dist_checkpointing_path: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    seed: ${actor_rollout_ref.actor.megatron.seed}
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    override_transformer_config: {}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    trust_remote_code: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    external_lib: ${actor_rollout_ref.model.external_lib}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  load_weight: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  micro_batch_size_per_gpu: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_dynamic_bsz: ${critic.use_dynamic_bsz}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_length: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  reward_manager: naive
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  launch_reward_fn_async: False # custom reward function executed async on CPU, during log_prob
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  sandbox_fusion:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    url: null # faas url to run code in cloud sandbox
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_concurrent: 64 # max concurrent requests to sandbox
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+custom_reward_function:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  path: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  name: compute_score
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+algorithm:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  gamma: 1.0
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  lam: 1.0
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  adv_estimator: gae
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  norm_adv_by_std_in_grpo: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_kl_in_reward: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  kl_penalty: kl  # how to estimate kl divergence
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  kl_ctrl:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    type: fixed
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    kl_coef: 0.001
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    horizon: 10000
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    target_kl: 0.1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_pf_ppo: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  pf_ppo:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    reweight_method: pow  # ["pow", "max_min", "max_random"]
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    weight_pow: 2.0
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+trainer:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  balance_batch: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  total_epochs: 30
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  total_training_steps: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  project_name: verl_examples
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  experiment_name: gsm8k
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  logger: ['console', 'wandb']
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  log_val_generations: 0
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  nnodes: 1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  n_gpus_per_node: 8
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  save_freq: -1
+  # auto: find the last ckpt to resume. If can't find, start from scratch
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  resume_mode: auto # or disable or resume_path if resume_from_path is set
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  resume_from_path: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  del_local_ckpt_after_load: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  val_before_train: True
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  test_freq: -1
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  critic_warmup: 0
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  default_hdfs_dir: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_actor_ckpt_to_keep: null
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_critic_ckpt_to_keep: null
+  # The timeout for ray worker group to wait for the register center to be ready
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ray_wait_register_center_timeout: 300
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  device: cuda
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+ray_init:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.

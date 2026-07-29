@@ -1,0 +1,87 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
+from typing import Dict
+
+# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
+from verl.single_controller.base import ResourcePool, WorkerGroup
+
+# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
+from .worker import DistGlobalInfo, DistRankInfo
+
+
+# [EXPLAIN] `MegatronWorkerGroup` として状態と関連処理をまとめ、worker・trainer・dataset などの責務境界を定義する。
+class MegatronWorkerGroup(WorkerGroup):
+    # [EXPLAIN] `__init__` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def __init__(self, resource_pool: ResourcePool, **kwargs):
+        # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
+        super().__init__(resource_pool=resource_pool, **kwargs)
+        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
+        self._megatron_rank_info = None
+        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
+        self._megatron_global_info: DistGlobalInfo = None
+
+    # [EXPLAIN] `init_megatron` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def init_megatron(self, default_megatron_kwargs: Dict = None):
+        # [EXPLAIN] 不正な設定・shape・task または実行状態を例外として明示する。
+        raise NotImplementedError("MegatronWorkerGroup.init_megatron should be overwritten")
+
+    # [EXPLAIN] `get_megatron_rank_info` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def get_megatron_rank_info(self, rank: int) -> DistRankInfo:
+        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
+        assert 0 <= rank < self.world_size, f"rank must be from [0, world_size), Got {rank}"
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_rank_info[rank]
+
+    # [EXPLAIN] 直後の定義へ decorator を適用し、呼び出し規約または実行時属性を付与する。
+    @property
+    # [EXPLAIN] `tp_size` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def tp_size(self):
+        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
+        assert self._megatron_global_info is not None, "MegatronWorkerGroup._megatron_global_info must be initialized"
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_global_info.tp_size
+
+    # [EXPLAIN] 直後の定義へ decorator を適用し、呼び出し規約または実行時属性を付与する。
+    @property
+    # [EXPLAIN] `dp_size` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def dp_size(self):
+        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
+        assert self._megatron_global_info is not None, "MegatronWorkerGroup._megatron_global_info must be initialized"
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_global_info.dp_size
+
+    # [EXPLAIN] 直後の定義へ decorator を適用し、呼び出し規約または実行時属性を付与する。
+    @property
+    # [EXPLAIN] `pp_size` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def pp_size(self):
+        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
+        assert self._megatron_global_info is not None, "MegatronWorkerGroup._megatron_global_info must be initialized"
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_global_info.pp_size
+
+    # [EXPLAIN] 直後の定義へ decorator を適用し、呼び出し規約または実行時属性を付与する。
+    @property
+    # [EXPLAIN] `cp_size` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def cp_size(self):
+        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
+        assert self._megatron_global_info is not None, "MegatronWorkerGroup._megatron_global_info must be initialized"
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_global_info.cp_size
+
+    # [EXPLAIN] `get_megatron_global_info` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
+    def get_megatron_global_info(self):
+        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
+        return self._megatron_global_info
