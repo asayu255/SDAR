@@ -95,6 +95,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        self._fast_forward_env_schedules()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()

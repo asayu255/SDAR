@@ -191,6 +191,26 @@ class WebshopMultiProcessEnv(gym.Env):
 
         return obs_list, info_list
 
+    def fast_forward(self, num_resets: int) -> str:
+        """Replay ``num_resets`` goal draws without touching the workers.
+
+        Checkpoint resume support: ``_rng`` is rebuilt from the seed on every
+        start, so a resumed run would redraw the goals of step 1 onwards. One
+        ``reset()`` consumes exactly one ``_rng.choice`` (see :py:meth:`reset` --
+        the call below must stay identical to it), so replaying the draws the
+        restart skipped makes the next ``reset()`` select the goals an
+        uninterrupted run would have selected. The workers are untouched: only
+        the RNG advances, which costs well under a millisecond per draw.
+        """
+        if num_resets <= 0:
+            return 'replayed 0 goal draws'
+        for _ in range(int(num_resets)):
+            self._rng.choice(self.goal_idxs, size=self.env_num, replace=False)
+        return (
+            f'replayed {int(num_resets)} goal draws '
+            f'(env_num={self.env_num}, goal pool={len(self.goal_idxs)})'
+        )
+
     # ------------------------------------------------------------------
     # Convenience helpers ----------------------------------------------
     # ------------------------------------------------------------------
