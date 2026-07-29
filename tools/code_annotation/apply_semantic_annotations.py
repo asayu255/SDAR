@@ -633,6 +633,227 @@ CURATED = [
         "最後の`asyncio.gather`は全trajectory coroutineの合流点であり、Ray taskやOS threadの待機ではない。",
         annotation_type="synchronization",
     ),
+    entry(
+        "C-dispatch-register",
+        "C",
+        "verl/single_controller/base/decorator.py",
+        490,
+        548,
+        "`register`は関数をその場で分散実行せず、dispatch/execute/blocking metadataをwrapperへ付与する。"
+        "worker group構築時にこのmetadataから引数分割、remote call、結果collectの関数が結線される。",
+        "`materialize_futures`はdispatch前に`DataProtoFuture.get()`を呼ぶホスト側依存解決であり、"
+        "CUDA synchronizationやdistributed barrierではない。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "C-ray-generated-method",
+        "C",
+        "verl/single_controller/ray/base.py",
+        44,
+        61,
+        "動的worker-group methodはdispatch→Ray remote投入→必要なら`ray.get`→collect→auto-padding除去の順で実行する。",
+        "`blocking=False`ならObjectRefをcollect側へ渡すためdriverは待たず、`blocking=True`の`ray.get`が明示的なdriver合流点になる。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "C-ray-execute-sync-async",
+        "C",
+        "verl/single_controller/ray/base.py",
+        490,
+        600,
+        "`execute_*_async`は各Ray actorへ`.remote()`を投入してObjectRefを返す。"
+        "`execute_*_sync`だけが`ray.get()`で完了と例外をdriverへmaterializeする。",
+        "全引数がworker数と同長のlistならrankごとに対応要素をscatterし、それ以外は同じ引数をbroadcastする。"
+        "これはcollective通信ではなくdriverによるRay task引数routingである。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "C-sharding-base-contract",
+        "C",
+        "verl/workers/sharding_manager/base.py",
+        21,
+        32,
+        "sharding managerのcontext境界はtraining表現からinference表現への一時的な切替を表す。"
+        "`__enter__`でweight/RNG/memoryをrollout側へ移し、`__exit__`でtraining状態へ戻す。",
+        "`preprocess_data`/`postprocess_data`は同じglobal batchをinference TP/SP配置へgatherし、終了後に元rankのsliceへ戻す契約である。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "C-fsdp-vllm-session",
+        "C",
+        "verl/workers/sharding_manager/fsdp_vllm.py",
+        114,
+        235,
+        "entryではFSDP shardからstate dict（LoRA時はadapter、初回はbaseを含む）をmaterializeし、"
+        "vLLM weight領域をwakeして同期した後にKV cacheをwakeする。",
+        "FSDP full-param materializationはrank間AllGatherを伴い、`sync_model_weights/update_params`はtraining weightを"
+        "inference engineへコピーする別の同期である。exitの`sleep(level=1)`はvLLMメモリ解放状態への遷移でbarrierではない。",
+        "training RNGとgeneration RNGを交換してTP rank間のsamplingを一致させ、exitで元のtraining RNGと`train()`状態を復元する。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "C-fsdp-sglang-session",
+        "C",
+        "verl/workers/sharding_manager/fsdp_sglang.py",
+        92,
+        181,
+        "FSDP state dictをGPUへmaterializeし、infer-TP各rankのserialized shardを`dist.gather_object`でrank 0へ集めて"
+        "SGLang engineへweight単位でloadする。",
+        "ここでのgatherはweight同期、`all_gather_data_proto`はrollout入力複製で目的が異なる。"
+        "exitではSGLang memory occupationをreleaseし、actorをtrain modeとtraining RNGへ戻す。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "C-fsdp-ulysses-reshard",
+        "C",
+        "verl/workers/sharding_manager/fsdp_ulysses.py",
+        27,
+        70,
+        "context中だけglobal sequence-parallel groupをこのmodelのSP meshへ差し替え、終了時に必ず旧groupへ戻す。",
+        "FSDPのDP shardとして届いたDataProtoをSP group内AllGatherして各SP rankへ同一入力を渡し、"
+        "postprocessでSP rank対応chunkへ戻して外側のDP配置を復元する。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "C-megatron-sglang-session",
+        "C",
+        "verl/workers/sharding_manager/megatron_sglang.py",
+        84,
+        155,
+        "Megatron shardはconverterを通じてSGLangが読むtensor名/layoutへ逐次変換され、TP rank 0のengineへ反映される。"
+        "cache flush後にrolloutし、exitで推論memoryをreleaseして全pipeline modelをtrain modeへ戻す。",
+        "入力DataProtoはinfer TP group内AllGather、出力はrank対応chunkへ戻すため、weight変換とbatch reshardは独立した処理である。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "C-megatron-vllm-session",
+        "C",
+        "verl/workers/sharding_manager/megatron_vllm.py",
+        308,
+        365,
+        "Megatron parameter generatorがPP/TP shardをvLLM形式へ変換し、versionに応じて一括syncまたはwake後の直接loadを行う。",
+        "新vLLMではweight領域→KV cacheの順にwakeし、rollout終了時に`sleep(level=1)`で推論memoryを解放してtrainingへ戻す。",
+        "DataProtoのAllGather/chunkはinfer TPのbatch配置を変えるcollectiveであり、parameter loadとは別の同期点である。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "C-gpu-profiler-sampler",
+        "C",
+        "verl/utils/gpu_profiler.py",
+        210,
+        300,
+        "daemon threadがNVML/SMIのdevice-wide counterを一定間隔で読むため、値は現在processだけでなく同GPU上の全workloadを含む。"
+        "phase stack最上位のlabelを各sampleへ付け、lockはhost側のsample buffer整合性だけを守る。",
+        "`mean_util_between`は指定wall-clock窓、`report_and_reset`はtrainer step境界の集計であり、"
+        "どちらもCUDA synchronizeを挿入しないため測定自体でGPU pipelineを止めない。",
+        annotation_type="execution_context",
+    ),
+    entry(
+        "C-metrics-task-slicing",
+        "C",
+        "verl/trainer/ppo/metric_utils.py",
+        94,
+        163,
+        "global batchの`task_name`からrow indexを作り、overallと同じmetric関数をtask sliceごとに再実行して"
+        "`/.../{task}`系列を生成する。",
+        "worker micro-batchではstringを送らず`task_ids` maskへ復元する。batch全体へbroadcast済みのsuccess rateは"
+        "sliceしてもtask値にならないため除外し、env managerが直接出すtask別値を使う。",
+        annotation_type="tensor_shape",
+    ),
+    entry(
+        "C-metrics-trajectory-tokens",
+        "C",
+        "verl/trainer/ppo/metric_utils.py",
+        165,
+        210,
+        "1 rowは1 environment turnなのでresponse maskのsumはturn token数である。"
+        "`traj_uid`が同じrowを`np.bincount`で合算し、sample/trajectory単位の生成token数へ変換する。",
+        "これによりtaskごとのturn数差があるmultitask rolloutでも、throughputをrow数ではなく実際の生成token量で比較できる。",
+        annotation_type="tensor_shape",
+    ),
+    entry(
+        "D-alfworld-ray-env",
+        "D",
+        "agent_system/environments/env_package/alfworld/envs.py",
+        142,
+        231,
+        "各ALFWorld instanceをRay actorに隔離し、step/resetを全actorへ`.remote()`投入した後、"
+        "単一`ray.get(futures)`でdriverへ集約する。これはenvironment IPCの待機でGPU collectiveではない。",
+        "worker seedは`seed + group index`なので同じGRPO group内の複数trajectoryは同じ初期task scheduleを共有し、"
+        "action差による結果を比較できる。admissible commandsは次turnの合法action制約として保持する。",
+        annotation_type="execution_context",
+    ),
+    entry(
+        "D-alfworld-resume-schedule",
+        "D",
+        "agent_system/environments/env_package/alfworld/envs.py",
+        88,
+        140,
+        "resume時はTextWorld wrapper chainからseeded game-file iteratorを探索し、実際のgame loadをせずgeneratorだけを進める。"
+        "1 manager resetが各workerで1 gameを消費するという不変条件に依存する。",
+        "内部attributeがversion差で見つからない、またはiteratorが尽きた場合は部分進行を報告し、"
+        "復旧を停止せず再現性低下を上位へ通知する。",
+        annotation_type="uncertainty",
+    ),
+    entry(
+        "D-search-env-thread-pool",
+        "D",
+        "agent_system/environments/env_package/search/envs.py",
+        26,
+        148,
+        "Search episodeはseeded scheduleではなく各rowのquestion/ground truth/data_sourceでresetされる。"
+        "retriever URLはenvへround-robin割当し、blocking HTTPをthread poolへ逃がす。",
+        "`run_until_complete(asyncio.gather(...))`はhost threadsの全結果が揃うまで同期APIを待たせる境界である。"
+        "不足row用dummyは固定capacityを満たすだけで、valid maskにより戻りbatchから除外される。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "D-search-api-retry",
+        "D",
+        "agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py",
+        42,
+        153,
+        "retrieval HTTPはtimeoutとserver 5xx/connection failureを区別し、bounded retryを行う。"
+        "`WAIT_FOR_SERVICE`有効時のconnection/timeoutだけはservice起動待ちとして無期限retryになり得る。",
+        "4xx、JSON decode、その他例外は即座にerror resultへ変換する。sleepはこのhost threadだけを止め、"
+        "他envのthreadやGPU実行を直接同期しない。",
+        annotation_type="error_condition",
+    ),
+    entry(
+        "D-search-cache-session",
+        "D",
+        "agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py",
+        163,
+        259,
+        "全Search envでbase URL別`requests.Session`を共有してconnection poolを再利用し、"
+        "`(URL, topk, query)`をkeyにbounded LRUで同一retrieval結果を共有する。",
+        "session poolとquery cacheは別lockで保護される。cache hitはHTTPを完全に省くが、"
+        "retriever indexがrun中に変わらないことを前提とするため実験中のindex更新時は無効化が必要である。",
+        annotation_type="experimental",
+    ),
+    entry(
+        "D-webshop-reward",
+        "D",
+        "agent_system/environments/env_package/webshop/envs.py",
+        24,
+        63,
+        "workerはWebShopの連続scoreを`task_score`へ保存した上で、学習rewardを成功時10・それ以外0へ再定義する。"
+        "したがって評価用元scoreとpolicy optimization用sparse rewardを混同しない。",
+        "resetは指定session/goal indexを開き、available actionsをinfoへ同梱して追加IPCなしで次action制約を渡す。",
+        annotation_type="experimental",
+    ),
+    entry(
+        "D-webshop-goal-schedule",
+        "D",
+        "agent_system/environments/env_package/webshop/envs.py",
+        87,
+        215,
+        "WebShop vector envはgoalをseeded NumPy RNGで選び、同じgroupの`group_n` workerへ同一goal indexをrepeatする。"
+        "step/resetのRay taskは全workerへ投入後に`ray.get`でdriverへ合流する。",
+        "`fast_forward`はworkerをresetせず同じ`rng.choice`だけをcompleted step数分再生し、"
+        "checkpoint後の次goalを中断なしrunと一致させる。goal poolやenv_numが変わればこの再現性は成立しない。",
+        annotation_type="synchronization",
+    ),
 ]
 
 

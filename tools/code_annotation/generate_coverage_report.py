@@ -1,45 +1,66 @@
-"""manifest から再開用 coverage report を生成する。"""
+"""manifest、block coverage、semantic reviewから品質reportを生成する。"""
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 
+from annotation_map_utils import load_annotation_map
 from common import DOC_ROOT, load_manifest
 
 
+def _jsonl(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def main() -> None:
-    rows = load_manifest()
-    statuses = Counter(row["status"] for row in rows)
-    targets = [row for row in rows if row["status"] != "skipped"]
-    completed = [row for row in targets if row["status"] == "completed"]
-    source_lines = sum(row["source_line_count"] for row in targets)
-    completed_lines = sum(row["source_line_count"] for row in completed)
-    preservation_passed = sum(
-        row["source_preservation"] in {"passed", "not_applicable_notebook"}
-        for row in completed
-    )
-    full_coverage = sum(row["annotation_coverage"] == 1.0 for row in completed)
+    manifest = load_manifest()
+    targets = [row for row in manifest if row["status"] != "skipped"]
+    annotations = load_annotation_map()
+    blocks = _jsonl(DOC_ROOT / "block_coverage.jsonl")
+    reviews = json.loads((DOC_ROOT / "semantic_review.json").read_text(encoding="utf-8"))
+    statuses = Counter(row["status"] for row in manifest)
+    block_statuses = Counter(row["coverage_status"] for row in blocks)
+    annotation_types = Counter(row["annotation_type"] for row in annotations)
+
     text = f"""# Annotation Coverage Report
 
-- total inventoried files: {len(rows)}
+- total inventoried files: {len(manifest)}
 - target files: {len(targets)}
 - completed: {statuses.get("completed", 0)}
-- in progress: {statuses.get("in_progress", 0)}
-- pending: {statuses.get("pending", 0)}
 - skipped: {statuses.get("skipped", 0)}
-- blocked: {statuses.get("blocked", 0)}
-- needs review: {statuses.get("needs_review", 0)}
-- target source lines: {source_lines}
-- completed source lines: {completed_lines}
-- completed source preservation passed: {preservation_passed}/{len(completed)}
-- completed annotation coverage 100%: {full_coverage}/{len(completed)}
+- pending / blocked / needs review: {statuses.get("pending", 0)} / {statuses.get("blocked", 0)} / {statuses.get("needs_review", 0)}
+- source preservation passed: {sum(row["source_preservation"] in {"passed", "not_applicable_notebook"} for row in targets)}/{len(targets)}
+- semantic annotation blocks: {len(annotations)}
+- analyzed source blocks: {len(blocks)}
+- explained: {block_statuses.get("explained", 0)}
+- covered by parent comment: {block_statuses.get("covered_by_parent_comment", 0)}
+- self explanatory: {block_statuses.get("self_explanatory", 0)}
+- needs review: {block_statuses.get("needs_review", 0)}
 
-この数値は `manifest.json` の機械判定から生成しています。`pending`、`blocked`、
-`needs_review` が残る場合は完全完了ではありません。
+## Priority review
+
+| Priority | reviewed | required |
+| --- | ---: | ---: |
 """
-    (DOC_ROOT / "coverage_report.md").write_text(
-        text.rstrip() + "\n", encoding="utf-8", newline="\n"
+    for priority in ("A", "B", "C", "D"):
+        rows = [row for row in reviews if row["priority"] == priority]
+        reviewed = sum(row["review_status"] != "needs_review" for row in rows)
+        text += f"| {priority} | {reviewed} | {len(rows)} |\n"
+
+    text += "\n## Annotation types\n\n"
+    for name, count in sorted(annotation_types.items()):
+        text += f"- {name}: {count}\n"
+    text += (
+        "\n行ごとの強制coverageは使用していません。意味blockを"
+        "`explained`、`covered_by_parent_comment`、`self_explanatory`、"
+        "`needs_review`へ分類し、Priority A〜Dは別途全pathのsemantic reviewを必須にしています。\n"
     )
+    (DOC_ROOT / "coverage_report.md").write_text(text, encoding="utf-8", newline="\n")
     print(text)
 
 

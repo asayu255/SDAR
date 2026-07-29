@@ -24,6 +24,8 @@ from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_
 from .base import BaseShardingManager
 
 
+# context中だけglobal sequence-parallel groupをこのmodelのSP meshへ差し替え、終了時に必ず旧groupへ戻す。
+# FSDPのDP shardとして届いたDataProtoをSP group内AllGatherして各SP rankへ同一入力を渡し、postprocessでSP rank対応chunkへ戻して外側のDP配置を復元する。
 class FSDPUlyssesShardingManager(BaseShardingManager):
     """
     Sharding manager to support data resharding when using FSDP + Ulysses

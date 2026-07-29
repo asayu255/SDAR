@@ -305,6 +305,9 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         self.train_tp_larger = self.train_tp_size > self.infer_tp_size
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
+    # Megatron parameter generatorがPP/TP shardをvLLM形式へ変換し、versionに応じて一括syncまたはwake後の直接loadを行う。
+    # 新vLLMではweight領域→KV cacheの順にwakeし、rollout終了時に`sleep(level=1)`で推論memoryを解放してtrainingへ戻す。
+    # DataProtoのAllGather/chunkはinfer TPのbatch配置を変えるcollectiveであり、parameter loadとは別の同期点である。
     def __enter__(self):
         if vllm_version in (
             "0.5.4",

@@ -487,6 +487,8 @@ def _check_execute_mode(execute_mode):
     assert isinstance(execute_mode, Execute), f"execute_mode must be a Execute. Got {execute_mode}"
 
 
+# `register`は関数をその場で分散実行せず、dispatch/execute/blocking metadataをwrapperへ付与する。worker group構築時にこのmetadataから引数分割、remote call、結果collectの関数が結線される。
+# `materialize_futures`はdispatch前に`DataProtoFuture.get()`を呼ぶホスト側依存解決であり、CUDA synchronizationやdistributed barrierではない。
 def _materialize_futures(*args, **kwargs):
     new_args = []
     for arg in args:

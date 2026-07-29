@@ -91,9 +91,8 @@ def get_task_names(batch: DataProto) -> Optional[np.ndarray]:
     return normalized
 
 
-# task 名を正規化した後に global batch の row index を task ごとに保持する。
-# DataProto の select_idxs は tensor/non-tensor を同じ index で切るため、
-# per-task metric でも両者の row alignment が崩れない。
+# global batchの`task_name`からrow indexを作り、overallと同じmetric関数をtask sliceごとに再実行して`/.../{task}`系列を生成する。
+# worker micro-batchではstringを送らず`task_ids` maskへ復元する。batch全体へbroadcast済みのsuccess rateはsliceしてもtask値にならないため除外し、env managerが直接出すtask別値を使う。
 def task_row_indices(batch: DataProto) -> Dict[str, np.ndarray]:
     """Map each task present in the batch to the row indices belonging to it.
 
@@ -165,6 +164,8 @@ def compute_data_metrics_by_task(batch: DataProto, use_critic: bool = True) -> D
     )
 
 
+# 1 rowは1 environment turnなのでresponse maskのsumはturn token数である。`traj_uid`が同じrowを`np.bincount`で合算し、sample/trajectory単位の生成token数へ変換する。
+# これによりtaskごとのturn数差があるmultitask rolloutでも、throughputをrow数ではなく実際の生成token量で比較できる。
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     """
     Computes information about prompts and responses from a batch.
@@ -195,8 +196,6 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
-# multi-turn では一 trajectory が複数 row になるため、row 単位の response_length と
-# trajectory 単位の総 response token を分ける。traj_uid が aggregation key である。
 def compute_trajectory_response_tokens(batch: DataProto) -> Optional[np.ndarray]:
     """Generated tokens per trajectory, i.e. per sample rather than per turn.
 

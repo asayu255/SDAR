@@ -39,6 +39,8 @@ _QUERY_CACHE_ENABLED = os.environ.get("SEARCH_QUERY_CACHE", "0").strip().lower()
 _QUERY_CACHE_MAX_SIZE = int(os.environ.get("SEARCH_QUERY_CACHE_SIZE", "100000"))
 
 
+# retrieval HTTPはtimeoutとserver 5xx/connection failureを区別し、bounded retryを行う。`WAIT_FOR_SERVICE`有効時のconnection/timeoutだけはservice起動待ちとして無期限retryになり得る。
+# 4xx、JSON decode、その他例外は即座にerror resultへ変換する。sleepはこのhost threadだけを止め、他envのthreadやGPU実行を直接同期しない。
 def call_search_api(
     retrieval_service_url: str,
     query: str,
@@ -160,6 +162,8 @@ def _passages2string(retrieval_result):
     return format_reference
 
 
+# 全Search envでbase URL別`requests.Session`を共有してconnection poolを再利用し、`(URL, topk, query)`をkeyにbounded LRUで同一retrieval結果を共有する。
+# session poolとquery cacheは別lockで保護される。cache hitはHTTPを完全に省くが、retriever indexがrun中に変わらないことを前提とするため実験中のindex更新時は無効化が必要である。
 class SearchToolGroup(ToolGroup):
     # Class-level session pool shared across all instances
     _session_pool = {}

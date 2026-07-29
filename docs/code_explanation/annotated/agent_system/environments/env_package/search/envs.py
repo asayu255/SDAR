@@ -23,6 +23,8 @@ from omegaconf import DictConfig, ListConfig
 from copy import deepcopy 
 
 
+# Search episodeはseeded scheduleではなく各rowのquestion/ground truth/data_sourceでresetされる。retriever URLはenvへround-robin割当し、blocking HTTPをthread poolへ逃がす。
+# `run_until_complete(asyncio.gather(...))`はhost threadsの全結果が揃うまで同期APIを待たせる境界である。不足row用dummyは固定capacityを満たすだけで、valid maskにより戻りbatchから除外される。
 class SearchMultiProcessEnv(gym.Env):
     """
     - env_num  : Number of groups (logical sharding; keep the parameter for external compatibility)

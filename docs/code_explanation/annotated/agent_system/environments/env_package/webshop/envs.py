@@ -21,6 +21,8 @@ import numpy as np
 # Ray remote worker actor -----------------------------------------------------
 # -----------------------------------------------------------------------------
 
+# workerはWebShopの連続scoreを`task_score`へ保存した上で、学習rewardを成功時10・それ以外0へ再定義する。したがって評価用元scoreとpolicy optimization用sparse rewardを混同しない。
+# resetは指定session/goal indexを開き、available actionsをinfoへ同梱して追加IPCなしで次action制約を渡す。
 class WebshopWorker:
     """Ray remote actor that replaces the worker function.
     Each actor hosts a *WebAgentTextEnv* instance.
@@ -84,6 +86,8 @@ class WebshopWorker:
 # Vectorised Ray environment --------------------------------------------------
 # -----------------------------------------------------------------------------
 
+# WebShop vector envはgoalをseeded NumPy RNGで選び、同じgroupの`group_n` workerへ同一goal indexをrepeatする。step/resetのRay taskは全workerへ投入後に`ray.get`でdriverへ合流する。
+# `fast_forward`はworkerをresetせず同じ`rng.choice`だけをcompleted step数分再生し、checkpoint後の次goalを中断なしrunと一致させる。goal poolやenv_numが変わればこの再現性は成立しない。
 class WebshopMultiProcessEnv(gym.Env):
     """A vectorised, Ray-based wrapper around *WebAgentTextEnv*.
 

@@ -85,6 +85,8 @@ class AlfworldWorker:
     # TextWorld attribute names for the game-file cycle, most likely first.
     _GAMEFILE_ITER_ATTRS = ('_gamefiles_iterator', 'gamefiles_iterator', '_gamefile_iterator')
 
+    # resume時はTextWorld wrapper chainからseeded game-file iteratorを探索し、実際のgame loadをせずgeneratorだけを進める。1 manager resetが各workerで1 gameを消費するという不変条件に依存する。
+    # 内部attributeがversion差で見つからない、またはiteratorが尽きた場合は部分進行を報告し、復旧を停止せず再現性低下を上位へ通知する。
     def _find_game_iterator(self):
         """Locate the object holding TextWorld's game-file cycle.
 
@@ -139,6 +141,8 @@ class AlfworldWorker:
         return {'supported': True, 'attr': attr, 'skipped': skipped,
                 'batch_size': batch_size, 'env_type': env_type}
 
+# 各ALFWorld instanceをRay actorに隔離し、step/resetを全actorへ`.remote()`投入した後、単一`ray.get(futures)`でdriverへ集約する。これはenvironment IPCの待機でGPU collectiveではない。
+# worker seedは`seed + group index`なので同じGRPO group内の複数trajectoryは同じ初期task scheduleを共有し、action差による結果を比較できる。admissible commandsは次turnの合法action制約として保持する。
 class AlfworldEnvs(gym.Env):
     def __init__(self, alf_config_path, seed, env_num, group_n, resources_per_worker, is_train=True, env_kwargs={}):
         super().__init__()

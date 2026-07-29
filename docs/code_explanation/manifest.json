@@ -90,7 +90,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=6",
     "last_commit": ""
@@ -114,7 +114,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=77",
     "last_commit": ""
@@ -138,7 +138,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=40",
     "last_commit": ""
@@ -162,7 +162,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=54",
     "last_commit": ""
@@ -186,7 +186,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=48",
     "last_commit": ""
@@ -210,7 +210,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=38",
     "last_commit": ""
@@ -234,7 +234,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=50",
     "last_commit": ""
@@ -258,7 +258,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=50",
     "last_commit": ""
@@ -282,7 +282,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=242",
     "last_commit": ""
@@ -306,7 +306,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=169",
     "last_commit": ""
@@ -330,7 +330,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=61",
     "last_commit": ""
@@ -354,7 +354,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=50",
     "last_commit": ""
@@ -378,7 +378,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=49",
     "last_commit": ""
@@ -402,7 +402,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=47",
     "last_commit": ""
@@ -426,7 +426,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=77",
     "last_commit": ""
@@ -450,7 +450,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=22",
     "last_commit": ""
@@ -474,7 +474,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=26",
     "last_commit": ""
@@ -498,7 +498,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=36",
     "last_commit": ""
@@ -522,7 +522,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=40",
     "last_commit": ""
@@ -546,7 +546,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=39",
     "last_commit": ""
@@ -570,7 +570,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=39",
     "last_commit": ""
@@ -594,7 +594,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=32",
     "last_commit": ""
@@ -618,7 +618,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=20",
     "last_commit": ""
@@ -642,7 +642,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=62",
     "last_commit": ""
@@ -666,7 +666,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=40",
     "last_commit": ""
@@ -690,7 +690,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=36",
     "last_commit": ""
@@ -714,7 +714,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=61",
     "last_commit": ""
@@ -762,7 +762,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=8",
     "last_commit": ""
@@ -786,7 +786,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=13",
     "last_commit": ""
@@ -12426,7 +12426,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=123",
     "last_commit": ""
@@ -12450,7 +12450,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=123",
     "last_commit": ""
@@ -18498,7 +18498,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=263",
     "last_commit": ""
@@ -19818,7 +19818,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=67",
     "last_commit": ""
@@ -21426,7 +21426,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=164",
     "last_commit": ""
@@ -21618,7 +21618,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=22",
     "last_commit": ""
@@ -21954,7 +21954,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=29",
     "last_commit": ""
@@ -22338,7 +22338,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=63",
     "last_commit": ""
@@ -22554,7 +22554,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=11",
     "last_commit": ""
@@ -22794,7 +22794,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=22",
     "last_commit": ""
@@ -23010,7 +23010,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=22",
     "last_commit": ""
@@ -29322,7 +29322,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=11",
     "last_commit": ""
@@ -29346,7 +29346,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=44",
     "last_commit": ""
@@ -29370,7 +29370,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=298",
     "last_commit": ""
@@ -29394,7 +29394,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=315",
     "last_commit": ""
@@ -29418,7 +29418,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=56",
     "last_commit": ""
@@ -29946,7 +29946,7 @@
     "skip_reason": "",
     "annotation_coverage": 1.0,
     "source_preservation": "passed",
-    "syntax_validation": "blocked:yaml_parser_not_found",
+    "syntax_validation": "passed",
     "baseline_test_relevance": "indirect",
     "notes": "source_encoding=utf-8; generated_explain_lines=4",
     "last_commit": ""

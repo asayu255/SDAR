@@ -207,6 +207,8 @@ def _make_backend():
 _METRICS = ("sm_util", "mem_bw_util", "mem_used_gb", "power_w", "sm_clock_mhz", "pcie_tx_mb_s", "pcie_rx_mb_s")
 
 
+# daemon threadがNVML/SMIのdevice-wide counterを一定間隔で読むため、値は現在processだけでなく同GPU上の全workloadを含む。phase stack最上位のlabelを各sampleへ付け、lockはhost側のsample buffer整合性だけを守る。
+# `mean_util_between`は指定wall-clock窓、`report_and_reset`はtrainer step境界の集計であり、どちらもCUDA synchronizeを挿入しないため測定自体でGPU pipelineを止めない。
 class _Sampler:
     def __init__(self, backend, interval):
         self._backend = backend

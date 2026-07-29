@@ -4,14 +4,16 @@
 
 - 元コードは変更しません。
 - 注釈版は `annotated/` 以下に元のパスを保って配置します。
-- 追加コメントは `[EXPLAIN]` で識別します。
-- `tools/code_annotation/` の検証ツールで、元コード保持・注釈範囲・構文を確認します。
+- 解説は通常の日本語コメントとして表示し、正本は `annotation_map.jsonl` で元sourceの行範囲と対応付けます。
+- `render_annotations.py` が固定sourceと注釈mapからmirrorを決定的に生成します。
+- `tools/code_annotation/` の検証ツールで、元コード保持・汎用コメント不在・block coverage・構文を確認します。
 - Pure OPD の実効経路と、共有コード上に存在するだけの非実効経路を区別します。
 
 注釈ミラーは元 source の trailing whitespace も保持します。そのため commit gate では、
 ミラー外を `git diff --check`、ミラー内を `validate_source_preservation.py` で検証します。
 
 進捗と再開位置は [STATUS.md](STATUS.md)、対象判定は `manifest.json` / `manifest.csv`、source 固定値は `SOURCE_COMMIT` を参照してください。
+意味blockの分類は `block_coverage.jsonl`、Priority A〜Dのレビュー結果は `semantic_review.json` に記録します。
 
 ## 読み始める場所
 

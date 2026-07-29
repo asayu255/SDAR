@@ -1,0 +1,219 @@
+[
+  {
+    "priority": "A",
+    "original_path": "examples/opd_trainer/run_multitask_qwen3.sh",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "A",
+    "original_path": "examples/opd_trainer/expected_multitask_config.yaml",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 5
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/trainer/main_opd.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 11
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/trainer/ppo/opd_ray_trainer.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 4
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/workers/fsdp_workers.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 6
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/workers/actor/dp_actor.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 3
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/trainer/ppo/core_algos.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "A",
+    "original_path": "verl/trainer/config/ppo_trainer.yaml",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 5
+  },
+  {
+    "priority": "B",
+    "original_path": "examples/data_preprocess/prepare_sdar_multitask.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 3
+  },
+  {
+    "priority": "B",
+    "original_path": "verl/trainer/main_ppo.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "B",
+    "original_path": "verl/utils/dataset/rl_dataset.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "B",
+    "original_path": "agent_system/environments/env_manager.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "B",
+    "original_path": "agent_system/environments/resume.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "B",
+    "original_path": "agent_system/multi_turn_rollout/rollout_loop.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 3
+  },
+  {
+    "priority": "B",
+    "original_path": "agent_system/multi_turn_rollout/utils.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "B",
+    "original_path": "agent_system/multi_turn_rollout/async_rollout_core.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/single_controller/base/decorator.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/single_controller/ray/base.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/__init__.py",
+    "review_status": "self_explanatory",
+    "reason": "公開symbolを持たないpackage markerで、実行blockがない。",
+    "annotation_count": 0
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/base.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/fsdp_sglang.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/fsdp_ulysses.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/fsdp_vllm.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/megatron_sglang.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/workers/sharding_manager/megatron_vllm.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/utils/gpu_profiler.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "C",
+    "original_path": "verl/trainer/ppo/metric_utils.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "D",
+    "original_path": "agent_system/environments/env_package/alfworld/envs.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "D",
+    "original_path": "agent_system/environments/env_package/search/envs.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 1
+  },
+  {
+    "priority": "D",
+    "original_path": "agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  },
+  {
+    "priority": "D",
+    "original_path": "agent_system/environments/env_package/webshop/envs.py",
+    "review_status": "reviewed",
+    "reason": "semantic annotation mapにpriority block解説あり",
+    "annotation_count": 2
+  }
+]

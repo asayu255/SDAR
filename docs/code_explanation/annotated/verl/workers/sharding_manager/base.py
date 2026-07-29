@@ -18,6 +18,8 @@ Sharding manager to implement HybridEngine
 from verl import DataProto
 
 
+# sharding managerのcontext境界はtraining表現からinference表現への一時的な切替を表す。`__enter__`でweight/RNG/memoryをrollout側へ移し、`__exit__`でtraining状態へ戻す。
+# `preprocess_data`/`postprocess_data`は同じglobal batchをinference TP/SP配置へgatherし、終了後に元rankのsliceへ戻す契約である。
 class BaseShardingManager:
     def __enter__(self):
         pass

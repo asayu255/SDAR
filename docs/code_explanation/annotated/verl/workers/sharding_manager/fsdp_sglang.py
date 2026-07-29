@@ -89,6 +89,8 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
+    # FSDP state dictをGPUへmaterializeし、infer-TP各rankのserialized shardを`dist.gather_object`でrank 0へ集めてSGLang engineへweight単位でloadする。
+    # ここでのgatherはweight同期、`all_gather_data_proto`はrollout入力複製で目的が異なる。exitではSGLang memory occupationをreleaseし、actorをtrain modeとtraining RNGへ戻す。
     def __enter__(self):
         torch.cuda.empty_cache()
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)

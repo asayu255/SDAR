@@ -81,6 +81,8 @@ class MegatronSGLangShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
     @GPUMemoryLogger(role="MegatronSGLangShardingManager enter", logger=logger)
+    # Megatron shardはconverterを通じてSGLangが読むtensor名/layoutへ逐次変換され、TP rank 0のengineへ反映される。cache flush後にrolloutし、exitで推論memoryをreleaseして全pipeline modelをtrain modeへ戻す。
+    # 入力DataProtoはinfer TP group内AllGather、出力はrank対応chunkへ戻すため、weight変換とbatch reshardは独立した処理である。
     def __enter__(self):
         per_tensor_param = per_tensor_generator(
             self.actor_module,

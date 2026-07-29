@@ -111,6 +111,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             VLLMHijack.hijack()
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
+    # entryではFSDP shardからstate dict（LoRA時はadapter、初回はbaseを含む）をmaterializeし、vLLM weight領域をwakeして同期した後にKV cacheをwakeする。
+    # FSDP full-param materializationはrank間AllGatherを伴い、`sync_model_weights/update_params`はtraining weightをinference engineへコピーする別の同期である。exitの`sleep(level=1)`はvLLMメモリ解放状態への遷移でbarrierではない。
+    # training RNGとgeneration RNGを交換してTP rank間のsamplingを一致させ、exitで元のtraining RNGと`train()`状態を復元する。
     def __enter__(self):
         def __collect_lora_params()->OrderedDict:
             """

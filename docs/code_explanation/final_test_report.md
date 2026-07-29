@@ -14,7 +14,7 @@
 | `python tests/trainer/test_expected_config.py` | blocked: `ray` missing | blocked: `ray` missing | unchanged |
 | `pytest -q tests/trainer/test_opd_routing.py` | dependency skip | 1 skipped | unchanged |
 | `pytest -q tests/trainer/ppo/test_per_task_metrics.py` | blocked: `torch` missing | blocked: `torch` missing | unchanged |
-| `pytest -q tests/ray_cpu/test_async_rollout_equivalence.py` | 6 passed | 6 passed in 0.19s | unchanged / passed |
+| `pytest -q tests/ray_cpu/test_async_rollout_equivalence.py` | 6 passed | 6 passed in 0.18s | unchanged / passed |
 | `pytest -q tests/ray_cpu/test_rollout_speedup_mechanisms.py` | blocked: `torch` missing | blocked: `torch` missing | unchanged |
 
 元sourceと既存testは変更していない。実行可能な軽量testはbaseline/finalとも6件成功し、
@@ -26,7 +26,9 @@
 |---|---|
 | manifest target | 743 completed / 0 pending / 0 blocked / 0 needs-review |
 | source preservation | 743/743 passed |
-| annotation coverage | 743/743 passed |
+| visible legacy tags / generic templates | 0 / 0 |
+| semantic block coverage | 10,253 blocks / 0 needs-review |
+| Priority semantic review | A 8/8、B 8/8、C 11/11、D 4/4 |
 | Python syntax | 425/425 passed |
 | Shell syntax | 149/149 passed |
 | YAML syntax | 46/46 passed |

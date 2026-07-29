@@ -41,6 +41,8 @@ def get_random_string(length: int) -> str:
     return "".join(random.choice(letters_digits) for _ in range(length))
 
 
+# 動的worker-group methodはdispatch→Ray remote投入→必要なら`ray.get`→collect→auto-padding除去の順で実行する。
+# `blocking=False`ならObjectRefをcollect側へ渡すためdriverは待たず、`blocking=True`の`ray.get`が明示的なdriver合流点になる。
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
@@ -487,6 +489,8 @@ class RayWorkerGroup(WorkerGroup):
             setattr(self, role_name, role_wg)
         self.method_names = self._bind_worker_method(self.ray_cls_with_init.cls, func_generator)
 
+    # `execute_*_async`は各Ray actorへ`.remote()`を投入してObjectRefを返す。`execute_*_sync`だけが`ray.get()`で完了と例外をdriverへmaterializeする。
+    # 全引数がworker数と同長のlistならrankごとに対応要素をscatterし、それ以外は同じ引数をbroadcastする。これはcollective通信ではなくdriverによるRay task引数routingである。
     def _execute_remote_single_worker(self, worker, method_name: str, *args, **kwargs):
         """Execute a method on a single worker remotely.
 
