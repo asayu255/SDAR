@@ -3,15 +3,15 @@
 - source commit: `10cacaf6fb2cd4eea971b06d3e73ada868b611f4`
 - source branch: `claude/pure-opd-multitask`
 - work branch: `codex/explain-pure-opd-multitask`
-- current phase: Phase 6 - async rollout・再開・共通 trainer
-- completed paths: Phase 0〜5、Pure OPD critical path、data/sampler/environment/rollout、主要 architecture 7文書
-- in-progress path: checkpoint resume → async rollout → shared trainer/workers
-- next path: `agent_system/environments/resume.py`
-- pending count: 724
+- current phase: Phase 7 - リポジトリ全対象の注釈展開
+- completed paths: Phase 0〜6、branch delta 50/50、architecture 13文書
+- in-progress path: target 743ファイルの残りをtop-level単位で生成・検証
+- next path: `verl/` の未完了target
+- pending count: 693
 - blocked count: 0
 - needs-review count: 0
-- last validation: 19 files source preservation 100%、coverage 100%、Python syntax passed
-- last commit SHA: `15ecc57`
+- last validation: 50 files source preservation 100%、coverage 100%、Python/Shell/YAML syntax passed
+- last commit SHA: `34ae829`
 
 ## 安全確認記録
 
