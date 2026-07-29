@@ -1,0 +1,36 @@
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+{
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "char_ords": [
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        48,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        49,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        50,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        51,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        52,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        53,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        54,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        55,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        56,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        57,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        44,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        58
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "model_max_length": 2048,
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "chat_template": "{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% set role = message['role'] %}{{ message['content'] }}{% endfor %}{% if add_generation_prompt %}{{ sep_token }}{% endif %}"
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+}

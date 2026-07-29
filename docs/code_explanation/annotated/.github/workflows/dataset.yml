@@ -1,0 +1,98 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+name: dataset
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  push:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    branches:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - main
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - v0.*
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  pull_request:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    branches:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - main
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    paths:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - "verl/utils/**/*.py"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - .github/workflows/dataset.yml
+
+# Cancel jobs on the same ref if a new one is triggered
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+concurrency:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Declare permissions just read content.
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+permissions:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  contents: read
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+jobs:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  ray:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    runs-on: [L20x8]
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    timeout-minutes: 10 # Increase this timeout value as needed
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    env:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_ENDPOINT: "https://hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    container:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.3
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      options: --gpus all --shm-size=10g
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    steps:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        with:
+          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+          fetch-depth: 0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Install the current repository
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip install -e .[test]
+          pip install --upgrade "ray>=2.40.0"
+          pip install cupy-cuda12x
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running dataset tests
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          [ ! -d "$HOME/verl-data" ] && git clone --depth 1 https://github.com/eric-haibin-lin/verl-data ~/verl-data
+          python3 examples/data_preprocess/geo3k.py
+          pytest -s -x tests/utils/gpu_tests/dataset/test_rl_dataset.py
+          pytest -s -x tests/utils/gpu_tests/dataset/test_sft_dataset.py
+          # pytest -s -x tests/utils/gpu_tests/dataset/test_rm_dataset.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running ray test using cupy (move it to L20 when dockerfile ready)
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          cd tests/ray_gpu
+          pytest -s -x test_rvdz.py

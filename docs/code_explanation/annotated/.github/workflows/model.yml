@@ -1,0 +1,186 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+name: model_rmpad
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  push:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    branches:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - main
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - v0.*
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  pull_request:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    branches:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - main
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - v0.*
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    paths:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - "verl/**/*.py"
+      # Entrypoints
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - ".github/workflows/model.yml"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - "tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - "tests/models/test_transformers_ulysses.py"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - "tests/distributed/run_all.sh"
+
+# Declare permissions just read content.
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+permissions:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  contents: read
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+jobs:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model_rmpad:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    runs-on: [L20x8]
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    timeout-minutes: 20 # Increase this timeout value as needed
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    env:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_ENDPOINT: "https://hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    container:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.3
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      options: --gpus all --shm-size=10g
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    steps:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        with:
+          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+          fetch-depth: 0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Install the current repository and upgrade to latest transformers/flash_attn
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install --no-deps -e .[test]
+          pip3 install --upgrade transformers
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running rmpad model tests on 8 L20 GPUs + flash_attn 2.5.8
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pytest -s tests/models/test_transformer.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running rmpad model tests on 8 L20 GPUs + latest flash_attn
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install --upgrade flash_attn --no-build-isolation
+          pytest -s tests/models/test_transformer.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running FSDP rmpad model tests on 8 L20 GPUs + latest flash_attn
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          STRATEGY=fsdp torchrun --nproc_per_node=8 tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + latest transformers
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.49.0
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install transformers==4.49.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.48.0
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install transformers==4.48.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.47.0
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install transformers==4.47.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.46.0
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install transformers==4.46.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.45.0
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install transformers==4.45.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Run distributed test
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          bash tests/distributed/run_all.sh
+
+  # TODO: Move this back to model_rmpad once FSDP2 is stable.
+  # NOTE: List as an independent job to make rerun easier.
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model_rmpad_fsdp2_unstable:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    runs-on: [L20x8]
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    timeout-minutes: 20 # Increase this timeout value as needed
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    env:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_ENDPOINT: "https://hf-mirror.com"
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    container:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.3
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      options: --gpus all --shm-size=10g
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    steps:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        with:
+          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+          fetch-depth: 0
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Install the current repository and upgrade to latest transformers/flash_attn
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install --no-deps -e .[test]
+          pip3 install --upgrade transformers
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      - name: Running FSDP2 rmpad model tests on 8 L20 GPUs + latest flash_attn
+        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+        run: |
+          pip3 install --upgrade flash_attn --no-build-isolation
+          STRATEGY=fsdp2 torchrun --nproc_per_node=8 tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py

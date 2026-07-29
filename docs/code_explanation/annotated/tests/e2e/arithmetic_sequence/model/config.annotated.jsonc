@@ -1,0 +1,58 @@
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+{
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "architectures": [
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "LlamaForCausalLM"
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  ],
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "attention_bias": false,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "attention_dropout": 0.0,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "bos_token_id": null,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "eos_token_id": 1,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "hidden_act": "silu",
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "hidden_size": 128,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "initializer_range": 0.02,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "intermediate_size": 344,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "max_position_embeddings": 2048,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "mlp_bias": false,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "model_type": "llama",
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "num_attention_heads": 4,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "num_hidden_layers": 4,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "num_key_value_heads": 4,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "pad_token_id": 2,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "pretraining_tp": 1,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "rms_norm_eps": 1e-06,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "rope_scaling": null,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "rope_theta": 10000.0,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "tie_word_embeddings": false,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "torch_dtype": "bfloat16",
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "transformers_version": "4.43.3",
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "use_cache": true,
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "vocab_size": 16
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+}
