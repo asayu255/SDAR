@@ -3,15 +3,15 @@
 - source commit: `10cacaf6fb2cd4eea971b06d3e73ada868b611f4`
 - source branch: `claude/pure-opd-multitask`
 - work branch: `codex/explain-pure-opd-multitask`
-- current phase: Phase 5 - data と multitask environment
-- completed paths: Phase 0〜3、Pure OPD critical path 9 files、主要 architecture 4文書
-- in-progress path: multitask data → sampler → environment → rollout
-- next path: `examples/data_preprocess/prepare_sdar_multitask.py`
-- pending count: 733
+- current phase: Phase 6 - async rollout・再開・共通 trainer
+- completed paths: Phase 0〜5、Pure OPD critical path、data/sampler/environment/rollout、主要 architecture 7文書
+- in-progress path: checkpoint resume → async rollout → shared trainer/workers
+- next path: `agent_system/environments/resume.py`
+- pending count: 724
 - blocked count: 0
 - needs-review count: 0
-- last validation: 10 files source preservation 100%、coverage 100%、Python/Shell/YAML syntax passed
-- last commit SHA: `864456d`
+- last validation: 19 files source preservation 100%、coverage 100%、Python syntax passed
+- last commit SHA: `15ecc57`
 
 ## 安全確認記録
 
