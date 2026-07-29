@@ -12,11 +12,14 @@ import ray
 from omegaconf import OmegaConf
 
 
+# `@hydra.main`が`ppo_trainer.yaml`へCLI overrideをcomposeし、未解決のDictConfigをPure OPD専用`run_opd`へ渡すentrypointである。
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     run_opd(config)
 
 
+# 既存Ray runtimeがなければ、VERL既定runtime_envと`config.ray_init.runtime_env`をmergeしてdriverからclusterへ接続する。
+# `ray.init`はactorを作る処理ではなく、後続のremote task/worker groupが使うruntimeを初期化する境界である。
 def run_opd(config) -> None:
     if not ray.is_initialized():
         from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -30,6 +33,8 @@ def run_opd(config) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
+    # `OPDTaskRunner.remote()`で1 CPUのRay actorを作り、`runner.run.remote(config)`を非同期投入する。
+    # 外側の`ray.get`がdriverの明示的blocking pointであり、worker初期化・training・validation・checkpointが終了するまで`run_opd`は戻らない。
     runner = OPDTaskRunner.remote()
     ray.get(runner.run.remote(config))
 
@@ -43,6 +48,7 @@ class OPDTaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        # `OmegaConf.resolve`後の値を基準にteacher pathの存在を確認するため、Hydra interpolationやCLI overrideを反映した実効設定を検査する。
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
@@ -55,11 +61,8 @@ class OPDTaskRunner:
 
         # Inject the pure-distillation invariants so no signal other than the
         # per-task teacher KL can flow into the actor loss.
-        # ここは raw Hydra config を worker が実際に読む effective config へ変換する境界である。
-        # `pg_loss_coef=0` と `entropy_coeff=0` により GRPO/entropy の scalar 寄与をゼロ化し、
-        # reference-KL・SDL・SDAR・reward-KL も無効化して、teacher KL だけを gradient 経路に残す。
-        # `adv_estimator=grpo` が raw config に残っていても、thin loop が advantage を作らず、
-        # actor も `pg_loss_coef==0` なら `old_log_probs`/`advantages` を要求しない点が重要である。
+        # `open_dict(config)`はOmegaConfのstruct制約をこのblockだけ一時解除し、compose済み設定へPure OPD固有keyと実効値を書き込む。
+        # resource、autocast、no-gradの寿命を管理するcontext managerではない。
         with open_dict(config):
             config.actor_rollout_ref.actor.use_teacher_kl_loss = True
             config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
@@ -77,8 +80,8 @@ class OPDTaskRunner:
         # injection above) against the version-controlled expectations file.
         # Required — a run without a pinned intent is exactly how the
         # low_var_kl-instead-of-topk_kl mishap happened.
-        # 検証順は Hydra compose → この entry-point injection → expected-config 比較である。
-        # したがって expectations file は raw default ではなく、実験開始直前の実効値を固定する。
+        # 検証順はHydra compose → Pure OPD invariant注入 → expected-config比較である。
+        # `enforce_expected_config`はraw defaultではなくworkerが読む直前のeffective configをdot pathごとに照合する。
         from verl.utils.expected_config import enforce_expected_config
 
         expect_file = config.trainer.get("expected_config", None)
@@ -88,6 +91,8 @@ class OPDTaskRunner:
         )
         enforce_expected_config(config, expect_file, tag="opd expected-config")
 
+        # `actor_rollout_ref.model.path`だけをlocalizeしてstudent tokenizer/processorを構築する。
+        # task別teacher pathはここでstudent pathへ混ぜず、後の`OPDRayTrainer.init_workers`で各ref-role copyへ設定する。
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
@@ -110,6 +115,7 @@ class OPDTaskRunner:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
+        # actor strategyに応じてFSDPまたはMegatron worker group実装を選ぶ。現在runはFSDPで、同じ`ActorRolloutRefWorker` classをactor_rollout roleとtask別ref roleに使い分ける。
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
@@ -135,6 +141,9 @@ class OPDTaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        # global resource poolへActorRolloutとCriticのclassを登録するが、`Role.RefPolicy`は登録しない。
+        # task別teacherはshared ref policyではなく、OPDRayTrainerが同じpool上へ追加する独立worker groupである。
+        # reward managerはmonitoring用scoreを作るが、Pure OPD thin loopのscalar lossには接続されない。
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
@@ -175,6 +184,8 @@ class OPDTaskRunner:
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
+        # engine側`actor_rollout_ref.rollout.n`を1に固定し、GRPO groupの8 trajectoryは環境側`env.rollout.n`で複製する。
+        # この分離によりmulti-turn collectorがtrajectory UIDとturn-rowを一貫して管理する。
         assert config.actor_rollout_ref.rollout.n == 1, (
             "In verl, actor_rollout_ref.rollout.n>1 is for GRPO. "
             "In verl+env, we keep n=1, and achieve GRPO by env.rollout.n"
@@ -202,6 +213,8 @@ class OPDTaskRunner:
 
         from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 
+        # `OPDRayTrainer`はcompose済みconfigからteacher pathを読み、`init_workers`でactorの前に3 teacherを初期化する。
+        # `fit`は通常PPO loopではなく、rollout → monitoring reward → teacher forward → actor updateのthin loopを実行する。
         trainer = OPDRayTrainer(
             config=config,
             tokenizer=tokenizer,

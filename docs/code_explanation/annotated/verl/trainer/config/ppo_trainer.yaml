@@ -44,6 +44,7 @@ actor_rollout_ref:
     use_liger: False
     use_fused_kernels: False
     trust_remote_code: False
+  # ここは共有PPOのraw defaultであり、Pure OPDの実効値ではない。`main_opd.py`がteacher KLを有効化し、PG/entropy/reference-KLを無効化した後にexpected-configが照合する。
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
     ppo_mini_batch_size: 256
@@ -96,6 +97,8 @@ actor_rollout_ref:
       offload_policy: False # only for fsdp2, offload param\grad\optimizer during train
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       fsdp_size: -1
+  # task別teacherはこの`ref` micro-batch/offload系列を再利用するが、通常のshared RefPolicy roleではない。
+  # 現在runの4/GPUはteacher forward専用で、actor updateの2/GPUとは独立に正規化される。
   ref:
     strategy: fsdp
     fsdp_config:
@@ -110,6 +113,8 @@ actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+  # rollout backendのsampling、KV-cache、vLLM sessionに関する性能defaultであり、expected-configが固定する科学的loss設定とは分離される。
+  # `rollout.n`はengine側sample数で、Pure OPD multitask runでは1に固定する。
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
@@ -241,6 +246,7 @@ custom_reward_function:
   path: null
   name: compute_score
 
+# GAE/GRPO、reward KL、filter_groupsはshared trainer用defaultである。Pure OPD thin loopはadvantage/returnsを作らず、entrypointが`use_kl_in_reward=false`を強制するため実効lossへ到達しない。
 algorithm:
   gamma: 1.0
   lam: 1.0
@@ -299,6 +305,7 @@ ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
 
 
+# global env defaultに対しmultitask runがtask別max_stepsをoverrideする。mixed batchはAlfWorld/Search/WebShop sub-managerへ分割され、結果だけ元global row順へscatterされる。
 env:
   env_name: alfworld/AlfredTWEnv
   seed: 0

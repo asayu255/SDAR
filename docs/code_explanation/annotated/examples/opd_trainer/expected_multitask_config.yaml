@@ -17,6 +17,8 @@
 #   - To change a setting intentionally: edit the run script AND this file in
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
+# この4組はOPD algorithm設定と、`main_opd.py`がactorへ注入した実効設定の一致を検査する。
+# `topk_kl`とK=20のどちらかがdefaultやoverrideで変われば、学習開始前にfail-fastする。
 # ---- distillation loss (the knob that caused the original low_var_kl mishap) --
 "algorithm.opd.kl_loss_type": topk_kl
 "algorithm.opd.kl_loss_coef": 1.0
@@ -27,6 +29,8 @@
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 
+# `pg_loss_coef=0`、entropy=0、reference-KL/SDL/SDAR/reward-KL=falseがteacher KL以外のgradient寄与を閉じる。
+# invalid-action penaltyは有効だが、Pure OPD thin loopはadvantage/returnsを作らないため、変更後rewardはmonitoringとdumpに留まりactor lossへ入らない。
 # ---- pure-distillation invariants (no other signal enters the loss) -----------
 "algorithm.adv_estimator": grpo
 "algorithm.use_kl_in_reward": false
@@ -42,6 +46,8 @@
   search: 0.01
   webshop: 0.1
 
+# 3つのpathはshared reference policyではなく、`task_name`で選ばれる独立teacher checkpointである。
+# 各pathは`OPDRayTrainer.init_workers`でdeepcopyしたref-role設定の`model.path`へ入る。
 # ---- teachers -------------------------------------------------------------------
 "algorithm.opd.teacher_paths.alfworld": /opt/home/ohara/checkpoints/teachers/alfworld_step300
 "algorithm.opd.teacher_paths.search": /opt/home/ohara/checkpoints/teachers/search_step300
@@ -53,6 +59,7 @@
 "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
 "actor_rollout_ref.actor.ppo_mini_batch_size": 60
 
+# 45 promptはtask別15件を合わせたglobal prompt batchであり、`TaskBalancedSampler`が各DP chunkのtask構成を保つ。prompt長とtruncationはtask overrideがglobal値より優先される。
 # ---- data -----------------------------------------------------------------------
 "data.train_batch_size": 45
 "data.val_batch_size": 126
@@ -72,6 +79,7 @@
 "data.task_overrides.webshop.truncation": error
 "data.apply_chat_template_kwargs.enable_thinking": false
 
+# `env.rollout.n=8`が各promptのtrajectory複製数を決める。task別max_stepsはAlfWorld=50、Search=4、WebShop=15で、mixed batch内でも各sub-managerへ個別に渡る。
 # ---- environment ------------------------------------------------------------------
 "env.env_name": multitask
 "env.seed": 1

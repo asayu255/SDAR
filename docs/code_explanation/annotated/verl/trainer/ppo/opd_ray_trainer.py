@@ -53,6 +53,8 @@ from agent_system.multi_turn_rollout import adjust_batch
 _ENV_RESET_PREFETCH = os.environ.get("ENV_RESET_PREFETCH", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+# `compute_opd_data_metrics`はadvantage/returnsを読まず、turn-row長、trajectory token数、episode reward/successだけを集計する。
+# ここで読む`token_level_scores`とinvalid-action penalty後rewardはmonitoring値であり、`update_actor`へloss入力として渡されない。
 def compute_opd_data_metrics(batch: DataProto) -> dict:
     """Lightweight, advantage-free replacement for ``compute_data_metrics``.
 
@@ -116,6 +118,8 @@ def compute_opd_data_metrics_by_task(batch: DataProto) -> dict:
     )
 
 
+# `teacher_paths`のkeyをcanonical task名へ正規化し、未知taskとshared reference-policy生成を拒否する。
+# `teacher_topk_kl`がtrueならteacherは各response位置のK個のID/log-probを返し、falseなら生成token位置だけのsingle-token signalを返す。
 class OPDRayTrainer(RayPPOTrainer):
     """Multitask on-policy distillation trainer with per-task teacher routing."""
 
@@ -163,6 +167,8 @@ class OPDRayTrainer(RayPPOTrainer):
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
+        # student設定をtaskごとにdeepcopyし、`model.path`だけを対応checkpointへ差し替えるためactor本体のpathは変わらない。
+        # 各copyを`role="ref"`で同一resource poolへ登録する。colocationはGPU常時同時常駐を意味せず、FSDP CPUOffload下でforward時に逐次利用される。
         # One teacher worker group per task, each with its own checkpoint.
         teacher_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
         self._teacher_keys = {}
@@ -193,6 +199,8 @@ class OPDRayTrainer(RayPPOTrainer):
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
 
+        # `create_colocated_worker_cls`が同じRay process/GPU配置へactorとteacher roleを束ね、`spawn`がtask別worker group handleを返す。
+        # `wg.init_model()`はRay側でblockingして各teacher checkpointのFSDP構築完了を待つ。teacherを先に初期化し、vLLMのKV-cache見積りを行うactor_rolloutを最後に初期化する。
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs)

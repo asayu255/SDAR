@@ -679,10 +679,9 @@ def topk_kl_per_token(
     teacher_topk_logprob: torch.FloatTensor,
     eps: float = 1e-8,
 ) -> torch.FloatTensor:
-    # 両入力 shape は (batch, response_length, k)、出力は (batch, response_length) である。
-    # token ID は teacher 側で選んだ同一 support を使うため、この関数へ渡る前に student logits を
-    # `teacher_topk_ids` で gather しておく。single-sampled-token の `low_var_kl` とは別経路である。
-    # teacher は detach して gradient を遮断し、student_topk_logprob 側だけが backward graph を持つ。
+    # `student_topk_logprob`と`teacher_topk_logprob`はともに`(B,R,K)`で、teacherが選んだ同一support上のreverse KLを計算する。
+    # K個の確率質量にtop-k外をまとめたtail bucketを加え、出力`teacher_kld(B,R)`をresponse maskでtoken-mean集約する。
+    # teacher入力はdetachされ、single sampled tokenの`low_var_kl`とは異なりstudentのK位置すべてへgradientが流れる。
     """Dense per-token reverse KL over a top-k support (+ a tail bucket).
 
     Approximates the exact per-token reverse KL ``KL(p_student || p_teacher)`` by
@@ -709,8 +708,6 @@ def topk_kl_per_token(
     p_t = teacher_topk_logprob.exp()
 
     # Tail mass = 1 - sum(top-k mass), clamped for numerical safety.
-    # top-k 外の全 vocabulary を1個の tail bucket に集約するため、top-k 確率質量の残差を求める。
-    # `eps` clamp は log(0) を避ける数値安定化で、k 個の support と tail の合計で近似 KL を構成する。
     tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)
     tail_t = (1.0 - p_t.sum(dim=-1)).clamp(min=eps, max=1.0)
 

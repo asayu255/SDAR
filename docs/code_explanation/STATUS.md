@@ -3,15 +3,15 @@
 - source commit: `10cacaf6fb2cd4eea971b06d3e73ada868b611f4`
 - source branch: `claude/pure-opd-multitask`
 - work branch: `codex/explain-pure-opd-multitask`
-- current phase: コメント品質修正 Phase 4 - Priority A再解説
+- current phase: コメント品質修正 Phase 5 - Priority B〜D再解説
 - completed paths: 検証基盤移行、全743 mirror再生成、`[EXPLAIN]`/汎用テンプレート除去
-- in-progress path: Pure OPD中核8ファイルのsemantic review
-- next path: entrypoint/config → teacher routing/thin loop → FSDP/top-k KL
+- in-progress path: data/environment/rollout → distributed/sharding/metrics → task環境
+- next path: Priority B 8ファイル
 - pending count: 0
 - blocked count: 0
 - needs-review count: 0
-- last validation: source preservation 743/743、`[EXPLAIN]` 0、generic 0、Python/Shell/TOML/Markdown passed（YAML parser依存は最終Phaseで再導入）
-- last validated content commit SHA: `f5baa11`
+- last validation: Priority A 8/8 reviewed、対象8ファイルsource preservation、Python/Shell passed、`[EXPLAIN]`/generic 0
+- last validated content commit SHA: `62a6196`
 
 ## 安全確認記録
 

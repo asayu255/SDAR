@@ -74,6 +74,9 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    # `_forward_micro_batch`は`input_ids(B,S)`をattention maskで`input_ids_rmpad(1,nnz)`へ変換し、FlashAttention varlen forward後にresponse位置へ戻す。
+    # teacher modeはlogitsから自前top-k ID/log-probを返し、student modeは`teacher_topk_ids(B,R,K)`と同じ位置をgatherする。
+    # top-k distillationはfull logitsを必要とするためfused-kernel経路をguardし、Ulysses使用時はpad/sliceとgather/unpadの順序を維持する。
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
         """
         Returns:
@@ -359,6 +362,8 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    # `compute_topk_log_prob`はteacher/ref forward全体を`torch.no_grad()`で囲み、micro-batchごとの`(B_i,R,K)`をconcatしてdynamic-batch並べ替えを元row順へ戻す。
+    # IDはint64のまま返し、teacher側Tensorからstudentへのgradient edgeは作らない。
     def compute_topk_log_prob(self, data: DataProto, topk_k: int):
         """Teacher-side: per response token, the teacher's top-k token ids and the
         teacher's full-vocab log-softmax values at those ids.
@@ -407,11 +412,9 @@ class DataParallelPPOActor(BasePPOActor):
         return topk_logprob, topk_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    # `pg_loss_coef==0`なら`old_log_probs`/`advantages`をselectせず、teacher signal、response mask、task IDだけをupdate inputへ残す。
+    # `teacher_kl_loss_type=topk_kl`では`teacher_topk_ids/logprobs`をstudent micro-batchと同じrow sliceで運ぶ。
     def update_policy(self, data: DataProto):
-        # Pure OPD の実効設定では global mini-batch 60 を rank/micro-batch へ分割し、
-        # 1 GPU あたり micro-batch 2 の forward/backward を gradient accumulation する。
-        # `response_mask` は (micro_batch,response_length) で、multi-turn の無効 token と padding を
-        # scalar loss の token-mean 分母・分子の双方から除外する。
         # make sure we are in training mode
         self.actor_module.train()
 

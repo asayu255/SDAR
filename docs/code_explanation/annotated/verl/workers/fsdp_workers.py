@@ -77,6 +77,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+# 1次元meshは全rankでparameterをshardするFULL_SHARD、2次元`(ddp, fsdp)` meshはnode/group内shardとreplicationを組み合わせるHYBRID_SHARDを選ぶ。
+# これは明示的barrierではないが、forward/backwardのAllGather/ReduceScatterがrank間のcollective待機点になる。
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -143,6 +145,8 @@ class ActorRolloutRefWorker(Worker):
             self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
+            # global `ppo_mini_batch_size`と旧global micro-batch指定を、DP world size / Ulysses SP sizeでrank-local値へ正規化する。
+            # 現在runは既に`ppo_micro_batch_size_per_gpu=2`、teacher/refは4/GPUを指定するため、両者を同じmicro-batchとして扱わない。
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
 
         # normalize config
@@ -307,15 +311,14 @@ class ActorRolloutRefWorker(Worker):
 
         print(f"wrap_policy: {auto_wrap_policy}")
 
+        # `role="actor"`はgradient accumulationの正確性のためparameter CPUOffloadを無効にし、task別teacherの`role="ref"`はCPUOffloadを有効にする。
+        # FSDP1/FSDP2ともforward前のparameter materializationと計算後reshardを行うため、colocated teacherが常時GPU residentとは限らない。
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        # OPD teacher は `role="ref"` でこの分岐へ入り、actor と異なり parameter CPUOffload が有効になる。
-        # task 別 teacher worker group は同じ resource pool に colocate されるが、常時 GPU 常駐ではない。
-        # forward 時の FSDP AllGather/一時 load、計算後の reshard/CPU 戻しにより GPU を逐次共有する。
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
@@ -600,6 +603,8 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
+    # `DP_COMPUTE_PROTO`がglobal DataProtoを各DP rankへ配送し、Ulysses preprocess後に`update_policy`を同期実行する。
+    # 各micro-batch backwardのFSDP collectiveを経てoptimizer stepが完了してから、CPU上のmetric DataProtoがdriverへ戻る。
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
@@ -643,6 +648,8 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    # 通常は各turnでsharding manager enter/exitに伴うFSDP state gather、vLLM weight sync、wake/sleepを行う。
+    # session modeはrollout境界で1回だけenter/exitし、凍結actor weightを全turnで共有する。per-turn DataProto shardingは残るためrow順は変わらない。
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
@@ -796,12 +803,11 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    # teacher sub-batchをGPUへ移し、ref用micro-batch=4/GPUとUlysses shardingを適用して`compute_topk_log_prob`をno-grad実行する。
+    # 返却する`teacher_topk_logprobs`/`teacher_topk_ids`は`(task_batch,response_length,K)`で、postprocess後CPUへ移動する。
+    # FSDP1では`reshard(True)`がroot parameterを再shardする。これは明示的`dist.barrier`とは別のcollective境界である。
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_topk_log_prob(self, data: DataProto):
-        # teacher forward は ref policy の no-grad 経路で実行し、response 各位置について
-        # top-k token ID と full-vocabulary log-softmax から gather した値を CPU DataProto で返す。
-        # ID は整数精度が必要で bf16 に格納できないため、DP padding を通る shared Tensor 経路では
-        # float32 を介した後に long へ戻し、最終 shape (batch,response_length,k) を維持する。
         """Teacher-side top-k log-probs for OPD distillation: per response token,
         the teacher's top-k token ids and the teacher's full-vocab log-softmax at
         those ids. ``topk_k`` is taken from data.meta_info (default 20)."""

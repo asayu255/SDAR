@@ -41,6 +41,8 @@ python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.
 # Data prep. These literals are shared with the training command below and are
 # also cross-checked there via the expectations file (per_task_batch_size=15,
 # val_per_task_size=126, total_training_steps=300, seed=1).
+# `prepare_sdar_multitask`が各task 15 prompt × 300 batch分のtrain rowと、task別126件のvalidation rowを固定seedで作る。
+# AlfWorld/WebShopのrowは環境側でepisodeを選ぶdummy prompt、Searchのrowはquestionとground truthを`env_kwargs`へ運ぶ。
 python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --search_dir "$HOME/data/searchR1_processed_direct" \
     --local_dir "$HOME/data/verl-agent/sdar_multitask" \
@@ -50,6 +52,9 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size 126 \
     --seed 1
 
+# このHydra commandがQwen3-1.7B student、45 prompt、`env.rollout.n=8`、task別teacher checkpoint、top-k=20を一つの実効runへcomposeする。
+# `actor_rollout_ref.rollout.n=1`はengine側の複製数であり、1 prompt当たりのtrajectory数は`env.rollout.n=8`が担う。multi-turn展開後のactor row数は360 trajectoryより多くなり得る。
+# actor micro-batchは2/GPU、teacher/ref forwardは4/GPU、rollout log-probは16/GPUで、同じ「batch size」ではない。
 python3 -m verl.trainer.main_opd \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_config.yaml \
     algorithm.adv_estimator=grpo \
