@@ -12,3 +12,17 @@
 ミラー外を `git diff --check`、ミラー内を `validate_source_preservation.py` で検証します。
 
 進捗と再開位置は [STATUS.md](STATUS.md)、対象判定は `manifest.json` / `manifest.csv`、source 固定値は `SOURCE_COMMIT` を参照してください。
+
+## 読み始める場所
+
+- [リポジトリ全体像](architecture/repository_overview.md)
+- [Pure OPD概要](architecture/pure_opd_overview.md)
+- [実効loss](architecture/pure_opd_effective_loss.md)
+- [call graph](indexes/call_graph.md)
+- [設定索引](indexes/config_index.md)
+- [環境変数索引](indexes/environment_variable_index.md)
+- [Tensor shape索引](indexes/tensor_shape_index.md)
+
+全ファイル、class、functionの機械生成索引は `indexes/`、既存環境で実行可能だった
+テストと依存関係blockの比較は `baseline_test_report.md` / `final_test_report.md`、
+Pure OPDで設定済みでも非実効な経路は `dormant_config_report.md` に記録しています。
