@@ -1,0 +1,904 @@
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+{
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "general_skills": [
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_001",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Prioritize Core Keywords",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Include the product type, 1-2 key functional attributes, and any hard constraints (price, size, color) in the search query; omit secondary descriptors to avoid over-constraining.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Before issuing the first search or when refining an over-specific query that yields few/irrelevant results."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_002",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Iterative Query Refinement",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "If top results are irrelevant, adjust keywords (add/remove terms or use synonyms) or apply site filters instead of repeating the same query.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After a search results page shows mostly off-target items or repeats despite multiple identical searches."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_003",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Scan Before You Click",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Read product titles, thumbnails, and prices in the results list to ensure the item plausibly meets core constraints before opening it.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "On any search results page when deciding which product link to open next."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_004",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Verify Early, Abort Fast",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "On the product page, immediately check category, core attributes, and price; if a key constraint is violated, leave the page at once.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Within the first observation on every product detail page."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_005",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Set Mandatory Variants",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Always select required variant options (size, color, capacity, etc.) before evaluating price or purchasing.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After confirming the product type matches and before any purchase action."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_006",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Confirm Hidden Attributes",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Open the Description/Features section to ensure non-visible specs (e.g., material, wash method, slip resistance) meet constraints; skip item if unconfirmed.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "When a constraint is not evident from the title, images, or variant list."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_007",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Check Variant Pricing",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "For products showing a price range, select the exact variant combination and verify its specific price is within budget before buying.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Whenever the price is shown as a range or changes with variant selection."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_008",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Avoid Option Loops",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "If changing variants yields no path to meeting all constraints, stop toggling and return to search rather than looping on the same product.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After two-three unsuccessful variant changes on the same page."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_009",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Use Result Pagination",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "If the first result page lacks suitable items, navigate to additional pages or adjust sorting/filters before concluding unavailability.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "When initial results are insufficient and additional pages are indicated."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_010",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Respect Constraint Hierarchy",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Treat product type, category, and hard limits (price, size, color) as non-negotiable; secondary preferences can be used to rank but not override these.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Whenever evaluating whether to open or purchase a candidate item."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_011",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Conclude When Necessary",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "After exhaustive search and reasonable refinements yield no matching product, stop and report failure instead of endless retries.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "When multiple varied searches and pages produce no viable candidates within remaining steps."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_012",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "One Good Click Rule",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Limit inspection of clearly mismatched items to a single quick check; prioritize exploring new candidates over re-opening the same unsuitable product.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "If a product has already been deemed unsuitable once."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_013",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Purchase Decisively",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Once all constraints are confirmed on a variant and price fits, execute 'Buy Now' without unnecessary further navigation.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After validating every constraint on the current product variant."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_014",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Documented Attribute Search",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "When a critical attribute (e.g., \u2018tuxedo\u2019, \u2018butt lifting\u2019) isn\u2019t filterable, keep the query concise but include that keyword to improve precision.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "During initial or refined searches targeting attributes not covered by site filters."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_015",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Fallback to Best Match",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "If no product meets every constraint, consider nearest matches that satisfy all hard constraints and most secondary ones, noting any unmet soft attributes.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Near task limit when exact match is absent but partial matches exist."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  ],
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "task_specific_skills": {
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "apparel": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Focus Key Query",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Include only product type + must-have attributes (gender, garment, fabric, sleeve/fit, price cap) in the search; drop minor or redundant terms to widen relevant results.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before issuing or refining any search query."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Validate Core Match",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "On every product page, confirm the title/category matches the requested garment type and primary attributes; if not, immediately return to results.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right after opening a product detail page."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Set Variants First",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Always select the required size and color options before evaluating price or purchasing to ensure the exact variant meets constraints.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Upon landing on a relevant product page with selectable options."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Check Variant Price",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "After choosing size/color, verify the displayed price for that specific variant is within budget; abandon if it exceeds the limit.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately after variant selection and before clicking buy."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Confirm Hidden Specs",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Scroll to bullet points/description to verify non-title attributes (material, care, fit, design features); reject items lacking evidence.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before purchase on a candidate product where attributes aren\u2019t obvious in the title."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "app_006",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Adaptive Search Loop",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If top results are irrelevant, alter search by removing rare constraints or scanning more pages instead of repeating identical queries or cycling one bad product.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After an initial search yields no suitable items or only mismatches."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "footwear": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "foo_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Load Search Constraints",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Include all hard filters (type, function, color, size, price cap) directly in the initial search query to surface only viable footwear candidates.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before the first search or whenever starting a new search cycle."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "foo_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Verify Key Features",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Open the product description/specs to explicitly confirm required functional attributes (e.g., slip-resistant, rubber sole) before moving toward purchase.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately after opening a product page and before selecting variants or buying."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "foo_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Select Variants First",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Always choose the requested color and size options on the product page prior to any purchase action to ensure the exact variant meets constraints.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Once a candidate product page is open and verified for required features."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "foo_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Check Variant Price",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Confirm the displayed price for the chosen size/color is strictly below the user\u2019s maximum before clicking \u201cBuy Now,\u201d especially when ranges are shown.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After selecting variants and just before initiating checkout."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "foo_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Exit Non-Matches Fast",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If a product or result page clearly violates any hard constraint, back out immediately instead of toggling options or repeating identical searches.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Upon noticing missing attributes, wrong category, unavailable size/color, or over-budget price."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "home_decor": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Encode All Constraints",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Include product type plus every known color, size, shape, feature, and price limit in the initial search query to surface the most relevant home-decor items.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Whenever beginning a search or when current results lack items meeting multiple stated attributes."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Verify Product Category",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Before investing time configuring options or purchasing, ensure the item\u2019s category (e.g., pillow, rug, furniture set) matches the user\u2019s requested product type and room usage.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately after opening a product page from search results."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Use Variant Selectors",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Systematically choose color, size, shape, and other visible variants on the product page, confirming that each selection updates the listing to match user constraints and price.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After landing on a potentially suitable product that offers configurable attributes."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Open Details For Hidden Specs",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Expand Description, Features, or Specs tabs to confirm less-visible requirements (e.g., material, washability, printing method) that aren\u2019t obvious from titles and thumbnails.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When any user constraint is not directly visible in the main listing or variant options."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Avoid Product Loops",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If a candidate fails any constraint after inspection, return to results or refine the query; do not repeatedly reopen or re-filter the same non-qualifying product.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After verifying a product and finding a mismatch with any required attribute."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "hom_006",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Confirm All Then Commit",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Proceed to \u2018Buy Now\u2019 only after every user constraint\u2014type, attributes, and price\u2014has been positively confirmed; otherwise continue searching.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right before clicking the purchase button on a configured product page."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "electronics": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Constraint-Rich Search",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Pack product type plus every mandatory attribute (features, color, size, price cap) into the initial search string to surface only highly relevant electronics items.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Whenever starting a new product hunt or refining after poor results."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Configure In-Page Variants",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Once on a promising product page, immediately set color, size/pack, and other variant selectors to test if the SKU can meet all requested specs.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right after opening a candidate item from search results."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Hard-Gate Price & Specs",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Before proceeding to buy, cross-check the displayed title, specs, and price; abandon any item that exceeds the budget or lacks the exact requested feature set.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After configuring variants but before clicking \u201cBuy Now.\u201d"
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Bail on Mismatch Fast",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If variant clicks don\u2019t update the product details to the required spec, or if the page remains wrong, use \u201cBack to results\u201d and seek another item instead of retrying the same option.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When repeated option clicks leave title/specs unchanged or incompatible."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Prioritize High-Match Results",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Scan the result list for items whose titles show all key constraints; open those first, rather than settling for the earliest but partial match.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "On any search results page with multiple potential electronics products."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ele_006",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Avoid Click Loops",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Track visited products and queries; if progress stalls, refine the search or change items instead of cycling between the same pages.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After revisiting a page or running an identical search without new insights."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "accessories": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "acc_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Constraint-Packed Search",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Compose the initial search query by combining the accessory type with every known constraint (color, size, price cap, material, washability) to surface only viable candidates.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before the first search when the user provides multiple specific requirements."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "acc_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Explicit Variant Selection",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Always click and visibly confirm the exact color/size/pattern variant on the product page instead of assuming the default matches the request.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately after opening a product that offers multiple variant options."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "acc_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Function Fit Check",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Read the title and description to verify the accessory\u2019s intended use (e.g., \u2018eye-shadow case\u2019 vs. generic \u2018makeup bag\u2019) aligns with the user\u2019s need before proceeding.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right after landing on a product page that seems category-relevant but may have ambiguous use."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "acc_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Post-Config Price Audit",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "After selecting all variants, re-confirm the displayed price is within the user\u2019s budget; if it exceeds, backtrack and search for alternatives.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Just before initiating checkout or adding to cart."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "acc_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Fallback to Next Result",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If any required variant is unavailable or constraints can\u2019t be met on the current page, return to results and open the next candidate instead of forcing a mismatch.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When the product lacks the needed option or violates any key constraint after inspection."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "beauty_health": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "bea_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Bundle Constraints Search",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Combine product type with every user-stated filter (price cap, color, size, material, feature keywords) in one search query to surface highly relevant results.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "User lists two or more specific requirements (e.g., price + color, size, feature)."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "bea_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Feature-Led Click",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Open the first result whose title explicitly mentions the key functional attribute (e.g., \"double sided\", \"long handle\", \"dry hair\") to maximize match likelihood.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After search results appear and at least one headline contains the core feature term."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "bea_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Variant Verification & Set",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Within the product page, actively choose color, size, or pack options to ensure the selected variant meets all user constraints before purchase.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Product offers selectable options and user has specified any of those attributes."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "bea_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Price Gatekeeping",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Cross-check the displayed price (including chosen variant) against the user\u2019s maximum; if exceeded, abandon and return to results immediately.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right after selecting the desired variant and before initiating checkout."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "bea_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Minimal Path Purchase",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Once a product fully satisfies all constraints, proceed directly to 'Buy Now' without extra browsing to reduce error risk and time.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "All user requirements are confirmed on the current product page."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "other": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Embed All Constraints",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Build the initial search query to include every required attribute\u2014product type, key features, color/size, and price cap\u2014to surface only high-relevance results.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Right before issuing any product search."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Confirm Exact Category",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Open a result only if its title clearly matches the requested product type, and abandon pages that reveal a different category despite matching other attributes.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately upon landing on a product detail page."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Select & Verify Variants",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "After choosing required color, size, or pack options, ensure the page\u2019s title/price update to the selected variant before proceeding to purchase.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When a product offers dropdown or swatch selections."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Check Fixed Specs",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Manually read the description/features to confirm non-selectable requirements (materials, special functions, care instructions) are explicitly met.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before clicking 'Buy Now' on any configured product."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Refine If No Match",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If initial results don\u2019t meet all constraints, adjust keywords or add filters (e.g., synonyms, price slider) instead of re-clicking unsuitable items.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After reviewing a results page that lacks clear matches."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "oth_006",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Follow Purchase Flow",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Maintain the disciplined sequence: Search \u2192 Open candidate \u2192 Apply constraints \u2192 Verify all criteria & price \u2192 Buy Now, avoiding unnecessary back-and-forth.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "For every shopping task from start to checkout."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ]
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  },
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "common_mistakes": [
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_001",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Submitting a search query that omits key constraints (e.g., size or price cap), leading to an overwhelming or irrelevant result set.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent focuses on main keywords (product + attributes) and forgets secondary filters like price, size, or color.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Always assemble the full requirement list first, then build the query so every mandatory constraint (category, attributes, price) is explicitly included."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_002",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Using overly specific or uncommon color/variant names in the initial search, returning zero or few results.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Agents translate the user-given color directly into the query without considering site vocabulary or synonyms.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Start with broader color families (e.g., \"red\" instead of \"dusty blush\") and narrow down with on-page filters once results appear."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_003",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Selecting a visually similar but wrong product category (e.g., picking dress pants instead of dress shirts).",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Thumbnail images can be misleading and the agent may rely solely on visual similarity without verifying category metadata.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Cross-check product titles and breadcrumb/category labels against the requested category before clicking or purchasing."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_004",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Failing to notice that the displayed price changes after selecting the required size or color, causing budget overruns.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Agents often check price only on the default variant and assume it persists across all options.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "After every option change (size, color, etc.) re-read the price element and abort if it exceeds the budget."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_005",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Adding an item to cart without first setting mandatory variant options, triggering errors or adding an unintended default variant.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent clicks \u201cBuy Now\u201d immediately because the button is visible and enabled, overlooking required selections.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Before purchasing, validate that every required dropdown/radio option (size, color, length, pack count) has been explicitly selected."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_006",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Assuming all desired attributes (e.g., material, wash type) are present without reading the product description.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Agents may treat search filters as guarantees and skip verifying details on the product page.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Parse the bullet list or specifications section to confirm every non-variant attribute (material, care, outsole type) is actually listed."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_007",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Ignoring shipping costs or add-on pricing that push the total above the user\u2019s budget.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent monitors only the item price field and forgets additional fees displayed later in checkout.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Include a price-check step after adding to cart or at checkout that sums item cost, shipping, and taxes, then compare with budget."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_008",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Misinterpreting size labels (e.g., confusing '5X' with '5X-Large Tall' or regional shoe size systems).",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Websites present multiple size systems, and agents may pick the first matching number/string without context.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Match the full size token (including modifiers like 'Tall', 'Wide', or units) and prefer exact string matches over partial matches."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_009",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Skipping availability checks and attempting to purchase out-of-stock variants, leading to failure screens.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Agents often assume a listed option is purchasable without reading stock indicators or disabled buttons.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "After selecting each variant, verify that the 'Add to Cart/Buy Now' button remains enabled and that no 'Out of Stock' message appears."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_010",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Navigating back to the results page after configuring a product, causing loss of selected options and wasted steps.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent re-evaluates alternatives but forgets that UI state resets on navigation.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Cache the current page state or finish purchase before leaving; if further comparison is needed, open new tabs/windows instead of back navigation."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_011",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Clicking sponsored or irrelevant ads that match keywords loosely, diverting the workflow away from suitable products.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Some search result layouts give ads prominence, and agents may not distinguish them from organic results.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Detect ad/disclaimer labels (e.g., 'Sponsored') and prioritize organic listings that more reliably satisfy user constraints."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_012",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Applying mutually exclusive or contradictory filters (e.g., selecting both a specific size and a 'one-size' filter), yielding empty results.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent applies every stated constraint mechanically without understanding that some filters override or negate others.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Reason about filter compatibility: if a required variant is chosen on the product page, avoid redundant or conflicting global filters."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  ],
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "metadata": {
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "source": "generated from WebShop trajectories",
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "total_memories_analyzed": 200,
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "product_distribution": {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "apparel": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 65,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 55
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "footwear": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 17,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 7
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "home_decor": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 5,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 7
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "electronics": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 4,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 2
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "accessories": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 4,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 1
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "beauty_health": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 3,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 0
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "other": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 22,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 8
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  }
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+}

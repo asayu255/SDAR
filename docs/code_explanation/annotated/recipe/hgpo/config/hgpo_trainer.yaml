@@ -1,0 +1,63 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+hydra:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  searchpath:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    - file://verl/trainer/config
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+defaults:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  - ppo_trainer
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  - _self_
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+data:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  gen_batch_size: ${data.train_batch_size}
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+reward_model:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  reward_manager: episode
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  overlong_buffer:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enable: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    len: 0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    penalty_factor: 0.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    log: False
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+algorithm:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  hgpo:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    mode: "mean_std_norm"
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    weight_type: "length"
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    length_weight_alpha: 1.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    base_group: false
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  filter_groups:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    enable: False
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    metric: null
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_num_gen_batches: 0
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+trainer:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  project_name: verl-hgpo
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  val_out: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  val_only: False

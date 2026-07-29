@@ -1,0 +1,32 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+version: 2
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+build:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  os: ubuntu-22.04
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  tools:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    python: "3.11"
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    rust: "1.70"
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+sphinx:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  configuration: docs/conf.py
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+python:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  install:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    - requirements: docs/requirements-docs.txt
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    - method: pip
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      path: .

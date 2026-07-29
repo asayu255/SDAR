@@ -1,0 +1,225 @@
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+<h1 align="center">
+Self-Distilled Agentic Reinforcement Learning
+</h1>
+<div align='center' style="font-size:18px;">
+<p>
+    <a href="https://arxiv.org/abs/2605.15155">
+      <img src="https://img.shields.io/badge/Paper-arxiv%3A2605.15155-blue" alt="Paper"/>
+    </a>
+    <a href="https://huggingface.co/papers/2605.15155">
+      <img src="https://img.shields.io/badge/Daily%20Paper-huggingface-yellow" alt="HF Paper"/>
+    </a>
+  </p>
+</div>
+
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+## 🔥 Overview
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+We introduce **SDAR**, a Self-Distilled Agentic Reinforcement learning method.
+<div align="center" style="display:flex; justify-content:center; gap:20px; align-items:flex-start;">
+  <img src="docs/sdar/sdar_teaser.png" alt="motivation" style="width:40%;">
+  <img src="docs/sdar/sdart_method.png" alt="method" style="width:58%;">
+</div>
+
+
+
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+SDAR achieves substantial improvements over the standard RL baseline on ALFWorld, WebShop, and Search-QA.
+<div align="center">
+  <img src="docs/sdar/metric.png" alt="Logo" style="width:80%;">
+</div>
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+## 🗞️ News
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+- **`2026-5-15`**: 🔥 We released our paper and code.
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+## 🛠️ Installation
+
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+### Python environment
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+conda create -n skillzero python==3.12 -y
+conda activate skillzero
+
+pip3 install vllm==0.11.0
+
+pip3 install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+pip install -e .
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Log in to Weights & Biases if you use WandB logging (scripts pass `trainer.logger=['console','wandb']` in many cases):
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+export WANDB_API_KEY=your_key_here
+```
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+### Install Supported Environments
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+#### 1. ALFWorld
+Install with pip:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+pip3 install gymnasium==0.29.1
+pip3 install stable-baselines3==2.6.0
+pip3 install alfworld
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Download PDDL & Game files and pre-trained MaskRCNN detector (will be stored in `~/.cache/alfworld/`):
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+alfworld-download -f
+```
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+#### 2. WebShop
+WebShop requires Python <=3.10, so begin by creating a new environment:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+conda create -n verl-webshop python==3.10 -y
+conda activate verl-webshop
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Install WebShop:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+cd ./agent_system/environments/env_package/webshop/webshop
+./setup.sh -d all
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+After WebShop is installed, return to the root directory and install the verl package:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+cd repo_root/
+pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+pip3 install flash-attn==2.7.4.post1 --no-build-isolation
+pip3 install -e .
+pip3 install vllm==0.8.2
+# spacy 3.7.2 requires typer<0.10.0,>=0.3.0, but you have typer 0.15.2 which is incompatible.
+# weasel 0.3.4 requires typer<0.10.0,>=0.3.0, but you have typer 0.15.2 which is incompatible.
+```
+The warnings can be safely ignored.
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+#### 3. Search
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+cd ./agent_system/environments/env_package/search/third_party
+pip install -e .
+pip install gym==0.26.2
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Prepare dataset (data will be saved at `~/data/searchR1_processed_direct`):
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+cd repo_root/
+python examples/data_preprocess/preprocess_search_r1_dataset.py
+```
+
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Since faiss-gpu is not available via pip, we setup a separate conda environment for the local retrieval server. Running this server will use around 6GB of GPU memory per GPU, so make sure to account for this in your training run configuration. Build Retriever environments:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+# Create and activate the retriever environment with Python 3.10
+conda create -n retriever python=3.10 -y
+conda activate retriever
+
+# Install PyTorch (with GPU support) and related libraries
+conda install numpy==1.26.4 # needed to stop incompatible version of numpy from being installed via pip
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install other Python packages
+pip install transformers datasets pyserini huggingface_hub
+
+# Install the GPU version of faiss
+conda install faiss-gpu==1.8.0 -c pytorch -c nvidia -y
+
+# Install the API service framework
+pip install uvicorn fastapi
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Download the index:
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+conda activate retriever
+
+local_dir=~/data/searchR1
+python examples/search/searchr1_download.py --local_dir $local_dir
+cat $local_dir/part_* > $local_dir/e5_Flat.index
+gzip -d $local_dir/wiki-18.jsonl.gz
+```
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+Start the local flat e5 retrieval server: 
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+conda activate retriever
+
+# redirect the output to a file to avoid cluttering the terminal
+# we have observed outputting to the terminal causing spikes in server response times
+bash examples/search/retriever/retrieval_launch.sh > retrieval_server.log 
+```
+
+
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+### Training
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+All scripts live under `examples/` and assume the repo root as working directory. You can run e.g.:
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bash
+bash examples/sdar_trainer/run_alfworld_3b.sh
+bash examples/sdar_trainer/run_search_3b.sh
+bash examples/sdar_trainer/run_webshop_3b.sh
+```
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+### Merge checkpoints
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+See `scripts/model_merger.py` for FSDP/Megatron merge examples using paths under `./checkpoints/...`.
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+## ⭐️ Citation
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+If you find this project useful, welcome to cite us.
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+```bibtex
+@misc{lu2026sdar,
+      title={Self-Distilled Agentic Reinforcement Learning}, 
+      author={Zhengxi Lu and Zhiyuan Yao and Zhuowen Han and Zi-Han Wang and Jinyang Wu and Qi Gu and Xunliang Cai and Weiming Lu and Jun Xiao and Yueting Zhuang and Yongliang Shen},
+      year={2026},
+      eprint={2605.15155},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.15155}, 
+}
+```
+
+<!-- [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。 -->
+## 🤝 Acknowledgement
+
+<!-- [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。 -->
+This project builds on [verl-agent](https://github.com/langfengQ/verl-agent), [veRL](https://github.com/volcengine/verl), [ALFWorld](https://github.com/alfworld/alfworld), [SkillRL](https://github.com/aiming-lab/SkillRL), and [Search-R1](https://github.com/PeterGriffinJin/Search-R1). We thank the authors of those projects.

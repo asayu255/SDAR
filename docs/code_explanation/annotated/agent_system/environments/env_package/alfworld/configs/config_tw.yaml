@@ -1,0 +1,268 @@
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+dataset:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  data_path: '$ALFWORLD_DATA/json_2.1.1/train'
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  eval_id_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_seen'    # null/None to disable
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  eval_ood_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_unseen' # null/None to disable
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  num_train_games: -1                                          # max training games (<=0 indicates full dataset)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  num_eval_games: -1                                           # max evaluation games (<=0 indicates full dataset)
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+logic:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  domain: '$ALFWORLD_DATA/logic/alfred.pddl'                   # PDDL domain file that defines the world dynamics
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  grammar: '$ALFWORLD_DATA/logic/alfred.twl2'                  # Grammar file that defines the text feedbacks
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+env:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  type: 'AlfredTWEnv'                                          # 'AlfredTWEnv' or 'AlfredThorEnv' or 'AlfredHybrid'
+  # regen_game_files: False                                      # check if game is solvable by expert and save to game.tw-pddl file
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  domain_randomization: False                                  # shuffle Textworld print order and object id nums
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  task_types: [1, 2, 3, 4, 5, 6]                               # task-type ids: 1 - Pick & Place, 2 - Examine in Light, 3 - Clean & Place, 4 - Heat & Place, 5 - Cool & Place, 6 - Pick Two & Place
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  expert_timeout_steps: 150                                    # max steps before timeout for expert to solve the task
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  expert_type: "handcoded"                                     # 'handcoded' or 'planner'. Note: the planner is very slow for real-time use
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  goal_desc_human_anns_prob: 0.0                               # prob of using human-annotated goal language instead of templated goals (1.0 indicates all human annotations from ALFRED)
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  hybrid:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    start_eps: 100000                                          # starting episode of hybrid training, tw-only training upto this point
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    thor_prob: 0.5                                             # prob of AlfredThorEnv during hybrid training
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    eval_mode: "tw"                                            # 'tw' or 'thor' - env used for evaluation during hybrid training
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  thor:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    screen_width: 300                                          # width of THOR window
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    screen_height: 300                                         # height of THOR window
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    smooth_nav: False                                          # smooth rotations, looks, and translations during navigation (very slow)
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    save_frames_to_disk: False                                 # save frame PNGs to disk (useful for making videos)
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    save_frames_path: './videos/'                              # path to save frame PNGs
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+controller:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  type: 'oracle'                                               # 'oracle' or 'oracle_astar' or 'mrcnn' or 'mrcnn_astar' (aka BUTLER)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  debug: False
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  load_receps: True                                            # load receptacle locations from precomputed dict (if available)
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+mask_rcnn:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  pretrained_model_path: '$ALFWORLD_DATA/detectors/mrcnn.pth'
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+general:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  random_seed: 42
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_cuda: True                                               # disable this when running on machine without cuda
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  visdom: False                                                # plot training/eval curves, run with visdom server
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  task: 'alfred'
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  training_method: 'dagger'                                    # 'dqn' or 'dagger'
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  save_path: './training/'                                     # path to save pytorch models
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  observation_pool_capacity: 3                                 # k-size queue, 0 indicates no observation
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  hide_init_receptacles: False                                 # remove initial observation containing navigable receptacles
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  training:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    batch_size: 10
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_episode: 50000
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    smoothing_eps: 0.1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    optimizer:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      learning_rate: 0.001
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      clip_grad_norm: 5
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  evaluate:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    run_eval: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    batch_size: 10
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    env:
+      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+      type: "AlfredTWEnv"
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  checkpoint:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    report_frequency: 1000                                    # report every N episode
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    experiment_tag: 'test'                                    # name of experiment
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    load_pretrained: False                                    # during test, enable this so that the agent load your pretrained model
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    load_from_tag: 'not loading anything'                     # name of pre-trained model to load in save_path
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    encoder_layers: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    decoder_layers: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    encoder_conv_num: 5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    block_hidden_dim: 64
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    n_heads: 1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    dropout: 0.1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    block_dropout: 0.1
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    recurrent: True
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+rl:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  action_space: "admissible"                                  # 'admissible' (candidates from text engine) or 'generation' (seq2seq-style generation) or 'beam_search_choice' or 'exhaustive' (not working)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_target_length: 20                                       # max token length for seq2seq generation
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  beam_width: 10                                              # 1 means greedy
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  generate_top_k: 3
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  training:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_nb_steps_per_episode: 50                              # terminate after this many steps
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    learn_start_from_this_episode: 0                          # delay updates until this epsiode
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    target_net_update_frequency: 500                          # sync target net with online net per this many epochs
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  replay:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    accumulate_reward_from_final: True
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    count_reward_lambda: 0.0                                  # 0 to disable
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    novel_object_reward_lambda: 0.0                           # 0 to disable
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    discount_gamma_game_reward: 0.9
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    discount_gamma_count_reward: 0.5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    discount_gamma_novel_object_reward: 0.5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_memory_capacity: 500000                            # adjust this depending on your RAM size
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_memory_priority_fraction: 0.5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    update_per_k_game_steps: 5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_batch_size: 64
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    multi_step: 3
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_sample_history_length: 4
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_sample_update_from: 2
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  epsilon_greedy:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    noisy_net: False                                          # if this is true, then epsilon greedy is disabled
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    epsilon_anneal_episodes: 1000                             # -1 if not annealing
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    epsilon_anneal_from: 0.3
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    epsilon_anneal_to: 0.1
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+dagger:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  action_space: "generation"                                  # 'admissible' (candidates from text engine) or 'generation' (seq2seq-style generation) or 'exhaustive' (not working)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  max_target_length: 20                                       # max token length for seq2seq generation
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  beam_width: 10                                              # 1 means greedy
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  generate_top_k: 5
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  unstick_by_beam_search: False                               # use beam-search for failed actions, set True during evaluation
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  training:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    max_nb_steps_per_episode: 50                              # terminate after this many steps
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  fraction_assist:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_assist_anneal_episodes: 50000
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_assist_anneal_from: 1.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_assist_anneal_to: 0.01
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  fraction_random:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_random_anneal_episodes: 0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_random_anneal_from: 0.0
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    fraction_random_anneal_to: 0.0
+
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  replay:
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_memory_capacity: 500000
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    update_per_k_game_steps: 5
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_batch_size: 64
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_sample_history_length: 4
+    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+    replay_sample_update_from: 2
+
+# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+vision_dagger:
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  model_type: "resnet"                                        # 'resnet' (whole image features) or 'maskrcnn_whole' (whole image MaskRCNN feats) or 'maskrcnn' (top k MaskRCNN detection feats) or 'no_vision' (zero vision input)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  resnet_fc_dim: 64
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  maskrcnn_top_k_boxes: 10                                    # top k box features
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  use_exploration_frame_feats: False                          # append feats from initial exploration (memory intensive!)
+  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
+  sequence_aggregation_method: "average"                      # 'sum' or 'average' or 'rnn'

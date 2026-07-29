@@ -1,0 +1,11 @@
+# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
+This project includes code from the verl project.
+
+# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
+Copyright 2023-2024 Bytedance Ltd. and/or its affiliates 
+
+# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
+Additional modifications and contributions:
+
+# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
+Copyright 2025 Nanyang Technological University (NTU), Singapore and the verl-agent (GiGPO) team.

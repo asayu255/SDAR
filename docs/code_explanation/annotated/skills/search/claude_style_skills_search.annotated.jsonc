@@ -1,0 +1,568 @@
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+{
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "general_skills": [
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_001",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Decompose Then Search",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Break the question into minimal sub-questions (entities, attributes, relations) and handle each with its own query before synthesizing the final answer.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Any complex or multi-part question, especially multi-hop or comparative tasks."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_002",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Precision Query Crafting",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Compose searches with the exact entity name plus the sought attribute (e.g., \"<entity> release date\"), avoiding filler words to maximize relevant hits.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Initial query formulation for any fact lookup."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_003",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Iterative Query Refinement",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "If top results don\u2019t yield direct evidence, rephrase by adding qualifiers (dates, roles, context) or alternate names instead of repeating the same query.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After scanning first result set and finding no definitive evidence."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_004",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Source-Backed Assertions",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Only state an answer once the supporting evidence (reliable source snippet) has been located and read; refrain from guessing or summarizing from memory.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Before committing to a final answer, especially for contentious or less-known facts."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_005",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Cross-Check Multiple Sources",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Validate critical facts (dates, numbers, names) against at least two independent sources to avoid outdated or incorrect information.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "When the fact may have changed over time or when initial sources disagree."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_006",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Explicit Ambiguity Resolution",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Detect ambiguous entity mentions and disambiguate by adding clarifiers (e.g., occupation, year, nationality) in the query or by exploring disambiguation pages.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "When an entity name maps to multiple possible referents or results appear mixed."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_007",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Attribute-Chaining Search",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "For multi-hop tasks, first retrieve the intermediate entity (e.g., a film\u2019s director) then run a second targeted query for that entity\u2019s attribute (e.g., birthplace) before synthesizing.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Whenever the answer depends on an attribute of a related entity rather than the entity in the question."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_008",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Structured Comparison",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "When comparing entities (earlier/later, larger/smaller), collect each relevant value separately, list them side by side, then decide using explicit comparison logic.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Any comparative question involving dates, counts, or quantitative attributes."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_009",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Freshness Awareness",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "For time-sensitive queries (e.g., upcoming releases, current versions), include temporal cues like \"latest\", year, or \"release date 2023\" and prioritize most recent authoritative sources.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "Questions asking for \u201ccurrent\u201d, \u201cnext\u201d, or \u201clatest\u201d information."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "skill_id": "gen_010",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "title": "Exit When Evidence Is Solid",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "principle": "Stop issuing further queries once you have clear, corroborated evidence; conversely, avoid premature termination if no source explicitly supports an answer.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "when_to_apply": "After each read step\u2014decide to answer only if confidence is justified; otherwise refine search."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  ],
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "query_type_skills": {
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "direct_retrieval": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "dir_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Isolate Core Query",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Strip the question to its key entity + sought fact (who/what/when/where) and search exactly that pair first.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "At the start of any direct-retrieval task."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "dir_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Refine When Empty",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If first search yields weak/no hits, instantly reformulate using synonyms, alternate names, dates, or quoted phrases instead of repeating the same query.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After an initial search returns no clear answer or only tangential results."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "dir_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Anchor With Quotes",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "For song titles, quotes, episode names, etc., wrap the unique phrase in quotation marks to pull exact-match sources.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When the query contains distinctive phrases, lyrics, book/film titles, or direct quotations."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "dir_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Check Temporal Context",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Include recency cues (e.g., \"current\", year) in the search and verify publication date to avoid outdated or speculative info.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "For questions about 'current', 'latest', or future events/releases."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "dir_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Evidence-Bound Answer",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Only state an answer that is explicitly supported by the retrieved text; if unclear, continue searching rather than guess or hallucinate.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Before finalizing any factoid answer."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "multi_hop_reasoning": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "mul_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Decompose Question First",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Split the main query into explicit sub-questions to identify each entity and the specific attribute or relationship needed before searching.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Any multi-hop question that links two or more entities/facts (e.g., director\u2019s birthplace, album vs film comparisons)."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "mul_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Targeted Sequential Searches",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Issue separate, focused searches for each sub-question or entity instead of one broad query to gather precise intermediate facts.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After decomposition, when distinct pieces of information must be collected individually."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "mul_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Collect-Then-Compare",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Retrieve concrete values for all items involved (dates, places, relations) before performing any comparison or conclusion to avoid premature or unsupported answers.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Comparative tasks (earlier/later, older/younger, bigger/smaller, etc.)."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "mul_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Contextual Disambiguation",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Add clarifying descriptors (profession, year, medium, location) to queries to distinguish between entities with identical or similar names and prevent mixing facts.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Whenever an entity name is generic or shared by multiple subjects (e.g., common personal names, titles appearing in different media)."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "mul_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Iterative Query Refinement",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If initial search fails or returns ambiguous results, promptly rephrase using synonyms, alternate titles, or additional context instead of repeating the same query.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After a search yields no relevant results or conflicting information."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "entity_attribute_lookup": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ent_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Direct Attribute Query",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Include both the full entity name and target attribute (e.g., \"[Name] occupation\") in the first search to surface authoritative bios immediately.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Whenever the entity\u2019s full, unambiguous name is provided in the question."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ent_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Disambiguation Add-Ons",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If the name is common or ambiguous, append clarifiers (birth year, nationality, known work) to the query or scan result snippets for matching context before selecting a source.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When multiple people/characters share the same name or early results mix different entities."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ent_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Two-Source Cross-Check",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Confirm the attribute in at least two independent, reputable sources (e.g., Wikipedia infobox + biography site) to avoid hallucinations.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After the first plausible answer appears or when the attribute seems uncommon or uncertain."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ent_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Iterative Query Refinement",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If initial search returns irrelevant hits, adjust the query instead of repeating it\u2014use alternative spellings, middle initials, or related works/titles.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "When consecutive top results don\u2019t mention the sought attribute for the intended entity."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "ent_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Attribute-Only Response",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "State solely the requested attribute (e.g., \"architect\") in the final answer, omitting extra explanations to meet answer-format expectations.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After verifying the attribute and preparing the final output for an entity_attribute_lookup task."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ],
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "comparison": [
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "com_001",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Decompose & Isolate",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "First split the question into (a) each entity and (b) the single attribute to be compared; this ensures every subsequent search is targeted and comparable.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "At the moment you read any comparison-type question."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "com_002",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Parallel Attribute Lookup",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Independently retrieve the identical attribute for each entity\u2014run separate, attribute-focused searches (e.g., \"[Entity] headquarters\", \"[Entity] release date\") and store the raw values.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Immediately after identifying entities and the comparison attribute."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "com_003",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Normalize Before Comparing",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "Convert retrieved values to a common, directly comparable form (e.g., standardize dates, compute ages, map demonyms to countries) before judging equality or ordering.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "After gathering each entity\u2019s attribute but before drawing any conclusion."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "com_004",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Confirm or Escalate Ambiguity",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "If a search yields no clear or multiple results, refine the query with context (profession, year, language) or acknowledge data insufficiency\u2014never infer without evidence.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "Whenever an attribute lookup returns ambiguous, missing, or conflicting information."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "skill_id": "com_005",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "title": "Explicit Comparative Reasoning",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "principle": "State each normalized value and perform the logical comparison (equal, earlier, larger, etc.) explicitly to derive the answer, ensuring traceability and avoiding hallucination.",
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "when_to_apply": "As the final synthesis step before outputting the comparison result."
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    ]
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  },
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "common_mistakes": [
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_001",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Submitting the exact same query repeatedly despite poor results.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent lacks a fallback strategy and treats search as a black-box, hoping for a different outcome from identical input.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "After one or two unhelpful results, reformulate the query\u2014add distinctive keywords, synonyms, date filters, or entity qualifiers\u2014before querying again."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_002",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Issuing queries that are too broad or vague, leading to floods of irrelevant documents.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent does not translate the task\u2019s specific constraints (film title, year, occupation, etc.) into precise search terms.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Identify unique, discriminative keywords (full names, titles, date ranges) and include them plus context terms (e.g., \"occupation\", \"born\", \"director\") in the initial query."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_003",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Hallucinating answers without citing or locating supporting evidence.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Pressure to produce an answer quickly overrides the requirement to ground claims in retrieved content.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Adopt a strict rule: never output a fact unless a retrieved document snippet explicitly states it; quote or reference the source before answering."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_004",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Failing to resolve ambiguous entity names, resulting in mixing up multiple people/films/places.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent assumes the first matching result is correct without checking for multiple candidates with the same name.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Collect basic disambiguation attributes (dates, domains, middle names, context terms) from the question and ensure retrieved documents match these before accepting them."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_005",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Skipping necessary decomposition in multi-hop questions and trying to answer in one jump.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent does not break the task into sequential sub-questions, so it cannot chain evidence correctly.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Explicitly outline the required hops (e.g., identify director \u2192 get director\u2019s birthplace) and answer each sub-question with evidence before synthesizing the final answer."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_006",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Providing comparative or superlative judgments without retrieving both (all) required data points.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent finds one data point, guesses the comparison, and responds without confirming the other side(s).",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "For any comparison, fetch and list the relevant metrics (dates, ages, counts) for each entity, then compute/compare them explicitly in the reasoning step."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_007",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Misreading or misquoting retrieved documents, leading to incorrect conclusions.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Superficial scanning or pattern-matching errors cause the agent to lift unrelated facts that look similar.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Cross-check key details (names, dates, pronouns) within the snippet\u2019s full sentence, and, when in doubt, open additional sources to confirm consistency."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_008",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Relying on outdated or time-sensitive information for questions about current/future events.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent retrieves older pages without considering publication dates or official announcements.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Filter or sort results by recency, include year keywords (e.g., \"2024 release date\"), and verify with authoritative, up-to-date sources such as official sites or reputable news outlets."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_009",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Stopping the search after the first seemingly relevant snippet and not verifying completeness or accuracy.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Early-exit bias causes the agent to prefer minimal effort over thorough validation.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Adopt a policy of retrieving and examining at least two independent sources (or until conflicting data appears) before finalizing the answer."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_010",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Neglecting to use question context (e.g., dataset type, hint words like \"occupation\" or \"nationality\") when forming queries.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "Template-based querying ignores domain-specific cues embedded in the prompt.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Parse the question for relationship words (occupation, birthplace, nationality) and explicit entities, then craft queries that pair the entity with the exact attribute term."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    },
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "mistake_id": "err_011",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "description": "Answering without handling plural or list requests fully, leading to partial or incomplete answers (e.g., partial cast lists).",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "why_it_happens": "The agent stops after finding one or two examples instead of confirming the full scope required.",
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "how_to_avoid": "Detect when the question expects a list; iterate through multiple reliable sources to compile a comprehensive answer, and indicate if the list is partial when coverage is uncertain."
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  ],
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  "metadata": {
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "source": "generated from Search agent trajectories using o3",
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "total_memories_analyzed": 196,
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    "query_type_distribution": {
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "direct_retrieval": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 53,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 26
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "multi_hop_reasoning": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 58,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 29
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "entity_attribute_lookup": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 11,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 5
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      },
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      "comparison": {
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "success": 10,
+        // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+        "failure": 4
+      // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+      }
+    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+    }
+  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+  }
+// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
+}
