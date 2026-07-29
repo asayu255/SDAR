@@ -695,6 +695,11 @@ class DataParallelPPOActor(BasePPOActor):
                                         agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
                                     )
 
+                                if self.config.get("use_sft_loss", False):
+                                    task_metrics[f"actor/sft_loss/{task}"] = (
+                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    )
+
                                 append_to_dict(metrics, task_metrics)
 
                     data = {
