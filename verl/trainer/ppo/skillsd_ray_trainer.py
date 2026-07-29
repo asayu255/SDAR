@@ -109,26 +109,6 @@ class SkillSDRayTrainer(RLSDRayTrainer):
             coefs.append(float(coef_by_task.get(task, fallback)))
         return torch.tensor(coefs, dtype=torch.float32)
 
-    def _fast_forward_webshop_goal_iterator(self):
-        """Advance WebShop's training goal sampler to the resumed step.
-
-        The single-task WebShop loop resets the training environment exactly
-        once per completed global step. Replaying the same number of goal draws
-        after rebuilding the seeded environment makes the next reset select the
-        same goals as an uninterrupted run.
-        """
-        if self.global_steps <= 0 or "webshop" not in self.config.env.env_name.lower():
-            return
-
-        webshop_envs = self.envs.envs
-        for _ in range(self.global_steps):
-            webshop_envs._rng.choice(
-                webshop_envs.goal_idxs,
-                size=webshop_envs.env_num,
-                replace=False,
-            )
-        print(f"[WebShop] Fast-forwarded goal iterator by {self.global_steps} steps")
-
     def fit(self):
         """
         The training loop of SkillSD. Identical to RLSD except:
@@ -147,7 +127,7 @@ class SkillSDRayTrainer(RLSDRayTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
-        self._fast_forward_webshop_goal_iterator()
+        self._fast_forward_env_schedules()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()

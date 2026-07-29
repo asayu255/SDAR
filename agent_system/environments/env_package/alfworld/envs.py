@@ -79,8 +79,65 @@ class AlfworldWorker:
     def getobs(self):
         """Get current observation image"""
         image = get_obs_image(self.env)
-        image = image.cpu()  
+        image = image.cpu()
         return image
+
+    # TextWorld attribute names for the game-file cycle, most likely first.
+    _GAMEFILE_ITER_ATTRS = ('_gamefiles_iterator', 'gamefiles_iterator', '_gamefile_iterator')
+
+    def _find_game_iterator(self):
+        """Locate the object holding TextWorld's game-file cycle.
+
+        ``textworld.gym.make()`` returns the batch env directly today, but it may
+        be wrapped, so probe the env, its ``.unwrapped`` and the ``.env`` chain.
+        Returns ``(holder, attr_name)`` or ``(None, None)``.
+        """
+        candidates = []
+        current = self.env
+        for _ in range(8):
+            if current is None or any(current is seen for seen in candidates):
+                break
+            candidates.append(current)
+            current = getattr(current, 'env', None)
+        unwrapped = getattr(self.env, 'unwrapped', None)
+        if unwrapped is not None and not any(unwrapped is seen for seen in candidates):
+            candidates.append(unwrapped)
+
+        for holder in candidates:
+            for attr in self._GAMEFILE_ITER_ATTRS:
+                if getattr(holder, attr, None) is not None:
+                    return holder, attr
+        return None, None
+
+    def skip_games(self, num_resets: int) -> dict:
+        """Advance the game-file cycle by ``num_resets`` episodes, loading nothing.
+
+        Checkpoint resume support. ``TextworldBatchGymEnv.reset()`` pulls
+        ``batch_size`` game files off a seeded, shuffled cycle and only then loads
+        them; pulling from the generator alone is pure Python, while loading would
+        cost minutes across all workers.
+
+        Called with ``num_resets == 0`` this is a pure probe. Never raises: on any
+        problem it reports ``supported: False`` and leaves the iterator untouched.
+        """
+        holder, attr = self._find_game_iterator()
+        env_type = type(getattr(self.env, 'unwrapped', self.env)).__name__
+        if holder is None:
+            return {'supported': False, 'attr': None, 'skipped': 0,
+                    'batch_size': None, 'env_type': env_type}
+
+        batch_size = int(getattr(holder, 'batch_size', 1) or 1)
+        iterator = getattr(holder, attr)
+        skipped = 0
+        try:
+            for _ in range(max(0, int(num_resets)) * batch_size):
+                next(iterator)
+                skipped += 1
+        except (StopIteration, TypeError) as exc:
+            return {'supported': False, 'attr': attr, 'skipped': skipped,
+                    'batch_size': batch_size, 'env_type': env_type, 'error': repr(exc)}
+        return {'supported': True, 'attr': attr, 'skipped': skipped,
+                'batch_size': batch_size, 'env_type': env_type}
 
 class AlfworldEnvs(gym.Env):
     def __init__(self, alf_config_path, seed, env_num, group_n, resources_per_worker, is_train=True, env_kwargs={}):
@@ -172,6 +229,41 @@ class AlfworldEnvs(gym.Env):
             image_obs_list = None
 
         return text_obs_list, image_obs_list, info_list
+
+    def probe_game_iterator(self) -> dict:
+        """Zero-cost check on one worker that :py:meth:`fast_forward` will work here."""
+        return ray.get(self.workers[0].skip_games.remote(0))
+
+    def fast_forward(self, num_resets: int) -> str:
+        """Advance every worker's game-file cycle by ``num_resets`` episodes.
+
+        Checkpoint resume support: each worker holds a batch_size-1 TextWorld env
+        and :py:meth:`reset` resets all of them, so one manager reset consumes
+        exactly one game per worker. Replaying the resets the restart skipped
+        makes the next ``reset()`` hand out the games an uninterrupted run would.
+        """
+        if num_resets <= 0:
+            return 'skipped 0 games per worker'
+
+        results = ray.get([worker.skip_games.remote(num_resets) for worker in self.workers])
+
+        def _complete(result):
+            expected = int(num_resets) * int(result.get('batch_size') or 1)
+            return bool(result.get('supported')) and result.get('skipped') == expected
+
+        bad = [r for r in results if not _complete(r)]
+        if bad:
+            return (
+                f'WARNING fast-forward INCOMPLETE - only {len(results) - len(bad)}/{len(results)} '
+                f'workers advanced (sample={bad[0]}). TextWorld\'s game-file iterator was not '
+                f'found or was exhausted, so the resumed run replays games from the start of the '
+                f'cycle instead of continuing the uninterrupted sequence. Training itself is '
+                f'unaffected; only which games are seen differs.'
+            )
+        return (
+            f'skipped {int(num_resets) * int(results[0].get("batch_size") or 1)} games on each of '
+            f'{len(results)} workers (attr={sorted({r["attr"] for r in results})})'
+        )
 
     def getobs(self):
         """
