@@ -11,7 +11,7 @@
 - blocked count: 0
 - needs-review count: 0
 - last validation: source preservation/coverage 100%、Python 425、Shell 149、YAML 46、TOML 1、Markdown 95 passed、baseline regressionなし
-- last commit SHA: `485d17b`
+- last validated content commit SHA: `18f3f58`
 
 ## 安全確認記録
 
