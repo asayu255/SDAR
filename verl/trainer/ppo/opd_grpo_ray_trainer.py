@@ -29,6 +29,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_data_metrics_by_task,
     compute_throughout_metrics,
     compute_timing_metrics,
 )
@@ -209,8 +210,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        metrics["actor/entropy_loss"] = entropy_loss.detach().item()
+                        metrics.update(self._entropy_loss_metrics(batch, entropys, response_masks, loss_agg_mode))
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
@@ -261,6 +261,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
                         self.compute_teacher_log_probs(batch)
 
+                    # tag rows with their task so the actor can split its metrics
+                    self._attach_task_ids(batch)
+
                     with _timer("update_actor", timing_raw):
                         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
@@ -299,6 +302,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     "training/epoch": epoch,
                 })
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics_by_task(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
