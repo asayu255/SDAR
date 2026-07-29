@@ -12,30 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import math
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import pytest
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from verl.utils.flops_counter import FlopsCounter
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 VALID_CONFIG_TYPE = {"llama", "qwen2", "qwen3", "qwen3_moe", "deepseek_v3"}
 
 
-# [EXPLAIN] `Config` として状態と関連処理をまとめ、worker・trainer・dataset などの責務境界を定義する。
 class Config:
-    # [EXPLAIN] `__init__` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def __init__(self, config_dict):
-        # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
         for key, value in config_dict.items():
-            # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
             setattr(self, key, value)
 
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 CONFIG = {
     "llama": {
         "config": {  # llama2-7B
@@ -133,25 +124,16 @@ CONFIG = {
 }
 
 
-# [EXPLAIN] 直後の定義へ decorator を適用し、呼び出し規約または実行時属性を付与する。
 @pytest.mark.parametrize(
     "config_type",
     ["llama", "qwen2", "qwen3", "qwen3_moe", "deepseek_v3"],
 )
-# [EXPLAIN] `test_flops_counter` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def test_flops_counter(config_type: str):
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     test_config = CONFIG[config_type]
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     config = Config(test_config["config"])
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     flops_counter = FlopsCounter(config)
-    # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
     for batch_seqlens, expected_flops in zip(test_config["batch_seqlens_tuple"], test_config["expected_flops_tuple"]):
         # set delta time to 1 to get the flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         counted_flops, _ = flops_counter.estimate_flops(batch_seqlens, 1)
-        # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
         print(f"Expect flops for {test_config['config']} is {expected_flops}, but get {counted_flops}")
-        # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
         assert math.isclose(counted_flops, expected_flops), f"Expect flops for {test_config['config']} is {expected_flops}, but get {counted_flops}"

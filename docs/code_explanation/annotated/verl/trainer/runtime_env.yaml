@@ -1,10 +1,6 @@
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 working_dir: ./
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 excludes: ["/.git/"]
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 env_vars:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
   # VLLM_ATTENTION_BACKEND: "XFORMERS"

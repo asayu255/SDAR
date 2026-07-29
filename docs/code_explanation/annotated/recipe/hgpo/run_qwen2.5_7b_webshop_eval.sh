@@ -1,93 +1,58 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=vllm
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 ulimit -u 65536
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export VLLM_ATTENTION_BACKEND=XFORMERS
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HF_HOME=${HF_HOME} # hugging face home directory
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=${WANDB_API_KEY} # wandb api key
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_DIR=${WANDB_DIR} # wandb directory
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} # cuda visible devices
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1  # The CPU resource allocated for each environment worker.
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 seeds=(123 456 789)  # three random seeds for evaluation
 
 # multiple eval experiment names
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 eval_experiment_names=(
     # example: "k2_hgpo_length_step30_alpha1.0"
     # example: "k4_hgpo_length_step30_alpha1.0"
 )
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CHECKPOINTS_DIR=${CHECKPOINTS_DIR} # checkpoints directory
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 step_length=30
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 mode="mean_norm" 
 
 # We only use data preparation to indicate the modality and the data size. to indicate the modality and the data size.
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
     --val_data_size $val_data_size
 
 # loop: first by experiment name, then by seed
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 for eval_experiment_name in "${eval_experiment_names[@]}"; do
     # parse number after k in experiment name as history_length (e.g. k6->6, k4->4), default 2 if not found
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     history_length=$(echo "$eval_experiment_name" | sed -n 's/.*k\([0-9]\+\).*/\1/p')
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     history_length=${history_length:-2}
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     echo "history_length: $history_length"
 
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     eval_dir="${CHECKPOINTS_DIR}/qwen2.5_7b_webshop_train/${eval_experiment_name}"
     # checkpoint directory exists in eval_dir
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     if [ ! -d "$eval_dir" ]; then
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         echo "Error: checkpoint directory does not exist: $eval_dir, skip."
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         continue
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     fi
 
     # create log directory
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     log_dir="logs/${eval_dir}"
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     mkdir -p "$log_dir"
 
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     for seed in "${seeds[@]}"; do
-        # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
         echo "=========================================="
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         echo "Running experiment: $eval_experiment_name, seed: $seed"
-        # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
         echo "=========================================="
 
-        # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
         temp_log="${log_dir}/output_seed${seed}.log"
 
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         python3 -m verl.trainer.main_ppo \
         algorithm.adv_estimator=hgpo \
         data.train_files=$HOME/data/verl-agent/text/train.parquet \
@@ -143,11 +108,7 @@ for eval_experiment_name in "${eval_experiment_names[@]}"; do
         trainer.default_local_dir=$eval_dir \
         trainer.val_only=True \
         trainer.val_before_train=True $@ 2>&1 | tee "$temp_log"
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         echo "Completed: $eval_experiment_name, seed: $seed"
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         echo ""
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     done
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 done

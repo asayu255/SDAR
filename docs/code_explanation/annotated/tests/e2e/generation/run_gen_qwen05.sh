@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # Tested with 1 & 4 GPUs
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 OUTPUT_PATH=${OUTPUT_PATH:-$HOME/data/gen/qwen_05_gen_test.parquet}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 GEN_TP=${GEN_TP:-2}  # Default tensor parallel size to 2
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_generation \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \

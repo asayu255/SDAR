@@ -1,25 +1,17 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
 # in e2e_sppo.yml, we set NUM_GPUS=8 L20
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NUM_GPUS=${NUM_GPUS:-8}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_train_path=./data/math/train.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_test_path=./data/math/test.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_files="['$gsm8k_train_path']"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 test_files="['$gsm8k_test_path']"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 exp_name="Qwen2.5-0.5B-Instruct-sppo-minimal"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.sppo.main_sppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \

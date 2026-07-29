@@ -1,39 +1,26 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1
 
 # OPSD hyperparameters (SDAR without GRPO loss)
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 sdar_coef=0.01
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gate_beta=5.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 skill_all=false
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 experiment_name="opsd_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=your_key_here
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
     --val_data_size $val_data_size
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_sdar \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \

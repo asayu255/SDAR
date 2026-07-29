@@ -13,13 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from megatron.core.optimizer import OptimizerConfig
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from megatron.core.optimizer import get_megatron_optimizer as get_megatron_optimizer_native
 
 
-# [EXPLAIN] `get_megatron_optimizer` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_megatron_optimizer(
     model,
     config: OptimizerConfig,
@@ -28,7 +25,6 @@ def get_megatron_optimizer(
     lr_mult=1.0,
 ):
     # Base optimizer.
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return get_megatron_optimizer_native(
         config=config,
         model_chunks=model,

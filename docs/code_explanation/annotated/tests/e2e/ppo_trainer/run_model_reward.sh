@@ -1,66 +1,40 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NUM_GPUS=${NUM_GPUS:-8}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TRAIN_FILES=${TRAIN_FILES:-$HOME/data/gsm8k/train.parquet}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_FILES=${VAL_FILES:-$HOME/data/gsm8k/test.parquet}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 RM_PAD=${RM_PAD:-True}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SP_SIZE=${SP_SIZE:-1}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SEQ_BALANCE=${SEQ_BALANCE:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 LIGER=${LIGER:-False}
 # Validation
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TEST_FREQ=${TEST_FREQ:--1}
 # Save & Resume
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 RESUME_MODE=${RESUME_MODE:-disable}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SAVE_FREQ=${SAVE_FREQ:--1}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-1}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz_per_gpu=2 # b
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 n_resp_per_prompt=4 # g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * NUM_GPUS)) # b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_mini_bsz=$((train_traj_micro_bsz * 2)) # 2 * b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_mini_bsz=$((train_traj_mini_bsz * n_resp_per_prompt)) # 2 * b * n / g
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_bsz=$((train_prompt_mini_bsz * 2)) # 4 * b * n / g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_max_token_num_per_gpu=32768
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 infer_max_token_num_per_gpu=32768
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 exp_name="$(basename "${MODEL_ID,,}")-model-reward-minimal"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
     data.train_files="${TRAIN_FILES}" \

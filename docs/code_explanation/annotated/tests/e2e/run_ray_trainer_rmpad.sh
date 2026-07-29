@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -e -x
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download Qwen/Qwen2.5-0.5B --local-dir $HOME/models/Qwen/Qwen2.5-0.5B
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 tests/e2e/arithmetic_sequence/rl/main_trainer.py \
     algorithm.adv_estimator=gae \
     data.train_files=tests/e2e/arithmetic_sequence/data/train.parquet \

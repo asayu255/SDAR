@@ -1,119 +1,74 @@
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 PROMPTS_search = {
 "contextual_description": """
 You are an expert **RAG Abstraction Engine** for an autonomous agent memory system.
 Your objective is to generate a **single-paragraph** "contextual_description" that describes the task and the resolution process.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Requirements:**
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Write ONE plain-text paragraph (no bullet points, no lists, no markdown).
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Include the task type and what the agent did to solve it.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Explicitly state whether it succeeded or failed, and briefly why.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Keep it concise (1-3 sentences).
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Input Data Analysis:**
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Analyze the `Raw Trajectory` to understand how the agent gathered information.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * Identify if it's a "Multi-hop reasoning" or "Direct retrieval" task.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Output Format:**
 Return ONLY the paragraph string.
 """,
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 "refined_trajectory": """
 You are an expert **Trajectory Refinement & Abstraction Engine** using a **"Backward Causal Chaining"** algorithm.
 Your goal is to extract the minimal `refined_trajectory` from a raw search log AND **generalize** the content.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Phase 1: The Refinement Algorithm (For Search Tasks)**
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1.  **Identify the Answer:** Find the step where the final `<answer>` was generated.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2.  **Trace Dependencies:** Look backward. Which specific `<search>` queries provided the information used in the final answer?
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 3.  **Filter Noise:** Remove search queries that returned "No result" or returned information NOT used in the final reasoning.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Phase 2: The Abstraction Layer (Generalization Rules)**
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1.  **Query Abstraction:**
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * **NEVER** keep specific entity names if they can be generalized to a category.
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * *Example:* "Michael Strahan career" -> "Search for [Person] career history".
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * *Example:* "iphone 13 price" -> "Search for [Product] price".
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * **Keep Templates:** The output should look like a reusable plan template.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2.  **Observation Abstraction (Crucial):**
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * Since specific observation text might be long, summarize the *type* of information found.
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * *Example:* "Found career dates and team list" instead of copying the full text.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Output Structure:**
 Output a JSON list `refined_trajectory`.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * `step_index`: The original step index.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * `action`: The **GENERALIZED** search query or reasoning step.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * `critical_observation`: Abstracted summary of what was found.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 * `reasoning`: Why this step was necessary.
 Output ONLY the JSON object.
 """,
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 "strategic_guidelines": """
 You are an expert **Strategic Analyst** for a Search/QA Agent.
 Your goal is to extract high-level `strategic_guidelines` from a trajectory.
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Input Analysis:** Check the `Outcome` of the trajectory.
 
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 ### **CASE 1: If Outcome is SUCCESS**
 Focus on **Search Patterns**.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1.  **`planning_pattern`:**
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * Abstract the logic flow into a chain.
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * *Example:* `Decompose Question -> Search Entity A -> Search Entity B -> Synthesize`.
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * Use generic terms: `[Entity]`, `[Attribute]`, `[Time_Period]`.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2.  **`mistakes_to_avoid`:** Leave empty `[]`.
 
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 ### **CASE 2: If Outcome is FAILURE**
 Focus on **Query/Reasoning Errors**.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1.  **`planning_pattern`:** Set to `null`.
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2.  **`mistakes_to_avoid`:**
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * Identify the **Root Cause**.
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * `trigger_condition`: What kind of question or state caused the error? (e.g., "Ambiguous entity name", "Search loop").
-    # [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     * `bad_action`: What did the agent do wrong? (e.g., "Repeated same query", "Hallucinated answer without evidence").
 
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Output Structure (JSON):**
-# [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ```json
 {
   "strategic_guidelines": {

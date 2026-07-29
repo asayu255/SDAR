@@ -1,53 +1,32 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export VLLM_ATTENTION_BACKEND=XFORMERS
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HF_HOME=${HF_HOME} # hugging face home directory
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=${WANDB_API_KEY} # wandb api key
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_DIR=${WANDB_DIR} # wandb directory
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} # cuda visible devices
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 project_name="qwen2.5_7b_alfworld_train"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 history_length=2 # history length 2 or 4
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8    
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 weight_type="length"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 length_weight_alpha=1.0  # weight is L^alpha, alpha=0 is uniform weight
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 base_group=False  # add episode_advantages as initial group to aggregate weight computation
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 experiment_name="k${history_length}_hgpo_${weight_type}_alpha${length_weight_alpha}_baseGroup_${base_group}"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CHECKPOINTS_DIR=${CHECKPOINTS_DIR} # checkpoints directory
 
 # We only use data preparation to indicate the modality and the data size.
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
     --val_data_size $val_data_size
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator='hgpo' \
     algorithm.hgpo.weight_type=$weight_type \

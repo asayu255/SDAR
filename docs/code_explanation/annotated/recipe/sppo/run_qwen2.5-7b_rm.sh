@@ -1,5 +1,4 @@
 # Discliamer: the model used in the script is only for academic purpose.
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
 # Data preparation scripts are available in ``examples/data_preprocess``.
@@ -8,24 +7,17 @@ set -x
 #   python3 examples/data_preprocess/math_dataset.py --local_dir ~/data/math
 #   python3 examples/data_preprocess/gsm8k.py --local_dir ~/data/gsm8k
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_train_path=$HOME/data/math/train.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_test_path=$HOME/data/math/test.parquet
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_files="['$gsm8k_train_path']"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 test_files="['$gsm8k_test_path']"
 
 # prepare model ckpt
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir $HOME/models/Qwen2.5-7B-Instruct &
 # huggingface-cli download sfairXC/FsfairX-LLaMA3-RM-v0.1 --local-dir $HOME/models/FsfairX-LLaMA3-RM-v0.1 &
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 wait
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.sppo.main_sppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \

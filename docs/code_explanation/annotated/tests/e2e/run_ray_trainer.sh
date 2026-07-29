@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -e -x
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 OUTPUT_FILE="/tmp/output_ray_trainer.txt"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export PATH=$PATH:~/.local/bin
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 rm -rf $OUTPUT_FILE
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 tests/e2e/arithmetic_sequence/rl/main_trainer.py \
     algorithm.adv_estimator=gae \
     data.train_files=tests/e2e/arithmetic_sequence/data/train.parquet \
@@ -41,7 +36,5 @@ python3 tests/e2e/arithmetic_sequence/rl/main_trainer.py \
     trainer.test_freq=1 \
     trainer.save_freq=110 | tee $OUTPUT_FILE;
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 python3 tests/e2e/check_results.py --output_file=$OUTPUT_FILE
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 rm -rf $OUTPUT_FILE

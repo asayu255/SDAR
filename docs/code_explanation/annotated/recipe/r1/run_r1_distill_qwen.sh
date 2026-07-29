@@ -1,16 +1,12 @@
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_PATH=Qwen/DeepSeek-R1-Distill-Qwen-1.5B
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 DATA_PATH=/workspace/datasets/r1_bench
 
 # Eval Data Process
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.r1.data_process \
     --local_dir $DATA_PATH \
     --tasks all
 
 # Generation
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_generation \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \
@@ -29,7 +25,6 @@ python3 -m verl.trainer.main_generation \
     rollout.max_num_batched_tokens=65536
 
 # Evaluation
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.r1.main_eval \
     data.path=$DATA_PATH/test-output-8.parquet \
     data.prompt_key=prompt \

@@ -1,15 +1,9 @@
 ## Enabled the dependabot to check the dependencies of the project
 ## Dependabot will open pull requests to update dependencies automatically
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 version: 2
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 updates:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   - package-ecosystem: pip
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     directory: "/"
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     schedule:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       interval: weekly

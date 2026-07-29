@@ -1,64 +1,38 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
 # Clean up stale Ray processes and GPU memory before starting
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 ray stop --force 2>/dev/null
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 pkill -f "ray::" 2>/dev/null
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 pkill -f "WebshopWorker" 2>/dev/null
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 pkill -f "verl.trainer.main_ppo" 2>/dev/null
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 sleep 2
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 source $(conda info --base)/etc/profile.d/conda.sh
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 conda activate verl-agent-webshop
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export JAVA_HOME=verl-agent-webshop
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export PATH=$JAVA_HOME/bin:$PATH
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export _JAVA_OPTIONS="-XX:+UseSerialGC -Xss512k -Xmx1g"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export OPENBLAS_NUM_THREADS=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export MKL_NUM_THREADS=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export OMP_NUM_THREADS=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export DATASETS_MAX_WORKERS=1
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 ulimit -u 65536
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export http_proxy=http://10.217.142.137:8080
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export https_proxy=http://10.217.142.137:8080
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=your_key_here
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
     --val_data_size $val_data_size
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \

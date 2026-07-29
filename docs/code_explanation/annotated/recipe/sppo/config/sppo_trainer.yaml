@@ -1,50 +1,28 @@
 # the sppo config will override default ppo_trainer.yaml
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 hydra:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   searchpath:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     - file://verl/trainer/config
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 defaults:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   - ppo_trainer
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   - _self_
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 actor_rollout_ref:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   actor:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     sppo_eta: 1.0
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     optim:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       lr_warmup_steps: 15
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   rollout:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     name: sglang
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     tensor_model_parallel_size: 2
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     gpu_memory_utilization: 0.5
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     val_kwargs:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       n: 2  # 2 will trigger validation, 1 will bypass
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 algorithm:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   adv_estimator: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   sppo_eta: 1.0
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 trainer:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   log_val_generations: 0

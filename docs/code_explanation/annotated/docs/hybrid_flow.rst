@@ -1,26 +1,18 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 =========================================================
 HybridFlow Programming Guide
 =========================================================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. _vermouth: https://github.com/vermouth1992
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Author: `Chi Zhang <https://github.com/vermouth1992>`_
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 verl is an open source implementation of the paper `HybridFlow <https://arxiv.org/abs/2409.19256v2>`_ [1]_. In this section, we will introduce the basic concepts of HybridFlow, the motivation and how to program with verl APIs.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Motivation and Design
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ------------------------
 We use dataflow to represent RL systems. [4]_.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 DataFlow
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~
 
 Dataflow is an abstraction of computations. Neural Network training is a typical dataflow. It can be represented by computational graph. 
@@ -58,49 +50,33 @@ Design Choices
 ~~~~~~~~~~~~~~~~~~~~
 The model size used in DRL before the LLM era is typically small. Thus, the high-level neural network computation can be done in a single process. This enables embedding the computation flow inside the control flow as a single process.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 However, in the LLM era, the computation flow (e.g., training neural network) becomes a multi-process program. This naturally leads to two design choices:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. Convert the control flow into a multi-process program as well. Then colocate with computation flow (unified multi-controller)
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Advantages:
 
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - Achieves the **optimal performance** under fixed computation flow and control flow as the communication overhead in both training and data transfer is minimized.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Disadvantages:
 
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - The computation and/or control flow is **hard to reuse** from software perspective as computation code is coupled with specific controller code. For example, the training loop of PPO is generic. Say we have an PPO training flow implemented with a specific computation flow such as FSDP. Neither the control flow or computation flow can be reused if we want to switch the computation flow from FSDP to Megatron, due to the coupling of control and computation flows.
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - Requires more efforts from the user under flexible and dynamic control flows, due to the multi-process nature of the program.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Separate the flows: single process for the control flow and multi-process for computation flow
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Advantages:
 
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - The computation flow defined elsewhere can be **easily reused** after the decoupling.
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - The controller runs on a single process. Implementing a new RL algorithm with a **different control flow is simple and easy**.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Disadvantages:
 
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - Additional **data communication overhead** each time the controller process and computatation processes interact. The data has to be sent back and forth.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In verl, the latter strategy with separate control flow and computation flow is adopted. verl is designed to decouple the control flow of RL algorithms, and the implementation of computation engines.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Overall Execution Diagram
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Below is a simplified diagram denoting the execution of a reinforcement learning job. In the diagram, the controller runs on a single process, while the generator/actor workers, critic workers run on multiple processes, placed with specific resource groups. For rollout, the controller passes the data to the generator to perform sample generation. When the rollout is done, the data is passed back to controller for the next step of the algorithm. Similar execution is done for other workers. With the hybrid controller design, the data flow and computation is decoupled to provide both efficiency in computation and flexiblity in defining algorithm training loops.
@@ -115,16 +91,12 @@ Entry function
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Code: https://github.com/volcengine/verl/blob/main/verl/trainer/main_ppo.py
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In this file, we define a remote function `main_task` that serves as the controller (driver) process as shown in the above figure. We also define a ``RewardManager``, where users can customize their reward function based on the data source in the dataset. Note that `RewardManager` should return the final token-level reward that is optimized by RL algorithms. Note that users can combine model-based rewards and rule-based rewards.
 The ``main_task`` constructs a RayPPOTrainer instance and launch the fit. Note that ``main_task`` **runs as a single process**.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We highly recommend that the ``main_task`` is NOT scheduled on the head of the ray cluster because ``main_task`` will consume a lot of memory but the head usually contains very few resources.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Ray trainer
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~
 Code: https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/ray_trainer.py
 
@@ -138,26 +110,18 @@ Note that, the fit function of RayPPOTrainer **runs as a single process**.
 Worker and WorkerGroup construction
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Each workerGroup manages a list of workers that runs remotely. Note that the worker group runs in the process of its construtor.
 Each worker inside the WorkerGroup runs on a GPU. The worker group serves as a proxy for the controller process to interact with a list of workers, in order to perform certain computations. **In order to do so, we have to bind the methods of the worker into the method of the WorkerGroup and define the data dispatch and data collection**. This is done via simple decoration that will be introduced in the Worker definition section.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 For example, in PPO, we define 3 worker groups:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ActorRolloutRef: manages actor, rollout and reference policy. ActorRolloutRefWorker can be instantiated as a single actor, a single rollout, a single reference policy, a combined actor/rollout or a combined actor/rollout/ref. This design is aimed for the maximum code reuse in various scenarios. The reason for colocating actor and rollout is for fast weight transfer using nccl. The reason for coloating actor and reference is to implement an efficient lora PPO as the reference policy is simply the base model of PPO in lora.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Critic: manages the critic model
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - Reward: manages the reward model
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 The worker group will be constructed on the resource pool it designates. The resource pool is a set of GPUs in the ray cluster.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Worker definition
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~
 
 .. _ActorRolloutRefWorker: https://github.com/volcengine/verl/blob/main/verl/workers/fsdp_workers.py
@@ -215,17 +179,14 @@ PPO main loop
 ~~~~~~~~~~~~~~~~~~~~
 With the aforementioned APIs, we can implement the main loop of PPO as if it is a single process program
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    for prompt in dataloader:
        output = actor_rollout_ref_wg.generate_sequences(prompt)
        old_log_prob = actor_rollout_ref_wg.compute_log_prob(output)
        ref_log_prob = actor_rollout_ref_wg.compute_ref_log_prob(output)
        values = critic_wg.compute_values(output)
        rewards = reward_wg.compute_scores(output)
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # compute_advantages is running directly on the control process
        advantages = compute_advantages(values, rewards)
        output = output.union(old_log_prob)
@@ -233,14 +194,11 @@ With the aforementioned APIs, we can implement the main loop of PPO as if it is 
        output = output.union(values)
        output = output.union(rewards)
        output = output.union(advantages)
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # update actor
        actor_rollout_ref_wg.update_actor(output)
        critic.update_critic(output)
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Takeaways
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~
 - This programming paradigm enables users to use different computation backend without modification of the control process.
 - This programming paradigm enables flexible placement (by changing the mapping of WorkerGroup and ResourcePool) without modification of the control process.

@@ -1,30 +1,15 @@
-// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
 {
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   "skill_files": {
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "general_skills": "general_skills.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "direct_retrieval": "direct_retrieval.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "multi_hop_reasoning": "multi_hop_reasoning.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "entity_attribute_lookup": "entity_attribute_lookup.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "compare": "compare.md"
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   },
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   "task_to_skill": {
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "direct_retrieval": "direct_retrieval",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "multi_hop_reasoning": "multi_hop_reasoning",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "entity_attribute_lookup": "entity_attribute_lookup",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "compare": "compare"
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   }
-// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
 }

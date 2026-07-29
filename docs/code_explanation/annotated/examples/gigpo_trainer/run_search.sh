@@ -1,30 +1,19 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=256
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=512
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=5
 
 # GiGPO config
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_similarity=True # enable similarity-based GiGPO
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 similarity_thresh=0.9 # similarity threshold for GiGPO
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gigpo \
     data.train_files=$TRAIN_DATA \

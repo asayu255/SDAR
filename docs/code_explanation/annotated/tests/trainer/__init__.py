@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
 """
 Tests for the trainer module.
 """

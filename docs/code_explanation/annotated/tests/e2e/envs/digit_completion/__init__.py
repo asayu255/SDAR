@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from transformers import AutoTokenizer, LlamaConfig
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .task import DigitCompletion, generate_ground_truth_response
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .tokenizer import CharTokenizer
 
-# [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
 AutoTokenizer.register(LlamaConfig, CharTokenizer, exist_ok=True)
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 __all__ = ["DigitCompletion", "generate_ground_truth_response", "CharTokenizer"]

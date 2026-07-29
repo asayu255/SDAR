@@ -1,14 +1,9 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 data_path=$HOME/data/rlhf/gsm8k/test.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 save_path=$HOME/data/rlhf/math/deepseek_v2_lite_gen_test.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 model_path=deepseek-ai/deepseek-llm-7b-chat
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_generation \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \

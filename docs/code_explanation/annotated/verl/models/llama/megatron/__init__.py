@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .modeling_llama_megatron import (
     ParallelLlamaForCausalLM,
     # rmpad with megatron
@@ -25,7 +24,6 @@ from .modeling_llama_megatron import (
     ParallelLlamaModel,
 )
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 __all__ = [
     "ParallelLlamaForCausalLM",
     "ParallelLlamaForCausalLMRmPad",

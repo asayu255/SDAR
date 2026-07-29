@@ -1,16 +1,8 @@
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 repos:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     rev: "v0.11.4"
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     hooks:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - id: ruff
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         args: ["--fix", "--show-fixes", "--output-format=full"]
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         exclude: ^.*\.(ipynb)$
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - id: ruff-format

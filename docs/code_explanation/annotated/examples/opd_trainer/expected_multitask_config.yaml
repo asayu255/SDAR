@@ -18,154 +18,87 @@
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
 # ---- distillation loss (the knob that caused the original low_var_kl mishap) --
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.kl_loss_type": topk_kl
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.kl_loss_coef": 1.0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.topk": 20
 # effective values after main_opd's injection into the actor config
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 
 # ---- pure-distillation invariants (no other signal enters the loss) -----------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.adv_estimator": grpo
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.use_kl_in_reward": false
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.pg_loss_coef": 0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.use_kl_loss": false
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.entropy_coeff": 0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.use_sdl_loss": false
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.use_sdar_loss": false
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.use_invalid_action_penalty": true
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   alfworld: 0.1
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   search: 0.01
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   webshop: 0.1
 
 # ---- teachers -------------------------------------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.teacher_paths.alfworld": /opt/home/ohara/checkpoints/teachers/alfworld_step300
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.teacher_paths.search": /opt/home/ohara/checkpoints/teachers/search_step300
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "algorithm.opd.teacher_paths.webshop": /opt/home/ohara/checkpoints/teachers/webshop_step300
 
 # ---- model / optimization -------------------------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.optim.lr": 1.0e-6
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.actor.ppo_mini_batch_size": 60
 
 # ---- data -----------------------------------------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.train_batch_size": 45
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.val_batch_size": 126
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.seed": 1
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.max_prompt_length": 4096
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.max_response_length": 512
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.truncation": left
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_balance.enable": true
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_balance.per_task_batch_size": 15
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_balance.num_batches": 300
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_balance.tasks": [alfworld, search, webshop]
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.alfworld.max_prompt_length": 2048
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.alfworld.truncation": error
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.search.max_prompt_length": 4096
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.search.truncation": left
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.webshop.max_prompt_length": 4096
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.task_overrides.webshop.truncation": error
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "data.apply_chat_template_kwargs.enable_thinking": false
 
 # ---- environment ------------------------------------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.env_name": multitask
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.seed": 1
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.max_steps": 50
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.history_length": 4
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.rollout.n": 8
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.tasks": [alfworld, search, webshop]
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.max_steps.alfworld": 50
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.max_steps.search": 4
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.max_steps.webshop": 15
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.history_length.alfworld": 2
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.history_length.search": 4
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.history_length.webshop": 2
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "env.multitask.val_per_task_batch_size": 126
 
 # ---- rollout sampling / validation protocol ----------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.temperature": 1.0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
 
 # ---- run identity ------------------------------------------------------------------
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "trainer.total_training_steps": 300
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "trainer.project_name": verl_agent_opd_multitask
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
 # name for a different config) requires touching this file next to the knobs.
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 "trainer.experiment_name": opd_multitask_qwen3_1.7b

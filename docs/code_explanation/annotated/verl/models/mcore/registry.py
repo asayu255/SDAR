@@ -12,22 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
 """
 Registry module for model architecture components.
 """
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from enum import Enum
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from typing import Callable
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import torch
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import torch.nn as nn
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .config_converter import (
     PretrainedConfig,
     TransformerConfig,
@@ -39,11 +33,8 @@ from .config_converter import (
     hf_to_mcore_config_qwen2moe,
     hf_to_mcore_config_qwen3moe,
 )
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .model_forward import gptmodel_forward_no_padding, model_forward_gen
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .model_forward_fused import fused_forward_model_gen
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .model_initializer import (
     BaseModelInitializer,
     DeepseekV3Model,
@@ -53,7 +44,6 @@ from .model_initializer import (
     Qwen3MoEModel,
     Qwen25VLModel,
 )
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from .weight_converter import (
     McoreToHFWeightConverterDense,
     McoreToHFWeightConverterDpskv3,
@@ -64,39 +54,24 @@ from .weight_converter import (
 )
 
 
-# [EXPLAIN] `SupportedModel` として状態と関連処理をまとめ、worker・trainer・dataset などの責務境界を定義する。
 class SupportedModel(Enum):
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     LLAMA = "LlamaForCausalLM"  # tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN2 = "Qwen2ForCausalLM"  # tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN2_MOE = "Qwen2MoeForCausalLM"  # pending
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     DEEPSEEK_V3 = "DeepseekV3ForCausalLM"  # not tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     MIXTRAL = "MixtralForCausalLM"  # tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN2_5_VL = "Qwen2_5_VLForConditionalGeneration"  # not supported
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     LLAMA4 = "Llama4ForConditionalGeneration"  # not tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN3 = "Qwen3ForCausalLM"  # tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN3_MOE = "Qwen3MoeForCausalLM"  # tested
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     GLM4_MOE = "Glm4MoeForCausalLM"
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN3_TOKEN_CLASSIFICATION = "Qwen3ForTokenClassification"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
 
 
 # Registry for model configuration converters
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig, torch.dtype], TransformerConfig]] = {
     SupportedModel.LLAMA: hf_to_mcore_config_dense,
     SupportedModel.QWEN2: hf_to_mcore_config_dense,
@@ -111,7 +86,6 @@ MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig
 }
 
 # Registry for model initializers
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_INITIALIZER_REGISTRY: dict[SupportedModel, type[BaseModelInitializer]] = {
     SupportedModel.LLAMA: DenseModel,
     SupportedModel.QWEN2: DenseModel,
@@ -126,7 +100,6 @@ MODEL_INITIALIZER_REGISTRY: dict[SupportedModel, type[BaseModelInitializer]] = {
 }
 
 # Registry for model forward functions
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA: model_forward_gen(),
     SupportedModel.QWEN2: model_forward_gen(),
@@ -145,7 +118,6 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
 }
 
 # Registry for model forward functions
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA: gptmodel_forward_no_padding,
     SupportedModel.QWEN2: gptmodel_forward_no_padding,
@@ -164,7 +136,6 @@ MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
 }
 
 # Registry for model forward functions
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA: fused_forward_model_gen(),
     SupportedModel.QWEN2: fused_forward_model_gen(),
@@ -182,7 +153,6 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
 }
 
 # Registry for model weight converters
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
     SupportedModel.LLAMA: McoreToHFWeightConverterDense,
     SupportedModel.QWEN2: McoreToHFWeightConverterDense,
@@ -196,27 +166,19 @@ MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
 }
 
 
-# [EXPLAIN] `get_supported_model` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_supported_model(model_type: str) -> SupportedModel:
-    # [EXPLAIN] 失敗し得る処理を開始し、後続の例外処理へ制御を接続する。
     try:
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return SupportedModel(model_type)
-    # [EXPLAIN] 発生した例外を捕捉し、fallback、cleanup または文脈付き再送出を行う。
     except ValueError as err:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         supported_models = [e.value for e in SupportedModel]
-        # [EXPLAIN] 不正な設定・shape・task または実行状態を例外として明示する。
         raise NotImplementedError(
             f"Model Type: {model_type} not supported. Supported models: {supported_models}"
         ) from err
 
 
-# [EXPLAIN] `hf_to_mcore_config` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def hf_to_mcore_config(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """Convert huggingface PretrainedConfig to mcore TransformerConfig.
 
     Args:
@@ -227,15 +189,11 @@ def hf_to_mcore_config(
     Returns:
         The mcore TransformerConfig.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return MODEL_CONFIG_CONVERTER_REGISTRY[model](hf_config, dtype, **override_transformer_config_kwargs)
 
 
-# [EXPLAIN] `init_mcore_model` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def init_mcore_model(
     tfconfig: TransformerConfig,
     hf_config: PretrainedConfig,
@@ -246,7 +204,6 @@ def init_mcore_model(
     value: bool = False,
     **extra_kwargs,  # may be used for vlm and moe
 ) -> nn.Module:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Initialize a Mcore model.
 
@@ -262,15 +219,10 @@ def init_mcore_model(
     Returns:
         The initialized model.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     initializer_cls = MODEL_INITIALIZER_REGISTRY[model]
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     initializer = initializer_cls(tfconfig, hf_config)
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return initializer.initialize(
         pre_process=pre_process,
         post_process=post_process,
@@ -280,59 +232,38 @@ def init_mcore_model(
     )
 
 
-# [EXPLAIN] `get_mcore_forward_fn` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_mcore_forward_fn(hf_config: PretrainedConfig) -> Callable:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Get the forward function for given model architecture.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return MODEL_FORWARD_REGISTRY[model]
 
 
-# [EXPLAIN] `get_mcore_forward_no_padding_fn` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_mcore_forward_no_padding_fn(hf_config: PretrainedConfig) -> Callable:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Get the forward function for given model architecture.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return MODEL_FORWARD_NOPAD_REGISTRY[model]
 
 
-# [EXPLAIN] `get_mcore_forward_fused_fn` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_mcore_forward_fused_fn(hf_config: PretrainedConfig) -> Callable:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Get the forward function for given model architecture.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return MODEL_FORWARD_FUSED_REGISTRY[model]
 
 
-# [EXPLAIN] `get_mcore_weight_converter` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_mcore_weight_converter(hf_config: PretrainedConfig, dtype: torch.dtype) -> Callable:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Get the weight converter for given model architecture.
     """
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     model = get_supported_model(hf_config.architectures[0])
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     tfconfig = hf_to_mcore_config(hf_config, dtype)
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return MODEL_WEIGHT_CONVERTER_REGISTRY[model](hf_config, tfconfig)

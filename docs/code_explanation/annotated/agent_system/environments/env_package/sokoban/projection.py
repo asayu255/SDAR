@@ -13,19 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import torch
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import random
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from typing import List
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import re
 
 
-# [EXPLAIN] `sokoban_projection` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def sokoban_projection(actions: List[str]):
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     A function to process the actions.
     actions: the list of actions to be processed, it is a list of strings.
@@ -39,7 +33,6 @@ def sokoban_projection(actions: List[str]):
     - 4: Right
     """
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     action_pools = {
         "up": 1,
         "down": 2,
@@ -48,72 +41,45 @@ def sokoban_projection(actions: List[str]):
         "still": 0,
     }
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     valids = [0] * len(actions)
 
-    # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
     for i in range(len(actions)):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         original_str = actions[i]  # keep the original string
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         actions[i] = actions[i].lower()
 
         # Attempt to extract the substring within <action>...</action>
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         start_tag = "<action>"
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         end_tag = "</action>"
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         start_idx = actions[i].find(start_tag)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         end_idx = actions[i].find(end_tag)
-        # [EXPLAIN] 失敗し得る処理を開始し、後続の例外処理へ制御を接続する。
         try:
-            # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
             if start_idx == -1 or end_idx == -1:
                 # If we can't find a valid <action>...</action> block, mark as invalid
-                # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                 actions[i] = 0  # 0 is invalid action for Sokoban
-                # [EXPLAIN] 現在の分岐または反復の制御を明示する。
                 continue
 
             # Extract just the content between the tags
-            # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
             extracted_action = actions[i][start_idx + len(start_tag):end_idx].strip().lower()
 
-            # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
             for act in action_pools.keys():
-                # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
                 if act in extracted_action:
-                    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                     actions[i] = action_pools[act]
                     # if found legal action, set valids to 1
-                    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                     valids[i] = 1
-                    # [EXPLAIN] 現在の分岐または反復の制御を明示する。
                     break
 
             # If no valid action found, randomly select from pool
-            # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
             if valids[i] == 0:
-                # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                 actions[i] = 0
 
-        # [EXPLAIN] 発生した例外を捕捉し、fallback、cleanup または文脈付き再送出を行う。
         except:
             # randomly choose an action from the action list if illegal
-            # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
             actions[i] = 0
 
         # check <think>...</think>
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         think_start_idx = original_str.find("<think>")
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         think_end_idx = original_str.find("</think>")
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if think_start_idx == -1 or think_end_idx == -1:
-            # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
             valids[i] = 0
 
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return actions, valids

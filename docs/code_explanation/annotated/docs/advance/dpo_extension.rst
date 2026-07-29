@@ -1,60 +1,44 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Extend to other RL(HF) algorithms
 =================================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We already implemented the complete training pipeline of the PPO
 algorithms. To extend to other algorithms, we analyze the high-level
 principle to use verl and provide a tutorial to implement the DPO
 algorithm. Users can follow the similar paradigm to extend to other RL algorithms.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. note:: **Key ideas**: Single process drives multi-process computation and data communication.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Overall Approach
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ----------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 1: Consider what multi-machine multi-GPU computations are needed
 for each model, such as ``generate_sequence`` , ``compute_log_prob`` and
 ``update_policy`` in the actor_rollout model. Implement distributed
 single-process-multiple-data (SPMD) computation and encapsulate them
 into APIs
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 2: Based on different distributed scenarios, including FSDP and 3D
 parallelism in Megatron-LM, implement single-process control of data
 interaction among multi-process computations.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 3: Utilize the encapsulated APIs to implement the control flow
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Example: Online DPO
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We use verl to implement a simple online DPO algorithm. The algorithm
 flow of Online DPO is as follows:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. There is a prompt (rollout) generator which has the same weight as
    the actor model. After a batch of prompts are fed into the generator,
    it generates N responses for each prompt.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Send all the prompts + responses to a verifier for scoring, which can
    be reward model or a rule-based function. Then sort them in pairs to
    form a training batch.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 3. Use this training batch to train the actor model using DPO. During
    the process, a reference policy is needed.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 1: What are the multi-machine multi-GPU computations
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 **Sample Generator**
@@ -142,31 +126,24 @@ verl/verl/trainer/ppo.
 Step 2: Based on different distributed scenarios, implement single-process control of multi-process data interaction
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **The core problem to solve here is how a single process sends data to
 multiple processes, drives multi-process computation, and how the
 control process obtains the results of multi-process computation.**
 First, we initialize the multi-process ``WorkerGroup`` in the control
 process.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    @ray.remote(num_cpus=1)
    def main_task(config):
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # construct SampleGenerator
        resource_pool = RayResourcePool(process_on_nodes=[8] * 2)  # 16 GPUs
        ray_cls = RayClassWithInitArgs(SampleGenerator, config=config)
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # put SampleGenerator onto resource pool
        worker_group = RayWorkerGroup(resource_pool, ray_cls)
        
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # construct reference policy
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 As we can see, in the control process, multiple processes are wrapped
 into a ``RayWorkerGroup``. Inside this ``WorkerGroup``, there is a
 ``self._workers`` member, where each worker is a RayActor
@@ -174,111 +151,83 @@ into a ``RayWorkerGroup``. Inside this ``WorkerGroup``, there is a
 ray_trainer.md also provide an implementation of
 ``MegatronRayWorkerGroup``.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Assuming the model is distributed using FSDP, and there is a batch of
 data on the control process, for data parallelism, the underlying
 calling process is:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    data = xxx
    data_list = data.chunk(dp_size)
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    output = []
    for d in data_list:
-       .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
        # worker_group._workers[i] is a SampleGenerator
        output.append(worker_group._workers[i].generate_sequences.remote(d))
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    output = ray.get(output)
    output = torch.cat(output)
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Single process calling multiple processes involves the following 3
 steps:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. Split the data into DP parts on the control process.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Send the data to remote, call the remote computation through RPC, and
    utilize multi-process computation.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 3. Obtain the computation results of each worker on the control process
    and merge them.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Frequently calling these 3 steps on the controller process greatly hurts
 code readability. **In verl, we have abstracted and encapsulated these 3
 steps, so that the worker's method + dispatch + collect can be
 registered into the worker_group**
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    from verl.single_controller.base.decorator import register
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    def dispatch_data(worker_group, data):
        return data.chunk(worker_group.world_size)
        
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    def collect_data(worker_group, data):
        return torch.cat(data)
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    dispatch_mode = {
        'dispatch_fn': dispatch_data,
        'collect_fn': collect_data
    }
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    @register(dispatch_mode=dispatch_mode)
    def generate_sequences(self, data):
        pass
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In this way, we can directly call the method inside the worker through
 the ``worker_group`` on the control (driver) process (which is a single
 process):
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    output = worker_group.generate_sequences(data)
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 This single line includes data splitting, data distribution and
 computation, and data collection.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Furthermore, the model parallelism size of each model is usually fixed,
 including dp, tp, pp. So for these common distributed scenarios, we have
 pre-implemented specific dispatch and collect methods,in `decorator.py <https://github.com/volcengine/verl/blob/main/verl/single_controller/base/decorator.py>`_, which can be directly used to wrap the computations.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    from verl.single_controller.base.decorator import register, Dispatch
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
    def generate_sequences(self, data: DataProto) -> DataProto:
        pass
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Here it requires the data interface to be ``DataProto``. Definition of
 ``DataProto`` is in `protocol.py <https://github.com/volcengine/verl/blob/main/verl/protocol.py>`_.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 3: Main training loop
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 With the above training flows, we can implement the algorithm's control

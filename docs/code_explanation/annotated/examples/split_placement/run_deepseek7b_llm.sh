@@ -1,7 +1,5 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 main_ppo_split.py \
     algorithm.adv_estimator=gae \
     data.train_files=$HOME/data/gsm8k/train.parquet \

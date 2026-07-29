@@ -1,13 +1,8 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -e
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VISIBLE_DEVICES="4,5,6,7"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HYDRA_FULL_ERROR=1
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES} python3 -m recipe.spin.main_spin \
   data.train_files=$HOME/data/gsm8k/train.parquet \
   data.val_files=$HOME/data/gsm8k/test.parquet \

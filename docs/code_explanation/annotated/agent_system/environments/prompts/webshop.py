@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # --------------------- WebShop --------------------- #
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 WEBSHOP_TEMPLATE_NO_HIS = """
 You are an expert autonomous agent operating in the WebShop e‑commerce environment. 
 Your task is to: {task_description}.
@@ -29,7 +28,6 @@ You should first reason step-by-step about the current situation, then think car
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 WEBSHOP_TEMPLATE = """
 You are an expert autonomous agent operating in the WebShop e‑commerce environment.
 Your task is to: {task_description}.

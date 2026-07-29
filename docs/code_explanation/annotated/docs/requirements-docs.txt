@@ -1,18 +1,13 @@
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 # markdown suport
 recommonmark
 myst_parser
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 # markdown table suport
 sphinx-markdown-tables
 
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 # theme default rtd
 
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 # crate-docs-theme
 sphinx-rtd-theme
 
-# [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 # pin tokenizers version to avoid env_logger version req
 tokenizers==0.19.1

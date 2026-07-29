@@ -1,99 +1,61 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 project_name='DAPO'
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 exp_name='DAPO-Qwen2.5-7b-MATH-0527a1'
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 adv_estimator=grpo
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_kl_in_reward=False
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 kl_coef=0.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_kl_loss=False
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 kl_loss_coef=0.0
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_low=0.2
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_high=0.28
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_prompt_length=$((1024 * 2))
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_response_length=$((1024 * 8))
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_overlong_buffer=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 overlong_buffer_len=$((1024 * 4))
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 overlong_penalty_factor=1.0
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 loss_agg_mode="token-mean"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_bsz=512
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 n_resp_per_prompt=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_mini_bsz=32
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NNODES=${NNODES:-8}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Algorithm
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 temperature=1.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 top_p=1.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_top_p=0.7
 
 # Performance Related Parameter
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 sp_size=4
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_dynamic_bsz=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 offload=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gen_tp=4
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 fsdp_size=32
 
 # remember to set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 for this model
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

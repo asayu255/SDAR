@@ -1,50 +1,29 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 source $(conda info --base)/etc/profile.d/conda.sh
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 conda activate verl-agent
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export OPENBLAS_NUM_THREADS=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export MKL_NUM_THREADS=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export OMP_NUM_THREADS=1
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export http_proxy=http://10.217.142.137:8080
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export https_proxy=http://10.217.142.137:8080
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export no_proxy=localhost,127.0.0.1,0.0.0.0,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,33.0.0.0/8
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export grpc_proxy=""
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export RAY_INCLUDE_DASHBOARD=0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export RAY_DASHBOARD_AGENT_CHECK_PARENT_INTERVAL_S=30
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=your_key_here
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=512
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$TRAIN_DATA \

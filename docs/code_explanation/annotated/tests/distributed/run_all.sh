@@ -14,7 +14,5 @@
 
 #!/usr/bin/env bash
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -e -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 torchrun --nproc-per-node=4 --standalone tests/distributed/test_tensor_dict.py

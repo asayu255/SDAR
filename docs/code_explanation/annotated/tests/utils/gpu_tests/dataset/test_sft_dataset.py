@@ -11,36 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import os
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from verl.utils import hf_tokenizer
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from verl.utils.dataset.sft_dataset import SFTDataset
 
 
-# [EXPLAIN] `get_gsm8k_data` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_gsm8k_data():
     # prepare test dataset
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     local_folder = os.path.expanduser("~/verl-data/gsm8k/")
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     local_path = os.path.join(local_folder, "train.parquet")
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return local_path
 
 
-# [EXPLAIN] `test_sft_cot_dataset` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def test_sft_cot_dataset():
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     tokenizer = hf_tokenizer("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     local_path = get_gsm8k_data()
-    # [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
     from omegaconf import OmegaConf
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     dataset = SFTDataset(
         parquet_files=local_path,
         tokenizer=tokenizer,
@@ -55,26 +43,17 @@ def test_sft_cot_dataset():
         ),
     )
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     data = dataset[0]["input_ids"]
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     output = tokenizer.batch_decode([data])[0]
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(output) > 1
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert isinstance(output, str)
 
 
-# [EXPLAIN] `test_sft_dataset` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def test_sft_dataset():
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     tokenizer = hf_tokenizer("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     local_path = get_gsm8k_data()
-    # [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
     from omegaconf import OmegaConf
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     dataset = SFTDataset(
         parquet_files=local_path,
         tokenizer=tokenizer,
@@ -89,11 +68,7 @@ def test_sft_dataset():
         ),
     )
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     data = dataset[0]["input_ids"]
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     output = tokenizer.batch_decode([data])[0]
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert len(output) > 1
-    # [EXPLAIN] 後続処理が依存する shape、dtype、設定または分散条件を検証する。
     assert isinstance(output, str)

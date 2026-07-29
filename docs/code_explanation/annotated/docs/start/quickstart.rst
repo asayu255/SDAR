@@ -1,125 +1,87 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. _quickstart:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 =========================================================
 Quickstart: PPO training on GSM8K dataset
 =========================================================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Post-train a LLM using GSM8K dataset.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Introduction
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. _hf_dataset_gsm8k: https://huggingface.co/datasets/gsm8k
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In this example, we train an LLM to tackle the `GSM8k <hf_dataset_gsm8k>`_ task with function-based rewards. [1]_
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Prerequisite:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - the latest version of ``verl`` and its dependencies installed following the installation guide. Using the docker image is recommended.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - a GPU with at least 24 GB HBM
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Dataset Introduction
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 --------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 GSM8k is a math problem dataset. The prompt is an elementary school
 problem. The LLM model is asked to solve the math problem. Below is an example:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Prompt
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    Katy makes coffee using teaspoons of sugar and cups of water in the
    ratio of 7:13. If she used a total of 120 teaspoons of sugar and cups
    of water, calculate the number of teaspoonfuls of sugar she used.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Solution
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    The total ratio representing the ingredients she used to make the
    coffee is 7+13 = <<7+13=20>>20 Since the fraction representing the
    number of teaspoons she used is 7/20, she used 7/20\ *120 =
    <<7/20*\ 120=42>>42 #### 42
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 1: Prepare the dataset
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ----------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We preprocess the dataset in parquet format so that (1) it contains necessary fields for computing RL rewards and (2) is faster to read.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    python3 examples/data_preprocess/gsm8k.py --local_dir ~/data/gsm8k
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 2: Download a model for post-training
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -------------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In this example, we start with the ``Qwen2.5-0.5B-Instruct`` model.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 If you want to perform SFT before RL, refer to the :doc:`Complete GSM8K Example<../examples/gsm8k_example>`, the `sft directory <https://github.com/volcengine/verl/blob/main/examples/sft/gsm8k>`_ and `SFT Trainer <https://github.com/volcengine/verl/blob/main/verl/trainer/fsdp_sft_trainer.py>`_ for further details.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    python3 -c "import transformers; transformers.pipeline('text-generation', model='Qwen/Qwen2.5-0.5B-Instruct')"
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 3: Perform PPO training with the instruct model
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ----------------------------------------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Reward Model/Function**
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We use a pre-defined rule-based reward model. We force the model to produce a final
 answer following 4 “#” as shown in the solution. We extract the final
 answer from both the solution and model's output using regular
 expression matching. We assign a reward of 1 to correct
 answer, 0.0 to incorrect answer and 0 to no answer. 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 For more details, please refer to `verl/utils/reward_score/gsm8k.py <https://github.com/volcengine/verl/blob/v0.1/verl/utils/reward_score/gsm8k.py>`_.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Training Script**
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Now let's run PPO training with the dataset and model above. [2]_
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Set the ``data.train_files`` ,\ ``data.val_files``, ``actor_rollout_ref.model.path`` and ``critic.model.path`` based on your dataset and model names or paths.
 You may set ``VERL_USE_MODELSCOPE=True`` to download models from modelscope instead of huggingface.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$HOME/data/gsm8k/train.parquet \
     data.val_files=$HOME/data/gsm8k/test.parquet \
@@ -147,47 +109,34 @@ You may set ``VERL_USE_MODELSCOPE=True`` to download models from modelscope inst
     trainer.test_freq=10 \
     trainer.total_epochs=15 2>&1 | tee verl_demo.log
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 You are expected to see the following logs, indicating training in progress. The key metric ``val/test_score/openai/gsm8k`` is computed every ``trainer.test_freq`` steps:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-    .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     step:0 - timing/gen:21.470 - timing/ref:4.360 - timing/values:5.800 - actor/reward_kl_penalty:0.000 - actor/reward_kl_penalty_coeff:0.001 - timing/adv:0.109 - timing/update_critic:15.664 - critic/vf_loss:14.947 - critic/vf_clipfrac:0.000 - critic/vpred_mean:-2.056 - critic/grad_norm:1023.278 - critic/lr(1e-4):0.100 - timing/update_actor:20.314 - actor/entropy_loss:0.433 - actor/pg_loss:-0.005 - actor/pg_clipfrac:0.000 - actor/ppo_kl:0.000 - actor/grad_norm:1.992 - actor/lr(1e-4):0.010 - critic/score/mean:0.004 - critic/score/max:1.000 - critic/score/min:0.000 - critic/rewards/mean:0.004 - critic/rewards/max:1.000 - critic/rewards/min:0.000 - critic/advantages/mean:-0.000 - critic/advantages/max:2.360 - critic/advantages/min:-2.280 - critic/returns/mean:0.003 - critic/returns/max:0.000 - critic/returns/min:0.000 - critic/values/mean:-2.045 - critic/values/max:9.500 - critic/values/min:-14.000 - response_length/mean:239.133 - response_length/max:256.000 - response_length/min:77.000 - prompt_length/mean:104.883 - prompt_length/max:175.000 - prompt_length/min:68.000
     step:1 - timing/gen:23.020 - timing/ref:4.322 - timing/values:5.953 - actor/reward_kl_penalty:0.000 - actor/reward_kl_penalty:0.001 - timing/adv:0.118 - timing/update_critic:15.646 - critic/vf_loss:18.472 - critic/vf_clipfrac:0.384 - critic/vpred_mean:1.038 - critic/grad_norm:942.924 - critic/lr(1e-4):0.100 - timing/update_actor:20.526 - actor/entropy_loss:0.440 - actor/pg_loss:0.000 - actor/pg_clipfrac:0.002 - actor/ppo_kl:0.000 - actor/grad_norm:2.060 - actor/lr(1e-4):0.010 - critic/score/mean:0.000 - critic/score/max:0.000 - critic/score/min:0.000 - critic/rewards/mean:0.000 - critic/rewards/max:0.000 - critic/rewards/min:0.000 - critic/advantages/mean:0.000 - critic/advantages/max:2.702 - critic/advantages/min:-2.616 - critic/returns/mean:0.000 - critic/returns/max:0.000 - critic/returns/min:0.000 - critic/values/mean:-2.280 - critic/values/max:11.000 - critic/values/min:-16.000 - response_length/mean:232.242 - response_length/max:256.000 - response_length/min:91.000 - prompt_length/mean:102.398 - prompt_length/max:185.000 - prompt_length/min:70.000
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Checkout :ref:`algo-baseline-page` for full training and validation logs for reference.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 The checkpoint is saved at the following dir by default: ``checkpoints/${trainer.project_name}/${trainer.experiment_name}``
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 To enable ``wandb`` for experiment tracking, set the following configs:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-    .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     trainer.logger=['console','wandb'] \
     trainer.project_name=$YOUR_PROJECT_NAME \
     trainer.experiment_name=$YOUR_RUN_NAME \
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 If you encounter out of memory issues with HBM less than 32GB, enable the following configs would help:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-    .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     critic.ppo_micro_batch_size_per_gpu=1 \
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 For the full set of configs, please refer to :ref:`config-explain-page` for detailed explanation and performance tuning.
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. [1] The original paper (https://arxiv.org/pdf/2110.14168) mainly focuses on training a verifier (a reward model) to solve math problems via Best-of-N sampling. In this example, we train an RL agent using a rule-based reward model.
 .. [2] More training script examples for FSDP and Megatron-LM backend are stored in `examples/ppo_trainer <https://github.com/volcengine/verl/tree/main/examples/ppo_trainer>`_ directory.

@@ -1,18 +1,12 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. _config-explain-page:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Config Explanation
 ===================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ppo_trainer.yaml for RL FSDP Backend
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Data
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~
 
 .. code:: yaml
@@ -80,25 +74,18 @@ Data
 Customized Dataset
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Customized dataset extension is implemented for the SFT trainer and can be extended to other trainers with similar changes.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: yaml
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    custom_cls:
      path: null
      name: null
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``data.custom_cls.path``: The path to the file containing your customized dataset class. If not specified, pre-implemented dataset will be used.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``data.custom_cls.name``: The name of the dataset class within the specified file.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Actor/Rollout/Reference Policy
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code:: yaml
@@ -390,12 +377,9 @@ Reference model will be enabled when ``actor.use_kl_loss`` or/and ``algorithm.us
 Critic Model
 ~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Most parameters for Critic are similar to Actor Model.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Reward Model
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~
 
 .. code:: yaml
@@ -438,22 +422,16 @@ Reward Model
 Customized Reward Function
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: yaml
   
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    custom_reward_function:
      path: null
      name: compute_score
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``custom_reward_function.path``: The path to the file containing your customized reward function. If not specified, pre-implemented reward functions will be used.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``custom_reward_function.name`` (Optional) : The name of the reward function within the specified file. Default is 'compute_score'.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Algorithm
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~
 
 .. code:: yaml
@@ -485,10 +463,8 @@ Algorithm
 Trainer
 ~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: yaml
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    trainer:
      total_epochs: 30
      project_name: verl_examples
@@ -509,68 +485,45 @@ Trainer
      del_local_ckpt_after_load: False
      ray_wait_register_center_timeout: 300
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.total_epochs``: Number of epochs in training.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.project_name``: For wandb, swanlab, mlflow
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.experiment_name``: For wandb, swanlab, mlflow
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.logger``: Support console and wandb, swanlab, mlflow, tensorboard
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.log_val_generations``: The number of logged generation during validation (default ``0``)
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.nnodes``: Number of nodes used in the training.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.n_gpus_per_node``: Number of GPUs per node.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.save_freq``: The frequency (by iteration) to save checkpoint
   of the actor and critic model.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.val_before_train``: Whether to run validation before training.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.test_freq``: The validation frequency (by iteration).
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.critic_warmup``: The number of iteration to train the critic
   model before actual policy learning.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.resume_mode``: The mode of resuming training. Support
   ``disable``, ``auto`` and ``resume_path``. If set to ``auto`` as default, the
   program will automatically resume from the latest checkpoint in the
   default_hdfs_dir. If set to ``resume_path``, the program will resume
   from the path specified in ``resume_from_path``.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.resume_from_path``: The path to resume training from. Only
   effective when ``resume_mode`` is set to ``resume_path``.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.remove_previous_ckpt_in_save``: Whether to remove previous
   checkpoints in the save directory. Default is False.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.del_local_ckpt_after_load``: Whether to delete local
   checkpoints after loading them. Default is False.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``trainer.ray_wait_register_center_timeout``: The timeout for waiting
   for the ray register center to be ready. Default is 300 seconds.
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 This figure illustrates how the configurations affect the training.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 https://excalidraw.com/#json=pfhkRmiLm1jnnRli9VFhb,Ut4E8peALlgAUpr7E5pPCA
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. image:: https://github.com/user-attachments/assets/16aebad1-0da6-4eb3-806d-54a74e712c2d
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 evaluation.yaml
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ---------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Data
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~
 
 .. code:: yaml
@@ -591,28 +544,20 @@ Data
 Customized Reward Function
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: yaml
   
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    custom_reward_function:
      path: null
      name: compute_score
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``custom_reward_function.path``: The path to the file containing your customized reward function. If not specified, pre-implemented reward functions will be used.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``custom_reward_function.name`` (Optional) : The name of the reward function within the specified file. Default is 'compute_score'.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 sft_trainer.yaml for SFT FSDP Backend
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 --------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: yaml
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    optim:
      lr: 1e-5
      weight_decay: 0.01
@@ -620,18 +565,11 @@ sft_trainer.yaml for SFT FSDP Backend
      clip_grad: 1.0
      lr_scheduler: cosine
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``optim.lr``: Learning rate for the optimizer.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``optim.weight_decay``: Weight decay for the optimizer.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``optim.warmup_steps_ratio``: Ratio of warmup steps to total training steps.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``optim.clip_grad``: Gradient clipping value.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``optim.lr_scheduler``: Learning rate scheduler type. Options:
 
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - ``cosine``: Cosine learning rate scheduler with warmup (default).
-  .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
   - ``wsd``: Warmup-Stable-Decay scheduler that provides a stable learning rate phase between warmup and decay phases.

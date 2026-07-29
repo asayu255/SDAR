@@ -1,4 +1,3 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python -m pyserini.index.lucene \
   --collection JsonCollection \
   --input resources_100 \
@@ -7,7 +6,6 @@ python -m pyserini.index.lucene \
   --threads 1 \
   --storePositions --storeDocvectors --storeRaw
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python -m pyserini.index.lucene \
   --collection JsonCollection \
   --input resources \
@@ -16,7 +14,6 @@ python -m pyserini.index.lucene \
   --threads 1 \
   --storePositions --storeDocvectors --storeRaw
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python -m pyserini.index.lucene \
   --collection JsonCollection \
   --input resources_1k \
@@ -25,7 +22,6 @@ python -m pyserini.index.lucene \
   --threads 1 \
   --storePositions --storeDocvectors --storeRaw
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python -m pyserini.index.lucene \
   --collection JsonCollection \
   --input resources_100k \

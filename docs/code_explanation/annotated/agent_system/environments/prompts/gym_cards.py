@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # --------------------- Gym Cards --------------------- #
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 GYM_CARDS_NUMBERLINE_TEMPLATE = """
 <image>You are playing a game called number line. You will see a target number and a current number in the image. And your goal is to move the current number closer to the target by choosing either adding or subtracting one to the current number.
 
@@ -27,7 +26,6 @@ Your response should be a valid json file in the following format:
 }}
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 GYM_CARDS_BLACKJACK_TEMPLATE = """
 <image>You are an expert blackjack player helping to decide the optimal action based on the current game state displayed in the image. 
 
@@ -54,7 +52,6 @@ Your response should be a valid json file in the following format:
 }}
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 GYM_CARDS_EZPOINTS_TEMPLATE = """
 <image>You are an expert card game player helping to build a math formula that evaluates to **12**, using only the two numbers shown on the playing cards in the image. You may choose from the following actions: one of the two available card numbers, the operators '+' or '*', or the equals sign '='. You must build the formula step by step, adding only one character at a time to the end of the current formula.
 
@@ -85,7 +82,6 @@ Your response MUST be a valid JSON object in the following format:
 }}
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 GYM_CARDS_POINTS24_TEMPLATE = """
 <image>You are an expert at solving the classic "24 Game", where you build an formula that evaluates exactly to **24**, using only the four numbers shown on the playing cards in the image. You may choose from the following actions: one of the four available card numbers, the operators ('+', '-', '*', '/'), the parentheses '(', ')', and the equals sign '='.
 

@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import torch
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from transformers import PretrainedConfig
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from verl.utils.device import get_torch_device
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 VALID_CONFIG_TYPE = {
     "llama",
     "qwen2",
@@ -42,9 +38,7 @@ VALID_CONFIG_TYPE = {
 }
 
 
-# [EXPLAIN] `get_device_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_device_flops(unit="T"):
-    # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
     """Get the theoretical FLOPS (Floating Point Operations Per Second) capacity of the current device.
 
     Args:
@@ -61,104 +55,57 @@ def get_device_flops(unit="T"):
         Returns float('inf') for unknown GPU types.
     """
 
-    # [EXPLAIN] `unit_convert` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def unit_convert(number, level):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         units = ["B", "K", "M", "G", "T", "P"]
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if number <= 0:
-            # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
             return number
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         ptr = 0
-        # [EXPLAIN] 終了条件を満たすまで rollout または状態更新を反復する。
         while ptr < len(units) and units[ptr] != level:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             number /= 1000
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             ptr += 1
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return number
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     device = get_torch_device()
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     if device == torch.cpu:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         device_name = "CPU"
-    # [EXPLAIN] 直前の条件が成立しない場合の代替経路を実行する。
     else:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         device_name = get_torch_device().get_device_name()
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     flops = float("inf")  # INF flops for unkown gpu type
 
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     if "CPU" in device_name:
         # use a general CPU flops placeholder to make the function CPU compatible
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 448e9
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "GB200" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 2.5e15
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "B200" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 2.25e15
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "MI300X" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 1336e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "H100" in device_name or "H800" in device_name or "H200" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 989e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "A100" in device_name or "A800" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 312e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "L40S" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 362.05e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "L40" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 181.05e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "A40" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 149.7e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "L20" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 119.5e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "H20" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 148e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "910B" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 354e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "Ascend910" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 354e12
-    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
     elif "RTX 3070 Ti" in device_name:
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops = 21.75e12
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     flops_unit = unit_convert(flops, unit)
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return flops_unit
 
 
-# [EXPLAIN] `FlopsCounter` として状態と関連処理をまとめ、worker・trainer・dataset などの責務境界を定義する。
 class FlopsCounter:
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     Used to count mfu during training loop
 
@@ -168,17 +115,13 @@ class FlopsCounter:
 
     """
 
-    # [EXPLAIN] `__init__` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def __init__(self, config: PretrainedConfig):
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if config.model_type not in VALID_CONFIG_TYPE:
-            # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
             print(
                 f"Only support config type of {VALID_CONFIG_TYPE}, but got {config.model_type}. MFU will always be "
                 f"zero."
             )
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         self.estimate_func = {
             "qwen2": self._estimate_qwen2_flops,
             "llama": self._estimate_qwen2_flops,
@@ -198,392 +141,242 @@ class FlopsCounter:
             "apertus": self._estimate_apertus_flops,
             "glm4v": self._estimate_qwen2_flops,
         }
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         self.config = getattr(config, "text_config", config)
 
-    # [EXPLAIN] `_estimate_unknown_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return 0
 
-    # [EXPLAIN] `_estimate_qwen2_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         hidden_size = self.config.hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         vocab_size = self.config.vocab_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_hidden_layers = self.config.num_hidden_layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_key_value_heads = self.config.num_key_value_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_attention_heads = self.config.num_attention_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         intermediate_size = self.config.intermediate_size
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         q_size = num_attention_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         k_size = num_key_value_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         v_size = num_key_value_heads * head_dim
 
         # non-attn per layer parm
         # Qwen2/LLama use SwiGelu, gate, having up and down linear layer in mlp
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         mlp_N = hidden_size * intermediate_size * 3
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N_flops = 6 * dense_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         seqlen_square_sum = 0
-        # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
         for seqlen in batch_seqlens:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             seqlen_square_sum += seqlen * seqlen
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_all_token = dense_N_flops + attn_qkv_flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return flops_achieved
 
-    # [EXPLAIN] `_estimate_deepseek_v3_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_deepseek_v3_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         hidden_size = self.config.hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         vocab_size = self.config.vocab_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_intermediate_size = self.config.moe_intermediate_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_hidden_layers = self.config.num_hidden_layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         first_k_dense_replace = self.config.first_k_dense_replace
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_query_heads = self.config.num_attention_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_num_expert = self.config.n_routed_experts
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_topk = self.config.num_experts_per_tok
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         share_expert_num = self.config.n_shared_experts
 
         # non-attn per layer parm
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_gata_N = hidden_size * moe_num_expert
         # moe has fc1_1, fc1_2 and fc2 using SwiGLU in ExpertMlp layer & shared experts
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
         # MLA attn
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_linear_N = 0
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if self.config.q_lora_rank is None:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             attn_linear_N += hidden_size * num_query_heads * q_head_dim
-        # [EXPLAIN] 直前の条件が成立しない場合の代替経路を実行する。
         else:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             attn_linear_N += hidden_size * self.config.q_lora_rank
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             attn_linear_N += num_query_heads * q_head_dim * self.config.q_lora_rank
 
-        # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
         attn_linear_N += hidden_size * (self.config.kv_lora_rank + self.config.qk_rope_head_dim)
-        # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
         attn_linear_N += (
             num_query_heads
             * (q_head_dim - self.config.qk_rope_head_dim + self.config.v_head_dim)
             * self.config.kv_lora_rank
         )
-        # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
         attn_linear_N += num_query_heads * self.config.v_head_dim * hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_N = (
             (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers - first_k_dense_replace)
             + (hidden_size * self.config.intermediate_size * 3 + attn_linear_N) * first_k_dense_replace
             + emd_and_lm_head_N
         )
         # non-attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N_flops = 6 * moe_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         seqlen_square_sum = 0
-        # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
         for seqlen in batch_seqlens:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             seqlen_square_sum += seqlen * seqlen * num_hidden_layers
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_qkv_flops = 12 * seqlen_square_sum * q_head_dim * num_query_heads
         # all_layer & all_token fwd & bwk flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_all_token = dense_N_flops + attn_qkv_flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
 
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return flops_achieved
 
-    # [EXPLAIN] `_estimate_qwen2_moe_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_qwen2_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         hidden_size = self.config.hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         vocab_size = self.config.vocab_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_hidden_layers = self.config.num_hidden_layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_key_value_heads = self.config.num_key_value_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_attention_heads = self.config.num_attention_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_intermediate_size = self.config.moe_intermediate_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_topk = self.config.num_experts_per_tok
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_experts = self.config.num_experts
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         q_size = num_attention_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         k_size = num_key_value_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         v_size = num_key_value_heads * head_dim
 
         # non-attn per layer parm
         # gate + moe export
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         moe_mlp_N = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N_flops = 6 * dense_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         seqlen_square_sum = 0
-        # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
         for seqlen in batch_seqlens:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             seqlen_square_sum += seqlen * seqlen
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_all_token = dense_N_flops + attn_qkv_flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return flops_achieved
 
-    # [EXPLAIN] `_estimate_gemma3_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_gemma3_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         hidden_size = self.config.hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         vocab_size = self.config.vocab_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_hidden_layers = self.config.num_hidden_layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_key_value_heads = self.config.num_key_value_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_attention_heads = self.config.num_attention_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         intermediate_size = self.config.intermediate_size
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         q_size = num_attention_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         k_size = num_key_value_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         v_size = num_key_value_heads * head_dim
 
         # non-attn per layer parm
         # Gemma3 uses GeGLU (gelu_pytorch_tanh), having 3 matrices in MLP (inherited from Gemma2MLP)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         mlp_N = hidden_size * intermediate_size * 3
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N_flops = 6 * dense_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
         # Gemma3 alternates between full and sliding window attention based on layer_types
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         seqlen_square_sum = 0
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         layer_types = getattr(self.config, "layer_types", None)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         sliding_window = getattr(self.config, "sliding_window", 1024)  # default 1024
         # default pattern: every 6th layer is full
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         sliding_window_pattern = getattr(self.config, "sliding_window_pattern", 6)
 
         # If layer_types is not provided, generate it based on sliding_window_pattern
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if layer_types is None and sliding_window is not None and sliding_window_pattern is not None:
-            # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
             layer_types = [
                 "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
                 for i in range(num_hidden_layers)
             ]
 
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if layer_types:
             # Calculate attention flops per layer based on attention type
-            # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
             for layer_idx in range(num_hidden_layers):
-                # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                 is_sliding = False
-                # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
                 if layer_types and layer_idx < len(layer_types):
-                    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                     is_sliding = layer_types[layer_idx] == "sliding_attention"
 
-                # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
                 for seqlen in batch_seqlens:
-                    # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
                     if is_sliding and sliding_window:
                         # Sliding window limits each token to attend to at most window_size tokens
-                        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
                         effective_seqlen = min(seqlen, sliding_window)
-                        # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
                         seqlen_square_sum += seqlen * effective_seqlen
-                    # [EXPLAIN] 直前の条件が成立しない場合の代替経路を実行する。
                     else:
                         # Full attention
-                        # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
                         seqlen_square_sum += seqlen * seqlen
-        # [EXPLAIN] 直前の条件が成立しない場合の代替経路を実行する。
         else:
             # If no layer_types config, assume all layers use full attention
-            # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
             for seqlen in batch_seqlens:
-                # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
                 seqlen_square_sum += seqlen * seqlen
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             seqlen_square_sum *= num_hidden_layers
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads
 
         # all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_all_token = dense_N_flops + attn_qkv_flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return flops_achieved
 
-    # [EXPLAIN] `_estimate_apertus_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def _estimate_apertus_flops(self, tokens_sum, batch_seqlens, delta_time):
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         hidden_size = self.config.hidden_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         vocab_size = self.config.vocab_size
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_hidden_layers = self.config.num_hidden_layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_key_value_heads = self.config.num_key_value_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         num_attention_heads = self.config.num_attention_heads
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         intermediate_size = self.config.intermediate_size
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         q_size = num_attention_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         k_size = num_key_value_heads * head_dim
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         v_size = num_key_value_heads * head_dim
 
         # Apertus MLP with XIELU activation uses only 2 linear layers (up_proj, down_proj)
         # No gate_proj for XIELU, unlike SwiGLU which has 3 layers
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         mlp_N = hidden_size * intermediate_size * 2
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
 
         # ApertusConfig has qk_norm defaulting to True.
         # This adds params for q_norm (on H) and k_norm (on num_kv_heads * head_dim)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         qk_norm_params_per_layer = hidden_size + num_key_value_heads * head_dim  # q_norm + k_norm
 
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer params
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N = (mlp_N + attn_linear_N + qk_norm_params_per_layer) * num_hidden_layers + emd_and_lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         dense_N_flops = 6 * dense_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         seqlen_square_sum = 0
-        # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
         for seqlen in batch_seqlens:
-            # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
             seqlen_square_sum += seqlen * seqlen
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwd flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_all_token = dense_N_flops + attn_qkv_flops
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return flops_achieved
 
-    # [EXPLAIN] `estimate_flops` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def estimate_flops(self, batch_seqlens, delta_time):
-        # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
 
@@ -596,13 +389,8 @@ class FlopsCounter:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
             promised_flops (float): The expected FLOPS of the current device.
         """
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         tokens_sum = sum(batch_seqlens)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         estimated_flops = func(tokens_sum, batch_seqlens, delta_time)
-        # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
         promised_flops = get_device_flops()
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return estimated_flops, promised_flops

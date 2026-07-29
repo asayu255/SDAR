@@ -1,36 +1,23 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=16
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_low=0.2
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_high=0.28
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_filter_groups=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_num_gen_batches=10
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size ${train_data_size} \
     --val_data_size ${val_data_size}
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \

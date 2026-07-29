@@ -1,30 +1,21 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
 # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 
 # download from https://huggingface.co/datasets/PRIME-RL/Eurus-2-RL-Data
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 math_train_path=$HOME/data/math/train.parquet
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 math_test_path=$HOME/data/math/test.parquet
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_files="['$gsm8k_train_path', '$math_train_path']"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 model_path=PRIME-RL/Eurus-2-7B-SFT
 # model_path=Qwen/Qwen2.5-0.5B-Instruct
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.prime.main_prime \
     data.train_files="$train_files" \
     data.val_files="$test_files" \

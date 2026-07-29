@@ -1,23 +1,16 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 =======================
 Search Tool Integration
 =======================
 Introduction
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ------------
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - We have added a search tool calling function to Multi-Turn RL, enabling the model to initiate retrieval requests during Actor rollout and directly use retrieval results for training. **We support using a local dense retriever as the retrieval tool, as well as integrating with your own local retrieval engine.**
 
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Quick Reproduction
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Create a New Docker Container
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code:: bash
@@ -43,28 +36,21 @@ If you need to restart after exiting the container:
 Update Python and Configure the Virtual Environment using uv
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    apt update
    apt install -y python3.10 python3.10-venv
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Create a virtual environment
    python3 -m venv ~/.python/verl-multiturn-rollout
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Activate the virtual environment
    source ~/.python/verl-multiturn-rollout/bin/activate
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install uv
    python3 -m pip install uv
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Install verl Upstream
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~
 
 .. code:: bash
@@ -85,78 +71,60 @@ Install verl Upstream
 Set Up a Local Retrieval Engine
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 If you are using your own local retrieval service, you can skip this
 step. We chose the local dense retriever provided in the search-R1
 example; detailed instructions are in the `searchR1
 docs <https://raw.githubusercontent.com/PeterGriffinJin/Search-R1/refs/heads/main/docs/retriever.md>`__.
 In brief:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -  The GPU version offers higher accuracy and speed; each GPU uses about
    5–7 GB of memory.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -  The CPU version can be used for simple testing but has lower
    retrieval precision, which will degrade training performance. See the
    `retriever
    documentation <https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/retriever.md>`__
    in search-R1 for details.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 -  Recommend using Conda to install faiss-gpu=1.8.0; venv may cause errors.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 **Note**: To start both the training process and the local retrieval
 service, we launch two separate Python environments. The training uses
 uv in the verl-multiturn-rollout environment, while the retriever uses
 conda to install ``faiss-gpu``.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: bash
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Download the Miniconda installer script
    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install to $HOME/miniconda3 in batch mode
    bash ~/miniconda.sh -b -p $HOME/miniconda3
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Activate conda (only in the current shell)
    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # (Optional) Add conda to your default shell startup
    conda init
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Reload shell config
    source ~/.bashrc
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Create and activate the retriever environment with Python 3.10
    conda create -n retriever python=3.10 -y
    conda activate retriever
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install PyTorch (with GPU support) and related libraries
    conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install other Python packages
    pip install transformers datasets pyserini huggingface_hub
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install the GPU version of faiss
    conda install faiss-gpu=1.8.0 -c pytorch -c nvidia -y
 
-   .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
    # Install the API service framework
    pip install uvicorn fastapi
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Download the Indexing and Corpus
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The local retrieval files are large—prepare sufficient disk space.
@@ -174,44 +142,29 @@ Downloading is about 60–70 GB, and uncompressed takes about 132 GB:
 Start the Local flat e5 Retrieval Server
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. The first startup will download models and load the index.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Apart from the download, startup takes about 1–2 minutes.
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 3. After startup, each GPU uses about 5–7 GB of memory, leaving the rest
    for multi-turn RL training.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    conda activate retriever
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    index_file=$save_path/e5_Flat.index
    corpus_file=$save_path/wiki-18.jsonl
    retriever_name=e5
    retriever_path=intfloat/e5-base-v2
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    python examples/sglang_multiturn/search_r1_like/local_dense_retriever/retrieval_server.py \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --index_path $index_file \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --corpus_path $corpus_file \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --topk 3 \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --retriever_name $retriever_name \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --retriever_model $retriever_path \
-     .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
      --faiss_gpu
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Set Up WANDB_API_KEY
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~
 
 .. code:: bash
@@ -226,19 +179,14 @@ Set Up WANDB_API_KEY
 **Preprocess the Dataset**
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    **Note:** The following data processing and training commands must be
    run in the verl-multiturn-rollout environment.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: bash
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    python3 examples/data_preprocess/preprocess_search_r1_dataset.py
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Testing on 8 x H20
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~
 
 .. code:: bash

@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # --------------------- ALFWorld --------------------- #
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 ALFWORLD_TEMPLATE_NO_HIS = """
 You are an expert agent operating in the ALFRED Embodied Environment.
 Your current observation is: {current_observation}
@@ -25,7 +24,6 @@ You should first reason step-by-step about the current situation. This reasoning
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 ALFWORLD_TEMPLATE = """
 You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
 Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}

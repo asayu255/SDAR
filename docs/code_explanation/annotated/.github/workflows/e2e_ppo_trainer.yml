@@ -1,314 +1,189 @@
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 name: e2e_ppo_trainer
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 on:
   # Trigger the workflow on push or pull request,
   # but only for the main branch
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   push:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     branches:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - main
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - v0.*
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   pull_request:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     branches:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - main
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - v0.*
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     paths:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "**/*.py"
       # Other entrypoints
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!examples/**"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!tests/**"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!verl/trainer/main_*.py"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!verl/trainer/fsdp_sft_trainer.py"
       # Recipes
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!recipe/**"
       # Megatron
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "!verl/workers/**/megatron_*.py"
       # Entrypoints
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - ".github/workflows/e2e_ppo_trainer.yml"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "examples/data_preprocess/gsm8k.py"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "examples/data_preprocess/geo3k.py"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "tests/e2e/ppo_trainer"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "verl/trainer/main_ppo.py"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "verl/trainer/config/ppo_trainer.yaml"
 
 # Cancel jobs on the same ref if a new one is triggered
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 concurrency:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   group: ${{ github.workflow }}-${{ github.ref }}
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Declare permissions just read content.
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 permissions:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   contents: read
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 jobs:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   pre_commit_for_ppo:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: ubuntu-latest
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     strategy:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       matrix:
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         python-version: ["3.12"]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Set up Python ${{ matrix.python-version }}
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           python-version: ${{ matrix.python-version }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Set ruff --output-format=github
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           sed -i 's/--output-format=full/--output-format=github/' .pre-commit-config.yaml
           git add .pre-commit-config.yaml
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: pre-commit/action@v3.0.1
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           extra_args: "" # Overriding default "--all-files"
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_vllm:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.3
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=10g
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install --no-deps -e .[test,vllm]
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare GSM8K dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/gsm8k.py
       # Function RM
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm with validation and saving (FSDP_SIZE=8)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           VAL_BEFORE_TRAIN=True TEST_FREQ=1 SAVE_FREQ=1 SAVE_HF_MODEL=True VERL_EXP_NAME="qwen2.5-0.5b-function-reward-minimal-fsdp8" bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm after resuming
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           RESUME_MODE=auto VERL_EXP_NAME="qwen2.5-0.5b-function-reward-minimal-fsdp8" bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Test merging FSDP checkpoints (Qwen Actor) 
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           exp_name="qwen2.5-0.5b-function-reward-minimal-fsdp8"
           python scripts/model_merger.py test --backend fsdp --local_dir checkpoints/verl-test/${exp_name}/global_step_1/actor --test_hf_dir checkpoints/verl-test/${exp_name}/global_step_1/actor/huggingface
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm with validation and saving (DDP_SIZE=2, FSDP_SIZE=4)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           VAL_BEFORE_TRAIN=True TEST_FREQ=1 SAVE_FREQ=1 SAVE_HF_MODEL=True FSDP_SIZE=4 VERL_EXP_NAME="qwen2.5-0.5b-function-reward-minimal-ddp2-fsdp4" bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Test merging DDP+FSDP checkpoints (Qwen Actor) 
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           exp_name="qwen2.5-0.5b-function-reward-minimal-ddp2-fsdp4"
           python scripts/model_merger.py test --backend fsdp --local_dir checkpoints/verl-test/${exp_name}/global_step_1/actor --test_hf_dir checkpoints/verl-test/${exp_name}/global_step_1/actor/huggingface
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E without rmpad using function rm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           RM_PAD=False bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm (GRPO)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           ADV_ESTIMATOR=grpo USE_KL=True bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm (ReMax)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           ADV_ESTIMATOR=remax USE_KL=True bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using customized reward function
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           CUSTOM_REWARD_FN=True bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm with in-reward kl and kl loss
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           USE_KL=True bash tests/e2e/ppo_trainer/run_function_reward.sh
       # LoRA tests
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with grpo lora using function rm with use_shm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           ADV_ESTIMATOR=grpo USE_SHM=True LORA_RANK=32 LOAD_FORMAT=safetensors bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with grpo lora using function rm with use_shm and layered_summon
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           ADV_ESTIMATOR=grpo USE_SHM=True LORA_RANK=32 LOAD_FORMAT=safetensors LAYERED_SUMMON=True bash tests/e2e/ppo_trainer/run_function_reward.sh
       # Model RM
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GRPO GSM8K E2E training tests with FSDP on 8 L20 GPUs (DeepSeek)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           MODEL_ID=deepseek-ai/deepseek-coder-1.3b-instruct bash tests/e2e/ppo_trainer/run_function_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E with rmpad using model rm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           bash tests/e2e/ppo_trainer/run_model_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E without rmpad using model rm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           RM_PAD=False bash tests/e2e/ppo_trainer/run_model_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E with rmpad using model rm and ulysses sp=2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           SP_SIZE=2 bash tests/e2e/ppo_trainer/run_model_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E with rmpad using model rm and dynamic batch size
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           SEQ_BALANCE=True bash tests/e2e/ppo_trainer/run_model_reward.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E with rmpad using model rm with Liger Kernel enabled
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           LIGER=True bash tests/e2e/ppo_trainer/run_model_reward.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_vllm_vlm:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.3-flashinfer0.2.2-cxx11abi0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=50g # Visual dataloader requires large memory
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,geo,vllm]
       # Geo3k
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare Geo3k dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/geo3k.py
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running Geo3k VLM E2E training tests on 8 L20 GPUs with rmpad using function rm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           TRAIN_FILES=$HOME/data/geo3k/train.parquet VAL_FILES=$HOME/data/geo3k/test.parquet \
@@ -318,165 +193,94 @@ jobs:
             SP_SIZE=2 \
             bash tests/e2e/ppo_trainer/run_function_reward.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_sglang:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6.post5-mcore0.12.0-te2.3
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=10g
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,gpu,sglang] --no-deps
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare gsm8k dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/gsm8k.py
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K E2E training tests on 8 L20 GPUs with rmpad using function rm and save ckpt
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           ENGINE=sglang bash tests/e2e/ppo_trainer/run_function_reward.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_sglang_multiturn_with_tool:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6.post5-mcore0.12.0-te2.3
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=10g
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,gpu,sglang] --no-deps
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare gsm8k dataset with tool
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/gsm8k_multiturn_w_tool.py --local_dir $HOME/data/gsm8k_verl_sgl_multi_turn_preprocessed
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K with tool E2E training tests on 8 L20 GPUs with rmpad using function rm and save ckpt with sglang
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           bash tests/e2e/run_gsm8k_fsdp_sgl_multiturn_w_tool.sh
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running GSM8K with tool E2E training tests with FSDP2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           FSDP_STRATEGY=fsdp2 bash tests/e2e/run_gsm8k_fsdp_sgl_multiturn_w_tool.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_sglang_vlm:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6.post5-mcore0.12.0-te2.3
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=50g # Visual dataloader requires large memory
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,geo,gpu,sglang]
       # Geo3k
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare Geo3k dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/geo3k.py
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running Geo3k VLM E2E training tests on 8 L20 GPUs with rmpad using function rm
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           TRAIN_FILES=$HOME/data/geo3k/train.parquet VAL_FILES=$HOME/data/geo3k/test.parquet \
@@ -487,55 +291,32 @@ jobs:
             ACTOR_FSDP_OPTIMIZER_OFFLOAD=True REF_FSDP_PARAM_OFFLOAD=True \
             bash tests/e2e/ppo_trainer/run_function_reward.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_fused_kernels_vllm:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.3-flashinfer0.2.2-cxx11abi0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=50g # Visual dataloader requires large memory
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,geo,vllm]
       # Geo3k
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare Geo3k dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/geo3k.py
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running Geo3k VLM E2E with rmpad using fused kernel (Qwen2.5-VL)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           FUSED_KERNELS=True TRAIN_FILES=$HOME/data/geo3k/train.parquet VAL_FILES=$HOME/data/geo3k/test.parquet \
@@ -546,54 +327,31 @@ jobs:
             ACTOR_FSDP_OPTIMIZER_OFFLOAD=True REF_FSDP_PARAM_OFFLOAD=True \
             bash tests/e2e/ppo_trainer/run_function_reward.sh
 
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   e2e_ppo_trainer_fused_kernels_sglang:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: [L20x8]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     needs: pre_commit_for_ppo
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 40 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     env:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_ENDPOINT: "https://hf-mirror.com"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     container:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6.post5-mcore0.12.0-te2.3
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       options: --gpus all --shm-size=50g # Visual dataloader requires large memory
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           fetch-depth: 0
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip3 install -e .[test,geo,gpu,sglang]
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Prepare Geo3k dataset
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           python3 examples/data_preprocess/geo3k.py
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Running Geo3k VLM E2E with rmpad using fused kernel (Qwen2.5-VL)
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           ray stop --force
           FUSED_KERNELS=True TRAIN_FILES=$HOME/data/geo3k/train.parquet VAL_FILES=$HOME/data/geo3k/test.parquet \

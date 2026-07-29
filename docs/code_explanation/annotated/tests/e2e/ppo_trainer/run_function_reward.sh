@@ -1,135 +1,79 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NUM_GPUS=${NUM_GPUS:-8}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TRAIN_FILES=${TRAIN_FILES:-$HOME/data/gsm8k/train.parquet}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_FILES=${VAL_FILES:-$HOME/data/gsm8k/test.parquet}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-512}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${ENGINE:-vllm}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ACTOR_FSDP_PARAM_OFFLOAD=${ACTOR_FSDP_PARAM_OFFLOAD:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ACTOR_FSDP_OPTIMIZER_OFFLOAD=${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 REF_FSDP_PARAM_OFFLOAD=${REF_FSDP_PARAM_OFFLOAD:-True}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 RM_PAD=${RM_PAD:-True}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 FUSED_KERNELS=${FUSED_KERNELS:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ADV_ESTIMATOR=${ADV_ESTIMATOR:-gae}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 USE_KL=${USE_KL:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CUSTOM_REWARD_FN=${CUSTOM_REWARD_FN:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL:-True} # For vLLM VLM placeholder issue: https://github.com/vllm-project/vllm/issues/15185
 # LoRA config
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 LORA_RANK=${LORA_RANK:-0}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 LORA_ALPHA=${LORA_ALPHA:-${LORA_RANK}}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 USE_SHM=${USE_SHM:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 LOAD_FORMAT=${LOAD_FORMAT:-dummy_dtensor}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 LAYERED_SUMMON=${LAYERED_SUMMON:-False}
 # Validation
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TEST_FREQ=${TEST_FREQ:--1}
 # Save & Resume
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 RESUME_MODE=${RESUME_MODE:-disable}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SAVE_FREQ=${SAVE_FREQ:--1}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-1}
 
 # whether to save hf_model
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SAVE_HF_MODEL=${SAVE_HF_MODEL:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 FSDP_SIZE=${FSDP_SIZE:--1}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 SP_SIZE=${SP_SIZE:-1}
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 if [ "${SAVE_HF_MODEL}" = "True" ]; then
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     CHECKPOINT_CONTENTS="['model','hf_model','optimizer','extra']"
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 else
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     CHECKPOINT_CONTENTS="['model','optimizer','extra']"
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 fi
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz_per_gpu=2 # b
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 n_resp_per_prompt=4 # g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * NUM_GPUS)) # b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_mini_bsz=$((train_traj_micro_bsz * 2)) # 2 * b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_mini_bsz=$((train_traj_mini_bsz * n_resp_per_prompt)) # 2 * b * n / g
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_bsz=$((train_prompt_mini_bsz * 2)) # 4 * b * n / g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 reward_fn_name=null
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 reward_fn_file_path=null
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 output_file="$(pwd)/output.txt"
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 if [ "${CUSTOM_REWARD_FN}" = "True" ]; then
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     reward_fn_name="my_reward_function"
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     reward_fn_file_path="$(pwd)/my_reward_function.py"
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     rm -rf "${reward_fn_file_path}"
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     cat <<EOF > "$reward_fn_file_path"
 def ${reward_fn_name}(data_source, solution_str, ground_truth, extra_info=None):
     print(f"Congratulations!!! You have called ${reward_fn_name} successfully!!!")
     return 0.1
 EOF
 
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     rm -rf "${output_file}"
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 fi
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 exp_name="${VERL_EXP_NAME:-$(basename "${MODEL_ID,,}")-function-reward-minimal}"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator="${ADV_ESTIMATOR}" \
     data.train_files="${TRAIN_FILES}" \
@@ -187,22 +131,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps="${TOTAL_TRAIN_STEPS}" $@ \
     | tee "${output_file}"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 if [ "${CUSTOM_REWARD_FN}" = "True" ]; then
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     python3 tests/e2e/check_custom_rwd_fn.py --output_file="${output_file}"
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     check_exit_code=$?
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     rm -rf "${reward_fn_file_path}"
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     rm -rf "${output_file}"
     # Return the exit code of check_custom_rwd_fn.py if it fails
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     if [ $check_exit_code -ne 0 ]; then
-        # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
         exit $check_exit_code
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     fi
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 fi

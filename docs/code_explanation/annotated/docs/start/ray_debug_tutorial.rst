@@ -1,22 +1,15 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Ray Debug Tutorial
 ==================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. _wuxibin89: https://github.com/wuxibin89
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Author: `Ao Shen <https://aoshen524.github.io/>`_.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 How to debug?
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ---------------------
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Ray Distributed Debugger VSCode Extension (Recommended)
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 1. Starting with Ray 2.39, Anyscale has introduced the `Ray Distributed Debugger <https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html>`_ VSCode extension. Follow the extension’s installation instructions, then add your cluster using the dashboard URL you obtained earlier.
@@ -85,22 +78,16 @@ Ray Distributed Debugger VSCode Extension (Recommended)
 
 Legacy Ray Debugger
 ~~~~~~~~~~~~~~~~~~~
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. Ray has a builtin legacy `debugger <https://docs.ray.io/en/latest/ray-observability/user-guides/debug-apps/ray-debugging.html>`_ that allows you to debug your distributed applications. To enable debugger, start ray cluster with ``RAY_DEBUG=legacy`` and ``--ray-debugger-external``.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-    .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
     # start head node
     RAY_DEBUG=legacy ray start --head --dashboard-host=0.0.0.0 --ray-debugger-external
-    .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
     # start worker node
     RAY_DEBUG=legacy ray start --address='10.124.46.192:6379' --ray-debugger-external
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Set up breakpoint in your code, and submit job to cluster. Then run ``ray debug`` to wait breakpoint:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/ray/legacy.png?raw=true
 

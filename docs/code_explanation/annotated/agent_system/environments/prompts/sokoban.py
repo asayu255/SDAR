@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # --------------------- Sokoban --------------------- #
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 SOKOBAN_TEMPLATE_NO_HIS = """
 You are an expert agent operating in the Sokoban environment.
 
@@ -45,7 +44,6 @@ You should first reason step-by-step about the current situation — observe the
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 SOKOBAN_TEMPLATE = """
 You are an expert agent operating in the Sokoban environment.
 
@@ -77,7 +75,6 @@ You should first reason step-by-step about the current situation — observe the
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 SOKOBAN_VISUAL_TEMPLATE = """
 You are an expert agent operating in the Sokoban environment. Your goal is to push all the boxes onto the target spots. Once all boxes are on the targets, you win!
 

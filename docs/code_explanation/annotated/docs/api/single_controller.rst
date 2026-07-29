@@ -1,17 +1,13 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Single Controller interface
 ============================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 The Single Controller provides a unified interface for managing distributed workers
 using Ray or other backends and executing functions across them.
 It simplifies the process of dispatching tasks and collecting results, particularly 
 when dealing with data parallelism or model parallelism. 
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Core APIs
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~
 
 .. autoclass:: verl.single_controller.Worker

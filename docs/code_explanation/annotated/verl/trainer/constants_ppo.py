@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import json
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 import os
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
@@ -39,28 +35,20 @@ PPO_RAY_RUNTIME_ENV = {
 }
 
 
-# [EXPLAIN] `get_ppo_ray_runtime_env` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def get_ppo_ray_runtime_env():
-    # [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
     """
     A filter function to return the PPO Ray runtime environment.
     To avoid repeat of some environment variables that are already set.
     """
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     working_dir = (
         json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {}).get("working_dir", None)
     )
 
-    # [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
     runtime_env = {
         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
         **({"working_dir": None} if working_dir is None else {}),
     }
-    # [EXPLAIN] batch、micro-batch、task または token の要素を順に処理する。
     for key in list(runtime_env["env_vars"].keys()):
-        # [EXPLAIN] 実行時の設定または状態を評価し、成立する経路だけを選択する。
         if os.environ.get(key) is not None:
-            # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
             runtime_env["env_vars"].pop(key, None)
-    # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
     return runtime_env

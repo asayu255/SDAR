@@ -1,50 +1,35 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 verl performance tuning for AMD (ROCm Kernel)
 =====================================================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Author: `Yang Wang <https://github.com/YangWang92/>`_
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Patch vLLM to Enable Sleep Mode for AMD GPUs
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 --------------------------------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 By default, verl requires vLLM to enable sleep mode, which allows vLLM to offload GPU memory to CPU memory after rollout. However, this feature is still under review by the vLLM community.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 To enable vLLM's sleep mode, you can first use community patched code (from `this pull request <https://github.com/vllm-project/vllm/pull/12695>`_) to build vLLM from the source code in the corresponding pull request. After the patch merged in vLLM main branch, you can directly install vLLM from the latest version.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 1. Clone the vLLM repository and build it with the following commands:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-    .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     git clone -b sleep_amd https://github.com/HollowMan6/vllm.git
     cd vllm
     sudo ln -sf /opt/rocm/lib/libamdhip64.so /usr/lib/libamdhip64.so
     VLLM_TARGET_DEVICE=rocm ROCM_PATH=/opt/rocm/ VLLM_GPU_LANG=HIP SETUPTOOLS_SCM_PRETEND_VERSION=0.8.4.dev python3 setup.py develop
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 2. Additionally, make sure to use the ROCm version in your Docker image lager than or equal to ROCm 6.3.4, and we recommend to use ROCm 6.4.0 for better performance (see `this comment <https://github.com/vllm-project/vllm/pull/12695#issuecomment-2637839574>`_).
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 After the upgrade, you can verify whether sleep mode is enabled by running the following test code (from `this comment <https://github.com/vllm-project/vllm/pull/12695#issuecomment-2637839574>`_).
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: python
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	import torch
 	from vllm import LLM
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", enable_sleep_mode=True)
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	def run_inference(prompt):
 		outputs = llm.generate(prompt)
 		for output in outputs:
@@ -53,53 +38,39 @@ After the upgrade, you can verify whether sleep mode is enabled by running the f
 			print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	print("CUDA Memory Usage (after inference):")
 	torch.cuda.empty_cache()
 	print(f"{torch.cuda.memory_allocated()=}")
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	run_inference("San Francisco is")
 	llm.sleep()
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	print("CUDA Memory Usage (after sleep):")
 	torch.cuda.empty_cache()
 	print(f"{torch.cuda.memory_allocated()=}")
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	llm.wake_up()
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	print("CUDA Memory Usage (after wakeup):")
 	torch.cuda.empty_cache()
 	print(f"{torch.cuda.memory_allocated()=}")
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	run_inference("Paris is")
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 If sleep mode is enabled, you should see the memory usage reduce after sleep.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 After applying the vLLM patch and completing the installation, you can enable sleep mode in verl to reduce memory overhead. This allows verl to offload unused GPU memory during rollout, significantly lowering the memory footprint during long-context training or multi-node reinforcement learning.
 
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Enable CUDA Graph and Bypass ROCm-related issues
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 --------------------------------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Due to potential issues with CUDA graph capture in ROCm, we’ve found that vLLM’s CUDA graph feature cannot be enabled on multiple nodes in verl on AMD platforms with vLLM V1 mode. This leads to significantly slower rollout performance.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Our investigation shows that ROCm may trigger an unexpected crash when attempting to capture large batches with CUDA graph. One workaround is to patch the LLM configuration (from `this commit <https://github.com/volcengine/verl/blob/v0.3.0.rc0/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py#L100-L115>`_).
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: python
 	
-    .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
     self.inference_engine = LLM(
         model=model_path,
         enable_sleep_mode=True,
@@ -119,20 +90,15 @@ Our investigation shows that ROCm may trigger an unexpected crash when attemptin
         enable_chunked_prefill=config.enable_chunked_prefill,
         enable_prefix_caching=True,
         trust_remote_code=trust_remote_code,
-        .. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
         # enable compilation config to bypass oom on rocm
-	.. [EXPLAIN] 以下の節で扱う設計・実行経路・制約の範囲を示す見出しである。
 	# change depends on your GPU memory size
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64]},
         seed=config.get('seed', 0),
     )
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Then, you can enable CUDA graph by setting the following environment variables (see `this page <https://github.com/volcengine/verl/blob/v0.3.0.rc0/docs/README_vllm0.8.md>`_):
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code-block:: bash
 
-	.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 	actor_rollout_ref.rollout.enforce_eager=False \
 	actor_rollout_ref.rollout.free_cache_engine=False \

@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --local-dir $HOME/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_generation \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \
@@ -26,7 +23,6 @@ python3 -m verl.trainer.main_generation \
     rollout.enforce_eager=False \
     rollout.free_cache_engine=False
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.r1.main_eval \
     data.path=$HOME/data/r1/test-output-k1.parquet \
     data.prompt_key=prompt \

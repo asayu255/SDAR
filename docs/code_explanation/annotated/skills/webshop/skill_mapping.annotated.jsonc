@@ -1,60 +1,30 @@
-// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
 {
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   "skill_files": {
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "general_skills": "general_skills.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "apparel": "apparel.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "footwear": "footwear.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "home_decor": "home_decor.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "electronics": "electronics.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "accessories": "accessories.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "beauty_health": "beauty_health.md",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "other": "other.md"
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   },
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   "task_to_skill": {
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "apparel": "apparel",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "footwear": "footwear",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "home_decor": "home_decor",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "electronics": "electronics",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "accessories": "accessories",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "beauty_health": "beauty_health",
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "other": "other"
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   },
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   "task_keywords": {
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "apparel": ["shirt", "dress", "pants", "jacket", "sweater", "blouse", "skirt", "coat", "jeans", "shorts"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "footwear": ["shoe", "boot", "sneaker", "sandal", "slipper", "loafer", "heel"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "home_decor": ["pillow", "rug", "curtain", "lamp", "vase", "frame", "candle", "decor"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "electronics": ["phone", "charger", "cable", "speaker", "headphone", "battery", "adapter", "usb"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "accessories": ["bag", "wallet", "belt", "watch", "sunglasses", "hat", "scarf", "glove"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "beauty_health": ["shampoo", "cream", "lotion", "makeup", "brush", "serum", "moisturizer", "soap"],
-    // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
     "other": []
-  // [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
   }
-// [EXPLAIN] この JSON 要素は実行時設定またはデータ構造の一部を保持する。
 }

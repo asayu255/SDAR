@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # --------------------- Appworld --------------------- #
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 APPWORLD_TEMPLATE_NO_HIS = """
 I am your supervisor and you are a super intelligent AI Assistant whose job is to achieve my day-to-day tasks completely autonomously.
 
@@ -154,7 +153,6 @@ Once you've finished your reasoning, you present the solution code body within <
 """
 
 
-# [EXPLAIN] 後続の計算・routing・mask・metric で参照する値を構築し、現在のスコープまたは batch に保持する。
 APPWORLD_TEMPLATE = """
 I am your supervisor and you are a super intelligent AI Assistant whose job is to achieve my day-to-day tasks completely autonomously.
 

@@ -13,19 +13,13 @@
 # limitations under the License.
 
 
-# [EXPLAIN] `test_import` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def test_import():
-    # [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
     import verl
 
-    # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
     print(verl.__version__)
 
 
-# [EXPLAIN] `test_single_controller_import` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
 def test_single_controller_import():
-    # [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
     import verl.single_controller
 
-    # [EXPLAIN] 必要な引数と現在の状態を渡して処理を呼び出し、戻り値またはbatch への副作用を次の段階へ接続する。
     print(verl.single_controller.__version__)

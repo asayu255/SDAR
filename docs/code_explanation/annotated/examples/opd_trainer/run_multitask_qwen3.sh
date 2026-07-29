@@ -1,4 +1,3 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
 # Pure OPD multitask (alfworld + search + webshop), Qwen3-1.7B.
@@ -33,20 +32,15 @@ set -x
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
 #   old_log_prob phase, so prefetched values would never be consumed.
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export ALFWORLD_DATA=$HOME/data/alfworld
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
 
 # Data prep. These literals are shared with the training command below and are
 # also cross-checked there via the expectations file (per_task_batch_size=15,
 # val_per_task_size=126, total_training_steps=300, seed=1).
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --search_dir "$HOME/data/searchR1_processed_direct" \
     --local_dir "$HOME/data/verl-agent/sdar_multitask" \
@@ -56,7 +50,6 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size 126 \
     --seed 1
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_opd \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_config.yaml \
     algorithm.adv_estimator=grpo \

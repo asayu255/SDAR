@@ -1,76 +1,46 @@
 #!/usr/bin/env bash
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -xeuo pipefail
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 NUM_GPUS=${NUM_GPUS:-8}
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 adv_estimator=grpo
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 kl_coef=0.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_kl_in_reward=False
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_kl_loss=False
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 kl_loss_coef=0.0
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_low=0.2
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 clip_ratio_high=0.28
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_prompt_length=1024
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_response_length=2048
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_overlong_buffer=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 overlong_buffer_len=128
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 overlong_penalty_factor=1.0
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 loss_agg_mode="token-mean"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_filter_groups=True
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 filter_groups_metric=seq_reward
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_num_gen_batches=10
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz_per_gpu=2 # b
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 n_resp_per_prompt=4 # g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * NUM_GPUS)) # b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_traj_mini_bsz=$((train_traj_micro_bsz * 2)) # 2 * b * n
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_mini_bsz=$((train_traj_mini_bsz * n_resp_per_prompt)) # 2 * b * n / g
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_prompt_bsz=$((train_prompt_mini_bsz * 2)) # 4 * b * n / g
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gen_prompt_bsz=$((train_prompt_bsz * 4))
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 exp_name="$(basename "${MODEL_ID,,}")-dapo-minimal"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m recipe.dapo.main_dapo \
     data.train_files="${HOME}/data/gsm8k/train.parquet" \
     data.val_files="${HOME}/data/gsm8k/test.parquet" \

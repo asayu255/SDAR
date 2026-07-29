@@ -11,33 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [EXPLAIN] この論理行で現在の処理ブロックに必要な状態または制御を定義する。
 """
 Sharding manager to implement HybridEngine
 """
 
-# [EXPLAIN] このモジュールで使用する型・設定・分散処理または Tensor 操作の依存関係を読み込む。
 from verl import DataProto
 
 
-# [EXPLAIN] `BaseShardingManager` として状態と関連処理をまとめ、worker・trainer・dataset などの責務境界を定義する。
 class BaseShardingManager:
-    # [EXPLAIN] `__enter__` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def __enter__(self):
-        # [EXPLAIN] 現在の分岐または反復の制御を明示する。
         pass
 
-    # [EXPLAIN] `__exit__` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def __exit__(self, exc_type, exc_value, traceback):
-        # [EXPLAIN] 現在の分岐または反復の制御を明示する。
         pass
 
-    # [EXPLAIN] `preprocess_data` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def preprocess_data(self, data: DataProto) -> DataProto:
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return data
 
-    # [EXPLAIN] `postprocess_data` の入力を検証・変換し、呼び出し元が使用する結果または副作用を生成する処理単位を定義する。
     def postprocess_data(self, data: DataProto) -> DataProto:
-        # [EXPLAIN] 計算済みの Tensor、metric、batch または状態を呼び出し元へ返す。
         return data

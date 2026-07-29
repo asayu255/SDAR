@@ -1,89 +1,51 @@
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 name: doc_test
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 on:
   # Trigger the workflow on push or pull request,
   # but only for the main branch
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   push:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     branches:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - main
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - v0.*
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   pull_request:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     branches:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - main
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - v0.*
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     paths:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "**/*.py"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - "docs/**"
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - .github/workflows/doc.yml
 
 # Cancel jobs on the same ref if a new one is triggered
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 concurrency:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   group: ${{ github.workflow }}-${{ github.ref }}
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Declare permissions just read content.
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 permissions:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   contents: read      # for checkout
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   pages: write        # for deploy-pages
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   id-token: write     # for deploy-pages
 
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 jobs:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   doc_test:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     runs-on: ubuntu-latest
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     timeout-minutes: 5 # Increase this timeout value as needed
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     strategy:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       matrix:
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         python-version: ["3.10"]
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     steps:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Set up Python ${{ matrix.python-version }}
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         with:
-          # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
           python-version: ${{ matrix.python-version }}
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Install the current repository
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           pip install -e .[test]
           pip install -r docs/requirements-docs.txt
 
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       - name: Run doc make html
-        # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
         run: |
           cd docs 
           make clean

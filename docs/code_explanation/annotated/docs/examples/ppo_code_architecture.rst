@@ -1,48 +1,35 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 PPO Example Architecture
 ========================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Let's start with the Proximal Policy Optimization algorithm, which is
 most widely used algorithm in LLM post-training.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 The main entry point of the PPO algorithm example is:
 `main_ppo.py <https://github.com/volcengine/verl/blob/main/verl/trainer/main_ppo.py>`_.
 In this tutorial, we will go through the code architecture in `main_ppo.py <https://github.com/volcengine/verl/blob/main/verl/trainer/main_ppo.py>`_.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Define the data
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ---------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Users need to preprocess and store the dataset in parquet files.
 And we implement `RLHFDataset` to load and tokenize the parquet files.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 For ``RLHFDataset`` (Default), at least 1 fields are required:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - ``prompt``: Contains the string prompt
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 We already provide some examples of processing the datasets to parquet
 files in `data_preprocess directory <https://github.com/volcengine/verl/blob/main/examples/data_preprocess>`_. Currently, we support
 preprocess of GSM8k, MATH, Hellasage, Full_hh_rlhf datasets. See :doc:`../preparation/prepare_data` for
 more information.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Define the reward functions for different datasets
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 --------------------------------------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 In this main entry point, the users only need to define their own reward
 function based on the datasets (or applications) utilized in PPO
 training.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 For example, we already provide reward functions for `GSM8k <https://github.com/volcengine/verl/blob/main/verl/utils/reward_score/gsm8k.py>`_ 
 and `MATH <https://github.com/volcengine/verl/blob/main/verl/utils/reward_score/math.py>`_
 datasets in the ``_select_rm_score_fn``. In the ``RewardManager``, we
@@ -52,46 +39,36 @@ full_hh_rlhf), the reward model is utilized to assess the responses
 without any reward functions. In this case, the ``RewardManager`` will
 return the ``rm_score`` computed by the reward model directly.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 See `reward functions <https://github.com/volcengine/verl/blob/main/verl/utils/reward_score>`_ for detailed implementation.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Define worker classes
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ---------------------
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. code:: python
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    if config.actor_rollout_ref.actor.strategy == 'fsdp': # for FSDP backend
        assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
        from verl.single_controller.ray import RayWorkerGroup
        ray_worker_group_cls = RayWorkerGroup
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    elif config.actor_rollout_ref.actor.strategy == 'megatron': # for Megatron backend
        assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
        from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
        ray_worker_group_cls = NVMegatronRayWorkerGroup # Ray worker class for Megatron-LM
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    else:
        raise NotImplementedError
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    role_worker_mapping = {
        Role.ActorRollout: ActorRolloutRefWorker,
        Role.Critic: CriticWorker,
        Role.RefPolicy: ActorRolloutRefWorker
    }
 
-   .. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
    global_pool_id = 'global_pool'
    resource_pool_spec = {
        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -102,9 +79,7 @@ Define worker classes
        Role.RefPolicy: global_pool_id,
    }
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 1: Construct the mapping between roles and workers
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A role represents a group of workers in the same process. We have
@@ -127,11 +102,9 @@ pre-defined several roles in `ray_trainer.py <https://github.com/volcengine/verl
 Step 2: Define the worker class corresponding to this role
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - We have pre-implemented the ``ActorRolloutRefWorker``. Through
   different configs, it can be a standalone actor, a standalone rollout,
   an ActorRollout HybridEngine, or an ActorRolloutRef HybridEngine
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - We also pre-implemented workers for ``Actor``, ``Rollout``,
   ``Critic``, ``Reward Model`` and ``Reference model`` on two different
   backend: PyTorch FSDP
@@ -140,9 +113,7 @@ Step 2: Define the worker class corresponding to this role
   and `Megatron-LM Workers <https://github.com/volcengine/verl/blob/main/verl/workers/megatron_workers.py>`_
   for more information.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Step 3: Define resource pool id and resource pool spec
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Resource pool is a division of global GPU resources,

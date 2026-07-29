@@ -1,10 +1,6 @@
-# play_gymcards_test_text_wrap.ipynb セル別解説
-
-<!-- [EXPLAIN] Notebook JSON は変更せず、cell 順序を保った解説を作成する。 -->
+# play_gymcards_test_text_wrap.ipynb セル別参照
 
 ## Cell 1: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 import matplotlib.pyplot as plt
@@ -14,8 +10,6 @@ from text_wrapper import info_to_text_obs, text_projection
 ```
 
 ## Cell 2: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 env_name = 'gym_cards/NumberLine-v0'
@@ -28,8 +22,6 @@ print(text_obs)
 ```
 
 ## Cell 3: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 """
@@ -45,8 +37,6 @@ print(reward, terminated, truncated, info)
 
 ## Cell 4: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 ## Please make sure the string contain the format "action": {act}"
 act = text_projection(['"action": "+"'], env_name)
@@ -57,15 +47,11 @@ print(reward, terminated, truncated, info)
 
 ## Cell 5: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 text_projection(["action: +"], env_name)
 ```
 
 ## Cell 6: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 env_name = 'gym_cards/Blackjack-v0'
@@ -78,8 +64,6 @@ print(text_obs)
 ```
 
 ## Cell 7: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 """
@@ -97,8 +81,6 @@ print(text_obs)
 
 ## Cell 8: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 ## Please make sure the string contain the format "actopm: {act}"
 act = text_projection(['"action": "hit"'], env_name)
@@ -111,8 +93,6 @@ print(text_obs)
 
 ## Cell 9: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 env_name = 'gym_cards/EZPoints-v0'
 env = gym.make(env_name)
@@ -124,8 +104,6 @@ print(text_obs)
 ```
 
 ## Cell 10: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 """
@@ -143,8 +121,6 @@ print(text_obs)
 
 ## Cell 11: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 ## Please make sure the string contain the format "actopm: {act}"
 act = text_projection(['"action": "+"'], env_name)
@@ -157,8 +133,6 @@ print(text_obs)
 
 ## Cell 12: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 env_name = 'gym_cards/Points24-v0'
 env = gym.make(env_name)
@@ -170,8 +144,6 @@ print(text_obs)
 ```
 
 ## Cell 13: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 """
@@ -189,8 +161,6 @@ print(text_obs)
 
 ## Cell 14: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 ## Please make sure the string contain the format "actopm: {act}"
 act = text_projection(['"action": "*"'], env_name)
@@ -202,8 +172,6 @@ print(text_obs)
 ```
 
 ## Cell 15: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 

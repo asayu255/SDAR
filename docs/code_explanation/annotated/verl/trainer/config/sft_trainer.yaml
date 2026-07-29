@@ -1,115 +1,59 @@
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 data:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   train_batch_size: 256
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   micro_batch_size_per_gpu: 4  # this is also val batch size
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   train_files: ~/data/gsm8k/train.parquet
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   val_files: ~/data/gsm8k/test.parquet
   # Single-turn settings
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   prompt_key: question
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   response_key: answer
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   prompt_dict_keys: ['question']
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   response_dict_keys: ['answer']
   # Multi-turn settings
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   multiturn:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     enable: false  # Set to true to use multi-turn dataset
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     messages_key: messages  # Key for messages list in multi-turn mode
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   max_length: 1024
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   truncation: error
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   balance_dp_token: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   chat_template: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   custom_cls:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     path: null
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     name: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   use_shm: False
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 model:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   partial_pretrain: ~/models/gemma-1.1-7b-it
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   use_shm: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   fsdp_config:
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     wrap_policy:
-      # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
       min_num_params: 0
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     cpu_offload: False
-    # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
     offload_params: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   external_lib: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   enable_gradient_checkpointing: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   trust_remote_code: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   lora_alpha: 16  # LoRA scaling factor
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   target_modules: all-linear  # Target modules for LoRA adaptation
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   use_liger: False
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   strategy: fsdp2
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 optim:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   lr: 1e-5
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   betas: [0.9, 0.95]
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   weight_decay: 0.01
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   warmup_steps_ratio: 0.1
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   clip_grad: 1.0
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   lr_scheduler: cosine
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 ulysses_sequence_parallel_size: 1
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 use_remove_padding: False
-# [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
 trainer:
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   default_local_dir: /tmp/sft_model
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   default_hdfs_dir: hdfs://tmp/experiments/gsm8k/gemma-1.1-7b-it/ # change the hdfs path here
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   resume_path: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   project_name: gsm8k-sft
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   experiment_name: test
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   total_epochs: 4
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   total_training_steps: null
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   logger: ['console']
-  # [EXPLAIN] この設定項目の値を、entry point または worker が読み取る構成として定義する。
   seed: 1
 

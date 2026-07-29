@@ -1,21 +1,14 @@
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 Data interface
 =========================
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 DataProto is the interface for data exchange.
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 The :class:`verl.DataProto` class contains two key members:
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - batch: a :class:`tensordict.TensorDict` object for the actual data
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 - meta_info: a :class:`Dict` with additional meta information
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 TensorDict
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 ~~~~~~~~~~~~
 
 :attr:`DataProto.batch` is built on top of :class:`tensordict`, a project in the PyTorch ecosystem.
@@ -62,6 +55,5 @@ For more about :class:`tensordict.TensorDict` usage, see the official tensordict
 Core APIs
 ~~~~~~~~~~~~~~~~~
 
-.. [EXPLAIN] この段落は実装の意図、利用条件または検証上の注意を説明する。
 .. autoclass::  verl.DataProto
    :members: to, select, union, make_iterator, concat

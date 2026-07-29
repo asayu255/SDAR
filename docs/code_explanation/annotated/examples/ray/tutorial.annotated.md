@@ -1,30 +1,20 @@
-# tutorial.ipynb セル別解説
-
-<!-- [EXPLAIN] Notebook JSON は変更せず、cell 順序を保った解説を作成する。 -->
+# tutorial.ipynb セル別参照
 
 ## Cell 1: markdown
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 # VeRL Ray API Tutorial
 
 ## Cell 2: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ## Chapter 1: Ray Basics
 
 ## Cell 3: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 import os
 ```
 
 ## Cell 4: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 import warnings
@@ -37,8 +27,6 @@ warnings.filterwarnings("ignore")
 
 ## Cell 5: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Build a local ray cluster. The head node and worker node are on this machine
 ray.init()
@@ -46,13 +34,9 @@ ray.init()
 
 ## Cell 6: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 Implement an Accumulator class.
 
 ## Cell 7: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 @ray.remote
@@ -69,16 +53,12 @@ class Accumulator:
 
 ## Cell 8: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Instantiate an accumulator. Accumulator can be viewed as a process, acting as an RPC service.
 accumulator = Accumulator.remote()
 ```
 
 ## Cell 9: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 value_ref = accumulator.get_value.remote()  # Check the current value. Note that this function returns immediately and does not actually wait for the remote execution to complete.
@@ -89,8 +69,6 @@ print(value)
 
 ## Cell 10: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Accumulate, then check the result.
 accumulator.add.remote(10)  # Similarly, the 'add' here will return immediately.
@@ -100,15 +78,11 @@ print(new_value)
 
 ## Cell 11: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ## Chapter 2: Resource Pool and RayWorkerGroup
 In the previous example, it was a simple single-process worker. 
 In this example, we implement a worker with a GPU and form a RayWorkerGroup. Within this RayWorkerGroup, we implement a simple operation of an accumulator.
 
 ## Cell 12: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 from verl.single_controller.base import Worker
@@ -117,15 +91,11 @@ from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePoo
 
 ## Cell 13: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 resource_pool = RayResourcePool([4], use_gpu=True)
 ```
 
 ## Cell 14: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 @ray.remote
@@ -143,8 +113,6 @@ class GPUAccumulator(Worker):
 
 ## Cell 15: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Each worker's initial value is its rank, and then each rank's value is incremented by 1, so the values obtained on each rank are [1, 2, 3, 4]
 class_with_args = RayClassWithInitArgs(cls=GPUAccumulator)
@@ -154,26 +122,18 @@ print(worker_group.execute_all_sync("add", x=[1, 1, 1, 1]))
 
 ## Cell 16: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 The principle of parameter passing: The input parameter is a list of length world_size, where each element in the list is dispatched respectively to each worker in the RayWorkerGroup. 
 The return parameter is also a list, corresponding to the return value of each worker.
 
 ## Cell 17: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ### GPU Resource Sharing
 
 ## Cell 18: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 RayWorkerGroups mapped to the same resource pool share the GPU. In this example, we implement three resource pools: the first occupies 4 GPUs, the second also occupies 4 GPUs, and the last occupies all 8 GPUs. Among them, the first resource pool reuses the resource pool mentioned above.
 
 ## Cell 19: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # Create a new resource pool and then merge the newly created resource pool with the previous one.
@@ -183,8 +143,6 @@ resource_pool_merge = merge_resource_pool(resource_pool, resource_pool_1)
 
 ## Cell 20: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Establish a RayWorkerGroup on the newly created resource pool.
 worker_group_1 = RayWorkerGroup(resource_pool_1, class_with_args)
@@ -192,8 +150,6 @@ worker_group_merge = RayWorkerGroup(resource_pool_merge, class_with_args)
 ```
 
 ## Cell 21: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # Run 'add' on the second set of 4 GPUs; the result should be [2, 3, 4, 5].
@@ -203,8 +159,6 @@ print(output_1)
 
 ## Cell 22: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 # Run 'add' on the merged set of 8 GPUs; the result should be [3, 4, 5, 6, 7, 8, 9, 10].
 output_merge = worker_group_merge.execute_all_sync("add", x=[3, 3, 3, 3, 3, 3, 3, 3])
@@ -213,36 +167,26 @@ print(output_merge)
 
 ## Cell 23: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 print(worker_group.world_size, worker_group_1.world_size, worker_group_merge.world_size)
 ```
 
 ## Cell 24: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ## Chapter 3: Data Dispatch, Execution and Collection
 
 ## Cell 25: markdown
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 In the above example, we used the `execute_all_sync` function in the RayWorkerGroup to dispatch data from the driver to each worker. This is very inconvenient for coding. 
 In this chapter, we use the form of function decorators to allow RayWorkerGroup to directly call functions written in the Worker, and to greatly simplify parameter passing.
 
 ## Cell 26: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 from verl.single_controller.base.decorator import Dispatch, Execute, register
 ```
 
 ## Cell 27: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 @ray.remote
@@ -263,16 +207,12 @@ class GPUAccumulatorDecorator(Worker):
 
 ## Cell 28: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 class_with_args = RayClassWithInitArgs(cls=GPUAccumulatorDecorator)
 gpu_accumulator_decorator = RayWorkerGroup(resource_pool_merge, class_with_args)
 ```
 
 ## Cell 29: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # As we can see, 10 is automatically dispatched to each Worker in this RayWorkerGroup.
@@ -281,22 +221,16 @@ print(gpu_accumulator_decorator.add(x=10))
 
 ## Cell 30: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ### Custom Dispatch, Collection
 Users can customize `dispatch` and `collection` function. You only need to write the `dispatch_fn` and `collect_fn` functions yourself. We also support executing RPC only on rank_zero, with specific examples provided below.
 
 ## Cell 31: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 from verl.single_controller.base.decorator import Dispatch, collect_all_to_all, register
 ```
 
 ## Cell 32: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 def two_to_all_dispatch_fn(worker_group, *args, **kwargs):
@@ -335,16 +269,12 @@ class TestActor(Worker):
 
 ## Cell 33: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 class_with_args = RayClassWithInitArgs(cls=TestActor, x=2)
 worker_group = RayWorkerGroup(resource_pool, class_with_args)
 ```
 
 ## Cell 34: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 output_ref = worker_group.foo_custom(x=[1, 2], y=[5, 6])
@@ -356,15 +286,11 @@ assert output_ref == 5
 
 ## Cell 35: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 print(gpu_accumulator_decorator.world_size)
 ```
 
 ## Cell 36: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # Shutdown ray cluster
@@ -373,13 +299,9 @@ ray.shutdown()
 
 ## Cell 37: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ## Chapter 4: NVMegatronRayWorkerGroup
 
 ## Cell 38: markdown
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 Due to the Ray issue, we can only support max_colocate_count=1 in RayResourcePool for now. 
 This means that each GPU can only have one process.
@@ -387,13 +309,9 @@ We can support max_colocate > 1 when applying this pull request: https://github.
 
 ## Cell 39: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 Therefore, we need to restart the ray and initialize a new resource_pool to demonstrate the **NVMegatronRayWorkerGroup**
 
 ## Cell 40: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # Build a local ray cluster. The head node and worker node are on this machine
@@ -402,13 +320,9 @@ ray.init()
 
 ## Cell 41: markdown
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 Finally, we implement a `NVMegatronRayWorkerGroup`, within which we create a Megatron and then run a tensor parallel (tp) split Llama mlp layer. Here, we use a complex dispatch mode, `Megatron_COMPUTE`. This dispatch mode assumes that user passes the data partitioned by DP dimension. The data is dispatched to all tp/pp ranks within the same dp group, and ultimately only collects output data from tp=0 and the last pp. In this way, for users that only write code on the driver, the Megatron behind the RPC becomes transparent.
 
 ## Cell 42: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 import sys
@@ -431,8 +345,6 @@ print(megatron.__file__)
 
 ## Cell 43: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 from megatron.core import parallel_state as mpu
 from omegaconf import OmegaConf
@@ -445,15 +357,11 @@ from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
 
 ## Cell 44: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 resource_pool = RayResourcePool([4], use_gpu=True, max_colocate_count=1)
 ```
 
 ## Cell 45: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 @ray.remote
@@ -516,8 +424,6 @@ class MLPLayerWorker(MegatronWorker):
 
 ## Cell 46: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 layer_cls = RayClassWithInitArgs(cls=MLPLayerWorker)
 layer_worker_group = NVMegatronRayWorkerGroup(
@@ -528,15 +434,11 @@ layer_worker_group = NVMegatronRayWorkerGroup(
 
 ## Cell 47: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 print(layer_worker_group.world_size, layer_worker_group.tp_size, layer_worker_group.pp_size, layer_worker_group.dp_size)
 ```
 
 ## Cell 48: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 ffn_hidden_size = 11008
@@ -557,15 +459,11 @@ config = OmegaConf.create(
 
 ## Cell 49: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 x = torch.rand(size=(seq_len, batch_size, hidden_size), dtype=torch.float32)
 ```
 
 ## Cell 50: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 layer_worker_group.init_model(config)
@@ -573,16 +471,12 @@ layer_worker_group.init_model(config)
 
 ## Cell 51: code
 
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
-
 ```python
 output = layer_worker_group.run_layer([x])  # This must be a list of size 1, ensuring that the input equals the data parallel (dp).
 print(output[0].shape)
 ```
 
 ## Cell 52: code
-
-<!-- [EXPLAIN] この cell の原文と実行・説明上の役割を対応付ける。 -->
 
 ```python
 # Shutdown ray cluster

@@ -1,43 +1,28 @@
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ENGINE=${1:-vllm}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 shift || true
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 num_cpus_per_env_worker=0.1
 
 # SDAR hyperparameters
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 sdar_coef=0.01
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gate_beta=5.0
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 skill_all=false
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 per_task_batch_size=15
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 train_data_size=45
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_per_task_size=126
 # val_data_size == val_per_task_size: the task-sorted test parquet then yields one
 # single-task batch per task, so each task is validated in its own rollout pass
 # (no mixed-task validation batch).
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 val_data_size=$val_per_task_size
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 group_size=8
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 total_training_steps=300
 # Shared seed for the search data subset (prepare) and the dataloader shuffle
 # (data.seed -> TaskBalancedSampler). Single-task runs use the dataloader default
 # (data.seed=1); set it explicitly here so the search周回 is reproducible and the
 # seed handling is consistent rather than relying on an implicit default.
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 seed=1
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 model_path="Qwen/Qwen3-1.7B"
 
 # --- Throughput knobs (opt-in; defaults preserve the fair-comparison alignment) -
@@ -55,23 +40,14 @@ model_path="Qwen/Qwen3-1.7B"
 # cache to exactly what is needed and truncates no valid sequence, so it is a pure
 # speedup and is on by default. prefix caching is already the code default (output
 # -safe deterministic reuse) and is kept on.
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 param_offload=${PARAM_OFFLOAD:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 max_model_len=${MAX_MODEL_LEN:-4608}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
 # CUDA-graph decode (mechanism B). The passthrough already exists in
 # vllm_rollout_spmd (enforce_eager=False is set below); capture sizes only take
@@ -80,21 +56,13 @@ gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
 #   VLLM_USE_V1=1 CUDAGRAPH_CAPTURE_SIZES='[8,16,32,64,128,256,384]' bash ...
 # Sampling-distribution-preserving (same class as prefix caching), not
 # bit-identical. Leave both unset to reproduce the current engine behavior.
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 cudagraph_capture_sizes=${CUDAGRAPH_CAPTURE_SIZES:-}
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 if [ -n "${VLLM_USE_V1:-}" ]; then
-    # [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
     export VLLM_USE_V1
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 fi
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 extra_rollout_args=()
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 if [ -n "$cudagraph_capture_sizes" ]; then
-    # [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
     extra_rollout_args+=("+actor_rollout_ref.rollout.cudagraph_capture_sizes=$cudagraph_capture_sizes")
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 fi
 # -----------------------------------------------------------------------------
 
@@ -132,20 +100,14 @@ fi
 #     leading 126 rows of test.parquet (same fixed population the single-task
 #     val_dataloader(shuffle=False) uses). See prepare_sdar_multitask.py.
 # -----------------------------------------------------------------------------
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export ALFWORLD_DATA=$HOME/data/alfworld
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --search_dir "$HOME/data/searchR1_processed_direct" \
     --local_dir "$HOME/data/verl-agent/sdar_multitask" \
@@ -155,7 +117,6 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size "$val_per_task_size" \
     --seed "$seed"
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_sdar \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \

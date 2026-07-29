@@ -1,23 +1,16 @@
 # run on 8xH100
 # make sure your current working directory is the root of the project
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 set -x
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 huggingface-cli download Qwen/Qwen2.5-3B-Instruct --local-dir $HOME/models/Qwen/Qwen2.5-3B-Instruct
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 ulimit -n 65535
 
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 PROJECT_DIR="$(pwd)"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
-# [EXPLAIN] 実行設定または後続 command が参照する環境値・引数を定義する。
 FSDP_STRATEGY=${FSDP_STRATEGY:-fsdp}
 
-# [EXPLAIN] 実験起動、環境準備または検証 command の一段階を実行する。
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
     --config-name='gsm8k_multiturn_grpo' \
