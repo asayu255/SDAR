@@ -8,4 +8,7 @@
 - `tools/code_annotation/` の検証ツールで、元コード保持・注釈範囲・構文を確認します。
 - Pure OPD の実効経路と、共有コード上に存在するだけの非実効経路を区別します。
 
+注釈ミラーは元 source の trailing whitespace も保持します。そのため commit gate では、
+ミラー外を `git diff --check`、ミラー内を `validate_source_preservation.py` で検証します。
+
 進捗と再開位置は [STATUS.md](STATUS.md)、対象判定は `manifest.json` / `manifest.csv`、source 固定値は `SOURCE_COMMIT` を参照してください。
