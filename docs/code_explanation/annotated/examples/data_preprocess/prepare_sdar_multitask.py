@@ -28,9 +28,9 @@ def _sample_dataframe(df: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
     return sampled.sort_index().reset_index(drop=True)
 
 
+# AlfWorld/WebShopのepisode内容はdataset行ではなく環境内部のseeded scheduleが選ぶため、ここでは空promptと`task_name`を持つ制御行だけを作る。
+# `extra_info.index`はsplit内の追跡用、`env_kwargs.task_name`はmixed environment routerのdispatch keyであり、どちらも教師入力そのものではない。
 def _dummy_task_dataframe(task_name: str, split: str, size: int) -> pd.DataFrame:
-    # AlfWorld/WebShop は parquet に実 episode を固定せず、task_name と dummy prompt を持つ row だけを作る。
-    # game/task の内容は reset 時に environment 内部 schedule から決まり、row 数は prompt batch 構成を規定する。
     rows = []
     for idx in range(size):
         rows.append(
@@ -56,9 +56,9 @@ def _as_dict(value):
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+# Searchだけはquestion/ground truthが各episodeの実体なので、旧parquetの複数schemaから値を回収し、`env_kwargs`へ正規化して環境へ渡す。
+# ground truthの優先順はenv_kwargs→reward_model→golden_answersで、欠損schemaを吸収しても`task_name=search`というrouting invariantは必ず付与する。
 def _process_search_row(row: pd.Series, split: str, idx: int) -> dict:
-    # Search は dummy ではなく parquet の question、ground truth、data source を保持し、
-    # rollout 時に `env_kwargs` として HTTP retriever を使う Search environment へ渡す。
     item = row.to_dict()
     env_kwargs = _as_dict(item.get("env_kwargs"))
     extra_info = _as_dict(item.get("extra_info"))
@@ -90,6 +90,8 @@ def _process_search_row(row: pd.Series, split: str, idx: int) -> dict:
     return item
 
 
+# test Searchはsingle-task baselineと同じ先頭母集団、trainはseed付き一様sampleを使う。連結後の行順は固定し、学習時の混合順序は`TaskBalancedSampler`だけに委ねる。
+# 3 taskの件数を直後に検証するため、欠落・過剰samplingをparquet生成時点で検出できる。
 def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.DataFrame:
     path = os.path.join(os.path.expanduser(search_dir), f"{split}.parquet")
     if not os.path.exists(path):
@@ -115,8 +117,6 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
 
 
 def _build_split(search_dir: str, split: str, per_task_size_by_task: dict[str, int], seed: int) -> pd.DataFrame:
-    # task ごとに必要 row 数を独立に作成・sample した後で concat し、
-    # 後段 TaskBalancedSampler が参照する contiguous task layout を形成する。
     frames = [
         _dummy_task_dataframe("alfworld", split, per_task_size_by_task["alfworld"]),
         _search_dataframe(search_dir, split, per_task_size_by_task["search"], seed),

@@ -675,9 +675,9 @@ class TrajectoryCollector:
         self._prefetched_log_probs = {}
         return prefetched
 
+    # 次rolloutのCPU/subprocess resetを、現rollout終了後のGPU training区間へ重ねる。pending futureは同じenv instanceかつ同一kwargsでのみ消費できる。
+    # `future.result()`は次rollout開始時のthread合流点である。kwargs不一致時に再resetするとstateful scheduleが二重に進むため、黙ってfallbackせず例外にする。
     def prefetch_env_reset(self, envs: EnvironmentManagerBase, env_kwargs):
-        # 次 step の env reset を background future として開始し、現在 step の teacher/actor GPU 計算と重ねる。
-        # env identity と kwargs が一致する場合だけ1回消費し、resume 用 dataloader pre-peek state と分離する。
         """Launch envs.reset() for the *next* rollout in a background thread.
 
         Called by the trainer right after a rollout's data has been collected
@@ -713,9 +713,9 @@ class TrajectoryCollector:
             return pending["future"].result()
         return envs.reset(kwargs=env_kwargs)
 
+    # 同期loopは未完了trajectoryだけをvLLM generationへ送り、出力をfull batch位置へscatterして履歴を更新する。taskごとの終了turnが違っても、done rowの不要なGPU生成を避けながらglobal indexを保つ。
+    # 任意のlog-prob prefetchでは`envs.step`をhost threadへ投入し、そのI/O待ち中だけ同じ凍結actorで完了rowのold log-probを計算する。`future.result()`が両処理の合流点で、次のgenerationとは競合しない。
     def vanilla_multi_turn_loop(
-        # 1 trajectory を複数 env turn row へ展開する同期 loop で、prompt batch 数と actor row 数は一致し得ない。
-        # 各 turn で active trajectory のみ生成し、done row は mask/placeholder で global trajectory 順を維持する。
             self,
             gen_batch: DataProto, 
             actor_rollout_wg, 
@@ -930,6 +930,8 @@ class TrajectoryCollector:
 
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
     
+    # `multi_turn_loop`はfeature flagによりasync prototypeか既存同期loopを選ぶ公開境界である。async経路も最終的には同じDataProto field、uid grouping、reward/length統計へ変換する必要がある。
+    # 比較実験ではsampling semanticsを変えずschedulerだけを切り替えることが前提で、未対応条件は同期経路へ戻す。
     def dynamic_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -999,9 +1001,6 @@ class TrajectoryCollector:
         return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
 
     def multi_turn_loop(
-        # production entry は config/env var に応じて vanilla/dynamic 経路を選び、
-        # session、active-only decode、compact record、prefetch などの性能機構を適用する。
-        # Pure OPD では old-log-prob 消費 phase がないため、ROLLOUT_PREFETCH_LOGPROB は実効的に不要である。
             self,
             gen_batch: DataProto, 
             actor_rollout_wg, 

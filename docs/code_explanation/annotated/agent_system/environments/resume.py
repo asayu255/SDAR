@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# checkpoint は dataloader 位置を復元しても Ray actor 内の環境 RNG/cycle
-# までは保存しないため、stateful な環境だけ reset 回数を再生して連続実行時の
-# episode 順へ追いつかせる。これは model state の復元とは独立した決定性対策である。
+# checkpointはdataloader位置を復元しても、プロセス内で再生成されるWebShop/ALFWorldのepisode schedule位置までは保存しない。そこでcompleted global step数と「1 stepにつきreset 1回」の不変条件からreset回数を再生する。
+# Searchはepisodeがrowの`env_kwargs`で決まるため対象外であり、dynamic filteringでreset回数が変わる構成にも適用できない。
 """Replay env-side episode schedules after a checkpoint resume.
 
 Some environments pick their episode from an internal, seeded schedule instead of
@@ -64,6 +63,8 @@ def _leaf_envs(env_manager) -> Iterator[Tuple[str, Any]]:
         yield type(leaf).__name__, leaf
 
 
+# single-task managerとmultitask配下のleaf vector envを列挙し、`fast_forward`を公開するstateful envだけを進める。stateless envは明示的にskipする。
+# 再生失敗は再現性を損なうがcheckpoint復旧自体を止めない設計なので、例外をmessageへ変換して学習を継続する。
 def fast_forward_env_schedules(envs, num_resets: int) -> List[str]:
     """Advance every stateful schedule reachable from ``envs`` by ``num_resets``.
 
@@ -79,8 +80,6 @@ def fast_forward_env_schedules(envs, num_resets: int) -> List[str]:
     if envs is None or num_resets is None or num_resets <= 0:
         return messages
 
-    # multitask manager では task 名を sort して走査するが、各 leaf は独立した
-    # schedule を持つため task 間の呼び出し順は episode 選択結果を変えない。
     for label, leaf in _leaf_envs(envs):
         fast_forward = getattr(leaf, "fast_forward", None)
         if not callable(fast_forward):
@@ -88,8 +87,6 @@ def fast_forward_env_schedules(envs, num_resets: int) -> List[str]:
             continue
         try:
             messages.append(f"{label}: {fast_forward(num_resets)}")
-        # ここは学習継続性を優先する best-effort 境界である。失敗は握り潰さず
-        # message に残るが、再開後の episode 順が完全一致しない可能性は残る。
         except Exception as exc:  # noqa: BLE001 - never block a resume
             messages.append(
                 f"{label}: WARNING fast_forward({num_resets}) failed ({exc!r}); "

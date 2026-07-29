@@ -162,6 +162,8 @@ class RLHFDataset(Dataset):
             task_overrides = OmegaConf.to_container(task_overrides, resolve=True)
         return dict(task_overrides)
 
+    # 各rowの`task_name`を正規化し、task別`max_prompt_length`/`truncation`を共有dataset上で選ぶ。row直下にない旧形式は`env_kwargs.task_name`へfallbackする。
+    # overrideがないtaskはglobal defaultへ戻るため、single-task datasetの挙動も維持される。
     def _task_name_from_example(self, example: dict):
         task_name = example.get("task_name")
         if task_name is None:
@@ -171,8 +173,6 @@ class RLHFDataset(Dataset):
         return self._normalize_task_name(task_name)
 
     def _task_config_value(self, example: dict, key: str, default):
-        # row の task_name を正規化し、task-specific override があれば global data config より優先する。
-        # これにより AlfWorld/Search/WebShop で max_prompt_length と truncation 方針を変えられる。
         task_name = self._task_name_from_example(example)
         if task_name is None:
             return default
@@ -247,10 +247,9 @@ class RLHFDataset(Dataset):
 
         return messages
 
+    # `__getitem__`はtask別上限を確定してからchat templateとmultimodal入力をtokenizeし、左padding済み`input_ids/attention_mask/position_ids`と環境用non-tensor metadataを同じrowへ束ねる。
+    # この境界より後ではtaskごとのprompt長差がtensor shapeへ反映済みなので、collate時はbatch最大長へのpaddingだけでよい。
     def __getitem__(self, item):
-        # parquet row から message/token Tensor と non-tensor metadata を作り、
-        # `task_name` と Search の `env_kwargs` を collate 後の DataProto まで保持する。
-        # prompt 長超過時は task-specific 方針に従い left/right truncate または error にする。
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """

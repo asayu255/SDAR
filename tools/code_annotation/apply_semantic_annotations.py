@@ -427,6 +427,212 @@ CURATED = [
         "AlfWorld/Search/WebShop sub-managerへ分割され、結果だけ元global row順へscatterされる。",
         annotation_type="configuration",
     ),
+    entry(
+        "B-prepare-dummy-rows",
+        "B",
+        "examples/data_preprocess/prepare_sdar_multitask.py",
+        31,
+        51,
+        "AlfWorld/WebShopのepisode内容はdataset行ではなく環境内部のseeded scheduleが選ぶため、"
+        "ここでは空promptと`task_name`を持つ制御行だけを作る。",
+        "`extra_info.index`はsplit内の追跡用、`env_kwargs.task_name`はmixed environment routerのdispatch keyであり、"
+        "どちらも教師入力そのものではない。",
+        annotation_type="configuration",
+    ),
+    entry(
+        "B-prepare-search-normalization",
+        "B",
+        "examples/data_preprocess/prepare_sdar_multitask.py",
+        57,
+        87,
+        "Searchだけはquestion/ground truthが各episodeの実体なので、旧parquetの複数schemaから値を回収し、"
+        "`env_kwargs`へ正規化して環境へ渡す。",
+        "ground truthの優先順はenv_kwargs→reward_model→golden_answersで、欠損schemaを吸収しても"
+        "`task_name=search`というrouting invariantは必ず付与する。",
+        annotation_type="configuration",
+    ),
+    entry(
+        "B-prepare-balanced-splits",
+        "B",
+        "examples/data_preprocess/prepare_sdar_multitask.py",
+        89,
+        124,
+        "test Searchはsingle-task baselineと同じ先頭母集団、trainはseed付き一様sampleを使う。"
+        "連結後の行順は固定し、学習時の混合順序は`TaskBalancedSampler`だけに委ねる。",
+        "3 taskの件数を直後に検証するため、欠落・過剰samplingをparquet生成時点で検出できる。",
+        annotation_type="experimental",
+    ),
+    entry(
+        "B-main-ppo-balanced-sampler",
+        "B",
+        "verl/trainer/main_ppo.py",
+        226,
+        269,
+        "samplerは各taskのindex poolを分離し、1 global generation batchが"
+        "`per_task_batch_size × task数`になることを初期化時に強制する。",
+        "最小poolより長いrunでは各task内だけを再shuffleして循環利用するため、task比率は崩れない。"
+        "一方、dataset行数やsample集合自体は変更しない。",
+        annotation_type="configuration",
+    ),
+    entry(
+        "B-main-ppo-dp-interleave",
+        "B",
+        "verl/trainer/main_ppo.py",
+        271,
+        303,
+        "`TASK_BALANCE_INTERLEAVE`有効時はtask-major配列をround-robinへ並べ替える。"
+        "これは各data-parallel rankの連続chunkにも同じtask比率を届けるためのlayout変換である。",
+        "epochごとに`seed + epoch`でtask内shuffleを再現し、yield総数は"
+        "`num_batches × per_task_batch_size × task数`から変わらない。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "B-dataset-task-overrides",
+        "B",
+        "verl/utils/dataset/rl_dataset.py",
+        165,
+        186,
+        "各rowの`task_name`を正規化し、task別`max_prompt_length`/`truncation`を共有dataset上で選ぶ。"
+        "row直下にない旧形式は`env_kwargs.task_name`へfallbackする。",
+        "overrideがないtaskはglobal defaultへ戻るため、single-task datasetの挙動も維持される。",
+        annotation_type="configuration",
+    ),
+    entry(
+        "B-dataset-item-tokenization",
+        "B",
+        "verl/utils/dataset/rl_dataset.py",
+        248,
+        362,
+        "`__getitem__`はtask別上限を確定してからchat templateとmultimodal入力をtokenizeし、"
+        "左padding済み`input_ids/attention_mask/position_ids`と環境用non-tensor metadataを同じrowへ束ねる。",
+        "この境界より後ではtaskごとのprompt長差がtensor shapeへ反映済みなので、collate時はbatch最大長へのpaddingだけでよい。",
+        annotation_type="tensor_shape",
+    ),
+    entry(
+        "B-env-manager-reset-routing",
+        "B",
+        "agent_system/environments/env_manager.py",
+        619,
+        689,
+        "mixed batchを`env_kwargs.task_name`でtask別sub-managerへ分割し、resetをthread poolへ同時投入する。"
+        "`future.result()`はRayではなくホスト側threadの完了待ちで、I/O/IPC待ちをtask間で重ねる。",
+        "sub-managerの戻り値は保存したglobal indexへscatterされ、呼出側から見えるrow順とbatch sizeは入力時のまま保たれる。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "B-env-manager-step-routing",
+        "B",
+        "agent_system/environments/env_manager.py",
+        691,
+        755,
+        "stepもactive taskだけを並行実行し、既に全episode終了またはtask固有max_steps到達のtaskは"
+        "最後の観測とdone-only結果でshort-circuitする。",
+        "各taskのreward/done/infoをglobal rowへscatterした後に返すため、短いSearchと長いAlfWorldが混在しても"
+        "trajectory indexの対応は変化しない。",
+        annotation_type="execution_context",
+    ),
+    entry(
+        "B-resume-schedule-invariant",
+        "B",
+        "agent_system/environments/resume.py",
+        16,
+        40,
+        "checkpointはdataloader位置を復元しても、プロセス内で再生成されるWebShop/ALFWorldのepisode schedule位置までは保存しない。"
+        "そこでcompleted global step数と「1 stepにつきreset 1回」の不変条件からreset回数を再生する。",
+        "Searchはepisodeがrowの`env_kwargs`で決まるため対象外であり、dynamic filteringでreset回数が変わる構成にも適用できない。",
+        annotation_type="experimental",
+    ),
+    entry(
+        "B-resume-fast-forward",
+        "B",
+        "agent_system/environments/resume.py",
+        64,
+        92,
+        "single-task managerとmultitask配下のleaf vector envを列挙し、`fast_forward`を公開するstateful envだけを進める。"
+        "stateless envは明示的にskipする。",
+        "再生失敗は再現性を損なうがcheckpoint復旧自体を止めない設計なので、例外をmessageへ変換して学習を継続する。",
+        annotation_type="error_condition",
+    ),
+    entry(
+        "B-rollout-prefetch-reset",
+        "B",
+        "agent_system/multi_turn_rollout/rollout_loop.py",
+        678,
+        712,
+        "次rolloutのCPU/subprocess resetを、現rollout終了後のGPU training区間へ重ねる。"
+        "pending futureは同じenv instanceかつ同一kwargsでのみ消費できる。",
+        "`future.result()`は次rollout開始時のthread合流点である。kwargs不一致時に再resetするとstateful scheduleが二重に進むため、"
+        "黙ってfallbackせず例外にする。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "B-rollout-vanilla-loop",
+        "B",
+        "agent_system/multi_turn_rollout/rollout_loop.py",
+        714,
+        864,
+        "同期loopは未完了trajectoryだけをvLLM generationへ送り、出力をfull batch位置へscatterして履歴を更新する。"
+        "taskごとの終了turnが違っても、done rowの不要なGPU生成を避けながらglobal indexを保つ。",
+        "任意のlog-prob prefetchでは`envs.step`をhost threadへ投入し、そのI/O待ち中だけ同じ凍結actorで"
+        "完了rowのold log-probを計算する。`future.result()`が両処理の合流点で、次のgenerationとは競合しない。",
+        annotation_type="synchronization",
+    ),
+    entry(
+        "B-rollout-entry-selection",
+        "B",
+        "agent_system/multi_turn_rollout/rollout_loop.py",
+        929,
+        1015,
+        "`multi_turn_loop`はfeature flagによりasync prototypeか既存同期loopを選ぶ公開境界である。"
+        "async経路も最終的には同じDataProto field、uid grouping、reward/length統計へ変換する必要がある。",
+        "比較実験ではsampling semanticsを変えずschedulerだけを切り替えることが前提で、未対応条件は同期経路へ戻す。",
+        annotation_type="experimental",
+    ),
+    entry(
+        "B-rollout-logprob-reuse",
+        "B",
+        "agent_system/multi_turn_rollout/utils.py",
+        87,
+        155,
+        "`prefetched`は`(traj_uid, turn_step)`をkeyに、rollout中の凍結actorで得たtoken単位"
+        "`old_log_probs/entropys`を再利用する。",
+        "欠損rowだけをworker world sizeへpadして再計算し、最後に元batch順の`(B,R)` tensorへscatterする。"
+        "response長不一致やkey欠損時は安全側で通常計算へfallbackする。",
+        annotation_type="tensor_shape",
+    ),
+    entry(
+        "B-rollout-batch-divisibility",
+        "B",
+        "agent_system/multi_turn_rollout/utils.py",
+        157,
+        202,
+        "rollout/ref/actorそれぞれのmicro-batch制約の最小公倍数を求め、batch sizeを全経路で割り切れる値へ調整する。",
+        "`copy`はrowを複製してsampleを保持し、`delete`はランダムに余剰rowを落とすため、"
+        "両modeは統計量と再現性への影響が異なる。",
+        annotation_type="distributed",
+    ),
+    entry(
+        "B-async-collection-contract",
+        "B",
+        "agent_system/multi_turn_rollout/async_rollout_core.py",
+        111,
+        150,
+        "各trajectoryが`generate_action → env_step`を独立に繰り返すasync schedulerで、"
+        "終了条件とuid groupingは同期loopと同じに保つ。",
+        "`max_in_flight`は生成中coroutine数だけをSemaphoreで制限し、収集するsampleやstep順序の意味は変更しない。",
+        annotation_type="execution_context",
+    ),
+    entry(
+        "B-async-gather",
+        "B",
+        "agent_system/multi_turn_rollout/async_rollout_core.py",
+        152,
+        190,
+        "Semaphore acquire/releaseは各generationの同時実行枠を管理し、`finally`により生成例外時もpermitを返す。"
+        "環境stepは同じtrajectory内では直列である。",
+        "最後の`asyncio.gather`は全trajectory coroutineの合流点であり、Ray taskやOS threadの待機ではない。",
+        annotation_type="synchronization",
+    ),
 ]
 
 

@@ -84,6 +84,8 @@ def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 * 
     return image
 
 
+# `prefetched`は`(traj_uid, turn_step)`をkeyに、rollout中の凍結actorで得たtoken単位`old_log_probs/entropys`を再利用する。
+# 欠損rowだけをworker world sizeへpadして再計算し、最後に元batch順の`(B,R)` tensorへscatterする。response長不一致やkey欠損時は安全側で通常計算へfallbackする。
 def compute_log_prob_with_prefetch(actor_rollout_wg, batch: DataProto, prefetched: Dict, temperature=None) -> DataProto:
     """old_log_prob phase that reuses per-row results prefetched during rollout.
 
@@ -154,6 +156,8 @@ def compute_log_prob_with_prefetch(actor_rollout_wg, batch: DataProto, prefetche
     )
 
 
+# rollout/ref/actorそれぞれのmicro-batch制約の最小公倍数を求め、batch sizeを全経路で割り切れる値へ調整する。
+# `copy`はrowを複製してsampleを保持し、`delete`はランダムに余剰rowを落とすため、両modeは統計量と再現性への影響が異なる。
 def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
     world_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
     size_divisor_rollout = config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu * world_size

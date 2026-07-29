@@ -111,6 +111,8 @@ def assign_uids(n_traj: int, rollout_n: int, uid_factory: Callable[[], Any]) -> 
     return uids
 
 
+# 各trajectoryが`generate_action → env_step`を独立に繰り返すasync schedulerで、終了条件とuid groupingは同期loopと同じに保つ。
+# `max_in_flight`は生成中coroutine数だけをSemaphoreで制限し、収集するsampleやstep順序の意味は変更しない。
 async def collect_async(
     n_traj: int,
     max_steps: int,
@@ -149,11 +151,11 @@ async def collect_async(
     ]
 
     # Concurrency instrumentation + optional generation gate.
-    # semaphore が制限するのは生成中 request 数だけで、env_step の並行性や
-    # trajectory の意味論は変えない。0/None は無制限として扱われる。
     state = {"in_flight": 0, "peak": 0}
     gate = asyncio.Semaphore(max_in_flight) if max_in_flight else None
 
+    # Semaphore acquire/releaseは各generationの同時実行枠を管理し、`finally`により生成例外時もpermitを返す。環境stepは同じtrajectory内では直列である。
+    # 最後の`asyncio.gather`は全trajectory coroutineの合流点であり、Ray taskやOS threadの待機ではない。
     async def _generate(traj_id: int, step: int, obs: Any) -> Any:
         if gate is not None:
             await gate.acquire()
@@ -166,8 +168,6 @@ async def collect_async(
             if gate is not None:
                 gate.release()
 
-    # trajectory ごとに coroutine を一つ持たせることで、遅い環境が別 trajectory の
-    # 次 token 生成を止めない。一方、同一 trajectory は await により逐次実行される。
     async def _run_trajectory(i: int) -> None:
         res = results[i]
         obs = initial_obs[i]

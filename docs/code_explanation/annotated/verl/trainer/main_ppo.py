@@ -223,10 +223,9 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     return dataset
 
 
+# samplerは各taskのindex poolを分離し、1 global generation batchが`per_task_batch_size × task数`になることを初期化時に強制する。
+# 最小poolより長いrunでは各task内だけを再shuffleして循環利用するため、task比率は崩れない。一方、dataset行数やsample集合自体は変更しない。
 class TaskBalancedSampler:
-    # `task_to_indices` は dataset row を canonical task ごとの index list に分割する。
-    # 各 batch は task ごとに `per_task_batch_size` 件を取り、不足時は shuffle 済み index を循環再利用する。
-    # `seed + epoch` で task 内順序を再現し、interleave は sample 集合ではなく batch 内 row order だけを変える。
     """Yield indices so every dataloader batch has the same task mix."""
 
     def __init__(self, dataset, task_balance_config, batch_size: int, shuffle: bool, seed: int):
@@ -271,6 +270,8 @@ class TaskBalancedSampler:
         # data-parallel split of the generation batch is task-balanced.
         self._interleave = os.environ.get("TASK_BALANCE_INTERLEAVE", "0").strip().lower() in ("1", "true", "yes", "on")
 
+    # `TASK_BALANCE_INTERLEAVE`有効時はtask-major配列をround-robinへ並べ替える。これは各data-parallel rankの連続chunkにも同じtask比率を届けるためのlayout変換である。
+    # epochごとに`seed + epoch`でtask内shuffleを再現し、yield総数は`num_batches × per_task_batch_size × task数`から変わらない。
     def _indices_for_required_size(self, indices, required: int, rng):
         indices = list(indices)
         output = []
@@ -282,9 +283,6 @@ class TaskBalancedSampler:
         return output[:required]
 
     def __iter__(self):
-        # default は task ごとの contiguous block、`TASK_BALANCE_INTERLEAVE=1` は round-robin 配置にする。
-        # world size で分割される各 DP chunk に複数 task が入るよう順序を調整する性能・負荷分散機構である。
-        # 実装上の不確実性として、backend の乱数消費順や浮動小数点演算順まで bit-identical かは equivalence test の対象である。
         rng = self._np.random.RandomState(self.seed + self._epoch)
         self._epoch += 1
 

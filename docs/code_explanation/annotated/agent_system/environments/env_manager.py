@@ -616,10 +616,9 @@ def _plain_container(value):
     return OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
 
 
+# mixed batchを`env_kwargs.task_name`でtask別sub-managerへ分割し、resetをthread poolへ同時投入する。`future.result()`はRayではなくホスト側threadの完了待ちで、I/O/IPC待ちをtask間で重ねる。
+# sub-managerの戻り値は保存したglobal indexへscatterされ、呼出側から見えるrow順とbatch sizeは入力時のまま保たれる。
 class MultiTaskEnvironmentManager(EnvironmentManagerBase):
-    # mixed global batch を canonical task 名で分割し、task-local manager を並列呼び出しした後、
-    # observation/reward/done/info を元の global batch index へ scatter して復元する facade である。
-    # task-local index と global index を混同しないことが row/trajectory 対応を保つ条件になる。
     """Route a mixed batch to existing task-specific environment managers."""
 
     def __init__(self, managers: Dict[str, EnvironmentManagerBase], task_max_steps: Dict[str, int], config):
@@ -633,8 +632,6 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         self._last_infos_by_task = {}
 
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
-        # kwargs の task_name から global index 群を作り、ThreadPoolExecutor で task 別 reset を並行実行する。
-        # task manager の戻りを global batch size の container へ merge し、rollout row 順を維持する。
         if kwargs is None:
             raise ValueError("multitask environment requires env_kwargs with task_name for every sample.")
         if isinstance(kwargs, np.ndarray):
@@ -693,10 +690,9 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         infos = self._merge_infos(task_infos, len(kwargs))
         return observations, infos
 
+    # stepもactive taskだけを並行実行し、既に全episode終了またはtask固有max_steps到達のtaskは最後の観測とdone-only結果でshort-circuitする。
+    # 各taskのreward/done/infoをglobal rowへscatterした後に返すため、短いSearchと長いAlfWorldが混在してもtrajectory indexの対応は変化しない。
     def step(self, text_actions: List[str]):
-        # action を task-local 配列へ slice し、task ごとの max_steps と done 状態を考慮して step する。
-        # 早期終了済み task は last observation を再利用して short-circuit し、他 task の進行を妨げない。
-        # 最後に reward/done/info/success を global order へ戻し、per-task metric の row mask を保持する。
         if not self._task_indices:
             raise RuntimeError("MultiTaskEnvironmentManager.step called before reset.")
 
