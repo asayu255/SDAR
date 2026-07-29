@@ -1147,6 +1147,56 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _fast_forward_env_schedules(self):
+        """Replay the env-side episode schedules that the restart skipped.
+
+        Call this right after ``_load_checkpoint()`` in any ``fit()`` that resets
+        the training envs once per global step. WebShop's goal RNG and ALFWorld's
+        game-file cycle live in this process, not in the checkpoint, so without
+        this a resumed run re-trains on the same early episodes; see
+        ``agent_system/environments/resume.py``.
+
+        Idempotent, a no-op on a fresh run, and never fatal.
+        """
+        if getattr(self, "_env_schedules_fast_forwarded", False):
+            return
+        self._env_schedules_fast_forwarded = True
+
+        envs = getattr(self, "envs", None)
+        if envs is None or getattr(self, "global_steps", 0) <= 0:
+            return
+
+        # Dynamic sampling re-runs the rollout (and its env reset) an unknown
+        # number of times per step, so the number of resets already consumed
+        # cannot be derived from the step count.
+        if bool(OmegaConf.select(self.config, "algorithm.filter_groups.enable", default=False)):
+            print(
+                "[resume][env] algorithm.filter_groups.enable=True: envs are reset more than "
+                f"once per global step, so the resets consumed before step {self.global_steps} "
+                "cannot be derived. Skipping the env schedule fast-forward - the resumed run "
+                "will sample a different episode sequence than an uninterrupted run."
+            )
+            return
+
+        if str(OmegaConf.select(self.config, "env.env_name", default="") or "").lower() == "multitask" and not bool(
+            OmegaConf.select(self.config, "data.task_balance.enable", default=False)
+        ):
+            print(
+                "[resume][env] WARNING: multitask envs without data.task_balance.enable - a batch "
+                "may omit a task, so its resets may not equal the step count. Replaying anyway."
+            )
+
+        try:
+            from agent_system.environments.resume import fast_forward_env_schedules
+
+            messages = fast_forward_env_schedules(envs, self.global_steps)
+        except Exception as exc:  # noqa: BLE001 - never block a resume
+            print(f"[resume][env] WARNING: env schedule fast-forward unavailable ({exc!r}); skipping.")
+            return
+
+        for message in messages:
+            print(f"[resume][env] resuming at step {self.global_steps} -> {message}")
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1182,6 +1232,7 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self._fast_forward_env_schedules()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
