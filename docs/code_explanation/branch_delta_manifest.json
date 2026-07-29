@@ -1,0 +1,402 @@
+[
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/environments/env_manager.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/environments/env_manager.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/environments/env_package/alfworld/envs.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/environments/env_package/alfworld/envs.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/environments/env_package/webshop/envs.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/environments/env_package/webshop/envs.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/environments/resume.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/environments/resume.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/multi_turn_rollout/__init__.py",
+    "git_status_vs_master": "M",
+    "target_status": "completed",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/multi_turn_rollout/__init__.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/multi_turn_rollout/async_rollout_core.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "experimental",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/multi_turn_rollout/async_rollout_core.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/multi_turn_rollout/rollout_loop.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/multi_turn_rollout/rollout_loop.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "agent_system/multi_turn_rollout/utils.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/agent_system/multi_turn_rollout/utils.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "docs/async_rollout_project.md",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "experimental",
+    "annotated_path": "docs/code_explanation/annotated/docs/async_rollout_project.md"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "docs/optimization_phase2.md",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "documentation",
+    "annotated_path": "docs/code_explanation/annotated/docs/optimization_phase2.md"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "docs/optimization_report.md",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "documentation",
+    "annotated_path": "docs/code_explanation/annotated/docs/optimization_report.md"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "docs/per_task_metrics.md",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "documentation",
+    "annotated_path": "docs/code_explanation/annotated/docs/per_task_metrics.md"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/data_preprocess/prepare_sdar_multitask.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/examples/data_preprocess/prepare_sdar_multitask.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/opd_trainer/expected_multitask_config.yaml",
+    "git_status_vs_master": "A",
+    "target_status": "completed",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/examples/opd_trainer/expected_multitask_config.yaml"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/opd_trainer/run_multitask_qwen3.sh",
+    "git_status_vs_master": "A",
+    "target_status": "completed",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/examples/opd_trainer/run_multitask_qwen3.sh"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/sdar_trainer/run_alfworld_qwen3.sh",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/examples/sdar_trainer/run_alfworld_qwen3.sh"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/sdar_trainer/run_multitask_qwen3.sh",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/examples/sdar_trainer/run_multitask_qwen3.sh"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/sdar_trainer/run_search_qwen3.sh",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/examples/sdar_trainer/run_search_qwen3.sh"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "examples/sdar_trainer/run_webshop_qwen3.sh",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/examples/sdar_trainer/run_webshop_qwen3.sh"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "tests/ray_cpu/test_async_rollout_equivalence.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "experimental",
+    "annotated_path": "docs/code_explanation/annotated/tests/ray_cpu/test_async_rollout_equivalence.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "tests/ray_cpu/test_rollout_speedup_mechanisms.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "test",
+    "annotated_path": "docs/code_explanation/annotated/tests/ray_cpu/test_rollout_speedup_mechanisms.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "tests/trainer/ppo/test_per_task_metrics.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "test",
+    "annotated_path": "docs/code_explanation/annotated/tests/trainer/ppo/test_per_task_metrics.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "tests/trainer/test_expected_config.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/tests/trainer/test_expected_config.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "tests/trainer/test_opd_routing.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/tests/trainer/test_opd_routing.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/models/transformers/dense_common.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/models/transformers/dense_common.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/tools/utils/search_r1_like_utils.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/tools/utils/search_r1_like_utils.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/config/ppo_trainer.yaml",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/config/ppo_trainer.yaml"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/main_opd.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/main_opd.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/main_ppo.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/main_ppo.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/main_sdar.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/main_sdar.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/main_skill_grpo.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/main_skill_grpo.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/core_algos.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/core_algos.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/metric_utils.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/metric_utils.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/opd_ray_trainer.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/opd_ray_trainer.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/ray_trainer.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/rlsd_ray_trainer.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/rlsd_ray_trainer.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/rlsd_utils.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/rlsd_utils.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/trainer/ppo/skillsd_ray_trainer.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/utils/dataset/rl_dataset.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/utils/dataset/rl_dataset.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/utils/expected_config.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/utils/expected_config.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/utils/gpu_profiler.py",
+    "git_status_vs_master": "A",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/utils/gpu_profiler.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/actor/dp_actor.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/actor/dp_actor.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/actor/megatron_actor.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/actor/megatron_actor.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/critic/dp_critic.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/critic/dp_critic.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/fsdp_workers.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_critical",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/fsdp_workers.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/rollout/hf_rollout.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/rollout/hf_rollout.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/rollout/sglang_rollout/sglang_rollout.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/rollout/vllm_rollout/vllm_rollout.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/rollout/vllm_rollout/vllm_rollout.py"
+  },
+  {
+    "source_commit": "10cacaf6fb2cd4eea971b06d3e73ada868b611f4",
+    "original_path": "verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py",
+    "git_status_vs_master": "M",
+    "target_status": "pending",
+    "execution_relevance": "pure_opd_transitive",
+    "annotated_path": "docs/code_explanation/annotated/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py"
+  }
+]
