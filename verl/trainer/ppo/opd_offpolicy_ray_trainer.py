@@ -66,6 +66,17 @@ _SAVE_TENSOR_KEYS = [
 ]
 _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 
+# Saved by Stage 1 but never read by Stage 2, and together a quarter of every row
+# (prompts is 4096 int64 columns, response_mask another 512), so they are dropped
+# as each file is loaded rather than carried in host RAM for the whole run:
+#   prompts       - only read by the *on-policy* trainer's rollout_data_dir dump
+#                   (opd_ray_trainer), which works off live rollouts, not this pool.
+#   response_mask - _prepare_batch recomputes it from attention_mask every step via
+#                   compute_response_mask, and _compute_response_info slices
+#                   attention_mask directly, so the stored copy is never consulted.
+# Dropping happens at load, so pools already on disk need no regeneration.
+_DROP_TENSOR_KEYS = ["prompts", "response_mask"]
+
 # Keys popped from the prompt batch to form the generation input (mirrors OPD).
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
 _GEN_NON_TENSOR_KEYS = ["raw_prompt_ids", "data_source"]
@@ -262,7 +273,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
 
     @staticmethod
     def _load_offpolicy_file(path: str) -> DataProto:
-        """Load one Stage-1 ``<task>.pt``, dropping any adjust_batch padding rows.
+        """Load one Stage-1 ``<task>.pt``, dropping padding rows and dead columns.
 
         Pools written before Stage 1 stopped calling adjust_batch carry duplicated
         turn-rows. Dropping them here rather than zero-weighting them also corrects
@@ -275,45 +286,112 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         *retained* batch, so the row a copy was made from is always still present.
         Row order is preserved, so the first-seen order of traj_uids -- and hence
         the trajectory sampling sequence -- is unchanged.
+
+        ``_DROP_TENSOR_KEYS`` go too. They are a quarter of every row and nothing in
+        this stage reads them, so keeping them only costs host RAM -- see the
+        constant for why each is dead.
+
+        Both happen in one column-wise pass that releases each source column as soon
+        as its replacement exists. Doing it with select_idxs instead would hold the
+        whole file and its filtered copy at once, which at 36k trajectories is a
+        larger transient than the steady-state footprint this is trying to reduce.
         """
         data = DataProto.load_from_disk(path)
-        if "traj_uid" not in data.non_tensor_batch:
-            return data
-        is_dup = find_padding_duplicates(data.non_tensor_batch["traj_uid"])
-        n_dup = int(is_dup.sum())
-        if n_dup:
-            n_before = len(data)
-            data = data.select_idxs(np.flatnonzero(~is_dup).tolist())
-            print(f"[OPD-offpolicy] {os.path.basename(path)}: dropped {n_dup} Stage-1 "
-                  f"padding rows ({n_dup / n_before:.1%}), kept {len(data)}")
-        return data
+        name = os.path.basename(path)
+
+        keep_idx = None
+        n_rows = len(data)
+        if "traj_uid" in data.non_tensor_batch:
+            is_dup = find_padding_duplicates(data.non_tensor_batch["traj_uid"])
+            n_dup = int(is_dup.sum())
+            if n_dup:
+                keep_idx = torch.from_numpy(np.flatnonzero(~is_dup))
+                print(f"[OPD-offpolicy] {name}: dropping {n_dup} Stage-1 padding rows "
+                      f"({n_dup / n_rows:.1%}), keeping {n_rows - n_dup}")
+        keep_np = keep_idx.numpy() if keep_idx is not None else None
+
+        dropped_cols = []
+        tensors = {}
+        source = data.batch
+        for key in list(source.keys()):
+            column = source[key]
+            if key in _DROP_TENSOR_KEYS:
+                dropped_cols.append(key)
+            elif keep_idx is None:
+                tensors[key] = column
+            else:
+                tensors[key] = column[keep_idx]
+            del source[key]
+            del column
+
+        non_tensors = {
+            key: (value if keep_np is None else value[keep_np])
+            for key, value in data.non_tensor_batch.items()
+        }
+        if dropped_cols:
+            print(f"[OPD-offpolicy] {name}: dropped unused columns {dropped_cols}")
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
 
     def _load_offpolicy_data(self):
+        """Load the Stage-1 pool, one DataProto per task.
+
+        The tasks are deliberately *not* concatenated. The only thing a single
+        concatenated DataProto ever provided was a global row-index space for
+        _offpolicy_batch_iter's select_idxs, and building it doubles peak host RAM:
+        the parts and the result are both live while torch.cat runs. At 36k
+        trajectories the pool is well over a hundred GiB, so that copy is the
+        difference between fitting and not. Indices are task-local instead, and the
+        only concat left is the per-step batch, which is a few thousand rows.
+        """
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
-        parts = [self._load_offpolicy_file(f) for f in files]
-        self.offpolicy_data = DataProto.concat(parts)
-        task_names = self.offpolicy_data.non_tensor_batch["task_name"]
-        normalized = np.array([self._normalize_task_name(t) for t in task_names])
-        assert "traj_uid" in self.offpolicy_data.non_tensor_batch, (
-            "off-policy dataset must carry traj_uid for trajectory-level sampling"
-        )
-        traj_uids = self.offpolicy_data.non_tensor_batch["traj_uid"]
-        # Group row indices by trajectory within each task, so a step can draw whole
-        # trajectories (all their turn-rows) exactly like OPD's per-step rollout.
-        self._task_to_traj_rows = {}  # task -> {traj_uid: np.ndarray(row_idx)}
+
+        self._task_data = {}          # task -> DataProto (that task's rows only)
+        self._task_to_traj_rows = {}  # task -> {traj_uid: np.ndarray(task-local row idx)}
         self._task_to_trajs = {}      # task -> np.ndarray(traj_uid) sampling population
-        for task in sorted(set(normalized.tolist())):
-            traj_to_rows = {}
-            for ridx in np.where(normalized == task)[0]:
-                traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
-            self._task_to_traj_rows[task] = {u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()}
-            self._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
-        sizes = {
-            t: (len(self._task_to_trajs[t]), int(sum(len(r) for r in self._task_to_traj_rows[t].values())))
-            for t in self._task_to_trajs
-        }
-        print(f"[OPD-offpolicy] loaded {len(self.offpolicy_data)} rows from {len(files)} files; "
+        for path in files:
+            data = self._load_offpolicy_file(path)
+            assert "traj_uid" in data.non_tensor_batch, (
+                f"{os.path.basename(path)}: off-policy dataset must carry traj_uid "
+                "for trajectory-level sampling"
+            )
+            task_names = data.non_tensor_batch["task_name"]
+            normalized = np.array([self._normalize_task_name(t) for t in task_names])
+            traj_uids = data.non_tensor_batch["traj_uid"]
+            for task in sorted(set(normalized.tolist())):
+                rows_of_task = np.where(normalized == task)[0]
+                # Group by trajectory so a step can draw whole trajectories (all their
+                # turn-rows) exactly like OPD's per-step rollout.
+                traj_to_rows = {}
+                for ridx in rows_of_task:
+                    traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
+                assert task not in self._task_data, (
+                    f"task {task} appears in more than one <task>.pt file"
+                )
+                # One file per task in practice; slice only when it is mixed, so the
+                # common path keeps the loaded object rather than copying it.
+                if len(rows_of_task) == len(data):
+                    self._task_data[task] = data
+                else:
+                    remap = {old: new for new, old in enumerate(rows_of_task.tolist())}
+                    traj_to_rows = {u: [remap[r] for r in rows] for u, rows in traj_to_rows.items()}
+                    self._task_data[task] = data.select_idxs(rows_of_task)
+                self._task_to_traj_rows[task] = {
+                    u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()
+                }
+                self._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
+            del data
+
+        # Every task's rows are concatenated into one batch each step, which requires
+        # them to agree on their columns.
+        key_sets = {task: set(d.batch.keys()) for task, d in self._task_data.items()}
+        assert len(set(map(frozenset, key_sets.values()))) == 1, (
+            f"per-task pools disagree on their tensor columns: {key_sets}"
+        )
+
+        sizes = {t: (len(self._task_to_trajs[t]), len(self._task_data[t])) for t in self._task_data}
+        total_rows = sum(len(d) for d in self._task_data.values())
+        print(f"[OPD-offpolicy] loaded {total_rows} rows from {len(files)} files; "
               f"per-task (trajectories, rows): {sizes}")
         for task, trajs in self._task_to_trajs.items():
             assert len(trajs) > 0, f"no trajectories for task {task}"
@@ -342,11 +420,15 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             return out
 
         for _ in range(self.total_training_steps):
-            rows = []
+            # Select within each task, then concatenate. Row order is task-major, the
+            # same as selecting those rows out of one concatenated pool would give.
+            parts = []
             for task in pools:
+                rows = []
                 for uid in _draw_trajs(task, self.per_task_traj_per_step):
                     rows.extend(self._task_to_traj_rows[task][uid].tolist())
-            yield self.offpolicy_data.select_idxs(rows)
+                parts.append(self._task_data[task].select_idxs(rows))
+            yield DataProto.concat(parts)
 
     def _prepare_batch(self, batch: DataProto):
         """Everything between drawing a batch and dispatching it to the workers.

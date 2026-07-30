@@ -2,8 +2,8 @@
 
 Covered (CPU-only; Ray / workers are bypassed):
 * the fixed teacher dataset round-trips through ``DataProto.save_to_disk`` and
-  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` with correct per-task,
-  per-trajectory indexing;
+  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` into one DataProto per task with
+  correct per-trajectory, task-local indexing;
 * ``OffPolicyOPDRayTrainer._offpolicy_batch_iter`` yields the right number of
   task-balanced steps, each drawing ``per_task_traj_per_step`` whole trajectories
   per task from the matching task;
@@ -62,15 +62,19 @@ def _bare_trainer():
     return object.__new__(OffPolicyOPDRayTrainer)
 
 
-def _index_by_task(trainer, tasks):
-    """The trajectory grouping _load_offpolicy_data builds, for a hand-made pool."""
-    task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
-    traj_uids = trainer.offpolicy_data.non_tensor_batch["traj_uid"]
+def _index_by_task(trainer, pool_by_task):
+    """The per-task grouping _load_offpolicy_data builds, for hand-made pools.
+
+    Indices are task-local, so each task's rows are addressed inside its own
+    DataProto -- there is no concatenated pool to index into.
+    """
+    trainer._task_data = dict(pool_by_task)
     trainer._task_to_traj_rows = {}
     trainer._task_to_trajs = {}
-    for task in tasks:
+    for task, data in pool_by_task.items():
+        traj_uids = data.non_tensor_batch["traj_uid"]
         traj_to_rows = {}
-        for ridx in np.where(task_names == task)[0]:
+        for ridx in range(len(data)):
             traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
         trainer._task_to_traj_rows[task] = {
             u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()
@@ -78,7 +82,7 @@ def _index_by_task(trainer, tasks):
         trainer._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
 
 
-def test_load_offpolicy_data_concats_and_indexes_per_task(tmp_path):
+def test_load_offpolicy_data_indexes_per_task(tmp_path):
     _make_task_proto("alfworld", 5).save_to_disk(str(tmp_path / "alfworld.pt"))
     _make_task_proto("search", 3).save_to_disk(str(tmp_path / "search.pt"))
     _make_task_proto("webshop", 4).save_to_disk(str(tmp_path / "webshop.pt"))
@@ -87,22 +91,26 @@ def test_load_offpolicy_data_concats_and_indexes_per_task(tmp_path):
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
 
-    assert len(trainer.offpolicy_data) == 12
+    # One DataProto per task, never concatenated.
+    assert set(trainer._task_data) == {"alfworld", "search", "webshop"}
+    assert {t: len(d) for t, d in trainer._task_data.items()} == {"alfworld": 5, "search": 3, "webshop": 4}
     sizes = {t: len(trajs) for t, trajs in trainer._task_to_trajs.items()}
     assert sizes == {"alfworld": 5, "search": 3, "webshop": 4}
-    # Every row a task's trajectories point at must actually be that task's.
-    task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
+    # Indices are task-local and address that task's own rows.
     for task, traj_rows in trainer._task_to_traj_rows.items():
+        data = trainer._task_data[task]
+        task_names = data.non_tensor_batch["task_name"]
         for rows in traj_rows.values():
             assert all(task_names[i] == task for i in rows.tolist())
 
 
 def test_offpolicy_batch_iter_is_task_balanced(tmp_path):
     trainer = _bare_trainer()
-    trainer.offpolicy_data = DataProto.concat(
-        [_make_task_proto("alfworld", 10), _make_task_proto("search", 10), _make_task_proto("webshop", 10)]
-    )
-    _index_by_task(trainer, ("alfworld", "search", "webshop"))
+    _index_by_task(trainer, {
+        "alfworld": _make_task_proto("alfworld", 10),
+        "search": _make_task_proto("search", 10),
+        "webshop": _make_task_proto("webshop", 10),
+    })
     trainer.per_task_traj_per_step = 4
     trainer.total_training_steps = 6
     trainer.config = OmegaConf.create({"data": {"seed": 1}})
@@ -121,10 +129,10 @@ def test_pool_recycles_when_drawing_more_than_available():
     """Drawing more per step than a task's pool size must still succeed
     (pool reshuffled + recycled) and stay balanced."""
     trainer = _bare_trainer()
-    trainer.offpolicy_data = DataProto.concat(
-        [_make_task_proto("alfworld", 3), _make_task_proto("search", 3)]
-    )
-    _index_by_task(trainer, ("alfworld", "search"))
+    _index_by_task(trainer, {
+        "alfworld": _make_task_proto("alfworld", 3),
+        "search": _make_task_proto("search", 3),
+    })
     trainer.per_task_traj_per_step = 5  # > 3 available per task
     trainer.total_training_steps = 2
     trainer.config = OmegaConf.create({"data": {"seed": 7}})
@@ -187,9 +195,43 @@ def test_load_offpolicy_data_filters_before_indexing(tmp_path):
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
 
-    assert len(trainer.offpolicy_data) == 12  # 4 trajectories * 3 turns, padding gone
+    assert len(trainer._task_data["webshop"]) == 12  # 4 trajectories * 3 turns, padding gone
     assert len(trainer._task_to_trajs["webshop"]) == 4
     assert all(len(rows) == 3 for rows in trainer._task_to_traj_rows["webshop"].values())
+
+
+def test_load_offpolicy_file_drops_dead_columns(tmp_path):
+    """prompts / response_mask are a quarter of every row and nothing reads them."""
+    proto = _make_task_proto("search", 3, turns_per_traj=2)
+    n, resp_len = len(proto), proto.batch["responses"].shape[-1]
+    proto.batch["prompts"] = torch.zeros((n, 8), dtype=torch.long)
+    proto.batch["response_mask"] = torch.ones((n, resp_len), dtype=torch.long)
+    path = str(tmp_path / "search.pt")
+    proto.save_to_disk(path)
+
+    loaded = OffPolicyOPDRayTrainer._load_offpolicy_file(path)
+
+    assert "prompts" not in loaded.batch
+    assert "response_mask" not in loaded.batch
+    # Everything the stage does read survives, rows and all.
+    assert set(loaded.batch.keys()) == {"responses", "teacher_topk_logprobs", "teacher_topk_ids"}
+    assert len(loaded) == n
+    assert loaded.non_tensor_batch["traj_uid"].tolist() == proto.non_tensor_batch["traj_uid"].tolist()
+
+
+def test_load_offpolicy_file_drops_columns_and_padding_together(tmp_path):
+    """The single pass has to survive doing both at once."""
+    proto = _make_task_proto("webshop", 4, turns_per_traj=2)
+    proto.batch["prompts"] = torch.zeros((len(proto), 8), dtype=torch.long)
+    padded = DataProto.concat([proto, proto.select_idxs([0, 5])])
+    path = str(tmp_path / "webshop.pt")
+    padded.save_to_disk(path)
+
+    loaded = OffPolicyOPDRayTrainer._load_offpolicy_file(path)
+
+    assert "prompts" not in loaded.batch
+    assert len(loaded) == 8
+    assert loaded.non_tensor_batch["traj_uid"].tolist() == [f"webshop-{j}" for j in range(4) for _ in range(2)]
 
 
 def test_topk_teacher_kl_matches_opd_loss():

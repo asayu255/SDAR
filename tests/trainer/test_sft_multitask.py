@@ -88,8 +88,9 @@ def test_load_and_balanced_iter_on_topk_free_data(tmp_path):
     trainer = object.__new__(MultiTaskSFTTrainer)
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
-    assert len(trainer.offpolicy_data) == 6 * 2 * 2  # trajectories * turns * tasks
-    assert "teacher_topk_logprobs" not in trainer.offpolicy_data.batch
+    # One DataProto per task; the pool is never concatenated.
+    assert {t: len(d) for t, d in trainer._task_data.items()} == {"alfworld": 12, "search": 12}
+    assert "teacher_topk_logprobs" not in trainer._task_data["alfworld"].batch
     assert set(trainer._task_to_trajs) == {"alfworld", "search"}
     assert {t: len(v) for t, v in trainer._task_to_trajs.items()} == {"alfworld": 6, "search": 6}
 
