@@ -555,6 +555,18 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
+                # Checkpoint before validating, the reverse of the on-policy loop.
+                # Neither touches the weights, so the checkpoint still holds exactly
+                # what gets evaluated -- but validation is the far more failure-prone
+                # of the two here (this loop has no training rollout, so validation is
+                # the only generation it does, and search alone now walks its whole
+                # test set). Validating first meant a validation crash took the step's
+                # checkpoint with it, including at the last step, where both fire and
+                # the final model would be lost.
+                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    with _timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
+
                 test_start_step = self.config.trainer.get("test_start_step", 0)
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or (self.global_steps >= test_start_step and self.global_steps % self.config.trainer.test_freq == 0)):
                     with _timer("testing", timing_raw):
@@ -562,10 +574,6 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
-                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                    with _timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
 
             metrics.update({
                 "training/global_step": self.global_steps,
