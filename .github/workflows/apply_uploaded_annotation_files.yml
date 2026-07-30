@@ -5,7 +5,7 @@ on:
     branches:
       - codex/explain-pure-opd-multitask
     paths:
-      - .codex_upload/READY
+      - .codex_upload/APPLY_NOW
 
 permissions:
   contents: write
@@ -32,9 +32,21 @@ jobs:
           mkdir -p docs/code_explanation/annotated/verl/trainer/ppo
           mkdir -p docs/code_explanation/annotated/verl/trainer
 
-          cat .codex_upload/ray_trainer.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
-          cat .codex_upload/main_ppo.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/main_ppo.py
-          cat .codex_upload/skillsd_ray_trainer.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py
+          cat \
+            .codex_upload/ray_trainer.py.gz.b64.000.exact \
+            .codex_upload/ray_trainer.py.gz.b64.001.exact \
+            .codex_upload/ray_trainer.py.gz.b64.002.exact \
+            .codex_upload/ray_trainer.py.gz.b64.003.exact \
+            | tr -d '\n' | base64 --decode | gzip --decompress \
+            > docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
+
+          tr -d '\n' < .codex_upload/main_ppo.py.gz.b64.000 \
+            | base64 --decode | gzip --decompress \
+            > docs/code_explanation/annotated/verl/trainer/main_ppo.py
+
+          tr -d '\n' < .codex_upload/skillsd_ray_trainer.py.gz.b64.000 \
+            | base64 --decode | gzip --decompress \
+            > docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py
 
           cat <<'EOF' | sha256sum -c -
           1b6e3d19cf543dff46d59fe7b0a736c51de132cb6a0cfa5e716c528a958c09d8  docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
@@ -57,12 +69,6 @@ jobs:
           rm -rf .codex_upload
           rm -f .github/workflows/apply_uploaded_annotation_files.yml
 
-          git add \
-            docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py \
-            docs/code_explanation/annotated/verl/trainer/main_ppo.py \
-            docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py \
-            .codex_upload \
-            .github/workflows/apply_uploaded_annotation_files.yml
-
+          git add -A
           git commit -m "docs(annotation): add detailed Japanese trainer comments"
           git push origin HEAD:codex/explain-pure-opd-multitask
