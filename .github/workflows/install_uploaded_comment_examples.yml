@@ -1,0 +1,43 @@
+name: Install uploaded comment examples
+
+on:
+  push:
+    branches:
+      - codex/explain-pure-opd-multitask
+    paths:
+      - .install_uploaded_comment_examples
+
+permissions:
+  contents: write
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/explain-pure-opd-multitask
+          fetch-depth: 0
+
+      - name: Install uploaded files
+        run: |
+          python docs/code_explanation/reference_examples/extract_reference_examples.py --install
+          python -m py_compile \
+            docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py \
+            docs/code_explanation/annotated/verl/trainer/main_ppo.py \
+            docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py
+
+      - name: Commit installed files
+        run: |
+          rm -f .install_uploaded_comment_examples
+          rm -f .github/workflows/install_uploaded_comment_examples.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py \
+            docs/code_explanation/annotated/verl/trainer/main_ppo.py \
+            docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py \
+            .install_uploaded_comment_examples \
+            .github/workflows/install_uploaded_comment_examples.yml
+          git commit -m "docs(annotation): install preferred detailed comments"
+          git push origin HEAD:codex/explain-pure-opd-multitask
