@@ -7,7 +7,7 @@
 - source preservation: 743 / 743
 - Priority review: A 8 / 8、B 8 / 8、C 11 / 11、D 4 / 4
 - 意味block `needs_review`: 0
-- semantic annotation map: 84 block
+- semantic annotation map: 627 block
 
 ## 移行内容
 
@@ -23,3 +23,10 @@ Priority A〜Dの解説を再執筆しました。
 coverageは全論理行へのコメント強制ではありません。AST上のmodule/class/function/control blockを
 `explained`、`covered_by_parent_comment`、`self_explanatory`、`needs_review`へ分類し、
 短く自明な処理へ不要な逐語コメントを追加しない方式へ変更しました。
+
+## ユーザー提供解説の反映
+
+`ray_trainer.py`、`main_ppo.py`、`skillsd_ray_trainer.py`、`dp_actor.py` の日本語解説付き版から、
+551 blockの日本語コメントを現行sourceへ移植しました。提供版のうち3本には現行sourceより古い
+実装差分が含まれていたため、ファイル全体の直接コピーは行わず、コメントだけを対応する現行行へ
+移しています。これによりtask別metricsやresume schedule復元などの現行機能を保持しています。

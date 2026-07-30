@@ -856,14 +856,27 @@ CURATED = [
     ),
 ]
 
+# これらはユーザー提供の詳細解説から注釈mapを再構築しているため、
+# 旧CURATED blockを再適用すると同義コメントが重複する。
+ATTACHMENT_OVERRIDE_PATHS = {
+    "verl/trainer/main_ppo.py",
+    "verl/trainer/ppo/ray_trainer.py",
+    "verl/trainer/ppo/skillsd_ray_trainer.py",
+    "verl/workers/actor/dp_actor.py",
+}
+
 
 def main() -> None:
     rows = load_annotation_map()
-    curated_ids = {row["curated_id"] for row in CURATED}
+    active_curated = [
+        row for row in CURATED
+        if row["original_path"] not in ATTACHMENT_OVERRIDE_PATHS
+    ]
+    curated_ids = {row["curated_id"] for row in active_curated}
     rows = [row for row in rows if row.get("curated_id") not in curated_ids]
     # 新しいblock解説が覆う旧legacy注釈は、同義コメントの連続を避けるため置換する。
     covered_ranges: dict[str, list[tuple[int, int]]] = {}
-    for curated in CURATED:
+    for curated in active_curated:
         covered_ranges.setdefault(curated["original_path"], []).append(
             (curated["source_start_line"], curated["source_end_line"])
         )
@@ -876,13 +889,13 @@ def main() -> None:
             for start, end in covered_ranges.get(row["original_path"], [])
         )
     ]
-    rows.extend(CURATED)
+    rows.extend(active_curated)
     save_annotation_map(rows)
-    print(f"curated_total={len(CURATED)}")
+    print(f"curated_total={len(active_curated)}")
     for priority in ("A", "B", "C", "D"):
         print(
             f"priority_{priority}="
-            f"{sum(row.get('priority') == priority for row in CURATED)}"
+            f"{sum(row.get('priority') == priority for row in active_curated)}"
         )
 
 

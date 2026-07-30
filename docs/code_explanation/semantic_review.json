@@ -39,7 +39,7 @@
     "original_path": "verl/workers/actor/dp_actor.py",
     "review_status": "reviewed",
     "reason": "semantic annotation mapにpriority block解説あり",
-    "annotation_count": 3
+    "annotation_count": 116
   },
   {
     "priority": "A",
@@ -67,7 +67,7 @@
     "original_path": "verl/trainer/main_ppo.py",
     "review_status": "reviewed",
     "reason": "semantic annotation mapにpriority block解説あり",
-    "annotation_count": 2
+    "annotation_count": 110
   },
   {
     "priority": "B",
