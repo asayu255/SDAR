@@ -82,6 +82,46 @@ def _env_flag(name: str, default: str = "0") -> bool:
 _BATCH_PREFETCH = _env_flag("OFFPOLICY_BATCH_PREFETCH")
 
 
+def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
+    """Boolean mask of the rows an earlier Stage 1 appended as adjust_batch padding.
+
+    Pools generated before that call was removed carry duplicated turn-rows: every
+    gen step was padded up to a multiple of lcm(log_prob_micro*W, actor_micro*W) by
+    copying randomly chosen rows onto the end of the step's block. The copies were
+    saved, so those turns are trained on twice.
+
+    They are identified structurally rather than by hashing. A Stage-1 block is
+    laid out trajectory-major -- ``gather_rollout_data`` iterates trajectories in
+    the outer loop and turns in the inner one -- so each trajectory's turn-rows are
+    contiguous, and ``adjust_batch`` concatenates its copies after all of them.
+    A traj_uid starting a *second* run can therefore only be padding.
+
+    The one row this misses is a copy that landed immediately after its own
+    trajectory's run and merged into it, which needs the copy to be drawn from the
+    block's last trajectory: ~1/120 per block, so ~0.5 rows per file against tens
+    of thousands of padding rows. The error direction is safe -- a missed copy is
+    kept (trained twice, as today), never an original dropped.
+    """
+    n = len(traj_uids)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    uids = np.asarray(traj_uids)
+    change = np.ones(n, dtype=bool)
+    change[1:] = uids[1:] != uids[:-1]
+    run_starts = np.flatnonzero(change)
+    run_ends = np.append(run_starts[1:], n)
+
+    is_dup = np.zeros(n, dtype=bool)
+    seen = set()
+    for start, end in zip(run_starts.tolist(), run_ends.tolist()):
+        uid = uids[start]
+        if uid in seen:
+            is_dup[start:end] = True
+        else:
+            seen.add(uid)
+    return is_dup
+
+
 def _build_gen_batch(batch: DataProto) -> DataProto:
     """Pop the model-input fields out of a prompt batch (same set as OPD/_validate)."""
     non_tensor_keys = list(_GEN_NON_TENSOR_KEYS)
@@ -132,7 +172,12 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                     envs=self.envs,
                     is_train=True,
                 )
-                gen_out = adjust_batch(self.config, gen_out)
+                # NOTE: deliberately no adjust_batch here. Padding the per-step
+                # batch to a DP/micro-divisible size duplicates random *rows*, and
+                # those copies would be written into <task>.pt and trained on
+                # twice. Nothing in this stage needs the divisibility: the only
+                # worker call below pads and unpads itself (auto_padding_key), and
+                # the SFT variant (collect_topk=False) makes no worker call at all.
                 gen_out.batch["response_mask"] = compute_response_mask(gen_out)
 
                 # Teacher scores its own top-k over the generated responses (KD only).
@@ -214,10 +259,38 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         )
         return data_dir
 
+    @staticmethod
+    def _load_offpolicy_file(path: str) -> DataProto:
+        """Load one Stage-1 ``<task>.pt``, dropping any adjust_batch padding rows.
+
+        Pools written before Stage 1 stopped calling adjust_batch carry duplicated
+        turn-rows. Dropping them here rather than zero-weighting them also corrects
+        the row count, and with it the number of mini-batches a step is split into:
+        left in, they inflate the optimizer-update count for the same real data
+        (measured ~+10% overall, driven by the short-episode tasks where the fixed
+        ~120 padding rows per gen step are a large fraction of the block).
+
+        Removal cannot lose data: adjust_batch concatenated its copies onto the
+        *retained* batch, so the row a copy was made from is always still present.
+        Row order is preserved, so the first-seen order of traj_uids -- and hence
+        the trajectory sampling sequence -- is unchanged.
+        """
+        data = DataProto.load_from_disk(path)
+        if "traj_uid" not in data.non_tensor_batch:
+            return data
+        is_dup = find_padding_duplicates(data.non_tensor_batch["traj_uid"])
+        n_dup = int(is_dup.sum())
+        if n_dup:
+            n_before = len(data)
+            data = data.select_idxs(np.flatnonzero(~is_dup).tolist())
+            print(f"[OPD-offpolicy] {os.path.basename(path)}: dropped {n_dup} Stage-1 "
+                  f"padding rows ({n_dup / n_before:.1%}), kept {len(data)}")
+        return data
+
     def _load_offpolicy_data(self):
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
-        parts = [DataProto.load_from_disk(f) for f in files]
+        parts = [self._load_offpolicy_file(f) for f in files]
         self.offpolicy_data = DataProto.concat(parts)
         task_names = self.offpolicy_data.non_tensor_batch["task_name"]
         normalized = np.array([self._normalize_task_name(t) for t in task_names])

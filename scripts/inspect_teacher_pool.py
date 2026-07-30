@@ -54,32 +54,6 @@ import torch
 DEFAULT_BLOCK_DIVISOR = 240
 
 
-def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
-    """Boolean mask of rows appended by Stage-1's adjust_batch padding.
-
-    Marks every run of a traj_uid after its first one. See module docstring for
-    why that is exactly the padding set.
-    """
-    n = len(traj_uids)
-    if n == 0:
-        return np.zeros(0, dtype=bool)
-    uids = np.asarray(traj_uids)
-    change = np.ones(n, dtype=bool)
-    change[1:] = uids[1:] != uids[:-1]
-    run_starts = np.flatnonzero(change)
-    run_ends = np.append(run_starts[1:], n)
-
-    is_dup = np.zeros(n, dtype=bool)
-    seen = set()
-    for start, end in zip(run_starts.tolist(), run_ends.tolist()):
-        uid = uids[start]
-        if uid in seen:
-            is_dup[start:end] = True
-        else:
-            seen.add(uid)
-    return is_dup
-
-
 def _first_run_slice(uids: np.ndarray, uid) -> tuple:
     """(start, end) of uid's first contiguous run."""
     idx = np.flatnonzero(uids == uid)
@@ -117,6 +91,10 @@ def spot_check_bit_identity(data, is_dup: np.ndarray, n_check: int) -> tuple:
 
 def inspect_file(path: str, block_divisor: int, n_spot: int) -> dict:
     from verl import DataProto
+
+    # The same function OffPolicyOPDRayTrainer._load_offpolicy_file filters with, so
+    # what this reports is exactly what training will drop.
+    from verl.trainer.ppo.opd_offpolicy_ray_trainer import find_padding_duplicates
 
     data = DataProto.load_from_disk(path)
     n_rows = len(data)
