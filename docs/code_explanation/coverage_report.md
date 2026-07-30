@@ -6,10 +6,10 @@
 - skipped: 622
 - pending / blocked / needs review: 0 / 0 / 0
 - source preservation passed: 743/743
-- semantic annotation blocks: 627
+- semantic annotation blocks: 758
 - analyzed source blocks: 10253
-- explained: 327
-- covered by parent comment: 1535
+- explained: 389
+- covered by parent comment: 1473
 - self explanatory: 8391
 - needs review: 0
 
@@ -24,14 +24,14 @@
 
 ## Annotation types
 
-- configuration: 63
-- distributed: 22
+- configuration: 69
+- distributed: 95
 - error_condition: 4
-- execution_context: 38
+- execution_context: 46
 - experimental: 6
-- semantic: 419
-- synchronization: 23
-- tensor_shape: 51
+- semantic: 447
+- synchronization: 21
+- tensor_shape: 69
 - uncertainty: 1
 
 行ごとの強制coverageは使用していません。意味blockを`explained`、`covered_by_parent_comment`、`self_explanatory`、`needs_review`へ分類し、Priority A〜Dは別途全pathのsemantic reviewを必須にしています。

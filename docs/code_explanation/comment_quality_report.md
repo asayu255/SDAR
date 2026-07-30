@@ -7,7 +7,7 @@
 - source preservation: 743 / 743
 - Priority review: A 8 / 8、B 8 / 8、C 11 / 11、D 4 / 4
 - 意味block `needs_review`: 0
-- semantic annotation map: 627 block
+- semantic annotation map: 758 block
 
 ## 移行内容
 
@@ -26,7 +26,7 @@ coverageは全論理行へのコメント強制ではありません。AST上の
 
 ## ユーザー提供解説の反映
 
-`ray_trainer.py`、`main_ppo.py`、`skillsd_ray_trainer.py`、`dp_actor.py` の日本語解説付き版から、
-551 blockの日本語コメントを現行sourceへ移植しました。提供版のうち3本には現行sourceより古い
+`ray_trainer.py`、`main_ppo.py`、`skillsd_ray_trainer.py`、`dp_actor.py`、`fsdp_workers.py` の日本語解説付き版から、
+688 blockの日本語コメントを現行sourceへ移植しました。提供版のうち3本には現行sourceより古い
 実装差分が含まれていたため、ファイル全体の直接コピーは行わず、コメントだけを対応する現行行へ
 移しています。これによりtask別metricsやresume schedule復元などの現行機能を保持しています。

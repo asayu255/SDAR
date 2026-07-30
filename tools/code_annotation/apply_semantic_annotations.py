@@ -863,6 +863,7 @@ ATTACHMENT_OVERRIDE_PATHS = {
     "verl/trainer/ppo/ray_trainer.py",
     "verl/trainer/ppo/skillsd_ray_trainer.py",
     "verl/workers/actor/dp_actor.py",
+    "verl/workers/fsdp_workers.py",
 }
 
 
