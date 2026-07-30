@@ -1,34 +1,57 @@
 set -x
 
 # Multitask SFT (behaviour cloning on teacher trajectories), Qwen3-1.7B.
-# Stage 1: each task's frozen single-task RL teacher generates a fixed
-# trajectory dataset (token sequences only — no top-k). Stage 2: the student is
-# trained off-policy with cross-entropy on those teacher tokens; the hard-target
-# sibling of off-policy distillation (same data pipeline, only the loss differs).
+# The student is trained off-policy with cross-entropy on teacher tokens; the
+# hard-target sibling of off-policy distillation (same data, only the loss
+# differs).
 #
-# EVERY parameter lives as a literal argument of the python3 commands below —
-# there is deliberately NO variable block, NO ${VAR:-default} fallback, NO
-# shared-args array and NO per-task loop, so there is exactly one place to
-# read or edit a setting. One-off overrides for Stage 2 can be appended on the
-# command line (trailing "$@") and still pass the expectations check.
+# THIS SCRIPT HAS NO STAGE 1. It reads the *same* teacher-trajectory pool the
+# off-policy KD arm uses:
+#
+#     $HOME/data/verl-agent/sdar_multitask/teacher_traj
+#
+# generated once by examples/opd_trainer/run_multitask_opd_offpolicy_qwen3.sh.
+# Sharing it is the stronger comparison, not just the cheaper one: SFT and KD
+# then differ in exactly one thing, the loss, with the trajectories, the
+# teachers, the sampling seed and the truncation all identical. Generating a
+# second pool would have re-rolled every trajectory under a different RNG
+# stream, so any SFT-vs-KD gap would carry a data-sampling difference inside it.
+#
+# The KD pool carries teacher_topk_logprobs / teacher_topk_ids (it was written
+# with collect_topk=True). The SFT loss is a plain NLL on the teacher's sampled
+# tokens and never reads them, so MultiTaskSFTTrainer drops both columns as each
+# file loads — see its ``_drop_tensor_keys``. Nothing about the trajectories the
+# SFT arm trains on differs from the KD arm's.
+#
+# EVERY parameter lives as a literal argument of the python3 command below —
+# there is deliberately NO variable block, NO ${VAR:-default} fallback and NO
+# shared-args array, so there is exactly one place to read or edit a setting.
+# One-off overrides can be appended on the command line (trailing "$@") and
+# still pass the expectations check.
 #
 # INTENT LOCK (examples/sft_trainer/):
-#   expected_multitask_sft_gen_config.yaml — Stage-1 dataset knobs
-#     (collect_topk=False pinned), validated by main_opd_offpolicy_gen BEFORE
-#     its single-task restriction.
 #   expected_multitask_sft_config.yaml — Stage-2 training knobs, validated by
 #     main_sft_multitask AFTER its loss injection.
-# To change a scientific knob: edit the argument below AND the matching
-# expectations file in the same commit; a script-only edit refuses to start.
+# To change a scientific knob: edit the argument below AND the expectations file
+# in the same commit; a script-only edit refuses to start.
+#
+# The pool's own knobs are NOT under this lock — they belong to the run that
+# produced it, examples/opd_trainer/run_multitask_offpolicy_qwen3.sh, which has
+# no expectations file. Two of them this arm depends on, and neither is checked
+# automatically, so verify them before starting:
+#   * 36000 trajectories per task (that script's GEN_TRAJ_PER_TASK; its default
+#     is 2400). At 15*8=120 trajectories/task/step over 300 steps, 36000 is
+#     exactly one epoch. A smaller pool silently becomes replay.
+#   * the same teachers, seed=1 and truncation as below.
+# scripts/inspect_teacher_pool.py reports the per-task trajectory counts.
 #
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
-#    ROLLOUT_COMPACT_RECORD default to on; they speed up the Stage-1 teacher
-#    rollouts and the Stage-2 validation rollouts)
+#    ROLLOUT_COMPACT_RECORD default to on; they speed up the validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
-#   neither stage has an old_log_prob phase or a per-step train rollout.
+#   this stage has neither an old_log_prob phase nor a per-step train rollout.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -47,244 +70,6 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --env_train_per_task_size 15 \
     --val_per_task_size 126 \
     --seed 1
-
-# ===================== Stage 1: teacher trajectory generation =====================
-python3 -m verl.trainer.main_opd_offpolicy_gen \
-    +trainer.expected_config=examples/sft_trainer/expected_multitask_sft_gen_config.yaml \
-    +gen.task=alfworld \
-    +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
-    +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=36000 \
-    +gen.collect_topk=False \
-    data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
-    data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
-    data.train_batch_size=15 \
-    data.val_batch_size=15 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=512 \
-    data.filter_overlong_prompts=True \
-    data.truncation='left' \
-    data.return_raw_chat=True \
-    data.task_balance.enable=True \
-    data.task_balance.per_task_batch_size=15 \
-    +data.task_balance.num_batches=300 \
-    data.task_balance.tasks=[alfworld,search,webshop] \
-    +data.task_overrides.alfworld.max_prompt_length=2048 \
-    +data.task_overrides.alfworld.truncation='error' \
-    +data.task_overrides.search.max_prompt_length=4096 \
-    +data.task_overrides.search.truncation='left' \
-    +data.task_overrides.webshop.max_prompt_length=4096 \
-    +data.task_overrides.webshop.truncation='error' \
-    +data.apply_chat_template_kwargs.enable_thinking=False \
-    +data.seed=1 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-1.7B \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
-    actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=False \
-    +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-    actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.max_model_len=4608 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    +actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    algorithm.adv_estimator=grpo \
-    algorithm.use_kl_in_reward=False \
-    env.env_name=multitask \
-    env.seed=1 \
-    env.max_steps=50 \
-    env.history_length=4 \
-    env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.30:8000/retrieve' \
-    env.multitask.tasks=[alfworld,search,webshop] \
-    env.multitask.max_steps.alfworld=50 \
-    env.multitask.max_steps.search=4 \
-    env.multitask.max_steps.webshop=15 \
-    +env.multitask.history_length.alfworld=2 \
-    +env.multitask.history_length.search=4 \
-    +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size=126 \
-    env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=3 \
-    trainer.ray_wait_register_center_timeout=600 \
-    trainer.nnodes=1 \
-    trainer.logger=['console'] \
-    trainer.project_name='verl_agent_sft_multitask' \
-    trainer.experiment_name=sdar_multitask_sft_multitask_qwen3_1.7b_gen \
-    trainer.total_training_steps=300 \
-    trainer.total_epochs=300 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.val_before_train=False
-
-python3 -m verl.trainer.main_opd_offpolicy_gen \
-    +trainer.expected_config=examples/sft_trainer/expected_multitask_sft_gen_config.yaml \
-    +gen.task=search \
-    +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/search_step300 \
-    +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=36000 \
-    +gen.collect_topk=False \
-    data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
-    data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
-    data.train_batch_size=15 \
-    data.val_batch_size=15 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=512 \
-    data.filter_overlong_prompts=True \
-    data.truncation='left' \
-    data.return_raw_chat=True \
-    data.task_balance.enable=True \
-    data.task_balance.per_task_batch_size=15 \
-    +data.task_balance.num_batches=300 \
-    data.task_balance.tasks=[alfworld,search,webshop] \
-    +data.task_overrides.alfworld.max_prompt_length=2048 \
-    +data.task_overrides.alfworld.truncation='error' \
-    +data.task_overrides.search.max_prompt_length=4096 \
-    +data.task_overrides.search.truncation='left' \
-    +data.task_overrides.webshop.max_prompt_length=4096 \
-    +data.task_overrides.webshop.truncation='error' \
-    +data.apply_chat_template_kwargs.enable_thinking=False \
-    +data.seed=1 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-1.7B \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
-    actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=False \
-    +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-    actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.max_model_len=4608 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    +actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    algorithm.adv_estimator=grpo \
-    algorithm.use_kl_in_reward=False \
-    env.env_name=multitask \
-    env.seed=1 \
-    env.max_steps=50 \
-    env.history_length=4 \
-    env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.31:8001/retrieve' \
-    env.multitask.tasks=[alfworld,search,webshop] \
-    env.multitask.max_steps.alfworld=50 \
-    env.multitask.max_steps.search=4 \
-    env.multitask.max_steps.webshop=15 \
-    +env.multitask.history_length.alfworld=2 \
-    +env.multitask.history_length.search=4 \
-    +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size=126 \
-    env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=3 \
-    trainer.ray_wait_register_center_timeout=600 \
-    trainer.nnodes=1 \
-    trainer.logger=['console'] \
-    trainer.project_name='verl_agent_sft_multitask' \
-    trainer.experiment_name=sft_multitask_qwen3_1.7b_coef1.0_gen_search \
-    trainer.total_training_steps=300 \
-    trainer.total_epochs=300 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.val_before_train=False
-
-python3 -m verl.trainer.main_opd_offpolicy_gen \
-    +trainer.expected_config=examples/sft_trainer/expected_multitask_sft_gen_config.yaml \
-    +gen.task=webshop \
-    +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
-    +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=36000 \
-    +gen.collect_topk=False \
-    data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
-    data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
-    data.train_batch_size=15 \
-    data.val_batch_size=15 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=512 \
-    data.filter_overlong_prompts=True \
-    data.truncation='left' \
-    data.return_raw_chat=True \
-    data.task_balance.enable=True \
-    data.task_balance.per_task_batch_size=15 \
-    +data.task_balance.num_batches=300 \
-    data.task_balance.tasks=[alfworld,search,webshop] \
-    +data.task_overrides.alfworld.max_prompt_length=2048 \
-    +data.task_overrides.alfworld.truncation='error' \
-    +data.task_overrides.search.max_prompt_length=4096 \
-    +data.task_overrides.search.truncation='left' \
-    +data.task_overrides.webshop.max_prompt_length=4096 \
-    +data.task_overrides.webshop.truncation='error' \
-    +data.apply_chat_template_kwargs.enable_thinking=False \
-    +data.seed=1 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-1.7B \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
-    actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=False \
-    +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-    actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.max_model_len=4608 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    +actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    algorithm.adv_estimator=grpo \
-    algorithm.use_kl_in_reward=False \
-    env.env_name=multitask \
-    env.seed=1 \
-    env.max_steps=50 \
-    env.history_length=4 \
-    env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.31:8001/retrieve' \
-    env.multitask.tasks=[alfworld,search,webshop] \
-    env.multitask.max_steps.alfworld=50 \
-    env.multitask.max_steps.search=4 \
-    env.multitask.max_steps.webshop=15 \
-    +env.multitask.history_length.alfworld=2 \
-    +env.multitask.history_length.search=4 \
-    +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size=126 \
-    env.resources_per_worker.num_cpus=0.1 \
-    trainer.n_gpus_per_node=3 \
-    trainer.ray_wait_register_center_timeout=600 \
-    trainer.nnodes=1 \
-    trainer.logger=['console'] \
-    trainer.project_name='verl_agent_sft_multitask' \
-    trainer.experiment_name=sft_multitask_qwen3_1.7b_coef1.0_gen_webshop \
-    trainer.total_training_steps=300 \
-    trainer.total_epochs=300 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.val_before_train=False
 
 # ===================== Stage 2: SFT (cross-entropy on teacher tokens) =====================
 python3 -m verl.trainer.main_sft_multitask \
@@ -353,7 +138,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    +algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
+    +algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +algorithm.sft.loss_coef=1.0 \
     +algorithm.sft.num_epochs=1 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
@@ -375,9 +160,9 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
-# NOTE: Stage 2 (SFT) keeps trainer.total_training_steps fixed at 300. With
-# per_task_batch_size=15 and env.rollout.n=8, each step draws 15*8=120
-# trajectories/task, so a 36000-trajectory pool is consumed exactly once over the
-# 300 steps: one epoch, no replay. This matches the off-policy KD arm's pool and
+# NOTE: trainer.total_training_steps is fixed at 300. With per_task_batch_size=15
+# and env.rollout.n=8, each step draws 15*8=120 trajectories/task, so a
+# 36000-trajectory pool is consumed exactly once over the 300 steps: one epoch, no
+# replay. This is the same pool and the same horizon as the off-policy KD arm, and
 # the ~1-epoch regime reported for agentic off-policy distillation, where reusing
 # a smaller pool measured worse.

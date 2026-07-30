@@ -2,11 +2,14 @@
 Stage 2 entry point for multitask SFT (behaviour cloning on teacher trajectories).
 
 The student is trained on the fixed teacher-trajectory dataset produced by
-``main_opd_offpolicy_gen`` (Stage 1, run with ``+gen.collect_topk=False``), in
-3-task-balanced batches, with a cross-entropy / NLL loss on the teacher tokens.
+``main_opd_offpolicy_gen`` -- specifically, on the *same pool the off-policy KD
+arm uses*, so the two arms differ in the loss and in nothing else. Batches are
+3-task-balanced, and the loss is a cross-entropy / NLL on the teacher tokens.
 GRPO policy-gradient, entropy, reference-KL, teacher-KL and reward are all
-disabled so the only training signal is the SFT cross-entropy. Only validation
-rolls the student out (identical to OPD / off-policy distillation).
+disabled so the only training signal is the SFT cross-entropy. The pool's top-k
+teacher columns are KD's target and are dropped at load here (see
+``MultiTaskSFTTrainer._drop_tensor_keys``). Only validation rolls the student
+out (identical to OPD / off-policy distillation).
 """
 
 import hydra

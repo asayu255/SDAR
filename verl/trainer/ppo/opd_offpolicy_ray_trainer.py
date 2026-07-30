@@ -75,7 +75,9 @@ _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 #                   compute_response_mask, and _compute_response_info slices
 #                   attention_mask directly, so the stored copy is never consulted.
 # Dropping happens at load, so pools already on disk need no regeneration.
-_DROP_TENSOR_KEYS = ["prompts", "response_mask"]
+# Subclasses whose loss reads *less* than the top-k KD loss extend this via the
+# ``_drop_tensor_keys`` class attribute (see MultiTaskSFTTrainer).
+_DROP_TENSOR_KEYS = ("prompts", "response_mask")
 
 # Keys popped from the prompt batch to form the generation input (mirrors OPD).
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
@@ -271,8 +273,14 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         )
         return data_dir
 
-    @staticmethod
-    def _load_offpolicy_file(path: str) -> DataProto:
+    # Tensor columns discarded as each Stage-1 file is loaded. A subclass whose
+    # loss consumes fewer columns than the top-k KD loss overrides this to drop
+    # more; it must never drop fewer, since everything listed here is already
+    # unread by *any* Stage-2 loss.
+    _drop_tensor_keys = _DROP_TENSOR_KEYS
+
+    @classmethod
+    def _load_offpolicy_file(cls, path: str) -> DataProto:
         """Load one Stage-1 ``<task>.pt``, dropping padding rows and dead columns.
 
         Pools written before Stage 1 stopped calling adjust_batch carry duplicated
@@ -287,9 +295,10 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         Row order is preserved, so the first-seen order of traj_uids -- and hence
         the trajectory sampling sequence -- is unchanged.
 
-        ``_DROP_TENSOR_KEYS`` go too. They are a quarter of every row and nothing in
-        this stage reads them, so keeping them only costs host RAM -- see the
-        constant for why each is dead.
+        ``cls._drop_tensor_keys`` go too. They are a quarter of every row and nothing
+        in this stage reads them, so keeping them only costs host RAM -- see
+        ``_DROP_TENSOR_KEYS`` for why each is dead, and the class attribute for how a
+        subclass with a narrower loss drops more.
 
         Both happen in one column-wise pass that releases each source column as soon
         as its replacement exists. Doing it with select_idxs instead would hold the
@@ -315,7 +324,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         source = data.batch
         for key in list(source.keys()):
             column = source[key]
-            if key in _DROP_TENSOR_KEYS:
+            if key in cls._drop_tensor_keys:
                 dropped_cols.append(key)
             elif keep_idx is None:
                 tensors[key] = column

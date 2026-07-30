@@ -12,19 +12,28 @@
 #   - Only SCIENTIFIC knobs live here. Performance knobs (micro batch sizes,
 #     offload, prefix caching, max_model_len, ...) are intentionally NOT
 #     listed. $HOME-derived paths (parquets, algorithm.sft.data_dir) are also
-#     not pinned (machine-dependent); the teacher DATASET's own knobs are
-#     pinned by the Stage-1 expectations file instead.
+#     not pinned (machine-dependent).
 #   - To change a setting intentionally: edit the run script AND this file in
 #     the same commit. A run-script-only edit will (by design) refuse to start.
+#
+# TEACHER POOL. This arm has no generation stage of its own: it reads the pool
+# the off-policy KD arm generated, $HOME/.../sdar_multitask/teacher_traj, so the
+# two arms differ in the loss and in nothing else -- same trajectories, same
+# teachers, same RNG stream. That pool's knobs therefore live with the run that
+# produced it (examples/opd_trainer/run_multitask_offpolicy_qwen3.sh), which has
+# no expectations file; see the run script's header for what to check by hand
+# before starting. It carries the teacher's top-k columns for KD's loss;
+# MultiTaskSFTTrainer drops them at load because the NLL never reads them, which
+# is a host-RAM decision and does not touch the data the loss sees.
 
 # ---- SFT loss (hard-target sibling of the off-policy top-k teacher-KL) ---------
 "algorithm.sft.loss_coef": 1.0
 # Epochs the fixed teacher pool is intended to be reused. 300 steps * 120
-# trajectories/task against a 36000 pool is exactly one pass, matching the
-# off-policy KD arm. NOTE: nothing reads this key -- the horizon is
-# trainer.total_training_steps and the reuse count follows from the Stage-1 pool
-# size, so this pins the *intent* only. Changing it without changing
-# gen.num_trajectories changes nothing.
+# trajectories/task against a 36000 pool is exactly one pass. NOTE: nothing reads
+# this key -- the horizon is trainer.total_training_steps and the reuse count
+# follows from the pool size, which this arm does not control (see TEACHER POOL
+# above). It pins the *intent* only; a pool smaller than 36000/task will replay
+# and nothing here will catch it.
 "algorithm.sft.num_epochs": 1
 # Per-task normalisation of the SFT loss. The plain token-mean weights a task by
 # its share of response tokens, measured at 69/27/4% for alfworld/webshop/search

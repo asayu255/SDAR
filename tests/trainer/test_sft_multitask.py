@@ -3,7 +3,8 @@
 Covered (CPU-only; Ray / workers are bypassed):
 * the SFT cross-entropy loss direction: ``agg_loss(-log_prob, mask)`` decreases
   as the student's log-prob of the (teacher) tokens increases;
-* ``MultiTaskSFTTrainer._resolve_data_dir`` reads ``algorithm.sft.data_dir``;
+* ``MultiTaskSFTTrainer._resolve_data_dir`` reads ``algorithm.sft.data_dir``, and
+  refuses a loss configuration that would need the columns this arm drops;
 * the inherited fixed-data loading + task-balanced iteration work on SFT data
   that carries NO teacher top-k fields (only token sequences);
 * ``_attach_sft_loss_weights`` hands every task an equal share of the loss and
@@ -70,13 +71,37 @@ def _make_sft_task_proto(task, n_traj, turns_per_traj=1, resp_len=4):
     )
 
 
+def _sft_config(data_dir="/some/dir", **actor_overrides):
+    """The composed config as main_sft_multitask leaves it after its injection."""
+    actor = {"use_sft_loss": True, "use_teacher_kl_loss": False}
+    actor.update(actor_overrides)
+    sft = {"data_dir": data_dir} if data_dir is not None else {}
+    return OmegaConf.create({"algorithm": {"sft": sft}, "actor_rollout_ref": {"actor": actor}})
+
+
 def test_resolve_data_dir_reads_sft_namespace():
     trainer = object.__new__(MultiTaskSFTTrainer)
-    trainer.config = OmegaConf.create({"algorithm": {"sft": {"data_dir": "/some/dir"}}})
+    trainer.config = _sft_config()
     assert trainer._resolve_data_dir() == "/some/dir"
 
-    trainer.config = OmegaConf.create({"algorithm": {"sft": {}}})
+    trainer.config = _sft_config(data_dir=None)
     with pytest.raises(AssertionError):
+        trainer._resolve_data_dir()
+
+
+def test_resolve_data_dir_rejects_a_loss_that_needs_the_dropped_columns():
+    """The arm throws the teacher top-k away at load, so a teacher-KL term would
+    read a key that is not there. It has to fail before the pool is loaded, not
+    on the first optimizer step."""
+    trainer = object.__new__(MultiTaskSFTTrainer)
+
+    trainer.config = _sft_config(use_teacher_kl_loss=True)
+    with pytest.raises(AssertionError, match="use_teacher_kl_loss"):
+        trainer._resolve_data_dir()
+
+    # ...and the arm is only itself when the SFT loss is actually on.
+    trainer.config = _sft_config(use_sft_loss=False)
+    with pytest.raises(AssertionError, match="use_sft_loss"):
         trainer._resolve_data_dir()
 
 

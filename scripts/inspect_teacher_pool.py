@@ -25,7 +25,7 @@ trajectories, so the padding row count should come out close to the trajectory
 count -- ``dup_rows / n_trajectories ~= 1.0`` is the headline check.
 
 Usage:
-    python3 scripts/inspect_teacher_pool.py $HOME/data/verl-agent/sdar_multitask/teacher_traj_sft
+    python3 scripts/inspect_teacher_pool.py $HOME/data/verl-agent/sdar_multitask/teacher_traj
     python3 scripts/inspect_teacher_pool.py <dir> --sizes-only      # disk sizes, no load
 """
 

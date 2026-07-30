@@ -9,6 +9,8 @@ Covered (CPU-only; Ray / workers are bypassed):
   per task from the matching task;
 * ``find_padding_duplicates`` recovers exactly the rows an earlier Stage 1
   appended as adjust_batch padding, and ``_load_offpolicy_file`` drops them;
+* the SFT arm, which reads this same pool, additionally drops the teacher top-k
+  columns its NLL never reads, without changing any row the loss does read;
 * the top-k teacher-KL math (``topk_kl_per_token``) is the *same* one OPD uses:
   zero when the student matches the teacher, positive when it does not.
 
@@ -29,6 +31,7 @@ try:
         OffPolicyOPDRayTrainer,
         find_padding_duplicates,
     )
+    from verl.trainer.ppo.sft_multitask_ray_trainer import MultiTaskSFTTrainer
 except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
 
@@ -232,6 +235,36 @@ def test_load_offpolicy_file_drops_columns_and_padding_together(tmp_path):
     assert "prompts" not in loaded.batch
     assert len(loaded) == 8
     assert loaded.non_tensor_batch["traj_uid"].tolist() == [f"webshop-{j}" for j in range(4) for _ in range(2)]
+
+
+def test_sft_arm_also_drops_the_teacher_topk_columns(tmp_path):
+    """The SFT arm reads the KD arm's pool but not the KD arm's target.
+
+    Same file, two loaders: KD keeps the teacher's top-k distribution because its
+    loss is a KL against it; SFT's loss is an NLL on the sampled tokens, so those
+    columns are dead weight (the largest thing in a row) and go at load. The rows
+    themselves, and everything the NLL reads, must be identical either way --
+    that is what makes the two arms differ only in the loss.
+    """
+    proto = _make_task_proto("search", 3, turns_per_traj=2)
+    n = len(proto)
+    proto.batch["input_ids"] = torch.arange(n * 8, dtype=torch.long).reshape(n, 8)
+    proto.batch["prompts"] = torch.zeros((n, 8), dtype=torch.long)
+    path = str(tmp_path / "search.pt")
+    proto.save_to_disk(path)
+
+    kd = OffPolicyOPDRayTrainer._load_offpolicy_file(path)
+    sft = MultiTaskSFTTrainer._load_offpolicy_file(path)
+
+    assert "teacher_topk_logprobs" in kd.batch and "teacher_topk_ids" in kd.batch
+    assert "teacher_topk_logprobs" not in sft.batch and "teacher_topk_ids" not in sft.batch
+    # The parent's drops still apply to the subclass; it extends, not replaces.
+    assert "prompts" not in sft.batch
+    # Identical data underneath.
+    assert len(sft) == len(kd) == n
+    assert torch.equal(sft.batch["input_ids"], kd.batch["input_ids"])
+    assert torch.equal(sft.batch["responses"], kd.batch["responses"])
+    assert sft.non_tensor_batch["traj_uid"].tolist() == kd.non_tensor_batch["traj_uid"].tolist()
 
 
 def test_topk_teacher_kl_matches_opd_loss():

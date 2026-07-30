@@ -78,14 +78,25 @@ class OPDGenTaskRunner:
         # model.path per invocation and filters the parquet on disk). The
         # expectations file pins only task-agnostic knobs, which the
         # restriction does not touch.
-        from verl.utils.expected_config import enforce_expected_config
-
+        #
+        # Optional, not required. It was briefly mandatory, for a Stage 1 the SFT
+        # arm no longer has -- that arm now reads the KD arm's pool directly, so
+        # the only caller left is the KD generation script, which has never
+        # shipped an expectations file and whose pool is already on disk. Writing
+        # one now would pin knobs reconstructed after the fact, which is a worse
+        # guarantee than none. The warning keeps the omission visible.
         expect_file = config.trainer.get("expected_config", None)
-        assert expect_file is not None, (
-            "Stage-1 generation requires +trainer.expected_config=<expectations yaml> "
-            "(see examples/sft_trainer/expected_multitask_sft_gen_config.yaml)"
-        )
-        enforce_expected_config(config, expect_file, tag="offpolicy-gen expected-config")
+        if expect_file is None:
+            print(
+                "[OPD-offpolicy gen] WARNING: no +trainer.expected_config given; "
+                "this run's knobs are not checked against a version-controlled "
+                "intent file. The generated pool is only as trustworthy as the "
+                "command line that produced it."
+            )
+        else:
+            from verl.utils.expected_config import enforce_expected_config
+
+            enforce_expected_config(config, expect_file, tag="offpolicy-gen expected-config")
 
         # ---- Restrict everything to this single task; teacher drives the rollout. ----
         per_task_batch_size = int(config.data.task_balance.per_task_batch_size)
