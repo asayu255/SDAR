@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=alfworld \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -133,7 +133,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=search \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -212,7 +212,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.task=webshop \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
-    +gen.num_trajectories=7200 \
+    +gen.num_trajectories=36000 \
     +gen.collect_topk=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -354,7 +354,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.nnodes=1 \
     +algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft \
     +algorithm.sft.loss_coef=1.0 \
-    +algorithm.sft.num_epochs=5 \
+    +algorithm.sft.num_epochs=1 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample=True \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature=0 \
@@ -376,5 +376,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.val_before_train=False "$@"
 # NOTE: Stage 2 (SFT) keeps trainer.total_training_steps fixed at 300. With
 # per_task_batch_size=15 and env.rollout.n=8, each step draws 15*8=120
-# trajectories/task; 7200 Stage-1 trajectories/task therefore gives
-# 300 * 120 / 7200 = 5 epochs of fixed-pool reuse.
+# trajectories/task, so a 36000-trajectory pool is consumed exactly once over the
+# 300 steps: one epoch, no replay. This matches the off-policy KD arm's pool and
+# the ~1-epoch regime reported for agentic off-policy distillation, where reusing
+# a smaller pool measured worse.

@@ -15,7 +15,11 @@
 # gen.teacher_path, filtered parquet paths, per-task experiment names).
 
 # ---- dataset size / content ---------------------------------------------------------
-"gen.num_trajectories": 7200
+# 36000 is what makes Stage 2 a single epoch: it draws per_task_batch_size 15 *
+# env.rollout.n 8 = 120 trajectories/task/step over 300 steps, consuming the pool
+# exactly once. Generation reaches it in one pass of its own prompt pool too
+# (120/step * 300 steps), so search never reuses a prompt.
+"gen.num_trajectories": 36000
 "gen.collect_topk": false
 
 # ---- prompts / episode shape (identical to the OPD / offline-KD runs) --------------

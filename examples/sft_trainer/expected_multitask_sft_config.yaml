@@ -19,12 +19,21 @@
 
 # ---- SFT loss (hard-target sibling of the off-policy top-k teacher-KL) ---------
 "algorithm.sft.loss_coef": 1.0
-# Epochs the fixed teacher pool is intended to be reused (standard SFT; TAID's
-# SFT baseline=5). Stage 2 keeps trainer.total_training_steps fixed at 300; the
-# Stage-1 pool size is chosen so 300 steps draws each trajectory about 5 times.
-"algorithm.sft.num_epochs": 5
-# effective values after main_sft_multitask's injection into the actor config
+# Epochs the fixed teacher pool is intended to be reused. 300 steps * 120
+# trajectories/task against a 36000 pool is exactly one pass, matching the
+# off-policy KD arm. NOTE: nothing reads this key -- the horizon is
+# trainer.total_training_steps and the reuse count follows from the Stage-1 pool
+# size, so this pins the *intent* only. Changing it without changing
+# gen.num_trajectories changes nothing.
+"algorithm.sft.num_epochs": 1
+# Per-task normalisation of the SFT loss. The plain token-mean weights a task by
+# its share of response tokens, measured at 69/27/4% for alfworld/webshop/search
+# on these pools purely because of the 50/15/4-turn episode caps; the per-row
+# weights in _attach_sft_loss_weights make it 1/3 each. Data composition, pool
+# sizes and epoch counts are untouched, so this arm still differs from off-policy
+# KD in nothing but the loss.
 "actor_rollout_ref.actor.use_sft_loss": true
+# effective values after main_sft_multitask's injection into the actor config
 "actor_rollout_ref.actor.sft_loss_coef": 1.0
 "actor_rollout_ref.actor.use_teacher_kl_loss": false
 
