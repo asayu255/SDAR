@@ -860,8 +860,11 @@ CURATED = [
 # 旧CURATED blockを再適用すると同義コメントが重複する。
 ATTACHMENT_OVERRIDE_PATHS = {
     "verl/trainer/main_ppo.py",
+    "verl/trainer/ppo/core_algos.py",
     "verl/trainer/ppo/ray_trainer.py",
     "verl/trainer/ppo/skillsd_ray_trainer.py",
+    "verl/protocol.py",
+    "verl/utils/seqlen_balancing.py",
     "verl/workers/actor/dp_actor.py",
     "verl/workers/fsdp_workers.py",
 }

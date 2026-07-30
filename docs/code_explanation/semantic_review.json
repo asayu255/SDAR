@@ -46,7 +46,7 @@
     "original_path": "verl/trainer/ppo/core_algos.py",
     "review_status": "reviewed",
     "reason": "semantic annotation mapにpriority block解説あり",
-    "annotation_count": 1
+    "annotation_count": 108
   },
   {
     "priority": "A",
