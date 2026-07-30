@@ -32,9 +32,9 @@ jobs:
           mkdir -p docs/code_explanation/annotated/verl/trainer/ppo
           mkdir -p docs/code_explanation/annotated/verl/trainer
 
-          cat .codex_upload/ray_trainer.py.b64.* | tr -d '\n' | base64 --decode > docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
-          cat .codex_upload/main_ppo.py.b64.* | tr -d '\n' | base64 --decode > docs/code_explanation/annotated/verl/trainer/main_ppo.py
-          cat .codex_upload/skillsd_ray_trainer.py.b64.* | tr -d '\n' | base64 --decode > docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py
+          cat .codex_upload/ray_trainer.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
+          cat .codex_upload/main_ppo.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/main_ppo.py
+          cat .codex_upload/skillsd_ray_trainer.py.gz.b64.* | tr -d '\n' | base64 --decode | gzip --decompress > docs/code_explanation/annotated/verl/trainer/ppo/skillsd_ray_trainer.py
 
           cat <<'EOF' | sha256sum -c -
           1b6e3d19cf543dff46d59fe7b0a736c51de132cb6a0cfa5e716c528a958c09d8  docs/code_explanation/annotated/verl/trainer/ppo/ray_trainer.py
