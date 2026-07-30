@@ -23,7 +23,7 @@ set -x
 #
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
-#   ROLLOUT_KEEP_VLLM_AWAKE=1  SEARCH_QUERY_CACHE=1  ROLLOUT_PREPROC_WORKERS=8
+#   ROLLOUT_KEEP_VLLM_AWAKE=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on; they speed up the Stage-1 teacher
 #    rollouts and the Stage-2 validation rollouts)
