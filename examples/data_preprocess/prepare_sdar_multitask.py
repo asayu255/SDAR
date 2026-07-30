@@ -86,7 +86,8 @@ def _process_search_row(row: pd.Series, split: str, idx: int) -> dict:
     return item
 
 
-def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.DataFrame:
+def _search_dataframe(search_dir: str, split: str, size: "int | None", seed: int) -> pd.DataFrame:
+    """Search rows for one split. ``size`` applies to train only; test takes every row."""
     path = os.path.join(os.path.expanduser(search_dir), f"{split}.parquet")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -95,13 +96,17 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
 
     full = pd.read_parquet(path)
     if split == "test":
-        # Match the single-task search baseline: run_search_qwen3.sh validates with
-        # val_dataloader(shuffle=False), which consumes the first val_batch_size rows of
-        # test.parquet. Take the leading `size` rows deterministically so the multitask
-        # search validation is computed over the same fixed population (fair metric comparison).
-        if len(full) < size:
-            raise ValueError(f"search test parquet has {len(full)} rows but {size} were requested.")
-        selected = full.head(size).reset_index(drop=True)
+        # Every row, in file order. _validate iterates the *whole* val_dataloader, so
+        # the single-task search baseline scores all of test.parquet -- not the first
+        # val_batch_size rows, as this used to assume. Truncating here left the
+        # multitask run reporting val/search/test_score over a 126-prompt subset while
+        # the baseline reported it over thousands, which is why search was the only
+        # task whose validation did not line up. alfworld and webshop are unaffected:
+        # their prompt rows are content-free placeholders generated at exactly
+        # val_per_task_size, so the population is the same on both sides.
+        # The dataloader reads with shuffle=False, so file order is preserved and the
+        # two runs walk the same prompts in the same sequence.
+        selected = full.reset_index(drop=True)
     else:
         # Train: uniform random subset without replacement (same budget/distribution as the
         # single-task RandomSampler). Ordering is left to the dataloader's TaskBalancedSampler.
@@ -110,15 +115,32 @@ def _search_dataframe(search_dir: str, split: str, size: int, seed: int) -> pd.D
     return pd.DataFrame(rows)
 
 
-def _build_split(search_dir: str, split: str, per_task_size_by_task: dict[str, int], seed: int) -> pd.DataFrame:
-    frames = [
-        _dummy_task_dataframe("alfworld", split, per_task_size_by_task["alfworld"]),
-        _search_dataframe(search_dir, split, per_task_size_by_task["search"], seed),
-        _dummy_task_dataframe("webshop", split, per_task_size_by_task["webshop"]),
-    ]
+def _build_split(search_dir: str, split: str, per_task_size_by_task: "dict[str, int | None]", seed: int) -> pd.DataFrame:
+    search_frame = _search_dataframe(search_dir, split, per_task_size_by_task["search"], seed)
+    alfworld_frame = _dummy_task_dataframe("alfworld", split, per_task_size_by_task["alfworld"])
+    webshop_frame = _dummy_task_dataframe("webshop", split, per_task_size_by_task["webshop"])
+
+    if split == "test":
+        # Search goes last. Validation reads this file with batch_size=val_batch_size
+        # and shuffle=False, and search's row count is whatever test.parquet holds --
+        # not necessarily a multiple of that batch size. Placed last, the only short
+        # batch is search's own tail, which the search env pads with masked-out dummies.
+        # Anywhere else, that tail would share a batch with the next task, and
+        # _validation_task_name raises on a mixed batch because val_kwargs_by_task is
+        # resolved once per batch.
+        frames = [alfworld_frame, webshop_frame, search_frame]
+    else:
+        frames = [alfworld_frame, search_frame, webshop_frame]
     df = pd.concat(frames, ignore_index=True)
+
     counts = df["task_name"].value_counts().to_dict()
     expected = {task: per_task_size_by_task[task] for task in TASKS}
+    # Test search is "however many rows test.parquet has", so there is no configured
+    # count to check it against; the other two are still pinned.
+    if expected["search"] is None:
+        expected["search"] = len(search_frame)
+        if not len(search_frame):
+            raise RuntimeError(f"search {split} parquet produced no rows")
     if counts != expected:
         raise RuntimeError(f"Unexpected multitask counts for {split}: got {counts}, expected {expected}")
     return df
@@ -136,7 +158,13 @@ def main():
             "search": search_train_size,
             "webshop": env_train_size,
         },
-        "test": {task: args.val_per_task_size for task in TASKS},
+        "test": {
+            "alfworld": args.val_per_task_size,
+            # None = every row of the search test parquet, matching the single-task
+            # baseline's validation population.
+            "search": None,
+            "webshop": args.val_per_task_size,
+        },
     }
 
     for split, per_task_size_by_task in split_sizes.items():
@@ -149,6 +177,24 @@ def main():
         missing = {"ground_truth", "question", "data_source"} - set(search_env_kwargs)
         if missing:
             raise RuntimeError(f"Search env_kwargs is missing keys: {sorted(missing)}")
+
+        if split == "test":
+            # Task order decides how validation batches out, so report it: with
+            # val_batch_size = val_per_task_size the run should log
+            # "Size of val dataloader: 2 + ceil(n_search / val_per_task_size)", and
+            # every batch but search's tail should hold exactly one task.
+            n_search = int((df["task_name"] == "search").sum())
+            batch_size = args.val_per_task_size
+            logger.info(
+                "Validation layout: alfworld(%s) -> webshop(%s) -> search(%s); "
+                "expect %s val batches at val_batch_size=%s (search tail of %s rows)",
+                args.val_per_task_size,
+                args.val_per_task_size,
+                n_search,
+                2 + -(-n_search // batch_size),
+                batch_size,
+                n_search % batch_size or batch_size,
+            )
 
     if args.hdfs_dir:
         makedirs(args.hdfs_dir)
@@ -164,6 +210,10 @@ if __name__ == "__main__":
     parser.add_argument("--total_training_steps", default=150, type=int)
     parser.add_argument("--per_task_batch_size", default=16, type=int)
     parser.add_argument("--env_train_per_task_size", default=None, type=int)
+    # alfworld and webshop only. Their validation prompts are content-free
+    # placeholders, so this is just how many episodes each is evaluated over. Search
+    # ignores it and takes every row of its test parquet, because that is what the
+    # single-task baseline scores.
     parser.add_argument("--val_per_task_size", default=128, type=int)
     parser.add_argument("--seed", default=1, type=int)
     args = parser.parse_args()
