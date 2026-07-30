@@ -48,6 +48,21 @@ elif is_npu_available:
 
 __all__ = ["DataParallelPPOActor"]
 
+# With pg_loss_coef == 0 (pure distillation / SFT) the policy-gradient statistics are
+# a single device-side zero tensor. Reading it back with .item() synchronises the
+# stream, and update_policy would do so four times per micro-batch plus four more per
+# task -- so name the constants instead.
+_ZERO_PG_METRICS = {
+    "actor/pg_loss": 0.0,
+    "actor/pg_clipfrac": 0.0,
+    "actor/ppo_kl": 0.0,
+    "actor/pg_clipfrac_lower": 0.0,
+}
+
+
+def _ZERO_PG_METRICS_BY_TASK(task: str) -> dict:
+    return {f"{name}/{task}": value for name, value in _ZERO_PG_METRICS.items()}
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -440,6 +455,37 @@ class DataParallelPPOActor(BasePPOActor):
         task_id_names = data.meta_info.get("task_id_names", None)
         if "task_ids" in data.batch.keys():
             select_keys.append("task_ids")
+        # Per-task normalised SFT loss: the driver attaches a per-row weight (see
+        # OffPolicyOPDRayTrainer._attach_sft_loss_weights). Absent -> plain token-mean.
+        weighted_sft = self.config.get("use_sft_loss", False) and "sft_loss_weight" in data.batch.keys()
+        if weighted_sft:
+            select_keys.append("sft_loss_weight")
+            # The weights encode the whole normalisation, which these three would
+            # each re-scale out from under it.
+            assert not self.config.use_dynamic_bsz, (
+                "per-task normalised SFT loss is incompatible with use_dynamic_bsz "
+                "(its mini-batch scaling assumes an unweighted token-mean)"
+            )
+            assert self.ulysses_sequence_parallel_size == 1, (
+                "per-task normalised SFT loss assumes DP size == world size; "
+                f"got ulysses_sequence_parallel_size={self.ulysses_sequence_parallel_size}"
+            )
+            assert self.config.ppo_epochs == 1, (
+                "per-task normalised SFT loss assumes one pass over each mini-batch; "
+                f"got ppo_epochs={self.config.ppo_epochs}"
+            )
+            # Any other loss term would be added to a differently-normalised number.
+            for other in ("use_kl_loss", "use_sdl_loss", "use_sdar_loss", "use_teacher_kl_loss"):
+                assert not self.config.get(other, False), (
+                    f"per-task normalised SFT loss must be the only loss term, but {other} is set"
+                )
+            assert pg_loss_coef == 0 and self.config.entropy_coeff == 0, (
+                "per-task normalised SFT loss must be the only loss term, but "
+                f"pg_loss_coef={pg_loss_coef} entropy_coeff={self.config.entropy_coeff}"
+            )
+            self.sft_dp_world_size = (
+                torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+            )
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -481,6 +527,7 @@ class DataParallelPPOActor(BasePPOActor):
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
+                    sft_loss_weight = data["sft_loss_weight"] if weighted_sft else None
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
@@ -616,7 +663,25 @@ class DataParallelPPOActor(BasePPOActor):
                         # (one-hot teacher) limit of the teacher-KL distillation.
                         sft_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         sft_coef = self.config.get("sft_loss_coef", 1.0)
-                        policy_loss = policy_loss + sft_loss * sft_coef
+                        if sft_loss_weight is None:
+                            policy_loss = policy_loss + sft_loss * sft_coef
+                        else:
+                            # Per-task normalised variant: the driver put a weight on
+                            # every row such that summing weight * row-NLL over the
+                            # whole step gives each task an equal share of the loss
+                            # (see _attach_sft_loss_weights). The two divisions this
+                            # sum must survive are undone here rather than by
+                            # special-casing the shared scaling below: FSDP averages
+                            # gradients across the DP ranks, and the mini-batch loss
+                            # is divided by gradient_accumulation, but the weights
+                            # already carry the full normalisation.
+                            row_nll = (-log_prob * response_mask).sum(-1)
+                            weighted = (row_nll * sft_loss_weight).sum()
+                            weighted = weighted * (self.sft_dp_world_size * self.gradient_accumulation)
+                            policy_loss = policy_loss + weighted * sft_coef
+                            metrics["actor/sft_loss_weighted"] = weighted.detach().item()
+                        # Kept unweighted so it stays comparable with runs that do not
+                        # normalise per task.
                         metrics["actor/sft_loss"] = sft_loss.detach().item()
                         metrics["actor/sft_coef"] = sft_coef
 
@@ -648,12 +713,15 @@ class DataParallelPPOActor(BasePPOActor):
                                         clip_ratio_c=clip_ratio_c,
                                         loss_agg_mode=loss_agg_mode,
                                     )
+                                    task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
+                                    task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
+                                    task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
+                                    task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
                                 else:
-                                    task_pg_loss = task_pg_clipfrac = task_ppo_kl = task_pg_clipfrac_lower = zero
-                                task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
-                                task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
-                                task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
-                                task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
+                                    # Reading four device-side constants back per task
+                                    # per micro-batch costs a stream sync each; the
+                                    # values are known.
+                                    task_metrics.update(_ZERO_PG_METRICS_BY_TASK(task))
 
                                 if entropy_coeff != 0:
                                     task_metrics[f"actor/entropy_loss/{task}"] = (
@@ -702,12 +770,15 @@ class DataParallelPPOActor(BasePPOActor):
 
                                 append_to_dict(metrics, task_metrics)
 
-                    data = {
-                        "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                        "actor/ppo_kl": ppo_kl.detach().item(),
-                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                    }
+                    if pg_loss_coef != 0:
+                        data = {
+                            "actor/pg_loss": pg_loss.detach().item(),
+                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                            "actor/ppo_kl": ppo_kl.detach().item(),
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        }
+                    else:
+                        data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()

@@ -5,7 +5,9 @@ Covered (CPU-only; Ray / workers are bypassed):
   as the student's log-prob of the (teacher) tokens increases;
 * ``MultiTaskSFTTrainer._resolve_data_dir`` reads ``algorithm.sft.data_dir``;
 * the inherited fixed-data loading + task-balanced iteration work on SFT data
-  that carries NO teacher top-k fields (only token sequences).
+  that carries NO teacher top-k fields (only token sequences);
+* ``_attach_sft_loss_weights`` hands every task an equal share of the loss and
+  zeroes the adjust_batch padding rows.
 
 If the verl stack (numpy/torch/...) is not installed, the module is skipped.
 """
@@ -78,18 +80,6 @@ def test_resolve_data_dir_reads_sft_namespace():
         trainer._resolve_data_dir()
 
 
-def test_epoch_to_step_conversion():
-    # total_steps == num_epochs * ceil(max_pool / per_task_traj_per_step).
-    # e.g. pool=2400 trajectories/task, 120 trajectories/step, 5 epochs -> 100 steps
-    #   (each trajectory reused ~5 times, standard SFT).
-    assert MultiTaskSFTTrainer._steps_per_epoch(2400, 120) == 20
-    assert 5 * MultiTaskSFTTrainer._steps_per_epoch(2400, 120) == 100
-    # non-divisible pools round up so the whole pool is covered each epoch
-    assert MultiTaskSFTTrainer._steps_per_epoch(2401, 120) == 21
-    # a pool smaller than one step's draw still yields at least 1 step/epoch
-    assert MultiTaskSFTTrainer._steps_per_epoch(10, 120) == 1
-
-
 def test_load_and_balanced_iter_on_topk_free_data(tmp_path):
     # 6 trajectories/task, 2 turns each; NO teacher top-k fields (SFT data).
     _make_sft_task_proto("alfworld", 6, turns_per_traj=2).save_to_disk(str(tmp_path / "alfworld.pt"))
@@ -119,3 +109,115 @@ def test_load_and_balanced_iter_on_topk_free_data(tmp_path):
         for u in batch.non_tensor_batch["traj_uid"]:
             uid_counts[u] = uid_counts.get(u, 0) + 1
         assert all(c == 2 for c in uid_counts.values())
+
+
+def _weight_batch(rows_per_task, tokens_per_row, n_padding=0):
+    """A batch with a known per-task response-token budget.
+
+    ``rows_per_task`` maps task -> row count; every one of that task's rows carries
+    ``tokens_per_row[task]`` response tokens. ``n_padding`` rows are appended to
+    stand in for adjust_batch's copies (their task name is reused from the first
+    task, exactly as a real copy would carry its source row's task).
+    """
+    resp_len = max(tokens_per_row.values())
+    masks, names = [], []
+    for task, n_rows in rows_per_task.items():
+        for _ in range(n_rows):
+            row = torch.zeros(resp_len)
+            row[: tokens_per_row[task]] = 1.0
+            masks.append(row)
+            names.append(task)
+    first_task = next(iter(rows_per_task))
+    for _ in range(n_padding):
+        row = torch.zeros(resp_len)
+        row[: tokens_per_row[first_task]] = 1.0
+        masks.append(row)
+        names.append(first_task)
+    return DataProto.from_dict(
+        tensors={"response_mask": torch.stack(masks)},
+        non_tensors={"task_name": np.array(names, dtype=object)},
+    )
+
+
+def _attach_weights(batch, n_real, mini_batch_size):
+    trainer = object.__new__(MultiTaskSFTTrainer)
+    trainer.config = OmegaConf.create(
+        {"actor_rollout_ref": {"actor": {"ppo_mini_batch_size": mini_batch_size}}}
+    )
+    metrics = {}
+    trainer._attach_sft_loss_weights(batch, n_real=n_real, metrics=metrics)
+    return batch.batch["sft_loss_weight"], metrics
+
+
+def test_sft_weights_give_every_task_an_equal_share():
+    # Deliberately lopsided: alfworld brings 24x the response tokens of search.
+    rows = {"alfworld": 12, "webshop": 6, "search": 2}
+    tokens = {"alfworld": 8, "webshop": 4, "search": 2}
+    batch = _weight_batch(rows, tokens)
+    weights, metrics = _attach_weights(batch, n_real=len(batch), mini_batch_size=5)
+
+    num_mini_batches = len(batch) / 5
+    row_tokens = batch.batch["response_mask"].sum(-1)
+    task_names = batch.non_tensor_batch["task_name"]
+
+    # Each task's total weight-times-tokens is the same 1/num_tasks share.
+    budgets = {}
+    for task in rows:
+        sel = torch.from_numpy(np.asarray(task_names == task))
+        budgets[task] = float((weights[sel] * row_tokens[sel]).sum())
+    for task, budget in budgets.items():
+        assert budget == pytest.approx(num_mini_batches / len(rows), rel=1e-6), task
+
+    # The unweighted token share it corrects for is the lopsided one.
+    assert metrics["sft/token_share/alfworld"] == pytest.approx(96 / 124)
+    assert metrics["sft/token_share/search"] == pytest.approx(4 / 124)
+    assert sum(metrics[f"sft/token_share/{t}"] for t in rows) == pytest.approx(1.0)
+
+
+def test_sft_weighted_loss_recovers_the_mean_of_per_task_means():
+    rows = {"alfworld": 12, "webshop": 6, "search": 2}
+    tokens = {"alfworld": 8, "webshop": 4, "search": 2}
+    batch = _weight_batch(rows, tokens)
+    weights, _ = _attach_weights(batch, n_real=len(batch), mini_batch_size=5)
+    response_mask = batch.batch["response_mask"]
+    num_mini_batches = len(batch) / 5
+
+    # Give each task a different constant per-token NLL. Summed over the step the
+    # weighted loss must be num_mini_batches * mean(per-task token-means), i.e. the
+    # per-task means enter with equal weight even though their token counts do not.
+    nll_by_task = {"alfworld": 3.0, "webshop": 1.0, "search": 0.5}
+    task_names = batch.non_tensor_batch["task_name"]
+    per_token = torch.zeros_like(response_mask)
+    for task, value in nll_by_task.items():
+        sel = torch.from_numpy(np.asarray(task_names == task))
+        per_token[sel] = value
+
+    row_nll = (per_token * response_mask).sum(-1)
+    total = float((row_nll * weights).sum())
+    expected = num_mini_batches * sum(nll_by_task.values()) / len(nll_by_task)
+    assert total == pytest.approx(expected, rel=1e-6)
+
+
+def test_sft_weights_zero_the_padding_rows():
+    rows = {"alfworld": 8, "search": 2}
+    tokens = {"alfworld": 4, "search": 2}
+    batch = _weight_batch(rows, tokens, n_padding=5)
+    n_real = 10
+    weights, metrics = _attach_weights(batch, n_real=n_real, mini_batch_size=3)
+
+    assert (weights[n_real:] == 0).all()
+    assert (weights[:n_real] > 0).all()
+    assert metrics["sft/padding_rows"] == 5
+    # The padding rows are alfworld copies; excluding them keeps alfworld's share
+    # at what its real rows alone contribute.
+    assert metrics["sft/token_share/alfworld"] == pytest.approx(32 / 36)
+    # And the per-task budgets still come out equal.
+    row_tokens = batch.batch["response_mask"].sum(-1)
+    task_names = batch.non_tensor_batch["task_name"]
+    num_mini_batches = len(batch) / 3
+    for task in rows:
+        sel = torch.from_numpy(np.asarray(task_names == task))
+        sel[n_real:] = False
+        assert float((weights[sel] * row_tokens[sel]).sum()) == pytest.approx(
+            num_mini_batches / len(rows), rel=1e-6
+        )

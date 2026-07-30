@@ -39,6 +39,7 @@ from verl.protocol import DataProtoConfig
 from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
+    get_task_names,
 )
 from verl.trainer.ppo.opd_ray_trainer import compute_opd_data_metrics, compute_opd_data_metrics_by_task
 from verl.trainer.ppo.ray_trainer import (
@@ -358,14 +359,82 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         under prefetch that dict does not exist yet.
         """
         prep_metrics = {}
+        n_real = len(batch)
+        # Stage 2 keeps adjust_batch: unlike Stage 1 it is load-bearing here.
+        # _balance_batch's partitioner requires a row count divisible by the DP
+        # world size, and update_policy scales every mini-batch by the *configured*
+        # gradient_accumulation, so a ragged final mini-batch would be mis-scaled.
         batch = adjust_batch(self.config, batch)
         batch.batch["response_mask"] = compute_response_mask(batch)
+        # Must precede _balance_batch only in the sense that the weights are
+        # computed from the pre-reorder row order; reorder() moves the column with
+        # its rows, so the weights stay attached either way.
+        if self.config.actor_rollout_ref.actor.get("use_sft_loss", False):
+            self._attach_sft_loss_weights(batch, n_real=n_real, metrics=prep_metrics)
         if self.config.trainer.balance_batch:
             self._balance_batch(batch, metrics=prep_metrics)
         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
         # tag rows with their task so the actor can split its metrics
         self._attach_task_ids(batch)
         return batch, prep_metrics
+
+    def _attach_sft_loss_weights(self, batch: DataProto, n_real: int, metrics: dict):
+        """Give every row the weight that makes each task's share of the SFT loss 1/3.
+
+        The plain token-mean cross-entropy weights a task by its share of response
+        tokens in the batch, and for these three tasks that share is nowhere near
+        equal: episode caps of 50/15/4 turns and differing per-turn lengths put
+        alfworld around 69% of the tokens and search around 4%. Weighting each row
+        by ``1 / (num_tasks * T_task)`` makes the sum over a task's rows its own
+        token-mean, so the three contribute equally regardless of how many rows or
+        tokens they brought.
+
+        ``T_task`` is the task's response-token total over the *whole* step rather
+        than per mini-batch. Per mini-batch, search contributes only a handful of
+        rows, and dividing by a token count drawn from those few rows would amplify
+        their noise -- and would divide by zero whenever a mini-batch happened to
+        contain none of a task at all. The step-level totals come from thousands of
+        rows and need no all_reduce, since the driver has the whole batch here.
+
+        Scaling by the mini-batch count keeps a single optimizer step's loss at the
+        same O(1) magnitude as the unweighted token-mean it replaces: without it
+        each step would carry 1/num_mini_batches of the step's loss and the
+        effective learning rate would collapse.
+
+        Rows at or past ``n_real`` are adjust_batch's padding; they get weight 0 and
+        are excluded from ``T_task``, so they neither contribute nor dilute. Their
+        originals are still in the batch with a full weight, so no turn loses its
+        signal.
+        """
+        response_mask = batch.batch["response_mask"]
+        row_tokens = response_mask.sum(-1).to(torch.float64)
+        real = torch.zeros(len(batch), dtype=torch.bool)
+        real[:n_real] = True
+
+        task_names = get_task_names(batch)
+        assert task_names is not None, (
+            "multitask SFT loss weighting requires per-row task names on the batch"
+        )
+        tasks = sorted({t for t in task_names[:n_real] if t is not None})
+        assert tasks, "no task names on the real rows of the SFT batch"
+
+        mini_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        num_mini_batches = len(batch) / mini_batch_size
+        assert float(num_mini_batches).is_integer(), (
+            f"batch of {len(batch)} rows is not divisible by ppo_mini_batch_size "
+            f"{mini_batch_size}; the per-step loss scale would drift between steps"
+        )
+
+        weights = torch.zeros(len(batch), dtype=torch.float32)
+        for task in tasks:
+            rows = torch.from_numpy(np.asarray(task_names == task)) & real
+            task_tokens = float(row_tokens[rows].sum())
+            assert task_tokens > 0, f"task {task} contributed no response tokens"
+            weights[rows] = float(num_mini_batches / (len(tasks) * task_tokens))
+            metrics[f"sft/token_share/{task}"] = task_tokens / float(row_tokens[real].sum())
+            metrics[f"sft/rows/{task}"] = int(rows.sum())
+        batch.batch["sft_loss_weight"] = weights
+        metrics["sft/padding_rows"] = len(batch) - n_real
 
     def _prepared_batch_iter(self):
         """Yield ``(batch, prep_metrics)`` ready to dispatch.
