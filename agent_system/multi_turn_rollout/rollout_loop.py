@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -58,17 +56,6 @@ _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").st
 # overhead is removed (and vLLM's prefix cache can persist across turns). Opt-in;
 # OFF reproduces the current per-turn behavior exactly.
 _ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
-
-# Parallelize the per-row prompt tokenization (apply_chat_template + tokenize) of
-# preprocess_batch across a thread pool. HF fast tokenizers release the GIL in
-# their Rust encode path, and every row is processed by an *identical, independent*
-# call, so the outputs are byte-for-byte the same as the sequential loop — only
-# wall time changes. Each worker thread uses its own deepcopy of the tokenizer
-# because HF fast tokenizers mutate internal truncation/padding state per call and
-# are not safe to share across threads. 0 (default) keeps the sequential loop;
-# multimodal batches always fall back to sequential (processor thread-safety is
-# not established).
-_ROLLOUT_PREPROC_WORKERS = int(os.environ.get("ROLLOUT_PREPROC_WORKERS", "0"))
 
 # Decode only the rows that were actually generated this turn. Finished rows'
 # scattered filler is all pad tokens, which batch_decode(skip_special_tokens=True)
@@ -220,10 +207,6 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
-        # ROLLOUT_PREPROC_WORKERS: lazily-built thread pool + per-thread tokenizer
-        # clones (HF fast tokenizers are not safe to share across threads).
-        self._preproc_executor = None
-        self._preproc_local = threading.local()
         # ROLLOUT_PREFETCH_LOGPROB state: rows of finished trajectories waiting for
         # a prefetched compute_log_prob, and the per-row results keyed by
         # (traj_uid, turn_step). Cleared at the start of every multi_turn_loop.
@@ -236,55 +219,18 @@ class TrajectoryCollector:
         self._env_reset_prefetch = None
         self._env_reset_executor = None
 
-    def _get_preproc_executor(self) -> ThreadPoolExecutor:
-        if self._preproc_executor is None:
-            self._preproc_executor = ThreadPoolExecutor(max_workers=_ROLLOUT_PREPROC_WORKERS)
-        return self._preproc_executor
-
-    def _thread_tokenizer(self):
-        tokenizer = getattr(self._preproc_local, "tokenizer", None)
-        if tokenizer is None:
-            tokenizer = copy.deepcopy(self.tokenizer)
-            self._preproc_local.tokenizer = tokenizer
-        return tokenizer
-
     def _run_full_preprocess(self, items: List[int], gen_batch: DataProto, obs: Dict) -> Dict[int, dict]:
-        """Run preprocess_single_sample over `items`, optionally in parallel.
-
-        The parallel path calls the *same* function with per-thread tokenizer
-        clones, so every row's output is identical to the sequential loop.
-        Multimodal batches always use the sequential path.
-        """
-        use_threads = (
-            _ROLLOUT_PREPROC_WORKERS > 1
-            and len(items) > 1
-            and obs.get('image', None) is None
-        )
-        if not use_threads:
-            return {
-                item: self.preprocess_single_sample(item=item, gen_batch=gen_batch, obs=obs)
-                for item in items
-            }
-        executor = self._get_preproc_executor()
-        futures = {
-            item: executor.submit(
-                self._preprocess_single_sample_threadsafe, item, gen_batch, obs
-            )
+        """Run preprocess_single_sample over `items`."""
+        return {
+            item: self.preprocess_single_sample(item=item, gen_batch=gen_batch, obs=obs)
             for item in items
         }
-        return {item: future.result() for item, future in futures.items()}
-
-    def _preprocess_single_sample_threadsafe(self, item: int, gen_batch: DataProto, obs: Dict):
-        return self.preprocess_single_sample(
-            item=item, gen_batch=gen_batch, obs=obs, tokenizer=self._thread_tokenizer()
-        )
 
     def preprocess_single_sample(
         self,
         item: int,
         gen_batch: DataProto,
         obs: Dict,
-        tokenizer=None,
     ):
         """
         Process a single observation sample, organizing environment observations (text and/or images) 
@@ -299,8 +245,7 @@ class TrajectoryCollector:
             dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
 
-        if tokenizer is None:
-            tokenizer = self.tokenizer
+        tokenizer = self.tokenizer
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
