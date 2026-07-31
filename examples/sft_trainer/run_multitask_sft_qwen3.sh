@@ -54,6 +54,22 @@ set -x
 # nothing else: the loader globs *.pt, and a stale or duplicated shard is caught
 # only by a traj_uid collision check, which a *different* run's shards would pass.
 #
+# STARTUP COST. Loading reads all 339.5 GiB to keep 139.2 GiB: the rest is the
+# padding rows and the columns this arm's loss never reads. Paying that on every
+# start (and every restart) is avoidable -- do the filtering once and point this
+# run at the result:
+#
+#   python3 scripts/cache_teacher_pool.py \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj_sft_cache --arm sft
+#   bash examples/sft_trainer/run_multitask_sft_qwen3.sh \
+#       +algorithm.sft.data_dir=$HOME/data/.../teacher_traj_sft_cache
+#
+# The cache is the same DataProto the loader builds today, one file per source
+# file with the same name and row order, so the draws are unchanged (asserted in
+# tests/trainer/test_cache_teacher_pool.py). It is ARM-SPECIFIC: the SFT cache has
+# no teacher top-k, so a KD run must not read it.
+#
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1
