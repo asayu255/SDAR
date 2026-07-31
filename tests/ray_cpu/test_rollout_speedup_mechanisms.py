@@ -14,15 +14,13 @@
 # limitations under the License.
 """CPU-only equivalence gates for the rollout speedup mechanisms.
 
-Covers the pure-logic pieces of the A/C/D/E optimizations:
+Covers the pure-logic pieces of the A/C/E optimizations:
 
   * compute_log_prob_with_prefetch (A): merging prefetched per-row log probs
     with the normally computed remainder must equal computing every row.
   * prefetch_env_reset / _reset_envs (C): the prefetched reset is consumed
     exactly once, matched by env identity and kwargs, and a kwargs mismatch
     fails loudly instead of silently double-resetting.
-  * SearchToolGroup query cache (D): enabled cache returns the identical
-    result text without a second API call; disabled cache always calls.
   * compact record (E): dropping active_masks=False rows from
     total_batch_list produces the identical effective batch from
     gather_rollout_data-style filtering (prefix property).
