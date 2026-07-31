@@ -34,7 +34,6 @@ knob reproduces the Phase 1 behavior exactly when unset.
   `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py`).
 - C: `TrajectoryCollector.prefetch_env_reset` / `_reset_envs` + the peek-ahead
   loop in both trainers' `fit()`.
-- D: `agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py`.
 - E: `preprocess_batch` / `_run_full_preprocess`, the decode and record blocks
   of `vanilla_multi_turn_loop`.
 
