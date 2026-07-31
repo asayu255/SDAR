@@ -167,11 +167,47 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         target = gen_cfg.get("num_trajectories", None)
         target = int(target) if target else None
 
+        # Flush every N steps instead of holding the whole run. Without it this
+        # actor keeps every turn-row until the end and then DataProto.concat
+        # allocates a second full copy, so a webshop pass peaks near 150 GiB and a
+        # run can die at its last step after hours. Sharding also caps what Stage 2
+        # unpickles at once: it holds the pool per file, so the load peak is
+        # 'resident + largest file' -- one 74 GiB file would undo that.
+        # 0 keeps the single-file behaviour.
+        shard_every = int(gen_cfg.get("shard_every_steps", 0) or 0)
+        shard_idx = 0
+        shard_paths = []
+
         self.global_steps = 0
         collected = []
         seen_trajs = set()
         n_collected = 0
+        n_rows_total = 0
         os.makedirs(out_dir, exist_ok=True)
+
+        # Stage 2 globs *.pt, so this task's previous output would be loaded
+        # alongside the new one -- and traj_uid is a uuid4, so the duplicate check
+        # would not catch it: the pool would simply hold twice the trajectories.
+        # Regenerating a task replaces it, so clear what is there first.
+        stale = sorted(glob.glob(os.path.join(out_dir, f"{task}_[0-9]*.pt")))
+        legacy = os.path.join(out_dir, f"{task}.pt")
+        if os.path.exists(legacy):
+            stale.append(legacy)
+        for path in stale:
+            print(f"[OPD-offpolicy gen][{task}] removing stale output {path}", flush=True)
+            os.remove(path)
+
+        def _flush_shard():
+            nonlocal collected, shard_idx
+            if not collected:
+                return
+            shard = DataProto.concat(collected)
+            path = os.path.join(out_dir, f"{task}_{shard_idx:04d}.pt")
+            shard.save_to_disk(path)
+            shard_paths.append(path)
+            print(f"[OPD-offpolicy gen][{task}] wrote shard {path} ({len(shard)} turn-rows)", flush=True)
+            collected = []
+            shard_idx += 1
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -218,20 +254,32 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                 keep = gen_out.select(batch_keys=tensor_keys, non_tensor_batch_keys=non_tensor_keys)
                 keep = keep.to("cpu")
                 collected.append(keep)
+                n_rows_total += len(keep)
                 if "traj_uid" in keep.non_tensor_batch:
                     seen_trajs.update(keep.non_tensor_batch["traj_uid"].tolist())
                     n_collected = len(seen_trajs)
                 else:
-                    n_collected = sum(len(c) for c in collected)
+                    # No uid to count trajectories with; count turn-rows. Uses the
+                    # running total rather than the buffer, which sharding empties.
+                    n_collected = n_rows_total
                 self.global_steps += 1
                 print(f"[OPD-offpolicy gen][{task}] collected {n_collected} trajectories "
-                      f"({sum(len(c) for c in collected)} turn-rows)")
+                      f"({n_rows_total} turn-rows)", flush=True)
 
-                if target is not None and n_collected >= target:
+                reached_target = target is not None and n_collected >= target
+                if shard_every > 0 and (reached_target or self.global_steps % shard_every == 0):
+                    _flush_shard()
+                if reached_target:
                     break
             else:
                 continue
             break
+
+        if shard_every > 0:
+            _flush_shard()  # the remainder, if the loop ended off a flush boundary
+            print(f"[OPD-offpolicy gen][{task}] saved {n_collected} trajectories "
+                  f"({n_rows_total} turn-rows) -> {len(shard_paths)} shards in {out_dir}")
+            return out_dir
 
         data = DataProto.concat(collected)
         out_path = os.path.join(out_dir, f"{task}.pt")

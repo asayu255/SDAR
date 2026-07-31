@@ -176,3 +176,42 @@ def test_skip_existing_resumes(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
     assert os.path.exists(victim)
     assert "wrote 1 file(s) (8 skipped)" in out.stdout
+
+
+def test_skip_existing_rebuilds_a_regenerated_task(tmp_path):
+    """Regenerating one task must not leave its stale view in the cache.
+
+    --skip-existing exists to resume an interrupted pass, not to preserve an
+    answer the source has moved past. A cache that silently disagrees with the
+    pool it claims to be a view of is worse than no cache.
+    """
+    import time
+
+    src = _make_pool(tmp_path / "pool")
+    dst = tmp_path / "cache"
+    _build_cache(src, dst, "sft")
+    before = DataProto.load_from_disk(os.path.join(dst, "webshop_0000.pt"))
+
+    # Regenerate webshop with different trajectories, as a fresh Stage 1 would.
+    time.sleep(0.01)  # mtime granularity
+    for s in range(3):
+        _shard("webshop", 4, 2, first_uid=100 + s * 4).save_to_disk(
+            os.path.join(src, f"webshop_{s:04d}.pt")
+        )
+
+    out = subprocess.run(
+        [sys.executable, _SCRIPT, str(src), str(dst), "--arm", "sft", "--skip-existing"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "source is newer" in out.stdout
+    assert "wrote 3 file(s) (6 skipped)" in out.stdout
+
+    after = DataProto.load_from_disk(os.path.join(dst, "webshop_0000.pt"))
+    assert after.non_tensor_batch["traj_uid"][0] == "webshop-100"
+    assert before.non_tensor_batch["traj_uid"][0] == "webshop-0"
+    # The untouched tasks are still whole, so the cache describes the whole pool.
+    trainer, _ = _iterate(MultiTaskSFTTrainer, dst)
+    assert {t: len(v) for t, v in trainer._task_to_trajs.items()} == {
+        "alfworld": 12, "search": 12, "webshop": 12
+    }

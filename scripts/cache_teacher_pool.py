@@ -110,25 +110,49 @@ def main():
     loader = _loader_for(args.arm)
     print(f"arm: {args.arm} ({loader.__name__}), dropping columns {list(loader._drop_tensor_keys)}\n")
 
+    # Row counts are kept per file and merged with any existing manifest, so a
+    # resumed or partial pass (regenerating one task, then --skip-existing) still
+    # describes the whole directory rather than only what this run touched.
+    manifest_path = os.path.join(dst, _MANIFEST)
+    rows_by_file = {}
+    previous = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                previous = json.load(f)
+            if previous.get("arm") == args.arm:
+                rows_by_file = dict(previous.get("rows_by_file", {}))
+        except (OSError, ValueError):
+            pass  # unreadable manifest is not worth failing over; it gets rewritten
+
     written = skipped = 0
     out_bytes = 0
-    rows_in = rows_out = 0
+    rows_out = 0
     columns = None
     t0 = time.time()
     for i, path in enumerate(files, 1):
         name = os.path.basename(path)
         out_path = os.path.join(dst, name)
         if args.skip_existing and os.path.exists(out_path):
-            out_bytes += os.path.getsize(out_path)
-            skipped += 1
-            print(f"[{i}/{len(files)}] {name}: exists, skipped")
-            continue
+            # Skipping is for resuming an interrupted pass, not for keeping a stale
+            # answer. A source file rewritten since its cache entry (a task
+            # regenerated) must be redone, or the cache silently stops matching the
+            # pool it claims to be a view of.
+            if os.path.getmtime(path) > os.path.getmtime(out_path):
+                print(f"[{i}/{len(files)}] {name}: source is newer than the cached "
+                      f"copy, rebuilding", flush=True)
+            else:
+                out_bytes += os.path.getsize(out_path)
+                skipped += 1
+                note = "" if name in rows_by_file else "  (no row count recorded)"
+                print(f"[{i}/{len(files)}] {name}: exists, skipped{note}")
+                continue
 
         # The same call the trainer makes, so what lands on disk is exactly what
         # the trainer would have held in memory.
         data = loader._load_offpolicy_file(path)
         n_rows = len(data)
-        rows_out += n_rows
+        rows_by_file[name] = n_rows
         if columns is None:
             columns = sorted(data.batch.keys())
         elif sorted(data.batch.keys()) != columns:
@@ -154,7 +178,15 @@ def main():
               f"{_gib(size):.2f} GiB, {n_rows:,} rows, "
               f"{rate:.2f} GiB/s, ETA {eta / 60:.0f} min", flush=True)
 
-    with open(os.path.join(dst, _MANIFEST), "w") as f:
+    # Only files still present in the source belong in the manifest: a task
+    # regenerated into fewer shards leaves the extra ones behind here otherwise.
+    present = {os.path.basename(f) for f in files}
+    rows_by_file = {k: v for k, v in rows_by_file.items() if k in present}
+    rows_out = sum(rows_by_file.values())
+    complete = len(rows_by_file) == len(files)
+    if columns is None:  # everything was skipped
+        columns = previous.get("columns")
+    with open(manifest_path, "w") as f:
         json.dump(
             {
                 "source": src,
@@ -164,12 +196,15 @@ def main():
                 "columns": columns,
                 "files": len(files),
                 "rows": rows_out,
+                "rows_complete": complete,
+                "rows_by_file": rows_by_file,
             },
             f,
             indent=2,
         )
 
-    print(f"\nwrote {written} file(s) ({skipped} skipped), {rows_out:,} rows")
+    total = f"{rows_out:,} rows" if complete else f"{rows_out:,} rows (partial: {len(rows_by_file)}/{len(files)} files counted)"
+    print(f"\nwrote {written} file(s) ({skipped} skipped), {total}")
     print(f"  {_gib(src_bytes):7.1f} GiB in  ->  {_gib(out_bytes):7.1f} GiB out "
           f"({out_bytes / src_bytes:.2f}x)")
     print(f"  columns kept: {columns}")
