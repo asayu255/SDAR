@@ -63,7 +63,12 @@ set -x
 #       $HOME/data/verl-agent/sdar_multitask/teacher_traj \
 #       $HOME/data/verl-agent/sdar_multitask/teacher_traj_sft_cache --arm sft
 #   bash examples/sft_trainer/run_multitask_sft_qwen3.sh \
-#       +algorithm.sft.data_dir=$HOME/data/.../teacher_traj_sft_cache
+#       ++algorithm.sft.data_dir=$HOME/data/.../teacher_traj_sft_cache
+#
+# Note the DOUBLE plus. The argument below already adds algorithm.sft.data_dir,
+# so a trailing '+algorithm.sft.data_dir=' is a second append of a key that now
+# exists and Hydra refuses it; '++' means append-or-override. The same applies to
+# every other '+' argument here that a one-off run wants to point elsewhere.
 #
 # The cache is the same DataProto the loader builds today, one file per source
 # file with the same name and row order, so the draws are unchanged (asserted in

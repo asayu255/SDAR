@@ -16,7 +16,10 @@ the cache instead:
         $HOME/data/verl-agent/sdar_multitask/teacher_traj_sft_cache --arm sft
 
     bash examples/sft_trainer/run_multitask_sft_qwen3.sh \\
-        +algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft_cache
+        ++algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_sft_cache
+
+Double plus: the run script already adds that key with a single '+', so another
+'+' is a second append of an existing key and Hydra refuses it.
 
 Nothing about the run changes. The cache holds exactly the DataProto the loader
 builds in memory today, one output file per input file with the same basename and
