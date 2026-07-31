@@ -18,8 +18,6 @@ knob reproduces the Phase 1 behavior exactly when unset.
 | A | **Finished-trajectory log-prob prefetch**: while `envs.step()` runs in a background thread (GPU idle), the driver runs `compute_log_prob` on a bounded chunk of rows whose trajectories already finished (search from ~turn 4, webshop from ~turn 15). The trainer's `old_log_prob` phase reuses the prefetched rows and computes only the remainder. | `ROLLOUT_PREFETCH_LOGPROB=1` (off), chunk via `ROLLOUT_PREFETCH_LOGPROB_CHUNK` (64) | Moves `old_log_prob` work into the rollout's GPU-idle env.step windows (~35 tail turns) | Same weights (frozen during rollout), same per-row computation; micro-batch grouping differs from the monolithic phase → **③-class** |
 | B | **CUDA-graph decode knobs**: `CUDAGRAPH_CAPTURE_SIZES` passes `cudagraph_capture_sizes` through to vLLM (`enforce_eager=False` is already set); requires the V1 engine (`VLLM_USE_V1=1`) — under V0 the CompilationConfig is ignored (the Phase 1 finding). 1.7B decode is launch-overhead-sensitive, so graphs target the decode-bound tail directly. | `VLLM_USE_V1=1 CUDAGRAPH_CAPTURE_SIZES='[8,16,32,64,128,256,384]'` (both unset) | Kernel-launch gaps in autoregressive decode | Sampling-distribution-preserving → **③-class** |
 | C | **Env-reset prefetch**: right after a rollout's data is collected the train envs are idle; the trainer peeks the next dataloader batch and launches `envs.reset()` (CPU / subprocess / HTTP: alfworld game loading etc.) in a background thread, overlapping `old_log_prob`/`teacher`/`ref`/`update_actor`. Reset still runs exactly once per rollout in the same order, so stateful schedules (alfworld's game-file iterator) are unchanged; a kwargs mismatch fails loudly instead of double-resetting. | `ENV_RESET_PREFETCH=1` (off) | Rollout-start reset latency | **bit-identical** |
-| D | **Retriever query cache**: class-level LRU keyed by (url, topk, query). RL rollouts re-issue identical queries (GRPO group members share questions; epochs revisit the same subset); a deterministic retriever returns the byte-identical passage set, so hits skip the HTTP round trip. Only successful lookups are cached. | `SEARCH_QUERY_CACHE=1` (off), size via `SEARCH_QUERY_CACHE_SIZE` (100k) | search `env.step` HTTP latency | **bit-identical** iff the retriever is deterministic (fixed index) |
-| E1 | **Parallel prompt tokenization**: the per-row `apply_chat_template` + tokenize loop runs on a thread pool with per-thread tokenizer clones (HF fast tokenizers release the GIL in Rust but mutate shared truncation/padding state, hence the clones). Verified byte-identical against the sequential loop. Multimodal batches stay sequential. | `ROLLOUT_PREPROC_WORKERS=8` (0 = off) | Remaining preproc CPU (~37 s/step after ②) | **bit-identical** |
 | E2 | **Active-only decode**: decode only generated rows; finished rows' scattered filler is pad-only, which `batch_decode(skip_special_tokens=True)` renders as `''` anyway — fill `''` directly. | `ROLLOUT_DECODE_ACTIVE_ONLY=1` (**on**; set 0 for A/B) | Wasted decode of pad rows (2/3 of batch in the tail) | **bit-identical** |
 | E3 | **Compact per-turn recording**: skip appending `active_masks=False` rows to `total_batch_list`/`total_infos`. Active rows form a prefix of each trajectory's list, so `turn_step` (enumerate), the last-active-entry scans in `success_evaluator`, and `filter_group_data` all see identical data; `gather_rollout_data` dropped these rows anyway. | `ROLLOUT_COMPACT_RECORD=1` (**on**; set 0 for A/B) | Per-turn dict materialization + memory for finished rows | **bit-identical** |
 
@@ -75,8 +73,6 @@ knob reproduces the Phase 1 behavior exactly when unset.
   the search env's asyncio loop from a non-main thread — the same pattern the
   Phase 1 multitask manager already uses for its concurrent per-task stepping
   (sequential use of the loop from one thread at a time).
-- **D**: only enable against a deterministic retriever (fixed index, no
-  sampling); the cache returns byte-identical observations on hits.
 
 ## Tests
 
@@ -84,6 +80,4 @@ knob reproduces the Phase 1 behavior exactly when unset.
 prefetch-merge equivalence incl. `adjust_batch` row duplication and
 all/none-prefetched edges; the rollout pending pool; env-reset prefetch
 consume/mismatch semantics incl. cross-env isolation; compact-record
-equivalence; and the query cache. The E1 parallel tokenization path was
-verified byte-identical against the sequential loop with a real HF fast
-tokenizer (full-batch and active-mask paths).
+equivalence.

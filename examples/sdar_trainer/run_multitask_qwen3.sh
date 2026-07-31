@@ -79,8 +79,6 @@ fi
 #                                        (chunk via ROLLOUT_PREFETCH_LOGPROB_CHUNK)
 #   ENV_RESET_PREFETCH=1              C: overlap next rollout's envs.reset with
 #                                        the GPU training phases
-#   SEARCH_QUERY_CACHE=1              D: cache deterministic retriever lookups
-#   ROLLOUT_PREPROC_WORKERS=8         E: parallel prompt tokenization
 #   ROLLOUT_DECODE_ACTIVE_ONLY=1      E: decode generated rows only (default on)
 #   ROLLOUT_COMPACT_RECORD=1          E: skip recording finished rows (default on)
 # -----------------------------------------------------------------------------
