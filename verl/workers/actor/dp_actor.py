@@ -21,6 +21,7 @@ import itertools
 import time
 import logging
 import os
+from contextlib import contextmanager
 from typing import Tuple
 
 import torch
@@ -32,6 +33,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils import gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
@@ -52,6 +54,12 @@ __all__ = ["DataParallelPPOActor"]
 # a single device-side zero tensor. Reading it back with .item() synchronises the
 # stream, and update_policy would do so four times per micro-batch plus four more per
 # task -- so name the constants instead.
+# Worker-side stage profiling. Rank 0 only, and only when the profiler is on --
+# see _actor_phase. Read once at import so the instrumentation cannot change
+# halfway through a run.
+_PROFILE_STAGES = False   # set in DataParallelPPOActor.__init__ once the rank is known
+_SYNC_PHASES = os.environ.get("GPU_PROFILER_SYNC_PHASES", "0").strip().lower() in ("1", "true", "yes", "on")
+
 _ZERO_PG_METRICS = {
     "actor/pg_loss": 0.0,
     "actor/pg_clipfrac": 0.0,
@@ -63,6 +71,44 @@ _ZERO_PG_METRICS = {
 def _ZERO_PG_METRICS_BY_TASK(task: str) -> dict:
     return {f"{name}/{task}": value for name, value in _ZERO_PG_METRICS.items()}
 
+@contextmanager
+def _actor_phase(name: str):
+    """Tag GPU samples inside update_policy with the stage that produced them.
+
+    The gpu_profiler's phase stack is driven by ray_trainer._timer, which runs in
+    the DRIVER. update_policy runs in a worker, so from the driver's side the
+    whole call is one opaque ``update_actor`` bucket. Pushing here starts a second
+    sampler in the worker process and gives that bucket an interior: NVML reads
+    are device-wide, so a worker-side sampler sees the same GPUs and the phase tag
+    is what makes the samples attributable.
+
+    Only rank 0 pushes. Three concurrent samplers would triple the NVML polling
+    and print three interleaved reports for readings that are already device-wide
+    and therefore identical.
+
+    A caveat the numbers carry: kernel launches are asynchronous, so a phase's
+    wall clock is when its work was *issued*, not when the GPU finished it. The
+    boundaries smear by roughly one launch queue. GPU_PROFILER_SYNC_PHASES=1 adds
+    a device synchronize at each boundary, which makes the split exact at the cost
+    of serializing what the run would otherwise overlap -- read those numbers as
+    an attribution, not as the run's real speed.
+
+    A no-op unless GPU_PROFILER=1: push_phase/pop_phase return immediately.
+    """
+    if not _PROFILE_STAGES:
+        yield
+        return
+    if _SYNC_PHASES:
+        get_torch_device().synchronize()
+    gpu_profiler.push_phase(name)
+    try:
+        yield
+    finally:
+        if _SYNC_PHASES:
+            get_torch_device().synchronize()
+        gpu_profiler.pop_phase(name)
+
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -73,6 +119,15 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+
+        # Stage profiling on rank 0 only: NVML is device-wide, so one sampler
+        # already sees every GPU and three would just triple the polling and
+        # interleave three identical reports.
+        global _PROFILE_STAGES
+        try:
+            _PROFILE_STAGES = gpu_profiler.enabled() and torch.distributed.get_rank() == 0
+        except Exception:
+            _PROFILE_STAGES = False
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -545,7 +600,8 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
-                    entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
+                    with _actor_phase("actor.fwd"):
+                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -690,13 +746,17 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    with _actor_phase("actor.bwd"):
+                        loss.backward()
 
                     if task_ids is not None:
                         # Same losses, re-aggregated over the rows of one task at a
                         # time. Diagnostics only: nothing here touches the graph the
-                        # optimizer step above was built from.
-                        with torch.no_grad():
+                        # optimizer step above was built from -- but every .item()
+                        # below blocks until the GPU drains, so this is timed
+                        # separately: three syncs per task per micro-batch is a
+                        # plausible place for the step to be losing time.
+                        with _actor_phase("actor.task_metrics"), torch.no_grad():
                             for task, rows in iter_task_row_masks(task_ids, task_id_names):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
@@ -781,8 +841,14 @@ class DataParallelPPOActor(BasePPOActor):
                         data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
 
-                grad_norm = self._optimizer_step()
+                with _actor_phase("actor.optim"):
+                    grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        if _PROFILE_STAGES:
+            # One table per update_policy call. The driver's boundary phase
+            # ("step") never pops in this process, so the report is asked for
+            # explicitly rather than falling out of the phase stack.
+            gpu_profiler.report_and_reset(label="update_policy stages (rank 0)")
         return metrics

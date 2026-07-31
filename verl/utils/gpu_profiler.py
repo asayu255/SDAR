@@ -73,6 +73,12 @@ Env vars
   GPU_PROFILER_ROLLUP_EVERY=25 emit the cumulative table every N boundary
                                phases (0 disables the periodic one; the
                                at-exit rollup still fires)
+  GPU_PROFILER_SYNC_PHASES=1   synchronize the device at each phase boundary.
+                               Kernel launches are async, so without this a
+                               phase's wall clock is when its work was issued,
+                               not when the GPU finished it, and the boundaries
+                               smear. Exact attribution, but it serializes what
+                               the run would overlap -- the totals get slower.
   GPU_PROFILER_TRACE=<path>    also append every raw sample to this CSV
                                (ts, clock, phase, per-GPU sm%, per-GPU memBW%,
                                driver cpu%). The tables above are per-step
@@ -744,6 +750,12 @@ _PHASE_ORDER = [
     "update_critic",
     "update_actor",
     "reward",
+    # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
+    # execution order so the interior of a step reads top to bottom.
+    "actor.fwd",
+    "actor.bwd",
+    "actor.task_metrics",
+    "actor.optim",
 ]
 
 
