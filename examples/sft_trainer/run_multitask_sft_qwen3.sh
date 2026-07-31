@@ -194,7 +194,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.experiment_name=sdar_multitask_sft_multitask_qwen3_1.7b \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_sft_multitask \
     trainer.save_freq=25 \
-    trainer.test_freq=50 \
+    trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
