@@ -655,6 +655,15 @@ class ActorRolloutRefWorker(Worker):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
+            # The driver's timing_s/update_actor is a blocking ray.get around this
+            # call, so it also covers serializing the batch into the object store,
+            # the workers pulling their shards, and the metrics coming back. At a
+            # few thousand rows that batch is hundreds of MB, and the GPUs sit idle
+            # for all of it. Reporting the compute time separately makes the
+            # difference readable: timing_s/update_actor minus this is transport,
+            # and a GPU-idle window inside update_actor is one or the other.
+            metrics = dict(metrics)
+            metrics["timing_s/update_actor_worker"] = delta_time
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
