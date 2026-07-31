@@ -96,6 +96,13 @@ actor_rollout_ref:
       offload_policy: False # only for fsdp2, offload param\grad\optimizer during train
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       fsdp_size: -1
+      # null keeps the mesh default (FULL_SHARD / ZeRO-3 on 1-D). shard_grad_op
+      # (ZeRO-2) keeps parameters gathered from forward through backward, dropping
+      # the repeated all-gathers a layer does per micro-batch under gradient
+      # checkpointing. Arithmetic is unchanged -- gradients are still reduce-
+      # scattered in reduce_dtype -- but peak memory grows by about the unsharded
+      # parameter size minus its shard. Pointless with param_offload=True.
+      sharding_strategy: null # [null, full_shard, shard_grad_op]
   ref:
     strategy: fsdp
     fsdp_config:

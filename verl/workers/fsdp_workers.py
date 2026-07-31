@@ -85,16 +85,57 @@ def create_device_mesh(world_size, fsdp_size):
     return device_mesh
 
 
-def get_sharding_strategy(device_mesh):
+def get_sharding_strategy(device_mesh, fsdp_config=None):
+    """FSDP sharding strategy for a mesh, optionally overridden by config.
+
+    Defaults are unchanged: FULL_SHARD (ZeRO-3) on a 1-D mesh, HYBRID_SHARD on 2-D.
+
+    ``fsdp_config.sharding_strategy: shard_grad_op`` selects ZeRO-2 instead, which
+    keeps parameters gathered from the forward through the backward rather than
+    resharding after each. That removes two of the three all-gathers a layer does
+    per micro-batch under gradient checkpointing (forward, recompute, backward),
+    leaving only the gradient reduce-scatter as collective traffic.
+
+    The arithmetic is untouched: an all-gather only moves bytes, the forward and
+    backward kernels see identical inputs, and gradients are reduced by the same
+    reduce-scatter in the same reduce_dtype. What changes is memory -- parameters
+    stay unsharded for the length of a micro-batch's backward, so peak grows by
+    roughly the unsharded parameter size minus its shard.
+    """
     from torch.distributed.fsdp import ShardingStrategy
 
     if device_mesh.ndim == 1:
-        sharding_strategy = ShardingStrategy.FULL_SHARD
+        default, alternatives = ShardingStrategy.FULL_SHARD, {
+            "full_shard": ShardingStrategy.FULL_SHARD,
+            "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+        }
     elif device_mesh.ndim == 2:
-        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        default, alternatives = ShardingStrategy.HYBRID_SHARD, {
+            "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
+            "shard_grad_op": ShardingStrategy._HYBRID_SHARD_ZERO2,
+        }
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
-    return sharding_strategy
+
+    requested = None
+    if fsdp_config is not None:
+        requested = fsdp_config.get("sharding_strategy", None)
+    if requested is None:
+        return default
+    requested = str(requested).strip().lower()
+    if requested == "shard_grad_op" and fsdp_config.get("param_offload", False):
+        warnings.warn(
+            "fsdp_config.sharding_strategy=shard_grad_op with param_offload=True: "
+            "the parameters ZeRO-2 keeps resident are the ones offloading sends to "
+            "CPU, so the all-gathers this is meant to remove come back as transfers.",
+            stacklevel=2,
+        )
+    if requested not in alternatives:
+        raise ValueError(
+            f"fsdp_config.sharding_strategy={requested!r} is not supported for a "
+            f"{device_mesh.ndim}-D mesh; choose one of {sorted(alternatives)}"
+        )
+    return alternatives[requested]
 
 
 class ActorRolloutRefWorker(Worker):
@@ -308,7 +349,7 @@ class ActorRolloutRefWorker(Worker):
         print(f"wrap_policy: {auto_wrap_policy}")
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_config)
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -1020,7 +1061,7 @@ class CriticWorker(Worker):
         log_gpu_memory_usage("Before critic FSDP", logger=None)
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sharding_strategy = get_sharding_strategy(fsdp_mesh, self.config.model.fsdp_config)
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
@@ -1290,7 +1331,7 @@ class RewardModelWorker(Worker):
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sharding_strategy = get_sharding_strategy(fsdp_mesh, self.config.model.fsdp_config)
 
         if config.strategy == "fsdp":
             reward_module = FSDP(
