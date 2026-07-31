@@ -12,9 +12,14 @@ skill_all=false
 per_task_batch_size=15
 train_data_size=45
 val_per_task_size=126
-# val_data_size == val_per_task_size: the task-sorted test parquet then yields one
-# single-task batch per task, so each task is validated in its own rollout pass
-# (no mixed-task validation batch).
+# val_data_size == val_per_task_size: the test parquet is laid out
+# alfworld -> webshop -> search (see prepare_sdar_multitask), so validation runs
+# one single-task batch for each of alfworld and webshop and then
+# ceil(n_search / val_per_task_size) batches of search — every batch holds a
+# single task, and the only short one is search's own tail, which the search env
+# pads with masked-out dummies. val_per_task_size applies to alfworld/webshop
+# only; search is validated over its whole test parquet, as the single-task
+# baseline does.
 val_data_size=$val_per_task_size
 group_size=8
 total_training_steps=300
