@@ -57,10 +57,23 @@ set -x
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1
+#   OFFPOLICY_BATCH_PREFETCH=1   — builds step k+1's batch on a background thread
+#     while step k is inside update_actor (a blocking ray.get, so it holds no
+#     GIL). Bit-identical to the sequential path; see _prepared_batch_iter for
+#     the two RNG invariants that make that true.
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on; they speed up the validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
 #   this stage has neither an old_log_prob phase nor a per-step train rollout.
+#   TASK_BALANCE_INTERLEAVE does nothing here: it reorders the *train* sampler,
+#   which this loop never iterates (it draws from the fixed pool), and the
+#   validation dataloader takes no sampler at all.
+
+# The one variable in this file, and it is not a knob: an absolute path to this
+# script's own directory. The expectations file is read inside a Ray actor, after
+# Hydra has chdir'd the driver into its output directory, so a path relative to
+# the launcher's cwd is not reliably resolvable by the time it is opened.
+SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -82,7 +95,7 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
 
 # ===================== Stage 2: SFT (cross-entropy on teacher tokens) =====================
 python3 -m verl.trainer.main_sft_multitask \
-    +trainer.expected_config=examples/sft_trainer/expected_multitask_sft_config.yaml \
+    +trainer.expected_config=$SFT_DIR/expected_multitask_sft_config.yaml \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=45 \
@@ -134,7 +147,7 @@ python3 -m verl.trainer.main_sft_multitask \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.31:8001/retrieve' \
+    env.search.search_url='http://100.86.45.30:8001/retrieve' \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
