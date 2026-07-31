@@ -30,6 +30,14 @@ set -x
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
 #   old_log_prob phase, so prefetched values would never be consumed.
+#
+# ZeRO-2 for the actor update (config, not an env var; off by default):
+#   actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op
+#   keeps parameters gathered from forward through backward, so a layer
+#   all-gathers once per micro-batch instead of three times under gradient
+#   checkpointing. Arithmetic-neutral; costs roughly the unsharded parameter
+#   size minus its shard in peak memory. It sits on the gradient path, so pin it
+#   in expected_multitask_config.yaml in the same commit that enables it.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
