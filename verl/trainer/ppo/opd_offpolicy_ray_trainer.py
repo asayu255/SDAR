@@ -342,21 +342,37 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
 
     def _load_offpolicy_data(self):
-        """Load the Stage-1 pool, one DataProto per task.
+        """Load the Stage-1 pool, keeping every file it was written as.
 
-        The tasks are deliberately *not* concatenated. The only thing a single
-        concatenated DataProto ever provided was a global row-index space for
-        _offpolicy_batch_iter's select_idxs, and building it doubles peak host RAM:
-        the parts and the result are both live while torch.cat runs. At 36k
-        trajectories the pool is well over a hundred GiB, so that copy is the
-        difference between fitting and not. Indices are task-local instead, and the
-        only concat left is the per-step batch, which is a few thousand rows.
+        Nothing is ever concatenated -- not across tasks, and not across a task's
+        shards. Each file stays the object it was loaded as, and a trajectory is
+        addressed by ``(shard index, rows within that shard)``. The only concat
+        left is the per-step batch, a few thousand rows.
+
+        This is what makes the pool loadable at all. A concatenated DataProto has
+        both the parts and the result live while torch.cat runs, so it costs a
+        second full copy of whatever it spans, and the measured pool is 340 GiB on
+        disk / 142 GiB resident once the dead columns are dropped. Holding the
+        shards instead puts the peak at ``resident + one shard``: the largest
+        shard is ~9 GiB, so loading tops out barely above the steady state, and
+        the steady state is the floor -- every step samples trajectories uniformly
+        from every task, so the whole pool has to stay reachable.
+
+        A pool is sharded when the generator that wrote it flushed periodically
+        (``gen.shard_every_steps`` on the off-policy KD branch, files named
+        ``<task>_0000.pt``) rather than holding the whole run in the generating
+        actor's RAM until the end. The generator in *this* file does not shard,
+        so a pool it writes is one file per task -- but the pool the KD and SFT
+        arms actually train on was written by the sharding one, and either layout
+        has to load. sorted() puts a task's shards in write order, so the
+        trajectory population is ordered exactly as a single concatenated file
+        would have been, and the draw sequence is unchanged.
         """
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
 
-        self._task_data = {}          # task -> DataProto (that task's rows only)
-        self._task_to_traj_rows = {}  # task -> {traj_uid: np.ndarray(task-local row idx)}
+        self._task_shards = {}        # task -> [DataProto] (that task's rows, in write order)
+        self._task_to_traj_rows = {}  # task -> {traj_uid: (shard idx, np.ndarray(rows in shard))}
         self._task_to_trajs = {}      # task -> np.ndarray(traj_uid) sampling population
         for path in files:
             data = self._load_offpolicy_file(path)
@@ -374,34 +390,56 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 traj_to_rows = {}
                 for ridx in rows_of_task:
                     traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
-                assert task not in self._task_data, (
-                    f"task {task} appears in more than one <task>.pt file"
-                )
-                # One file per task in practice; slice only when it is mixed, so the
+                # One task per file in practice; slice only when it is mixed, so the
                 # common path keeps the loaded object rather than copying it.
                 if len(rows_of_task) == len(data):
-                    self._task_data[task] = data
+                    shard = data
                 else:
                     remap = {old: new for new, old in enumerate(rows_of_task.tolist())}
                     traj_to_rows = {u: [remap[r] for r in rows] for u, rows in traj_to_rows.items()}
-                    self._task_data[task] = data.select_idxs(rows_of_task)
-                self._task_to_traj_rows[task] = {
-                    u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()
-                }
-                self._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
+                    shard = data.select_idxs(rows_of_task)
+                shards = self._task_shards.setdefault(task, [])
+                shard_idx = len(shards)
+                shards.append(shard)
+
+                traj_rows = self._task_to_traj_rows.setdefault(task, {})
+                for uid, rows in traj_to_rows.items():
+                    # Shard boundaries fall on generation-step boundaries and a
+                    # trajectory is produced entirely within one step, so its rows
+                    # are always in one shard. traj_uid is a uuid4, so a repeat
+                    # across files is a corrupt pool (a shard written twice, or two
+                    # runs' output mixed in one directory), not a split trajectory
+                    # -- and silently merging the two would make one "trajectory"
+                    # whose turns come from different rollouts.
+                    assert uid not in traj_rows, (
+                        f"traj_uid {uid} appears in more than one file under "
+                        f"{self.teacher_data_dir} (at {os.path.basename(path)}); "
+                        "the directory holds duplicate or overlapping shards"
+                    )
+                    traj_rows[uid] = (shard_idx, np.array(rows, dtype=np.int64))
             del data
 
+        for task, traj_rows in self._task_to_traj_rows.items():
+            self._task_to_trajs[task] = np.array(list(traj_rows.keys()), dtype=object)
+
         # Every task's rows are concatenated into one batch each step, which requires
-        # them to agree on their columns.
-        key_sets = {task: set(d.batch.keys()) for task, d in self._task_data.items()}
+        # every shard of every task to agree on its columns.
+        key_sets = {
+            f"{task}[{i}]": set(s.batch.keys())
+            for task, shards in self._task_shards.items()
+            for i, s in enumerate(shards)
+        }
         assert len(set(map(frozenset, key_sets.values()))) == 1, (
-            f"per-task pools disagree on their tensor columns: {key_sets}"
+            f"pool shards disagree on their tensor columns: {key_sets}"
         )
 
-        sizes = {t: (len(self._task_to_trajs[t]), len(self._task_data[t])) for t in self._task_data}
-        total_rows = sum(len(d) for d in self._task_data.values())
+        sizes = {
+            t: (len(self._task_to_trajs[t]), sum(len(s) for s in shards), len(shards))
+            for t, shards in self._task_shards.items()
+        }
+        total_rows = sum(len(s) for shards in self._task_shards.values() for s in shards)
         print(f"[OPD-offpolicy] loaded {total_rows} rows from {len(files)} files; "
-              f"per-task (trajectories, rows): {sizes}")
+              f"per-task (trajectories, rows, shards): {sizes}")
         for task, trajs in self._task_to_trajs.items():
             assert len(trajs) > 0, f"no trajectories for task {task}"
 
@@ -433,11 +471,42 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             # same as selecting those rows out of one concatenated pool would give.
             parts = []
             for task in pools:
-                rows = []
-                for uid in _draw_trajs(task, self.per_task_traj_per_step):
-                    rows.extend(self._task_to_traj_rows[task][uid].tolist())
-                parts.append(self._task_data[task].select_idxs(rows))
+                parts.append(self._gather_trajs(task, _draw_trajs(task, self.per_task_traj_per_step)))
             yield DataProto.concat(parts)
+
+    def _gather_trajs(self, task, uids):
+        """The turn-rows of ``uids``, in the order the trajectories were drawn.
+
+        A task's rows live across its shards, so this selects once per shard and
+        then undoes the shard-major grouping. Restoring the draw order is not
+        free -- it is a second copy of the (few-thousand-row) step batch -- but it
+        keeps this identical to the single-file path rather than merely
+        equivalent to it: with the order preserved, adjust_batch pads the same
+        rows and _balance_batch partitions the same way, so nothing downstream
+        can tell how the pool happened to be split on disk.
+        """
+        shards = self._task_shards[task]
+        traj_rows = self._task_to_traj_rows[task]
+        shard_of, row_of = [], []
+        for uid in uids:
+            shard_idx, rows = traj_rows[uid]
+            shard_of.append(np.full(len(rows), shard_idx, dtype=np.int64))
+            row_of.append(rows)
+        shard_of = np.concatenate(shard_of)
+        row_of = np.concatenate(row_of)
+
+        if len(shards) == 1:
+            return shards[0].select_idxs(row_of.tolist())
+
+        # Stable, so rows keep their draw order within each shard.
+        order = np.argsort(shard_of, kind="stable")
+        ordered_shard = shard_of[order]
+        parts = [
+            shards[int(s)].select_idxs(row_of[order[ordered_shard == s]].tolist())
+            for s in np.unique(ordered_shard)
+        ]
+        merged = DataProto.concat(parts)
+        return merged.select_idxs(np.argsort(order, kind="stable").tolist())
 
     def _prepare_batch(self, batch: DataProto):
         """Everything between drawing a batch and dispatching it to the workers.

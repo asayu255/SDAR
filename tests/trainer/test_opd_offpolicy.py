@@ -68,19 +68,23 @@ def _bare_trainer():
 def _index_by_task(trainer, pool_by_task):
     """The per-task grouping _load_offpolicy_data builds, for hand-made pools.
 
-    Indices are task-local, so each task's rows are addressed inside its own
-    DataProto -- there is no concatenated pool to index into.
+    Accepts either one DataProto per task or a list of shards. Indices are
+    (shard, rows-in-shard), so each task's rows are addressed inside the file
+    they were loaded from -- there is no concatenated pool to index into.
     """
-    trainer._task_data = dict(pool_by_task)
+    trainer._task_shards = {
+        task: list(v) if isinstance(v, list) else [v] for task, v in pool_by_task.items()
+    }
     trainer._task_to_traj_rows = {}
     trainer._task_to_trajs = {}
-    for task, data in pool_by_task.items():
-        traj_uids = data.non_tensor_batch["traj_uid"]
+    for task, shards in trainer._task_shards.items():
         traj_to_rows = {}
-        for ridx in range(len(data)):
-            traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
+        for shard_idx, shard in enumerate(shards):
+            traj_uids = shard.non_tensor_batch["traj_uid"]
+            for ridx in range(len(shard)):
+                traj_to_rows.setdefault(traj_uids[ridx], (shard_idx, []))[1].append(int(ridx))
         trainer._task_to_traj_rows[task] = {
-            u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()
+            u: (s, np.array(r, dtype=np.int64)) for u, (s, r) in traj_to_rows.items()
         }
         trainer._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
 
@@ -94,16 +98,17 @@ def test_load_offpolicy_data_indexes_per_task(tmp_path):
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
 
-    # One DataProto per task, never concatenated.
-    assert set(trainer._task_data) == {"alfworld", "search", "webshop"}
-    assert {t: len(d) for t, d in trainer._task_data.items()} == {"alfworld": 5, "search": 3, "webshop": 4}
+    # One DataProto per file, never concatenated.
+    assert set(trainer._task_shards) == {"alfworld", "search", "webshop"}
+    assert {t: len(s) for t, s in trainer._task_shards.items()} == {
+        "alfworld": 1, "search": 1, "webshop": 1
+    }
     sizes = {t: len(trajs) for t, trajs in trainer._task_to_trajs.items()}
     assert sizes == {"alfworld": 5, "search": 3, "webshop": 4}
-    # Indices are task-local and address that task's own rows.
+    # Indices address rows inside the shard they name.
     for task, traj_rows in trainer._task_to_traj_rows.items():
-        data = trainer._task_data[task]
-        task_names = data.non_tensor_batch["task_name"]
-        for rows in traj_rows.values():
+        for shard_idx, rows in traj_rows.values():
+            task_names = trainer._task_shards[task][shard_idx].non_tensor_batch["task_name"]
             assert all(task_names[i] == task for i in rows.tolist())
 
 
@@ -198,9 +203,90 @@ def test_load_offpolicy_data_filters_before_indexing(tmp_path):
     trainer.teacher_data_dir = str(tmp_path)
     trainer._load_offpolicy_data()
 
-    assert len(trainer._task_data["webshop"]) == 12  # 4 trajectories * 3 turns, padding gone
+    assert sum(len(s) for s in trainer._task_shards["webshop"]) == 12  # 4 trajs * 3 turns, padding gone
     assert len(trainer._task_to_trajs["webshop"]) == 4
-    assert all(len(rows) == 3 for rows in trainer._task_to_traj_rows["webshop"].values())
+    assert all(len(rows) == 3 for _, rows in trainer._task_to_traj_rows["webshop"].values())
+
+
+def _tagged(proto):
+    """Give every row a unique, checkable value so two pools can be compared."""
+    n, resp_len = len(proto), proto.batch["responses"].shape[-1]
+    proto.batch["responses"] = torch.arange(n * resp_len, dtype=torch.long).reshape(n, resp_len)
+    return proto
+
+
+def _run_iter(data_dir, steps=5, per_task=3, seed=11):
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(data_dir)
+    trainer._load_offpolicy_data()
+    trainer.per_task_traj_per_step = per_task
+    trainer.total_training_steps = steps
+    trainer.config = OmegaConf.create({"data": {"seed": seed}})
+    return trainer, list(trainer._offpolicy_batch_iter())
+
+
+def test_sharded_pool_is_indistinguishable_from_one_file(tmp_path):
+    """Stage 1 writes <task>_0000.pt shards when gen.shard_every_steps is set;
+    at 36k trajectories that is what makes the pool loadable at all. Which
+    shard a row landed in must not reach the training batches: same rows, same
+    order, step for step."""
+    whole, sharded = tmp_path / "whole", tmp_path / "sharded"
+    whole.mkdir()
+    sharded.mkdir()
+    for task, n_traj in (("alfworld", 8), ("search", 8)):
+        proto = _tagged(_make_task_proto(task, n_traj, turns_per_traj=2))
+        proto.save_to_disk(str(whole / f"{task}.pt"))
+        # Same rows, same order, cut into shards on trajectory boundaries the way
+        # a flush every N generation steps cuts them.
+        for i, start in enumerate(range(0, len(proto), 4)):
+            part = proto.select_idxs(list(range(start, min(start + 4, len(proto)))))
+            part.save_to_disk(str(sharded / f"{task}_{i:04d}.pt"))
+
+    one, steps_one = _run_iter(whole)
+    many, steps_many = _run_iter(sharded)
+
+    assert {t: len(s) for t, s in one._task_shards.items()} == {"alfworld": 1, "search": 1}
+    assert {t: len(s) for t, s in many._task_shards.items()} == {"alfworld": 4, "search": 4}
+    # The sampling population is ordered the same, so the draws match.
+    for task in one._task_to_trajs:
+        assert one._task_to_trajs[task].tolist() == many._task_to_trajs[task].tolist()
+
+    assert len(steps_one) == len(steps_many) == 5
+    for a, b in zip(steps_one, steps_many):
+        assert torch.equal(a.batch["responses"], b.batch["responses"])
+        assert a.non_tensor_batch["traj_uid"].tolist() == b.non_tensor_batch["traj_uid"].tolist()
+        assert a.non_tensor_batch["task_name"].tolist() == b.non_tensor_batch["task_name"].tolist()
+
+
+def test_shards_of_one_task_are_read_in_write_order(tmp_path):
+    """Shard files are numbered, and sorted() has to put them back in the order
+    Stage 1 flushed them -- otherwise the trajectory population is permuted and
+    a resumed/regenerated pool draws a different sequence."""
+    proto = _tagged(_make_task_proto("webshop", 12, turns_per_traj=1))
+    for i in range(12):
+        proto.select_idxs([i]).save_to_disk(str(tmp_path / f"webshop_{i:04d}.pt"))
+
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(tmp_path)
+    trainer._load_offpolicy_data()
+
+    assert trainer._task_to_trajs["webshop"].tolist() == [f"webshop-{j}" for j in range(12)]
+    assert [s for s, _ in trainer._task_to_traj_rows["webshop"].values()] == list(range(12))
+
+
+def test_duplicate_trajectory_across_files_is_rejected(tmp_path):
+    """traj_uid is a uuid4, so the same one in two files means the directory
+    holds overlapping shards -- two runs' output, or a shard written twice.
+    Merging them would build a trajectory whose turns came from different
+    rollouts, so it has to fail instead."""
+    proto = _make_task_proto("search", 4, turns_per_traj=2)
+    proto.save_to_disk(str(tmp_path / "search_0000.pt"))
+    proto.save_to_disk(str(tmp_path / "search_0001.pt"))  # same shard written twice
+
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(tmp_path)
+    with pytest.raises(AssertionError, match="more than one file"):
+        trainer._load_offpolicy_data()
 
 
 def test_load_offpolicy_file_drops_dead_columns(tmp_path):

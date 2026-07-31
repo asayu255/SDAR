@@ -43,7 +43,16 @@ set -x
 #     is 2400). At 15*8=120 trajectories/task/step over 300 steps, 36000 is
 #     exactly one epoch. A smaller pool silently becomes replay.
 #   * the same teachers, seed=1 and truncation as below.
-# scripts/inspect_teacher_pool.py reports the per-task trajectory counts.
+# scripts/inspect_teacher_pool.py reports the per-task trajectory counts, and the
+# host RAM this run will hold.
+#
+# The pool is SHARDED: the generator flushes every gen.shard_every_steps steps,
+# so it is <task>_0000.pt ... <task>_0029.pt, 30 per task, not one file per task.
+# Stage 2 loads shards without concatenating them, which is what keeps the peak
+# at 'resident + largest shard' (~9 GiB) instead of 'resident + whole task'
+# (~237 GiB for alfworld). Keep every shard of a task in this directory, and keep
+# nothing else: the loader globs *.pt, and a stale or duplicated shard is caught
+# only by a traj_uid collision check, which a *different* run's shards would pass.
 #
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations files — see docs/optimization_phase2.md):
