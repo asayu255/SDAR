@@ -368,7 +368,12 @@ class ActorRolloutRefWorker(Worker):
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
-                forward_prefetch=False,
+                # Off by default (upstream behaviour). fsdp_config.forward_prefetch=True
+                # issues the NEXT FSDP unit's all-gather while the current one computes,
+                # overlapping communication it would otherwise serialize -- scheduling
+                # only, the arithmetic is untouched. Worth turning on when collectives
+                # run over PCIe (no NVLink) and the profile is communication-bound.
+                forward_prefetch=bool(fsdp_config.get("forward_prefetch", False)),
             )
         elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
