@@ -22,11 +22,15 @@ loop and turns in the inner one -- so every trajectory's turn-rows are contiguou
 ``adjust_batch`` concatenates its duplicated rows after all of them, so a traj_uid
 starting a *second* run can only be padding.
 
-Expected padding volume: ``adjust_batch`` pads each gen step to a multiple of
-lcm(log_prob_micro*W, actor_micro*W) = 240 rows, so it adds 1..239 rows, ~120 on
-average. A gen step produces per_task_batch_size * env.rollout.n = 120
-trajectories, so the padding row count should come out close to the trajectory
-count -- ``dup_rows / n_trajectories ~= 1.0`` is the headline check.
+Expected padding volume: ``adjust_batch`` pads each gen step up to a multiple of
+a divisor set by the generating run's micro batch sizes and world size, so it
+adds 1..divisor-1 rows, ~divisor/2 on average. The pool does not record that
+divisor, so it is inferred here (see ``infer_block_divisor``) and the mean
+padding per step is reported against it rather than against a hardcoded guess.
+
+The check that actually matters is the bit-identity spot check: a flagged row
+must be byte-for-byte a row already present in its own trajectory. If that ever
+fails, the rows being dropped are real turns, not copies.
 
 Usage:
     python3 scripts/inspect_teacher_pool.py $HOME/data/verl-agent/sdar_multitask/teacher_traj
@@ -39,6 +43,8 @@ import glob
 import os
 import re
 import sys
+from functools import reduce
+from math import gcd
 
 # Stage-1 shard names: <task>_0000.pt (gen.shard_every_steps).
 _SHARD_RE = re.compile(r"^.+_\d{4}\.pt$")
@@ -56,10 +62,16 @@ import torch
 # verl is imported lazily inside inspect_file: it drags in ray/vllm, which is slow
 # and can fail for reasons unrelated to this script, and --sizes-only never needs it.
 
-# adjust_batch's divisor for these runs: lcm(log_prob_micro_bs*W, actor_micro_bs*W).
-# Only used to sanity-check that padding really was applied; override if the run
-# used different micro batch sizes or a different world size.
-DEFAULT_BLOCK_DIVISOR = 240
+# adjust_batch pads each generation step up to a multiple of
+# lcm(size_divisor_ref, size_divisor_rollout, size_divisor_actor) -- see
+# agent_system/multi_turn_rollout/utils.py:168. That value depends on the micro
+# batch sizes and world size the GENERATING run used, which this script cannot
+# read: the pool does not record them. So it is inferred from the data instead of
+# assumed. Every step's row count is a multiple of the divisor, a shard is whole
+# steps, so the gcd over the shards is a multiple of it -- and the mean padding
+# per step confirms the inference (a uniform remainder gives ~divisor/2).
+# Hardcoding a guess here is what made an earlier version flag 63 of 90 healthy
+# shards. Pass --block-divisor only to check against a value you know.
 
 # Columns the Stage-2 loaders drop, mirroring OffPolicyOPDRayTrainer._drop_tensor_keys
 # and MultiTaskSFTTrainer's extension of it. Only used to report what each arm will
@@ -103,7 +115,7 @@ def spot_check_bit_identity(data, is_dup: np.ndarray, n_check: int) -> tuple:
     return checked, matched
 
 
-def inspect_file(path: str, block_divisor: int, n_spot: int) -> dict:
+def inspect_file(path: str, n_spot: int) -> dict:
     from verl import DataProto
 
     # The same function OffPolicyOPDRayTrainer._load_offpolicy_file filters with, so
@@ -160,7 +172,6 @@ def inspect_file(path: str, block_divisor: int, n_spot: int) -> dict:
         "n_keep": n_keep,
         "n_dup": n_dup,
         "n_traj": n_traj,
-        "block_ok": (n_rows % block_divisor) == 0,
         "dup_over_traj": n_dup / n_traj if n_traj else float("nan"),
         "r_k": n_keep / n_traj if n_traj else float("nan"),
         "l_k": full_tokens / n_keep if n_keep else float("nan"),
@@ -174,6 +185,25 @@ def inspect_file(path: str, block_divisor: int, n_spot: int) -> dict:
         "spot_checked": checked,
         "spot_matched": matched,
     }
+
+
+def infer_block_divisor(per_file: list, override) -> tuple:
+    """adjust_batch's divisor, inferred from the shards unless one is given.
+
+    Every generation step is padded up to a multiple of it and a shard is whole
+    steps, so it divides every shard's row count -- the gcd is the tightest value
+    the data can justify. Reported rather than assumed because the pool does not
+    record the micro batch sizes and world size that determined it, and a
+    hardcoded guess turns this check into noise the moment a run uses different
+    ones.
+    """
+    if override:
+        return int(override), "given with --block-divisor"
+    counts = [r["n_rows"] for r in per_file]
+    if not counts:
+        return 0, "no files"
+    divisor = reduce(gcd, counts)
+    return divisor, f"gcd over {len(counts)} file(s)"
 
 
 def merge_by_task(rows: list) -> list:
@@ -194,7 +224,6 @@ def merge_by_task(rows: list) -> list:
                     "resp_tokens", "dup_resp_tokens", "disk_bytes",
                     "spot_checked", "spot_matched"):
             agg[key] += r[key]
-        agg["block_ok"] = agg["block_ok"] and r["block_ok"]
         agg["has_topk"] = agg["has_topk"] and r["has_topk"]
         agg["file"] = f"{r['task']}_* ({agg['files']} shards)"
     for agg in merged.values():
@@ -216,7 +245,8 @@ def main():
              "is still running -- its .pt is either stale or half-written.",
     )
     ap.add_argument("--sizes-only", action="store_true", help="print disk sizes and exit")
-    ap.add_argument("--block-divisor", type=int, default=DEFAULT_BLOCK_DIVISOR)
+    ap.add_argument("--block-divisor", type=int, default=None,
+                    help="adjust_batch's divisor, if you know it. Default: infer it from the data.")
     ap.add_argument("--spot-check", type=int, default=20, help="flagged rows to verify bit-identity on")
     args = ap.parse_args()
 
@@ -253,19 +283,18 @@ def main():
     verbose = len(files) <= 6
     rows = []
     for f in files:
-        r = inspect_file(f, args.block_divisor, args.spot_check)
+        r = inspect_file(f, args.spot_check)
         rows.append(r)
         if not verbose:
             print(f"  {r['file']:28s} task={r['task']:9s} rows={r['n_rows']:>8,} "
                   f"trajs={r['n_traj']:>7,} pad={r['n_dup']:>6,} "
-                  f"block_ok={str(r['block_ok']):5s} spot={r['spot_matched']}/{r['spot_checked']}")
+                  f"spot={r['spot_matched']}/{r['spot_checked']}")
             continue
         print(f"\n--- {os.path.basename(f)}")
         print(f"    task={r['task']}  topk={'yes' if r['has_topk'] else 'no'}")
         print(f"    rows={r['n_rows']:,}  trajectories={r['n_traj']:,}")
         print(f"    padding rows = {r['n_dup']:,}  ({r['n_dup'] / r['n_rows']:.1%} of rows)")
         print(f"    dup_rows / n_traj = {r['dup_over_traj']:.2f}   (expect ~1.0)")
-        print(f"    rows % {args.block_divisor} == 0 : {r['block_ok']}   (expect True)")
         print(f"    bit-identity spot check: {r['spot_matched']}/{r['spot_checked']} matched "
               f"(expect all)")
         print(f"    r_k (rows/traj, padding excluded) = {r['r_k']:.2f}")
@@ -309,10 +338,39 @@ def main():
     print("                each task equal rows, pool sizes must scale as 1/r_k to keep")
     print("                the epoch count equal across tasks.")
 
-    bad = [r for r in per_file if not r["block_ok"] or r["spot_matched"] != r["spot_checked"]]
+    print("\n===== padding sanity check =====")
+    divisor, why = infer_block_divisor(per_file, args.block_divisor)
+    print(f"  adjust_batch divisor: {divisor} ({why})")
+    for r in rows:
+        blocks = r["n_rows"] / divisor if divisor else float("nan")
+        # Each generation step is padded by 1..divisor-1 rows, ~divisor/2 on
+        # average, so the padding volume recovers how many steps wrote this task.
+        # It should come out at the generating run's step count; well under it
+        # means many steps landed on the grid and needed no padding (short-episode
+        # tasks do), well over it means the padding is not what it looks like.
+        implied_steps = 2 * r["n_dup"] / divisor if divisor else float("nan")
+        print(f"  {r['task']:10s} rows/{divisor} = {blocks:10.2f} "
+              f"{'OK' if float(blocks).is_integer() else '<-- NOT WHOLE'}   "
+              f"padding {r['n_dup']:>7,} -> ~{implied_steps:.0f} generation steps")
+    total_checked = sum(r["spot_checked"] for r in per_file)
+    total_matched = sum(r["spot_matched"] for r in per_file)
+    print(f"  bit-identity spot check: {total_matched}/{total_checked} flagged rows matched "
+          f"a row in their own trajectory")
+
+    bad = [r for r in per_file if r["spot_matched"] != r["spot_checked"]]
+    off_grid = [r for r in per_file if divisor and r["n_rows"] % divisor]
     if bad:
-        print("\nWARNING: sanity checks failed for: " + ", ".join(r["file"] for r in bad))
-        print("  Do not filter on this result -- the structural assumption may not hold.")
+        print("\nWARNING: flagged rows that are NOT copies, in: "
+              + ", ".join(r["file"] for r in bad))
+        print("  Do not filter on this result -- the structural assumption does not hold")
+        print("  for these files, so find_padding_duplicates would drop real turns.")
+    elif off_grid:
+        print(f"\nWARNING: {len(off_grid)} file(s) are not a multiple of the divisor "
+              f"{divisor}, which was given with --block-divisor. Either the generating")
+        print("  run used a different one (drop the flag and let it be inferred), or the")
+        print("  directory mixes shards from runs with different batch geometry.")
+    else:
+        print("  -> padding detection is sound; those rows are dropped at load.")
 
 
 if __name__ == "__main__":
