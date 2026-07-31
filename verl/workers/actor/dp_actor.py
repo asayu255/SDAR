@@ -109,6 +109,36 @@ def _actor_phase(name: str):
         gpu_profiler.pop_phase(name)
 
 
+def _grad_sync_context(module, active: bool):
+    """FSDP's no_sync() for one micro-batch, or None when it does not apply.
+
+    Returned rather than yielded because it has to be entered and exited at
+    micro-batch *boundaries*: FSDP1's no_sync() asserts the module is IDLE, so it
+    cannot be wrapped around the backward alone -- by then the forward has moved
+    the module into FORWARD_BACKWARD.
+
+    Returns None when there is nothing to do, so the caller can skip the enter
+    entirely on the single-micro-batch path.
+    """
+    if not active:
+        return None
+    if isinstance(module, FSDP):
+        return module.no_sync()
+    if isinstance(module, FSDPModule):
+        return _fsdp2_no_sync(module)
+    return None
+
+
+@contextmanager
+def _fsdp2_no_sync(module):
+    """no_sync() for FSDP2, which spells it as a setter rather than a context."""
+    module.set_requires_gradient_sync(False)
+    try:
+        yield
+    finally:
+        module.set_requires_gradient_sync(True)
+
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -128,6 +158,15 @@ class DataParallelPPOActor(BasePPOActor):
             _PROFILE_STAGES = gpu_profiler.enabled() and torch.distributed.get_rank() == 0
         except Exception:
             _PROFILE_STAGES = False
+
+        # Accumulate gradients locally across a mini-batch's micro-batches and
+        # reduce once, instead of reducing after every one. Off by default: it
+        # changes the order the partial sums are reduced in, so gradients differ
+        # in their last bits (the expectation is identical -- summing then
+        # averaging across ranks and averaging then summing are the same number).
+        self.no_sync_grad_accum = bool(self.config.get("no_sync_grad_accum", False))
+        if self.no_sync_grad_accum:
+            print("Actor no_sync_grad_accum=True (one gradient reduce per mini-batch)")
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -481,6 +520,14 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        # A call that died between entering and leaving no_sync would leave the
+        # flag off, and every later step would then silently skip its gradient
+        # reduce. Cheap to make each call start from a known state.
+        if self.no_sync_grad_accum and isinstance(self.actor_module, FSDP):
+            for m in self.actor_module.modules():
+                if isinstance(m, FSDP):
+                    m._sync_gradients = True
+
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
@@ -584,7 +631,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for data in micro_batches:
+                # One reduce per mini-batch instead of one per micro-batch. The
+                # context is entered before the first micro-batch's forward and
+                # left before the last one's, both points where FSDP is IDLE --
+                # no_sync() asserts that, so it cannot wrap the backward alone.
+                # The last micro-batch then runs with sync on and reduces
+                # everything accumulated.
+                #
+                # Under SHARD_GRAD_OP this removes the all-gather as well, not
+                # just the reduce-scatter: _should_free_in_backward returns
+                # `state._sync_gradients or strategy in
+                # RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES`, and SHARD_GRAD_OP is
+                # not in that set -- so with sync off the parameters are left
+                # unsharded and the next micro-batch does not re-gather them.
+                # That is why this pairs with sharding_strategy=shard_grad_op.
+                n_micro = len(micro_batches)
+                accum_ctx = None
+                for micro_idx, data in enumerate(micro_batches):
+                    if self.no_sync_grad_accum:
+                        if micro_idx == 0 and n_micro > 1:
+                            accum_ctx = _grad_sync_context(self.actor_module, True)
+                            if accum_ctx is not None:
+                                accum_ctx.__enter__()
+                        elif micro_idx == n_micro - 1 and accum_ctx is not None:
+                            accum_ctx.__exit__(None, None, None)
+                            accum_ctx = None
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
