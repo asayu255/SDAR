@@ -25,8 +25,7 @@ set -x
 #
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations file — see docs/optimization_phase2.md):
-#   ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1  SEARCH_QUERY_CACHE=1
-#   ROLLOUT_PREPROC_WORKERS=8  TASK_BALANCE_INTERLEAVE=1
+#   ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no

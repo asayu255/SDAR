@@ -14,15 +14,13 @@
 # limitations under the License.
 """CPU-only equivalence gates for the rollout speedup mechanisms.
 
-Covers the pure-logic pieces of the A/C/D/E optimizations:
+Covers the pure-logic pieces of the A/C/E optimizations:
 
   * compute_log_prob_with_prefetch (A): merging prefetched per-row log probs
     with the normally computed remainder must equal computing every row.
   * prefetch_env_reset / _reset_envs (C): the prefetched reset is consumed
     exactly once, matched by env identity and kwargs, and a kwargs mismatch
     fails loudly instead of silently double-resetting.
-  * SearchToolGroup query cache (D): enabled cache returns the identical
-    result text without a second API call; disabled cache always calls.
   * compact record (E): dropping active_masks=False rows from
     total_batch_list produces the identical effective batch from
     gather_rollout_data-style filtering (prefix property).
@@ -320,64 +318,6 @@ def test_compact_record_equivalence():
     print("E: compact record equivalence OK")
 
 
-# --------------------------------------------------------------------------- #
-# D: search query cache
-# --------------------------------------------------------------------------- #
-def test_search_query_cache():
-    os.environ["SEARCH_QUERY_CACHE"] = "1"
-    search_mod_path = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "agent_system",
-            "environments",
-            "env_package",
-            "search",
-            "third_party",
-            "skyrl_gym",
-            "tools",
-            "search.py",
-        )
-    )
-    import importlib.util
-    import types
-
-    # Importing the search package pulls `gym` (unneeded for the cache logic);
-    # stub it when absent so this test stays CPU/deps-light.
-    if "gym" not in sys.modules:
-        try:
-            import gym  # noqa: F401
-        except ImportError:
-            gym_stub = types.ModuleType("gym")
-            gym_stub.Env = object
-            sys.modules["gym"] = gym_stub
-
-    spec = importlib.util.spec_from_file_location("search_tool_cache_test", search_mod_path)
-    module = importlib.util.module_from_spec(spec)
-    # The module imports its ToolGroup base via the package path; make sure the
-    # repo root import used inside the module resolves.
-    spec.loader.exec_module(module)
-
-    calls = {"n": 0}
-
-    def fake_call_search_api(**kwargs):
-        calls["n"] += 1
-        return {"result": [[{"document": {"contents": f"doc for {kwargs['query']}"}}]]}, None
-
-    module.call_search_api = fake_call_search_api
-    group = module.SearchToolGroup(search_url="http://fake:8000/retrieve", log_requests=False)
-
-    first = group.search("who wrote hamlet")
-    second = group.search("who wrote hamlet")
-    assert first == second
-    assert calls["n"] == 1, f"expected 1 API call with cache on, got {calls['n']}"
-
-    third = group.search("different query")
-    assert calls["n"] == 2 and third != first
-    print("D: search query cache OK")
-
-
 if __name__ == "__main__":
     test_prefetch_merge_equivalence()
     test_prefetch_merge_all_and_none()
@@ -386,5 +326,4 @@ if __name__ == "__main__":
     test_env_reset_prefetch()
     test_env_kwargs_equal()
     test_compact_record_equivalence()
-    test_search_query_cache()
     print("\nALL ROLLOUT SPEEDUP MECHANISM TESTS PASSED")
