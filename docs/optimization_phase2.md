@@ -40,7 +40,6 @@ knob reproduces the Phase 1 behavior exactly when unset.
 - C: `TrajectoryCollector.prefetch_env_reset` / `_reset_envs` + the peek-ahead
   loop in the skillsd / rlsd / opd_grpo trainers' `fit()` (with the pre-peek
   dataloader snapshot used by their `_save_checkpoint` overrides).
-- D: `agent_system/environments/env_package/search/third_party/skyrl_gym/tools/search.py`.
 - E: `preprocess_batch` / `_run_full_preprocess`, the decode and record blocks
   of `vanilla_multi_turn_loop`.
 
