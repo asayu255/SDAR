@@ -111,10 +111,6 @@ set -x
 # 12-17 GiB, which is small enough that fragmentation is not the binding issue.
 
 export ROLLOUT_KEEP_VLLM_AWAKE=1   # (1) one vLLM weight-sync per rollout, not per turn
-export ROLLOUT_PREPROC_WORKERS=8   # (E1) parallel prompt tokenization, bit-identical
-export SEARCH_QUERY_CACHE=1        # (D) reuse retriever hits; needs a deterministic
-                                   #     (fixed-index) retriever. Only the search
-                                   #     block below issues queries at all.
 # ROLLOUT_SKIP_DONE_PREPROC (2) / ROLLOUT_DECODE_ACTIVE_ONLY (E2) /
 # ROLLOUT_COMPACT_RECORD (E3) default to on; all three speed up the alfworld tail.
 # enable_prefix_caching (3) is passed as a Hydra arg in each block below.

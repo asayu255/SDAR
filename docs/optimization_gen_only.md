@@ -413,8 +413,8 @@ recommendation.
 | A | log-prob prefetch | `ROLLOUT_PREFETCH_LOGPROB=1` | **N** | Correct as the script says: no `old_log_prob` phase. Replace with G7 (top-k prefetch). |
 | B | CUDA-graph decode | `CUDAGRAPH_CAPTURE_SIZES` | **measure** | The Phase-1/2 note that this needs `VLLM_USE_V1=1` is stale for the pinned `vllm==0.11.0`, which has no V0 engine. Capture sizes should cover the *gen* batch sizes, which are much larger than training's if G2 is on. Gen is also more prefill-heavy than training (every turn re-prefills the history, responses are short), so expect less from decode graphs here — measure before adopting. |
 | C | env-reset prefetch | `ENV_RESET_PREFETCH=1` | **N (port)** | Not wired into the generator — see G8. Setting the env var today does nothing. |
-| D | retriever query cache | `SEARCH_QUERY_CACHE=1` | **Y (search only)** | High hit rate: the 8 GRPO group members share a question, so turn-1 queries repeat 8×. Requires a deterministic retriever (fixed index). Useless for alfworld/webshop. |
-| E1 | parallel tokenization | `ROLLOUT_PREPROC_WORKERS=8` | **Y** | Bit-identical, and preproc is a larger share of a gen step than of a training step (no training phases to hide behind). |
+| D | retriever query cache | — | **removed** | Dropped from the tree: barely worth its complexity, and only sound against a deterministic (fixed-index) retriever. |
+| E1 | parallel tokenization | — | **removed** | Dropped from the tree: barely worth its complexity, and it needed per-thread tokenizer clones because HF fast tokenizers mutate shared truncation/padding state. |
 | E2 | active-only decode | `ROLLOUT_DECODE_ACTIVE_ONLY=1` (default on) | **Y** | Keep on. |
 | E3 | compact record | `ROLLOUT_COMPACT_RECORD=1` (default on) | **Y** | Keep on. |
 | — | profilers | `GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1` | **Y, first run** | Gen has never been profiled; §6. |
@@ -435,8 +435,6 @@ worker is created under grpo + `use_kl_in_reward=False`), and
 
 ```bash
 export ROLLOUT_KEEP_VLLM_AWAKE=1     # ①
-export ROLLOUT_PREPROC_WORKERS=8     # E1
-export SEARCH_QUERY_CACHE=1          # D (search block only; needs a fixed index)
 # ②/E2/E3 default on; ③ already passed as a Hydra arg
 ```
 
