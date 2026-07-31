@@ -49,7 +49,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.metric import reduce_metrics
 
-from agent_system.multi_turn_rollout import adjust_batch
+from agent_system.multi_turn_rollout import adjust_batch, batch_size_divisor
 
 # Tensor fields persisted per trajectory (Stage 1 -> Stage 2). These are exactly
 # the keys update_policy's top-k distillation path consumes, plus prompts/
@@ -178,6 +178,36 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         shard_idx = 0
         shard_paths = []
 
+        # Padding each step up to a DP/micro-divisible size duplicates random rows
+        # and writes the copies into <task>.pt, so it is off by default: Stage 2
+        # needs no divisibility here (the only worker call pads and unpads itself),
+        # and the copies would otherwise be trained on twice.
+        #
+        # It exists as an option for one case: extending a pool whose other tasks
+        # were generated when this was unconditional. The loaders on THIS branch
+        # drop the padding at load, so it makes no difference to them -- but the
+        # off-policy KD branch's loader does not, and there a task without padding
+        # would carry slightly less weight than its neighbours that have it. A pool
+        # should be uniform in the format it was written in.
+        pad_batches = bool(gen_cfg.get("adjust_batch", False))
+        pad_divisor = batch_size_divisor(self.config) if pad_batches else None
+        if pad_batches:
+            print(f"[OPD-offpolicy gen][{task}] adjust_batch ON, padding each step up "
+                  f"to a multiple of {pad_divisor}", flush=True)
+            # The divisor comes from the micro batch sizes and world size, so a
+            # config that differs from the one the rest of the pool was written
+            # with silently changes how much padding lands on disk. Checking it
+            # here costs seconds; discovering it afterwards costs the whole run.
+            expected = gen_cfg.get("expect_pad_divisor", None)
+            assert expected is None or int(expected) == pad_divisor, (
+                f"adjust_batch would pad to a multiple of {pad_divisor}, but "
+                f"gen.expect_pad_divisor={int(expected)}. The divisor is "
+                f"lcm(rollout.log_prob_micro_batch_size_per_gpu, "
+                f"actor.ppo_micro_batch_size_per_gpu) * n_gpus_per_node * nnodes -- "
+                f"set those to match the pool this task is joining "
+                f"(scripts/inspect_teacher_pool.py reports the pool's divisor)."
+            )
+
         self.global_steps = 0
         collected = []
         seen_trajs = set()
@@ -222,12 +252,13 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                     envs=self.envs,
                     is_train=True,
                 )
-                # NOTE: deliberately no adjust_batch here. Padding the per-step
-                # batch to a DP/micro-divisible size duplicates random *rows*, and
-                # those copies would be written into <task>.pt and trained on
-                # twice. Nothing in this stage needs the divisibility: the only
-                # worker call below pads and unpads itself (auto_padding_key), and
-                # the SFT variant (collect_topk=False) makes no worker call at all.
+                # Off by default -- nothing in this stage needs the divisibility
+                # (the worker call below pads and unpads itself via
+                # auto_padding_key, and collect_topk=False makes no worker call at
+                # all) and the copies it appends get written into the dataset. See
+                # gen.adjust_batch above for the one reason to turn it back on.
+                if pad_batches:
+                    gen_out = adjust_batch(self.config, gen_out)
                 gen_out.batch["response_mask"] = compute_response_mask(gen_out)
 
                 # Teacher scores its own top-k over the generated responses (KD only).
