@@ -1127,7 +1127,7 @@ class CriticWorker(Worker):
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
-                forward_prefetch=False,
+                forward_prefetch=bool(fsdp_config.get("forward_prefetch", False)),
                 device_mesh=self.device_mesh,
                 cpu_offload=None,
             )
@@ -1396,7 +1396,7 @@ class RewardModelWorker(Worker):
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
                 cpu_offload=CPUOffload(offload_params=True),
-                forward_prefetch=False,
+                forward_prefetch=bool(self.config.model.fsdp_config.get("forward_prefetch", False)),
                 device_mesh=self.device_mesh,
             )
         elif config.strategy == "fsdp2":
