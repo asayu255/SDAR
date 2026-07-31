@@ -554,6 +554,18 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # Scalar metrics that are only read by the logger are kept as 0-d GPU
+        # tensors until the end of the call. Reading them per micro-batch
+        # (.item()) blocks the host until the device drains -- with three tasks
+        # that was ~450 forced syncs per step, timed as actor.task_metrics.
+        # Deferring changes nothing about the values: the single read at the end
+        # takes the same mean over micro-batches that append_to_dict +
+        # reduce_metrics would have.
+        deferred_metrics = {}
+
+        def _defer(name, value):
+            deferred_metrics.setdefault(name, []).append(value.detach())
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -709,7 +721,10 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
-                        metrics["actor/teacher_kl_loss"] = teacher_kl_loss.detach().item()
+                        # Deferred, and appended rather than assigned: assignment kept
+                        # only the LAST micro-batch, which after _balance_batch's
+                        # reorder is often entirely adjust_batch padding.
+                        _defer("actor/teacher_kl_loss", teacher_kl_loss)
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
                     if self.config.get("use_sft_loss", False):
@@ -735,10 +750,14 @@ class DataParallelPPOActor(BasePPOActor):
                             weighted = (row_nll * sft_loss_weight).sum()
                             weighted = weighted * (self.sft_dp_world_size * self.gradient_accumulation)
                             policy_loss = policy_loss + weighted * sft_coef
-                            metrics["actor/sft_loss_weighted"] = weighted.detach().item()
+                            # Appended, not assigned: assignment kept only the LAST
+                            # micro-batch, which after _balance_batch's reorder is often
+                            # entirely adjust_batch padding -- weight 0, so the logged
+                            # value sat at 0.000 while the real loss was fine.
+                            _defer("actor/sft_loss_weighted", weighted)
                         # Kept unweighted so it stays comparable with runs that do not
                         # normalise per task.
-                        metrics["actor/sft_loss"] = sft_loss.detach().item()
+                        _defer("actor/sft_loss", sft_loss)
                         metrics["actor/sft_coef"] = sft_coef
 
                     if self.config.use_dynamic_bsz:
@@ -752,10 +771,10 @@ class DataParallelPPOActor(BasePPOActor):
                     if task_ids is not None:
                         # Same losses, re-aggregated over the rows of one task at a
                         # time. Diagnostics only: nothing here touches the graph the
-                        # optimizer step above was built from -- but every .item()
-                        # below blocks until the GPU drains, so this is timed
-                        # separately: three syncs per task per micro-batch is a
-                        # plausible place for the step to be losing time.
+                        # optimizer step above was built from, and the results are
+                        # deferred GPU tensors -- no host sync happens here. Timed
+                        # separately anyway: this phase is where the backward's
+                        # queued reduce-scatter tail drains.
                         with _actor_phase("actor.task_metrics"), torch.no_grad():
                             for task, rows in iter_task_row_masks(task_ids, task_id_names):
                                 task_response_mask = response_mask[rows]
@@ -819,13 +838,15 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    task_metrics[f"actor/teacher_kl_loss/{task}"] = (
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    _defer(
+                                        f"actor/teacher_kl_loss/{task}",
+                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                     )
 
                                 if self.config.get("use_sft_loss", False):
-                                    task_metrics[f"actor/sft_loss/{task}"] = (
-                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    _defer(
+                                        f"actor/sft_loss/{task}",
+                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                     )
 
                                 append_to_dict(metrics, task_metrics)
@@ -846,6 +867,10 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        # The one read for everything deferred above. torch.stack forces a single
+        # host sync here instead of one per micro-batch.
+        for name, values in deferred_metrics.items():
+            metrics[name] = torch.stack(values).mean().item()
         if _PROFILE_STAGES:
             # One table per update_policy call. The driver's boundary phase
             # ("step") never pops in this process, so the report is asked for
