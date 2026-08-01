@@ -70,6 +70,17 @@
 # -- gradients are reduce-scattered in the same reduce_dtype either way -- so the
 # three arms may adopt it independently without confounding their comparison.
 "actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+# One gradient reduce per mini-batch instead of one per micro-batch: FSDP's
+# no_sync() over all but the last micro-batch. Listed here for the same reason as
+# the line above -- it is on the gradient path. It is not arithmetic-neutral the
+# way the sharding strategy is: the unsharded micro-batch gradients are summed
+# first and reduce-scattered once, rather than reduce-scattered and summed as
+# shards, so the floating-point association differs. The difference is at
+# rounding level and the expectation is unchanged, but it is a real change to how
+# the gradient is formed, so it should not be invisible to this file. The three
+# arms may adopt it independently (it does not interact with the loss); measured
+# at -45 s of a 415 s step here, at the cost of holding the unsharded gradient.
+"actor_rollout_ref.actor.no_sync_grad_accum": true
 
 # ---- model / optimization -------------------------------------------------------
 "actor_rollout_ref.model.path": Qwen/Qwen3-1.7B

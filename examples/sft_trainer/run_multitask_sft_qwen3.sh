@@ -89,6 +89,14 @@ set -x
 #   TASK_BALANCE_INTERLEAVE does nothing here: it reorders the *train* sampler,
 #   which this loop never iterates (it draws from the fixed pool), and the
 #   validation dataloader takes no sampler at all.
+#
+# DO NOT set GPU_PROFILER=1 for a real run. The profiler is entirely inert
+# without it (verl/utils/gpu_profiler.py; the phase tags in dp_actor.py return
+# immediately), but when on it starts an NVML sampler in the driver and in rank
+# 0, prints a table every step, and with GPU_PROFILER_SYNC_PHASES=1 inserts a
+# device synchronize at every phase boundary — which serializes work the run
+# would otherwise overlap. It is a measurement tool; leave it off and the run is
+# byte-identical to one built without it.
 
 # The one variable in this file, and it is not a knob: an absolute path to this
 # script's own directory. The expectations file is read inside a Ray actor, after
@@ -150,6 +158,8 @@ python3 -m verl.trainer.main_sft_multitask \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
