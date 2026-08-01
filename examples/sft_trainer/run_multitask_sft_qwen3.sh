@@ -75,8 +75,10 @@ set -x
 # tests/trainer/test_cache_teacher_pool.py). It is ARM-SPECIFIC: the SFT cache has
 # no teacher top-k, so a KD run must not read it.
 #
-# Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
-# code, not in the expectations files — see docs/optimization_phase2.md):
+# Throughput mechanisms (process env vars, accuracy-preserving; live in code, not
+# in the expectations files — see docs/optimization_phase2.md). The first two are
+# exported below so they are on without being remembered; set either to 0 to
+# disable:
 #   ROLLOUT_KEEP_VLLM_AWAKE=1
 #   OFFPOLICY_BATCH_PREFETCH=1   — builds step k+1's batch on a background thread
 #     while step k is inside update_actor (a blocking ray.get, so it holds no
@@ -106,6 +108,13 @@ SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+# On by default, for the same reason the two FSDP knobs are literals below: a
+# 300-step run gets restarted, and a mechanism that has to be exported by hand is
+# one that will eventually be missing from a restart. Both are accuracy-
+# preserving (see the header), so this changes throughput and nothing else.
+# ROLLOUT_KEEP_VLLM_AWAKE=0 / OFFPOLICY_BATCH_PREFETCH=0 still turns either off.
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
