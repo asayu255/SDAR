@@ -42,6 +42,29 @@
   search: 0.01
   webshop: 0.1
 
+# ---- FSDP sharding ----------------------------------------------------------------
+# ZeRO-2 rather than the FULL_SHARD default: parameters stay gathered from the
+# forward through the backward, so the repeated all-gathers a layer does per
+# micro-batch under gradient checkpointing collapse to one. Listed here despite
+# being a throughput knob because it is on the gradient path, and a run's identity
+# should not depend on something invisible to this file. It is arithmetic-neutral
+# -- gradients are reduce-scattered in the same reduce_dtype either way -- so the
+# arms may adopt it independently without confounding their comparison.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+# One gradient reduce per mini-batch instead of one per micro-batch: FSDP's
+# no_sync() over all but the last micro-batch. Listed here for the same reason as
+# the line above -- it is on the gradient path. It is not arithmetic-neutral the
+# way the sharding strategy is: the unsharded micro-batch gradients are summed
+# first and reduce-scattered once, rather than reduce-scattered and summed as
+# shards, so the floating-point association differs. The difference is at
+# rounding level and the expectation is unchanged, but it is a real change to how
+# the gradient is formed, so it should not be invisible to this file. The arms may
+# adopt it independently (it does not interact with the loss).
+"actor_rollout_ref.actor.no_sync_grad_accum": true
+# forward_prefetch is deliberately NOT here: it only reorders the issue of
+# all-gathers that happen either way, so it touches scheduling and not the
+# gradient.
+
 # ---- model / optimization -------------------------------------------------------
 "actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
 "actor_rollout_ref.actor.optim.lr": 1.0e-6

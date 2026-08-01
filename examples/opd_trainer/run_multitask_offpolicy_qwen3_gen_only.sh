@@ -129,6 +129,14 @@ export ROLLOUT_KEEP_VLLM_AWAKE=1   # (1) one vLLM weight-sync per rollout, not p
 # ROLLOUT_COMPACT_RECORD (E3) default to on; all three speed up the alfworld tail.
 # enable_prefix_caching (3) is passed as a Hydra arg in each block below.
 
+# The one variable in this file, and it is not a knob: an absolute path to this
+# script's own directory. The expectations files are read inside a Ray actor,
+# after Hydra has chdir'd the driver into its output directory, so a path
+# relative to the launcher's cwd is not reliably resolvable by the time it is
+# opened. (python3 -m still requires the repo root as cwd; this only fixes the
+# one path that outlives that assumption.)
+OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
@@ -155,7 +163,7 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
 
 # ===================== Stage 1: teacher trajectory generation =====================
 python3 -m verl.trainer.main_opd_offpolicy_gen \
-    +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
+    +trainer.expected_config=$OPD_DIR/expected_multitask_offpolicy_gen_config.yaml \
     +gen.task=alfworld \
     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
@@ -236,7 +244,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     trainer.val_before_train=False
 
 # python3 -m verl.trainer.main_opd_offpolicy_gen \
-#     +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
+#     +trainer.expected_config=$OPD_DIR/expected_multitask_offpolicy_gen_config.yaml \
 #     +gen.task=search \
 #     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/search_step300 \
 #     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
@@ -317,7 +325,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
 #     trainer.val_before_train=False
 
 # python3 -m verl.trainer.main_opd_offpolicy_gen \
-#     +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_gen_config.yaml \
+#     +trainer.expected_config=$OPD_DIR/expected_multitask_offpolicy_gen_config.yaml \
 #     +gen.task=webshop \
 #     +gen.teacher_path=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
 #     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \

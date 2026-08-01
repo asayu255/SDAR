@@ -22,14 +22,32 @@ set -x
 # To change a scientific knob: edit the argument below AND the matching
 # expectations file in the same commit; a script-only edit refuses to start.
 #
-# Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
-# code, not in the expectations files — see docs/optimization_phase2.md):
-#   ROLLOUT_KEEP_VLLM_AWAKE=1
+# Throughput mechanisms (process env vars, accuracy-preserving; they live in code,
+# not in the expectations files — see docs/optimization_phase2.md). The first two
+# are exported below so they are on without being remembered; set either to 0 to
+# disable:
+#   ROLLOUT_KEEP_VLLM_AWAKE=1   — one vLLM weight-sync per rollout, not per turn
+#   OFFPOLICY_BATCH_PREFETCH=1  — builds step k+1's batch on a background thread
+#     while step k is inside update_actor (a blocking ray.get, so it holds no
+#     GIL). Bit-identical to the sequential path; see _prepared_batch_iter for
+#     the two RNG invariants that make that true.
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on; they speed up the Stage-1 teacher
 #    rollouts and the Stage-2 validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
 #   neither stage has an old_log_prob phase or a per-step train rollout.
+#   TASK_BALANCE_INTERLEAVE does nothing for Stage 2: it reorders the *train*
+#   sampler, which that loop never iterates (it draws from the fixed pool), and
+#   the validation dataloader takes no sampler at all.
+#   GPU_PROFILER must be OFF for a real run: inert when unset, but when set it
+#   starts a per-step NVML sampler and (with GPU_PROFILER_SYNC_PHASES=1) a device
+#   synchronize at every actor stage boundary.
+#
+# On the gradient path, and therefore pinned in the Stage-2 expectations file
+# rather than left as env vars: fsdp_config.sharding_strategy=shard_grad_op
+# (ZeRO-2) and actor.no_sync_grad_accum=True. fsdp_config.forward_prefetch=True is
+# passed beside them but stays out of the expectations file — it only reorders the
+# issue of all-gathers that happen either way.
 #
 # TEACHER POOL: algorithm.opd.teacher_data_dir below points at the raw Stage-1
 # pool, which the loader filters on every start (padding rows written by an older
@@ -48,6 +66,24 @@ set -x
 # unchanged. It is ARM-SPECIFIC — an --arm sft cache has no teacher top-k and this
 # run must not read one (scripts/inspect_teacher_pool.py reports what a pool holds).
 
+# The one variable in this file, and it is not a knob: an absolute path to this
+# script's own directory. The expectations files are read inside a Ray actor,
+# after Hydra has chdir'd the driver into its output directory, so a path
+# relative to the launcher's cwd is not reliably resolvable by the time it is
+# opened. (python3 -m still requires the repo root as cwd; this only fixes the
+# one path that outlives that assumption.)
+OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# On by default, for the same reason the three FSDP knobs are literals in the
+# Stage-2 command: a 300-step run gets restarted, and a mechanism that has to be
+# exported by hand is one that will eventually be missing from a restart, and the
+# restarted run would then differ from the one before it for no recorded reason.
+# Both are accuracy-preserving (batch prefetch is bit-identical to the sequential
+# path; see _prepared_batch_iter), so this changes throughput and nothing else.
+# ROLLOUT_KEEP_VLLM_AWAKE=0 / OFFPOLICY_BATCH_PREFETCH=0 still turns either off.
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
+
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
@@ -56,7 +92,7 @@ python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.
 
 # ===================== Stage 2: off-policy distillation =====================
 python3 -m verl.trainer.main_opd_offpolicy \
-    +trainer.expected_config=examples/opd_trainer/expected_multitask_offpolicy_config.yaml \
+    +trainer.expected_config=$OPD_DIR/expected_multitask_offpolicy_config.yaml \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=45 \
@@ -89,6 +125,9 @@ python3 -m verl.trainer.main_opd_offpolicy \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
