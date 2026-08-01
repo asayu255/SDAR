@@ -43,9 +43,9 @@
   webshop: 0.1
 
 # ---- teachers -------------------------------------------------------------------
-"algorithm.opd.teacher_paths.alfworld": /opt/home/ohara/checkpoints/teachers/alfworld_step300
-"algorithm.opd.teacher_paths.search": /opt/home/ohara/checkpoints/teachers/search_step300
-"algorithm.opd.teacher_paths.webshop": /opt/home/ohara/checkpoints/teachers/webshop_step300
+"algorithm.opd.teacher_paths.alfworld": "$HOME/checkpoints/teachers/alfworld_step300"
+"algorithm.opd.teacher_paths.search": "$HOME/checkpoints/teachers/search_step300"
+"algorithm.opd.teacher_paths.webshop": "$HOME/checkpoints/teachers/webshop_step300"
 
 # ---- model / optimization -------------------------------------------------------
 "actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
