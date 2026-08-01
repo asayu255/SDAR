@@ -2,8 +2,9 @@
 
 Covered (CPU-only; Ray / workers are bypassed):
 * the fixed teacher dataset round-trips through ``DataProto.save_to_disk`` and
-  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` with correct per-task /
-  per-trajectory indexing;
+  ``OffPolicyOPDRayTrainer._load_offpolicy_data`` into one DataProto per file
+  with correct per-trajectory, task-local indexing -- and a pool split into
+  shards yields the same batches, step for step, as the same rows in one file;
 * ``OffPolicyOPDRayTrainer._offpolicy_batch_iter`` yields the right number of
   task-balanced steps, each drawing ``per_task_traj_per_step`` WHOLE trajectories
   per task (all of a trajectory's turn-rows kept together), matching OPD's
@@ -76,16 +77,18 @@ def test_load_offpolicy_data_groups_rows_by_trajectory(tmp_path):
     trainer = _bare_trainer()
     _load_from(tmp_path, trainer)
 
-    assert len(trainer.offpolicy_data) == 5 * 3 + 3 * 1 + 4 * 2
+    total = sum(len(s) for shards in trainer._task_shards.values() for s in shards)
+    assert total == 5 * 3 + 3 * 1 + 4 * 2
     traj_counts = {t: len(v) for t, v in trainer._task_to_trajs.items()}
     assert traj_counts == {"alfworld": 5, "search": 3, "webshop": 4}
     # Each trajectory's row-index group must have the expected number of turn-rows,
-    # and all its rows belong to that task.
-    task_names = trainer.offpolicy_data.non_tensor_batch["task_name"]
+    # and address rows inside a shard that holds that task.
     expected_turns = {"alfworld": 3, "search": 1, "webshop": 2}
     for task, traj_rows in trainer._task_to_traj_rows.items():
-        for uid, rows in traj_rows.items():
+        for uid, (shard_idx, rows) in traj_rows.items():
             assert len(rows) == expected_turns[task]
+            shard = trainer._task_shards[task][shard_idx]
+            task_names = shard.non_tensor_batch["task_name"]
             assert all(task_names[r] == task for r in rows)
 
 
@@ -188,9 +191,9 @@ def test_load_offpolicy_data_filters_before_indexing(tmp_path):
     trainer = _bare_trainer()
     _load_from(tmp_path, trainer)
 
-    assert len(trainer.offpolicy_data) == 12  # 4 trajectories * 3 turns, padding gone
+    assert sum(len(s) for s in trainer._task_shards["webshop"]) == 12  # 4 trajs * 3 turns, padding gone
     assert len(trainer._task_to_trajs["webshop"]) == 4
-    assert all(len(rows) == 3 for rows in trainer._task_to_traj_rows["webshop"].values())
+    assert all(len(rows) == 3 for _, rows in trainer._task_to_traj_rows["webshop"].values())
 
 
 def test_load_offpolicy_file_drops_dead_columns(tmp_path):
@@ -260,6 +263,90 @@ def test_duplicate_trajectory_across_files_is_rejected(tmp_path):
     trainer.teacher_data_dir = str(tmp_path)
     with pytest.raises(AssertionError, match="more than one file"):
         trainer._load_offpolicy_data()
+
+
+def _tagged(proto):
+    """Give every row a unique, checkable value so two pools can be compared."""
+    n, resp_len = len(proto), proto.batch["responses"].shape[-1]
+    proto.batch["responses"] = torch.arange(n * resp_len, dtype=torch.long).reshape(n, resp_len)
+    return proto
+
+
+def _run_iter(data_dir, steps=5, per_task=3, seed=11):
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(data_dir)
+    trainer._load_offpolicy_data()
+    trainer.per_task_traj_per_step = per_task
+    trainer.total_training_steps = steps
+    trainer.config = OmegaConf.create({"data": {"seed": seed}})
+    return trainer, list(trainer._offpolicy_batch_iter())
+
+
+def test_sharded_pool_is_indistinguishable_from_one_file(tmp_path):
+    """Stage 1 writes <task>_0000.pt shards when gen.shard_every_steps is set;
+    at 36k trajectories that is what makes the pool loadable at all. Which
+    shard a row landed in must not reach the training batches: same rows, same
+    order, step for step."""
+    whole, sharded = tmp_path / "whole", tmp_path / "sharded"
+    whole.mkdir()
+    sharded.mkdir()
+    for task, n_traj in (("alfworld", 8), ("search", 8)):
+        proto = _tagged(_make_task_proto(task, n_traj, turns_per_traj=2))
+        proto.save_to_disk(str(whole / f"{task}.pt"))
+        # Same rows, same order, cut into shards on trajectory boundaries the way
+        # a flush every N generation steps cuts them.
+        for i, start in enumerate(range(0, len(proto), 4)):
+            part = proto.select_idxs(list(range(start, min(start + 4, len(proto)))))
+            part.save_to_disk(str(sharded / f"{task}_{i:04d}.pt"))
+
+    one, steps_one = _run_iter(whole)
+    many, steps_many = _run_iter(sharded)
+
+    assert {t: len(s) for t, s in one._task_shards.items()} == {"alfworld": 1, "search": 1}
+    assert {t: len(s) for t, s in many._task_shards.items()} == {"alfworld": 4, "search": 4}
+    # The sampling population is ordered the same, so the draws match.
+    for task in one._task_to_trajs:
+        assert one._task_to_trajs[task].tolist() == many._task_to_trajs[task].tolist()
+
+    assert len(steps_one) == len(steps_many) == 5
+    for a, b in zip(steps_one, steps_many):
+        assert torch.equal(a.batch["responses"], b.batch["responses"])
+        assert a.non_tensor_batch["traj_uid"].tolist() == b.non_tensor_batch["traj_uid"].tolist()
+        assert a.non_tensor_batch["task_name"].tolist() == b.non_tensor_batch["task_name"].tolist()
+
+
+def test_shards_of_one_task_are_read_in_write_order(tmp_path):
+    """Shard files are numbered, and sorted() has to put them back in the order
+    Stage 1 flushed them -- otherwise the trajectory population is permuted and
+    a resumed/regenerated pool draws a different sequence."""
+    proto = _tagged(_make_task_proto("webshop", 12, turns_per_traj=1))
+    for i in range(12):
+        proto.select_idxs([i]).save_to_disk(str(tmp_path / f"webshop_{i:04d}.pt"))
+
+    trainer = _bare_trainer()
+    _load_from(tmp_path, trainer)
+
+    assert trainer._task_to_trajs["webshop"].tolist() == [f"webshop-{j}" for j in range(12)]
+    assert [s for s, _ in trainer._task_to_traj_rows["webshop"].values()] == list(range(12))
+
+
+def test_nothing_is_concatenated_across_files(tmp_path):
+    """The point of the shard layout: a task's files stay the objects they were
+    loaded as, so the load peak is 'resident + one shard' rather than twice the
+    pool. A shard the loader kept whole must be the same length as its file."""
+    for i in range(3):
+        _make_task_proto("search", 4, turns_per_traj=2, uid_offset=i * 4).save_to_disk(
+            str(tmp_path / f"search_{i:04d}.pt")
+        )
+
+    trainer = _bare_trainer()
+    _load_from(tmp_path, trainer)
+
+    shards = trainer._task_shards["search"]
+    assert len(shards) == 3 and [len(s) for s in shards] == [8, 8, 8]
+    # Rows are addressed within their own shard, never in a pool-wide index space.
+    for _, (shard_idx, rows) in trainer._task_to_traj_rows["search"].items():
+        assert rows.max() < len(shards[shard_idx])
 
 
 def test_topk_teacher_kl_matches_opd_loss():

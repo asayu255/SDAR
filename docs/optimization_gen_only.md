@@ -378,8 +378,8 @@ Rows are padded to `data.max_prompt_length + data.max_response_length` =
 that caps alfworld at 2048 does not shrink this: it applies only to the initial
 dataset load, while the rollout's per-turn retokenization pads to the global
 value (`rollout_loop.py:376` → `torch_functional.py:360` →
-`postprocess_data(..., max_length)`). Same finding as G4, and it is also why
-Stage 2's `DataProto.concat` over the three tasks' files works at all.
+`postprocess_data(..., max_length)`). Same finding as G4, and it is also what
+makes a row's size predictable enough to plan Stage 2's footprint around.
 
 | Key | dtype | bytes/row |
 |---|---|---|
@@ -414,6 +414,32 @@ worth instead of the whole run's, and the doubling `DataProto.concat` at the
 end is gone. Stage 2 needs no change — `_load_offpolicy_data` already globs
 `*.pt` in `teacher_data_dir`. A crash now costs at most N steps instead of
 everything.
+
+**Stage 2 holds the shards, never concatenates them — IMPLEMENTED.**
+`_load_offpolicy_data` keeps every file as the object it was loaded as and
+addresses a trajectory by `(shard index, rows within that shard)`; the only
+concat left is the per-step batch, a few thousand rows. Concatenating the pool
+would cost a second full copy of it while `torch.cat` runs, and the measured
+pool is 340 GiB on disk / 142 GiB resident once the dead columns are dropped —
+so the load peak goes from ~2× the pool to `resident + one shard` (~9 GiB for
+the largest). The steady state is the floor either way: every step samples
+uniformly from every task, so the whole pool has to stay reachable.
+
+`_gather_trajs` restores the draw order after selecting per shard, so the
+sharded and single-file layouts are *identical*, not merely equivalent — with
+the order preserved, `adjust_batch` pads the same rows and `_balance_batch`
+partitions the same way, and nothing downstream can tell how the pool happened
+to be split on disk (`test_sharded_pool_is_indistinguishable_from_one_file`).
+
+**The dead columns go at load — IMPLEMENTED.** `prompts` (32.8 KB/row) is only
+read by the *on-policy* trainer's `rollout_data_dir` dump, and `response_mask`
+(4.1 KB/row) is recomputed from `attention_mask` every step by
+`compute_response_mask` — a quarter of every row, for nothing. `_load_offpolicy_file`
+drops both in the same column-wise pass that removes the padding rows, releasing
+each source column as its replacement appears. This is the `−37 KB/row` item in
+the list above, minus `position_ids` (still stored; the actor reads it).
+`scripts/cache_teacher_pool.py --arm kd` writes the result so a run does not
+redo it. The dtype narrowings above remain unimplemented.
 
 Because Stage 2 globs the directory, a rerun first deletes that task's own
 `<task>_[0-9]*.pt` and any legacy `<task>.pt` (logged per file): a stale shard
