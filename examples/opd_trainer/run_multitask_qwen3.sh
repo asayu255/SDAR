@@ -29,6 +29,21 @@ set -x
 #   groups (they reuse actor_rollout_ref.ref.* settings: log-prob micro batch,
 #   FSDP CPUOffload); each sample is distilled from the teacher of its task.
 #
+# ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
+# server as another concurrent run. What makes that safe is not the URL but the
+# retry policy beside it: env.search.max_retries=null waits for a timeout /
+# refused connection / 5xx to clear instead of giving up. Giving up is not a
+# no-op -- the client hands the error text back as the retrieval result, so it
+# lands in the <information> block the model is trained on with nothing in the
+# metrics to say so, and under a shared retriever an exhausted budget is exactly
+# what a load spike looks like. 4xx and malformed JSON still fail immediately:
+# waiting cannot turn a bad URL into a document. Both knobs are pinned in the
+# expectations file, because they decide what enters the data.
+#
+# env.search.timeout=600 is generous but finite on purpose; see the expectations
+# file for why null is worse here. A request that is still retrying says so in
+# the log every ~60s, so an intentional wait is never mistaken for a hang.
+#
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations file — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
@@ -152,6 +167,8 @@ python3 -m verl.trainer.main_opd \
     env.history_length=4 \
     env.rollout.n=8 \
     env.search.search_url='http://0.0.0.0:8000/retrieve' \
+    env.search.timeout=600 \
+    env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \

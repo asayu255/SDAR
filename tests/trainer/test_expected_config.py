@@ -105,6 +105,31 @@ def test_missing_key_fails():
     print("PASS: expectation key absent from config is a hard mismatch")
 
 
+def test_a_null_expectation_is_not_confused_with_an_absent_key():
+    """``env.search.max_retries: null`` is a pinned value, not a missing one.
+
+    ``OmegaConf.select`` returns its ``default`` when a key is absent, so a
+    sentinel that happened to be ``None`` would make "pinned to null" and "not in
+    the config at all" indistinguishable -- and the second is exactly the failure
+    the lock exists to catch.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        expect_file = os.path.join(tmp, "expect.yaml")
+        with open(expect_file, "w") as f:
+            f.write('"env.search.max_retries": null\n')
+
+        assert check_expected_config(OmegaConf.create({"env": {"search": {"max_retries": None}}}), expect_file) == []
+
+        drifted = check_expected_config(OmegaConf.create({"env": {"search": {"max_retries": 10}}}), expect_file)
+        assert len(drifted) == 1 and drifted[0][1] == 10
+
+        absent = check_expected_config(OmegaConf.create({"env": {"search": {}}}), expect_file)
+        assert len(absent) == 1, "an absent key must still be reported"
+    print("PASS: null expectation distinguishes pinned-null from absent")
+
+
 def test_committed_expectations_files_self_consistent():
     """Every committed expectations file must (a) load, (b) validate against a
     config assembled from itself, and (c) fail if any knob drifts."""

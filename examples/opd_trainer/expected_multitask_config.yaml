@@ -93,6 +93,21 @@
 "env.multitask.history_length.search": 4
 "env.multitask.history_length.webshop": 2
 "env.multitask.val_per_task_batch_size": 126
+# On an exhausted retry budget the client does NOT fail the run: the error text is
+# substituted for the retrieved document and becomes the <information> block the
+# model sees, with nothing in the metrics to say so. That makes the retry policy a
+# property of the DATA, which is why it is pinned here rather than left with the
+# performance knobs. max_retries: null retries a timeout / refused connection / 5xx
+# until the retriever answers, so no turn can be trained on an error string; 4xx and
+# malformed JSON still fail at once, since waiting cannot turn those into a document.
+#
+# timeout is generous but finite on purpose. null would also wait, but a connection
+# that dies without being closed (a retriever restart) then blocks forever with
+# nothing to detect it -- and the rollout's turn barrier waits on the slowest env, so
+# one dead socket stalls every trajectory in the step. A finite timeout turns that
+# into one more retry against the restarted server.
+"env.search.timeout": 600
+"env.search.max_retries": null
 
 # ---- rollout sampling / validation protocol ----------------------------------------
 "actor_rollout_ref.rollout.temperature": 1.0

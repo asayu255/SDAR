@@ -2,6 +2,7 @@ from agent_system.environments.env_package.search.third_party.skyrl_gym.envs.bas
 from typing import Any
 from agent_system.environments.env_package.search.third_party.skyrl_gym.envs.search.utils import compute_score
 from agent_system.environments.env_package.search.third_party.skyrl_gym.tools import SearchToolGroup
+from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.search import MAX_RETRIES
 import re
 from typing import Dict, Optional, List
 from omegaconf import DictConfig
@@ -23,6 +24,9 @@ class SearchEnv(BaseTextEnv):
             topk=env_config.topk,
             timeout=env_config.timeout,
             log_requests=env_config.log_requests,
+            # Absent in configs written before the knob existed; the default
+            # keeps their behaviour.
+            max_retries=env_config.get("max_retries", MAX_RETRIES),
         )
         self.init_tool_groups([self.tool_group])
         
