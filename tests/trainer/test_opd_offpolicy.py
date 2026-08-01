@@ -30,8 +30,11 @@ try:
     from verl import DataProto
     from verl.trainer.ppo.core_algos import topk_kl_per_token
     from verl.trainer.ppo.opd_offpolicy_ray_trainer import (
+        _POOL_COMPUTE_DTYPES,
+        _POOL_STORE_DTYPES,
         OffPolicyOPDRayTrainer,
         find_padding_duplicates,
+        restore_compute_dtypes,
     )
 except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
@@ -248,6 +251,43 @@ def test_already_cached_pool_passes_through_unchanged(tmp_path):
     assert len(twice) == len(once) == 6
     assert torch.equal(twice.batch["responses"], once.batch["responses"])
     assert twice.non_tensor_batch["traj_uid"].tolist() == once.non_tensor_batch["traj_uid"].tolist()
+
+
+def test_storage_narrowing_is_lossless_and_restored(tmp_path):
+    """The pool is held in narrowed dtypes (int32 / uint8) and every column is
+    restored to its compute dtype before anything reads it. The pair of maps is
+    only correct together: a key narrowed at load but missing from the restore
+    map would feed an int32 tensor to torch.gather, which raises -- or worse, an
+    embedding lookup that silently works. So the round trip is pinned end to end:
+    same values, original dtypes."""
+    proto = _make_task_proto("search", 4, turns_per_traj=2)
+    n = len(proto)
+    # Values near the real ranges: token ids up to the vocab, mask 0/1.
+    proto.batch["input_ids"] = torch.randint(0, 151936, (n, 8), dtype=torch.int64)
+    proto.batch["attention_mask"] = (torch.rand(n, 8) > 0.3).to(torch.int64)
+    proto.batch["position_ids"] = torch.arange(8, dtype=torch.int64).repeat(n, 1)
+    original = {k: v.clone() for k, v in proto.batch.items()}
+    path = str(tmp_path / "search.pt")
+    proto.save_to_disk(path)
+
+    loaded = OffPolicyOPDRayTrainer._load_offpolicy_file(path)
+
+    # Stored narrow...
+    for key, store in _POOL_STORE_DTYPES.items():
+        if key in loaded.batch:
+            assert loaded.batch[key].dtype == store, key
+    assert loaded.batch["teacher_topk_logprobs"].dtype == torch.float32  # never touched
+
+    # ...restored wide, value-identical.
+    restore_compute_dtypes(loaded)
+    for key, value in original.items():
+        assert loaded.batch[key].dtype == value.dtype, key
+        assert torch.equal(loaded.batch[key], value), key
+
+
+def test_every_narrowed_key_has_a_restore_entry():
+    """The failure mode this guards is adding a key to one map and not the other."""
+    assert set(_POOL_STORE_DTYPES) == set(_POOL_COMPUTE_DTYPES)
 
 
 def test_duplicate_trajectory_across_files_is_rejected(tmp_path):

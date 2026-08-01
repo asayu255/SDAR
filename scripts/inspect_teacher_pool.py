@@ -157,9 +157,19 @@ def inspect_file(path: str, n_spot: int) -> dict:
     # Bytes one row costs, per column, so the RAM the loaders will actually hold
     # can be reported rather than guessed. Both arms drop the same dead columns;
     # the SFT arm drops the teacher top-k on top, because its NLL never reads it.
-    per_row = {k: t.element_size() * t[0].numel() for k, t in data.batch.items()}
-    kd_row = sum(v for k, v in per_row.items() if k not in _DEAD_COLS)
-    sft_row = sum(v for k, v in per_row.items() if k not in _DEAD_COLS and k not in _KD_ONLY_COLS)
+    # The KD loader also narrows storage dtypes at load (lossless -- see
+    # _POOL_STORE_DTYPES in opd_offpolicy_ray_trainer), so its resident bytes are
+    # counted at the NARROWED width, not the width stored on disk. A pool already
+    # narrow (a cache) divides by 1 and reports the same number.
+    from verl.trainer.ppo.opd_offpolicy_ray_trainer import _POOL_STORE_DTYPES
+
+    narrowed_row = {}
+    for k, t in data.batch.items():
+        store = _POOL_STORE_DTYPES.get(k)
+        itemsize = torch.tensor([], dtype=store).element_size() if store is not None else t.element_size()
+        narrowed_row[k] = itemsize * t[0].numel()
+    kd_row = sum(v for k, v in narrowed_row.items() if k not in _DEAD_COLS)
+    sft_row = sum(v for k, v in narrowed_row.items() if k not in _DEAD_COLS and k not in _KD_ONLY_COLS)
 
     del data, attention_mask, response_mask, keep_t, full_per_row, resp_per_row_t
     gc.collect()
@@ -322,7 +332,9 @@ def main():
     print(f"  off-policy KD arm : {kd:7.2f} GiB resident, peak ~{kd + big:.2f} GiB")
     print(f"  multitask SFT arm : {sft:7.2f} GiB resident, peak ~{sft + big:.2f} GiB")
     print(f"  (SFT is lower because its NLL never reads {'/'.join(_KD_ONLY_COLS)};")
-    print(f"   peak adds the largest file, {os.path.basename(biggest)}, held whole while it unpickles)")
+    print(f"   peak adds the largest file, {os.path.basename(biggest)}, held whole while it unpickles.")
+    print(f"   Both numbers assume THIS branch's loader, which narrows storage dtypes at")
+    print(f"   load [lossless]; a branch whose loader keeps the stored int64 holds ~1.9x.)")
 
     print("\nInterpretation")
     if len(rows) < 3:

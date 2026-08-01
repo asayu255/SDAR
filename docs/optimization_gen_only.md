@@ -404,8 +404,10 @@ Cheap, additive fixes:
 - drop `position_ids` (recomputable from `attention_mask` at load) and
   `prompts` (a prefix of `input_ids`): −37 KB/row.
 
-Together ≈ 275 KB → ≈ 128 KB/row, a **2.1×** reduction. None of these are
-implemented.
+Together ≈ 275 KB → ≈ 128 KB/row, a **2.1×** reduction. The lossless subset is
+implemented at LOAD (see below); the lossy items (`teacher_topk_logprobs` →
+fp16/bf16, which would perturb the KD targets) and the on-disk format change are
+not.
 
 **Shard incrementally — IMPLEMENTED.** `+gen.shard_every_steps=N` (0 = the old
 single-file behavior; the run script sets 10) flushes the buffer to
@@ -439,7 +441,21 @@ drops both in the same column-wise pass that removes the padding rows, releasing
 each source column as its replacement appears. This is the `−37 KB/row` item in
 the list above, minus `position_ids` (still stored; the actor reads it).
 `scripts/cache_teacher_pool.py --arm kd` writes the result so a run does not
-redo it. The dtype narrowings above remain unimplemented.
+redo it.
+
+**The lossless dtype narrowings happen at load too — IMPLEMENTED.** The same
+column-wise pass casts the resident pool to storage dtypes
+(`_POOL_STORE_DTYPES`): token/position/top-k id columns int64 → int32 (vocab
+151,936 and seq 4,608 both fit), `attention_mask` → uint8. `teacher_topk_logprobs`
+stays fp32 — narrowing it would change the KD targets, so it is excluded on
+purpose. `_prepare_batch` restores every column to its compute dtype on the
+per-step batch before anything reads it, so no kernel ever sees the narrow form:
+values are bit-identical, only the resident container shrinks. Measured on the
+90-file pool: KD arm 283 → ~149 GiB resident. This is what fit the run onto a
+503 GiB node beside ~160 GiB of env workers — the pool alone at int64 pushed the
+node to the Ray OOM-kill threshold while the model workers were still
+initialising. A cache written by `cache_teacher_pool.py` is narrow on disk as
+well, since the cache is whatever the loader built.
 
 Because Stage 2 globs the directory, a rerun first deletes that task's own
 `<task>_[0-9]*.pt` and any legacy `<task>.pt` (logged per file): a stale shard

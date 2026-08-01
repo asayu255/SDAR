@@ -80,6 +80,43 @@ _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 # ``_drop_tensor_keys`` class attribute.
 _DROP_TENSOR_KEYS = ("prompts", "response_mask")
 
+# Storage dtypes for the RESIDENT pool, all lossless: the vocab (151,936) and the
+# padded sequence length (4,608) both fit int32 with room to spare, and
+# attention_mask is 0/1. Stage 1 writes int64 because that is what the rollout
+# stack produces, and at 1.28M resident rows those unused high bytes are real
+# memory: narrowing takes the KD pool from ~283 GiB to ~149 GiB (measured columns:
+# input_ids/position_ids 36.9->18.4 KB/row each, attention_mask 36.9->4.6,
+# teacher_topk_ids 82->41, responses 4.1->2.0; teacher_topk_logprobs stays fp32
+# untouched -- narrowing THAT would change the KD targets).
+#
+# The narrow dtypes never reach a kernel: _prepare_batch restores every column to
+# its compute dtype on the per-step batch (a few thousand rows) before anything
+# reads it, so embedding lookups, torch.gather on the top-k ids and the mask
+# cumsums all see the int64 they always saw. Values are identical either way --
+# this is a change of container, not of content.
+_POOL_STORE_DTYPES = {
+    "input_ids": torch.int32,
+    "position_ids": torch.int32,
+    "responses": torch.int32,
+    "teacher_topk_ids": torch.int32,
+    "attention_mask": torch.uint8,
+}
+_POOL_COMPUTE_DTYPES = {key: torch.int64 for key in _POOL_STORE_DTYPES}
+
+
+def restore_compute_dtypes(batch: DataProto) -> DataProto:
+    """Undo the pool's storage narrowing on one step batch, in place.
+
+    Split out of _prepare_batch so it is testable against _POOL_STORE_DTYPES
+    without a trainer: the pair is only correct together, and a key added to one
+    map but not the other would silently feed a narrowed tensor to torch.gather.
+    """
+    for key, dtype in _POOL_COMPUTE_DTYPES.items():
+        if key in batch.batch and batch.batch[key].dtype != dtype:
+            batch.batch[key] = batch.batch[key].to(dtype)
+    return batch
+
+
 # Keys popped from the prompt batch to form the generation input (mirrors OPD).
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
 _GEN_NON_TENSOR_KEYS = ["raw_prompt_ids", "data_source"]
@@ -418,16 +455,25 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         keep_np = keep_idx.numpy() if keep_idx is not None else None
 
         dropped_cols = []
+        narrowed_cols = []
         tensors = {}
         source = data.batch
         for key in list(source.keys()):
             column = source[key]
             if key in cls._drop_tensor_keys:
                 dropped_cols.append(key)
-            elif keep_idx is None:
-                tensors[key] = column
             else:
-                tensors[key] = column[keep_idx]
+                kept = column if keep_idx is None else column[keep_idx]
+                # Lossless storage narrowing (see _POOL_STORE_DTYPES). Done in
+                # this same pass so the int64 original is released column by
+                # column rather than living beside its int32 copy for the whole
+                # file. A cache written by cache_teacher_pool.py is already
+                # narrow, so the cast is a no-op there.
+                store = _POOL_STORE_DTYPES.get(key)
+                if store is not None and kept.dtype != store:
+                    kept = kept.to(store)
+                    narrowed_cols.append(key)
+                tensors[key] = kept
             del source[key]
             del column
 
@@ -437,6 +483,9 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         }
         if dropped_cols:
             print(f"[OPD-offpolicy] {name}: dropped unused columns {dropped_cols}")
+        if narrowed_cols:
+            print(f"[OPD-offpolicy] {name}: narrowed storage dtypes of {narrowed_cols} "
+                  f"(lossless; restored per step batch)")
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
 
     def _load_offpolicy_data(self):
@@ -449,8 +498,9 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
 
         This is what makes the pool loadable at all. A concatenated DataProto has
         both the parts and the result live while torch.cat runs, so it costs a
-        second full copy of whatever it spans, and the measured pool is 340 GiB on
-        disk / 142 GiB resident once the dead columns are dropped. Holding the
+        second full copy of whatever it spans, and the measured pool is 333 GiB on
+        disk / ~149 GiB resident once the dead columns are dropped and the
+        storage dtypes narrowed (~283 GiB without the narrowing). Holding the
         shards instead puts the peak at ``resident + one shard``: the largest
         shard is ~9 GiB, so loading tops out barely above the steady state, and
         the steady state is the floor -- every step samples trajectories uniformly
@@ -615,6 +665,11 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         under prefetch that dict does not exist yet.
         """
         prep_metrics = {}
+        # First thing, before anything reads a column: undo the pool's storage
+        # narrowing on this step's few thousand rows, so everything downstream --
+        # compute_response_mask's cumsums here, the embedding lookup and the
+        # top-k torch.gather in the workers -- sees the int64 it always saw.
+        restore_compute_dtypes(batch)
         # Stage 2 keeps adjust_batch: unlike Stage 1 it is load-bearing here.
         # _balance_batch's partitioner requires a row count divisible by the DP
         # world size, and update_policy scales every mini-batch by the *configured*
