@@ -89,6 +89,16 @@ def get_device_flops(unit="T"):
         flops = 362.05e12
     elif "L40" in device_name:
         flops = 181.05e12
+    # Without these the unknown-device fallback leaves flops at inf and every MFU
+    # divides to exactly 0.0 -- a metric that looks broken rather than missing.
+    elif "RTX PRO 6000" in device_name:
+        # GB202. NVIDIA publishes only the FP4-with-sparsity "AI TOPS" headline;
+        # dense BF16 is that / 8 (sparsity /2, FP4->FP8 /2, FP8->BF16 /2).
+        # Max-Q is the 300W variant and is binned lower: 3511 vs 4000 AI TOPS.
+        flops = 439e12 if "Max-Q" in device_name else 500e12
+    elif "A6000" in device_name:
+        # Same GA102 die as the A40 below, clocked slightly higher.
+        flops = 154.8e12
     elif "A40" in device_name:
         flops = 149.7e12
     elif "L20" in device_name:

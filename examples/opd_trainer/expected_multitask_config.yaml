@@ -52,6 +52,13 @@
 "actor_rollout_ref.actor.optim.lr": 1.0e-6
 "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
 "actor_rollout_ref.actor.ppo_mini_batch_size": 60
+# Throughput knobs that nonetheless sit on the GRADIENT path, so they are pinned
+# here even though the rule above exempts performance settings. ZeRO-2 is
+# arithmetic-neutral; no_sync_grad_accum reduces once per mini-batch instead of
+# once per micro-batch, which reorders the partial sums (same expectation,
+# different last bits). Neither may change silently between runs.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+"actor_rollout_ref.actor.no_sync_grad_accum": true
 
 # ---- data -----------------------------------------------------------------------
 "data.train_batch_size": 45

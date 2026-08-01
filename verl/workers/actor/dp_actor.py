@@ -21,6 +21,7 @@ import itertools
 import time
 import logging
 import os
+from contextlib import contextmanager
 from typing import Tuple
 
 import torch
@@ -32,6 +33,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils import gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
@@ -48,6 +50,96 @@ elif is_npu_available:
 
 __all__ = ["DataParallelPPOActor"]
 
+# Worker-side stage profiling. Rank 0 only, and only when the profiler is on --
+# see _actor_phase. Read once at import so the instrumentation cannot change
+# halfway through a run.
+_PROFILE_STAGES = False   # set in DataParallelPPOActor.__init__ once the rank is known
+_SYNC_PHASES = os.environ.get("GPU_PROFILER_SYNC_PHASES", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# With pg_loss_coef == 0 (pure distillation) the policy-gradient statistics are a
+# single device-side zero tensor. Reading it back with .item() synchronises the
+# stream, and update_policy would do so four times per micro-batch plus four more
+# per task -- so name the constants instead.
+_ZERO_PG_METRICS = {
+    "actor/pg_loss": 0.0,
+    "actor/pg_clipfrac": 0.0,
+    "actor/ppo_kl": 0.0,
+    "actor/pg_clipfrac_lower": 0.0,
+}
+
+
+def _ZERO_PG_METRICS_BY_TASK(task: str) -> dict:
+    return {f"{name}/{task}": value for name, value in _ZERO_PG_METRICS.items()}
+
+
+@contextmanager
+def _actor_phase(name: str):
+    """Tag GPU samples inside update_policy with the stage that produced them.
+
+    The gpu_profiler's phase stack is driven by ray_trainer._timer, which runs in
+    the DRIVER. update_policy runs in a worker, so from the driver's side the
+    whole call is one opaque ``update_actor`` bucket. Pushing here starts a second
+    sampler in the worker process and gives that bucket an interior: NVML reads
+    are device-wide, so a worker-side sampler sees the same GPUs and the phase tag
+    is what makes the samples attributable.
+
+    Only rank 0 pushes. Three concurrent samplers would triple the NVML polling
+    and print three interleaved reports for readings that are already device-wide
+    and therefore identical.
+
+    A caveat the numbers carry: kernel launches are asynchronous, so a phase's
+    wall clock is when its work was *issued*, not when the GPU finished it. The
+    boundaries smear by roughly one launch queue. GPU_PROFILER_SYNC_PHASES=1 adds
+    a device synchronize at each boundary, which makes the split exact at the cost
+    of serializing what the run would otherwise overlap -- read those numbers as
+    an attribution, not as the run's real speed.
+
+    A no-op unless GPU_PROFILER=1: push_phase/pop_phase return immediately.
+    """
+    if not _PROFILE_STAGES:
+        yield
+        return
+    if _SYNC_PHASES:
+        get_torch_device().synchronize()
+    gpu_profiler.push_phase(name)
+    try:
+        yield
+    finally:
+        if _SYNC_PHASES:
+            get_torch_device().synchronize()
+        gpu_profiler.pop_phase(name)
+
+
+def _grad_sync_context(module, active: bool):
+    """FSDP's no_sync() for one micro-batch, or None when it does not apply.
+
+    Returned rather than yielded because it has to be entered and exited at
+    micro-batch *boundaries*: FSDP1's no_sync() asserts the module is IDLE, so it
+    cannot be wrapped around the backward alone -- by then the forward has moved
+    the module into FORWARD_BACKWARD.
+
+    Returns None when there is nothing to do, so the caller can skip the enter
+    entirely on the single-micro-batch path.
+    """
+    if not active:
+        return None
+    if isinstance(module, FSDP):
+        return module.no_sync()
+    if isinstance(module, FSDPModule):
+        return _fsdp2_no_sync(module)
+    return None
+
+
+@contextmanager
+def _fsdp2_no_sync(module):
+    """no_sync() for FSDP2, which spells it as a setter rather than a context."""
+    module.set_requires_gradient_sync(False)
+    try:
+        yield
+    finally:
+        module.set_requires_gradient_sync(True)
+
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -58,6 +150,24 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+
+        # Stage profiling on rank 0 only: NVML is device-wide, so one sampler
+        # already sees every GPU and three would just triple the polling and
+        # interleave three identical reports.
+        global _PROFILE_STAGES
+        try:
+            _PROFILE_STAGES = gpu_profiler.enabled() and torch.distributed.get_rank() == 0
+        except Exception:
+            _PROFILE_STAGES = False
+
+        # Accumulate gradients locally across a mini-batch's micro-batches and
+        # reduce once, instead of reducing after every one. Off by default: it
+        # changes the order the partial sums are reduced in, so gradients differ
+        # in their last bits (the expectation is identical -- summing then
+        # averaging across ranks and averaging then summing are the same number).
+        self.no_sync_grad_accum = bool(self.config.get("no_sync_grad_accum", False))
+        if self.no_sync_grad_accum:
+            print("Actor no_sync_grad_accum=True (one gradient reduce per mini-batch)")
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -411,6 +521,14 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        # A call that died between entering and leaving no_sync would leave the
+        # flag off, and every later step would then silently skip its gradient
+        # reduce. Cheap to make each call start from a known state.
+        if self.no_sync_grad_accum and isinstance(self.actor_module, FSDP):
+            for m in self.actor_module.modules():
+                if isinstance(m, FSDP):
+                    m._sync_gradients = True
+
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
@@ -461,6 +579,18 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # Scalar metrics that are only read by the logger are kept as 0-d GPU
+        # tensors until the end of the call. Reading them per micro-batch
+        # (.item()) blocks the host until the device drains -- with three tasks
+        # that was ~450 forced syncs per step, timed as actor.task_metrics.
+        # Deferring changes nothing about the values: the single read at the end
+        # takes the same mean over micro-batches that append_to_dict +
+        # reduce_metrics would have.
+        deferred_metrics = {}
+
+        def _defer(name, value):
+            deferred_metrics.setdefault(name, []).append(value.detach())
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -486,7 +616,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for data in micro_batches:
+                # One reduce per mini-batch instead of one per micro-batch. The
+                # context is entered before the first micro-batch's forward and
+                # left before the last one's, both points where FSDP is IDLE --
+                # no_sync() asserts that, so it cannot wrap the backward alone.
+                # The last micro-batch then runs with sync on and reduces
+                # everything accumulated.
+                #
+                # Under SHARD_GRAD_OP this removes the all-gather as well, not
+                # just the reduce-scatter: _should_free_in_backward returns
+                # `state._sync_gradients or strategy in
+                # RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES`, and SHARD_GRAD_OP is
+                # not in that set -- so with sync off the parameters are left
+                # unsharded and the next micro-batch does not re-gather them.
+                # That is why this pairs with sharding_strategy=shard_grad_op.
+                n_micro = len(micro_batches)
+                accum_ctx = None
+                for micro_idx, data in enumerate(micro_batches):
+                    if self.no_sync_grad_accum:
+                        if micro_idx == 0 and n_micro > 1:
+                            accum_ctx = _grad_sync_context(self.actor_module, True)
+                            if accum_ctx is not None:
+                                accum_ctx.__enter__()
+                        elif micro_idx == n_micro - 1 and accum_ctx is not None:
+                            accum_ctx.__exit__(None, None, None)
+                            accum_ctx = None
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
@@ -513,7 +667,8 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
-                    entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
+                    with _actor_phase("actor.fwd"):
+                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -621,7 +776,10 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
-                        metrics["actor/teacher_kl_loss"] = teacher_kl_loss.detach().item()
+                        # Deferred, and appended rather than assigned: assignment kept
+                        # only the LAST micro-batch, which after _balance_batch's
+                        # reorder is often entirely adjust_batch padding.
+                        _defer("actor/teacher_kl_loss", teacher_kl_loss)
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
                     if self.config.use_dynamic_bsz:
@@ -639,13 +797,17 @@ class DataParallelPPOActor(BasePPOActor):
                             loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    with _actor_phase("actor.bwd"):
+                        loss.backward()
 
                     if task_ids is not None:
                         # Same losses, re-aggregated over the rows of one task at a
                         # time. Diagnostics only: nothing here touches the graph the
-                        # optimizer step above was built from.
-                        with torch.no_grad():
+                        # optimizer step above was built from, and the results are
+                        # deferred GPU tensors -- no host sync happens here. Timed
+                        # separately anyway: this phase is where the backward's
+                        # queued reduce-scatter tail drains.
+                        with _actor_phase("actor.task_metrics"), torch.no_grad():
                             for task, rows in iter_task_row_masks(task_ids, task_id_names):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
@@ -662,12 +824,15 @@ class DataParallelPPOActor(BasePPOActor):
                                         clip_ratio_c=clip_ratio_c,
                                         loss_agg_mode=loss_agg_mode,
                                     )
+                                    task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
+                                    task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
+                                    task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
+                                    task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
                                 else:
-                                    task_pg_loss = task_pg_clipfrac = task_ppo_kl = task_pg_clipfrac_lower = zero
-                                task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
-                                task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
-                                task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
-                                task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
+                                    # Reading four device-side constants back per task
+                                    # per micro-batch costs a stream sync each; the
+                                    # values are known.
+                                    task_metrics.update(_ZERO_PG_METRICS_BY_TASK(task))
 
                                 if entropy_coeff != 0:
                                     task_metrics[f"actor/entropy_loss/{task}"] = (
@@ -705,22 +870,36 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    task_metrics[f"actor/teacher_kl_loss/{task}"] = (
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    _defer(
+                                        f"actor/teacher_kl_loss/{task}",
+                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                     )
 
                                 append_to_dict(metrics, task_metrics)
 
-                    data = {
-                        "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                        "actor/ppo_kl": ppo_kl.detach().item(),
-                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                    }
+                    if pg_loss_coef != 0:
+                        data = {
+                            "actor/pg_loss": pg_loss.detach().item(),
+                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                            "actor/ppo_kl": ppo_kl.detach().item(),
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        }
+                    else:
+                        data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
 
-                grad_norm = self._optimizer_step()
+                with _actor_phase("actor.optim"):
+                    grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        # The one read for everything deferred above. torch.stack forces a single
+        # host sync here instead of one per micro-batch.
+        for name, values in deferred_metrics.items():
+            metrics[name] = torch.stack(values).mean().item()
+        if _PROFILE_STAGES:
+            # One table per update_policy call. The driver's boundary phase
+            # ("step") never pops in this process, so the report is asked for
+            # explicitly rather than falling out of the phase stack.
+            gpu_profiler.report_and_reset(label="update_policy stages (rank 0)")
         return metrics

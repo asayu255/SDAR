@@ -37,13 +37,23 @@ set -x
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
 #   old_log_prob phase, so prefetched values would never be consumed.
 #
-# ZeRO-2 for the actor update (config, not an env var; off by default):
-#   actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op
-#   keeps parameters gathered from forward through backward, so a layer
-#   all-gathers once per micro-batch instead of three times under gradient
-#   checkpointing. Arithmetic-neutral; costs roughly the unsharded parameter
-#   size minus its shard in peak memory. It sits on the gradient path, so pin it
-#   in expected_multitask_config.yaml in the same commit that enables it.
+# Actor-update mechanisms (config, not env vars). These target the PCIe
+# collectives: tamago's two GPUs have no NVLink, so every FSDP all-gather and
+# reduce-scatter crosses the bus, and update_actor is the phase with by far the
+# highest measured PCIe traffic. Both of the first two sit on the gradient path
+# and are therefore pinned in expected_multitask_config.yaml.
+#   sharding_strategy=shard_grad_op — ZeRO-2. Keeps parameters gathered from
+#     forward through backward, so a layer all-gathers once per micro-batch
+#     instead of three times under gradient checkpointing. Arithmetic-neutral;
+#     costs roughly the unsharded parameter size minus its shard in peak memory.
+#   no_sync_grad_accum=True — accumulate gradients across a mini-batch's
+#     micro-batches and reduce ONCE (60/5 = 12 reduces per mini-batch become 1).
+#     Under ZeRO-2 this also drops the per-micro-batch re-gather. NOT
+#     bit-identical: the partial sums reduce in a different order, so gradients
+#     differ in their last bits (identical expectation).
+#   fsdp_config.forward_prefetch=True — issue the next FSDP unit's all-gather
+#     while the current one computes. Scheduling only, arithmetic untouched, so
+#     it is a plain performance knob and is not pinned.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -104,6 +114,9 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \

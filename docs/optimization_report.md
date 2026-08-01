@@ -148,3 +148,41 @@ The deferred headroom above is partially claimed by the Phase 2 mechanisms
 decode/record, CUDA-graph knobs) — see `docs/optimization_phase2.md`. Two more
 were prototyped there and have since been removed: a retriever query cache and a
 parallel prompt tokenizer.
+
+---
+
+## 10. Phase 3 — the actor update on a PCIe-only host
+
+Phases 1–2 left `update_actor` alone on the reading that it was compute-bound at
+~93–97% SM. That reading does not survive the move to a 2-GPU host without
+NVLink: `update_actor` carries by far the highest PCIe traffic of any phase
+(≈10.5 GB/s TX, 9.0 GB/s RX vs ≈2.0/1.9 during `gen`), and NCCL collectives
+count as SM-busy, so SM% cannot distinguish computing from communicating. Same
+lesson as §5, one layer down.
+
+| Mechanism | Knob (default) | What it removes | Accuracy class |
+|---|---|---|---|
+| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy=shard_grad_op` (`null`) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
+| **`no_sync` gradient accumulation** — reduce once per mini-batch | `actor.no_sync_grad_accum=True` (off) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
+| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch=True` (off) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
+| **Deferred metric reads** — keep logger-only scalars as 0-d GPU tensors until the end of `update_policy`; name the constants when `pg_loss_coef==0` | always on | ~450 forced host↔device syncs per step | identical values |
+
+The first two sit on the gradient path and are therefore pinned in
+`examples/opd_trainer/expected_multitask_config.yaml`, against the usual rule
+that performance knobs stay out of the intent lock.
+
+Two measurement additions come with them:
+
+- **worker-side stage phases** (`actor.fwd` / `actor.bwd` / `actor.task_metrics`
+  / `actor.optim`) — the driver's `_timer` cannot see inside `update_policy`
+  because that runs in a worker; rank 0 pushes its own phases so the
+  `update_actor` bucket gets an interior. `GPU_PROFILER_SYNC_PHASES=1` makes the
+  split exact at the cost of serializing overlap.
+- **`timing_s/update_actor_worker`** — `timing_s/update_actor` is a blocking
+  `ray.get`, so it also covers serializing a few-hundred-MB batch into the object
+  store and back. The difference between the two is transport.
+
+Separately, `verl/utils/flops_counter.py` had no entry for either host's GPU, so
+`perf/mfu/actor` divided by `inf` and logged exactly `0.000` every step — a
+metric that reads as broken rather than missing. RTX A6000 and RTX PRO 6000
+Blackwell (incl. the 300W Max-Q bin) are now in the table.
