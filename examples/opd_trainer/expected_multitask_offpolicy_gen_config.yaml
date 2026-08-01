@@ -27,6 +27,15 @@
 # exactly the 300 batches the 36000 target needs.
 "gen.num_trajectories": 36000
 "gen.topk": 20
+# adjust_batch(mode="copy") rounds each generation step up to a DP/micro-divisible
+# size by DUPLICATING randomly chosen rows, and the copies are written into the
+# shards -- so Stage 2 would train on those turns twice and split its steps into
+# more mini-batches than the real data warrants. Nothing in Stage 1 needs the
+# divisibility (the top-k worker call pads and unpads itself), so this is a pure
+# dataset property and belongs here rather than with the performance knobs.
+# Turning it on (to extend a pool whose other tasks carry padding) is a change to
+# what Stage 2 trains on, and must be made here and in the run script together.
+"gen.adjust_batch": false
 
 # ---- prompts / episode shape (identical to the on-policy OPD run) -----------------
 "data.train_batch_size": 15

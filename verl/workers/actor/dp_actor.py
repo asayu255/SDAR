@@ -453,6 +453,17 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # Scalar metrics that are only read by the logger are kept as 0-d GPU
+        # tensors until the end of the call. Reading them per micro-batch
+        # (.item()) blocks the host until the device drains -- with three tasks
+        # that was hundreds of forced syncs per step. Deferring changes nothing
+        # about the values: the single read at the end takes the same mean over
+        # micro-batches that append_to_dict + reduce_metrics would have.
+        deferred_metrics = {}
+
+        def _defer(name, value):
+            deferred_metrics.setdefault(name, []).append(value.detach())
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -606,7 +617,10 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
-                        metrics["actor/teacher_kl_loss"] = teacher_kl_loss.detach().item()
+                        # Deferred, and appended rather than assigned: assignment kept
+                        # only the LAST micro-batch, which after _balance_batch's
+                        # reorder is often entirely adjust_batch padding.
+                        _defer("actor/teacher_kl_loss", teacher_kl_loss)
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
                     if self.config.use_dynamic_bsz:
@@ -680,8 +694,9 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    task_metrics[f"actor/teacher_kl_loss/{task}"] = (
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                    _defer(
+                                        f"actor/teacher_kl_loss/{task}",
+                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                     )
 
                                 append_to_dict(metrics, task_metrics)
@@ -698,4 +713,8 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        # The one read for everything deferred above. torch.stack forces a single
+        # host sync here instead of one per micro-batch.
+        for name, values in deferred_metrics.items():
+            metrics[name] = torch.stack(values).mean().item()
         return metrics

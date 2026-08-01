@@ -30,9 +30,11 @@ set -x
 # failure in a later task does not lose the tasks that already finished — rerun
 # this script with the finished blocks commented out. Note that rerunning a task
 # DELETES its existing <task>_NNNN.pt (and any legacy <task>.pt) before it
-# starts: Stage 2 globs the directory, so a leftover shard from a longer previous
-# run would otherwise be concatenated into the new dataset. A task that died
-# part-way therefore restarts from step 1, not from its last shard.
+# starts, sharded or not: Stage 2 globs the directory, so a leftover shard from a
+# longer previous run would otherwise be concatenated into the new dataset — and
+# traj_uid is a uuid4, so the duplicate check would not catch it either; the pool
+# would simply hold two generations at once. A task that died part-way therefore
+# restarts from step 1, not from its last shard.
 #
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block, NO ${VAR:-default} fallback, NO
@@ -46,6 +48,18 @@ set -x
 #     validated by main_opd_offpolicy_gen BEFORE its single-task restriction.
 # To change a scientific knob: edit the argument below AND that expectations
 # file in the same commit; a script-only edit refuses to start.
+#
+# NO PADDING IS WRITTEN. adjust_batch(mode="copy") rounds each generation step up
+# to a DP/micro-divisible size by duplicating random rows; those copies used to be
+# saved into the shards, so Stage 2 trained on those turns twice and split its
+# steps into more mini-batches than the real data warrants (~+10% optimizer
+# updates, worst on the short-episode tasks). Stage 1 needs no divisibility — the
+# top-k worker call pads and unpads itself via auto_padding_key — so it is off.
+# +gen.adjust_batch=True turns it back on for one case only: extending a pool whose
+# other tasks were written when it was unconditional, so the pool stays uniform in
+# format. Pass +gen.expect_pad_divisor=<n> with it and Stage 1 asserts the divisor
+# this config produces matches the one that pool was written with
+# (scripts/inspect_teacher_pool.py reports a pool's divisor and its padding rows).
 #
 # gen.num_trajectories=36000 is what makes Stage 2 a single epoch: Stage 2 draws
 # per_task_batch_size 15 * env.rollout.n 8 = 120 trajectories/task/step over 300
@@ -147,6 +161,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.adjust_batch=False \
     +gen.shard_every_steps=10 \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -227,6 +242,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
 #     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
 #     +gen.num_trajectories=36000 \
 #     +gen.topk=20 \
+#     +gen.adjust_batch=False \
 #     +gen.shard_every_steps=10 \
 #     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
 #     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -307,6 +323,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
 #     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
 #     +gen.num_trajectories=36000 \
 #     +gen.topk=20 \
+#     +gen.adjust_batch=False \
 #     +gen.shard_every_steps=10 \
 #     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
 #     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \

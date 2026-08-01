@@ -154,18 +154,30 @@ def compute_log_prob_with_prefetch(actor_rollout_wg, batch: DataProto, prefetche
     )
 
 
-def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
+def batch_size_divisor(config, multi_modal: bool = False) -> int:
+    """The multiple ``adjust_batch`` rounds a batch to.
+
+    Split out of ``adjust_batch`` so a caller can report or check it without
+    having a batch in hand. It is a property of the *config*, not the data: the
+    micro batch sizes and the world size decide it, so a pool generated with
+    different ones carries a different amount of padding. Two pools are only the
+    same format if this agrees.
+    """
     world_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
     size_divisor_rollout = config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu * world_size
     if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
         size_divisor_ref = config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu * world_size
     else:
         size_divisor_ref = size_divisor_rollout
-    if "multi_modal_inputs" in data.non_tensor_batch:
+    if multi_modal:
         size_divisor_actor = config.actor_rollout_ref.actor.ppo_mini_batch_size
     else:
         size_divisor_actor = config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu * world_size
-    size_divisor = np.lcm.reduce(np.array([size_divisor_ref, size_divisor_rollout, size_divisor_actor])).item()
+    return np.lcm.reduce(np.array([size_divisor_ref, size_divisor_rollout, size_divisor_actor])).item()
+
+
+def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
+    size_divisor = batch_size_divisor(config, "multi_modal_inputs" in data.non_tensor_batch)
 
     # check if the batch size is divisible by the dp size, if not, delete the last few samples to make it divisible
     bs = len(data)

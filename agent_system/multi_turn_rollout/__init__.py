@@ -14,4 +14,4 @@
 # limitations under the License.
 
 from .rollout_loop import TrajectoryCollector
-from .utils import adjust_batch, compute_log_prob_with_prefetch
+from .utils import adjust_batch, batch_size_divisor, compute_log_prob_with_prefetch

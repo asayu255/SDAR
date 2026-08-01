@@ -30,6 +30,30 @@ set -x
 #    rollouts and the Stage-2 validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
 #   neither stage has an old_log_prob phase or a per-step train rollout.
+#
+# STAGE 1 WRITES NO PADDING. adjust_batch(mode="copy") pads each generation step
+# up to a DP/micro-divisible size by duplicating random rows, and those copies used
+# to be saved — so Stage 2 trained on those turns twice and split the step into
+# more mini-batches than the real data warrants. Nothing in Stage 1 needs the
+# divisibility (the top-k worker call pads and unpads itself), so it is off unless
+# +gen.adjust_batch=True is passed; pass +gen.expect_pad_divisor=<n> with it to
+# assert the divisor matches the pool being extended.
+#
+# STAGE 2 READS A CACHED VIEW. The loader drops any padding it does find, plus the
+# columns no Stage-2 loss reads, on every start. Do it once instead:
+#
+#   python3 scripts/cache_teacher_pool.py \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj_kd_cache --arm kd
+#
+# then append to this script's command line (double plus — the key below already
+# uses a single '+', and Hydra refuses a second append of an existing key):
+#
+#   ++algorithm.opd.teacher_data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_kd_cache
+#
+# The cache is exactly what the loader would have built, file for file and row for
+# row, so the run is unchanged. It is ARM-SPECIFIC — an --arm sft cache has no
+# teacher top-k and this run must not read one.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -57,6 +81,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.adjust_batch=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \
@@ -136,6 +161,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.adjust_batch=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \
@@ -215,6 +241,7 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     +gen.out_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj \
     +gen.num_trajectories=36000 \
     +gen.topk=20 \
+    +gen.adjust_batch=False \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
     data.train_batch_size=15 \

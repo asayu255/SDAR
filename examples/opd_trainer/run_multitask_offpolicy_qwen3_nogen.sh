@@ -30,6 +30,23 @@ set -x
 #    rollouts and the Stage-2 validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
 #   neither stage has an old_log_prob phase or a per-step train rollout.
+#
+# TEACHER POOL: algorithm.opd.teacher_data_dir below points at the raw Stage-1
+# pool, which the loader filters on every start (padding rows written by an older
+# Stage 1, plus the columns no Stage-2 loss reads). Do that once instead:
+#
+#   python3 scripts/cache_teacher_pool.py \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj \
+#       $HOME/data/verl-agent/sdar_multitask/teacher_traj_kd_cache --arm kd
+#
+#   bash examples/opd_trainer/run_multitask_offpolicy_qwen3_nogen.sh \
+#       ++algorithm.opd.teacher_data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_kd_cache
+#
+# Double plus: the key is added with a single '+' below, so another '+' would be a
+# second append of an existing key and Hydra refuses it. The cache holds exactly
+# what the loader would have built, file for file and row for row, so the run is
+# unchanged. It is ARM-SPECIFIC — an --arm sft cache has no teacher top-k and this
+# run must not read one (scripts/inspect_teacher_pool.py reports what a pool holds).
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}

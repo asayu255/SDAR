@@ -46,7 +46,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.metric import reduce_metrics
 
-from agent_system.multi_turn_rollout import adjust_batch
+from agent_system.multi_turn_rollout import adjust_batch, batch_size_divisor
 
 # Tensor fields persisted per trajectory (Stage 1 -> Stage 2). These are exactly
 # the keys update_policy's top-k distillation path consumes, plus prompts/
@@ -63,9 +63,62 @@ _SAVE_TENSOR_KEYS = [
 ]
 _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 
+# Saved by Stage 1 but never read by Stage 2, and together a quarter of every row
+# (prompts is 4096 int64 columns, response_mask another 512), so they are dropped
+# as each file is loaded rather than carried in host RAM for the whole run:
+#   prompts       - only read by the *on-policy* trainer's rollout_data_dir dump
+#                   (opd_ray_trainer), which works off live rollouts, not this pool.
+#   response_mask - the training loop recomputes it from attention_mask every step
+#                   via compute_response_mask, and _compute_response_info slices
+#                   attention_mask directly, so the stored copy is never consulted.
+# Dropping happens at load, so pools already on disk need no regeneration.
+# Subclasses whose loss reads *less* than the top-k KD loss extend this via the
+# ``_drop_tensor_keys`` class attribute.
+_DROP_TENSOR_KEYS = ("prompts", "response_mask")
+
 # Keys popped from the prompt batch to form the generation input (mirrors OPD).
 _GEN_BATCH_KEYS = ["input_ids", "attention_mask", "position_ids"]
 _GEN_NON_TENSOR_KEYS = ["raw_prompt_ids", "data_source"]
+
+
+def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
+    """Boolean mask of the rows an earlier Stage 1 appended as adjust_batch padding.
+
+    Pools generated before that call was made optional carry duplicated turn-rows:
+    every gen step was padded up to a multiple of lcm(log_prob_micro*W,
+    actor_micro*W) by copying randomly chosen rows onto the end of the step's
+    block. The copies were saved, so those turns are trained on twice.
+
+    They are identified structurally rather than by hashing. A Stage-1 block is
+    laid out trajectory-major -- ``gather_rollout_data`` iterates trajectories in
+    the outer loop and turns in the inner one -- so each trajectory's turn-rows are
+    contiguous, and ``adjust_batch`` concatenates its copies after all of them.
+    A traj_uid starting a *second* run can therefore only be padding.
+
+    The one row this misses is a copy that landed immediately after its own
+    trajectory's run and merged into it, which needs the copy to be drawn from the
+    block's last trajectory: ~1/120 per block, so ~0.5 rows per file against tens
+    of thousands of padding rows. The error direction is safe -- a missed copy is
+    kept (trained twice, as today), never an original dropped.
+    """
+    n = len(traj_uids)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    uids = np.asarray(traj_uids)
+    change = np.ones(n, dtype=bool)
+    change[1:] = uids[1:] != uids[:-1]
+    run_starts = np.flatnonzero(change)
+    run_ends = np.append(run_starts[1:], n)
+
+    is_dup = np.zeros(n, dtype=bool)
+    seen = set()
+    for start, end in zip(run_starts.tolist(), run_ends.tolist()):
+        uid = uids[start]
+        if uid in seen:
+            is_dup[start:end] = True
+        else:
+            seen.add(uid)
+    return is_dup
 
 
 def _build_gen_batch(batch: DataProto) -> DataProto:
@@ -108,6 +161,34 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         shard_idx = 0
         shard_paths = []
 
+        # Padding each step up to a DP/micro-divisible size duplicates random rows
+        # and writes the copies into <task>.pt, so it is off by default: Stage 2
+        # needs no divisibility here (the only worker call pads and unpads itself),
+        # and the copies would otherwise be trained on twice.
+        #
+        # It exists as an option for one case: extending a pool whose other tasks
+        # were generated when this was unconditional. The loader drops the padding
+        # at load, so it makes no difference to a run on this branch -- but a pool
+        # should be uniform in the format it was written in.
+        pad_batches = bool(gen_cfg.get("adjust_batch", False))
+        pad_divisor = batch_size_divisor(self.config) if pad_batches else None
+        if pad_batches:
+            print(f"[OPD-offpolicy gen][{task}] adjust_batch ON, padding each step up "
+                  f"to a multiple of {pad_divisor}", flush=True)
+            # The divisor comes from the micro batch sizes and world size, so a
+            # config that differs from the one the rest of the pool was written
+            # with silently changes how much padding lands on disk. Checking it
+            # here costs seconds; discovering it afterwards costs the whole run.
+            expected = gen_cfg.get("expect_pad_divisor", None)
+            assert expected is None or int(expected) == pad_divisor, (
+                f"adjust_batch would pad to a multiple of {pad_divisor}, but "
+                f"gen.expect_pad_divisor={int(expected)}. The divisor is "
+                f"lcm(rollout.log_prob_micro_batch_size_per_gpu, "
+                f"actor.ppo_micro_batch_size_per_gpu) * n_gpus_per_node * nnodes -- "
+                f"set those to match the pool this task is joining "
+                f"(scripts/inspect_teacher_pool.py reports the pool's divisor)."
+            )
+
         self.global_steps = 0
         collected = []
         seen_trajs = set()
@@ -115,18 +196,19 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
         n_rows_total = 0
         os.makedirs(out_dir, exist_ok=True)
 
-        if shard_every > 0:
-            # Stage 2 globs *.pt in this directory, so a stale shard left by a
-            # longer previous run (or a <task>.pt from a pre-sharding run) would be
-            # silently concatenated into the new dataset. Rerunning a task already
-            # overwrites its output, so clear this task's files first.
-            stale = sorted(glob.glob(os.path.join(out_dir, f"{task}_[0-9]*.pt")))
-            legacy = os.path.join(out_dir, f"{task}.pt")
-            if os.path.exists(legacy):
-                stale.append(legacy)
-            for path in stale:
-                print(f"[OPD-offpolicy gen][{task}] removing stale output {path}", flush=True)
-                os.remove(path)
+        # Stage 2 globs *.pt, so this task's previous output would be loaded
+        # alongside the new one -- and traj_uid is a uuid4, so the duplicate check
+        # would not catch it: the pool would simply hold twice the trajectories.
+        # Regenerating a task replaces it, so clear what is there first. Runs
+        # whether or not this pass shards, because the two layouts have different
+        # filenames and either can be what the previous pass left behind.
+        stale = sorted(glob.glob(os.path.join(out_dir, f"{task}_[0-9]*.pt")))
+        legacy = os.path.join(out_dir, f"{task}.pt")
+        if os.path.exists(legacy):
+            stale.append(legacy)
+        for path in stale:
+            print(f"[OPD-offpolicy gen][{task}] removing stale output {path}", flush=True)
+            os.remove(path)
 
         def _flush_shard():
             nonlocal collected, shard_idx
@@ -164,7 +246,13 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                             envs=self.envs,
                             is_train=True,
                         )
-                    gen_out = adjust_batch(self.config, gen_out)
+                    # Off by default -- nothing in this stage needs the divisibility
+                    # (the worker call below pads and unpads itself via
+                    # auto_padding_key) and the copies it appends get written into
+                    # the dataset. See gen.adjust_batch above for the one reason to
+                    # turn it back on.
+                    if pad_batches:
+                        gen_out = adjust_batch(self.config, gen_out)
                     gen_out.batch["response_mask"] = compute_response_mask(gen_out)
 
                     # Teacher scores its own top-k over the generated responses.
@@ -213,7 +301,7 @@ class TeacherTrajectoryGenerator(RayPPOTrainer):
                       f"topk {timing_raw.get('teacher_topk', 0):.1f}s + "
                       f"collect {timing_raw.get('collect', 0):.1f}s]", flush=True)
 
-                if shard_every > 0 and self.global_steps % shard_every == 0:
+                if shard_every > 0 and (reached_target or self.global_steps % shard_every == 0):
                     _flush_shard()
 
                 if reached_target:
@@ -263,11 +351,87 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self.per_task_traj_per_step = per_task_prompts * group_size
         self._load_offpolicy_data()
 
+    # Tensor columns discarded as each Stage-1 file is loaded. A subclass whose
+    # loss consumes fewer columns than the top-k KD loss overrides this to drop
+    # more; it must never drop fewer, since everything listed here is already
+    # unread by *any* Stage-2 loss.
+    _drop_tensor_keys = _DROP_TENSOR_KEYS
+
+    @classmethod
+    def _load_offpolicy_file(cls, path: str) -> DataProto:
+        """Load one Stage-1 ``<task>.pt``, dropping padding rows and dead columns.
+
+        Pools written while Stage 1 still called adjust_batch unconditionally carry
+        duplicated turn-rows. Dropping them here rather than zero-weighting them also
+        corrects the row count, and with it the number of mini-batches a step is
+        split into: left in, they inflate the optimizer-update count for the same
+        real data (measured ~+10% overall, driven by the short-episode tasks where
+        the fixed ~120 padding rows per gen step are a large fraction of the block).
+
+        Removal cannot lose data: adjust_batch concatenated its copies onto the
+        *retained* batch, so the row a copy was made from is always still present.
+        Row order is preserved, so the first-seen order of traj_uids -- and hence
+        the trajectory sampling sequence -- is unchanged.
+
+        ``cls._drop_tensor_keys`` go too. They are a quarter of every row and nothing
+        in this stage reads them, so keeping them only costs host RAM -- see
+        ``_DROP_TENSOR_KEYS`` for why each is dead, and the class attribute for how a
+        subclass with a narrower loss drops more.
+
+        Both happen in one column-wise pass that releases each source column as soon
+        as its replacement exists. Doing it with select_idxs instead would hold the
+        whole file and its filtered copy at once, which at 36k trajectories is a
+        larger transient than the steady-state footprint this is trying to reduce.
+
+        A pool already filtered by ``scripts/cache_teacher_pool.py`` passes straight
+        through: there is no padding left to find and no listed column left to drop.
+        """
+        data = DataProto.load_from_disk(path)
+        name = os.path.basename(path)
+
+        keep_idx = None
+        n_rows = len(data)
+        if "traj_uid" in data.non_tensor_batch:
+            is_dup = find_padding_duplicates(data.non_tensor_batch["traj_uid"])
+            n_dup = int(is_dup.sum())
+            if n_dup:
+                keep_idx = torch.from_numpy(np.flatnonzero(~is_dup))
+                print(f"[OPD-offpolicy] {name}: dropping {n_dup} Stage-1 padding rows "
+                      f"({n_dup / n_rows:.1%}), keeping {n_rows - n_dup}")
+        keep_np = keep_idx.numpy() if keep_idx is not None else None
+
+        dropped_cols = []
+        tensors = {}
+        source = data.batch
+        for key in list(source.keys()):
+            column = source[key]
+            if key in cls._drop_tensor_keys:
+                dropped_cols.append(key)
+            elif keep_idx is None:
+                tensors[key] = column
+            else:
+                tensors[key] = column[keep_idx]
+            del source[key]
+            del column
+
+        non_tensors = {
+            key: (value if keep_np is None else value[keep_np])
+            for key, value in data.non_tensor_batch.items()
+        }
+        if dropped_cols:
+            print(f"[OPD-offpolicy] {name}: dropped unused columns {dropped_cols}")
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
+
     def _load_offpolicy_data(self):
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
-        parts = [DataProto.load_from_disk(f) for f in files]
+        parts = [self._load_offpolicy_file(f) for f in files]
+        # Which file each row came from, so a trajectory that spans two of them can
+        # be caught below. sorted() puts a task's shards in write order, so the
+        # concatenated row order is the order a single unsharded file would have had.
+        file_of_row = np.repeat(np.arange(len(parts)), [len(p) for p in parts])
         self.offpolicy_data = DataProto.concat(parts)
+        del parts
         task_names = self.offpolicy_data.non_tensor_batch["task_name"]
         normalized = np.array([self._normalize_task_name(t) for t in task_names])
         assert "traj_uid" in self.offpolicy_data.non_tensor_batch, (
@@ -282,6 +446,20 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             traj_to_rows = {}
             for ridx in np.where(normalized == task)[0]:
                 traj_to_rows.setdefault(traj_uids[ridx], []).append(int(ridx))
+            for uid, rows in traj_to_rows.items():
+                # Shard boundaries fall on generation-step boundaries and a
+                # trajectory is produced entirely within one step, so its rows are
+                # always in one file. traj_uid is a uuid4, so a repeat across files
+                # is a corrupt pool (a shard written twice, or two runs' output
+                # mixed in one directory), not a split trajectory -- and silently
+                # merging the two would make one "trajectory" whose turns come from
+                # different rollouts.
+                sources = np.unique(file_of_row[rows])
+                assert len(sources) == 1, (
+                    f"traj_uid {uid} appears in more than one file under "
+                    f"{self.teacher_data_dir} ({[os.path.basename(files[s]) for s in sources]}); "
+                    "the directory holds duplicate or overlapping shards"
+                )
             self._task_to_traj_rows[task] = {u: np.array(r, dtype=np.int64) for u, r in traj_to_rows.items()}
             self._task_to_trajs[task] = np.array(list(traj_to_rows.keys()), dtype=object)
         sizes = {

@@ -24,7 +24,7 @@ Per invocation (one task, one frozen teacher), 300 steps of:
 |---|---|---|
 | dataloader + preproc | 15 prompts → ×8 → 120 trajectories, tokenize | CPU |
 | **multi-turn rollout** | up to `max_steps` turns of (preproc → vLLM generate → decode → `envs.step`) | GPU + CPU |
-| `adjust_batch` | pad turn-rows up to a multiple of 240 by **duplicating rows** | CPU |
+| ~~`adjust_batch`~~ | pad turn-rows up to a multiple of 240 by **duplicating rows** — removed, see G6; `+gen.adjust_batch=True` restores it | CPU |
 | **`compute_actor_topk_log_prob`** | one FSDP forward over *every* turn-row, top-20 | GPU |
 | accumulate | `keep.to("cpu")`, append to an in-RAM list | CPU/RAM |
 
@@ -113,8 +113,10 @@ collection, and the Ray isolation — `RAY_ADDRESS=local` (without it a later
 `include_dashboard=False`, and a pinned `object_store_memory` (the default
 "30% of *available* memory" is racy with three simultaneous inits and can
 overflow `/dev/shm`). Note also that world size 3 → 1 changes `adjust_batch`'s
-divisor from `lcm(16·3, 5·3)=240` to `lcm(16,5)=80`, so the number of
-duplicated turn-rows written into each `<task>.pt` changes — see G6.
+divisor from `lcm(16·3, 5·3)=240` to `lcm(16,5)=80`. That no longer changes
+what lands on disk, since Stage 1 stopped padding (G6), but it still matters when
+`+gen.adjust_batch=True` is used to extend an older pool — hence
+`+gen.expect_pad_divisor`.
 
 ### G2 — Enlarge the generation batch (est. 1.5–2.5× on alfworld)
 
@@ -258,7 +260,7 @@ per step — sub-second against a multi-minute step.
 
 Accuracy class: bit-identical (FSDP placement only), same as in Phase 1.
 
-### G6 — Drop `adjust_batch` from the generation path
+### G6 — Drop `adjust_batch` from the generation path — **DONE**
 
 `adjust_batch(..., mode="copy")` pads the turn-row batch up to a multiple of
 `lcm(log_prob_micro×ws, ppo_micro×ws)` = 240 (at `n_gpus=3`) by **duplicating
@@ -276,8 +278,31 @@ divisibility (`opd_offpolicy_ray_trainer.py:128`). Removing the call is both a
 speedup and a data-quality fix.
 
 Accuracy class: **changes the Stage-2 dataset** (removes duplicated rows). It
-should be a deliberate, separately-flagged decision, not folded into a
-throughput commit.
+was therefore taken as its own change rather than folded into a throughput
+commit, and landed in two halves:
+
+* **Stage 1** no longer calls `adjust_batch` unless `+gen.adjust_batch=True` is
+  passed. That flag exists for one case — extending a pool whose other tasks
+  were generated when the call was unconditional, so the pool stays uniform in
+  the format it was written in. `+gen.expect_pad_divisor=<n>` asserts the
+  divisor this config produces is the one that pool carries
+  (`batch_size_divisor` in `agent_system/multi_turn_rollout/utils.py`).
+* **Stage 2** drops the padding that pools already on disk carry, at load, in
+  `OffPolicyOPDRayTrainer._load_offpolicy_file`. `find_padding_duplicates`
+  identifies it structurally: a Stage-1 block is trajectory-major, and
+  `adjust_batch` appends its copies after all of it, so a `traj_uid` starting a
+  *second* run can only be padding. No pool needs regenerating.
+
+Measured effect beyond the wasted top-k rows: left in, the copies inflate the
+row count and with it the number of mini-batches a Stage-2 step is split into —
+~+10% optimizer updates for the same real data, worst on the short-episode
+tasks where the fixed ~120 padding rows per gen step are a large fraction of the
+block.
+
+`scripts/cache_teacher_pool.py --arm kd` runs that load-time filtering once and
+writes the result, so a run reads a pool with nothing left to drop; the cache is
+file-for-file and row-for-row what the loader would have built, so which of the
+two a run reads makes no difference to it.
 
 ### G7 — Overlap top-k scoring with the rollout (the gen analog of A)
 
@@ -462,7 +487,7 @@ vLLM and `compute_actor_topk_log_prob` reloads it only for its own forward.
 G4 needs a code change first — see G4.
 
 **Separately, as scientific decisions.** G6 (removes duplicated rows from the
-Stage-2 dataset) and G10 (changes the KD targets).
+Stage-2 dataset) — **done**, in both halves; and G10 (changes the KD targets).
 
 ---
 
