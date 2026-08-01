@@ -40,6 +40,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
+from verl.utils import gpu_profiler
 from verl.utils.metric import reduce_metrics
 
 from agent_system.multi_turn_rollout import adjust_batch
@@ -351,21 +352,32 @@ class OPDRayTrainer(RayPPOTrainer):
             # shares the parent's meta_info dict by reference).
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info[DataProtoConfig.auto_padding_key] = True
-            if self.teacher_topk_kl:
-                sub.meta_info["topk_k"] = k
-                out = wg.compute_ref_topk_log_prob(sub)
-                tlp = out.batch["teacher_topk_logprobs"]
-                tid = out.batch["teacher_topk_ids"]
-                for j, i in enumerate(idxs):
-                    teacher_topk_logprobs[i] = tlp[j]
-                    teacher_topk_ids[i] = tid[j]
-                    seen[i] = True
-            else:
-                out = wg.compute_ref_log_prob(sub)
-                lp = out.batch["ref_log_prob"]
-                for j, i in enumerate(idxs):
-                    teacher_log_probs[i] = lp[j]
-                    seen[i] = True
+            # The teachers run one after another in this loop, so "teacher_forward"
+            # as a single phase says how long all three took together but not which
+            # one dominates -- and they are not interchangeable: the tasks differ in
+            # prompt length (webshop's mean prompt is ~3x alfworld's), and under
+            # topk_kl each teacher ships back (rows, resp_len, k) log-probs and ids
+            # instead of one value per token. Tagging per task splits both the
+            # compute and that transfer out by teacher.
+            gpu_profiler.push_phase(f"teacher_forward/{task}")
+            try:
+                if self.teacher_topk_kl:
+                    sub.meta_info["topk_k"] = k
+                    out = wg.compute_ref_topk_log_prob(sub)
+                    tlp = out.batch["teacher_topk_logprobs"]
+                    tid = out.batch["teacher_topk_ids"]
+                    for j, i in enumerate(idxs):
+                        teacher_topk_logprobs[i] = tlp[j]
+                        teacher_topk_ids[i] = tid[j]
+                        seen[i] = True
+                else:
+                    out = wg.compute_ref_log_prob(sub)
+                    lp = out.batch["ref_log_prob"]
+                    for j, i in enumerate(idxs):
+                        teacher_log_probs[i] = lp[j]
+                        seen[i] = True
+            finally:
+                gpu_profiler.pop_phase(f"teacher_forward/{task}")
 
         if not all(seen):
             missing = sorted({normalized[i] for i in range(bs) if not seen[i]})
