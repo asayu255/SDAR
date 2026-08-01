@@ -80,6 +80,9 @@ class WebAgentTextEnv(gym.Env):
             self.kwargs.get('human_goals'),
             self.kwargs.get('show_attrs', False),
         ) if server is None else server
+        # A shared server may be serving other envs' sessions; only the env that
+        # created its own may evict them on reset (see `reset`).
+        self._owns_server = server is None
         self.browser = SimBrowser(self.server)
 
         self.session = self.kwargs.get('session')
@@ -261,6 +264,13 @@ class WebAgentTextEnv(gym.Env):
             self.session = ''.join(random.choices(string.ascii_lowercase, k=10))
         if self.session_prefix is not None:
             self.session = self.session_prefix + self.session
+
+        # `SimServer.receive` adds a session on first contact and never removes
+        # it, so an env that runs one episode per training step accumulates one
+        # dead session per step for the life of the run. Only the live episode
+        # is ever read back.
+        if self._owns_server:
+            self.server.user_sessions.clear()
 
         init_url = f'{self.base_url}/{self.session}'
         self.browser.get(init_url, session_id=self.session, session_int=session_int)
