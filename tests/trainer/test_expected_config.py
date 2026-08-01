@@ -21,6 +21,7 @@ one knob drifts — the low_var_kl-instead-of-topk_kl scenario.
 Run:  python tests/trainer/test_expected_config.py
 """
 
+import glob
 import os
 import sys
 
@@ -34,16 +35,16 @@ from verl.utils.expected_config import (
     load_expectations,
 )
 
-_EXPECT_FILE = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "examples",
-        "opd_grpo_trainer",
-        "expected_multitask_config.yaml",
-    )
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# The OPD+GRPO lock, for the assertions about this branch's own experiment.
+_EXPECT_FILE = os.path.join(
+    _REPO_ROOT, "examples", "opd_grpo_trainer", "expected_multitask_config.yaml"
 )
+# Every committed lock, for the checks that should hold of any of them. This
+# branch carries the pure-OPD arm's file too, and a lock nobody validates is a
+# lock that can rot until the run it guards refuses to start.
+_EXPECT_FILES = sorted(glob.glob(os.path.join(_REPO_ROOT, "examples", "*", "expected_*.yaml")))
 
 
 def _config_from_expectations(expect_file):
@@ -110,11 +111,43 @@ def test_missing_key_fails():
     print("PASS: expectation key absent from config is a hard mismatch")
 
 
-def test_committed_expectations_file_self_consistent():
-    """The committed OPD+GRPO expectations file must (a) load, (b) validate
-    against a config assembled from itself, and (c) fail if the KL type drifts."""
+def test_a_null_expectation_is_not_confused_with_an_absent_key():
+    """``env.search.max_retries: null`` is a pinned value, not a missing one.
+
+    ``OmegaConf.select`` returns its ``default`` when a key is absent, so a
+    sentinel that happened to be ``None`` would make "pinned to null" and "not in
+    the config at all" indistinguishable -- and the second is exactly the failure
+    the lock exists to catch.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        expect_file = os.path.join(tmp, "expect.yaml")
+        with open(expect_file, "w") as f:
+            f.write('"env.search.max_retries": null\n')
+
+        assert check_expected_config(OmegaConf.create({"env": {"search": {"max_retries": None}}}), expect_file) == []
+
+        drifted = check_expected_config(OmegaConf.create({"env": {"search": {"max_retries": 10}}}), expect_file)
+        assert len(drifted) == 1 and drifted[0][1] == 10
+
+        absent = check_expected_config(OmegaConf.create({"env": {"search": {}}}), expect_file)
+        assert len(absent) == 1, "an absent key must still be reported"
+    print("PASS: null expectation distinguishes pinned-null from absent")
+
+
+def test_committed_expectations_files_self_consistent():
+    """Every committed expectations file must (a) load, (b) validate against a
+    config assembled from itself, and (c) fail if any knob drifts."""
+    assert _EXPECT_FILES, "no expectations files found under examples/*/expected_*.yaml"
+    for expect_file in _EXPECT_FILES:
+        rel = os.path.relpath(expect_file, _REPO_ROOT)
+        config = _config_from_expectations(expect_file)
+        assert check_expected_config(config, expect_file) == [], rel
+
+    # The drift checks below are about THIS branch's experiment, so they read the
+    # OPD+GRPO lock specifically rather than whichever file the loop ended on.
     config = _config_from_expectations(_EXPECT_FILE)
-    assert check_expected_config(config, _EXPECT_FILE) == []
 
     # Sanity: the file pins the knob that caused the original mishap, and the
     # algorithm-level and injected actor-level values agree with each other.
