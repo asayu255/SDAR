@@ -47,6 +47,20 @@ class _FakeTeacherWG:
         out[:, 0] = self.code * 1000.0 + first_tok  # marker = code*1000 + orig_idx
         return DataProto.from_dict(tensors={"ref_log_prob": out})
 
+    def compute_ref_topk_log_prob(self, sub):
+        """Same marker scheme for the dense top-k branch (kl_loss_type=topk_kl)."""
+        first_tok = sub.batch["responses"][:, 0].float()
+        self.calls.append(first_tok.tolist())
+        bs, resp_len = sub.batch["responses"].shape
+        k = sub.meta_info["topk_k"]
+        logprobs = torch.zeros((bs, resp_len, k), dtype=torch.float32)
+        ids = torch.zeros((bs, resp_len, k), dtype=torch.long)
+        logprobs[:, 0, 0] = self.code * 1000.0 + first_tok
+        ids[:, 0, 0] = self.code * 1000 + first_tok.long()
+        return DataProto.from_dict(
+            tensors={"teacher_topk_logprobs": logprobs, "teacher_topk_ids": ids}
+        )
+
 
 def _make_batch(task_names, resp_len=4):
     bs = len(task_names)
@@ -59,12 +73,16 @@ def _make_batch(task_names, resp_len=4):
     )
 
 
-def _make_trainer(teacher_wg):
+def _make_trainer(teacher_wg, topk=None):
     from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 
-    # Bypass the heavy __init__; we only exercise compute_teacher_log_probs.
+    # Bypass the heavy __init__; we only exercise compute_teacher_log_probs. The
+    # attributes it would have set and this method reads have to be set by hand --
+    # teacher_topk_kl selects the single-token or the dense top-k branch.
     trainer = object.__new__(OPDRayTrainer)
     trainer.teacher_wg = teacher_wg
+    trainer.teacher_topk_kl = topk is not None
+    trainer.teacher_kl_topk = topk or 0
     return trainer
 
 
@@ -76,7 +94,8 @@ def test_routing_assigns_correct_teacher_and_restores_order():
     task_names = ["webshop", "alfworld", "search", "alfworld_easy", "search/nq"]
     batch = _make_batch(task_names)
 
-    out = trainer.compute_teacher_log_probs(batch)
+    assert trainer.compute_teacher_log_probs(batch) is None  # writes into batch
+    out = batch.batch["teacher_log_probs"]
 
     code_by_task = {"alfworld": 1, "search": 2, "webshop": 3}
     norm = ["webshop", "alfworld", "search", "alfworld", "search"]
@@ -90,11 +109,36 @@ def test_empty_task_slice_is_skipped():
     trainer = _make_trainer(teachers)
     batch = _make_batch(["alfworld", "search"])  # no webshop samples
 
-    out = trainer.compute_teacher_log_probs(batch)
+    trainer.compute_teacher_log_probs(batch)
+    out = batch.batch["teacher_log_probs"]
 
     assert teachers["webshop"].calls == []  # never invoked
     assert out[0, 0].item() == pytest.approx(1000.0)  # alfworld, idx 0
     assert out[1, 0].item() == pytest.approx(2001.0)  # search, idx 1
+
+
+def test_topk_routing_assigns_correct_teacher_and_restores_order():
+    """kl_loss_type=topk_kl takes a separate branch, with its own output tensors."""
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    task_names = ["webshop", "alfworld", "search", "alfworld_easy", "search/nq"]
+    batch = _make_batch(task_names)
+
+    trainer.compute_teacher_log_probs(batch)
+
+    assert "teacher_log_probs" not in batch.batch  # the single-token branch stayed out
+    logprobs = batch.batch["teacher_topk_logprobs"]
+    ids = batch.batch["teacher_topk_ids"]
+    assert logprobs.shape == (5, 4, 20)
+    assert ids.shape == (5, 4, 20)
+
+    code_by_task = {"alfworld": 1, "search": 2, "webshop": 3}
+    norm = ["webshop", "alfworld", "search", "alfworld", "search"]
+    for i, task in enumerate(norm):
+        expected = code_by_task[task] * 1000.0 + i  # right teacher AND right position
+        assert logprobs[i, 0, 0].item() == pytest.approx(expected), f"row {i} ({task}) mis-routed"
+        assert ids[i, 0, 0].item() == int(expected)
 
 
 def test_unknown_task_raises():
