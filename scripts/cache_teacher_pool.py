@@ -31,6 +31,14 @@ remove, and passes the data through unchanged.
 The cache is ARM-SPECIFIC. --arm sft drops the teacher top-k columns, which the KD
 loss needs; a KD run must not be pointed at an SFT cache. The written columns are
 printed so this is visible, and the arm is recorded in the directory's manifest.
+
+When one task has been regenerated, rebuild just that task:
+
+    python3 scripts/cache_teacher_pool.py <src> <dst> --arm sft --only webshop
+
+The other tasks' outputs and their manifest row counts are left untouched, and any
+output shard the source no longer has is deleted -- the trainer globs the whole
+directory, so a stale shard left behind would be trained on beside the new ones.
 """
 
 import argparse
@@ -48,6 +56,17 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 _MANIFEST = "_cache_manifest.json"
+
+
+def _task_of(name):
+    """Task name behind a pool filename: webshop_0007.pt and webshop.pt -> webshop.
+
+    Stage 1 writes one file per task, or ``<task>_%04d.pt`` when it shards, so the
+    numeric suffix is the only thing separating a shard from the task it belongs to.
+    """
+    stem = name[:-3] if name.endswith(".pt") else name
+    head, _, tail = stem.rpartition("_")
+    return head if head and tail.isdigit() else stem
 
 
 def _loader_for(arm: str):
@@ -86,6 +105,13 @@ def main():
         action="store_true",
         help="leave already-written outputs alone, so an interrupted run can resume",
     )
+    ap.add_argument(
+        "--only",
+        nargs="+",
+        metavar="TASK",
+        help="rebuild only these tasks (e.g. --only webshop). Other tasks' outputs and "
+             "their manifest row counts are left exactly as they are.",
+    )
     args = ap.parse_args()
 
     src = os.path.abspath(os.path.expanduser(args.src))
@@ -93,9 +119,26 @@ def main():
     if src == dst:
         raise SystemExit("src and dst must differ -- this never overwrites the source pool")
 
-    files = sorted(glob.glob(os.path.join(src, "*.pt")))
-    if not files:
+    all_files = sorted(glob.glob(os.path.join(src, "*.pt")))
+    if not all_files:
         raise SystemExit(f"no *.pt files in {src}")
+
+    # --only narrows what is read and written. Everything downstream that describes
+    # the *directory* -- the manifest, the stale-output sweep -- still works from the
+    # full source listing, so a partial pass never claims the cache is smaller than
+    # it is.
+    if args.only:
+        tasks = {_task_of(os.path.basename(f)) for f in all_files}
+        unknown = sorted(set(args.only) - tasks)
+        if unknown:
+            raise SystemExit(
+                f"--only names task(s) not in {src}: {unknown}. Present: {sorted(tasks)}"
+            )
+        selected = set(args.only)
+        files = [f for f in all_files if _task_of(os.path.basename(f)) in selected]
+    else:
+        selected = None
+        files = all_files
     src_bytes = sum(os.path.getsize(f) for f in files)
 
     os.makedirs(dst, exist_ok=True)
@@ -103,7 +146,8 @@ def main():
     # The filtered pool is smaller than the source, so the source size is a safe
     # upper bound -- and checking before a multi-hour pass is cheaper than failing
     # in the middle of it.
-    print(f"source: {len(files)} file(s), {_gib(src_bytes):.1f} GiB")
+    scope = "" if selected is None else f" of {len(all_files)} (--only {' '.join(sorted(selected))})"
+    print(f"source: {len(files)} file(s){scope}, {_gib(src_bytes):.1f} GiB")
     print(f"target: {dst}  ({_gib(free):.1f} GiB free)")
     if free < src_bytes:
         print(f"  NOTE: free space is below the source size. The output is smaller "
@@ -112,6 +156,21 @@ def main():
 
     loader = _loader_for(args.arm)
     print(f"arm: {args.arm} ({loader.__name__}), dropping columns {list(loader._drop_tensor_keys)}\n")
+
+    # A task regenerated into fewer shards leaves its extra outputs behind, and the
+    # trainer globs the whole directory -- it would load those stale shards beside
+    # the new ones and train on a mix of two generations without noticing (the
+    # duplicate-traj_uid assert does not fire, because the trajectories differ).
+    # Sweep them before writing anything.
+    present = {os.path.basename(f) for f in all_files}
+    for out in sorted(glob.glob(os.path.join(dst, "*.pt"))):
+        name = os.path.basename(out)
+        if name in present:
+            continue
+        if selected is not None and _task_of(name) not in selected:
+            continue  # not this pass's business
+        os.remove(out)
+        print(f"removed stale output {name} (no such file in the source)")
 
     # Row counts are kept per file and merged with any existing manifest, so a
     # resumed or partial pass (regenerating one task, then --skip-existing) still
@@ -183,10 +242,11 @@ def main():
 
     # Only files still present in the source belong in the manifest: a task
     # regenerated into fewer shards leaves the extra ones behind here otherwise.
-    present = {os.path.basename(f) for f in files}
+    # This is measured against the whole source, not this pass's selection, so
+    # --only keeps describing the whole directory.
     rows_by_file = {k: v for k, v in rows_by_file.items() if k in present}
     rows_out = sum(rows_by_file.values())
-    complete = len(rows_by_file) == len(files)
+    complete = len(rows_by_file) == len(all_files)
     if columns is None:  # everything was skipped
         columns = previous.get("columns")
     with open(manifest_path, "w") as f:
@@ -197,7 +257,7 @@ def main():
                 "loader": loader.__name__,
                 "dropped_columns": list(loader._drop_tensor_keys),
                 "columns": columns,
-                "files": len(files),
+                "files": len(all_files),
                 "rows": rows_out,
                 "rows_complete": complete,
                 "rows_by_file": rows_by_file,
@@ -206,10 +266,11 @@ def main():
             indent=2,
         )
 
-    total = f"{rows_out:,} rows" if complete else f"{rows_out:,} rows (partial: {len(rows_by_file)}/{len(files)} files counted)"
-    print(f"\nwrote {written} file(s) ({skipped} skipped), {total}")
+    total = (f"{rows_out:,} rows across {len(all_files)} file(s)" if complete
+             else f"{rows_out:,} rows (partial: {len(rows_by_file)}/{len(all_files)} files counted)")
+    print(f"\nwrote {written} file(s) ({skipped} skipped), cache now holds {total}")
     print(f"  {_gib(src_bytes):7.1f} GiB in  ->  {_gib(out_bytes):7.1f} GiB out "
-          f"({out_bytes / src_bytes:.2f}x)")
+          f"({out_bytes / src_bytes:.2f}x)" + ("" if selected is None else "   [this pass only]"))
     print(f"  columns kept: {columns}")
     print(f"  elapsed {(time.time() - t0) / 60:.0f} min")
     print(f"\nPoint the {args.arm} arm at:\n  {dst}")

@@ -215,3 +215,89 @@ def test_skip_existing_rebuilds_a_regenerated_task(tmp_path):
     assert {t: len(v) for t, v in trainer._task_to_trajs.items()} == {
         "alfworld": 12, "search": 12, "webshop": 12
     }
+
+
+def test_only_rebuilds_one_task_and_leaves_the_rest(tmp_path):
+    """--only webshop must touch webshop and nothing else, manifest included."""
+    import json
+
+    src = _make_pool(tmp_path / "pool")
+    dst = tmp_path / "cache"
+    _build_cache(src, dst, "sft")
+    untouched = {
+        name: os.path.getmtime(os.path.join(dst, name))
+        for name in os.listdir(dst)
+        if name.endswith(".pt") and not name.startswith("webshop")
+    }
+
+    for s in range(3):  # a fresh Stage 1 for webshop only
+        _shard("webshop", 4, 2, first_uid=100 + s * 4).save_to_disk(
+            os.path.join(src, f"webshop_{s:04d}.pt")
+        )
+    out = subprocess.run(
+        [sys.executable, _SCRIPT, str(src), str(dst), "--arm", "sft", "--only", "webshop"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "wrote 3 file(s)" in out.stdout
+
+    for name, mtime in untouched.items():
+        assert os.path.getmtime(os.path.join(dst, name)) == mtime, name
+    assert DataProto.load_from_disk(
+        os.path.join(dst, "webshop_0000.pt")
+    ).non_tensor_batch["traj_uid"][0] == "webshop-100"
+
+    # The manifest still describes all nine files, not just the three rebuilt.
+    manifest = json.load(open(dst / "_cache_manifest.json"))
+    assert manifest["files"] == 9
+    assert manifest["rows_complete"] is True
+    assert len(manifest["rows_by_file"]) == 9
+    assert manifest["columns"] == ["attention_mask", "input_ids", "position_ids", "responses"]
+
+    trainer, _ = _iterate(MultiTaskSFTTrainer, dst)
+    assert {t: len(v) for t, v in trainer._task_to_trajs.items()} == {
+        "alfworld": 12, "search": 12, "webshop": 12
+    }
+
+
+def test_only_deletes_shards_the_source_no_longer_has(tmp_path):
+    """Regenerating into fewer shards must not leave the extra ones readable.
+
+    The trainer globs the cache directory, so a leftover shard is loaded beside the
+    new ones -- a silent mix of two generations that no assert catches, because the
+    stale trajectories are simply different, not duplicated.
+    """
+    src = _make_pool(tmp_path / "pool")
+    dst = tmp_path / "cache"
+    _build_cache(src, dst, "sft")
+
+    os.remove(os.path.join(src, "webshop_0002.pt"))  # regenerated into 2 shards
+    for s in range(2):
+        _shard("webshop", 6, 2, first_uid=100 + s * 6).save_to_disk(
+            os.path.join(src, f"webshop_{s:04d}.pt")
+        )
+    out = subprocess.run(
+        [sys.executable, _SCRIPT, str(src), str(dst), "--arm", "sft", "--only", "webshop"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "removed stale output webshop_0002.pt" in out.stdout
+    assert not os.path.exists(os.path.join(dst, "webshop_0002.pt"))
+
+    trainer, _ = _iterate(MultiTaskSFTTrainer, dst)
+    assert {t: len(v) for t, v in trainer._task_to_trajs.items()} == {
+        "alfworld": 12, "search": 12, "webshop": 12
+    }
+
+
+def test_only_rejects_a_task_that_is_not_there(tmp_path):
+    """A typo must not silently write nothing and report success."""
+    src = _make_pool(tmp_path / "pool")
+    out = subprocess.run(
+        [sys.executable, _SCRIPT, str(src), str(tmp_path / "cache"),
+         "--arm", "sft", "--only", "webshopp"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode != 0
+    combined = out.stdout + out.stderr
+    assert "webshopp" in combined and "alfworld" in combined
