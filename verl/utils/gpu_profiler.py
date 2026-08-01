@@ -73,6 +73,19 @@ Env vars
   GPU_PROFILER_ROLLUP_EVERY=25 emit the cumulative table every N boundary
                                phases (0 disables the periodic one; the
                                at-exit rollup still fires)
+  GPU_PROFILER_SYNC_PHASES=1   synchronize the device at each phase boundary.
+                               Kernel launches are async, so without this a
+                               phase's wall clock is when its work was issued,
+                               not when the GPU finished it, and the boundaries
+                               smear. Exact attribution, but it serializes what
+                               the run would overlap -- the totals get slower.
+  GPU_PROFILER_TRACE=<path>    also append every raw sample to this CSV
+                               (ts, clock, phase, per-GPU sm%, per-GPU memBW%,
+                               driver cpu%). The tables above are per-step
+                               aggregates reset at each boundary, so they say a
+                               gap happened and how long it was but not *when*;
+                               the trace is what lines a dip seen on an external
+                               monitor up against the phase that produced it.
 """
 
 import atexit
@@ -114,6 +127,7 @@ _INTERVAL = float(os.environ.get("GPU_PROFILER_INTERVAL", "0.3"))
 _IDLE_THRESH = float(os.environ.get("GPU_PROFILER_IDLE_THRESH", "30"))
 _BOUNDARY = os.environ.get("GPU_PROFILER_BOUNDARY", "step").strip()
 _ROLLUP_EVERY = int(os.environ.get("GPU_PROFILER_ROLLUP_EVERY", "25"))
+_TRACE_PATH = os.environ.get("GPU_PROFILER_TRACE", "").strip()
 
 _GB = 1024.0 ** 3
 _KIB_TO_MB = 1024.0 / (1000.0 * 1000.0)  # NVML NVLink counters are KiB
@@ -369,6 +383,14 @@ class _Sampler:
         # a long run.
         self._cum = {}
         self._cum_steps = 0
+        self._trace = None
+        if _TRACE_PATH:
+            try:
+                self._trace = open(_TRACE_PATH, "w", buffering=1)
+                self._trace.write("ts,clock,phase,sm_pct_per_gpu,membw_pct_per_gpu,driver_cpu_pct\n")
+                print(f"[gpu-profiler] per-sample trace -> {_TRACE_PATH}", flush=True)
+            except OSError as e:
+                print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={_TRACE_PATH}: {e}", flush=True)
         self._thread = threading.Thread(target=self._run, name="gpu-profiler", daemon=True)
         self._thread.start()
 
@@ -410,6 +432,36 @@ class _Sampler:
                 # store per-GPU sm so callers can see data-parallel imbalance
                 per_gpu_sm = [g.get("sm_util") for g in per_gpu]
                 self._util_trace.append((t, per_gpu_sm))
+            self._write_trace(t, phase, per_gpu, host)
+
+    def _write_trace(self, t, phase, per_gpu, host):
+        """Append one row to GPU_PROFILER_TRACE, if it is set.
+
+        The tables are per-step aggregates and are reset at every step boundary,
+        which is the right shape for "where does the time go" but the wrong one
+        for a transient that happens once an hour: they say a gap existed and how
+        long it was, not when. This keeps every sample with its wall-clock time
+        and the phase it fell in, so a dip seen on an external monitor can be
+        lined up with what the trainer was doing at that moment.
+
+        Written outside the sampler lock, and never allowed to kill the sampler:
+        a profiler that takes the run down with it is worse than no profiler.
+        """
+        if self._trace is None:
+            return
+        try:
+            sm = ";".join("" if g.get("sm_util") is None else f"{g['sm_util']:.0f}" for g in per_gpu)
+            bw = ";".join("" if g.get("mem_bw_util") is None else f"{g['mem_bw_util']:.0f}" for g in per_gpu)
+            cpu = (host or {}).get("cpu_pct")
+            self._trace.write(
+                f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{phase},"
+                f"{sm},{bw},{'' if cpu is None else f'{cpu:.0f}'}\n"
+            )
+            # Flushed every row: the interesting runs are the ones that end in a
+            # crash or a Ctrl-C, and a buffered tail would lose exactly those.
+            self._trace.flush()
+        except Exception:
+            self._trace = None
 
     def mean_util_between(self, t0, t1):
         """Mean (across GPUs and time) SM util in [t0, t1]."""
@@ -698,6 +750,12 @@ _PHASE_ORDER = [
     "update_critic",
     "update_actor",
     "reward",
+    # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
+    # execution order so the interior of a step reads top to bottom.
+    "actor.fwd",
+    "actor.bwd",
+    "actor.task_metrics",
+    "actor.optim",
 ]
 
 
