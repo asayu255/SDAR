@@ -115,6 +115,21 @@ set -x
 #     analogous win is prefetching the top-k forward; not implemented yet.)
 #   ENV_RESET_PREFETCH       — not wired into TeacherTrajectoryGenerator.generate();
 #     setting it here would do nothing.
+#
+# ONE RETRIEVER, SHARED. env.search.search_url can point at the same server as
+# another concurrent run. What makes that safe is not the URL but the retry policy
+# beside it: env.search.max_retries=null waits for a timeout / refused connection /
+# 5xx to clear instead of giving up. Giving up is not a no-op -- the client hands the
+# error text back as the retrieval result, so it lands in the <information> block the
+# model is trained on with nothing in the metrics to say so, and under a shared
+# retriever an exhausted budget is exactly what a load spike looks like. 4xx and
+# malformed JSON still fail immediately: waiting cannot turn a bad URL into a
+# document. Both knobs are pinned in the expectations files, because they decide
+# what enters the data.
+#
+# env.search.timeout=600 is generous but finite on purpose; see the expectations
+# file for why null is worse here. A request that is still retrying says so in the
+# log every ~60s, so an intentional wait is never mistaken for a hang.
 
 # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. The
 # torch OOM message recommends it, but vLLM's CuMemAllocator — which this config
@@ -222,6 +237,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
     env.history_length=4 \
     env.rollout.n=8 \
     env.search.search_url=${SEARCH_URL:-http://100.86.45.31:8001/retrieve} \
+    env.search.timeout=600 \
+    env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
@@ -303,6 +320,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
 #     env.history_length=4 \
 #     env.rollout.n=8 \
 #     env.search.search_url=${SEARCH_URL:-http://100.86.45.30:8001/retrieve} \
+#     env.search.timeout=600 \
+#     env.search.max_retries=null \
 #     env.multitask.tasks=[alfworld,search,webshop] \
 #     env.multitask.max_steps.alfworld=50 \
 #     env.multitask.max_steps.search=4 \
@@ -384,6 +403,8 @@ python3 -m verl.trainer.main_opd_offpolicy_gen \
 #     env.history_length=4 \
 #     env.rollout.n=8 \
 #     env.search.search_url=${SEARCH_URL:-http://100.86.45.30:8001/retrieve} \
+#     env.search.timeout=600 \
+#     env.search.max_retries=null \
 #     env.multitask.tasks=[alfworld,search,webshop] \
 #     env.multitask.max_steps.alfworld=50 \
 #     env.multitask.max_steps.search=4 \
