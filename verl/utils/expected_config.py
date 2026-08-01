@@ -36,6 +36,7 @@ injection, typo'd ``+key=`` overrides that never take effect, and stray CLI
 overrides appended via ``$@``.
 """
 
+import os
 from typing import Any, Dict, List, Tuple
 
 from omegaconf import OmegaConf
@@ -91,7 +92,10 @@ def load_expectations(expect_file: str) -> Dict[str, Any]:
             _flatten(str(key), val)
         else:
             flat[str(key)] = val
-    return flat
+    # Expectation values may reference the home directory ("$HOME/checkpoints/..."),
+    # so one file pins the same teacher on machines whose home is not in the same
+    # place. What the lock is asserting is *which* checkpoint, not where $HOME is.
+    return {k: os.path.expandvars(os.path.expanduser(v)) if isinstance(v, str) else v for k, v in flat.items()}
 
 
 def check_expected_config(config, expect_file: str) -> List[Tuple[str, Any, Any]]:

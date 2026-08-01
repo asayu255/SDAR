@@ -146,3 +146,20 @@ if __name__ == "__main__":
     test_missing_key_fails()
     test_committed_expectations_file_self_consistent()
     print("\nALL EXPECTED-CONFIG TESTS PASSED")
+
+
+def test_expectation_paths_expand_the_home_directory(tmp_path, monkeypatch):
+    """A pinned teacher path must survive machines whose $HOME differs.
+
+    The lock asserts *which* checkpoint the run distils from, not where the home
+    directory happens to live, so the file may write "$HOME/..." and still match.
+    """
+    from verl.utils.expected_config import load_expectations
+
+    monkeypatch.setenv("HOME", "/somewhere/else")
+    expect = tmp_path / "expect.yaml"
+    expect.write_text('"algorithm.opd.teacher_paths.alfworld": "$HOME/checkpoints/teachers/alfworld_step300"\n')
+
+    loaded = load_expectations(str(expect))
+    assert loaded["algorithm.opd.teacher_paths.alfworld"] == "/somewhere/else/checkpoints/teachers/alfworld_step300"
+

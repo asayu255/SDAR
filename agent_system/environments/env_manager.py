@@ -953,6 +953,35 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
     return MultiTaskEnvironmentManager(managers=managers, task_max_steps=task_max_steps, config=config)
 
 
+class LazyEnvManager:
+    """Defer env construction until something actually needs the environments.
+
+    The val envs are Ray actors that sit idle from startup until the first
+    validation (``trainer.test_freq`` steps in), and with ``test_freq <= 0`` they are
+    never touched at all; the train envs are likewise dead weight in a
+    ``trainer.val_only`` run. In multitask that is 252 of 492 actors either way, each
+    holding its own copy of the environment's data, which is the difference between
+    fitting in host RAM and being killed by the OOM killer.
+
+    Everything else is unchanged: the same builder runs with the same arguments, just
+    later, so a rollout sees the same games and seeds it would have seen before.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+        self._envs = None
+
+    def materialize(self):
+        if self._envs is None:
+            self._envs = self._builder()
+        return self._envs
+
+    def __getattr__(self, name):
+        # only reached for names that are not instance attributes, i.e. never for
+        # _builder / _envs, so this cannot recurse
+        return getattr(self.materialize(), name)
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -986,48 +1015,60 @@ def make_envs(config):
                 f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
             )
 
-        envs = _build_multitask_manager(
-            config=config,
-            tasks=tasks,
-            task_max_steps=task_max_steps,
-            per_task_batch_size=train_per_task_batch_size,
-            group_n=group_n,
-            is_train=True,
-            seed=config.env.seed,
-            resources_per_worker=resources_per_worker,
-        )
-        val_envs = _build_multitask_manager(
-            config=config,
-            tasks=tasks,
-            task_max_steps=task_max_steps,
-            per_task_batch_size=val_per_task_batch_size,
-            group_n=1,
-            is_train=False,
-            seed=config.env.seed + 1000,
-            resources_per_worker=resources_per_worker,
-        )
-        if "webshop" in tasks:
-            import time
+        def _build_train_envs():
+            managers = _build_multitask_manager(
+                config=config,
+                tasks=tasks,
+                task_max_steps=task_max_steps,
+                per_task_batch_size=train_per_task_batch_size,
+                group_n=group_n,
+                is_train=True,
+                seed=config.env.seed,
+                resources_per_worker=resources_per_worker,
+            )
+            if "webshop" in tasks:
+                import time
 
-            time.sleep((train_per_task_batch_size * group_n + val_per_task_batch_size) * 0.1)
-        return envs, val_envs
+                time.sleep(train_per_task_batch_size * group_n * 0.1)
+            return managers
+
+        def _build_val_envs():
+            managers = _build_multitask_manager(
+                config=config,
+                tasks=tasks,
+                task_max_steps=task_max_steps,
+                per_task_batch_size=val_per_task_batch_size,
+                group_n=1,
+                is_train=False,
+                seed=config.env.seed + 1000,
+                resources_per_worker=resources_per_worker,
+            )
+            if "webshop" in tasks:
+                import time
+
+                time.sleep(val_per_task_batch_size * 0.1)
+            return managers
+
+        return LazyEnvManager(_build_train_envs), LazyEnvManager(_build_val_envs)
     elif "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
-        _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
-        _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env)
-
         projection_f = partial(search_projection)
-        envs = SearchEnvironmentManager(_envs, projection_f, config)
-        val_envs = SearchEnvironmentManager(_val_envs, projection_f, config)
+        envs = LazyEnvManager(lambda: SearchEnvironmentManager(
+            build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env),
+            projection_f, config))
+        val_envs = LazyEnvManager(lambda: SearchEnvironmentManager(
+            build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env),
+            projection_f, config))
         return envs, val_envs
     elif "gym_cards" in config.env.env_name.lower():
         from agent_system.environments.env_package.gym_cards import build_gymcards_envs, gym_projection
-        _envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, resources_per_worker=resources_per_worker)
-        _val_envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, resources_per_worker=resources_per_worker)
-        
         projection_f = partial(gym_projection, env_name=config.env.env_name)
-        envs = GymCardEnvironmentManager(_envs, projection_f, config)
-        val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config)
+        envs = LazyEnvManager(lambda: GymCardEnvironmentManager(
+            build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, resources_per_worker=resources_per_worker),
+            projection_f, config))
+        val_envs = LazyEnvManager(lambda: GymCardEnvironmentManager(
+            build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, resources_per_worker=resources_per_worker),
+            projection_f, config))
         return envs, val_envs
     elif "alfworld" in config.env.env_name.lower():
         from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
@@ -1041,12 +1082,13 @@ def make_envs(config):
         env_kwargs = {
             'eval_dataset': config.env.alfworld.eval_dataset, # 'eval_in_distribution' or 'eval_out_of_distribution'
         }
-        _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        
         projection_f = partial(alfworld_projection)
-        envs = AlfWorldEnvironmentManager(_envs, projection_f, config)
-        val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config)
+        envs = LazyEnvManager(lambda: AlfWorldEnvironmentManager(
+            build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+            projection_f, config))
+        val_envs = LazyEnvManager(lambda: AlfWorldEnvironmentManager(
+            build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+            projection_f, config))
         return envs, val_envs
     elif "sokoban" in config.env.env_name.lower():
         from agent_system.environments.env_package.sokoban import build_sokoban_envs, sokoban_projection
@@ -1056,12 +1098,13 @@ def make_envs(config):
             'max_steps': config.env.max_steps,
             'search_depth': config.env.sokoban.search_depth
         }
-        _envs = build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        
         projection_f = partial(sokoban_projection)
-        envs = SokobanEnvironmentManager(_envs, projection_f, config)
-        val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
+        envs = LazyEnvManager(lambda: SokobanEnvironmentManager(
+            build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+            projection_f, config))
+        val_envs = LazyEnvManager(lambda: SokobanEnvironmentManager(
+            build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+            projection_f, config))
         return envs, val_envs
     elif "webshop" in config.env.env_name.lower():
         from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
@@ -1078,23 +1121,36 @@ def make_envs(config):
                     'file_path': file_path,
                     'attr_path': attr_path
                     }
-        _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-
         projection_f = partial(webshop_projection)
-        envs = WebshopEnvironmentManager(_envs, projection_f, config)
-        val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
-        import time
-        time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
+
+        def _build_train_envs():
+            import time
+            managers = WebshopEnvironmentManager(
+                build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+                projection_f, config)
+            time.sleep(config.data.train_batch_size * group_n * 0.1)  # wait for the envs to be ready
+            return managers
+
+        def _build_val_envs():
+            import time
+            managers = WebshopEnvironmentManager(
+                build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker),
+                projection_f, config)
+            time.sleep(config.data.val_batch_size * 0.1)  # wait for the envs to be ready
+            return managers
+
+        envs = LazyEnvManager(_build_train_envs)
+        val_envs = LazyEnvManager(_build_val_envs)
         return envs, val_envs
     elif "appworld" in config.env.env_name.lower():
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
-        _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
-        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
-        
         projection_f = partial(appworld_projection)
-        envs = AppWorldEnvironmentManager(_envs, projection_f, config)
-        val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        envs = LazyEnvManager(lambda: AppWorldEnvironmentManager(
+            build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker),
+            projection_f, config))
+        val_envs = LazyEnvManager(lambda: AppWorldEnvironmentManager(
+            build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker),
+            projection_f, config))
         return envs, val_envs
     else:
         print("Environment not supported")
