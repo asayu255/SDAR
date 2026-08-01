@@ -22,8 +22,9 @@ What it checks, per shard:
              and nothing downstream can notice
   padding    attention_mask is left-padded over the prompt and right-padded over
              the response (0*1* then 1*0*). verl's left-truncation assumes it
-  positions  position_ids == clamp(cumsum(attention_mask) - 1, min=0), the layout
-             the rotary embedding is built for
+  positions  position_ids follows the mask over the prompt and then runs straight
+             on through the response's right padding, which is what vLLM writes
+             and what the rotary embedding is therefore built for
   masked     every row has at least one response token. A row with none
              contributes nothing to the loss but still counts in the per-task
              token totals the SFT weights normalise by
@@ -131,10 +132,22 @@ def _check_shard(path, rep, vocab_size):
     rep.check(empty == 0, name, f"{empty}/{n} rows have no response token")
 
     # --- position_ids ------------------------------------------------------
-    expected_pos = torch.clamp(am.cumsum(dim=1) - 1, min=0)
+    # The prompt half follows the mask, but the response half does NOT: vLLM
+    # numbers it straight on from the prompt's last position and keeps counting
+    # through the right padding, which the generator spells out at
+    # vllm_rollout_spmd.py:366 --
+    #   attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+    #   position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+    # Checking clamp(cumsum(mask)-1) over the whole row instead flags every row
+    # whose response did not fill its window -- which is nearly all of them, and
+    # is a bug in the check, not the pool.
+    prompt_pos = torch.clamp(prompt_mask.cumsum(dim=1) - 1, min=0)
+    delta = torch.arange(1, resp_len + 1, dtype=torch.long).unsqueeze(0)
+    expected_pos = torch.cat([prompt_pos, prompt_pos[:, -1:] + delta], dim=1)
     pos_bad = int((expected_pos != batch["position_ids"]).any(dim=1).sum())
     rep.check(pos_bad == 0, name,
-              f"{pos_bad}/{n} rows where position_ids != clamp(cumsum(attention_mask)-1, 0)")
+              f"{pos_bad}/{n} rows where position_ids is neither "
+              f"clamp(cumsum(mask)-1) over the prompt nor a straight run over the response")
 
     # --- vocab range -------------------------------------------------------
     ids = batch["input_ids"]

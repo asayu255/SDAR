@@ -36,7 +36,13 @@ def _valid(task="webshop", n_traj=3, turns=2, resp_used=3, prompt_used=7):
 
     input_ids = torch.randint(1, 900, (n, seq), dtype=torch.long)
     responses = input_ids[:, -RESP_LEN:].clone()
-    position_ids = torch.clamp(attention_mask.cumsum(dim=1) - 1, min=0)
+    # Built the way vllm_rollout_spmd.py builds it: the prompt half follows the
+    # mask, the response half counts straight on through its right padding.
+    prompt_pos = torch.clamp(attention_mask[:, :PROMPT_LEN].cumsum(dim=1) - 1, min=0)
+    position_ids = torch.cat(
+        [prompt_pos, prompt_pos[:, -1:] + torch.arange(1, RESP_LEN + 1).unsqueeze(0)],
+        dim=1,
+    )
 
     uids = []
     for j in range(n_traj):
@@ -62,8 +68,8 @@ def _run(pool):
     )
 
 
-def _pool(tmp_path, proto, name="webshop_0000.pt"):
-    root = tmp_path / "pool"
+def _pool(tmp_path, proto, name="webshop_0000.pt", sub="pool"):
+    root = tmp_path / sub
     root.mkdir(exist_ok=True)
     proto.save_to_disk(os.path.join(root, name))
     return root
@@ -104,6 +110,32 @@ def test_position_ids_that_do_not_follow_the_mask_fail(tmp_path):
     proto = _valid()
     proto.batch["position_ids"][0] += 1
     out = _run(_pool(tmp_path, proto))
+    assert out.returncode == 1
+    assert "position_ids" in out.stdout
+
+
+def test_the_response_positions_run_through_the_padding(tmp_path):
+    """The layout vllm_rollout_spmd.py:366 documents, pinned as its own case.
+
+    The naive reading -- clamp(cumsum(attention_mask) - 1) across the whole row --
+    holds the position flat over the response's right padding. Every row whose
+    response did not fill its window disagrees with that, so a checker written
+    the naive way rejects almost every real pool. This asserts the flat version
+    is the one that fails.
+    """
+    proto = _valid(resp_used=3)              # 3 of RESP_LEN=5 response tokens used
+    real = proto.batch["position_ids"][0].tolist()
+    assert real[-RESP_LEN:] == [real[PROMPT_LEN - 1] + i for i in range(1, RESP_LEN + 1)]
+    assert _run(_pool(tmp_path, proto)).returncode == 0
+
+    flat = _valid(resp_used=3)
+    naive = torch.clamp(flat.batch["attention_mask"].cumsum(dim=1) - 1, min=0)
+    rebuilt = DataProto.from_dict(
+        tensors={**dict(flat.batch), "position_ids": naive},
+        non_tensors=dict(flat.non_tensor_batch),
+    )
+    # A separate directory: --shards 1 reads only the first shard of each task.
+    out = _run(_pool(tmp_path, rebuilt, sub="naive"))
     assert out.returncode == 1
     assert "position_ids" in out.stdout
 
