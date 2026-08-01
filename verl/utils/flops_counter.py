@@ -91,6 +91,11 @@ def get_device_flops(unit="T"):
         flops = 181.05e12
     elif "A40" in device_name:
         flops = 149.7e12
+    # Same GA102 die as the A40 above, clocked slightly higher. Without this the
+    # unknown-device fallback below leaves flops at inf and every MFU divides to
+    # exactly 0.0 -- a metric that looks broken rather than missing.
+    elif "A6000" in device_name:
+        flops = 154.8e12
     elif "L20" in device_name:
         flops = 119.5e12
     elif "H20" in device_name:
