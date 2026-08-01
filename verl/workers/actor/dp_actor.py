@@ -766,6 +766,27 @@ class DataParallelPPOActor(BasePPOActor):
                         _defer("actor/teacher_kl_loss", teacher_kl_loss)
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
+                    if self.config.get("use_sft_loss", False):
+                        # Hard-label cross-entropy on the teacher's own sampled tokens:
+                        # the degenerate (one-hot teacher) limit of the distillation
+                        # term above. Added to it rather than replacing it, so the
+                        # signal is kl_coef * KL(teacher_topk || student) + sft_coef * CE.
+                        #
+                        # Both terms are aggregated the same way over the same mask, so
+                        # the sum is well defined -- but they are not on the same scale
+                        # and do not stay in the same ratio. The KL goes to 0 as the
+                        # student matches the teacher; the CE cannot, because it is
+                        # bounded below by the teacher's own entropy on those tokens. A
+                        # fixed sft_loss_coef therefore weights the CE more and more
+                        # heavily as training converges, which is a property of the
+                        # objective, not a bug -- see actor/sft_loss vs
+                        # actor/teacher_kl_loss in wandb to see the ratio move.
+                        sft_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        sft_coef = self.config.get("sft_loss_coef", 1.0)
+                        policy_loss = policy_loss + sft_loss * sft_coef
+                        _defer("actor/sft_loss", sft_loss)
+                        metrics["actor/sft_coef"] = sft_coef
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
@@ -847,6 +868,12 @@ class DataParallelPPOActor(BasePPOActor):
                                     _defer(
                                         f"actor/teacher_kl_loss/{task}",
                                         agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                    )
+
+                                if self.config.get("use_sft_loss", False):
+                                    _defer(
+                                        f"actor/sft_loss/{task}",
+                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                     )
 
                                 append_to_dict(metrics, task_metrics)

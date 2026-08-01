@@ -6,7 +6,15 @@ The student is trained on the *fixed* teacher-trajectory dataset produced by
 top-k teacher-KL as on-policy OPD. No rollout and no teacher forward pass happen
 during training (the teacher top-k is baked into the dataset); only validation
 rolls the student out. GRPO policy-gradient, entropy, reference-KL and reward are
-all disabled so the only training signal is the per-token top-k teacher KL.
+all disabled, so the training signal is exactly
+
+    algorithm.opd.kl_loss_coef  * KL(teacher_topk || student)
+  + algorithm.opd.sft_loss_coef * CE(teacher's sampled tokens, student)
+
+with the second term present only when ``algorithm.opd.sft_loss_coef`` is set.
+The CE is the degenerate (one-hot teacher) limit of the first term, so the sum is
+the usual soft-target + hard-target distillation objective over the same tokens
+and the same mask.
 """
 
 import hydra
@@ -54,13 +62,29 @@ class OPDOffPolicyTaskRunner:
             "(directory of Stage-1 <task>.pt files; pass via +algorithm.opd.teacher_data_dir=/path)"
         )
 
-        # Inject the pure-distillation invariants. The distillation signal is the
-        # same top-k teacher-KL as on-policy OPD (forced to topk_kl / top-20 here).
+        # Inject the distillation invariants. The signal is the same top-k
+        # teacher-KL as on-policy OPD (forced to topk_kl / top-20 here), optionally
+        # summed with the hard-label cross-entropy on the teacher's sampled tokens:
+        #
+        #     loss = kl_loss_coef * KL(teacher_topk || student) + sft_loss_coef * CE
+        #
+        # The CE term is off unless algorithm.opd.sft_loss_coef is set, so a config
+        # written before it existed is still pure KD. Everything else that could
+        # enter the loss stays forced off below -- the two terms above are the whole
+        # objective either way.
+        sft_loss_coef = opd_cfg.get("sft_loss_coef", None)
         with open_dict(config):
             config.actor_rollout_ref.actor.use_teacher_kl_loss = True
             config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
             config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "topk_kl")
             config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
+            # None -> KD only. 0.0 is NOT the same thing: it keeps the term (and its
+            # metrics) with a zero weight, which is a useful control run, so it is
+            # taken at face value rather than folded into "off".
+            config.actor_rollout_ref.actor.use_sft_loss = sft_loss_coef is not None
+            config.actor_rollout_ref.actor.sft_loss_coef = (
+                float(sft_loss_coef) if sft_loss_coef is not None else 0.0
+            )
             config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
             config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
             config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

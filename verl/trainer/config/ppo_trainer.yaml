@@ -71,6 +71,11 @@ actor_rollout_ref:
     teacher_kl_loss_coef: 1.0 # OPD: weight of the teacher KL term
     teacher_kl_loss_type: low_var_kl # OPD: KL form: single-token (low_var_kl / kl / abs / mse) or dense top-k (topk_kl)
     teacher_kl_topk: 20 # OPD: support size for topk_kl (dense top-k + tail-bucket reverse KL)
+    # Hard-label cross-entropy on the teacher's own sampled tokens -- the
+    # degenerate (one-hot teacher) limit of the KL above. Summed with it, over the
+    # same tokens and the same mask, when both are on.
+    use_sft_loss: False
+    sft_loss_coef: 1.0 # weight of the CE term when use_sft_loss is on
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size

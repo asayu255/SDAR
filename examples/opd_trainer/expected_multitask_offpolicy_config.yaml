@@ -17,17 +17,40 @@
 #   - To change a setting intentionally: edit the run script AND this file in
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
-# ---- distillation loss (same top-20 dense KL as on-policy OPD) -----------------
+# ---- distillation loss: soft targets + hard targets -----------------------------
+# The training signal is exactly
+#
+#     kl_loss_coef * KL(teacher_topk || student) + sft_loss_coef * CE
+#
+# over the same response tokens and the same mask. The first term is the same
+# top-20 dense KL as on-policy OPD; the second is the hard-label cross-entropy on
+# the tokens the teacher actually sampled, i.e. the degenerate (one-hot teacher)
+# limit of the first.
+#
+# The two are not on the same scale and do not stay in a fixed ratio: the KL goes
+# to 0 as the student matches the teacher, while the CE is bounded below by the
+# teacher's own entropy on those tokens. A constant sft_loss_coef therefore takes
+# over the gradient as the run converges. That is a property of the objective and
+# the reason the coefficient is pinned here rather than treated as a tuning dial:
+# two runs with different values are different experiments.
+#
+# Removing "algorithm.opd.sft_loss_coef" from the run script (rather than setting
+# it to 0) turns the CE term off entirely, which is the pure-KD arm. 0.0 is NOT
+# the same thing -- it keeps the term and its metrics at zero weight, which is the
+# control run for "does the CE matter", so it is taken at face value.
 "algorithm.opd.kl_loss_type": topk_kl
 "algorithm.opd.kl_loss_coef": 1.0
 "algorithm.opd.topk": 20
+"algorithm.opd.sft_loss_coef": 1.0
 # effective values after main_opd_offpolicy's injection into the actor config
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
 "actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
 "actor_rollout_ref.actor.teacher_kl_topk": 20
+"actor_rollout_ref.actor.use_sft_loss": true
+"actor_rollout_ref.actor.sft_loss_coef": 1.0
 
-# ---- pure-distillation invariants (no other signal enters the loss) -----------
+# ---- distillation invariants (nothing beyond those two terms enters the loss) --
 "algorithm.adv_estimator": grpo
 "algorithm.use_kl_in_reward": false
 "actor_rollout_ref.actor.pg_loss_coef": 0
