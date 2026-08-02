@@ -226,3 +226,173 @@ def test_topk_kl_nonnegative_and_student_only_gradient():
     kl.sum().backward()
     assert s_logits.grad is not None
     assert t_logits.grad is None  # teacher provides no gradient
+
+
+# --------------------------------------------------------------------------- #
+# Teacher prefetch (ROLLOUT_PREFETCH_TEACHER)
+# --------------------------------------------------------------------------- #
+def _make_batch_with_ids(task_names, traj_uids, turn_steps, resp_len=4):
+    """A batch that also carries the (traj_uid, turn_step) identity a prefetch keys on."""
+    batch = _make_batch(task_names, resp_len=resp_len)
+    batch.non_tensor_batch["traj_uid"] = np.array(traj_uids, dtype=object)
+    batch.non_tensor_batch["turn_step"] = np.array(turn_steps, dtype=object)
+    return batch
+
+
+def _prefetch_entry(marker, resp_len=4, k=20):
+    """A prefetched top-k result carrying `marker`, in the same slot the fakes use."""
+    logprobs = torch.zeros((resp_len, k), dtype=torch.float32)
+    ids = torch.zeros((resp_len, k), dtype=torch.long)
+    logprobs[0, 0] = marker
+    ids[0, 0] = int(marker)
+    return logprobs, ids
+
+
+def _make_row(idx, task, resp_len=4, seqlen=6):
+    """A rollout row as the loop queues it: four model inputs plus its task."""
+    responses = torch.zeros(resp_len, dtype=torch.long)
+    responses[0] = idx
+    return {
+        "input_ids": torch.zeros(seqlen, dtype=torch.long),
+        "attention_mask": torch.ones(seqlen, dtype=torch.long),
+        "position_ids": torch.arange(seqlen, dtype=torch.long),
+        "responses": responses,
+        "task_name": task,
+    }
+
+
+def test_prefetch_chunk_routes_each_row_to_its_task_teacher():
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    chunk = [
+        (("t0", 0), _make_row(0, "webshop")),
+        (("t1", 0), _make_row(1, "alfworld")),
+        (("t1", 1), _make_row(2, "alfworld_easy")),  # alias normalises to alfworld
+        (("t2", 3), _make_row(3, "search/nq")),
+    ]
+    out = trainer._teacher_prefetch_chunk(chunk)
+
+    assert set(out) == {("t0", 0), ("t1", 0), ("t1", 1), ("t2", 3)}
+    code_by_key = {("t0", 0): 3, ("t1", 0): 1, ("t1", 1): 1, ("t2", 3): 2}
+    idx_by_key = {("t0", 0): 0, ("t1", 0): 1, ("t1", 1): 2, ("t2", 3): 3}
+    for key, (logprobs, ids) in out.items():
+        expected = code_by_key[key] * 1000.0 + idx_by_key[key]
+        assert logprobs[0, 0].item() == pytest.approx(expected), f"{key} mis-routed"
+    # one call per task present, and alfworld's two rows travelled together
+    assert teachers["alfworld"].calls == [[1.0, 2.0]]
+    assert teachers["search"].calls == [[3.0]]
+    assert teachers["webshop"].calls == [[0.0]]
+
+
+def test_prefetched_rows_are_not_rescored():
+    """A hit fills the row and keeps it out of the per-task teacher call."""
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    batch = _make_batch_with_ids(
+        task_names=["alfworld", "alfworld", "search"],
+        traj_uids=["a", "a", "b"],
+        turn_steps=[0, 1, 0],
+    )
+    # Row 1 only. 77777 cannot collide with a fake teacher's code*1000 + idx.
+    prefetched = {("a", 1): _prefetch_entry(77777.0)}
+
+    trainer.compute_teacher_log_probs(batch, prefetched=prefetched)
+    logprobs = batch.batch["teacher_topk_logprobs"]
+
+    assert logprobs[1, 0, 0].item() == pytest.approx(77777.0)  # came from the prefetch
+    assert logprobs[0, 0, 0].item() == pytest.approx(1000.0)   # alfworld teacher, idx 0
+    assert logprobs[2, 0, 0].item() == pytest.approx(2002.0)   # search teacher, idx 2
+    # the alfworld teacher saw row 0 alone -- row 1 was already done
+    assert teachers["alfworld"].calls == [[0.0]]
+
+
+def test_a_fully_prefetched_task_skips_its_teacher_entirely():
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    batch = _make_batch_with_ids(["search", "alfworld"], ["s", "a"], [0, 0])
+    prefetched = {("s", 0): _prefetch_entry(55555.0)}
+
+    trainer.compute_teacher_log_probs(batch, prefetched=prefetched)
+
+    assert teachers["search"].calls == []       # never invoked
+    assert teachers["alfworld"].calls == [[1.0]]
+    assert batch.batch["teacher_topk_logprobs"][0, 0, 0].item() == pytest.approx(55555.0)
+
+
+def test_adjust_batch_duplicates_reuse_one_prefetched_entry():
+    """adjust_batch copies rows; a copy shares its original's key, so both hit."""
+    teachers = {"alfworld": _FakeTeacherWG(1)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    # rows 0 and 2 are the same (traj_uid, turn_step) -- 2 is the appended copy.
+    batch = _make_batch_with_ids(
+        task_names=["alfworld", "alfworld", "alfworld"],
+        traj_uids=["a", "a", "a"],
+        turn_steps=[0, 1, 0],
+    )
+    prefetched = {("a", 0): _prefetch_entry(99999.0)}
+
+    trainer.compute_teacher_log_probs(batch, prefetched=prefetched)
+    logprobs = batch.batch["teacher_topk_logprobs"]
+
+    assert logprobs[0, 0, 0].item() == pytest.approx(99999.0)
+    assert logprobs[2, 0, 0].item() == pytest.approx(99999.0)
+    assert teachers["alfworld"].calls == [[1.0]]  # only the un-prefetched row
+
+
+def test_a_stale_prefetch_key_is_ignored():
+    """Keys with no row in this batch (filtered groups, a later step) change nothing."""
+    teachers = {"alfworld": _FakeTeacherWG(1)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    batch = _make_batch_with_ids(["alfworld"], ["a"], [0])
+    trainer.compute_teacher_log_probs(batch, prefetched={("gone", 7): _prefetch_entry(1.0)})
+
+    assert teachers["alfworld"].calls == [[0.0]]
+    assert batch.batch["teacher_topk_logprobs"][0, 0, 0].item() == pytest.approx(1000.0)
+
+
+def test_batch_without_turn_identity_ignores_the_prefetch():
+    """Validation batches carry no traj_uid/turn_step; the merge must stay off."""
+    teachers = {"alfworld": _FakeTeacherWG(1)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    batch = _make_batch(["alfworld"])  # no traj_uid / turn_step
+    trainer.compute_teacher_log_probs(batch, prefetched={("a", 0): _prefetch_entry(1.0)})
+
+    assert teachers["alfworld"].calls == [[0.0]]  # scored normally
+    assert batch.batch["teacher_topk_logprobs"][0, 0, 0].item() == pytest.approx(1000.0)
+
+
+def test_prefetch_metrics_report_the_hit_rate():
+    teachers = {"alfworld": _FakeTeacherWG(1)}
+    trainer = _make_trainer(teachers, topk=20)
+
+    batch = _make_batch_with_ids(["alfworld"] * 4, ["a"] * 4, [0, 1, 2, 3])
+    prefetched = {("a", 0): _prefetch_entry(1.0), ("a", 2): _prefetch_entry(2.0)}
+    metrics = {}
+
+    trainer.compute_teacher_log_probs(batch, prefetched=prefetched, metrics=metrics)
+
+    assert metrics["teacher_prefetch/rows"] == 2
+    assert metrics["teacher_prefetch/hit_rate"] == pytest.approx(0.5)
+
+
+def test_single_token_branch_also_merges_the_prefetch():
+    """kl_loss_type != topk_kl stores one value per token, not a (logprob, id) pair."""
+    teachers = {"alfworld": _FakeTeacherWG(1)}
+    trainer = _make_trainer(teachers)  # topk=None -> single-token estimator
+
+    batch = _make_batch_with_ids(["alfworld", "alfworld"], ["a", "a"], [0, 1])
+    row = torch.zeros(4, dtype=torch.float32)
+    row[0] = 42424.0
+
+    trainer.compute_teacher_log_probs(batch, prefetched={("a", 1): row})
+    out = batch.batch["teacher_log_probs"]
+
+    assert out[1, 0].item() == pytest.approx(42424.0)
+    assert out[0, 0].item() == pytest.approx(1000.0)
+    assert teachers["alfworld"].calls == [[0.0]]

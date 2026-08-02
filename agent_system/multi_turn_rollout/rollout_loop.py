@@ -92,6 +92,33 @@ _ROLLOUT_PREFETCH_LOGPROB = os.environ.get("ROLLOUT_PREFETCH_LOGPROB", "0").stri
 # is still subtracted from the old_log_prob phase, but the overlap is lost.
 _ROLLOUT_PREFETCH_LOGPROB_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_LOGPROB_CHUNK", "64"))
 
+# Prefetch the per-task TEACHER forward for trajectories that already finished,
+# overlapped with the rollout's CPU glue. The teacher is frozen for the whole run,
+# so a finished trajectory's distillation targets can be computed the moment its
+# last turn is recorded instead of after the rollout; the trainer then only scores
+# what is left (see OPDRayTrainer.compute_teacher_log_probs).
+#
+# The window this fills is the driver's own CPU time -- decode, envs.step, and the
+# next turn's tokenization -- NOT the generation tail. The teachers are colocated
+# with the rollout in one WorkerDict per GPU (see OPDRayTrainer.init_workers ->
+# create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
+# teacher call issued during generate_sequences would simply queue behind it. The
+# chunk is therefore launched right after generation returns and joined right
+# before the next one is issued.
+#
+# NOT bit-identical: a row is scored in a different micro-batch than the trainer's
+# monolithic per-task slice would have put it in, and packed GEMMs of different
+# total length can differ in their last bits. Same expectation, same rows, same
+# frozen weights. Opt-in; OFF reproduces the serial behavior exactly.
+_ROLLOUT_PREFETCH_TEACHER = os.environ.get("ROLLOUT_PREFETCH_TEACHER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Rows per prefetch call. One chunk is issued per turn, so this trades window fit
+# against per-call overhead: too small and the ~45 usable turns cannot drain the
+# queue, too large and the turn runs past its CPU glue (that excess is still
+# subtracted from the teacher_forward phase -- it is moved, not wasted -- but the
+# overlap is lost). Watch the tchWait column of the turn table to tune it.
+_ROLLOUT_PREFETCH_TEACHER_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_TEACHER_CHUNK", "128"))
+
 
 def _env_kwargs_equal(a, b) -> bool:
     """Compare two env_kwargs sequences (None or sequence of per-env dicts)."""
@@ -137,25 +164,27 @@ def _print_turn_timing(records):
     if not records:
         return
     header = (
-        f"{'turn':>4}{'active':>8}{'preproc':>9}{'gen':>9}{'decode':>9}"
+        f"{'turn':>4}{'active':>8}{'preproc':>9}{'gen':>9}{'tchWait':>9}{'decode':>9}"
         f"{'envstep':>9}{'total':>9}{'genGPU%':>9}{'  perGPU%':>12}"
     )
     lines = ["[rollout-turn-timing] per-turn breakdown (seconds); GPU busy only during 'gen'", header, "-" * len(header)]
-    tot = {k: 0.0 for k in ("preproc", "gen", "decode", "envstep", "total")}
+    tot = {k: 0.0 for k in ("preproc", "gen", "tchwait", "decode", "envstep", "total")}
     full_util, shrunk_util = [], []
     dp_spreads = []  # per-turn max-min across GPUs during gen (DP imbalance)
     first_active = records[0]["active"]
     for r in records:
-        total = r["preproc"] + r["gen"] + r["decode"] + r["envstep"]
+        tchwait = r.get("tchwait", 0.0)
+        total = r["preproc"] + r["gen"] + tchwait + r["decode"] + r["envstep"]
         for k in ("preproc", "gen", "decode", "envstep"):
             tot[k] += r[k]
+        tot["tchwait"] += tchwait
         tot["total"] += total
         gu = r["gen_util"]
         gu_s = f"{gu:.0f}" if gu is not None else "-"
         pg = r.get("gen_util_per_gpu")
         pg_s = _fmt_per_gpu(pg)
         lines.append(
-            f"{r['turn']:>4}{r['active']:>8}{r['preproc']:>9.2f}{r['gen']:>9.2f}"
+            f"{r['turn']:>4}{r['active']:>8}{r['preproc']:>9.2f}{r['gen']:>9.2f}{tchwait:>9.2f}"
             f"{r['decode']:>9.2f}{r['envstep']:>9.2f}{total:>9.2f}{gu_s:>9}{pg_s:>12}"
         )
         if gu is not None:
@@ -166,14 +195,18 @@ def _print_turn_timing(records):
                 dp_spreads.append(max(present) - min(present))
     lines.append("-" * len(header))
     lines.append(
-        f"{'TOTAL':>4}{'':>8}{tot['preproc']:>9.1f}{tot['gen']:>9.1f}"
+        f"{'TOTAL':>4}{'':>8}{tot['preproc']:>9.1f}{tot['gen']:>9.1f}{tot['tchwait']:>9.1f}"
         f"{tot['decode']:>9.1f}{tot['envstep']:>9.1f}{tot['total']:>9.1f}"
     )
     cpu_glue = tot["preproc"] + tot["decode"] + tot["envstep"]
     if tot["total"] > 0:
+        # tchWait is GPU-busy (a teacher forward the trainer no longer has to do),
+        # but it is the part of that work the glue could NOT hide, so it is counted
+        # apart from gen: driving it to 0 by shrinking the chunk is the goal.
         lines.append(
             f"SHARE  gen(GPU-busy)={100*tot['gen']/tot['total']:.1f}%  "
             f"cpu-glue(preproc+decode+envstep, GPU-idle)={100*cpu_glue/tot['total']:.1f}%"
+            + (f"  teacher-spill(GPU-busy)={100*tot['tchwait']/tot['total']:.1f}%" if tot["tchwait"] > 0 else "")
         )
     fa = sum(full_util) / len(full_util) if full_util else None
     sa = sum(shrunk_util) / len(shrunk_util) if shrunk_util else None
@@ -214,6 +247,14 @@ class TrajectoryCollector:
         self._logprob_pending = []
         self._prefetched_log_probs = {}
         self._env_step_executor = None
+        # ROLLOUT_PREFETCH_TEACHER state: same shape as the log-prob queue above,
+        # plus the one outstanding background call and the trainer-supplied
+        # callback that knows how to route a chunk to its task's teacher.
+        self._teacher_prefetch_fn = None
+        self._teacher_pending = []
+        self._prefetched_teacher = {}
+        self._teacher_future = None
+        self._teacher_executor = None
         # ENV_RESET_PREFETCH state: one outstanding background envs.reset, launched
         # by the trainer between rollouts (see prefetch_env_reset).
         self._env_reset_prefetch = None
@@ -620,6 +661,48 @@ class TrajectoryCollector:
         self._prefetched_log_probs = {}
         return prefetched
 
+    def _launch_teacher_prefetch(self):
+        """Start one chunk of teacher scoring in the background, if any is queued.
+
+        Called right after generate_sequences returns, so the call runs while the
+        driver decodes, steps the envs and tokenizes the next turn. Exactly one
+        chunk is in flight at a time: the teachers share a Ray actor with the
+        rollout, so a second concurrent call would only queue.
+        """
+        if self._teacher_prefetch_fn is None or self._teacher_future is not None:
+            return
+        chunk = self._teacher_pending[:_ROLLOUT_PREFETCH_TEACHER_CHUNK]
+        if not chunk:
+            return
+        del self._teacher_pending[:len(chunk)]
+        if self._teacher_executor is None:
+            self._teacher_executor = ThreadPoolExecutor(max_workers=1)
+        self._teacher_future = self._teacher_executor.submit(self._teacher_prefetch_fn, chunk)
+
+    def _join_teacher_prefetch(self) -> float:
+        """Collect the outstanding chunk. Returns the seconds spent waiting.
+
+        Must run before the next generate_sequences: both calls land on the same
+        colocated WorkerDict, so leaving one outstanding would serialize them
+        anyway -- but on Ray's queue, where the driver could not see the cost.
+        The wait is reported per turn (tchWait) so an oversized chunk is visible
+        rather than silently charged to generation.
+        """
+        if self._teacher_future is None:
+            return 0.0
+        started = _now()
+        future, self._teacher_future = self._teacher_future, None
+        self._prefetched_teacher.update(future.result())
+        return _now() - started
+
+    def take_prefetched_teacher(self) -> Dict:
+        """Hand the prefetched (traj_uid, turn_step) -> teacher outputs to the
+        trainer and clear them. Empty unless ROLLOUT_PREFETCH_TEACHER was on and
+        a teacher callback was supplied for the last multi_turn_loop."""
+        prefetched = self._prefetched_teacher
+        self._prefetched_teacher = {}
+        return prefetched
+
     def prefetch_env_reset(self, envs: EnvironmentManagerBase, env_kwargs):
         """Launch envs.reset() for the *next* rollout in a background thread.
 
@@ -746,12 +829,19 @@ class TrajectoryCollector:
 
             # pad to be divisible by dp_size
             batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
+            # Everything above this line was driver-side CPU work with the GPU
+            # parked, which is what the teacher chunk launched last turn has been
+            # covering. Collect it before issuing generation.
+            _teacher_wait = self._join_teacher_prefetch()
             _gw0 = gpu_profiler.now()
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             _gw1 = gpu_profiler.now()
             # # unpad
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
             _m_gen = _now()  # end of GPU generation window
+            # The GPU is now idle until the next generation; start the next chunk
+            # so it runs under the decode / envs.step / tokenize glue below.
+            self._launch_teacher_prefetch()
 
             # Scatter active outputs back to the full batch size for union/recording.
             batch_output = active_batch_output if generate_all else \
@@ -796,7 +886,11 @@ class TrajectoryCollector:
                     "turn": _step,
                     "active": int(len(active_idx)),
                     "preproc": _m_preproc - _m0,
-                    "gen": _m_gen - _m_preproc,
+                    # The join sits inside this window, so subtract it: an oversized
+                    # teacher chunk must not masquerade as slow generation. The
+                    # turn's columns still sum to its wall clock.
+                    "gen": _m_gen - _m_preproc - _teacher_wait,
+                    "tchwait": _teacher_wait,
                     "decode": _m_decode - _m_gen,
                     "envstep": _m_env - _m_decode,
                     "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
@@ -844,13 +938,17 @@ class TrajectoryCollector:
             newly_done = np.logical_and(active_masks, dones)
             is_done = np.logical_or(is_done, dones)
 
-            if self._logprob_prefetch_enabled:
+            if self._logprob_prefetch_enabled or self._teacher_prefetch_fn is not None:
                 # Trajectories that finished this turn now have all their rows
-                # final; queue them for prefetched old_log_prob on later turns.
+                # final; queue them for prefetched scoring on later turns.
                 for i in np.nonzero(newly_done)[0]:
                     for step_idx, row in enumerate(total_batch_list[i]):
                         if row['active_masks']:
-                            self._logprob_pending.append(((traj_uid[i], step_idx), row))
+                            entry = ((str(traj_uid[i]), step_idx), row)
+                            if self._logprob_prefetch_enabled:
+                                self._logprob_pending.append(entry)
+                            if self._teacher_prefetch_fn is not None:
+                                self._teacher_pending.append(entry)
 
             # Update observations for next step
             obs = next_obs
@@ -858,6 +956,11 @@ class TrajectoryCollector:
             # Break if all environments are done
             if is_done.all():
                 break
+
+        # No generation left to overlap with, so anything still outstanding is
+        # collected here rather than left for the trainer to recompute. Whatever
+        # is still queued stays queued and the trainer scores it as usual.
+        self._join_teacher_prefetch()
 
         if _turn_records is not None:
             _print_turn_timing(_turn_records)
@@ -941,10 +1044,11 @@ class TrajectoryCollector:
 
     def multi_turn_loop(
             self,
-            gen_batch: DataProto, 
-            actor_rollout_wg, 
+            gen_batch: DataProto,
+            actor_rollout_wg,
             envs: EnvironmentManagerBase,
             is_train: bool = True,
+            teacher_prefetch_fn=None,
             ) -> DataProto:
         """
         Select and run the appropriate rollout loop (dynamic or vanilla).
@@ -954,6 +1058,13 @@ class TrajectoryCollector:
             actor_rollout_wg: Actor model workers.
             envs (EnvironmentManagerBase): Environment manager for interaction.
             is_train (bool): Whether in training mode (affects dynamic sampling).
+            teacher_prefetch_fn: optional ``chunk -> {(traj_uid, turn_step): out}``
+                callback that scores finished rows with their task's teacher. When
+                given (and ROLLOUT_PREFETCH_TEACHER is on) it is called on a
+                background thread under the rollout's CPU glue; collect the results
+                afterwards with ``take_prefetched_teacher()``. Routing and the
+                shape of ``out`` are entirely the caller's business -- this class
+                only decides *when* it is safe to run.
 
         Returns:
             DataProto: Final collected trajectory data with metadata.
@@ -973,6 +1084,15 @@ class TrajectoryCollector:
         )
         self._logprob_pending = []
         self._prefetched_log_probs = {}
+
+        # Teacher prefetch: training rollouts only (validation never scores a
+        # teacher), and only when the caller supplied a routing callback. State is
+        # cleared per rollout; anything still pending at the end is scored by the
+        # trainer as usual.
+        self._teacher_prefetch_fn = teacher_prefetch_fn if (_ROLLOUT_PREFETCH_TEACHER and is_train) else None
+        self._teacher_pending = []
+        self._prefetched_teacher = {}
+        self._teacher_future = None
 
         # Initial observations from the environment
         # Open one vLLM session for the whole rollout (opt-in). end_rollout_session

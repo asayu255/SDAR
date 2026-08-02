@@ -251,7 +251,77 @@ class OPDRayTrainer(RayPPOTrainer):
     # ------------------------------------------------------------------ #
     # Per-task teacher routing.
     # ------------------------------------------------------------------ #
-    def compute_teacher_log_probs(self, batch: DataProto) -> None:
+    def _teacher_prefetch_chunk(self, chunk):
+        """Score a chunk of already-finished trajectory rows with their teachers.
+
+        Handed to ``multi_turn_loop`` as its ``teacher_prefetch_fn`` and called on
+        a background thread while the driver is doing CPU work between
+        generations (see ROLLOUT_PREFETCH_TEACHER). The teachers are frozen for
+        the whole run, so a row's targets do not depend on *when* it is scored --
+        only the micro-batch it lands in differs from the post-rollout path, which
+        moves the last bits of a packed GEMM and nothing else.
+
+        Args:
+            chunk: list of ``((traj_uid, turn_step), row_dict)`` as queued by the
+                rollout loop. Rows carry the four model-input tensors and their
+                ``task_name``.
+
+        Returns:
+            ``{(traj_uid, turn_step): tensor-or-tuple}`` in the same form
+            ``compute_teacher_log_probs`` writes: a ``(resp, k)`` log-prob/id pair
+            under top-k, else a ``(resp,)`` log-prob row.
+        """
+        by_task = {}
+        for key, row in chunk:
+            task = self._normalize_task_name(row.get("task_name"))
+            by_task.setdefault(task, []).append((key, row))
+
+        out = {}
+        for task, entries in by_task.items():
+            wg = self.teacher_wg.get(task)
+            if wg is None:
+                # Unknown task: leave it queued-but-unscored. compute_teacher_log_probs
+                # raises on it with the full list of configured teachers, which is a
+                # better error than one from a background thread.
+                continue
+            sub = DataProto.from_dict(
+                tensors={
+                    name: torch.stack([row[name] for _, row in entries])
+                    for name in ("input_ids", "attention_mask", "position_ids", "responses")
+                },
+            )
+            # Same dispatch as the post-rollout path: chunks are not divisible by
+            # the teacher group's world size, so let DP_COMPUTE_PROTO pad and unpad.
+            sub.meta_info = {DataProtoConfig.auto_padding_key: True}
+            if self.teacher_topk_kl:
+                sub.meta_info["topk_k"] = self.teacher_kl_topk
+                scored = wg.compute_ref_topk_log_prob(sub)
+                tlp = scored.batch["teacher_topk_logprobs"]
+                tid = scored.batch["teacher_topk_ids"]
+                for j, (key, _) in enumerate(entries):
+                    out[key] = (tlp[j], tid[j])
+            else:
+                scored = wg.compute_ref_log_prob(sub)
+                lp = scored.batch["ref_log_prob"]
+                for j, (key, _) in enumerate(entries):
+                    out[key] = lp[j]
+        return out
+
+    def _prefetched_teacher_rows(self, batch: DataProto):
+        """Row index -> prefetch key, for the rows a prefetch could have covered.
+
+        ``None`` when the batch carries no trajectory identity (validation, or a
+        recipe that does not record turn_step), which disables the merge.
+        """
+        traj_uid = batch.non_tensor_batch.get("traj_uid", None)
+        turn_step = batch.non_tensor_batch.get("turn_step", None)
+        if traj_uid is None or turn_step is None:
+            return None
+        # adjust_batch's duplicates share their original's key, so two rows can map
+        # to the same entry -- reading it twice is what makes them duplicates.
+        return {i: (str(traj_uid[i]), int(turn_step[i])) for i in range(len(batch))}
+
+    def compute_teacher_log_probs(self, batch: DataProto, prefetched=None, metrics=None) -> None:
         """Route each sample to its task's teacher and write the distillation
         signal into ``batch.batch`` in original order.
 
@@ -262,6 +332,10 @@ class OPDRayTrainer(RayPPOTrainer):
         - default (single-token estimator): sets ``teacher_log_probs`` (bs, resp).
         - top-k mode: sets ``teacher_topk_logprobs`` and ``teacher_topk_ids``
           (bs, resp, k), the teacher's top-k log-softmax and ids per token.
+
+        ``prefetched`` holds rows already scored during the rollout (see
+        ``_teacher_prefetch_chunk``); those are filled in here and excluded from
+        the per-task calls below, so each row is scored exactly once either way.
         """
         task_names = batch.non_tensor_batch.get("task_name", None)
         assert task_names is not None, "OPD requires task_name on every sample for teacher routing"
@@ -278,8 +352,24 @@ class OPDRayTrainer(RayPPOTrainer):
         else:
             teacher_log_probs = torch.zeros((bs, resp_len), dtype=torch.float32)
 
+        keys = self._prefetched_teacher_rows(batch) if prefetched else None
+        if keys is not None:
+            for i, key in keys.items():
+                hit = prefetched.get(key)
+                if hit is None:
+                    continue
+                if self.teacher_topk_kl:
+                    teacher_topk_logprobs[i], teacher_topk_ids[i] = hit
+                else:
+                    teacher_log_probs[i] = hit
+                seen[i] = True
+        if metrics is not None:
+            n_hit = sum(seen)
+            metrics["teacher_prefetch/rows"] = n_hit
+            metrics["teacher_prefetch/hit_rate"] = n_hit / bs if bs else 0.0
+
         for task, wg in self.teacher_wg.items():
-            idxs = [i for i, t in enumerate(normalized) if t == task]
+            idxs = [i for i, t in enumerate(normalized) if t == task and not seen[i]]
             if not idxs:
                 continue
             sub = batch.select_idxs(idxs)
@@ -405,6 +495,10 @@ class OPDRayTrainer(RayPPOTrainer):
                             actor_rollout_wg=self.actor_rollout_wg,
                             envs=self.envs,
                             is_train=True,
+                            # Score finished trajectories under the rollout's own
+                            # CPU glue instead of after it; a no-op unless
+                            # ROLLOUT_PREFETCH_TEACHER is on.
+                            teacher_prefetch_fn=self._teacher_prefetch_chunk,
                         )
 
                     # The train envs are idle from here until the next rollout;
@@ -482,7 +576,11 @@ class OPDRayTrainer(RayPPOTrainer):
                     # ---- Per-task teacher forward pass (the only training signal) ----
                     with _timer("teacher_forward", timing_raw):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
-                        self.compute_teacher_log_probs(batch)
+                        self.compute_teacher_log_probs(
+                            batch,
+                            prefetched=self.traj_collector.take_prefetched_teacher(),
+                            metrics=metrics,
+                        )
 
                     # tag rows with their task so the actor can split its metrics
                     self._attach_task_ids(batch)

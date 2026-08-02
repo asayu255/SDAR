@@ -59,10 +59,26 @@ set -x
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations file — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
+#   ROLLOUT_PREFETCH_TEACHER=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
 #   old_log_prob phase, so prefetched values would never be consumed.
+#
+# ROLLOUT_PREFETCH_TEACHER scores finished trajectories with their task's teacher
+# during the rollout instead of after it. What it fills is the driver's own CPU
+# time — decode, envs.step, the next turn's tokenization — measured at 18% of the
+# rollout with the GPU at 0. It does NOT fill the alfworld generation tail: the
+# teachers share one WorkerDict per GPU with the rollout (init_workers ->
+# create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
+# teacher call issued during generate_sequences would only queue behind it.
+# Bound accordingly — the whole teacher phase cannot disappear, only the part
+# that fits in the glue. ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128 rows) sets
+# how much is attempted per turn; the turn table's tchWait column shows what did
+# not fit. Frozen teachers, so the targets do not depend on when a row is scored,
+# but a row lands in a different micro-batch than the post-rollout path would put
+# it in, which moves the last bits of a packed GEMM — same class as
+# no_sync_grad_accum, not bit-identical.
 #
 # Actor-update mechanisms (config, not env vars). These target the PCIe
 # collectives: tamago's two GPUs have no NVLink, so every FSDP all-gather and
