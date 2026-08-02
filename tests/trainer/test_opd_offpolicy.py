@@ -367,3 +367,64 @@ def test_topk_teacher_kl_matches_opd_loss():
     shifted_student = teacher + torch.tensor([0.5, -0.3, 0.1, -0.2])
     diverged = topk_kl_per_token(student_topk_logprob=shifted_student, teacher_topk_logprob=teacher)
     assert (diverged.abs() > 1e-4).any()
+
+
+def _resume_uids(data_dir, steps, skip=0, per_task=2, seed=3):
+    """The traj_uids each step would train on, starting from a resume point."""
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(data_dir)
+    trainer._load_offpolicy_data()
+    trainer.per_task_traj_per_step = per_task
+    trainer.total_training_steps = steps
+    trainer.config = OmegaConf.create({"data": {"seed": seed}})
+    trainer._prepare_batch = lambda b: (b, {})  # no workers in this test
+    return [b.non_tensor_batch["traj_uid"].tolist()
+            for b, _ in trainer._prepared_batch_iter(skip=skip)]
+
+
+def test_resume_continues_the_draw_sequence_instead_of_restarting_it(tmp_path):
+    """The property a resumed run has to preserve, for both arms.
+
+    _load_checkpoint restores global_steps, but the draw sequence lives in a
+    plain generator created fresh in _offpolicy_batch_iter. Without the replay,
+    resuming at step k re-trained on draws 1..N-k and never saw the tail --
+    breaking "36000 trajectories == exactly one epoch, no replay" with nothing
+    in the metrics to show it, and differently for each arm that resumed.
+    """
+    for task in ("alfworld", "search"):
+        _tagged(_make_task_proto(task, 40, turns_per_traj=1)).save_to_disk(str(tmp_path / f"{task}.pt"))
+
+    whole = _resume_uids(tmp_path, 10)
+    assert len(whole) == 10
+
+    resumed = _resume_uids(tmp_path, 10, skip=6)
+    assert len(resumed) == 4
+    assert resumed == whole[6:]
+    # And specifically NOT the start of the sequence, which is the old behaviour.
+    assert resumed != whole[:4]
+
+
+def test_replay_refuses_a_checkpoint_from_beyond_the_end(tmp_path):
+    """A skip past the horizon means the checkpoint and the config disagree;
+    silently yielding nothing would look like an instant, successful run."""
+    _tagged(_make_task_proto("search", 10, turns_per_traj=1)).save_to_disk(str(tmp_path / "search.pt"))
+    with pytest.raises(AssertionError, match="steps are done"):
+        _resume_uids(tmp_path, 5, skip=6)
+
+
+def test_replay_runs_prepare_batch_so_the_global_rng_advances(tmp_path):
+    """adjust_batch draws its duplicate-row indices from the GLOBAL numpy RNG.
+    Skipping only the draw would leave that stream at the wrong position and
+    every later step would pad different rows -- silently."""
+    _tagged(_make_task_proto("alfworld", 20, turns_per_traj=1)).save_to_disk(str(tmp_path / "alfworld.pt"))
+    trainer = _bare_trainer()
+    trainer.teacher_data_dir = str(tmp_path)
+    trainer._load_offpolicy_data()
+    trainer.per_task_traj_per_step = 2
+    trainer.total_training_steps = 8
+    trainer.config = OmegaConf.create({"data": {"seed": 5}})
+
+    prepared = []
+    trainer._prepare_batch = lambda b: (prepared.append(len(b)), (b, {}))[1]
+    list(trainer._prepared_batch_iter(skip=3))
+    assert len(prepared) == 8, "every replayed step must go through _prepare_batch"

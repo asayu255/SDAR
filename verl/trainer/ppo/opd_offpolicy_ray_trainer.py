@@ -28,6 +28,7 @@ import glob
 import os
 import queue
 import threading
+import time
 from pprint import pprint
 
 import numpy as np
@@ -675,8 +676,64 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         batch.batch["sft_loss_weight"] = weights
         metrics["sft/padding_rows"] = len(batch) - n_real
 
-    def _prepared_batch_iter(self):
+    def _skip_consumed_steps(self, source, skip: int) -> None:
+        """Replay and discard the first ``skip`` steps of the draw sequence.
+
+        ``_load_checkpoint`` restores the model, the optimizer and
+        ``global_steps``, but the thing that decides WHICH trajectories a step
+        trains on is a plain Python generator created fresh in
+        ``_offpolicy_batch_iter`` -- seeded RNG, per-task cursors, no state
+        anywhere. A resumed run therefore restarted the draw sequence at step 1:
+        resuming at step 125 of 300 re-trained on draws 1..175 and never saw the
+        last 125. That silently breaks the property the pool is sized for
+        (36000 trajectories = exactly one epoch over 300 steps, no replay), and
+        nothing in the metrics shows it. Both arms that inherit this loop -- the
+        off-policy KD one and MultiTaskSFTTrainer -- were affected the same way,
+        so a resumed run of either would also stop being comparable with the
+        other.
+
+        The inherited ``_save_checkpoint`` does persist ``train_dataloader``
+        state, which is why this went unnoticed -- but that loader drives Stage 1
+        and validation, not this loop.
+
+        Replay rather than a saved cursor because the sequence is deterministic:
+        ``_offpolicy_batch_iter`` seeds ``default_rng(data.seed)`` and consumes
+        its permutations in order. Replaying is exact and needs no new
+        checkpoint format, so a checkpoint written before this existed resumes
+        correctly too.
+
+        The discarded steps go through ``_prepare_batch`` as well, not just the
+        draw. ``adjust_batch`` takes its duplicate-row indices from the *global*
+        numpy RNG, so skipping the preparation would leave that stream at the
+        wrong position and every later step would pad different rows. (With the
+        current 4260-row step that call returns early on a zero remainder and
+        consumes nothing -- but the parity should not depend on a batch size
+        that happens to divide.)
+        """
+        if skip <= 0:
+            return
+        assert skip <= self.total_training_steps, (
+            f"checkpoint says {skip} steps are done, but the run is only "
+            f"{self.total_training_steps} steps long"
+        )
+        print(f"[OPD-offpolicy] resuming at step {skip + 1}: replaying {skip} draw(s) "
+              f"so the trajectory sequence continues where it stopped", flush=True)
+        start = time.monotonic()
+        for i in range(skip):
+            self._prepare_batch(next(source))
+            # Long enough to look like a hang otherwise: each replayed step draws
+            # a few thousand rows out of the pool and prepares them.
+            if (i + 1) % 25 == 0:
+                print(f"[OPD-offpolicy] replayed {i + 1}/{skip} draws "
+                      f"({time.monotonic() - start:.0f}s)", flush=True)
+        print(f"[OPD-offpolicy] replay done in {time.monotonic() - start:.0f}s", flush=True)
+
+    def _prepared_batch_iter(self, skip: int = 0):
         """Yield ``(batch, prep_metrics)`` ready to dispatch.
+
+        ``skip`` replays and discards that many steps before yielding, which is
+        what makes a resumed run continue the draw sequence instead of restarting
+        it -- see ``_skip_consumed_steps``.
 
         With ``OFFPOLICY_BATCH_PREFETCH=1`` the draw + _prepare_batch for step
         k+1 runs on a background thread while step k is inside update_actor,
@@ -704,6 +761,10 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         is queued, which would put three prepared batches in memory at once.
         """
         source = self._offpolicy_batch_iter()
+        # Before anything else, and in particular before the prefetch thread
+        # exists: the replay has to be the only consumer of both RNG streams
+        # while it runs, and it has to finish in step order.
+        self._skip_consumed_steps(source, skip)
         if not _BATCH_PREFETCH:
             for raw in source:
                 yield self._prepare_batch(raw)
@@ -760,6 +821,10 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        # Captured here rather than read inside the generator: the generator body
+        # does not run until the first next(), by which point global_steps has
+        # already been incremented below, and the off-by-one would be silent.
+        consumed_steps = self.global_steps
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
@@ -773,7 +838,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self.global_steps += 1
         last_val_metrics = None
 
-        for batch, prep_metrics in self._prepared_batch_iter():
+        for batch, prep_metrics in self._prepared_batch_iter(skip=consumed_steps):
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
