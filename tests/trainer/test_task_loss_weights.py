@@ -12,6 +12,8 @@ same formula as ``DataParallelPPOActor.update_policy``) rather than by standing
 up FSDP.
 """
 
+import math
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -57,21 +59,25 @@ def _replay_actor(batch, per_token_loss, *, mini_batch_size, dp_world_size, micr
     bs = len(batch)
     per_rank = bs // dp_world_size
     mini_per_rank = mini_batch_size // dp_world_size
+    # The CONFIGURED value, which is what update_policy divides by even when the
+    # final mini-batch is short and yields fewer micro-batches than this.
     gradient_accumulation = mini_per_rank // micro_batch_size
-    num_mini_batches = bs // mini_batch_size
+    num_mini_batches = math.ceil(bs / mini_batch_size)
 
     step_losses = []
     for mb in range(num_mini_batches):
         rank_losses = []
         for rank in range(dp_world_size):
             base = rank * per_rank + mb * mini_per_rank
+            stop = min(base + mini_per_rank, (rank + 1) * per_rank)  # short tail
             total = 0.0
-            for micro in range(gradient_accumulation):
-                lo = base + micro * micro_batch_size
-                hi = lo + micro_batch_size
+            lo = base
+            while lo < stop:
+                hi = min(lo + micro_batch_size, stop)
                 weighted = float((row_loss[lo:hi] * weights[lo:hi]).sum())
                 weighted = weighted * dp_world_size * gradient_accumulation
                 total += weighted / gradient_accumulation  # loss = policy_loss / grad_accum
+                lo = hi
             rank_losses.append(total)
         step_losses.append(sum(rank_losses) / dp_world_size)  # FSDP averages the ranks
     return sum(step_losses) / len(step_losses)
@@ -129,10 +135,15 @@ def test_padding_rows_get_zero_weight_and_do_not_dilute():
     assert float(weights[2]) == pytest.approx(2 / (2 * 8))
 
 
-def test_indivisible_batch_is_rejected():
+def test_indivisible_batch_counts_the_short_final_mini_batch():
+    """adjust_batch rounds to lcm(log_prob_micro*W, ppo_micro*W), not to the
+    mini-batch size, so most batches end with a short mini-batch. The scale must
+    follow the number of optimizer steps that produces, i.e. the ceiling."""
     batch = _make_batch(["alfworld"] * 5, [4] * 5)
-    with pytest.raises(AssertionError, match="not divisible by ppo_mini_batch_size"):
-        attach_task_loss_weights(batch, n_real=5, mini_batch_size=2, metrics={})
+    attach_task_loss_weights(batch, n_real=5, mini_batch_size=2, metrics={})
+
+    # 5 rows / 2 = 3 optimizer steps (2 + 2 + 1), one task, 20 tokens total
+    assert float(batch.batch[TASK_LOSS_WEIGHT_KEY][0]) == pytest.approx(3 / (1 * 20))
 
 
 def test_missing_task_names_are_rejected():
@@ -203,32 +214,44 @@ def test_step_loss_is_invariant_to_micro_batch_grouping():
     assert a == pytest.approx(b, rel=1e-9)
 
 
-def test_both_distillation_terms_share_one_set_of_weights():
-    """kl_coef * KL + sft_coef * CE stays that objective under normalisation.
+def test_short_final_mini_batch_keeps_the_equal_share():
+    """The real failure: 6880 rows against ppo_mini_batch_size 60.
 
-    Both terms are weighted by the same per-row numbers, so normalising per task
-    redistributes across tasks without touching the coefficient ratio the run
-    pins: the step's loss is the coefficient-weighted sum of each term's own
-    equal-share token-mean.
+    adjust_batch rounds to lcm(log_prob_micro*W, ppo_micro*W) = 160, so the row
+    count is a multiple of 160 and only every third step is also a multiple of
+    60. The short mini-batch that leaves needs no special handling: update_policy
+    divides by the CONFIGURED gradient_accumulation and the weights multiply by
+    the same constant, so they cancel whatever the mini-batch's length.
     """
-    tasks = ["alfworld", "webshop", "search"] * 8
-    tokens = [32, 12, 2] * 8
+    # 30 rows, mini-batch 12 -> 12 + 12 + 6, i.e. a short final mini-batch.
+    tasks = ["alfworld", "webshop", "search"] * 10
+    tokens = [32, 12, 2] * 10
     batch = _make_batch(tasks, tokens)
-    attach_task_loss_weights(batch, n_real=24, mini_batch_size=12, metrics={})
+    attach_task_loss_weights(batch, n_real=30, mini_batch_size=12, metrics={})
 
     mask = batch.batch["response_mask"]
-    torch.manual_seed(2)
-    kl = torch.rand(mask.shape, dtype=torch.float64) * mask
-    ce = torch.rand(mask.shape, dtype=torch.float64) * mask
-    kl_coef, sft_coef = 1.0, 0.25
+    torch.manual_seed(3)
+    per_token_loss = torch.rand(mask.shape, dtype=torch.float64) * mask
 
-    kwargs = dict(mini_batch_size=12, dp_world_size=2, micro_batch_size=3)
-    got = kl_coef * _replay_actor(batch, kl, **kwargs) + sft_coef * _replay_actor(batch, ce, **kwargs)
+    got = _replay_actor(
+        batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
+    )
+    expected = sum(
+        _token_mean(per_token_loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
+        for task in ("alfworld", "webshop", "search")
+    )
+    assert got == pytest.approx(expected, rel=1e-9)
 
-    def equal_share(loss):
-        return sum(
-            _token_mean(loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
-            for task in ("alfworld", "webshop", "search")
-        )
 
-    assert got == pytest.approx(kl_coef * equal_share(kl) + sft_coef * equal_share(ce), rel=1e-9)
+def test_short_final_mini_batch_keeps_the_magnitude():
+    """A uniform per-token loss still comes out at its own value, not scaled."""
+    tasks = ["alfworld", "webshop", "search"] * 10
+    tokens = [32, 12, 2] * 10
+    batch = _make_batch(tasks, tokens)
+    attach_task_loss_weights(batch, n_real=30, mini_batch_size=12, metrics={})
+
+    mask = batch.batch["response_mask"]
+    got = _replay_actor(
+        batch, mask.double() * 0.5, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
+    )
+    assert got == pytest.approx(0.5, rel=1e-9)
