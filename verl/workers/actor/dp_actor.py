@@ -111,6 +111,33 @@ def _actor_phase(name: str):
         gpu_profiler.pop_phase(name)
 
 
+def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: int):
+    """Which unpadded rows land in the response slice, and where.
+
+    ``indices`` is what ``unpad_input`` returns: for each row of the packed
+    (total_nnz, ...) batch, its position in the flattened (batch * seqlen) grid.
+    The distillation path only ever reads ``[:, -response_length - 1 : -1]`` of
+    the re-padded result, so every row outside that window is vocab-sized work
+    thrown away -- see the caller in ``_forward_micro_batch``.
+
+    The window is offset by one because a logit at position ``t`` predicts the
+    token at ``t + 1``: predicting the ``response_length`` response tokens needs
+    positions ``seqlen - response_length - 1 .. seqlen - 2``.
+
+    Returns:
+        sel: row numbers into the packed batch, ascending.
+        sel_indices: ``indices[sel]``, i.e. their flattened grid positions, so
+            ``pad_input`` can scatter results straight back.
+        sel_slot: each selected row's column in a (bs, response_length, ...)
+            tensor, for reading per-response-token inputs without first
+            scattering them across the full sequence.
+    """
+    seq_pos = indices % seqlen
+    lo = seqlen - response_length - 1
+    sel = torch.nonzero((seq_pos >= lo) & (seq_pos < seqlen - 1), as_tuple=True)[0]
+    return sel, indices[sel], seq_pos[sel] - lo
+
+
 def _grad_sync_context(module, active: bool):
     """FSDP's no_sync() for one micro-batch, or None when it does not apply.
 
@@ -330,25 +357,43 @@ class DataParallelPPOActor(BasePPOActor):
                 if topk_k is not None or topk_ids is not None:
                     if self.use_fused_kernels or self.use_ulysses_sp:
                         raise NotImplementedError("top-k KL forward is not supported with fused kernels or ulysses SP")
-                    lse = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)  # (total_nnz, 1)
+                    # Restrict the vocab-sized work to the rows that survive the slice
+                    # at the end of this block. logits_rmpad covers prompt AND response,
+                    # and on this mixture the mean prompt is ~3x the mean response, so
+                    # roughly three quarters of the rows were being logsumexp'd, top-k'd
+                    # and gathered only for pad_input to scatter them somewhere the
+                    # slice drops. On the student side that waste sat inside the
+                    # autograd graph, so the backward paid for it a second time.
+                    #
+                    # Values are unchanged. A row outside the window can only land
+                    # outside the slice, and a window position missing from rmpad
+                    # (attention_mask==0, i.e. response padding) is zero-filled by
+                    # pad_input whether or not any row was scattered elsewhere.
+                    #
+                    # Cost: one (n_resp, vocab) copy of the selected logits. It is a
+                    # quarter of logits_rmpad, which is live either way.
+                    sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
+                    logits_resp = logits_rmpad[sel]  # (n_resp, vocab)
+                    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
                     if topk_k is not None:
-                        tvals, tids = torch.topk(logits_rmpad, k=topk_k, dim=-1)  # (total_nnz, k)
+                        tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)  # (n_resp, k)
                         # Use float32 for pad_input: bf16 cannot represent vocab ids
                         # (>256) exactly, and float32 keeps log-probs precise.
                         t_lp_rmpad = (tvals - lse).float()
-                        full_t_lp = pad_input(t_lp_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
-                        full_t_id = pad_input(tids.float(), indices=indices, batch=batch_size, seqlen=seqlen)
+                        full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
+                        full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
                         topk_out = (
                             full_t_lp[:, -response_length - 1 : -1, :],
                             full_t_id[:, -response_length - 1 : -1, :].round().long(),
                         )
                     else:
-                        k = topk_ids.size(-1)
-                        full_ids = torch.zeros((batch_size, seqlen, k), dtype=torch.long, device=logits_rmpad.device)
-                        full_ids[:, -response_length - 1 : -1, :] = topk_ids
-                        ids_rmpad = index_first_axis(rearrange(full_ids, "b s k -> (b s) k"), indices)  # (total_nnz, k)
-                        s_lp_rmpad = (logits_rmpad.gather(-1, ids_rmpad) - lse).float()  # (total_nnz, k), keeps grad
-                        full_s_lp = pad_input(s_lp_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+                        # Read topk_ids (bs, response_len, k) directly at each selected
+                        # row's (sample, response-slot). The old path scattered it into a
+                        # (bs, seqlen, k) zero tensor and gathered that back through
+                        # `indices`, which is the same map computed the long way round.
+                        ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
+                        s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
+                        full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
                         topk_out = full_s_lp[:, -response_length - 1 : -1, :]
 
             else:  # not using rmpad and no ulysses sp
