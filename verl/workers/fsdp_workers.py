@@ -352,9 +352,24 @@ class ActorRolloutRefWorker(Worker):
         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_config)
 
         # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation.
+        #
+        # For the reference / teacher policy, fsdp_config.param_offload decides. It
+        # used to be forced on, which made that key dead: the ref path has no manual
+        # offload (compute_ref_log_prob / compute_ref_topk_log_prob never call
+        # load_fsdp_model_to_gpu), so _is_offload_param was set from it and then read
+        # by nobody, and FSDP did the offloading unconditionally instead.
+        #
+        # The cost of forcing it is paid per all-gather, not per step: FSDP re-fetches
+        # each unit's parameters from CPU on every micro-batch. For the OPD teachers
+        # that is the whole model over PCIe once per micro-batch (measured at 7.6-8.9
+        # GB/s sustained pcieRX through teacher_forward, against ~2 GB/s during gen),
+        # and with no NVLink on the box it competes with the collectives. Keeping the
+        # shards resident costs param_bytes / world_size per teacher and removes it.
+        #
+        # Correctness is not at stake either way here -- the ref runs under no_grad, so
+        # the grad-accumulation problem that forces this off for the actor cannot arise.
+        cpu_offload = None if role == "actor" else (CPUOffload(offload_params=True) if fsdp_config.get("param_offload", False) else None)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
@@ -383,7 +398,9 @@ class ActorRolloutRefWorker(Worker):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
             else:
-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+                # Same rule as the FSDP1 branch above: the ref/teacher honours
+                # fsdp_config.param_offload instead of being forced onto CPU.
+                cpu_offload = None if role == "actor" else (CPUOffloadPolicy(pin_memory=True) if fsdp_config.get("param_offload", False) else None)
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,

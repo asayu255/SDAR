@@ -106,6 +106,12 @@ actor_rollout_ref:
   ref:
     strategy: fsdp
     fsdp_config:
+      # Keep the reference / teacher parameters on CPU, fetched per all-gather.
+      # This used to be forced on regardless of the value here; it now decides.
+      # True is the memory-safe setting and what every recipe in examples/ asks
+      # for. False keeps the shards resident (param_bytes / world_size per ref
+      # model) and removes a full model's worth of PCIe traffic per micro-batch,
+      # which is worth it when the ref is small and the box has no NVLink.
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       wrap_policy:
