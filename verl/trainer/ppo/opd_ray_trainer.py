@@ -40,6 +40,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
+from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 from verl.utils import gpu_profiler
 from verl.utils.metric import reduce_metrics
 
@@ -464,8 +465,33 @@ class OPDRayTrainer(RayPPOTrainer):
                     del batch
                     batch = gen_batch_output
 
+                    # Rows at or past n_real are the duplicates adjust_batch appends
+                    # to reach a DP/micro-divisible count; the per-task weights below
+                    # need to tell them from the trajectories that were rolled out.
+                    n_real = len(batch)
                     batch = adjust_batch(self.config, batch)
                     batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Computed from the pre-reorder row order, but _balance_batch moves
+                    # the column with its rows, so the weights stay attached either way.
+                    if self.config.actor_rollout_ref.actor.get("normalize_loss_by_task", False):
+                        attach_task_loss_weights(
+                            batch,
+                            n_real=n_real,
+                            # Rows in one optimizer step, globally. ppo_mini_batch_size is
+                            # counted in PROMPTS: the worker multiplies it by rollout.n
+                            # (then divides by the DP world size) in
+                            # ActorRolloutRefWorker.__init__. The env recipes leave
+                            # rollout.n at 1 and expand the group in the env manager
+                            # instead, so the factor is usually 1 -- but it decides how
+                            # many optimizer steps a batch becomes, which is what the
+                            # weights are scaled by.
+                            mini_batch_size=(
+                                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                                * self.config.actor_rollout_ref.rollout.n
+                            ),
+                            metrics=metrics,
+                        )
 
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)

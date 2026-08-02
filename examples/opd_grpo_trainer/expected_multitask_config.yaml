@@ -19,11 +19,23 @@
 "algorithm.opd.kl_loss_type": topk_kl
 "algorithm.opd.kl_loss_coef": 1.0
 "algorithm.opd.topk": 20
+# Per-task normalisation of the loss. The plain token-mean weights a task by its
+# share of response tokens, measured at 69/27/4% for alfworld/webshop/search on
+# this mixture purely because of the 50/15/4-turn episode caps; the per-row
+# weights in attach_task_loss_weights make it 1/3 each. On this arm it applies to
+# the GRPO policy gradient as well as the teacher KL -- weighting only one of them
+# would silently change their ratio, which pg_loss_coef is supposed to control.
+# Data composition, batch sizes and step count are untouched, so this arm still
+# differs from the pure-OPD, SFT and offline-KD arms in nothing but the loss --
+# which is exactly why it is pinned: the arms must agree on it or the comparison
+# confounds the objective with the task weighting.
+"algorithm.opd.normalize_loss_by_task": true
 # effective values after main_opd_grpo's injection into the actor config
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
 "actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
 "actor_rollout_ref.actor.teacher_kl_topk": 20
+"actor_rollout_ref.actor.normalize_loss_by_task": true
 
 # ---- GRPO side ----------------------------------------------------------------
 "algorithm.adv_estimator": grpo
