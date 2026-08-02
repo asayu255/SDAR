@@ -29,6 +29,8 @@ signal (on-policy teacher KL, off-policy top-k KL, hard-label CE), so that the
 arms differ in their loss and not in how the tasks are weighted inside it.
 """
 
+import math
+
 import numpy as np
 import torch
 
@@ -70,7 +72,8 @@ def attach_task_loss_weights(
     step would carry ``1/num_mini_batches`` of the step's loss and the effective
     learning rate would collapse. Summed over the step's mini-batches the loss is
     then ``(1/num_tasks) * sum_task token_mean(task)``, i.e. the equal-share
-    token-mean, per optimizer step.
+    token-mean, per optimizer step. A short final mini-batch is fine and is the
+    common case -- see the count below for why.
 
     Rows at or past ``n_real`` are ``adjust_batch``'s padding -- on the on-policy
     path those are duplicated trajectories, on the off-policy path duplicated pool
@@ -103,11 +106,19 @@ def attach_task_loss_weights(
     tasks = sorted({t for t in task_names[:n_real] if t is not None})
     assert tasks, "no task names on the real rows of the batch"
 
-    num_mini_batches = len(batch) / int(mini_batch_size)
-    assert float(num_mini_batches).is_integer(), (
-        f"batch of {len(batch)} rows is not divisible by ppo_mini_batch_size "
-        f"{mini_batch_size}; the per-step loss scale would drift between steps"
-    )
+    # The batch is generally NOT a multiple of the mini-batch size, and does not
+    # need to be. adjust_batch rounds to lcm(log_prob_micro * W, ppo_micro * W)
+    # -- 160 against a mini-batch of 60 on the multitask run -- so the last
+    # mini-batch update_policy splits off is usually short.
+    #
+    # That short mini-batch needs no special handling *here*: update_policy
+    # divides every mini-batch by the CONFIGURED gradient_accumulation and the
+    # weights are multiplied by the same constant, so the two cancel and a
+    # mini-batch contributes exactly the sum of its rows' weighted losses however
+    # many rows it has. num_mini_batches only sets the overall scale, so what it
+    # has to equal is the number of optimizer steps the batch becomes -- which is
+    # what batch.split() produces, i.e. the ceiling.
+    num_mini_batches = math.ceil(len(batch) / int(mini_batch_size))
 
     weights = torch.zeros(len(batch), dtype=torch.float32)
     real_tokens = float(row_tokens[real].sum())
