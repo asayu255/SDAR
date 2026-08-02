@@ -402,3 +402,86 @@ def test_topk_teacher_kl_matches_opd_loss():
     shifted_student = teacher + torch.tensor([0.5, -0.3, 0.1, -0.2])
     diverged = topk_kl_per_token(student_topk_logprob=shifted_student, teacher_topk_logprob=teacher)
     assert (diverged.abs() > 1e-4).any()
+
+
+def test_resume_continues_the_draw_sequence_instead_of_restarting_it(tmp_path):
+    """The property a resumed run has to preserve.
+
+    _load_checkpoint restores global_steps, but the draw sequence lives in a
+    plain generator created fresh in _offpolicy_batch_iter. Without the replay,
+    resuming at step k re-trained on draws 1..N-k and never saw the tail -- which
+    breaks "36000 trajectories == exactly one epoch, no replay" with nothing in
+    the metrics to show it.
+    """
+    for task in ("alfworld", "search"):
+        _tagged(_make_task_proto(task, 40, turns_per_traj=1)).save_to_disk(str(tmp_path / f"{task}.pt"))
+
+    def _uids(steps, skip=0):
+        trainer = _bare_trainer()
+        _load_from(tmp_path, trainer)
+        trainer.per_task_traj_per_step = 2
+        trainer.total_training_steps = steps
+        trainer.config = OmegaConf.create({"data": {"seed": 3}})
+        trainer._prepare_batch = lambda b: (b, {})  # no workers here
+        return [b.non_tensor_batch["traj_uid"].tolist()
+                for b, _ in trainer._prepared_batch_iter(skip=skip)]
+
+    whole = _uids(10)
+    assert len(whole) == 10
+
+    # Resuming after 6 steps must yield exactly steps 7..10 of the same sequence.
+    resumed = _uids(10, skip=6)
+    assert len(resumed) == 4
+    assert resumed == whole[6:]
+
+    # And specifically NOT the start of the sequence, which is the old behaviour.
+    assert resumed != whole[:4]
+
+
+def test_replaying_zero_steps_is_the_fresh_run(tmp_path):
+    _tagged(_make_task_proto("webshop", 20, turns_per_traj=1)).save_to_disk(str(tmp_path / "webshop.pt"))
+
+    def _uids(skip):
+        trainer = _bare_trainer()
+        _load_from(tmp_path, trainer)
+        trainer.per_task_traj_per_step = 3
+        trainer.total_training_steps = 5
+        trainer.config = OmegaConf.create({"data": {"seed": 7}})
+        trainer._prepare_batch = lambda b: (b, {})
+        return [b.non_tensor_batch["traj_uid"].tolist()
+                for b, _ in trainer._prepared_batch_iter(skip=skip)]
+
+    assert _uids(0) == _uids(0)          # deterministic to begin with
+    assert len(_uids(0)) == 5
+
+
+def test_replay_refuses_a_checkpoint_from_beyond_the_end(tmp_path):
+    """A skip past the horizon means the checkpoint and the config disagree;
+    silently yielding nothing would look like an instant, successful run."""
+    _tagged(_make_task_proto("search", 10, turns_per_traj=1)).save_to_disk(str(tmp_path / "search.pt"))
+    trainer = _bare_trainer()
+    _load_from(tmp_path, trainer)
+    trainer.per_task_traj_per_step = 2
+    trainer.total_training_steps = 5
+    trainer.config = OmegaConf.create({"data": {"seed": 1}})
+    trainer._prepare_batch = lambda b: (b, {})
+
+    with pytest.raises(AssertionError, match="steps are done"):
+        list(trainer._prepared_batch_iter(skip=6))
+
+
+def test_replay_runs_prepare_batch_so_the_global_rng_advances(tmp_path):
+    """adjust_batch draws its duplicate-row indices from the GLOBAL numpy RNG.
+    Skipping only the draw would leave that stream at the wrong position and
+    every later step would pad different rows -- silently."""
+    _tagged(_make_task_proto("alfworld", 20, turns_per_traj=1)).save_to_disk(str(tmp_path / "alfworld.pt"))
+    trainer = _bare_trainer()
+    _load_from(tmp_path, trainer)
+    trainer.per_task_traj_per_step = 2
+    trainer.total_training_steps = 8
+    trainer.config = OmegaConf.create({"data": {"seed": 5}})
+
+    prepared = []
+    trainer._prepare_batch = lambda b: (prepared.append(len(b)), (b, {}))[1]
+    list(trainer._prepared_batch_iter(skip=3))
+    assert len(prepared) == 8, "every replayed step must go through _prepare_batch"
