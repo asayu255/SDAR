@@ -181,6 +181,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     +algorithm.opd.sft_loss_coef=1.0 \
+    +algorithm.opd.normalize_loss_by_task=True \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample=True \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature=0 \

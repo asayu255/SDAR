@@ -43,6 +43,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
 )
 from verl.trainer.ppo.opd_ray_trainer import compute_opd_data_metrics, compute_opd_data_metrics_by_task
+from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _timer,
@@ -670,12 +671,34 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         # compute_response_mask's cumsums here, the embedding lookup and the
         # top-k torch.gather in the workers -- sees the int64 it always saw.
         restore_compute_dtypes(batch)
+        # Rows at or past n_real are the duplicates adjust_batch appends to reach a
+        # DP/micro-divisible count; the per-task weights below need to tell them
+        # from the pool rows this step actually drew.
+        n_real = len(batch)
         # Stage 2 keeps adjust_batch: unlike Stage 1 it is load-bearing here.
         # _balance_batch's partitioner requires a row count divisible by the DP
         # world size, and update_policy scales every mini-batch by the *configured*
         # gradient_accumulation, so a ragged final mini-batch would be mis-scaled.
         batch = adjust_batch(self.config, batch)
         batch.batch["response_mask"] = compute_response_mask(batch)
+        # Computed from the pre-reorder row order, but _balance_batch moves the
+        # column with its rows, so the weights stay attached either way.
+        if self.config.actor_rollout_ref.actor.get("normalize_loss_by_task", False):
+            attach_task_loss_weights(
+                batch,
+                n_real=n_real,
+                # Rows in one optimizer step, globally. ppo_mini_batch_size is counted
+                # in PROMPTS: the worker multiplies it by rollout.n (then divides by
+                # the DP world size) in ActorRolloutRefWorker.__init__. The env recipes
+                # leave rollout.n at 1 and expand the group in the env manager instead,
+                # so the factor is usually 1 -- but it decides how many optimizer steps
+                # a batch becomes, which is what the weights are scaled by.
+                mini_batch_size=(
+                    self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    * self.config.actor_rollout_ref.rollout.n
+                ),
+                metrics=prep_metrics,
+            )
         if self.config.trainer.balance_batch:
             self._balance_batch(batch, metrics=prep_metrics)
         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

@@ -85,6 +85,13 @@ class OPDOffPolicyTaskRunner:
             config.actor_rollout_ref.actor.sft_loss_coef = (
                 float(sft_loss_coef) if sft_loss_coef is not None else 0.0
             )
+            # Equal per-task share of the distillation loss (both terms), instead
+            # of the token-count share the plain token-mean gives. Scientific knob,
+            # so it is surfaced under algorithm.opd like the other loss settings and
+            # pinned in the expectations file rather than left to the actor default.
+            config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
+                "normalize_loss_by_task", False
+            )
             config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
             config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
             config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

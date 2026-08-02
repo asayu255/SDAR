@@ -50,6 +50,22 @@
 "actor_rollout_ref.actor.use_sft_loss": true
 "actor_rollout_ref.actor.sft_loss_coef": 1.0
 
+# ---- per-task normalisation of the loss above ------------------------------------
+# The plain token-mean weights a task by its share of response tokens, measured at
+# 69/27/4% for alfworld/webshop/search on these pools purely because of the
+# 50/15/4-turn episode caps; the per-row weights in attach_task_loss_weights make
+# it 1/3 each. Both terms of the loss are weighted by the same numbers, so the
+# kl_loss_coef : sft_loss_coef ratio pinned above is untouched, as are the pool
+# sizes, data composition and epoch count.
+#
+# Pinned rather than left with the throughput knobs because the three arms
+# (on-policy OPD, this one, multitask SFT) must agree on it: the SFT arm has
+# normalised per task from the start, so a run of this arm without it would make
+# the arms differ in the task weighting as well as in the objective, and the
+# comparison would not attribute the difference to the loss.
+"algorithm.opd.normalize_loss_by_task": true
+"actor_rollout_ref.actor.normalize_loss_by_task": true
+
 # ---- distillation invariants (nothing beyond those two terms enters the loss) --
 "algorithm.adv_estimator": grpo
 "algorithm.use_kl_in_reward": false

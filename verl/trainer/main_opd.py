@@ -61,6 +61,12 @@ class OPDTaskRunner:
             config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
             # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
             config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
+            # Equal per-task share of the teacher-KL loss, instead of the token-count
+            # share the plain token-mean gives. Scientific knob, so it is surfaced
+            # under algorithm.opd like the other loss settings.
+            config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
+                "normalize_loss_by_task", False
+            )
             config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
             config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
             config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

@@ -32,6 +32,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
+from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
@@ -558,6 +559,48 @@ class DataParallelPPOActor(BasePPOActor):
         task_id_names = data.meta_info.get("task_id_names", None)
         if "task_ids" in data.batch.keys():
             select_keys.append("task_ids")
+        # Per-task normalised distillation loss: the driver attaches a per-row weight
+        # (see verl/trainer/ppo/task_loss_weights.py) that makes each task's share of
+        # the loss 1/num_tasks instead of its share of the response tokens. Absent ->
+        # plain token-mean, i.e. nothing below changes. Both distillation terms (the
+        # top-k KL and the hard-label CE) are weighted by it, so their sum stays the
+        # objective the run declares.
+        task_weighted = TASK_LOSS_WEIGHT_KEY in data.batch.keys()
+        if task_weighted:
+            select_keys.append(TASK_LOSS_WEIGHT_KEY)
+            # The weights encode the whole normalisation, which these three would
+            # each re-scale out from under it.
+            assert not self.config.use_dynamic_bsz, (
+                "per-task loss normalisation is incompatible with use_dynamic_bsz "
+                "(its mini-batch scaling assumes an unweighted token-mean)"
+            )
+            assert self.ulysses_sequence_parallel_size == 1, (
+                "per-task loss normalisation assumes DP size == world size; "
+                f"got ulysses_sequence_parallel_size={self.ulysses_sequence_parallel_size}"
+            )
+            assert self.config.ppo_epochs == 1, (
+                "per-task loss normalisation assumes one pass over each mini-batch; "
+                f"got ppo_epochs={self.config.ppo_epochs}"
+            )
+            # Any term that is not weighted the same way would be added to a
+            # differently-normalised number.
+            assert use_teacher_kl_loss or self.config.get("use_sft_loss", False), (
+                "per-task loss normalisation has nothing to normalise: neither "
+                "use_teacher_kl_loss nor use_sft_loss is set"
+            )
+            for other in ("use_kl_loss", "use_sdl_loss", "use_sdar_loss"):
+                assert not self.config.get(other, False), (
+                    f"per-task loss normalisation requires the distillation terms to be "
+                    f"the only loss terms, but {other} is set"
+                )
+            assert pg_loss_coef == 0 and self.config.entropy_coeff == 0, (
+                "per-task loss normalisation requires the distillation terms to be the "
+                f"only loss terms, but pg_loss_coef={pg_loss_coef} "
+                f"entropy_coeff={self.config.entropy_coeff}"
+            )
+            self.task_dp_world_size = (
+                torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+            )
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -634,10 +677,27 @@ class DataParallelPPOActor(BasePPOActor):
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
+                    task_loss_weight = data[TASK_LOSS_WEIGHT_KEY] if task_weighted else None
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
+
+                    def _task_weighted(loss_mat):
+                        """The per-task normalised counterpart of ``agg_loss``.
+
+                        The driver put a weight on every row such that summing
+                        weight * row-loss over the whole step gives each task an
+                        equal share (see attach_task_loss_weights). The two
+                        divisions that sum must survive are undone here rather
+                        than by special-casing the shared scaling below: FSDP
+                        averages gradients across the DP ranks, and the mini-batch
+                        loss is divided by gradient_accumulation, but the weights
+                        already carry the full normalisation.
+                        """
+                        row_loss = (loss_mat * response_mask).sum(-1)
+                        weighted = (row_loss * task_loss_weight).sum()
+                        return weighted * (self.task_dp_world_size * self.gradient_accumulation)
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -759,10 +819,23 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
-                        policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                        if task_loss_weight is None:
+                            policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                        else:
+                            weighted_teacher_kl = _task_weighted(teacher_kld)
+                            policy_loss = policy_loss + weighted_teacher_kl * teacher_kl_coef
+                            # Appended, not assigned: assignment kept only the LAST
+                            # micro-batch, which after _balance_batch's reorder is often
+                            # entirely adjust_batch padding -- weight 0, so the logged
+                            # value sat at 0.000 while the real loss was fine.
+                            _defer("actor/teacher_kl_loss_weighted", weighted_teacher_kl)
                         # Deferred, and appended rather than assigned: assignment kept
                         # only the LAST micro-batch, which after _balance_batch's
                         # reorder is often entirely adjust_batch padding.
+                        #
+                        # Kept unweighted so it stays comparable with runs that do not
+                        # normalise per task -- and so the KL/CE ratio below is read on
+                        # one consistent scale.
                         _defer("actor/teacher_kl_loss", teacher_kl_loss)
                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
@@ -783,7 +856,15 @@ class DataParallelPPOActor(BasePPOActor):
                         # actor/teacher_kl_loss in wandb to see the ratio move.
                         sft_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         sft_coef = self.config.get("sft_loss_coef", 1.0)
-                        policy_loss = policy_loss + sft_loss * sft_coef
+                        if task_loss_weight is None:
+                            policy_loss = policy_loss + sft_loss * sft_coef
+                        else:
+                            # Same weights as the KL term above, so normalising per task
+                            # does not disturb the kl_coef : sft_coef ratio the run pins.
+                            weighted_sft = _task_weighted(-log_prob)
+                            policy_loss = policy_loss + weighted_sft * sft_coef
+                            _defer("actor/sft_loss_weighted", weighted_sft)
+                        # Unweighted, for the same reason as actor/teacher_kl_loss.
                         _defer("actor/sft_loss", sft_loss)
                         metrics["actor/sft_coef"] = sft_coef
 
