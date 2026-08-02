@@ -32,7 +32,14 @@ set -x
 #     and same weights as that arm, so the arms differ in the loss only.
 # Teachers: per-task single-task RL checkpoints, created as role="ref" worker
 #   groups (they reuse actor_rollout_ref.ref.* settings: log-prob micro batch,
-#   FSDP CPUOffload); each sample is distilled from the teacher of its task.
+#   FSDP param_offload); each sample is distilled from the teacher of its task.
+#   ref.fsdp_config.param_offload=False keeps the teacher shards resident on GPU.
+#   With them on CPU, FSDP re-fetches every unit's parameters from host memory on
+#   every micro-batch, and teacher_forward was measured pulling 7.6-8.9 GB/s over
+#   PCIe for the whole phase (gen, by comparison, sits near 2). Resident costs
+#   3 teachers * 3.4GB bf16 / 2 GPUs = 5.1GB per GPU. If a bigger student or a
+#   longer context leaves no room for that, put it back to True -- this is a
+#   placement knob, the distillation targets are identical either way.
 #
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
@@ -155,7 +162,7 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
