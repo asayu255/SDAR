@@ -25,6 +25,11 @@ set -x
 #   use_kl_loss=False, so nothing but the teacher KL enters the loss.
 #   - algorithm.opd.kl_loss_type: low_var_kl (single-token estimator) or
 #     topk_kl (dense top-k+tail reverse KL; support size algorithm.opd.topk).
+#   - algorithm.opd.normalize_loss_by_task: each task contributes 1/3 of the
+#     loss. Without it the token-mean hands alfworld ~69% and search ~4% of the
+#     gradient, purely because of the 50/15/4-turn episode caps -- a weighting
+#     nobody chose, and one the multitask SFT arm does not use. Same mechanism
+#     and same weights as that arm, so the arms differ in the loss only.
 # Teachers: per-task single-task RL checkpoints, created as role="ref" worker
 #   groups (they reuse actor_rollout_ref.ref.* settings: log-prob micro batch,
 #   FSDP CPUOffload); each sample is distilled from the teacher of its task.
@@ -161,6 +166,7 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.kl_loss_coef=1.0 \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
+    +algorithm.opd.normalize_loss_by_task=True \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \
