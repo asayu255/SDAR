@@ -60,6 +60,105 @@ OPD で同じ道具を使うと、全く違う絵が出る。理由は単純で�
    ホストに NVLink が無いので FSDP の集団通信も PCIe に出る。パラメータの
    CPU→GPU 再ストリーミングと集団通信が同じ列に混ざるが、**phase で分ければ判別できる**。
 
+### 1.1 計測は 3 層あり、層ごとに別の表が出る
+
+これを把握していないと「phase が粗い」と誤解する。**タグは 3 つの別プロセス/別機構に
+散っていて、それぞれ独立した表を印字する。**
+
+| 層 | 実装 | 出力先 | phase |
+|---|---|---|---|
+| **driver** | `opd_ray_trainer.py` の `_timer` | `(OPDTaskRunner pid=…)` | `step`(:491) / `gen`(:492) / `reward`(:567) / `teacher_forward`(:577)＋タスク別 / `update_actor`(:588) / `dump_rollout_generations`(:601) / `testing`(:615) / `save_checkpoint`(:622) |
+| **worker** | `dp_actor.py` の `_actor_phase`（**rank 0 のみ**） | `(WorkerDict pid=…) update_policy stages` | `actor.fwd`(:756) / `actor.bwd`(:907) / `actor.task_metrics`(:917) / `actor.optim`(:998) |
+| **rollout** | turn table（`ROLLOUT_TURN_TIMING=1`） | `[rollout-turn-timing]` | ターンごとに `preproc / gen / tchWait / decode / envstep` |
+
+worker 層が別プロセスなのは必然で、`_timer` はドライバで動くため
+`update_actor` はドライバ側からは**1 個の不透明なバケット**にしかならない。
+`_actor_phase` は worker プロセスに**第 2 のサンプラーを立てて**その内側を割る。
+NVML の読みはデバイス単位なので、どのプロセスから読んでも同じ GPU が見える ――
+**phase タグだけが帰属を可能にしている**（`dp_actor.py:78`〜 のドキュメント文字列）。
+
+`_PROFILE_STAGES = gpu_profiler.enabled() and rank == 0`（`:187`）。rank 0 限定なのは、
+3 つ同時にサンプラーが回ると NVML のポーリングが 3 倍になり、
+**同一の読みに対して 3 つの表が交錯して印字される**から。
+
+### 1.2 タグの被覆範囲 —— 何が割れていて、何が割れていないか
+
+| 処理 | タグ | 備考 |
+|---|---|---|
+| rollout（生成） | ✓ driver `gen` ＋ turn table | **内側は割れていない**（下記） |
+| reward | ✓ driver `reward` | 純 CPU |
+| teacher forward | ✓ **タスク別** `teacher_forward/<task>` | `90f8de9` で分割 |
+| student forward | △ `actor.fwd` に同居 | lse/topk/gather も同じタグの中 |
+| KL の計算 | **✗ 未タグ** | `_actor_phase` の外（`:756` は `_forward_micro_batch` 1 行だけを包む） |
+| backward | ✓ `actor.bwd` | |
+| optimizer ＋ scheduler | ✓ `actor.optim` | LR スケジュールは optim の中 |
+| metrics | ✓ `actor.task_metrics` | |
+| batch 組み立て（`adjust_batch` / `attach_task_loss_weights` / `_balance_batch`） | ✗ driver `(idle/other)` | 実測 0.6 s/step で無視可能（1.3 節） |
+| checkpoint | ✓ `save_checkpoint` | |
+| validation | ✓ `testing` | |
+| `env.reset` | 対象外 | `_ENV_RESET_PREFETCH` で意図的にバックグラウンド |
+
+**割れていない実質は 2 箇所だけで、うち 1 つは引き算で上界が取れる。**
+
+**① KL の計算（未タグ、ただし ≲1 s）。** `_actor_phase("actor.fwd")` は
+`self._forward_micro_batch(...)` **1 行だけ**を包んでいて、`topk_kl_per_token` と
+重み付き集約（`:845`〜）はブロックの外にある。worker 表では `(idle/other)` に落ちて
+gen 中のサンプルと区別できない。しかし
+`update_actor` − `actor.* 合計` = **3.9 s** であり、そのうち Ray の dispatch が
+約 3.0 s（`update_actor` − `timing_s/update_actor_worker`）なので、
+**KL の実計算は 1 s 未満**。タグを足す価値がないことが確定した。
+
+**② `gen` の内側は、どちらのサンプラーからも原理的に届かない。これが本レポートの
+最大の弱点。** `gen` は step の 46%、`sm 65.2` で失点の 2/3 を占めるのに、
+- vLLM の wake/sleep と weight sync
+- prefill
+- decode
+- KV 逼迫による preemption
+
+が一切分離されていない。`_timer` はドライバに、`_actor_phase` は actor モジュールにしか
+置けず、**vLLM エンジンの内部は Ray worker の中の別ライブラリ**だからである。
+2.3 節で「decode のテール」と書いた根拠は turn table の間接証拠
+（`gen_util 65`、`full_batch 48–68% vs shrunk 71–74%`）だけで、直接の内訳ではない。
+
+### 1.3 1 step の完全な内訳（step 91、変更前）
+
+driver 表と worker 表が揃っている step。両サンプラーは同じ壁時計を見ているので
+入れ子で読める。**TOTAL 509.3 s、sm 71.2。**
+
+| phase | 層 | 時間 | share | sm% | memBW% | idle% | cpu% | memGB | pcieRX |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`gen`** | driver | **223.2 s** | 43.8% | **56.0** | 33.3 | 15.9 | 14 | 68.0 | 123 |
+| `reward` | driver | 2.6 s | 0.5% | **0.0** | 0.0 | 100 | 100 | 16.8 | 0 |
+| `teacher_forward`（glue） | driver | 0.3 s | 0.1% | 0.0 | 0.0 | 100 | 102 | 16.8 | 0 |
+| ├ `/alfworld` | driver | 39.3 s | 7.7% | 89.8 | 32.6 | 6.0 | 9 | 55.3 | **7,755** |
+| ├ `/search` | driver | 3.7 s | 0.7% | 77.7 | 24.9 | 7.7 | 11 | 70.9 | **7,643** |
+| └ `/webshop` | driver | 23.5 s | 4.6% | 92.7 | 38.0 | 0.0 | 5 | 68.6 | 4,503 |
+| **`update_actor`** | driver | **215.5 s** | 42.3% | **82.4** | 31.2 | 1.5 | 4 | 79.3 | 1,902 |
+| ├ `actor.fwd`（student forward） | worker | **58.4 s** | 11.5% | 81.2 | 31.0 | 3.5 | 104 | 79.7 | 2,218 |
+| ├ `actor.bwd` | worker | **149.7 s** | 29.4% | 83.6 | 31.6 | 0.2 | 104 | 79.1 | 1,697 |
+| ├ `actor.task_metrics` | worker | 0.6 s | 0.1% | 94.0 | 40.0 | 0.0 | 103 | 80.0 | 32 |
+| ├ `actor.optim`（＋scheduler） | worker | 2.9 s | 0.6% | 92.7 | 27.4 | 0.0 | 105 | 79.0 | **9,585** |
+| └ KL ＋ loss 組立 ＋ dispatch | *未タグ* | **3.9 s** | 0.8% | — | — | — | — | — | — |
+| `step`（境界） | driver | 0.6 s | 0.1% | 14.0 | 6.5 | 100 | 121 | 16.8 | 0 |
+| **合計** | | **509.3 s** | 100% | **71.2** | | | | | |
+
+driver タグの合計は 508.7 s で、**未計上は 0.6 s** ―― 1.2 節で「batch 組み立ては
+無視可能」と書いた根拠がこれ。
+
+この表からしか読めないこと:
+
+- **`actor.bwd` 単独で step の 29.4%。** タグ済み phase では `gen` に次ぐ塊で、
+  `bwd/fwd = 2.56` は gradient checkpointing の再計算込みとして妥当。
+  SFT arm の「削るべきは backward」という結論は、**この phase については正しい**。
+- **`actor.optim` の PCIe が突出。** 2.9 s（0.6%）しかないのに
+  `pcieTX 14,924 / pcieRX 9,585` で、他のどの phase の 5〜7 倍。
+  optimizer state が CPU 側にあり更新のたびに全量を往復させている。
+  **時間比で見ると完全に見逃す**部分で、ここは今回手を入れていない。
+- **`reward` は `sm 0.0 / memBW 0.0 / cpu 100`。** GPU が完全に遊ぶ純 CPU 区間で、
+  4 節で overlap 候補としながら見送った根拠。
+- **`gen` の `memBW/sm = 0.59` に対し `update_actor` は `0.38`。**
+  2.1 節の判別ラベルどおり、gen の方がメモリ律速寄り＝ decode の性質が出ている。
+
 ---
 
 ## 2. 分かったこと
@@ -208,6 +307,60 @@ CSV は解析不能になる。SFT arm は単一プロセスで測っていた�
 
 今回は per-step / cumulative の集計表で代替した。**分散構成で trace を使うなら
 パスに rank を混ぜる必要がある。**
+
+### 2.8 律速はホスト RAM で、validation がその崖だった（run が落ちた）
+
+**step 150 の最初の validation で OOM し、run が死んだ。** GPU ではなくホスト RAM。
+本レポートで追いかけていた GPU 利用率とは別の軸に、より低い天井があった。
+
+```
+Worker exit detail: Worker unexpectedly exits with a connection error code 2. End of file.
+  (1) The process is killed by SIGKILL by OOM killer due to high memory usage.
+  [repeated 169x / 217x / 57x / 33x across cluster]
+→ ActorUnavailableError: keepalive watchdog timeout
+```
+
+数百の環境ワーカーが一斉に SIGKILL され、巻き添えで GPU の `WorkerDict` が落ち、
+driver がタイムアウトした。タイミングは `test_gen_batch` →
+`Initializing AlfredTWEnv...` の直後で、疑う余地がない。
+
+**原因は validation が環境の母数を倍増させること。**
+
+| | 環境数 | 生成時期 |
+|---|---:|---|
+| train envs | `15 × 3 tasks × env.rollout.n=8` = **360** | step 1、以後常駐 |
+| val envs | `val_per_task_batch_size=126 × 3 tasks` = **378** | **最初の validation** |
+| 合計 | **738** | |
+
+val envs は `LazyEnvManager`（`env_manager.py:1052`）なので**最初の validation まで
+作られない**。`test_freq=150` は、その生成を step 150 に置いていた。
+
+数字が合う。tamago は **256 GB**（`docs/webshop_worker_memory.md`）。step 149 の
+`cpu_memory_used_gb` は **195.1 GB（76%）**で、Ray の閾値 0.95（243 GB）まで残り 48 GB。
+そこへ 378 ワーカーを新規に立てれば、1 ワーカー 130 MB でも足りない。
+
+**定常成長（+150 MB/step）は壁ではなかった。** それだけなら step 300 で約 218 GB に
+収まる。**壁は step 150 の段差の方**で、成長率だけを見ていると見えない。
+
+`val_batch_size` と `val_per_task_batch_size` は**両方 intent lock に入っている**
+（`expected_multitask_config.yaml:75,105`）＝評価プロトコルなので下げられない。
+一方 **`test_freq` はロック外**なので、run 中の validation を切って
+チェックポイントを後からオフライン評価するのが、科学的に中立な回避策になる:
+
+```bash
+bash examples/opd_trainer/run_multitask_qwen3.sh \
+  env.search.search_url=http://100.86.45.30:8000/retrieve \
+  trainer.test_freq=-1
+```
+
+評価する checkpoint も `val_batch_size=126` も `val_kwargs_by_task` も変わらない。
+学習中に測るか後で測るかの違いだけで、ピークは消える。
+**offpolicy arm も同じ崖に当たるので、同じ扱いが要る。**
+
+根本対策は validation の前に train envs を `close()`（`env_manager.py:836` に実装あり）
+して終了後に再構築することだが、episode schedule が resume 用にステートフル
+（`3bce704`）なので、閉じて作り直すと進行位置がずれる危険がある。**走行中に入れる
+変更ではない。**
 
 ---
 
@@ -464,7 +617,24 @@ step 1（7,200 行）は偶然通り、step 2（6,880 行）で落ちた。
 見積りに入っていなかった最大の効果を見落としていた。
 **代理指標は「効いている」を示すが「効果量」は示さない。両方要る。**
 
-**⑥ wandb チャートの凡例にある GPU 2 を見て、3 枚目が遊んでいる可能性を指摘した。**
+**⑥ ホスト RAM の増加を「対処不要」と判断し、その直後に run が OOM で死んだ。**
+最も高くついた誤り。`cpu_memory_used_gb` が 188 → 195 GB（+150 MB/step）と
+増えているのを見て、こう書いた ――「baseline run は step 94 の時点で既に 217.8 GB に
+達しており、旧 run が問題なく通過した水準」。3 点間違えている:
+
+1. **ホストの総容量を確認せずに「通過した水準」と言った。** tamago は 256 GB なので
+   217.8 GB は **85%**、Ray の閾値のすぐ手前である。「通過した」のではなく
+   「ぎりぎりだった」が正しい。**比率を出さずに絶対値を比べた。**
+2. **validation が第二の環境群を遅延生成することを勘定に入れなかった。**
+   定常成長だけを見ていたが、実際の壁は成長ではなく **step 150 の段差**だった
+   （2.8 節）。**傾きを見て段差を見なかった。**
+3. **`docs/webshop_worker_memory.md` がこのホストのこの OOM を正面から記録しているのに、
+   読まずに判断した。** リポジトリ内に答えがあった。
+
+教訓は **「余裕がある」と言う前に分母を出すこと**、そして
+**単調な指標を見たら傾きだけでなく将来の段差を探すこと**。
+
+**⑦ wandb チャートの凡例にある GPU 2 を見て、3 枚目が遊んでいる可能性を指摘した。**
 `run_multitask_qwen3.sh:11` に `HOST: 2 GPUs (tamago / 100.86.45.34)` と明記されており、
 `trainer.n_gpus_per_node=2`。凡例の GPU 2 は同じ project に投げている
 **SFT arm（A6000 × 3）の系列が残っていただけ**。
@@ -507,6 +677,19 @@ step 94 の時点で既に 217.8 GB に達しており**、そこは問題なく
 代償は step 100 が 647.2 s（`turn 0 envstep = 69.62 s`、`cpu-glue 34.6%`）になった
 1 step 分だけで、直後から 480〜580 s に戻った。**対処不要。**
 
+15:11 にも短い断（`RemoteDisconnected` × 8）があり、全件 2 attempts / 9 s で復旧している。
+
+### 6.2 run の終わり方
+
+**step 150 の最初の validation でホスト RAM の OOM により停止**（2.8 節）。
+学習そのものは step 149 まで完全に健全で、上表の指標はすべて安定していた。
+最後の checkpoint は `global_step_125`（`save_freq=25`）。`resume_mode: auto` なので
+同じコマンドで 125 から再開するが、**`trainer.test_freq=-1` を付けないと
+step 150 で同じ崖に落ちる。**
+
+この run から得られた性能上の結論（3.5 節の +8.2%、1.3 節の phase 内訳、
+2.8 節のホスト RAM 制約）はすべて有効で、再取得の必要はない。
+
 ---
 
 ## 7. 再現手順
@@ -517,6 +700,18 @@ export ROLLOUT_TURN_TIMING=1            # turn table。gen の中と外を分離
 export GPU_PROFILER_ROLLUP_EVERY=1      # 既定 25。数 step しか回さないとき
 # export GPU_PROFILER_TRACE=...         # 分散では使えない（2.7 節）
 ```
+
+**worker 側の表（`update_policy stages`）が出ているかは別に確認すること。**
+`_PROFILE_STAGES = gpu_profiler.enabled() and rank == 0`（`dp_actor.py:187`）で、
+`gpu_profiler.enabled()` は **worker プロセスの** `GPU_PROFILER` を読む。
+`constants_ppo.py` の Ray runtime env には `GPU_PROFILER` が入っていないので、
+worker がドライバの環境を継承しない構成では**黙って出力されない**:
+
+```bash
+grep -c "update_policy stages" ~/logs/*.log    # 0 なら worker 層が動いていない
+```
+
+これが 0 だと `update_actor` は 1 バケットのままで、1.3 節の表は作れない。
 
 turn table の読み方:
 
@@ -545,9 +740,23 @@ export TASK_BALANCE_INTERLEAVE=1
 
 ## 8. 残課題
 
+**計測機構に足りないもの**（1.2 節、優先度順）:
+
+| # | 追加 | 手段 | 効果 |
+|---|---|---|---|
+| 1 | **`gen` の内訳** | `disable_log_stats=False` で vLLM 自身の統計（prefill/decode トークン数、preemption 回数、running batch 推移）を出す | 失点の 65% を占める場所の内訳が推定から実測になる。**最優先** |
+| 2 | `actor.fwd` を model / lse+topk+gather に分割 | `_actor_phase` を `_forward_micro_batch` の中に 2 個 | 3.2 節の効果を直接測れる（今はメモリでしか語れない） |
+| 3 | `actor.optim` の PCIe を追う | optimizer state の配置を確認 | 1.3 節の突出（他 phase の 5〜7 倍）の正体 |
+| — | KL のタグ | — | **不要と確定**（≲1 s、1.2 節） |
+
+いずれも再起動が必要。
+
+**その他:**
+
+- **validation の env teardown**（2.8 節）。`test_freq=-1` は回避策であって修正ではない。
+  `close()` は実装済みだが episode schedule のステートと衝突する。
 - **`GPU_PROFILER_TRACE` の多重 open**（2.7 節）。パスに rank を混ぜれば直る。未修正。
-- **decode テールの深掘り**。`disable_log_stats=False` で 6〜7 ms/decode-step の内訳を取り、
-  `cudagraph_capture_sizes`（V1 のみ）が効くか見る。走行中は測れないので run 後。
+- **`cudagraph_capture_sizes`**（V1 のみ）が decode テールに効くか。上記 1 の後。
 - **offline-KD arm の `experiment_name` 不一致**。
   `run_multitask_offpolicy_qwen3.sh:464` は
   `opd_offpolicy_multitask_qwen3_1.7b_coef1.0_topk_kl20` を渡すが、
