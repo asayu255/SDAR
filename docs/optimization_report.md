@@ -204,6 +204,16 @@ scientific knobs rather than trusting the default to stay put.
 - **`timing_s/update_actor_worker`** — `timing_s/update_actor` is a blocking
   `ray.get`, so it also covers serializing a few-hundred-MB batch into the object
   store and back. The difference between the two is transport.
+- **`teacher_forward/build` vs `teacher_forward/logprob`** — `build_teacher_batch`
+  decodes and re-encodes every row on the driver (two tokenizer calls per row, GPU
+  parked) before anything reaches the GPU. One bucket named "forward" hides that
+  entirely. Alongside them, `teacher_forward/{prompt_tokens,skill_overhead_tokens,
+  skill_truncated_ratio}/<task>` report the cost driver the wall clock cannot be
+  split by, since the GPU call is one call over the mixed batch.
+  `skill_truncated_ratio` is the one to watch: the prepend sits at the start of the
+  prompt and the truncation keeps the end, so a saturated row is one whose
+  privileged information was cut away — the teacher is then running on the
+  student's own prompt.
 - **NVLink and driver-CPU columns, cumulative table, per-sample trace** — see the
   module docstring of `verl/utils/gpu_profiler.py`. On a node *with* NVLink the
   collectives are invisible to the PCIe counters, so `nvlink_mb_s` is the only

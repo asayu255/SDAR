@@ -744,6 +744,11 @@ _PHASE_ORDER = [
     "gen",
     "old_log_prob",
     "teacher_forward",
+    # Interior of teacher_forward (rlsd_ray_trainer._profiler_phase). The build is
+    # a driver-side tokenizer loop with the GPU parked; only the second is a
+    # forward pass. Listed in execution order, right under their parent.
+    "teacher_forward/build",
+    "teacher_forward/logprob",
     "ref",
     "values",
     "adv",

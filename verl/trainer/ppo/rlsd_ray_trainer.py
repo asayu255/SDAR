@@ -5,6 +5,7 @@ Extends the standard RayPPOTrainer with a teacher forward pass that uses
 privileged information (skills) to construct token-level advantages.
 """
 
+from contextlib import contextmanager
 from pprint import pprint
 
 import os
@@ -26,6 +27,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.rlsd_utils import SkillProvider, compute_rlsd_token_advantage
+from verl.utils import gpu_profiler
 from verl.utils.metric import reduce_metrics
 from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo.metric_utils import (
@@ -162,6 +164,59 @@ def build_teacher_batch(
     )
 
     return teacher_batch
+
+
+@contextmanager
+def _profiler_phase(name: str):
+    """Tag GPU samples with a sub-phase, without adding a timing_raw entry.
+
+    ``_timer`` would do both, but its dict entries land in ``timing_s/*`` and are
+    divided by the batch size for ``timing_per_token_ms/*``; these two are an
+    interior view of a phase that is already reported, not two more phases.
+    """
+    gpu_profiler.push_phase(name)
+    try:
+        yield
+    finally:
+        gpu_profiler.pop_phase(name)
+
+
+def _teacher_batch_metrics(student: DataProto, teacher: DataProto, max_prompt_length: int) -> dict:
+    """What the teacher forward is actually being asked to chew through, per task.
+
+    The GPU call is one call over the mixed batch, so its wall clock cannot be
+    split by task the way a per-task teacher loop's could. What can be reported
+    is the cost driver: prompt length differs several-fold between these tasks,
+    and the privileged skill text prepended on top differs per task as well.
+
+    ``skill_overhead_tokens`` is the prepend's actual cost -- teacher prompt
+    tokens minus student prompt tokens -- and ``skill_truncated_ratio`` is the
+    share of rows whose teacher prompt came out at exactly ``max_prompt_length``.
+    That second one is worth watching: ``build_teacher_batch`` keeps the END of
+    an over-long prompt, and the skill text sits at the BEGINNING, so a saturated
+    row is one where the privileged information was silently cut away and the
+    "teacher" is running on the student's own prompt. Length equality is a proxy
+    for that, not a proof, but a ratio that is not ~0 means the teacher signal is
+    not what the recipe thinks it is.
+    """
+    response_length = student.batch["responses"].size(1)
+    student_prompt = student.batch["attention_mask"][:, :-response_length].sum(-1).float()
+    teacher_prompt = teacher.batch["attention_mask"][:, :-response_length].sum(-1).float()
+    overhead = teacher_prompt - student_prompt
+    saturated = (teacher_prompt >= max_prompt_length).float()
+
+    metrics = {
+        "teacher_forward/prompt_tokens/mean": float(teacher_prompt.mean()),
+        "teacher_forward/skill_overhead_tokens/mean": float(overhead.mean()),
+        "teacher_forward/skill_truncated_ratio": float(saturated.mean()),
+    }
+    for task, rows in task_row_indices(student).items():
+        idx = torch.from_numpy(rows)
+        metrics[f"teacher_forward/prompt_tokens/mean/{task}"] = float(teacher_prompt[idx].mean())
+        metrics[f"teacher_forward/skill_overhead_tokens/mean/{task}"] = float(overhead[idx].mean())
+        metrics[f"teacher_forward/skill_truncated_ratio/{task}"] = float(saturated[idx].mean())
+        metrics[f"teacher_forward/rows/{task}"] = int(len(rows))
+    return metrics
 
 
 class RLSDRayTrainer(RayPPOTrainer):
@@ -344,7 +399,7 @@ class RLSDRayTrainer(RayPPOTrainer):
 
                     # ---- RLSD: Teacher forward pass ----
                     with _timer("teacher_forward", timing_raw):
-                        teacher_log_probs = self._compute_teacher_log_probs(batch)
+                        teacher_log_probs = self._compute_teacher_log_probs(batch, metrics=metrics)
                         batch.batch["teacher_log_probs"] = teacher_log_probs
 
                     if self.use_reference_policy:
@@ -496,21 +551,49 @@ class RLSDRayTrainer(RayPPOTrainer):
                     progress_bar.close()
                     return
 
-    def _compute_teacher_log_probs(self, batch: DataProto) -> torch.Tensor:
+    def _compute_teacher_log_probs(self, batch: DataProto, metrics: dict = None) -> torch.Tensor:
         """
         Compute teacher log probs by running forward pass with privileged skill info
         prepended to the prompt. Uses the same model π_θ but conditioned on (x, r).
+
+        The driver's ``teacher_forward`` timer covers two things that behave
+        nothing alike, so they are pushed as separate profiler phases:
+
+        ``teacher_forward/build``   ``build_teacher_batch`` is a row-by-row Python
+            loop that decodes each prompt, asks the skill provider for its
+            privileged text and re-encodes the result -- two tokenizer calls per
+            row, on the driver, with the GPU at zero. At 45 prompts x group 8
+            that is 720 tokenizer calls a step charged to a phase whose name says
+            "forward".
+        ``teacher_forward/logprob`` the actual GPU pass.
+
+        Both are inherited by SkillSDRayTrainer, so SDAR gets the split too.
+
+        Args:
+            batch: the student batch.
+            metrics: optional dict the per-task size diagnostics are written into.
         """
-        teacher_batch = build_teacher_batch(
-            batch=batch,
-            skill_provider=self.skill_provider,
-            tokenizer=self.tokenizer,
-            max_prompt_length=self.config.data.max_prompt_length,
-            truncation=self.config.data.get("truncation", "left"),
-        )
+        with _profiler_phase("teacher_forward/build"):
+            teacher_batch = build_teacher_batch(
+                batch=batch,
+                skill_provider=self.skill_provider,
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.config.data.max_prompt_length,
+                truncation=self.config.data.get("truncation", "left"),
+            )
+
+        if metrics is not None:
+            metrics.update(
+                _teacher_batch_metrics(
+                    student=batch,
+                    teacher=teacher_batch,
+                    max_prompt_length=self.config.data.max_prompt_length,
+                )
+            )
 
         # Use the same actor to compute teacher log probs
-        teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
+        with _profiler_phase("teacher_forward/logprob"):
+            teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
         teacher_log_probs = teacher_output.batch["old_log_probs"]
 
         return teacher_log_probs

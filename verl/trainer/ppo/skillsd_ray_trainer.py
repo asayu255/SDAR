@@ -246,7 +246,7 @@ class SkillSDRayTrainer(RLSDRayTrainer):
 
                     # ---- SkillSD: Teacher forward pass (same as RLSD) ----
                     with _timer("teacher_forward", timing_raw):
-                        teacher_log_probs = self._compute_teacher_log_probs(batch)
+                        teacher_log_probs = self._compute_teacher_log_probs(batch, metrics=metrics)
                         batch.batch["teacher_log_probs"] = teacher_log_probs
 
                     if self.use_reference_policy:
