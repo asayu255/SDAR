@@ -782,7 +782,12 @@ class RayPPOTrainer:
         weight 0, and before ``_balance_batch``, whose reorder moves the weight
         column with its rows.
         """
-        if not self.config.actor_rollout_ref.actor.get("normalize_loss_by_task", False):
+        if not self.config.actor_rollout_ref.actor.get("normalize_loss_by_task", True):
+            return
+        # Single-task runs carry no per-row task name, and "an equal share per
+        # task" says nothing about one task anyway. Skipping keeps this default-on
+        # without every single-task recipe in examples/ having to opt out.
+        if get_task_names(batch) is None:
             return
         from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 

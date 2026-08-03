@@ -272,3 +272,53 @@ def test_the_per_task_diagnostics_stay_unweighted():
     assert "_task_weighted" not in task_block, (
         "the per-task diagnostics must stay on the plain token-mean"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Shipped default
+# --------------------------------------------------------------------------- #
+
+
+def test_the_shipped_config_turns_the_weighting_on():
+    """It changes the loss, so nothing else in the tree asserts this value and a
+    one-character edit to the yaml would otherwise go unnoticed."""
+    import os
+
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(
+        os.path.join(os.path.dirname(__file__), "..", "..", "verl", "trainer", "config", "ppo_trainer.yaml")
+    )
+    assert OmegaConf.select(cfg, "actor_rollout_ref.actor.normalize_loss_by_task") is True
+
+
+def test_a_single_task_batch_is_skipped_rather_than_rejected():
+    """Default-on must not break the single-task recipes.
+
+    They carry no per-row task name, and attach_task_loss_weights asserts on
+    that -- correctly, since "an equal share per task" is meaningless with one
+    task. The driver has to skip them instead of every recipe opting out.
+    """
+    from verl.trainer.ppo.metric_utils import get_task_names
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    single_task = DataProto.from_dict(tensors={"response_mask": torch.ones(4, 3, dtype=torch.long)})
+    assert get_task_names(single_task) is None
+
+    # would raise if the driver did not skip
+    with pytest.raises(AssertionError, match="requires per-row task names"):
+        attach_task_loss_weights(single_task, n_real=4, mini_batch_size=2, metrics={})
+
+    class _Stub:
+        config = None
+
+    stub = _Stub()
+    from omegaconf import OmegaConf
+
+    stub.config = OmegaConf.create(
+        {"actor_rollout_ref": {"actor": {"normalize_loss_by_task": True, "ppo_mini_batch_size": 2}, "rollout": {"n": 1}}}
+    )
+    metrics = {}
+    RayPPOTrainer._attach_task_loss_weights(stub, single_task, n_real=4, metrics=metrics)
+    assert TASK_LOSS_WEIGHT_KEY not in single_task.batch.keys()
+    assert metrics == {}

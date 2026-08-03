@@ -1,8 +1,13 @@
 # Per-task loss weighting in multitask runs
 
-`actor.normalize_loss_by_task` (off by default) makes every task contribute
+`actor.normalize_loss_by_task` (**on by default**) makes every task contribute
 `1/num_tasks` of **every** loss term, instead of its share of the batch's
 response tokens.
+
+Single-task runs are untouched: they carry no per-row task name, and the driver
+skips them rather than asserting. That is what lets this ship on by default
+without every recipe in `examples/` having to opt out — and it is the honest
+semantics, since "an equal share per task" says nothing about one task.
 
 ## The problem
 
@@ -96,15 +101,17 @@ scaling assumes an unweighted token-mean), requires
 `ulysses_sequence_parallel_size == 1` and `ppo_epochs == 1`. The multitask
 recipes satisfy all three.
 
-## Enabling it
+## Turning it off
 
 ```bash
-    actor_rollout_ref.actor.normalize_loss_by_task=True \
+    actor_rollout_ref.actor.normalize_loss_by_task=False \
 ```
 
-Pin it in the run's expectations file in the same commit — it decides what the
-experiment is. Both arms of a comparison must agree on it, or their difference
-carries the task weighting as well as the objective.
+That restores the historical token-share weighting. Change it in the run's
+expectations file in the same commit — it decides what the experiment is, and the
+lock reads the effective config, so a default moving underneath a comparison is
+exactly what the pin is for. Both arms of a comparison must agree on it, or their
+difference carries the task weighting as well as the objective.
 
 Implementation: `verl/trainer/ppo/task_loss_weights.py` (byte-identical with the
 pure-OPD and offline-KD branches, so all arms share one implementation) and

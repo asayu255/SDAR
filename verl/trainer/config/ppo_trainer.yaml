@@ -86,9 +86,12 @@ actor_rollout_ref:
     # single-task runs would produce, so each term's coefficient (including
     # kl_loss_coef_by_task) means what the single-task recipes mean by it.
     #
-    # Off by default: it changes the loss, so it must not appear mid-experiment.
-    # See verl/trainer/ppo/task_loss_weights.py.
-    normalize_loss_by_task: False
+    # ON by default, and it CHANGES THE LOSS -- a run started after this does not
+    # continue an earlier one's objective. Single-task runs are unaffected: they
+    # carry no per-row task name and the driver skips them, which is also why
+    # every recipe in examples/ keeps working untouched.
+    # See docs/task_loss_weighting.md and verl/trainer/ppo/task_loss_weights.py.
+    normalize_loss_by_task: True
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
