@@ -346,7 +346,20 @@ env:
     log_requests: false
     search_url: "http://127.0.0.1:8000/retrieve" # also support multiple urls: ["http://127.0.0.1:8000/retrieve", "http://127.0.0.1:8001/retrieve"]
     topk: 3
+    # Per-request timeout, seconds. null waits indefinitely -- but prefer a
+    # generous finite value with max_retries: null (see below), which means the
+    # same thing and still recovers from a connection that dies silently.
     timeout: 60
+    # Attempts before a retryable failure (timeout / refused connection / 5xx)
+    # gives up. null retries until the retriever answers.
+    #
+    # Giving up is not a no-op: the error text is substituted for the retrieved
+    # document and becomes the <information> block the model is trained on, with
+    # nothing in the metrics to say so. When one retriever is shared between
+    # concurrent runs, exhausting the budget is what a load spike looks like, so
+    # those runs want null. 4xx / malformed JSON still fail immediately -- no
+    # amount of waiting turns them into a document.
+    max_retries: 10
   multitask:
     tasks: [alfworld, search, webshop]
     max_steps:
