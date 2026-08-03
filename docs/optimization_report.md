@@ -322,18 +322,18 @@ on the driver.
 
 | # | lever | est. saving | accuracy class |
 |---|---|---|---|
-| 1 | `GRADIENT_CHECKPOINTING=False` | ~155 s (10 %) | bit-identical; needs activation headroom |
-| 2 | `REF_PARAM_OFFLOAD=False` | ~110 s (7 %) | bit-identical; +~3.4 GB resident |
+| 1 | `model.enable_gradient_checkpointing=False` | ~155 s (10 %) | bit-identical; needs activation headroom |
+| 2 | `ref.fsdp_config.param_offload=False` | ~110 s (7 %) | bit-identical; +~3.4 GB resident |
 | 3 | batch the tokenizer calls in `build_teacher_batch` | ~28 s (2 %) | exact (same tokens, one call) |
 | 4 | per-task metrics from the per-token matrices already computed | ≤30 s (2 %) | identical values |
 | 5 | `ENABLE_CHUNKED_PREFILL=True`, `GPU_MEMORY_UTILIZATION=0.7` | ~20–35 s | sampling-distribution-preserving |
 | 6 | `PPO_MICRO_PER_GPU` 5 → 10 | ~15 s | grouping only; lcm padding grows |
 
-1 and 2 are now env knobs on `run_multitask_qwen3.sh`, defaulted to today's
-values so the intent lock is unchanged; both are placement/recompute decisions
-that do not touch a formula. Together the six are ~360 s, i.e. 1500 → ~1140 s
-per step. 5 and 6 are the knobs §10 deferred, and the same caveat applies: they
-have to land on every comparison arm at once.
+1 and 2 are hardcoded to their current values in `run_multitask_qwen3.sh` — they
+are proposals here, not knobs, and measuring them means editing that line. Both
+are placement/recompute decisions that do not touch a formula. Together the six
+are ~360 s, i.e. 1500 → ~1140 s per step. 5 and 6 are the knobs §10 deferred,
+and the same caveat applies: they have to land on every comparison arm at once.
 
 4 is worth spelling out. `actor.task_metrics` re-runs `policy_loss_fn` and
 `agg_loss` per task over row subsets. The entropy, KL, SDL and SDAR terms need

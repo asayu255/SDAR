@@ -41,26 +41,12 @@ model_path="Qwen/Qwen3-1.7B"
 #   *_MICRO_PER_GPU larger      -> same algorithm, not bit-identical (grad-accum grouping)
 #   USE_FUSED_KERNELS=True      -> not bit-identical (fused kernel path)
 #   ENABLE_CHUNKED_PREFILL=True -> not bit-identical (prefill scheduling)
-#   REF_PARAM_OFFLOAD=False     -> bit-identical (FSDP placement only)
-#   GRADIENT_CHECKPOINTING=False-> bit-identical (activations kept, not rebuilt)
 # max_model_len defaults to prompt(4096)+response(512)=4608: it bounds the vLLM KV
 # cache to exactly what is needed and truncates no valid sequence, so it is a pure
 # speedup and is on by default. prefix caching is already the code default (output
 # -safe deterministic reuse) and is kept on.
 param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
-# The reference policy is offloaded by default because it is idle for most of
-# the step. The profile says that is not free: `ref` runs 190s at 98% SM but
-# only 32% memory bandwidth, with 2.2/2.7 GB/s of PCIe traffic -- the highest of
-# any phase -- against 60s for the same-shape `old_log_prob` pass with the
-# parameters already resident. Placement only, so REF_PARAM_OFFLOAD=False is
-# bit-identical; it costs a resident copy of the frozen weights.
-ref_param_offload=${REF_PARAM_OFFLOAD:-True}
-# Recompute-in-backward. actor.bwd measured 446s against actor.fwd's 146s -- the
-# ~3x ratio is the recompute. Turning it off is bit-identical (same math, the
-# activations are kept instead of rebuilt) and needs the activation memory:
-# reserved peaked at 66.7 GB of 80, so drop PPO_MICRO_PER_GPU if it OOMs.
-gradient_checkpointing=${GRADIENT_CHECKPOINTING:-True}
 ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
@@ -175,7 +161,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.model.enable_gradient_checkpointing=$gradient_checkpointing \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=$param_offload \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$optimizer_offload \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
@@ -194,7 +180,7 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
-    actor_rollout_ref.ref.fsdp_config.param_offload=$ref_param_offload \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
