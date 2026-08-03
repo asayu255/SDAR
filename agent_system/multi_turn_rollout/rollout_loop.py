@@ -109,8 +109,13 @@ _ROLLOUT_PREFETCH_LOGPROB_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_LOGPROB_C
 # NOT bit-identical: a row is scored in a different micro-batch than the trainer's
 # monolithic per-task slice would have put it in, and packed GEMMs of different
 # total length can differ in their last bits. Same expectation, same rows, same
-# frozen weights. Opt-in; OFF reproduces the serial behavior exactly.
-_ROLLOUT_PREFETCH_TEACHER = os.environ.get("ROLLOUT_PREFETCH_TEACHER", "0").strip().lower() in ("1", "true", "yes", "on")
+# frozen weights. ROLLOUT_PREFETCH_TEACHER=0 reproduces the serial behavior
+# exactly.
+#
+# ON by default, but inert outside OPD: the mechanism does nothing unless the
+# trainer hands multi_turn_loop a teacher_prefetch_fn, and only the OPD trainers
+# have a teacher to route to. Validation rollouts never score a teacher either.
+_ROLLOUT_PREFETCH_TEACHER = os.environ.get("ROLLOUT_PREFETCH_TEACHER", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Rows per prefetch call. One chunk is issued per turn, so this trades window fit
 # against per-call overhead: too small and the ~45 usable turns cannot drain the
@@ -1093,6 +1098,21 @@ class TrajectoryCollector:
         self._teacher_pending = []
         self._prefetched_teacher = {}
         self._teacher_future = None
+
+        # Both prefetches want the same two scarce things: the CPU-glue window
+        # between generations, and the colocated WorkerDict, where a Ray actor
+        # serves one call at a time. Running them together is CORRECT -- each
+        # still returns exactly its own rows -- but the second call issued waits
+        # on the first instead of on an idle GPU, so the overlap they exist to buy
+        # is spent queueing. Warn rather than pick one: which is worth more
+        # depends on the recipe's phase profile, and that is a measurement.
+        if self._logprob_prefetch_enabled and self._teacher_prefetch_fn is not None:
+            print(
+                "[rollout-prefetch] ROLLOUT_PREFETCH_LOGPROB and ROLLOUT_PREFETCH_TEACHER "
+                "are both active. They contend for the same CPU-glue window and the same "
+                "colocated workers, so enabling both usually buys less than either alone. "
+                "Turn one off and compare the turn table's tchWait / total columns."
+            )
 
         # Initial observations from the environment
         # Open one vLLM session for the whole rollout (opt-in). end_rollout_session

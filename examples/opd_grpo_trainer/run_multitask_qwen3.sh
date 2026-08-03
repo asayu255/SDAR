@@ -34,13 +34,14 @@ set -x
 #   that, put it back to True — this is a placement knob, the distillation
 #   targets are identical either way.
 #
-# Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
-# code, not in the expectations file — see docs/optimization_phase2.md):
-#   ROLLOUT_KEEP_VLLM_AWAKE=1  ROLLOUT_PREFETCH_LOGPROB=1  ENV_RESET_PREFETCH=1
-#   TASK_BALANCE_INTERLEAVE=1  ROLLOUT_PREFETCH_TEACHER=1
-#   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
-#    ROLLOUT_COMPACT_RECORD default to on)
+# Throughput mechanisms (process env vars, accuracy-preserving; live in code, not
+# in the expectations file — see docs/optimization_phase2.md):
+#   opt-in:      ROLLOUT_KEEP_VLLM_AWAKE=1  ROLLOUT_PREFETCH_LOGPROB=1
+#                ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
+#   default on:  ROLLOUT_PREFETCH_TEACHER  ROLLOUT_SKIP_DONE_PREPROC
+#                ROLLOUT_DECODE_ACTIVE_ONLY  ROLLOUT_COMPACT_RECORD
 #   e.g.  ROLLOUT_KEEP_VLLM_AWAKE=1 ENV_RESET_PREFETCH=1 bash run_multitask_qwen3.sh
+#   Set any of the default-on ones to 0 to turn it off.
 #
 # ROLLOUT_PREFETCH_TEACHER scores finished trajectories with their task's teacher
 # during the rollout instead of after it. What it fills is the driver's own CPU
@@ -64,7 +65,9 @@ set -x
 #   actor serves one call at a time. Enabling both does not corrupt anything —
 #   each mechanism still returns the same rows — but the second one issued waits
 #   on the first instead of on an idle GPU, so the overlap they exist to buy is
-#   spent queueing. Measure them separately before assuming either is free.
+#   spent queueing. TEACHER is the one on by default here, so adding
+#   ROLLOUT_PREFETCH_LOGPROB=1 means running both; the rollout prints a warning
+#   when it sees that. Measure them separately before assuming either is free.
 #
 # Dynamic (token-budget) micro-batching is wired below but OFF by default so the
 # fixed-batch objective is unchanged. It packs micro-batches to a token budget
@@ -73,8 +76,12 @@ set -x
 # (token-weighted, grouping-invariant) rather than the sample-count reweighting:
 #   e.g.  bash run_multitask_qwen3.sh actor_rollout_ref.actor.use_dynamic_bsz=True
 #
-# Actor-update mechanisms (config, not env vars). These target the PCIe
-# collectives: with no NVLink between the GPUs every FSDP all-gather and
+# Actor-update mechanisms (config, not env vars). All three are ON BY DEFAULT in
+# verl/trainer/config/ppo_trainer.yaml and are still written out literally below,
+# because this script's rule is that every parameter is readable in one place —
+# and because two of them are pinned in the intent lock, which reads the
+# EFFECTIVE config and cannot tell a default from an argument. They target the
+# PCIe collectives: with no NVLink between the GPUs every FSDP all-gather and
 # reduce-scatter crosses the bus, and update_actor is the phase with by far the
 # highest measured PCIe traffic (~10.5 GB/s TX vs ~2.0 during gen). NCCL
 # collectives count as SM-busy, so the 93-97% SM reading that made this phase
@@ -160,9 +167,9 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
-    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
-    +actor_rollout_ref.actor.no_sync_grad_accum=True \
+    actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \

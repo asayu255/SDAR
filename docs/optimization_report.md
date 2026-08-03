@@ -162,14 +162,33 @@ lesson as §5, one layer down.
 
 | Mechanism | Knob (default) | What it removes | Accuracy class |
 |---|---|---|---|
-| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy=shard_grad_op` (`null`) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
-| **`no_sync` gradient accumulation** — reduce once per mini-batch | `actor.no_sync_grad_accum=True` (off) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
-| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch=True` (off) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
+| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy` = `shard_grad_op` (default; `null` restores ZeRO-3) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
+| **`no_sync` gradient accumulation** — reduce once per mini-batch | `actor.no_sync_grad_accum` = `True` (default) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
+| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch` = `True` (default) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
 | **Deferred metric reads** — keep logger-only scalars as 0-d GPU tensors until the end of `update_policy`; name the constants when `pg_loss_coef==0` | always on | ~450 forced host↔device syncs per step | identical values |
+| **Response-row selection** — run the top-k distillation forward only over rows that survive the `[-response_length-1:-1]` slice | always on | ~3/4 of the vocab-sized `logsumexp`/`topk`/`gather`, and its backward on the student side | identical values |
+| **Resident teachers** — `ref.fsdp_config.param_offload` decides again, instead of FSDP `CPUOffload` being forced on | `ref.fsdp_config.param_offload` = `False` (default) | a full teacher fetched over PCIe per micro-batch (measured 7.6–8.9 GB/s sustained through `teacher_forward`) | placement only (the ref runs under `no_grad`) |
+| **Teacher prefetch** — score finished trajectories during the rollout's CPU glue | `ROLLOUT_PREFETCH_TEACHER` = on (default; `0` restores serial) | the 18% of the rollout the driver spends on decode / `envs.step` / tokenization with the GPU at 0 | **not** bit-identical: a row lands in a different micro-batch (same rows, same frozen weights) |
 
-The first two sit on the gradient path and are therefore pinned in
-`examples/opd_grpo_trainer/expected_multitask_config.yaml`, against the usual rule
-that performance knobs stay out of the intent lock.
+All of these are on by default. The two on the gradient path are nevertheless
+pinned in `examples/opd_grpo_trainer/expected_multitask_config.yaml`, against the
+usual rule that performance knobs stay out of the intent lock — the lock reads
+the *effective* config, so pinning them is what stops a default flipping
+underneath a comparison between arms.
+
+Scope of the defaults: `sharding_strategy`, `forward_prefetch` and
+`no_sync_grad_accum` live under `actor_rollout_ref.actor` in
+`verl/trainer/config/ppo_trainer.yaml`, so they change the **actor** update for
+every recipe that composes that file. The ref, critic and reward_model workers
+have their own `fsdp_config` blocks, do not carry these keys, and keep the mesh
+default. `ROLLOUT_PREFETCH_TEACHER` is inert unless the trainer hands
+`multi_turn_loop` a `teacher_prefetch_fn`, which only the OPD trainers do.
+
+Two consequences worth stating plainly. `no_sync_grad_accum=True` means a run
+started after this change will not reproduce an earlier run's gradients bit for
+bit; set it to `False` when that matters. And ZeRO-2 raises peak memory by
+roughly the unsharded parameter size minus its shard, so a model that only just
+fits under ZeRO-3 needs `sharding_strategy=null`.
 
 Two measurement additions come with them:
 
