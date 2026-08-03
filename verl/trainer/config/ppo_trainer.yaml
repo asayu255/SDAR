@@ -66,6 +66,18 @@ actor_rollout_ref:
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
+    # Accumulate gradients locally across a mini-batch's micro-batches and reduce
+    # ONCE, instead of reducing after every micro-batch (at ppo_mini_batch 60 /
+    # micro 5 that is 12 reduce-scatters becoming 1). Under
+    # fsdp_config.sharding_strategy=shard_grad_op it also drops the
+    # per-micro-batch re-gather, which is why the two are on together.
+    #
+    # ON by default, and NOT bit-identical: the partial sums reduce in a different
+    # order, so gradients differ in their last bits. The expectation is identical
+    # -- summing then averaging across ranks and averaging then summing are the
+    # same number -- but a run that must reproduce earlier numbers exactly has to
+    # set this to False.
+    no_sync_grad_accum: True
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
@@ -96,8 +108,19 @@ actor_rollout_ref:
       # the repeated all-gathers a layer does per micro-batch under gradient
       # checkpointing. Arithmetic is unchanged -- gradients are still reduce-
       # scattered in reduce_dtype -- but peak memory grows by about the unsharded
-      # parameter size minus its shard. Pointless with param_offload=True.
-      sharding_strategy: null # [null, full_shard, shard_grad_op]
+      # parameter size minus its shard. Pointless with param_offload=True, which
+      # sends away exactly what this keeps resident (get_sharding_strategy warns).
+      #
+      # ON by default. Only the ACTOR reads this key: ref / critic / reward_model
+      # have their own fsdp_config blocks and do not carry it, so they keep the
+      # mesh default. Set to null (or full_shard) here or per run if a model that
+      # fits under ZeRO-3 no longer fits under ZeRO-2.
+      sharding_strategy: shard_grad_op # [null, full_shard, shard_grad_op]
+      # Issue the NEXT FSDP unit's all-gather while the current one computes,
+      # overlapping communication that would otherwise serialize. Scheduling only
+      # -- the arithmetic is untouched -- so this is on by default. Same
+      # actor-only scope as sharding_strategy above.
+      forward_prefetch: True
   ref:
     strategy: fsdp
     fsdp_config:

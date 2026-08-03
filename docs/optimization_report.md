@@ -164,16 +164,35 @@ communicating. Same lesson as §5, one layer down.
 
 | Mechanism | Knob (default) | What it removes | Accuracy class |
 |---|---|---|---|
-| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy=shard_grad_op` (`null`) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
-| **`no_sync` gradient accumulation** — reduce once per mini-batch | `+actor.no_sync_grad_accum=True` (off) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
-| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch=True` (off) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
-| **Resident reference policy** | `ref.fsdp_config.param_offload=False` | a full model's worth of host→device PCIe per micro-batch; the key used to be dead and offload was forced on | placement; costs `param_bytes / world_size` |
+| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy` = `shard_grad_op` (default; `null` restores ZeRO-3) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
+| **`no_sync` gradient accumulation** — reduce once per mini-batch | `actor.no_sync_grad_accum` = `True` (default) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
+| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch` = `True` (default) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
+| **Resident reference policy** — `ref.fsdp_config.param_offload` decides again, instead of FSDP `CPUOffload` being forced on | `ref.fsdp_config.param_offload` = `False` (default) | a full model fetched over PCIe per micro-batch (measured 7.6–8.9 GB/s sustained through the reference forward) | placement only (the ref runs under `no_grad`); costs `param_bytes / world_size` |
 | **Deferred metric reads** — keep logger-only scalars as 0-d GPU tensors until the end of `update_policy` | always on | several hundred forced host↔device syncs per step | identical values, except `actor/kl_loss` and `actor/sdl_loss`, which were assigned rather than appended and so reported only the last micro-batch |
-| **Exact token-mean under dynamic bsz** | `+actor.dynamic_bsz_token_scale=True` (off) | nothing — it makes `use_dynamic_bsz` safe to turn on by removing the objective's dependence on the packing | changes the loss under dynamic bsz (to the correct one) |
+| **Exact token-mean under dynamic bsz** | `+actor.dynamic_bsz_token_scale=True` (**off**) | nothing — it makes `use_dynamic_bsz` safe to turn on by removing the objective's dependence on the packing | changes the loss under dynamic bsz (to the correct one) |
 
-`sharding_strategy` and `no_sync_grad_accum` sit on the gradient path, so a
-comparison run should pin them next to its scientific knobs rather than treating
-them as free tuning.
+Everything except the last row is on by default. `dynamic_bsz_token_scale` stays
+off because it is the one entry that changes the loss rather than how it is
+computed, and it only applies when `use_dynamic_bsz` is on — which the multitask
+recipes do not use.
+
+Scope of the defaults: `sharding_strategy`, `forward_prefetch` and
+`no_sync_grad_accum` live under `actor_rollout_ref.actor` in
+`verl/trainer/config/ppo_trainer.yaml`, so they change the **actor** update for
+every recipe that composes that file. The ref, critic and reward_model workers
+have their own `fsdp_config` blocks, do not carry these keys, and keep the mesh
+default. That separation is not a nicety for the ref: a recipe is free to ask for
+`param_offload=True` there, and ZeRO-2 exists to keep parameters resident, so the
+two would cancel — the combination `get_sharding_strategy` warns about.
+
+Two consequences worth stating plainly. `no_sync_grad_accum=True` means a run
+started after this change will not reproduce an earlier run's gradients bit for
+bit; set it to `False` when that matters. And ZeRO-2 raises peak memory by
+roughly the unsharded parameter size minus its shard, so a model that only just
+fits under ZeRO-3 needs `sharding_strategy=null`.
+
+Both sit on the gradient path, so a comparison run should pin them next to its
+scientific knobs rather than trusting the default to stay put.
 
 ### Instruments
 
@@ -209,17 +228,23 @@ Two fixes outside the GPU entirely, both required to finish a run on a 256GB box
   `docs/webshop_worker_memory.md`. ~1.8 GB/step of host RAM, which is what the OOM
   killer was reacting to around step 24.
 
-### Enabling it
+### Turning them off
 
-Every mechanism above is opt-in and defaults to the previous behaviour, so
-nothing changes until a run script asks:
+No run script has to opt in — the defaults are in `ppo_trainer.yaml`, and
+`tests/trainer/test_speedup_defaults.py` pins them, since flipping one is a
+one-character edit no other test would notice. Note that the three actor keys
+now *exist* in the config, so a run script must write them without Hydra's `+`
+append form, which refuses a key that is already there.
+
+To restore the pre-Phase-3 behaviour, per run or in the yaml:
 
 ```bash
-    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
-    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
-    +actor_rollout_ref.actor.no_sync_grad_accum=True \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.sharding_strategy=null \
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=False \
+    actor_rollout_ref.actor.no_sync_grad_accum=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
 ```
 
-`no_sync_grad_accum` is the one to think twice about: it is not bit-identical, so
-it should not be switched on mid-experiment.
+The one to reach for first is `no_sync_grad_accum=False`, when a run has to
+reproduce earlier gradients bit for bit; then `sharding_strategy=null`, if the
+model no longer fits.
