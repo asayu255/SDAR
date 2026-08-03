@@ -21,6 +21,13 @@ set -x
 #     topk_kl (dense top-k+tail reverse KL; support size algorithm.opd.topk).
 #   - use_kl_loss=False / entropy_coeff=0 keep the other terms off;
 #     use_teacher_kl_loss is force-injected in main_opd_grpo.py.
+#   - algorithm.opd.normalize_loss_by_task: each task contributes 1/3 of the
+#     loss. Without it the token-mean hands alfworld ~69% and search ~4% of the
+#     gradient, purely because of the 50/15/4-turn episode caps -- a weighting
+#     nobody chose, and one the multitask SFT and pure-OPD arms do not use. It
+#     weights BOTH terms of the loss above: weighting only the teacher KL would
+#     leave the policy gradient on the token-count split and silently change the
+#     ratio between them, which is what pg_loss_coef is supposed to control.
 # Teachers: per-task single-task RL checkpoints, created as role="ref" worker
 #   groups (they reuse actor_rollout_ref.ref.* settings: log-prob micro batch,
 #   FSDP param_offload); each sample is distilled from the teacher of its task.
@@ -219,6 +226,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.kl_loss_coef=1.0 \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
+    +algorithm.opd.normalize_loss_by_task=True \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \

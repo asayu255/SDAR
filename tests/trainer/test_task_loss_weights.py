@@ -10,6 +10,12 @@ These are CPU-only: the driver-side weights are computed exactly as in
 production, and the worker-side arithmetic is replayed by ``_replay_actor`` (the
 same formula as ``DataParallelPPOActor.update_policy``) rather than by standing
 up FSDP.
+
+Tolerances are ``rel=1e-6``, not tighter: ``attach_task_loss_weights`` stores
+float32 weights, so a few thousand of them summed in an order that depends on the
+torch build lands about 1e-8 relative away from the exact answer. A tolerance
+below float32's own resolution does not test the arithmetic, it tests the
+summation order.
 """
 
 import math
@@ -174,7 +180,7 @@ def test_step_loss_is_the_equal_share_token_mean():
         _token_mean(per_token_loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
         for task in ("alfworld", "webshop", "search")
     )
-    assert got == pytest.approx(expected, rel=1e-9)
+    assert got == pytest.approx(expected, rel=1e-6)
 
 
 def test_step_loss_magnitude_matches_the_unweighted_token_mean():
@@ -195,7 +201,7 @@ def test_step_loss_magnitude_matches_the_unweighted_token_mean():
     got = _replay_actor(
         batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
     )
-    assert got == pytest.approx(0.5, rel=1e-9)
+    assert got == pytest.approx(0.5, rel=1e-6)
 
 
 def test_step_loss_is_invariant_to_micro_batch_grouping():
@@ -211,7 +217,7 @@ def test_step_loss_is_invariant_to_micro_batch_grouping():
 
     a = _replay_actor(batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=3)
     b = _replay_actor(batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=6)
-    assert a == pytest.approx(b, rel=1e-9)
+    assert a == pytest.approx(b, rel=1e-6)
 
 
 def test_short_final_mini_batch_keeps_the_equal_share():
@@ -240,7 +246,7 @@ def test_short_final_mini_batch_keeps_the_equal_share():
         _token_mean(per_token_loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
         for task in ("alfworld", "webshop", "search")
     )
-    assert got == pytest.approx(expected, rel=1e-9)
+    assert got == pytest.approx(expected, rel=1e-6)
 
 
 def test_short_final_mini_batch_keeps_the_magnitude():
@@ -254,4 +260,213 @@ def test_short_final_mini_batch_keeps_the_magnitude():
     got = _replay_actor(
         batch, mask.double() * 0.5, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
     )
-    assert got == pytest.approx(0.5, rel=1e-9)
+    assert got == pytest.approx(0.5, rel=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# OPD+GRPO: the same weights applied to the policy-gradient term
+# --------------------------------------------------------------------------- #
+# Pure OPD has one live loss term, so weighting it is the whole story. OPD+GRPO
+# adds the GRPO policy gradient, and the two are combined as
+# ``pg_loss * pg_loss_coef + teacher_kl * teacher_kl_coef``. Weighting only the
+# KL would leave the policy gradient on the token-count split, which does not
+# just leave that term unbalanced -- it changes the RATIO between the terms,
+# task by task, and that ratio is what pg_loss_coef exists to set.
+from verl.trainer.ppo.core_algos import (  # noqa: E402
+    agg_loss,
+    agg_loss_by_task_weights,
+    compute_policy_loss,
+    compute_policy_loss_per_token,
+)
+
+
+def _policy_inputs(bs=8, resp=6, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return {
+        "old_log_prob": torch.randn(bs, resp, generator=g),
+        "log_prob": torch.randn(bs, resp, generator=g),
+        "advantages": torch.randn(bs, resp, generator=g),
+        "response_mask": torch.ones(bs, resp),
+    }
+
+
+@pytest.mark.parametrize("loss_agg_mode", ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"])
+def test_splitting_compute_policy_loss_changed_no_value(loss_agg_mode):
+    """The refactor that exposed the per-token matrix must be a no-op.
+
+    ``compute_policy_loss`` now delegates the clipping to
+    ``compute_policy_loss_per_token`` and aggregates the result. Every existing
+    caller -- every non-OPD recipe in the repo -- goes through that path, so a
+    drift here would silently change unrelated runs.
+    """
+    inp = _policy_inputs()
+    pg_loss, clipfrac, ppo_kl, clipfrac_lower = compute_policy_loss(
+        **inp, cliprange=0.2, clip_ratio_c=3.0, loss_agg_mode=loss_agg_mode
+    )
+    mat, clipfrac2, ppo_kl2, clipfrac_lower2 = compute_policy_loss_per_token(
+        **inp, cliprange=0.2, clip_ratio_c=3.0
+    )
+    recomposed = agg_loss(loss_mat=mat, loss_mask=inp["response_mask"], loss_agg_mode=loss_agg_mode)
+
+    assert torch.equal(pg_loss, recomposed)
+    assert torch.equal(clipfrac, clipfrac2)
+    assert torch.equal(ppo_kl, ppo_kl2)
+    assert torch.equal(clipfrac_lower, clipfrac_lower2)
+
+
+def test_per_token_policy_loss_keeps_its_gradient():
+    """The weighted path backprops through the matrix, not through a detached copy."""
+    inp = _policy_inputs()
+    inp["log_prob"] = inp["log_prob"].clone().requires_grad_(True)
+    mat, _, _, _ = compute_policy_loss_per_token(**inp, cliprange=0.2, clip_ratio_c=3.0)
+    weights = torch.rand(mat.size(0))
+    agg_loss_by_task_weights(loss_mat=mat, loss_mask=inp["response_mask"], row_weights=weights).backward()
+    assert inp["log_prob"].grad is not None and torch.isfinite(inp["log_prob"].grad).all()
+
+
+def test_task_weighted_aggregation_is_the_weighted_token_sum():
+    """``agg_loss_by_task_weights`` is sum_i w_i * sum_t (loss * mask), nothing else.
+
+    Stated as a test because it is deliberately NOT one of ``agg_loss``'s modes:
+    token-mean divides by the batch's token count, which is the very quantity the
+    weights exist to stop deciding the answer.
+    """
+    loss = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    w = torch.tensor([0.5, 2.0])
+    got = agg_loss_by_task_weights(loss_mat=loss, loss_mask=mask, row_weights=w)
+    assert float(got) == pytest.approx(0.5 * (1.0 + 2.0) + 2.0 * (4.0 + 5.0 + 6.0))
+
+
+def test_both_loss_terms_get_the_same_equal_share_treatment():
+    """pg and teacher-KL, weighted by one weight vector, each land at 1/T per task.
+
+    The point is not that either term is individually correct -- the tests above
+    already pin that -- but that they are correct under the SAME weights, which is
+    what leaves ``pg_loss_coef`` meaning the ratio between them rather than a
+    ratio that varies by task.
+    """
+    tasks = ["alfworld"] * 6 + ["search"] * 2
+    row_tokens = [10] * 6 + [1] * 2  # 60 vs 2 tokens: the imbalance being corrected
+    batch = _make_batch(tasks, row_tokens)
+    metrics = {}
+    attach_task_loss_weights(batch, n_real=len(tasks), mini_batch_size=8, metrics=metrics)
+
+    mask = batch.batch["response_mask"]
+    g = torch.Generator().manual_seed(7)
+    pg = torch.rand(mask.shape, generator=g)
+    kl = torch.rand(mask.shape, generator=g)
+
+    alf = list(range(6))
+    sea = [6, 7]
+    for name, per_token in (("pg", pg), ("kl", kl)):
+        got = _replay_actor(batch, per_token, mini_batch_size=8, dp_world_size=2, micro_batch_size=2)
+        want = 0.5 * (_token_mean(per_token, mask, alf) + _token_mean(per_token, mask, sea))
+        assert got == pytest.approx(want, rel=1e-6), name
+
+    # And the combination: a coefficient applied to a term scales that term's
+    # contribution and nothing else.
+    combined = _replay_actor(batch, 1.0 * pg + 0.25 * kl, mini_batch_size=8, dp_world_size=2, micro_batch_size=2)
+    separate = (
+        1.0 * _replay_actor(batch, pg, mini_batch_size=8, dp_world_size=2, micro_batch_size=2)
+        + 0.25 * _replay_actor(batch, kl, mini_batch_size=8, dp_world_size=2, micro_batch_size=2)
+    )
+    assert combined == pytest.approx(separate, rel=1e-6)
+
+
+def test_weighting_only_one_term_would_distort_their_ratio():
+    """The negative control for the choice above -- why both terms are weighted.
+
+    With alfworld holding 30x search's tokens, leaving the policy gradient on the
+    plain token-mean makes the pg:KL ratio differ per task by that same factor,
+    even though pg_loss_coef is a single number. If this ever stops failing, the
+    weighting has been silently applied to both sides of the comparison and the
+    test has lost its meaning.
+    """
+    tasks = ["alfworld"] * 6 + ["search"] * 2
+    batch = _make_batch(tasks, [10] * 6 + [1] * 2)
+    attach_task_loss_weights(batch, n_real=len(tasks), mini_batch_size=8, metrics={})
+
+    mask = batch.batch["response_mask"]
+    per_token = torch.ones(mask.shape)
+    alf, sea = list(range(6)), [6, 7]
+
+    # Weighted: each task contributes 1/2 of its own token-mean.
+    weighted = {t: 0.5 for t in ("alfworld", "search")}
+    # Unweighted token-mean: a task contributes its share of the batch's tokens.
+    total = float((per_token * mask).sum())
+    unweighted = {
+        "alfworld": float((per_token * mask)[torch.tensor(alf)].sum()) / total,
+        "search": float((per_token * mask)[torch.tensor(sea)].sum()) / total,
+    }
+    ratio = {t: unweighted[t] / weighted[t] for t in weighted}
+    assert ratio["alfworld"] / ratio["search"] == pytest.approx(30.0, rel=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# What the weighted path refuses to run under
+# --------------------------------------------------------------------------- #
+from verl.workers.actor.dp_actor import check_task_weighting_supported  # noqa: E402
+
+
+def _actor_config(**over):
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(
+        {
+            "use_dynamic_bsz": False,
+            "ppo_epochs": 1,
+            "loss_agg_mode": "token-mean",
+            "policy_loss": {"loss_mode": "vanilla"},
+            "use_kl_loss": False,
+            "use_sdl_loss": False,
+            "use_sdar_loss": False,
+        }
+    )
+    for k, v in over.items():
+        OmegaConf.update(cfg, k, v, force_add=True)
+    return cfg
+
+
+def test_opd_grpo_config_is_accepted_with_a_live_policy_gradient():
+    """The point of the GRPO extension: pg_loss_coef != 0 is no longer refused.
+
+    Pure OPD asserted pg_loss_coef == 0 because it only weighted the teacher KL.
+    Both terms are weighted now, so the OPD+GRPO arm's own config has to pass.
+    """
+    check_task_weighting_supported(
+        _actor_config(pg_loss_coef=1.0, entropy_coeff=0.0),
+        use_teacher_kl_loss=True,
+        ulysses_sequence_parallel_size=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "over, why",
+    [
+        ({"use_dynamic_bsz": True}, "rescales the mini-batch loss"),
+        ({"ppo_epochs": 2}, "reuses each mini-batch"),
+        ({"loss_agg_mode": "seq-mean-token-mean"}, "aggregates differently"),
+        ({"policy_loss.loss_mode": "gspo"}, "sequence-level ratio"),
+        ({"use_kl_loss": True}, "unweighted extra term"),
+        ({"use_sdl_loss": True}, "unweighted extra term"),
+        ({"use_sdar_loss": True}, "unweighted extra term"),
+    ],
+)
+def test_configs_that_would_silently_undo_the_weighting_are_refused(over, why):
+    """Each of these produces a plausible number with the weighting quietly gone."""
+    with pytest.raises(AssertionError):
+        check_task_weighting_supported(
+            _actor_config(**over), use_teacher_kl_loss=True, ulysses_sequence_parallel_size=1
+        )
+
+
+def test_sequence_parallel_and_missing_teacher_kl_are_refused():
+    with pytest.raises(AssertionError):
+        check_task_weighting_supported(
+            _actor_config(), use_teacher_kl_loss=True, ulysses_sequence_parallel_size=2
+        )
+    with pytest.raises(AssertionError):
+        check_task_weighting_supported(
+            _actor_config(), use_teacher_kl_loss=False, ulysses_sequence_parallel_size=1
+        )

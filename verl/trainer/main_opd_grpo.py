@@ -40,43 +40,69 @@ def run_opd_grpo(config) -> None:
     ray.get(runner.run.remote(config))
 
 
+def inject_opd_grpo_config(config):
+    """Turn ``algorithm.opd.*`` into the actor settings the trainer actually reads.
+
+    Separated from ``run`` so the EFFECTIVE config — the thing the expectations
+    file is checked against — can be produced without standing up Ray. A test that
+    composes the run script's arguments and applies this is the only way to catch
+    a lock/script disagreement before a run does, and the lock's whole purpose is
+    to fail in seconds instead of hours.
+
+    Modifies ``config`` in place and returns it.
+    """
+    from omegaconf import open_dict
+
+    opd_cfg = config.algorithm.get("opd", {})
+    teacher_paths = opd_cfg.get("teacher_paths", None)
+    assert teacher_paths is not None, (
+        "OPD+GRPO requires algorithm.opd.teacher_paths.{alfworld,search,webshop} "
+        "(pass via +algorithm.opd.teacher_paths.<task>=/path)"
+    )
+
+    # Enable the per-task teacher KL distillation AND keep the GRPO policy
+    # gradient active (pg_loss_coef != 0). Unlike pure OPD (main_opd.py), we
+    # do NOT zero pg_loss_coef and we do NOT force use_kl_in_reward; those are
+    # left to config so GRPO advantages can flow into the loss.
+    with open_dict(config):
+        config.actor_rollout_ref.actor.use_teacher_kl_loss = True
+        config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
+        config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
+        # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
+        config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
+        # Equal per-task share of the loss, instead of the token-count share the
+        # plain token-mean gives. On this arm it weights the policy gradient and
+        # the teacher KL alike, so pg_loss_coef still means the ratio between
+        # them. Scientific knob, so it is surfaced under algorithm.opd like the
+        # other loss settings and pinned in the expectations file rather than
+        # left to the actor's default.
+        config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
+            "normalize_loss_by_task", False
+        )
+        # pg_loss_coef is taken directly from actor_rollout_ref.actor.pg_loss_coef
+        # (the run script sets it there). It used to be re-injected from
+        # algorithm.opd.pg_loss_coef — which the script never sets — silently
+        # overriding the script's value with 1.0; that injection is removed.
+        # No reference-KL term and no SDL/SDAR distillation paths.
+        config.actor_rollout_ref.actor.use_kl_loss = False
+        config.actor_rollout_ref.actor.use_sdl_loss = False
+        config.actor_rollout_ref.actor.use_sdar_loss = False
+    return config
+
+
 @ray.remote(num_cpus=1)
 class OPDGRPOTaskRunner:
     def run(self, config):
         from pprint import pprint
 
-        from omegaconf import OmegaConf, open_dict
+        from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
 
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        opd_cfg = config.algorithm.get("opd", {})
-        teacher_paths = opd_cfg.get("teacher_paths", None)
-        assert teacher_paths is not None, (
-            "OPD+GRPO requires algorithm.opd.teacher_paths.{alfworld,search,webshop} "
-            "(pass via +algorithm.opd.teacher_paths.<task>=/path)"
-        )
-
-        # Enable the per-task teacher KL distillation AND keep the GRPO policy
-        # gradient active (pg_loss_coef != 0). Unlike pure OPD (main_opd.py), we
-        # do NOT zero pg_loss_coef and we do NOT force use_kl_in_reward; those are
-        # left to config so GRPO advantages can flow into the loss.
-        with open_dict(config):
-            config.actor_rollout_ref.actor.use_teacher_kl_loss = True
-            config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
-            config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
-            # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
-            config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
-            # pg_loss_coef is taken directly from actor_rollout_ref.actor.pg_loss_coef
-            # (the run script sets it there). It used to be re-injected from
-            # algorithm.opd.pg_loss_coef — which the script never sets — silently
-            # overriding the script's value with 1.0; that injection is removed.
-            # No reference-KL term and no SDL/SDAR distillation paths.
-            config.actor_rollout_ref.actor.use_kl_loss = False
-            config.actor_rollout_ref.actor.use_sdl_loss = False
-            config.actor_rollout_ref.actor.use_sdar_loss = False
+        inject_opd_grpo_config(config)
 
         # Fail-fast intent check: validate the EFFECTIVE config (after the
         # injection above) against the version-controlled expectations file.

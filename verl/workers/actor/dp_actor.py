@@ -30,7 +30,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
+from verl.trainer.ppo.core_algos import agg_loss, agg_loss_by_task_weights, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, compute_policy_loss_per_token, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
@@ -136,6 +136,63 @@ def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: 
     lo = seqlen - response_length - 1
     sel = torch.nonzero((seq_pos >= lo) & (seq_pos < seqlen - 1), as_tuple=True)[0]
     return sel, indices[sel], seq_pos[sel] - lo
+
+
+def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses_sequence_parallel_size: int):
+    """Refuse a configuration whose loss the per-task row weights do not describe.
+
+    The weights carry the WHOLE normalisation of the loss (see
+    ``verl/trainer/ppo/task_loss_weights.py``), which makes them fragile in one
+    specific way: anything that re-scales the loss afterwards, aggregates it
+    differently, or adds a term that was normalised some other way does not
+    produce a wrong-looking number -- it produces a plausible one, with the task
+    weighting quietly undone. Every check below is that failure mode.
+
+    Note what is NOT here: ``pg_loss_coef``. Pure OPD required it to be 0 because
+    it only knew how to weight the teacher KL, so a live policy gradient would
+    have been added to a differently-normalised number. This actor weights the
+    policy-gradient, entropy and teacher-KL terms with the same row weights, so
+    OPD+GRPO can run with the policy gradient on and the coefficients between the
+    terms keep meaning what they say.
+
+    Split out of ``update_policy`` so it can be tested without standing up FSDP.
+    """
+    assert not config.use_dynamic_bsz, (
+        "per-task loss normalisation is incompatible with use_dynamic_bsz "
+        "(its mini-batch scaling assumes an unweighted token-mean)"
+    )
+    assert ulysses_sequence_parallel_size == 1, (
+        "per-task loss normalisation assumes DP size == world size; "
+        f"got ulysses_sequence_parallel_size={ulysses_sequence_parallel_size}"
+    )
+    assert config.ppo_epochs == 1, (
+        "per-task loss normalisation assumes one pass over each mini-batch; "
+        f"got ppo_epochs={config.ppo_epochs}"
+    )
+    # The weighted path replaces the token-mean with a weighted token-sum, so a
+    # configured loss_agg_mode would be silently ignored rather than honoured.
+    # Only the mode the weights were derived against is allowed.
+    agg_mode = config.loss_agg_mode
+    assert agg_mode == "token-mean", (
+        "per-task loss normalisation replaces the token-mean with a weighted "
+        f"token-sum; loss_agg_mode={agg_mode!r} would be ignored"
+    )
+    # GSPO aggregates a sequence-level ratio with seq-mean-token-mean, a different
+    # normalisation that these row weights do not describe.
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    assert loss_mode == "vanilla", (
+        f"per-task loss normalisation is only derived for the vanilla policy loss; "
+        f"got policy_loss.loss_mode={loss_mode!r}"
+    )
+    assert use_teacher_kl_loss, (
+        "per-task loss normalisation is for the distillation loss, but "
+        "use_teacher_kl_loss is off"
+    )
+    for other in ("use_kl_loss", "use_sdl_loss", "use_sdar_loss"):
+        assert not config.get(other, False), (
+            f"per-task loss normalisation weights the policy-gradient, entropy and "
+            f"teacher-KL terms; {other} is set and would keep the plain token-mean"
+        )
 
 
 def _grad_sync_context(module, active: bool):
@@ -619,34 +676,10 @@ class DataParallelPPOActor(BasePPOActor):
         task_weighted = TASK_LOSS_WEIGHT_KEY in data.batch.keys()
         if task_weighted:
             select_keys.append(TASK_LOSS_WEIGHT_KEY)
-            # The weights encode the whole normalisation, which these three would
-            # each re-scale out from under it.
-            assert not self.config.use_dynamic_bsz, (
-                "per-task loss normalisation is incompatible with use_dynamic_bsz "
-                "(its mini-batch scaling assumes an unweighted token-mean)"
-            )
-            assert self.ulysses_sequence_parallel_size == 1, (
-                "per-task loss normalisation assumes DP size == world size; "
-                f"got ulysses_sequence_parallel_size={self.ulysses_sequence_parallel_size}"
-            )
-            assert self.config.ppo_epochs == 1, (
-                "per-task loss normalisation assumes one pass over each mini-batch; "
-                f"got ppo_epochs={self.config.ppo_epochs}"
-            )
-            # Any term that is not weighted the same way would be added to a
-            # differently-normalised number.
-            assert use_teacher_kl_loss, (
-                "per-task loss normalisation currently only normalises the teacher-KL "
-                "term, but use_teacher_kl_loss is off"
-            )
-            for other in ("use_kl_loss", "use_sdl_loss", "use_sdar_loss"):
-                assert not self.config.get(other, False), (
-                    f"per-task loss normalisation requires the teacher KL to be the only "
-                    f"loss term, but {other} is set"
-                )
-            assert pg_loss_coef == 0 and self.config.entropy_coeff == 0, (
-                "per-task loss normalisation requires the teacher KL to be the only loss "
-                f"term, but pg_loss_coef={pg_loss_coef} entropy_coeff={self.config.entropy_coeff}"
+            check_task_weighting_supported(
+                self.config,
+                use_teacher_kl_loss=use_teacher_kl_loss,
+                ulysses_sequence_parallel_size=self.ulysses_sequence_parallel_size,
             )
             self.task_dp_world_size = (
                 torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
@@ -764,33 +797,76 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
+                    # Under per-task normalisation every term is aggregated by the
+                    # same row weights instead of by the token-mean, so the
+                    # coefficients between them keep meaning what they say. The
+                    # weights already carry the full normalisation, so the two
+                    # divisions the sum has to survive are undone once here: FSDP
+                    # averages gradients across the DP ranks, and the mini-batch
+                    # loss is divided by gradient_accumulation below.
+                    task_agg_scale = None
+                    if task_loss_weight is not None:
+                        task_agg_scale = task_loss_weight * (
+                            self.task_dp_world_size * self.gradient_accumulation
+                        )
+
+                    def _task_agg(loss_mat):
+                        return agg_loss_by_task_weights(
+                            loss_mat=loss_mat, loss_mask=response_mask, row_weights=task_agg_scale
+                        )
+
                     if pg_loss_coef != 0:
                         old_log_prob = data["old_log_probs"]
                         advantages = data["advantages"]
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
+                        if task_agg_scale is None:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            pg_term = pg_loss
+                        else:
+                            # Same clipped objective, aggregated by the row weights.
+                            # loss_mode is pinned to vanilla for this path (asserted
+                            # where the weights are picked up), so the per-token split
+                            # of compute_policy_loss is the right one to use.
+                            pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_per_token(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                            )
+                            pg_term = _task_agg(pg_losses)
+                            # Reported unweighted so it stays comparable with runs
+                            # that do not normalise per task; the weighted number is
+                            # deferred separately below.
+                            pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            _defer("actor/pg_loss_weighted", pg_term)
                     else:
                         # Pure teacher-KL distillation: no policy-gradient signal.
                         old_log_prob = data.get("old_log_probs", None)
                         zero = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
                         pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
+                        pg_term = zero
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_term = entropy_loss if task_agg_scale is None else _task_agg(entropy)
 
                         # compute policy loss
-                        policy_loss = pg_loss * pg_loss_coef - entropy_loss * entropy_coeff
+                        policy_loss = pg_term * pg_loss_coef - entropy_term * entropy_coeff
                     else:
-                        policy_loss = pg_loss * pg_loss_coef
+                        policy_loss = pg_term * pg_loss_coef
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
@@ -861,23 +937,17 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
-                        if task_loss_weight is None:
+                        if task_agg_scale is None:
                             policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
                         else:
                             # Per-task normalised variant: the driver put a weight on
                             # every row such that summing weight * row-KL over the whole
                             # step gives each task an equal share of the loss (see
-                            # attach_task_loss_weights). The two divisions this sum must
-                            # survive are undone here rather than by special-casing the
-                            # shared scaling below: FSDP averages gradients across the DP
-                            # ranks, and the mini-batch loss is divided by
-                            # gradient_accumulation, but the weights already carry the
-                            # full normalisation.
-                            row_kl = (teacher_kld * response_mask).sum(-1)
-                            weighted_teacher_kl = (row_kl * task_loss_weight).sum()
-                            weighted_teacher_kl = weighted_teacher_kl * (
-                                self.task_dp_world_size * self.gradient_accumulation
-                            )
+                            # attach_task_loss_weights). Aggregated by the same helper
+                            # and the same scaled weights as the policy-gradient and
+                            # entropy terms above, which is what keeps teacher_kl_coef
+                            # and pg_loss_coef comparable to each other.
+                            weighted_teacher_kl = _task_agg(teacher_kld)
                             policy_loss = policy_loss + weighted_teacher_kl * teacher_kl_coef
                             _defer("actor/teacher_kl_loss_weighted", weighted_teacher_kl)
                         # Deferred, and appended rather than assigned: assignment kept
