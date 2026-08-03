@@ -637,6 +637,17 @@ class RayPPOTrainer:
         if expect_file:
             from verl.utils.expected_config import enforce_expected_config
 
+            # Relative paths resolve against the directory the run was launched
+            # from -- the same convention algorithm.sdar.skills_dir already uses.
+            # Say so here rather than letting OmegaConf.load raise a bare
+            # FileNotFoundError from inside the validator.
+            if not os.path.exists(expect_file):
+                raise FileNotFoundError(
+                    f"trainer.expected_config={expect_file!r} does not exist "
+                    f"(looked from {os.getcwd()!r}). Relative paths are resolved "
+                    f"against the launch directory; run from the repo root or pass "
+                    f"an absolute path."
+                )
             enforce_expected_config(config, expect_file, tag="expected-config")
 
         print("[validate_config] All configuration checks passed successfully!")

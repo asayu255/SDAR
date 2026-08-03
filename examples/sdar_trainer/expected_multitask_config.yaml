@@ -1,0 +1,160 @@
+# Expected effective config for the SDAR multitask run.
+#
+# This file is the machine-readable INTENT of the experiment.
+# RayPPOTrainer._validate_config validates the composed Hydra config against
+# every key below — after main_sdar's own injection — and aborts on any
+# mismatch, so a wrong default / typo'd override / shadowed injection fails in
+# seconds instead of producing a mislabeled multi-hour run.
+#
+# Wired in by examples/sdar_trainer/run_multitask_qwen3.sh via
+#   +trainer.expected_config=examples/sdar_trainer/expected_multitask_config.yaml
+#
+# Rules:
+#   - Keys are dotted paths into the composed config; values are the expected
+#     effective values.
+#   - Only knobs that define what the experiment IS live here. Machine and
+#     throughput settings (micro batch sizes, offload, prefix caching,
+#     max_model_len, gpu_memory_utilization, n_gpus_per_node, checkpoint and
+#     data paths) are intentionally NOT listed, so tuning a host never requires
+#     touching this file — which is also why every env-var knob at the top of
+#     the run script stays overridable.
+#   - The one deliberate exception is the two throughput knobs that sit on the
+#     GRADIENT path; see their section below.
+#   - To change a setting intentionally: edit the run script AND this file in
+#     the same commit. A run-script-only edit will (by design) refuse to start.
+#
+# tests/trainer/test_expected_config_matches_run_script.py checks this file
+# against the script by expanding the script's own overrides through bash and
+# Hydra, so the two cannot drift without a test failing first.
+
+# ---- SDAR distillation loss ---------------------------------------------------
+"algorithm.sdar.sdar_coef": 0.01
+"algorithm.sdar.gate_beta": 5.0
+"algorithm.sdar.skill_all": false
+"algorithm.sdar.skills_dir": skills/alfworld
+"algorithm.sdar.skills_dirs.alfworld": skills/alfworld
+"algorithm.sdar.skills_dirs.search": skills/search
+"algorithm.sdar.skills_dirs.webshop": skills/webshop
+"algorithm.sdar.kl_loss_coef_by_task":
+  alfworld: 0.01
+  search: 0.001
+  webshop: 0.01
+# Effective values after main_sdar's injection into the actor config. Pinned
+# separately from their algorithm.sdar.* sources on purpose: an injection that
+# silently stopped running would leave the sources correct and the loss wrong,
+# which is precisely the failure this file exists to catch.
+"actor_rollout_ref.actor.use_sdar_loss": true
+"actor_rollout_ref.actor.sdar_loss_coef": 0.01
+"actor_rollout_ref.actor.sdar_gate_beta": 5.0
+"actor_rollout_ref.actor.kl_loss_coef_by_task":
+  alfworld: 0.01
+  search: 0.001
+  webshop: 0.01
+
+# ---- RL objective -------------------------------------------------------------
+"algorithm.adv_estimator": grpo
+"algorithm.use_kl_in_reward": false
+"actor_rollout_ref.actor.use_kl_loss": true
+"actor_rollout_ref.actor.kl_loss_coef": 0.001
+"actor_rollout_ref.actor.kl_loss_type": low_var_kl
+"actor_rollout_ref.actor.entropy_coeff": 0.001
+"actor_rollout_ref.actor.loss_agg_mode": token-mean
+"actor_rollout_ref.actor.clip_ratio": 0.2
+"actor_rollout_ref.actor.clip_ratio_low": 0.2
+"actor_rollout_ref.actor.clip_ratio_high": 0.2
+"actor_rollout_ref.actor.clip_ratio_c": 3.0
+"actor_rollout_ref.actor.ppo_epochs": 1
+"actor_rollout_ref.actor.use_invalid_action_penalty": true
+"actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
+"actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
+  alfworld: 0.1
+  search: 0.01
+  webshop: 0.1
+
+# ---- model / optimization -----------------------------------------------------
+"actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
+"actor_rollout_ref.actor.optim.lr": 1.0e-6
+"actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
+"actor_rollout_ref.actor.ppo_mini_batch_size": 60
+# Pinned because the loss scaling depends on it: with use_dynamic_bsz the
+# micro-batch weighting is a function of the packing unless
+# actor.dynamic_bsz_token_scale is also on (see docs/optimization_report.md §10).
+"actor_rollout_ref.actor.use_dynamic_bsz": false
+
+# ---- throughput knobs that sit on the GRADIENT path ---------------------------
+# Against the rule above that performance settings stay out of the lock. Both of
+# these are shipped defaults in ppo_trainer.yaml rather than run-script
+# arguments, and the lock reads the EFFECTIVE config — it cannot tell a default
+# from an argument, so pinning them is what stops a default flipping underneath
+# a comparison between runs.
+#
+# ZeRO-2 is arithmetic-neutral (placement only). no_sync_grad_accum reduces once
+# per mini-batch instead of once per micro-batch, which reorders the partial sums
+# — same expectation, different last bits — so a run that must reproduce earlier
+# gradients exactly has to set it False here and in the script together.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+"actor_rollout_ref.actor.no_sync_grad_accum": true
+
+# ---- data ---------------------------------------------------------------------
+"data.train_batch_size": 45
+"data.val_batch_size": 126
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.enable": true
+"data.task_balance.per_task_batch_size": 15
+"data.task_balance.num_batches": 300
+"data.task_balance.tasks": [alfworld, search, webshop]
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment --------------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 0
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.tasks": [alfworld, search, webshop]
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+"env.multitask.val_per_task_batch_size": 126
+"env.search.topk": 3
+# The retry policy is a property of the DATA, not of throughput, which is why it
+# is pinned here rather than left with the machine knobs. On an exhausted budget
+# the client does NOT fail the run: the error text is substituted for the
+# retrieved document and becomes the <information> block the model is trained on,
+# with nothing in the metrics to say so.
+#
+# These are the current values (a bounded budget of 10). If this run ever shares
+# one retriever with another concurrent run, set max_retries to null — under a
+# shared retriever an exhausted budget is exactly what a load spike looks like.
+# 4xx and malformed JSON still fail at once either way, since waiting cannot turn
+# those into a document. See agent_system/.../skyrl_gym/tools/search.py.
+"env.search.timeout": 60
+"env.search.max_retries": 10
+
+# ---- rollout sampling / validation protocol -----------------------------------
+"actor_rollout_ref.rollout.temperature": 1.0
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
+
+# ---- run identity -------------------------------------------------------------
+"trainer.total_training_steps": 300
+"trainer.project_name": verl_agent_sdar_multitask
+# The script builds this name out of sdar_coef / gate_beta / skill_all, so
+# pinning it also asserts that the name and those three knobs still agree.
+"trainer.experiment_name": sdar_multitask_qwen3_1.7b_instruct_coef0.01_beta5.0_skillallfalse

@@ -120,7 +120,14 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size "$val_per_task_size" \
     --seed "$seed"
 
+# INTENT LOCK: expected_multitask_config.yaml pins the knobs that define what
+# this experiment IS (loss coefficients, seeds, batch sizes, eval protocol) plus
+# the two throughput knobs that sit on the gradient path. The trainer validates
+# the composed config against it after main_sdar's injection and refuses to start
+# on any mismatch. To change such a knob, edit the argument below AND the
+# expectations file in the same commit.
 python3 -m verl.trainer.main_sdar \
+    +trainer.expected_config=examples/sdar_trainer/expected_multitask_config.yaml \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \

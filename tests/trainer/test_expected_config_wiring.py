@@ -114,3 +114,17 @@ def test_an_empty_value_is_treated_as_no_lock(tmp_path):
     config = _config()
     OmegaConf.update(config, "trainer.expected_config", None, force_add=True)
     RayPPOTrainer._validate_config(_Stub(config))
+
+
+def test_a_missing_lock_file_says_where_it_looked(tmp_path):
+    """Relative paths resolve against the launch directory, like skills_dir.
+
+    A bare FileNotFoundError from inside the validator would send someone
+    looking at the yaml rather than at their working directory.
+    """
+    config = _config(tmp_path / "does_not_exist.yaml")
+    with pytest.raises(FileNotFoundError) as excinfo:
+        RayPPOTrainer._validate_config(_Stub(config))
+    message = str(excinfo.value)
+    assert "does_not_exist.yaml" in message
+    assert "launch directory" in message
