@@ -13,9 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import ray
 import gym
 import numpy as np
+
+# Heap cap handed to each worker's embedded JVM (see ``WebshopWorker.__init__``).
+# 512MB is ~50x WebShop's steady-state Lucene working set; raise it via
+# ``SDAR_WEBSHOP_JVM_OPTIONS`` if a future index needs more.
+WEBSHOP_JVM_OPTIONS = os.environ.get('SDAR_WEBSHOP_JVM_OPTIONS', '-Xmx512m -Xms64m -XX:+UseSerialGC')
 
 # -----------------------------------------------------------------------------
 # Ray remote worker actor -----------------------------------------------------
@@ -30,13 +37,52 @@ class WebshopWorker:
         # Lazy import avoids CUDA initialisation issues
         import sys
         import os
+
+        # WebShop's search engine is pyserini's ``LuceneSearcher``, i.e. an
+        # embedded JVM per worker. Left alone, HotSpot sizes its max heap at 1/4
+        # of *physical* RAM -- 62GB a worker here -- so 120 workers grow their
+        # heaps for tens of GB of anonymous memory before any of them bothers to
+        # collect. WebShop's working set is a handful of MB, so cap it. Must be
+        # set before ``web_agent_site.engine`` imports pyserini, which is what
+        # starts the JVM. See docs/webshop_worker_memory.md.
+        os.environ.setdefault('_JAVA_OPTIONS', WEBSHOP_JVM_OPTIONS)
+
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), 'webshop'))
         sys.path.append(project_root)
         from web_agent_site.envs import WebAgentTextEnv  # noqa: WPS433 (runtime import)
-        
+
         env_kwargs['seed'] = seed
         self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
-    
+
+    def mem_stats(self):
+        """Anonymous vs file-backed RSS of this worker, in MiB.
+
+        ``psutil.virtual_memory().used`` -- what ``perf/cpu_memory_used_gb`` and
+        Ray's OOM killer watch -- excludes page cache, so only the *anonymous*
+        half of a worker's RSS counts against the run. Splitting the two is what
+        tells a real leak apart from the Lucene index being paged in.
+        """
+        import os
+
+        stats = {}
+        try:
+            with open('/proc/self/smaps_rollup') as f:
+                for line in f:
+                    key, _, value = line.partition(':')
+                    if key in ('Rss', 'Anonymous'):
+                        stats[key.lower()] = int(value.split()[0]) / 1024
+        except OSError:
+            return {}
+        stats['file_mib'] = stats.get('rss', 0.0) - stats.get('anonymous', 0.0)
+        stats['rss_mib'] = stats.pop('rss', 0.0)
+        stats['anon_mib'] = stats.pop('anonymous', 0.0)
+        stats['pid'] = os.getpid()
+        try:
+            stats['sessions'] = len(self.env.server.user_sessions)
+        except AttributeError:
+            pass
+        return stats
+
     def step(self, action):
         """Execute a step in the environment"""
         obs, reward, done, info = self.env.step(action)
