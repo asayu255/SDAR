@@ -43,6 +43,7 @@ python3 -m recipe.prime.main_prime \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.adv_estimator=rloo \
     algorithm.use_kl_in_reward=True \
     algorithm.kl_penalty=kl \
