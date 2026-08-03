@@ -368,7 +368,12 @@ class ActorRolloutRefWorker(Worker):
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
-                forward_prefetch=False,
+                # Off by default (upstream behaviour). fsdp_config.forward_prefetch=True
+                # issues the NEXT FSDP unit's all-gather while the current one computes,
+                # overlapping communication it would otherwise serialize -- scheduling
+                # only, the arithmetic is untouched. Worth turning on when collectives
+                # run over PCIe (no NVLink) and the profile is communication-bound.
+                forward_prefetch=bool(fsdp_config.get("forward_prefetch", False)),
             )
         elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
@@ -655,6 +660,15 @@ class ActorRolloutRefWorker(Worker):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
+            # The driver's timing_s/update_actor is a blocking ray.get around this
+            # call, so it also covers serializing the batch into the object store,
+            # the workers pulling their shards, and the metrics coming back. At a
+            # few thousand rows that batch is hundreds of MB, and the GPUs sit idle
+            # for all of it. Reporting the compute time separately makes the
+            # difference readable: timing_s/update_actor minus this is transport,
+            # and a GPU-idle window inside update_actor is one or the other.
+            metrics = dict(metrics)
+            metrics["timing_s/update_actor_worker"] = delta_time
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
@@ -1046,7 +1060,7 @@ class CriticWorker(Worker):
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
-                forward_prefetch=False,
+                forward_prefetch=bool(fsdp_config.get("forward_prefetch", False)),
                 device_mesh=self.device_mesh,
                 cpu_offload=None,
             )
@@ -1315,7 +1329,7 @@ class RewardModelWorker(Worker):
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
                 cpu_offload=CPUOffload(offload_params=True),
-                forward_prefetch=False,
+                forward_prefetch=bool(self.config.model.fsdp_config.get("forward_prefetch", False)),
                 device_mesh=self.device_mesh,
             )
         elif config.strategy == "fsdp2":
