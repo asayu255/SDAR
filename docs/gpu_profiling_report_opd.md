@@ -364,16 +364,24 @@ OPD と offline-KD で**同じモジュールを共有**しているので、arm
 **トークン量が違う**（baseline 3.44 M tokens/step に対し変更後は 4.89〜5.20 M、**+43%**）。
 同じ step でも仕事量が別物なので、`s/step` は比較の単位にならない。
 
-フレームワーク自身の `perf/throughput`（定義は両 run で同一）で見る:
+`perf/throughput`（per-GPU、定義は両 run で同一）で見る:
 
-| | tok/s |
-|---|---|
-| baseline（step 92–96） | 3,207〜3,491（平均 **3,321**） |
-| 変更後 step 1 | 3,535 / 3,555 |
-| 変更後 step 2 | **3,999** |
+| | steps | tok/s 平均 | 範囲 |
+|---|---:|---:|---|
+| baseline | 92–96（5 点） | **3,321** | 3,207 〜 3,491 |
+| 変更後 | 100–148（**49 点**） | **3,594** | 3,332 〜 3,942 |
 
-**平均比 +20%、baseline 最良値比 +14.6%。ただし変更後は step 1–2 の 2 点しかなく、
-どちらも warmup の影響下にある。** この数字を確定値として扱ってはいけない。
+**+8.2%。** 分布で見るとより明確で、**49 step 中 38 step（78%）が baseline の最大値
+3,491 を上回る**。下回った 11 step のうち最低の 3,332 は 13:00 のリトリーバ断の step。
+
+wandb のログ行は `perf/throughput` を含まないことがあるが、`global_seqlen/mean` と
+profiler の `TOTAL/step` から復元できる。baseline で検算すると
+`3,543,577 ÷ (521.581 × 2) = 3,397.0` で `perf/throughput:3396.958` に一致するので、
+**`global_seqlen/mean ÷ wall_s` がそのまま per-GPU throughput** になる。
+
+**当初この数字を「+14.6〜20%」と述べたのは誤り**で、それは step 1–2 の warmup 2 点だけを
+見た値だった。サンプルを 2 → 49 に増やして +8.2% に落ち着いた。**2 点の測定を
+「速くなった量」として報告してはいけない**（5 節 ⑤ と同じ誤り）。
 
 **同一指標・同一定義で確実に言えるのは以下だけ:**
 
@@ -383,8 +391,9 @@ OPD と offline-KD で**同じモジュールを共有**しているので、arm
 | `teacher_forward` | 67.4 s/step | **40.1 s/step**（100 step 累積） | **−27.3 s (−40%)** |
 | `teacher/alfworld` の `pcieRX` | 7,591〜8,204 | **4,307** | 約半減 |
 | `perf/max_memory_allocated_gb` | **121.2** | **90.9〜93.9** | **−27 GB（トークンは +43%）** |
-| `update_actor` の sm | 82.4〜84.9 | 83.1 | 変化なし（手を入れていない） |
+| `update_actor` の sm | 82.4〜84.9 | 83.2 | 変化なし（手を入れていない） |
 | `TOTAL/step` の sm | 71.3〜73.7 | 74.4 | +1〜3 pt |
+| **throughput** | **3,321 tok/s** | **3,594 tok/s** | **+8.2%（49 step）** |
 
 **ピークメモリ −27 GB は当初の見積りに入っていなかった効果。** teacher の常駐化は
 逆に +5.1 GB/GPU 増やすので、差し引き 32 GB 分を稼いだのは 3.2 節の
@@ -392,9 +401,9 @@ response-only 化である。`topk_kl` は `(total_nnz, 151936)` に対して `l
 `topk` を掛けており、これを応答行だけに絞った分が活性メモリにそのまま効く。
 **「対象行が 1/9」は計算量の話だが、効果としてはメモリの方が大きかった。**
 
-**まだ足りていない計測: 変更後の step 90–100 における `perf/throughput`。**
-同じ step 帯・同じデータ位相での比較はそこでしか取れない。現状の throughput 比較は
-warmup 2 点に依存している。wandb から拾えば確定する。
+**`s/step` そのものは 544.5（125 step 累積）で baseline の 517.2 より大きいままだが、
+それはトークン量が増えたからで、単位仕事あたりでは 8.2% 速い。** 速度の議論は
+必ず throughput で行うこと。
 
 ---
 
@@ -463,7 +472,7 @@ step 1（7,200 行）は偶然通り、step 2（6,880 行）で落ちた。
 
 ---
 
-## 6. 本番での検証（step 1〜106）
+## 6. 本番での検証（step 1〜149）
 
 3 つの機構は本番で動作を確認済み。
 
@@ -475,7 +484,13 @@ step 1（7,200 行）は偶然通り、step 2（6,880 行）で落ちた。
 | `actor/teacher_kl_loss` | 0.006〜0.008、`_weighted` 0.009〜0.015 | 同オーダー＝正規化でスケールが壊れていない |
 | `task_loss/token_share` | alfworld 0.568〜0.782 / search 0.030〜0.063 | 補正対象の不均衡は実在し、100 step 経っても持続 |
 | `actor/grad_norm` | step 1 の約 41 → **2.1〜3.6** | warmup 由来の一過性。以降 clip は効いていない |
-| `perf/max_memory_allocated_gb` | 93.902 で横ばい（reserved 145.266、host 187〜190 GB） | リーク無し |
+| `perf/max_memory_allocated_gb` | 93.902 で完全固定（reserved 145.266） | GPU 側にリーク無し |
+| `perf/cpu_memory_used_gb` | step 101 の 188.0 → step 149 の 195.1（**+150 MB/step**） | 下記参照 |
+
+**ホスト RAM は横ばいではなく緩やかに増えている。** 当初 187〜190 の観測窓で「横ばい」と
+書いたが、窓が短すぎた。このペースなら step 300 で約 217 GB。ただし **baseline run は
+step 94 の時点で既に 217.8 GB に達しており**、そこは問題なく通過している水準なので
+対処は不要と判断した。GPU 側は 49 step 完全固定。
 | DP-IMBALANCE | 3.7〜9.6 pp（`TASK_BALANCE_INTERLEAVE` 導入前は 9〜18 pp） | 半減 |
 
 ### 6.1 retriever 断を retry ポリシーが完全に吸収した
@@ -530,9 +545,6 @@ export TASK_BALANCE_INTERLEAVE=1
 
 ## 8. 残課題
 
-- **変更後 step 90–100 の `perf/throughput` を wandb から取る**（3.5 節）。
-  現状の +14.6〜20% は warmup 2 点に依存しており、確定値ではない。
-  baseline は 3,207〜3,491 tok/s。**これが最優先。**
 - **`GPU_PROFILER_TRACE` の多重 open**（2.7 節）。パスに rank を混ぜれば直る。未修正。
 - **decode テールの深掘り**。`disable_log_stats=False` で 6〜7 ms/decode-step の内訳を取り、
   `cudagraph_capture_sizes`（V1 のみ）が効くか見る。走行中は測れないので run 後。
