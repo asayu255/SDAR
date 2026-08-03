@@ -145,6 +145,16 @@ actor_rollout_ref:
       # model) and removes a full model's worth of PCIe traffic per micro-batch,
       # which is worth it when the ref is small and the box has no NVLink.
       param_offload: False
+      # Same knob as actor.fsdp_config.sharding_strategy (get_sharding_strategy is
+      # shared): null keeps FULL_SHARD. shard_grad_op (ZeRO-2) stops resharding
+      # after forward -- and the ref path has no backward, so its parameters stay
+      # gathered across micro-batches instead of being re-all-gathered for every
+      # one. Placement only, bit-identical outputs; costs the unsharded parameter
+      # size per resident ref model. Worth it when the collectives are the ref
+      # phase's cost and there is memory headroom for the gathered copy.
+      # Pointless with param_offload=True (the warning in get_sharding_strategy
+      # explains why).
+      sharding_strategy: null # [null, full_shard, shard_grad_op]
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       wrap_policy:
         # transformer_layer_cls_to_wrap: None

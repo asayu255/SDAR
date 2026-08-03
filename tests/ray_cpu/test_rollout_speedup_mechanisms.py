@@ -222,6 +222,33 @@ def test_rollout_prefetch_pending_pool():
     print("A: rollout pending pool + take OK")
 
 
+def test_queue_row_for_prefetch_gates_and_key_format():
+    """Rows enter the pending pool iff the prefetch is on, keyed as the trainer
+    matches them.
+
+    The loop calls this once per recorded active row (record time, not
+    trajectory end), so the helper is also the single place that fixes the
+    queue-entry key format compute_log_prob_with_prefetch matches on:
+    (str(traj_uid), int(step)).
+    """
+    row = {"input_ids": torch.zeros(4, dtype=torch.long)}
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    collector._logprob_prefetch_enabled = False
+    collector._logprob_pending = []
+
+    # Prefetch off: recording a row queues nothing.
+    collector._queue_row_for_prefetch("t-0", 0, row)
+    assert not collector._logprob_pending
+
+    # Prefetch on: queued once, with normalized key types.
+    collector._logprob_prefetch_enabled = True
+    collector._queue_row_for_prefetch(np.str_("t-0"), np.int64(3), row)
+    assert collector._logprob_pending == [(("t-0", 3), row)]
+    key = collector._logprob_pending[0][0]
+    assert type(key[0]) is str and type(key[1]) is int
+    print("A: per-turn queue gating + key format OK")
+
+
 # --------------------------------------------------------------------------- #
 # C: env reset prefetch consume / mismatch semantics
 # --------------------------------------------------------------------------- #
@@ -323,6 +350,7 @@ if __name__ == "__main__":
     test_prefetch_merge_all_and_none()
     test_prefetch_merge_duplicated_rows()
     test_rollout_prefetch_pending_pool()
+    test_queue_row_for_prefetch_gates_and_key_format()
     test_env_reset_prefetch()
     test_env_kwargs_equal()
     test_compact_record_equivalence()

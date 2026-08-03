@@ -73,17 +73,22 @@ _ROLLOUT_DECODE_ACTIVE_ONLY = os.environ.get("ROLLOUT_DECODE_ACTIVE_ONLY", "1").
 # Default ON; set ROLLOUT_COMPACT_RECORD=0 for A/B.
 _ROLLOUT_COMPACT_RECORD = os.environ.get("ROLLOUT_COMPACT_RECORD", "1").strip().lower() in ("1", "true", "yes", "on")
 
-# Prefetch old_log_prob for trajectories that already finished, overlapped with
-# env.step: each turn, envs.step() (CPU/HTTP/IPC — GPU idle) runs in a background
-# thread while the driver issues actor_rollout_wg.compute_log_prob() on a bounded
-# chunk of finished-trajectory rows. The actor weights are frozen for the whole
-# rollout and are exactly the weights the trainer's old_log_prob phase would use
-# after it, so the prefetched values are computed by the same function on the
-# same weights and the same rows — only earlier. Accuracy class: same standard as
-# vLLM batch-composition changes (the micro-batch grouping differs from the
-# monolithic phase; per-row results are computed independently under rmpad).
-# Rows not prefetched by rollout end are computed by the trainer as usual.
-# Opt-in; OFF reproduces the current serial behavior exactly.
+# Prefetch old_log_prob for rows as they are recorded, overlapped with env.step:
+# each turn, envs.step() (CPU/HTTP/IPC — GPU idle) runs in a background thread
+# while the driver issues actor_rollout_wg.compute_log_prob() on a bounded chunk
+# of already-recorded rows. A turn's row is final the moment it is appended to
+# total_batch_list (later turns only append), and the actor weights are frozen
+# for the whole rollout and are exactly the weights the trainer's old_log_prob
+# phase would use after it, so the prefetched values are computed by the same
+# function on the same weights and the same rows — only earlier. Queueing used
+# to wait for the whole trajectory to finish, which kept alfworld's rows — the
+# bulk of the batch — out of the pool until episode end and capped the reuse at
+# 23% of the old_log_prob phase (reused 1608/6960, optimization report §11).
+# Accuracy class: same standard as vLLM batch-composition changes (the
+# micro-batch grouping differs from the monolithic phase; per-row results are
+# computed independently under rmpad). Rows not prefetched by rollout end are
+# computed by the trainer as usual. Opt-in; OFF reproduces the current serial
+# behavior exactly.
 _ROLLOUT_PREFETCH_LOGPROB = os.environ.get("ROLLOUT_PREFETCH_LOGPROB", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Rows per prefetch call. Sized so one compute_log_prob chunk roughly fits inside
@@ -620,6 +625,20 @@ class TrajectoryCollector:
         self._prefetched_log_probs = {}
         return prefetched
 
+    def _queue_row_for_prefetch(self, traj_uid, step_idx, row):
+        """Queue one recorded turn row for prefetched old_log_prob scoring.
+
+        Called at record time (see the loop): the row's tensors never change
+        after this point and the actor weights are frozen for the rollout, so
+        scoring order cannot affect the values -- only which micro-batch a row
+        is packed into, the accuracy class the prefetch already documents. Each
+        row is queued exactly once, by construction (one call per append).
+        No-op when the prefetch is off.
+        """
+        if not self._logprob_prefetch_enabled:
+            return
+        self._logprob_pending.append(((str(traj_uid), int(step_idx)), row))
+
     def prefetch_env_reset(self, envs: EnvironmentManagerBase, env_kwargs):
         """Launch envs.reset() for the *next* rollout in a background thread.
 
@@ -839,18 +858,21 @@ class TrajectoryCollector:
                     continue
                 total_batch_list[i].append(batch_list[i])
                 total_infos[i].append(infos[i])
+                if active_masks[i]:
+                    # A row is final the moment it is recorded: later turns only
+                    # append to total_batch_list[i], never rewrite earlier rows.
+                    # Queue it now instead of at trajectory end, so the env.step
+                    # windows can start draining alfworld's rows from turn 1
+                    # rather than after turn 50. step_idx matches the trainer's
+                    # turn_step: with COMPACT_RECORD on, active rows form a
+                    # prefix; with it off, inactive rows are appended too and
+                    # both sides count them the same way.
+                    self._queue_row_for_prefetch(
+                        traj_uid[i], len(total_batch_list[i]) - 1, batch_list[i]
+                    )
 
             # Update done states
-            newly_done = np.logical_and(active_masks, dones)
             is_done = np.logical_or(is_done, dones)
-
-            if self._logprob_prefetch_enabled:
-                # Trajectories that finished this turn now have all their rows
-                # final; queue them for prefetched old_log_prob on later turns.
-                for i in np.nonzero(newly_done)[0]:
-                    for step_idx, row in enumerate(total_batch_list[i]):
-                        if row['active_masks']:
-                            self._logprob_pending.append(((traj_uid[i], step_idx), row))
 
             # Update observations for next step
             obs = next_obs

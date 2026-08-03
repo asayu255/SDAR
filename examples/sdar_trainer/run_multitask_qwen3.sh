@@ -74,14 +74,42 @@ fi
 # --- Rollout/trainer overlap mechanisms (opt-in, env-var driven; live in code) --
 # These pair with ROLLOUT_KEEP_VLLM_AWAKE / ROLLOUT_SKIP_DONE_PREPROC /
 # TASK_BALANCE_INTERLEAVE from the earlier speedup work:
-#   ROLLOUT_PREFETCH_LOGPROB=1        A: prefetch old_log_prob for finished
-#                                        trajectories while env.step runs
-#                                        (chunk via ROLLOUT_PREFETCH_LOGPROB_CHUNK)
+#   ROLLOUT_PREFETCH_LOGPROB=1        A: prefetch old_log_prob for recorded rows
+#                                        while env.step runs (rows queue per turn
+#                                        as they are recorded, not at trajectory
+#                                        end -- see rollout_loop.py; chunk via
+#                                        ROLLOUT_PREFETCH_LOGPROB_CHUNK. §11
+#                                        measured 23% reuse under the old
+#                                        trajectory-end queueing)
 #   ENV_RESET_PREFETCH=1              C: overlap next rollout's envs.reset with
 #                                        the GPU training phases
 #   ROLLOUT_DECODE_ACTIVE_ONLY=1      E: decode generated rows only (default on)
 #   ROLLOUT_COMPACT_RECORD=1          E: skip recording finished rows (default on)
 # -----------------------------------------------------------------------------
+#
+# Speculative decoding (engine_kwargs.vllm.speculative_config below, pinned in
+# the expectations file): ngram / prompt-lookup drafting inside vLLM. Rejection
+# sampling preserves the sampling distribution EXACTLY -- the draft only decides
+# how many target-model forwards a token costs, never which token is kept -- and
+# training samples at temperature=1.0 / top_p=1 / top_k=-1, the cleanest case.
+# The gain lands where gen's SM% is lowest (72.4, §11): the decode tail, where
+# the last live sequences are bandwidth-bound and every accepted draft token
+# amortizes one full weight stream. Agent output is templated enough for prompt
+# lookup to hit. Not bit-identical (the verification forward batches tokens the
+# serial decode would process one by one -- same class as vLLM batch
+# composition); old_log_prob is recomputed by the actor, and vLLM logprobs feed
+# only the rollout_probs_diff diagnostic -- watch that metric for drift.
+#
+# Reference policy placement (ref.fsdp_config below): §11 measured the ref phase
+# at 190 s with the highest PCIe traffic of any phase (2212/2742 MB/s) -- the
+# offloaded parameters pulled back from host for every micro-batch. This is
+# lever #2 of §11's ranking (~110 s): param_offload=False keeps the shards
+# resident. sharding_strategy=shard_grad_op removes what offloading's removal
+# leaves behind -- FULL_SHARD still re-all-gathers the shards across GPUs per
+# micro-batch; ZeRO-2 does not reshard after forward and the ref has no
+# backward, so it gathers once per phase and stays whole. Bit-identical either
+# way (placement only). Cost: the gathered ref (~3.4 GB/GPU) on top of the
+# shards; §11 reserved 66.7 GB of 80, so it fits. Watch max_memory_reserved.
 
 # --- Fair-comparison alignment with the single-task baselines -----------------
 # This is a joint multitask run (one shared model/optimizer over alfworld+search+
@@ -171,6 +199,10 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
     actor_rollout_ref.rollout.enable_chunked_prefill=$enable_chunked_prefill \
     +actor_rollout_ref.rollout.enable_prefix_caching=$enable_prefix_caching \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max=4 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min=2 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
@@ -180,7 +212,8 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

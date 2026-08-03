@@ -374,3 +374,50 @@ is where the next round of *wall-clock* work is. After levers 1 and 2 land,
 largest phase — at which point re-sharding active rows per turn, and overlapping
 env stepping with generation, are the mechanisms that matter. Async rollout
 (§8) remains the structural answer to the long tail.
+
+## 12. Implemented from §11's ranking, plus two ports (unmeasured)
+
+Three changes landed after §11's profile, on request. Per this report's own
+rule, no effect sizes here — they have not been measured on this arm. What
+follows is what changed, its accuracy class, and what to watch.
+
+| change | where | accuracy class |
+|---|---|---|
+| ref resident + ZeRO-2 (lever 2, extended) | `ref.fsdp_config.param_offload=False` + `sharding_strategy=shard_grad_op` (run script; new yaml knob shared with the actor's) | bit-identical (placement only) |
+| per-turn queueing for the old_log_prob prefetch | `rollout_loop.py` (`_queue_row_for_prefetch` at record time) | same as mechanism A (expectation-identical, micro-batch composition only) |
+| ngram speculative decoding | `engine_kwargs.vllm.speculative_config.*` (run script; pinned in the lock) | sampling-distribution-preserving; trajectories not bit-identical |
+
+Rationale, against §11's numbers:
+
+1. **Lever 2, and the half it left on the table.** §11 measured `ref` at 190 s
+   with 2212/2742 MB/s PCIe — the offloaded parameters re-fetched from host per
+   micro-batch — and ranked `param_offload=False` at ~110 s. But FULL_SHARD
+   still re-all-gathers the resident shards across the 3 GPUs every
+   micro-batch. `shard_grad_op` does not reshard after forward, and the ref has
+   no backward, so it gathers once per phase and stays whole. Same knob the
+   actor already uses (`get_sharding_strategy` is shared); the OPD arm measured
+   what FULL_SHARD leaves behind at ~4.3 GB/s sustained on its teachers before
+   making the same change. Cost: the gathered ref (~3.4 GB/GPU) on top of its shards,
+   against §11's 66.7 GB reserved of 80. Watch `max_memory_reserved`.
+2. **Per-turn queueing.** §11's `old_log_prob` line already shows the prefetch
+   working (reused 1608/6960 = 23 %) — capped because rows only queued when
+   their whole trajectory finished, which keeps alfworld's rows (the tail that
+   dominates the batch) out of the pool until turns 23-49. A turn's row is
+   final the moment it is recorded, so it now queues that turn. The cap moves
+   to `ROLLOUT_PREFETCH_LOGPROB_CHUNK × turns`; with the default chunk of 64
+   and ~50 turns that is ~3,200 of ~7,000 rows, so raising the chunk is the
+   next knob if `old_log_prob` is still the constraint. Requires
+   `ROLLOUT_PREFETCH_LOGPROB=1` as before (default off, unchanged).
+3. **Spec decode.** §11 puts `gen` at 72.4 % SM with the tail half-empty from
+   turn 23 on — exactly the bandwidth-bound decode a draft-and-verify scheme
+   amortizes. Rejection sampling preserves the sampling distribution exactly;
+   training samples at temperature=1.0 / top_p=1 / top_k=-1. old_log_prob is
+   recomputed by the actor, so vLLM numerics cannot enter the loss; the
+   `rollout_probs_diff` diagnostic is the drift check. Pinned in the lock
+   (sampling path — must not differ silently between compared runs); the ref
+   placement keys are deliberately NOT pinned (machine knobs).
+
+The three land together with the same caveat as §11's levers 5-6: **they have
+to be on every comparison arm at once.** The OPD arm carries the same three
+already; the offline arms need the spec-decode pin only if their Stage-1 /
+validation throughput is being compared.
