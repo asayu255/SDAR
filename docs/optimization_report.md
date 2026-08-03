@@ -148,3 +148,78 @@ The deferred headroom above is partially claimed by the Phase 2 mechanisms
 decode/record, CUDA-graph knobs) — see `docs/optimization_phase2.md`. Two more
 were prototyped there and have since been removed: a retriever query cache and a
 parallel prompt tokenizer.
+
+---
+
+## 10. Phase 3 — the actor update, and the host that made it visible
+
+Phases 1–2 left `update_actor` alone on the reading in §8 that it was
+compute-bound at ~93–97% SM. That reading does not survive the move to a 2-GPU
+host without NVLink: `update_actor` carries by far the highest PCIe traffic of
+any phase (≈10.5 GB/s TX, 9.0 GB/s RX vs ≈2.0/1.9 during `gen`), and NCCL
+collectives count as SM-busy, so SM% cannot distinguish computing from
+communicating. Same lesson as §5, one layer down.
+
+### Mechanisms
+
+| Mechanism | Knob (default) | What it removes | Accuracy class |
+|---|---|---|---|
+| **ZeRO-2** — keep parameters gathered from forward through backward | `actor.fsdp_config.sharding_strategy=shard_grad_op` (`null`) | 3 all-gathers per layer per micro-batch under gradient checkpointing → 1 | arithmetic-neutral (placement) |
+| **`no_sync` gradient accumulation** — reduce once per mini-batch | `+actor.no_sync_grad_accum=True` (off) | 12 reduce-scatters per mini-batch → 1 at `ppo_mini_batch=60 / micro=5`; under ZeRO-2 also the per-micro-batch re-gather | **not** bit-identical: partial sums reduce in a different order (identical expectation) |
+| **FSDP forward prefetch** | `actor.fsdp_config.forward_prefetch=True` (off) | serialization of the next unit's all-gather behind the current unit's compute | scheduling only |
+| **Resident reference policy** | `ref.fsdp_config.param_offload=False` | a full model's worth of host→device PCIe per micro-batch; the key used to be dead and offload was forced on | placement; costs `param_bytes / world_size` |
+| **Deferred metric reads** — keep logger-only scalars as 0-d GPU tensors until the end of `update_policy` | always on | several hundred forced host↔device syncs per step | identical values, except `actor/kl_loss` and `actor/sdl_loss`, which were assigned rather than appended and so reported only the last micro-batch |
+| **Exact token-mean under dynamic bsz** | `+actor.dynamic_bsz_token_scale=True` (off) | nothing — it makes `use_dynamic_bsz` safe to turn on by removing the objective's dependence on the packing | changes the loss under dynamic bsz (to the correct one) |
+
+`sharding_strategy` and `no_sync_grad_accum` sit on the gradient path, so a
+comparison run should pin them next to its scientific knobs rather than treating
+them as free tuning.
+
+### Instruments
+
+- **worker-side stage phases** (`actor.fwd` / `actor.bwd` / `actor.task_metrics`
+  / `actor.optim`) — the driver's `_timer` cannot see inside `update_policy`
+  because that runs in a worker; rank 0 pushes its own phases so the
+  `update_actor` bucket gets an interior. `GPU_PROFILER_SYNC_PHASES=1` makes the
+  split exact at the cost of serializing overlap.
+- **`timing_s/update_actor_worker`** — `timing_s/update_actor` is a blocking
+  `ray.get`, so it also covers serializing a few-hundred-MB batch into the object
+  store and back. The difference between the two is transport.
+- **NVLink and driver-CPU columns, cumulative table, per-sample trace** — see the
+  module docstring of `verl/utils/gpu_profiler.py`. On a node *with* NVLink the
+  collectives are invisible to the PCIe counters, so `nvlink_mb_s` is the only
+  place they show up at all; the cumulative table is the only place periodic
+  phases (validation, checkpointing) show their real share of a run.
+
+Separately, `verl/utils/flops_counter.py` had no entry for either host's GPU, so
+`perf/mfu/actor` divided by `inf` and logged exactly `0.000` every step — a
+metric that reads as broken rather than missing. RTX A6000 and RTX PRO 6000
+Blackwell (incl. the 300W Max-Q bin) are now in the table.
+
+### Host memory, which is what actually killed the runs
+
+Two fixes outside the GPU entirely, both required to finish a run on a 256GB box:
+
+- **Lazy environment construction** (`LazyEnvManager`) — the val envs are Ray
+  actors that sit idle until the first validation, and are never touched at all
+  with `test_freq <= 0`; the train envs are dead weight in a `val_only` run. In
+  multitask that is 252 of 492 actors either way, each holding its own copy of the
+  environment's data.
+- **WebShop worker JVM cap and session pruning** — see
+  `docs/webshop_worker_memory.md`. ~1.8 GB/step of host RAM, which is what the OOM
+  killer was reacting to around step 24.
+
+### Enabling it
+
+Every mechanism above is opt-in and defaults to the previous behaviour, so
+nothing changes until a run script asks:
+
+```bash
+    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    +actor_rollout_ref.actor.no_sync_grad_accum=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+```
+
+`no_sync_grad_accum` is the one to think twice about: it is not bit-identical, so
+it should not be switched on mid-experiment.
