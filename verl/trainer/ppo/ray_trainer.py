@@ -626,6 +626,19 @@ class RayPPOTrainer:
             assert config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
 
+        # Optional intent lock. `+trainer.expected_config=<yaml>` pins the knobs
+        # that define what the experiment IS, and this aborts in seconds if the
+        # effective composed config does not match -- a wrong default, a typo'd
+        # `+key=` that never took effect, a stray override appended via "$@".
+        # Checked here rather than in an entry point because every trainer in
+        # this repo reaches _validate_config, and none of them inject config
+        # afterwards. See verl/utils/expected_config.py.
+        expect_file = OmegaConf.select(config, "trainer.expected_config")
+        if expect_file:
+            from verl.utils.expected_config import enforce_expected_config
+
+            enforce_expected_config(config, expect_file, tag="expected-config")
+
         print("[validate_config] All configuration checks passed successfully!")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
