@@ -99,18 +99,11 @@
 # gradients exactly has to set it False here and in the script together.
 "actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
 "actor_rollout_ref.actor.no_sync_grad_accum": true
-# Speculative decoding sits on the SAMPLING path, so it is pinned for the same
-# reason: rejection sampling preserves the sampling distribution exactly (the
-# ngram draft decides only how many verification forwards a token costs, never
-# which token is kept), but the verification forward batches tokens the serial
-# decode would process one by one, so trajectories are not bit-identical with
-# it off. It must not differ silently between runs being compared.
-# (ref.fsdp_config.{param_offload,sharding_strategy} are NOT pinned: placement-
-# only and bit-identical, i.e. covered by the machine-knob exemption.)
-"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method": ngram
-"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens": 4
-"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max": 4
-"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min": 2
+# ref.fsdp_config.{param_offload,sharding_strategy} are NOT pinned: placement-
+# only and bit-identical, i.e. covered by the machine-knob exemption.
+# Speculative decoding WOULD belong here (it sits on the sampling path, so it
+# must not differ silently between compared runs) but it cannot run on this
+# stack at all -- see the run script for why -- so there is nothing to pin.
 
 # ---- data ---------------------------------------------------------------------
 "data.train_batch_size": 45

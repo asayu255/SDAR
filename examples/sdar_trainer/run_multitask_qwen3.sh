@@ -87,18 +87,21 @@ fi
 #   ROLLOUT_COMPACT_RECORD=1          E: skip recording finished rows (default on)
 # -----------------------------------------------------------------------------
 #
-# Speculative decoding (engine_kwargs.vllm.speculative_config below, pinned in
-# the expectations file): ngram / prompt-lookup drafting inside vLLM. Rejection
-# sampling preserves the sampling distribution EXACTLY -- the draft only decides
-# how many target-model forwards a token costs, never which token is kept -- and
-# training samples at temperature=1.0 / top_p=1 / top_k=-1, the cleanest case.
-# The gain lands where gen's SM% is lowest (72.4, §11): the decode tail, where
-# the last live sequences are bandwidth-bound and every accepted draft token
-# amortizes one full weight stream. Agent output is templated enough for prompt
-# lookup to hit. Not bit-identical (the verification forward batches tokens the
-# serial decode would process one by one -- same class as vLLM batch
-# composition); old_log_prob is recomputed by the actor, and vLLM logprobs feed
-# only the rollout_probs_diff diagnostic -- watch that metric for drift.
+# NO speculative decoding here, and it is not a tuning choice -- it does not run
+# on this stack. Setting engine_kwargs.vllm.speculative_config swaps the vLLM V0
+# worker for spec_decode.SpecDecodeWorker (wrapping NGramWorker), which does not
+# implement sleep(); vllm_rollout_spmd builds the engine with
+# enable_sleep_mode=True and calls sleep(level=1) immediately (:210), so the run
+# dies in init_workers with "Method 'sleep' is not implemented" before step 1 --
+# measured on this script. The whole wake/sleep cycle ROLLOUT_KEEP_VLLM_AWAKE
+# and free_cache_engine=False depend on needs that method, so this is
+# structural, not a missing argument. The idea itself still fits §11's gen at
+# 72.4% SM with a half-empty tail (rejection sampling preserves the sampling
+# distribution exactly, and old_log_prob is recomputed by the actor), but it
+# needs the V1 engine, where spec decode lives in v1/spec_decode and sleep
+# exists. VLLM_USE_V1=1 changes the engine for every phase -- and §4 already
+# records cudagraph_capture_sizes as V1-only for the same reason -- so that is
+# its own experiment across all arms, not a knob to flip here.
 #
 # Reference policy placement (ref.fsdp_config below): §11 measured the ref phase
 # at 190 s with the highest PCIe traffic of any phase (2212/2742 MB/s) -- the
@@ -199,10 +202,6 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
     actor_rollout_ref.rollout.enable_chunked_prefill=$enable_chunked_prefill \
     +actor_rollout_ref.rollout.enable_prefix_caching=$enable_prefix_caching \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min=2 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \

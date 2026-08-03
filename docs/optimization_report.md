@@ -375,17 +375,17 @@ largest phase — at which point re-sharding active rows per turn, and overlappi
 env stepping with generation, are the mechanisms that matter. Async rollout
 (§8) remains the structural answer to the long tail.
 
-## 12. Implemented from §11's ranking, plus two ports (unmeasured)
+## 12. Implemented from §11's ranking, plus one port (unmeasured), and one that could not start
 
-Three changes landed after §11's profile, on request. Per this report's own
-rule, no effect sizes here — they have not been measured on this arm. What
-follows is what changed, its accuracy class, and what to watch.
+Three changes were attempted after §11's profile, on request; two landed. Per
+this report's own rule, no effect sizes here — they have not been measured on
+this arm. What follows is what changed, its accuracy class, and what to watch.
 
 | change | where | accuracy class |
 |---|---|---|
 | ref resident + ZeRO-2 (lever 2, extended) | `ref.fsdp_config.param_offload=False` + `sharding_strategy=shard_grad_op` (run script; new yaml knob shared with the actor's) | bit-identical (placement only) |
 | per-turn queueing for the old_log_prob prefetch | `rollout_loop.py` (`_queue_row_for_prefetch` at record time) | same as mechanism A (expectation-identical, micro-batch composition only) |
-| ngram speculative decoding | `engine_kwargs.vllm.speculative_config.*` (run script; pinned in the lock) | sampling-distribution-preserving; trajectories not bit-identical |
+| ~~ngram speculative decoding~~ | **withdrawn — does not start on this stack** (see 3 below) | — |
 
 Rationale, against §11's numbers:
 
