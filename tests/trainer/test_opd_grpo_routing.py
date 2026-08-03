@@ -56,12 +56,17 @@ def _make_batch(task_names, resp_len=4):
     )
 
 
-def _make_trainer(teacher_wg):
+def _make_trainer(teacher_wg, topk=None):
     from verl.trainer.ppo.opd_grpo_ray_trainer import OPDGRPORayTrainer
 
-    # Bypass the heavy __init__; we only exercise the inherited routing.
+    # Bypass the heavy __init__; we only exercise the inherited routing. The
+    # attributes it would have set and compute_teacher_log_probs reads have to be
+    # set by hand -- teacher_topk_kl selects the single-token or the dense top-k
+    # branch.
     trainer = object.__new__(OPDGRPORayTrainer)
     trainer.teacher_wg = teacher_wg
+    trainer.teacher_topk_kl = topk is not None
+    trainer.teacher_kl_topk = topk or 0
     return trainer
 
 
