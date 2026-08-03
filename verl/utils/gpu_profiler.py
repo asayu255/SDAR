@@ -418,6 +418,12 @@ _PHASE_ORDER = [
     "update_critic",
     "update_actor",
     "reward",
+    # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
+    # execution order so the interior of a step reads top to bottom.
+    "actor.fwd",
+    "actor.bwd",
+    "actor.task_metrics",
+    "actor.optim",
 ]
 
 

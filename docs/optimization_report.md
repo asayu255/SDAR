@@ -168,7 +168,7 @@ lesson as §5, one layer down.
 | **Deferred metric reads** — keep logger-only scalars as 0-d GPU tensors until the end of `update_policy`; name the constants when `pg_loss_coef==0` | always on | ~450 forced host↔device syncs per step | identical values |
 
 The first two sit on the gradient path and are therefore pinned in
-`examples/opd_trainer/expected_multitask_config.yaml`, against the usual rule
+`examples/opd_grpo_trainer/expected_multitask_config.yaml`, against the usual rule
 that performance knobs stay out of the intent lock.
 
 Two measurement additions come with them:

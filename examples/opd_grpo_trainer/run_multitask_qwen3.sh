@@ -23,15 +23,48 @@ set -x
 #     use_teacher_kl_loss is force-injected in main_opd_grpo.py.
 # Teachers: per-task single-task RL checkpoints, created as role="ref" worker
 #   groups (they reuse actor_rollout_ref.ref.* settings: log-prob micro batch,
-#   FSDP CPUOffload); each sample is distilled from the teacher of its task.
+#   FSDP param_offload); each sample is distilled from the teacher of its task.
+#   ref.fsdp_config.param_offload=False keeps the teacher shards resident on GPU.
+#   That key used to be dead — the ref/teacher policy was pinned to FSDP
+#   CPUOffload regardless of it — so with it honoured, FSDP no longer re-fetches
+#   every unit's parameters from host memory on every micro-batch. teacher_forward
+#   was measured pulling 7.6-8.9 GB/s over PCIe for the whole phase (gen, by
+#   comparison, sits near 2). Resident costs 3 teachers * 3.4GB bf16 / 3 GPUs =
+#   3.4GB per GPU. If a bigger student or a longer context leaves no room for
+#   that, put it back to True — this is a placement knob, the distillation
+#   targets are identical either way.
 #
 # Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
 # code, not in the expectations file — see docs/optimization_phase2.md):
 #   ROLLOUT_KEEP_VLLM_AWAKE=1  ROLLOUT_PREFETCH_LOGPROB=1  ENV_RESET_PREFETCH=1
-#   TASK_BALANCE_INTERLEAVE=1
+#   TASK_BALANCE_INTERLEAVE=1  ROLLOUT_PREFETCH_TEACHER=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   e.g.  ROLLOUT_KEEP_VLLM_AWAKE=1 ENV_RESET_PREFETCH=1 bash run_multitask_qwen3.sh
+#
+# ROLLOUT_PREFETCH_TEACHER scores finished trajectories with their task's teacher
+# during the rollout instead of after it. What it fills is the driver's own CPU
+# time — decode, envs.step, the next turn's tokenization — measured at 18% of the
+# rollout with the GPU at 0. It does NOT fill the alfworld generation tail: the
+# teachers share one WorkerDict per GPU with the rollout (init_workers ->
+# create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
+# teacher call issued during generate_sequences would only queue behind it.
+# Bound accordingly — the whole teacher phase cannot disappear, only the part
+# that fits in the glue. ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128 rows) sets
+# how much is attempted per turn; the turn table's tchWait column shows what did
+# not fit. Frozen teachers, so the targets do not depend on when a row is scored,
+# but a row lands in a different micro-batch than the post-rollout path would put
+# it in, which moves the last bits of a packed GEMM — same class as
+# no_sync_grad_accum, not bit-identical.
+#
+#   PICK ONE of ROLLOUT_PREFETCH_TEACHER / ROLLOUT_PREFETCH_LOGPROB on this
+#   recipe. Unlike pure OPD (which has no old_log_prob phase at all), OPD+GRPO
+#   runs both, and they want the same resource twice over: the same CPU-glue
+#   window between generations, and the same colocated WorkerDict, where a Ray
+#   actor serves one call at a time. Enabling both does not corrupt anything —
+#   each mechanism still returns the same rows — but the second one issued waits
+#   on the first instead of on an idle GPU, so the overlap they exist to buy is
+#   spent queueing. Measure them separately before assuming either is free.
 #
 # Dynamic (token-budget) micro-batching is wired below but OFF by default so the
 # fixed-batch objective is unchanged. It packs micro-batches to a token budget
@@ -39,6 +72,34 @@ set -x
 # trailing override; dynamic_bsz_token_scale=True keeps token-mean exact
 # (token-weighted, grouping-invariant) rather than the sample-count reweighting:
 #   e.g.  bash run_multitask_qwen3.sh actor_rollout_ref.actor.use_dynamic_bsz=True
+#
+# Actor-update mechanisms (config, not env vars). These target the PCIe
+# collectives: with no NVLink between the GPUs every FSDP all-gather and
+# reduce-scatter crosses the bus, and update_actor is the phase with by far the
+# highest measured PCIe traffic (~10.5 GB/s TX vs ~2.0 during gen). NCCL
+# collectives count as SM-busy, so the 93-97% SM reading that made this phase
+# look compute-bound could not tell computing from communicating. Both of the
+# first two sit on the gradient path and are therefore pinned in
+# expected_multitask_config.yaml, against the usual rule that performance knobs
+# stay out of the intent lock.
+#   sharding_strategy=shard_grad_op — ZeRO-2. Keeps parameters gathered from
+#     forward through backward, so a layer all-gathers once per micro-batch
+#     instead of three times under gradient checkpointing. Arithmetic-neutral;
+#     costs roughly the unsharded parameter size minus its shard in peak memory.
+#   no_sync_grad_accum=True — accumulate gradients across a mini-batch's
+#     micro-batches and reduce ONCE. Under ZeRO-2 this also drops the
+#     per-micro-batch re-gather. NOT bit-identical: the partial sums reduce in a
+#     different order, so gradients differ in their last bits (identical
+#     expectation).
+#   fsdp_config.forward_prefetch=True — issue the next FSDP unit's all-gather
+#     while the current one computes. Scheduling only, arithmetic untouched, so
+#     it is a plain performance knob and is not pinned.
+# Two mechanisms come with no knob because they change no value: the top-k
+# distillation forward now runs logsumexp/topk/gather only over the rows that
+# survive the response slice (prompts average ~3x responses here, and on the
+# student side the discarded work was inside the autograd graph), and
+# logger-only scalars stay as 0-d GPU tensors until the end of update_policy
+# instead of being read back per micro-batch (~450 forced host syncs a step).
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -99,6 +160,9 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
@@ -117,7 +181,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

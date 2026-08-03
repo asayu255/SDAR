@@ -154,6 +154,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                             actor_rollout_wg=self.actor_rollout_wg,
                             envs=self.envs,
                             is_train=True,
+                            # Score finished trajectories under the rollout's own
+                            # CPU glue instead of after it; a no-op unless
+                            # ROLLOUT_PREFETCH_TEACHER is on. Routing and the merge
+                            # are inherited from OPDRayTrainer.
+                            teacher_prefetch_fn=self._teacher_prefetch_chunk,
                         )
 
                     # The train envs are idle from here until the next rollout;
@@ -259,7 +264,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     # ---- Per-task teacher forward pass (the distillation signal) ----
                     with _timer("teacher_forward", timing_raw):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
-                        self.compute_teacher_log_probs(batch)
+                        self.compute_teacher_log_probs(
+                            batch,
+                            prefetched=self.traj_collector.take_prefetched_teacher(),
+                            metrics=metrics,
+                        )
 
                     # tag rows with their task so the actor can split its metrics
                     self._attach_task_ids(batch)
