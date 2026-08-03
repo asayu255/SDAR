@@ -14,8 +14,14 @@ semantics, since "an equal share per task" says nothing about one task.
 Every term of the actor loss is a `token-mean` over the whole mixed batch, so a
 task's contribution equals its share of the batch's response tokens. On the
 alfworld / webshop / search mixture that share is decided by the 50 / 15 / 4-turn
-episode caps and by nothing anyone chose — measured at roughly **69 / 27 / 4 %**.
-Search brings a third of the prompts and 4% of the gradient.
+episode caps and by nothing anyone chose. `task_loss/token_share` on the
+instrumented run measures **74.3 / 23.9 / 1.8 %** (an earlier estimate put it at
+69 / 27 / 4). Search brings a third of the prompts and under 2% of the gradient.
+
+The share is not a fixed property of the mixture — it moves with how far the
+episodes actually run, so treat any single number here as one run's measurement
+rather than a constant. What does not move is the direction: alfworld's 50-turn
+cap dominates and search's 4-turn cap is rounding error.
 
 The imbalance is in the rows as well as the tokens (a row is one *turn*, and
 alfworld runs up to 50 of them per trajectory), so `loss_agg_mode` cannot fix it:
@@ -28,7 +34,7 @@ task's rows, the four terms of the SDAR objective behave like this:
 
 ```
 single-task run t :  L_t = 1.0·M_t(pg) − 0.001·M_t(ent) + c_t·M_t(kl) + 0.01·M_t(sdar)
-multitask, today  :  L   = Σ_t  s_t · L_t          s ≈ 0.69 / 0.27 / 0.04
+multitask, today  :  L   = Σ_t  s_t · L_t          s ≈ 0.74 / 0.24 / 0.02
 multitask, on     :  L   = Σ_t (1/3) · L_t   =   (L_alfworld + L_webshop + L_search) / 3
 ```
 
@@ -55,11 +61,11 @@ task's token share:
 
 | task | intended `c_t` | × token share | effective | intended ratio | actual ratio |
 |---|---|---|---|---|---|
-| alfworld | 0.01 | × 0.69 | 6.9e-3 | 10 | **172** |
-| webshop | 0.01 | × 0.27 | 2.7e-3 | 10 | **67** |
-| search | 0.001 | × 0.04 | 4e-5 | 1 | **1** |
+| alfworld | 0.01 | × 0.743 | 7.4e-3 | 10 | **413** |
+| webshop | 0.01 | × 0.239 | 2.4e-3 | 10 | **133** |
+| search | 0.001 | × 0.018 | 1.8e-5 | 1 | **1** |
 
-Search's reference-KL leash was roughly 17× looser than asked for. With the
+Search's reference-KL leash was roughly 40× looser than asked for. With the
 weighting on, the normalisation and the per-task coefficient multiply into one
 row weight, the effective value is `c_t / 3`, and the ratio is 10 : 10 : 1 again.
 `tests/trainer/test_task_weighted_terms.py` measures both the distortion and its
@@ -68,7 +74,7 @@ removal.
 ## Consequences to expect
 
 - **Effective learning rate per task changes.** Search's gradient share goes from
-  ~4% to 33% (about 8×), alfworld's from ~69% to 33% (about 0.5×). The total
+  ~1.8% to 33% (about 18×), alfworld's from ~74% to 33% (about 0.45×). The total
   gradient magnitude stays O(1), so the learning rate does not need retuning, but
   `actor/grad_norm` and `actor/pg_loss/<task>` are worth watching for the first
   tens of steps.

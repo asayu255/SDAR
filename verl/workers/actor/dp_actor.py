@@ -752,9 +752,16 @@ class DataParallelPPOActor(BasePPOActor):
                         sdar_coef = self.config.get("sdar_loss_coef", 0.1)
                         policy_loss = policy_loss + sdar_loss * sdar_coef
                         if task_weighted:
-                            # compute_sdar_loss built this from the weighted
-                            # aggregate; put the comparable number back.
-                            sdar_metrics["sdar/loss_weighted"] = sdar_metrics["sdar/loss"]
+                            # compute_sdar_loss built its "sdar/loss" from the
+                            # WEIGHTED aggregate, so hand back the comparable
+                            # number and report the weighted one separately.
+                            #
+                            # Both are deferred rather than assigned: metrics.update
+                            # keeps only the LAST micro-batch, which after
+                            # _balance_batch's reorder is often entirely
+                            # adjust_batch padding -- weight 0, so the logged value
+                            # sat at exactly 0.000 while the real loss was fine.
+                            _defer("sdar/loss_weighted", sdar_loss)
                             sdar_metrics.pop("sdar/loss")
                             _defer("sdar/loss", _unweighted_agg["sdar/loss"])
                         metrics.update(sdar_metrics)

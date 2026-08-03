@@ -277,3 +277,100 @@ To restore the pre-Phase-3 behaviour, per run or in the yaml:
 The one to reach for first is `no_sync_grad_accum=False`, when a run has to
 reproduce earlier gradients bit for bit; then `sharding_strategy=null`, if the
 model no longer fits.
+
+## 11. Phase 3 measured, and what is left
+
+`GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1` on the 3-task run with every Phase-3
+default live. Step 1 was 1674 s (warm-up), step 2 **1500 s**; the numbers below
+are step 2. Wall-weighted SM is **89.4 %**, `perf/mfu/actor` 0.214,
+`max_memory_reserved` 66.7 GB against 48.8 GB allocated.
+
+| phase | wall s | share | SM % | memBW % | driver CPU % | PCIe TX/RX MB/s |
+|---|---|---|---|---|---|---|
+| `gen` | 340.3 | 22.7 % | 72.4 | 58.5 | 13 | 112 / 130 |
+| `old_log_prob` | 60.4 | 4.0 % | 95.2 | 67.2 | 5 | 21 / 29 |
+| `teacher_forward/build` | 33.9 | 2.3 % | **0.4** | 0.2 | **101** | 0 / 0 |
+| `teacher_forward/logprob` | 219.3 | 14.6 % | 98.4 | 69.7 | 3 | 10 / 30 |
+| `ref` | 190.0 | 12.7 % | 98.2 | **32.3** | 3 | **2212 / 2742** |
+| `update_actor` | 649.1 | **43.2 %** | 96.3 | 46.0 | 3 | 1609 / 1410 |
+
+Inside `update_actor`, from the worker phase stack: `actor.fwd` 145.6 s,
+`actor.bwd` **446.4 s**, `actor.task_metrics` 33.6 s, `actor.optim` 1.7 s.
+
+Three of those cells are the whole finding.
+
+**`actor.bwd / actor.fwd = 3.07`.** A backward without recompute costs about
+twice a forward; with full gradient checkpointing it costs the forward again on
+top, i.e. three times. The measured ratio is that signature almost exactly, so
+roughly 146 s of the step — **~10 %** — is recompute. It is bought with
+activation memory, and the run peaked at 66.7 GB reserved of 80.
+
+**`ref` is 190 s at 98 % SM but 32 % memory bandwidth,** with the highest PCIe
+traffic of any phase by two orders of magnitude. `old_log_prob` is the same
+model over the same shapes and takes 60.4 s — and that is with 23 % of its rows
+already served from the rollout prefetch (`reused 1608/6960`), so the
+like-for-like figure is ~78 s. The gap is the reference policy's parameters
+being pulled back over PCIe for every micro-batch. 98 % SM here means the SMs
+are *occupied*, not that they are doing work — the same distinction as §5.
+
+**`teacher_forward/build` is 33.9 s of one saturated CPU core with the GPU at
+0.4 %.** `build_teacher_batch` decodes each row to text, asks the skill provider
+for its prefix and re-encodes — two tokenizer calls per row, in a Python loop,
+on the driver.
+
+### Ranked next levers
+
+| # | lever | est. saving | accuracy class |
+|---|---|---|---|
+| 1 | `GRADIENT_CHECKPOINTING=False` | ~155 s (10 %) | bit-identical; needs activation headroom |
+| 2 | `REF_PARAM_OFFLOAD=False` | ~110 s (7 %) | bit-identical; +~3.4 GB resident |
+| 3 | batch the tokenizer calls in `build_teacher_batch` | ~28 s (2 %) | exact (same tokens, one call) |
+| 4 | per-task metrics from the per-token matrices already computed | ≤30 s (2 %) | identical values |
+| 5 | `ENABLE_CHUNKED_PREFILL=True`, `GPU_MEMORY_UTILIZATION=0.7` | ~20–35 s | sampling-distribution-preserving |
+| 6 | `PPO_MICRO_PER_GPU` 5 → 10 | ~15 s | grouping only; lcm padding grows |
+
+1 and 2 are now env knobs on `run_multitask_qwen3.sh`, defaulted to today's
+values so the intent lock is unchanged; both are placement/recompute decisions
+that do not touch a formula. Together the six are ~360 s, i.e. 1500 → ~1140 s
+per step. 5 and 6 are the knobs §10 deferred, and the same caveat applies: they
+have to land on every comparison arm at once.
+
+4 is worth spelling out. `actor.task_metrics` re-runs `policy_loss_fn` and
+`agg_loss` per task over row subsets. The entropy, KL, SDL and SDAR terms need
+no second pass at all — the main path already materialises those per-token
+matrices to hand them to `_task_weighted`, so the per-task number is a masked
+mean over a matrix that exists. The four `policy_loss_fn` outputs are the
+awkward ones: `pg_clipfrac`, `ppo_kl` and `pg_clipfrac_lower` are reductions
+over intermediates `compute_policy_loss` does not return, so reusing them means
+handing those back out alongside `pg_losses` first. Two caveats on the 33.6 s:
+it is an upper bound, since it is also where the backward's queued
+reduce-scatter tail drains, and the matrices are only retained when
+`normalize_loss_by_task` is on.
+
+`teacher_forward/logprob` (219 s) is deliberately absent. It runs at 98.4 % SM
+and 69.7 % memory bandwidth — it is compute-bound and near the machine's limit.
+The only way down is fewer teacher tokens or a less frequent teacher, and both
+change the objective rather than the schedule.
+
+### Where the utilization actually is
+
+Weighted SM is 89.4 %. Two of the three deficits are not what they look like:
+
+- **`ref` at 98 %** contributes nothing to the shortfall and everything to the
+  wall clock. Lever 2 lowers the wall *and* raises memBW; it does not raise SM%.
+- **`teacher_forward/build` at 0.4 %** is the only phase that is honestly idle.
+  Removing it lifts the weighted mean about **2 pp** on its own.
+- **`gen` at 72.4 %** is the real deficit: 340 s × 27.6 % ≈ **94 s of idle SM**,
+  more than every other phase's idleness combined. Three causes, from the turn
+  table: 25.2 % of turn wall is CPU glue (env stepping alone is 56.9 s); the
+  alfworld tail runs turns 23→49 with only ~105 of 360 rows still active, so the
+  last half of the rollout is a mostly-empty batch; and DP imbalance is 11.8 pp
+  even with `TASK_BALANCE_INTERLEAVE=1`, which balances tasks across ranks but
+  not surviving-row counts per turn.
+
+So the rollout is where the next round of *utilization* work is, and the actor
+is where the next round of *wall-clock* work is. After levers 1 and 2 land,
+`update_actor` drops from 43 % of the step to about 36 % and `gen` becomes the
+largest phase — at which point re-sharding active rows per turn, and overlapping
+env stepping with generation, are the mechanisms that matter. Async rollout
+(§8) remains the structural answer to the long tail.

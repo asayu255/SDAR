@@ -82,6 +82,37 @@ def test_deferral_reduces_to_the_same_number_as_the_old_append_path():
     assert deferred == pytest.approx(float(reduced))
 
 
+def test_weighted_loss_metrics_are_deferred_rather_than_assigned():
+    """``metrics[k] = v`` inside the loop keeps only the LAST micro-batch.
+
+    That is wrong for any per-micro-batch number, and it is *silently* wrong for
+    the task-weighted losses: ``_balance_batch`` reorders rows, so the last
+    micro-batch is frequently nothing but ``adjust_batch`` padding, whose task
+    weight is 0. ``sdar/loss_weighted`` shipped that way and logged exactly
+    0.000 for a whole run while the loss it was reporting was fine.
+    """
+    body = _micro_batch_loop_source()
+    deferred = set(re.findall(r'_defer\(\s*"([^"]+)"', body))
+    for name in set(re.findall(r'"((?:actor|sdar)/[^"]*_weighted)"', body)):
+        assert name in deferred, (
+            f"{name} is a per-micro-batch value; assigning it keeps only the "
+            "last micro-batch, which is often all-padding (weight 0)"
+        )
+
+
+def test_an_all_padding_last_micro_batch_reads_zero_when_assigned():
+    """Why the test above matters, in numbers."""
+    # Weighted losses per micro-batch; the last one is padding-only, so every
+    # row weight is 0 and the weighted aggregate is exactly 0.
+    per_micro = [torch.tensor(v) for v in (0.42, 0.38, 0.45, 0.0)]
+
+    assigned = per_micro[-1].item()  # what metrics[k] = v logs
+    averaged = torch.stack([v.detach() for v in per_micro]).mean().item()
+
+    assert assigned == 0.0
+    assert averaged == pytest.approx(0.3125)
+
+
 def test_a_metric_absent_from_some_micro_batches_averages_over_the_ones_it_had():
     """A task can be missing from a micro-batch entirely, so its per-task metric
     is appended fewer times than there are micro-batches. Both paths must divide
