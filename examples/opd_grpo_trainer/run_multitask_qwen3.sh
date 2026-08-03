@@ -34,6 +34,26 @@ set -x
 #   that, put it back to True — this is a placement knob, the distillation
 #   targets are identical either way.
 #
+# ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
+# server as another concurrent run. What makes that safe is not the URL but the
+# retry policy beside it: env.search.max_retries=null waits for a timeout /
+# refused connection / 5xx to clear instead of giving up. Giving up is not a
+# no-op — the client hands the error text back as the retrieval result, so it
+# lands in the <information> block the model is trained on with nothing in the
+# metrics to say so, and under a shared retriever an exhausted budget is exactly
+# what a load spike looks like. 4xx and malformed JSON still fail immediately:
+# waiting cannot turn a bad URL into a document. Both knobs are pinned in the
+# expectations file, because they decide what enters the data.
+#
+# env.search.timeout=600 is generous but finite on purpose; see the expectations
+# file for why null is worse here. A request that is still retrying says so in
+# the log every ~60s, so an intentional wait is never mistaken for a hang.
+#
+# HOST PATHS. Teachers, checkpoints and data are all written relative to $HOME,
+# and load_expectations expands $HOME before comparing, so one lock file pins the
+# same teacher on either machine — what it asserts is WHICH checkpoint, not where
+# $HOME is. Moving to a host with a different home needs no edit here.
+#
 # Throughput mechanisms (process env vars, accuracy-preserving; live in code, not
 # in the expectations file — see docs/optimization_phase2.md):
 #   opt-in:      ROLLOUT_KEEP_VLLM_AWAKE=1  ROLLOUT_PREFETCH_LOGPROB=1
@@ -193,9 +213,9 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
     algorithm.use_kl_in_reward=False \
-    +algorithm.opd.teacher_paths.alfworld=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
-    +algorithm.opd.teacher_paths.search=/opt/home/ohara/checkpoints/teachers/search_step300 \
-    +algorithm.opd.teacher_paths.webshop=/opt/home/ohara/checkpoints/teachers/webshop_step300 \
+    +algorithm.opd.teacher_paths.alfworld=$HOME/checkpoints/teachers/alfworld_step300 \
+    +algorithm.opd.teacher_paths.search=$HOME/checkpoints/teachers/search_step300 \
+    +algorithm.opd.teacher_paths.webshop=$HOME/checkpoints/teachers/webshop_step300 \
     +algorithm.opd.kl_loss_coef=1.0 \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
@@ -205,6 +225,8 @@ python3 -m verl.trainer.main_opd_grpo \
     env.history_length=4 \
     env.rollout.n=8 \
     env.search.search_url='http://0.0.0.0:8000/retrieve' \
+    env.search.timeout=600 \
+    env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
@@ -221,7 +243,7 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_grpo_multitask \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
