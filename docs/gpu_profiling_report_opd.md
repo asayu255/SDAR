@@ -789,6 +789,9 @@ export TASK_BALANCE_INTERLEAVE=1
    SHARD_GRAD_OP は forward 後に reshard せず、teacher に backward は無いので、
    フェーズ先頭の 1 回で gather したまま走る。gather 済み実体の分だけメモリは増える
    （最大 3 × 3.4 GB/GPU、`max_memory_allocated 93.902` に対し許容）。
+   **増えるのは GPU 側であって、2.8 節で run を殺したホスト RAM ではない。**
+   2 つの天井は別軸なので混同しないこと ―― この機構は step 150 の崖には効かないし、
+   悪化もさせない。見るのは `perf/max_memory_allocated_gb` の方。
 3. **spec decode。** 2.3(b) の decode テールは帯域律速で、バッチを増やせない以上
    「1 回の重みストリームあたりのトークン数」を増やすしかない。ngram draft ＋棄却
    サンプリングは分布を厳密に保存し（temperature=1.0 / top_p=1 / top_k=-1 の純サンプリング
