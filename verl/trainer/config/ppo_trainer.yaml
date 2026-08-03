@@ -78,6 +78,17 @@ actor_rollout_ref:
     # same number -- but a run that must reproduce earlier numbers exactly has to
     # set this to False.
     no_sync_grad_accum: True
+    # Multitask: give every task an equal share of EVERY loss term instead of a
+    # share proportional to its response tokens. The plain token-mean is decided
+    # by the episode caps (50/15/4 turns for alfworld/webshop/search), which put
+    # alfworld near 69% of the tokens and search near 4% -- a weighting nobody
+    # chose. With this on, the loss is the mean of the per-task losses a set of
+    # single-task runs would produce, so each term's coefficient (including
+    # kl_loss_coef_by_task) means what the single-task recipes mean by it.
+    #
+    # Off by default: it changes the loss, so it must not appear mid-experiment.
+    # See verl/trainer/ppo/task_loss_weights.py.
+    normalize_loss_by_task: False
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size

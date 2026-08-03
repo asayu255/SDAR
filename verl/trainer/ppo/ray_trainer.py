@@ -769,6 +769,40 @@ class RayPPOTrainer:
     def _normalize_task_name(task_name):
         return normalize_task_name(task_name)
 
+    def _attach_task_loss_weights(self, batch, n_real: int, metrics: dict) -> None:
+        """Give every task an equal share of the loss, when the run asks for it.
+
+        Off unless ``actor.normalize_loss_by_task``. On, the plain token-mean is
+        replaced by a per-row weighting that makes each task contribute
+        ``1/num_tasks`` of every loss term instead of its share of the batch's
+        response tokens -- a share decided by the per-task episode caps rather
+        than by anything anyone chose.
+
+        Called after ``adjust_batch`` so the padding rows it appended can be given
+        weight 0, and before ``_balance_batch``, whose reorder moves the weight
+        column with its rows.
+        """
+        if not self.config.actor_rollout_ref.actor.get("normalize_loss_by_task", False):
+            return
+        from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
+
+        attach_task_loss_weights(
+            batch,
+            n_real=n_real,
+            # Rows in one optimizer step, counted globally. ppo_mini_batch_size is
+            # counted in PROMPTS: the worker multiplies it by rollout.n (then
+            # divides by the DP world size) in ActorRolloutRefWorker.__init__. The
+            # env recipes leave rollout.n at 1 and expand the group in the env
+            # manager instead, so the factor is usually 1 -- but it decides how
+            # many optimizer steps a batch becomes, which is what the weights are
+            # scaled by.
+            mini_batch_size=(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                * self.config.actor_rollout_ref.rollout.n
+            ),
+            metrics=metrics,
+        )
+
     @staticmethod
     def _attach_task_ids(batch: DataProto):
         """Tag every row with an integer task id for worker-side per-task metrics.
@@ -1358,9 +1392,14 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
+                    # Rows at or past n_real are the duplicates adjust_batch appends
+                    # to reach a DP/micro-divisible count; the per-task weights below
+                    # need to tell them from the trajectories that were rolled out.
+                    n_real = len(batch)
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._attach_task_loss_weights(batch, n_real=n_real, metrics=metrics)
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo

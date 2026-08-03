@@ -464,6 +464,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    agg_fn=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -492,6 +493,11 @@ def compute_policy_loss(
             Defaults to 3.0.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        agg_fn (callable, optional):
+            Replaces ``agg_loss`` for the final aggregation, same
+            ``(loss_mat, loss_mask, loss_agg_mode)`` signature. The per-task loss
+            normalisation passes its own aggregator here, so the per-token losses
+            never have to leave this function and the returned shape is unchanged.
     """
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
 
@@ -513,7 +519,7 @@ def compute_policy_loss(
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = (agg_fn or agg_loss)(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -528,6 +534,7 @@ def compute_policy_loss_gspo(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "seq-mean-token-mean",
+    agg_fn=None,
 ):
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -545,6 +552,11 @@ def compute_policy_loss_gspo(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
+        agg_fn (callable, optional):
+            Replaces ``agg_loss`` for the final aggregation, same
+            ``(loss_mat, loss_mask, loss_agg_mode)`` signature. The per-task loss
+            normalisation passes its own aggregator here, so the per-token losses
+            never have to leave this function and the returned shape is unchanged.
     """
 
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
@@ -575,7 +587,7 @@ def compute_policy_loss_gspo(
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+    pg_loss = (agg_fn or agg_loss)(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)

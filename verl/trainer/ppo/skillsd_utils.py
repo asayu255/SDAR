@@ -17,6 +17,7 @@ def compute_sdl_loss(
     old_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    agg_fn=None,
 ) -> torch.Tensor:
     """
     Compute the Self Distillation Loss (SDL) for SkillSD.
@@ -30,6 +31,8 @@ def compute_sdl_loss(
             Frozen (no grad). Rollout-time policy.
         response_mask: (bs, response_length) — mask for valid response tokens.
         loss_agg_mode: aggregation mode passed to agg_loss.
+        agg_fn: optional replacement for agg_loss, same signature. Used by the
+            per-task loss normalisation.
 
     Returns:
         sdl_loss: scalar — the aggregated SDL loss.
@@ -47,6 +50,6 @@ def compute_sdl_loss(
 
     sdl_per_token = rho_on * k3
 
-    sdl_loss = agg_loss(loss_mat=sdl_per_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    sdl_loss = (agg_fn or agg_loss)(loss_mat=sdl_per_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return sdl_loss

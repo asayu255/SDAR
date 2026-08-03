@@ -208,8 +208,12 @@ class SkillSDRayTrainer(RLSDRayTrainer):
                     del batch
                     batch = gen_batch_output
 
+                    # See RayPPOTrainer._attach_task_loss_weights: rows at or past
+                    # n_real are adjust_batch's duplicates and get weight 0.
+                    n_real = len(batch)
                     batch = adjust_batch(self.config, batch)
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._attach_task_loss_weights(batch, n_real=n_real, metrics=metrics)
 
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
