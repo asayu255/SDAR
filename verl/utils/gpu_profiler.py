@@ -79,6 +79,13 @@ Env vars
                                not when the GPU finished it, and the boundaries
                                smear. Exact attribution, but it serializes what
                                the run would overlap -- the totals get slower.
+                               Read by the boundaries that can act on it, which
+                               today means the worker-side actor stages
+                               (dp_actor._actor_phase). The driver's own phases
+                               come from _timer, which wraps a BLOCKING ray.get
+                               into the workers, so their boundaries are already
+                               where the call returned rather than where it was
+                               issued -- there is nothing local to synchronize.
   GPU_PROFILER_TRACE=<path>    also append every raw sample to this CSV
                                (ts, clock, phase, per-GPU sm%, per-GPU memBW%,
                                driver cpu%). The tables above are per-step
