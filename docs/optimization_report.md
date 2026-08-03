@@ -238,6 +238,25 @@ Two fixes outside the GPU entirely, both required to finish a run on a 256GB box
   `docs/webshop_worker_memory.md`. ~1.8 GB/step of host RAM, which is what the OOM
   killer was reacting to around step 24.
 
+### Deferred, and why they must land on every arm at once
+
+The pure-OPD arm's profiling log lists three throughput knobs measured as worth
+having and deliberately not taken yet, because each one has to be enabled on
+**all** comparison arms in the same change or the arms stop being comparable:
+
+| knob | expected | why it is safe |
+|---|---|---|
+| `rollout.enable_chunked_prefill=True` | `gen` −5–10% | sampling distribution unchanged |
+| `rollout.gpu_memory_utilization` 0.6 → 0.7 | `gen` −3–8% | KV budget only |
+| `actor.ppo_micro_batch_size_per_gpu` 5 → 10 | `update_actor` −2–3% | grouping only; `adjust_batch`'s lcm goes 160 → 320, so padding grows |
+
+None of them changes a loss formula. They are listed here rather than applied so
+that turning them on is one deliberate change across the arms.
+
+Separately, `GPU_PROFILER_TRACE` used to be unusable on a distributed run: the
+driver and every worker opened the same path in mode `"w"` and truncated each
+other. Worker processes now get `.rank<N>` inserted before the extension.
+
 ### Turning them off
 
 No run script has to opt in — the defaults are in `ppo_trainer.yaml`, and

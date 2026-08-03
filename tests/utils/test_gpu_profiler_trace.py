@@ -112,3 +112,35 @@ def test_an_unwritable_path_is_reported_and_ignored(monkeypatch, tmp_path):
         assert sampler._thread.is_alive()
     finally:
         sampler._stop.set()
+
+
+def test_the_trace_path_is_unique_per_worker(monkeypatch):
+    mod = _fresh(monkeypatch, GPU_PROFILER="1", GPU_PROFILER_TRACE="/tmp/prof.csv")
+    """The driver and every worker run their own sampler.
+
+    All of them opening one path in mode "w" truncates each other's output and
+    leaves an unparseable CSV -- which is what happened the first time the trace
+    was used on a distributed run, the single-process case having hidden it.
+    """
+    monkeypatch.delenv("RANK", raising=False)
+    assert mod._trace_path_for_this_process() == "/tmp/prof.csv"
+
+    monkeypatch.setenv("RANK", "0")
+    assert mod._trace_path_for_this_process() == "/tmp/prof.rank0.csv"
+    monkeypatch.setenv("RANK", "2")
+    assert mod._trace_path_for_this_process() == "/tmp/prof.rank2.csv"
+
+    # no two processes can collide
+    paths = set()
+    for rank in range(4):
+        monkeypatch.setenv("RANK", str(rank))
+        paths.add(mod._trace_path_for_this_process())
+    monkeypatch.delenv("RANK", raising=False)
+    paths.add(mod._trace_path_for_this_process())
+    assert len(paths) == 5
+
+
+def test_an_extensionless_path_still_gets_a_rank(monkeypatch):
+    mod = _fresh(monkeypatch, GPU_PROFILER="1", GPU_PROFILER_TRACE="/tmp/prof")
+    monkeypatch.setenv("RANK", "1")
+    assert mod._trace_path_for_this_process() == "/tmp/prof.rank1"

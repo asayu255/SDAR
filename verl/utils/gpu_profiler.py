@@ -86,6 +86,9 @@ Env vars
                                gap happened and how long it was but not *when*;
                                the trace is what lines a dip seen on an external
                                monitor up against the phase that produced it.
+                               Worker processes get ".rank<N>" inserted before
+                               the extension, since the driver and the workers
+                               would otherwise truncate one file between them.
 """
 
 import atexit
@@ -136,6 +139,25 @@ _KIB_TO_MB = 1024.0 / (1000.0 * 1000.0)  # NVML NVLink counters are KiB
 # sample intervals are treated as different blocks of that phase, so an idle
 # stretch is never reported across a busy phase that ran in between.
 _CONTIGUITY_SLACK = 2.0
+
+
+def _trace_path_for_this_process() -> str:
+    """``GPU_PROFILER_TRACE``, made unique per process.
+
+    A sampler runs in the driver AND in every worker that pushes a phase of its
+    own (dp_actor._actor_phase does, on rank 0). All of them opening one path in
+    mode "w" truncates each other's output and leaves an unparseable CSV -- which
+    is what happened the first time this was used on a distributed run, the
+    single-process case having hidden it.
+
+    RANK is set on every verl worker (single_controller/ray/base.py); the driver
+    has none, so it keeps the path as given and a single-process run is unchanged.
+    """
+    rank = os.environ.get("RANK")
+    if rank is None:
+        return _TRACE_PATH
+    root, ext = os.path.splitext(_TRACE_PATH)
+    return f"{root}.rank{rank}{ext}"
 
 
 def now() -> float:
@@ -385,12 +407,13 @@ class _Sampler:
         self._cum_steps = 0
         self._trace = None
         if _TRACE_PATH:
+            path = _trace_path_for_this_process()
             try:
-                self._trace = open(_TRACE_PATH, "w", buffering=1)
+                self._trace = open(path, "w", buffering=1)
                 self._trace.write("ts,clock,phase,sm_pct_per_gpu,membw_pct_per_gpu,driver_cpu_pct\n")
-                print(f"[gpu-profiler] per-sample trace -> {_TRACE_PATH}", flush=True)
+                print(f"[gpu-profiler] per-sample trace -> {path}", flush=True)
             except OSError as e:
-                print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={_TRACE_PATH}: {e}", flush=True)
+                print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={path}: {e}", flush=True)
         self._thread = threading.Thread(target=self._run, name="gpu-profiler", daemon=True)
         self._thread.start()
 
