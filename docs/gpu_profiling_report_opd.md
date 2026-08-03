@@ -800,9 +800,24 @@ export TASK_BALANCE_INTERLEAVE=1
 
 次 run で見るもの:
 
-- `teacher_prefetch/hit_rate` — 0.28〜0.46 からどこまで上がるか。`tchWait` /
-  `teacher-spill` — queue がターン 1 から埋まるため、`ROLLOUT_PREFETCH_TEACHER_CHUNK`
-  は 32 のままで再チューニング（3.3 節の表の取り直し）。
+- `teacher_prefetch/hit_rate` — 0.28〜0.46 からどこまで上がるか。**ただしチャンク
+  サイズを上げないと上がらない。** 発行は 1 ターン 1 チャンクのままなので、
+  prefetch できる行数は `CHUNK × ターン数 ≤ CHUNK × 50` で頭打ちになる。
+  1 step は 6,880〜7,200 行（0 節）だから:
+
+  | `CHUNK` | 上限行数 | hit_rate の上限 |
+  |---:|---:|---:|
+  | 32 | 1,600 | **約 0.23** |
+  | 128（既定） | 6,400 | 約 0.91 |
+  | 160 | 8,000 | 1.0（行数側が先に尽きる） |
+
+  **32 は既に達成している 0.28〜0.46 を下回る**ので、ターン単位化と組み合わせるなら
+  戻してはいけない。ターン単位化以前は queue が枯れていた（alfworld の行が
+  エピソード終端まで入らない）ため小さいチャンクで足りていたが、いまは
+  **チャンクが唯一の律速**である。128 から始めて、下げるのは `tchWait` が
+  step 時間を実際に悪化させたときだけ。3.3 節の通り `tchWait` 自体は無駄では
+  ない（trainer がやらずに済んだ分）ので、判断は `tchWait` 単独ではなく
+  `teacher_forward` の s/step ＋ step 全体の壁時計で行う（3.3 節の表の取り直し）。
 - `teacher_forward/*` の `pcieRX` — 4,307 → 集団通信消滅でどこまで落ちるか。
   `perf/max_memory_allocated_gb` — 93.902 からの増分が見積り内か。
 - vLLM の acceptance 指標と `gen` の s/step・`gen_util`。効果の主張は
