@@ -512,7 +512,17 @@ class RayPPOTrainer:
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        if real_train_batch_size % n_gpus != 0:
+            # The env-driven recipes never dispatch the prompt batch to the workers as-is: the rows
+            # are placeholders that the environments turn into rollouts, and every worker-group call
+            # pads explicitly first (pad_dataproto_to_divisor(..., actor_rollout_wg.world_size) in
+            # agent_system/multi_turn_rollout/rollout_loop.py, then adjust_batch on the finished
+            # batch). Enforcing divisibility on the prompt count there would tie the per-task batch
+            # size to the GPU count -- moving a run from 3 GPUs to 2 would change the experiment,
+            # not just its placement.
+            if OmegaConf.select(config, "env.env_name") is None:
+                raise AssertionError(f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus}).")
+            print(f"[validate_config] real_train_batch_size ({real_train_batch_size}) is not divisible by n_gpus ({n_gpus}); the env rollout pads every dispatch, so this is allowed.")
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
