@@ -40,6 +40,14 @@ set -x
 #   3 teachers * 3.4GB bf16 / 2 GPUs = 5.1GB per GPU. If a bigger student or a
 #   longer context leaves no room for that, put it back to True -- this is a
 #   placement knob, the distillation targets are identical either way.
+#   ref.fsdp_config.sharding_strategy=shard_grad_op goes one step further: under
+#   FULL_SHARD the resident shards are still re-all-gathered over PCIe for EVERY
+#   micro-batch (teacher_forward's pcieRX sat at ~4.3 GB/s even after the
+#   offload fix). ZeRO-2 does not reshard after forward, and the teachers have
+#   no backward, so each teacher is gathered once and then stays whole; the
+#   per-micro-batch collective disappears. Placement only, bit-identical logits.
+#   Costs up to 3 * 3.4GB gathered per GPU on top of the shards; watch
+#   perf/max_memory_allocated_gb (93.9GB before this) after enabling.
 #
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
@@ -65,20 +73,39 @@ set -x
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
 #   old_log_prob phase, so prefetched values would never be consumed.
 #
-# ROLLOUT_PREFETCH_TEACHER scores finished trajectories with their task's teacher
-# during the rollout instead of after it. What it fills is the driver's own CPU
-# time — decode, envs.step, the next turn's tokenization — measured at 18% of the
-# rollout with the GPU at 0. It does NOT fill the alfworld generation tail: the
-# teachers share one WorkerDict per GPU with the rollout (init_workers ->
-# create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
+# ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
+# rollout instead of after it. A turn's row is final the moment it is recorded
+# (later turns only append), so rows are queued per turn — not, as previously, at
+# trajectory end, which kept alfworld's rows out of the pool until episode end
+# and capped the hit rate at 0.28-0.46. What the scoring fills is the driver's
+# own CPU time — decode, envs.step, the next turn's tokenization — measured at
+# 18% of the rollout with the GPU at 0. It does NOT fill the alfworld generation
+# tail: the teachers share one WorkerDict per GPU with the rollout (init_workers
+# -> create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
 # teacher call issued during generate_sequences would only queue behind it.
-# Bound accordingly — the whole teacher phase cannot disappear, only the part
-# that fits in the glue. ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128 rows) sets
-# how much is attempted per turn; the turn table's tchWait column shows what did
-# not fit. Frozen teachers, so the targets do not depend on when a row is scored,
-# but a row lands in a different micro-batch than the post-rollout path would put
-# it in, which moves the last bits of a packed GEMM — same class as
-# no_sync_grad_accum, not bit-identical.
+# ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128 rows) sets how much is attempted
+# per turn; the turn table's tchWait column shows what did not fit, and the
+# final turns' rows always remain for the trainer. Frozen teachers, so the
+# targets do not depend on when a row is scored, but a row lands in a different
+# micro-batch than the post-rollout path would put it in, which moves the last
+# bits of a packed GEMM — same class as no_sync_grad_accum, not bit-identical.
+#
+# Speculative decoding (engine_kwargs.vllm.speculative_config, pinned in the
+# expectations file): ngram / prompt-lookup drafting inside vLLM. Rejection
+# sampling preserves the sampling distribution EXACTLY — the draft only decides
+# how many target-model forwards a token costs, never which token is kept — and
+# this run samples with temperature=1.0 / top_p=1 / top_k=-1, the cleanest case.
+# The gain lands where gen's sm% is lowest: the decode tail, where a handful of
+# remaining sequences are pure HBM-bandwidth-bound and every accepted draft
+# token amortizes one full weight stream. Agent output is templated
+# ("Action: go to ...", <search>...</search>), so prompt-lookup acceptance is
+# high on this workload. Not bit-identical (the verification forward batches
+# tokens the serial decode would process one by one — same class as vLLM batch
+# composition), and the teacher KL is computed by the training-side forwards on
+# the sampled tokens, so vLLM numerics cannot enter the loss. Monitor vLLM's
+# acceptance metrics for the speedup actually realized; this arm's thin loop has
+# no old_log_prob phase, so the rollout_probs_diff drift check lives on the
+# arms that do (e.g. OPD+GRPO).
 #
 # Actor-update mechanisms (config, not env vars). These target the PCIe
 # collectives: tamago's two GPUs have no NVLink, so every FSDP all-gather and
@@ -168,6 +195,10 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max=4 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min=2 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
@@ -179,6 +210,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

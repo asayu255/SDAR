@@ -763,3 +763,49 @@ export TASK_BALANCE_INTERLEAVE=1
   `expected_multitask_offpolicy_config.yaml` は `sdar_multitask_offline_qwen3_1.7b` を pin
   している（`nogen` スクリプトの方は一致）。**intent lock 側の意図を確認して揃える。**
 - **次 run の 3 項目**（4 節）を 3 arm 揃えて入れる。到達点は 82〜85%、〜490 s/it。
+
+---
+
+## 9. 実装済み・未計測の 3 機構
+
+3.5 節・5 節⑤の教訓により、**効果量はここに書かない**（まだ測っていない）。
+書くのは「何を変えたか」「精度クラス」「次 run で何を見るか」だけ。
+
+| 機構 | 変更箇所 | 精度クラス |
+|---|---|---|
+| teacher prefetch のターン単位化 | `rollout_loop.py`（記録時に `_queue_row_for_prefetch`） | 既存 prefetch と同一（期待値同一・micro-batch 構成のみ） |
+| teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op`（run script; ノブは actor と共通の `get_sharding_strategy`） | **ビット同一**（配置と通信タイミングのみ） |
+| ngram speculative decoding | `engine_kwargs.vllm.speculative_config.*`（run script; lock に pin） | サンプリング分布を厳密保存・軌跡はビット非同一（vLLM batch 構成と同クラス） |
+
+根拠と設計:
+
+1. **ターン単位化。** 行（=1 ターン）は `total_batch_list[i].append` された瞬間に不変で、
+   teacher は run 全体で凍結。従来は軌跡完了時にまとめて queue していたため、バッチの
+   大半を占める alfworld の行がエピソード終端（〜50 ターン）まで pool に入らず、
+   hit_rate が 0.284〜0.463 で頭打ちだった（6 節）。記録時 queue なら glue 窓はターン 1
+   から捌ける。**最終ターン近傍の行は原理的に残る**ので hit_rate 1.0 にはならない。
+2. **ZeRO-2 teacher。** CPUOffload 解除後も `teacher_forward` の `pcieRX` は 4,307 で、
+   これは FULL_SHARD が micro-batch ごとに繰り返す all-gather（3.1 節の表の残り半分）。
+   SHARD_GRAD_OP は forward 後に reshard せず、teacher に backward は無いので、
+   フェーズ先頭の 1 回で gather したまま走る。gather 済み実体の分だけメモリは増える
+   （最大 3 × 3.4 GB/GPU、`max_memory_allocated 93.902` に対し許容）。
+3. **spec decode。** 2.3(b) の decode テールは帯域律速で、バッチを増やせない以上
+   「1 回の重みストリームあたりのトークン数」を増やすしかない。ngram draft ＋棄却
+   サンプリングは分布を厳密に保存し（temperature=1.0 / top_p=1 / top_k=-1 の純サンプリング
+   なので最も素直なケース）、この arm は old_log_prob も teacher KL も学習側 forward で
+   計算するため、vLLM の数値が損失に入る経路が無い。`engine_kwargs.vllm` の
+   パススルー（`vllm_rollout_spmd.py:161`）経由なのでコード変更なし。
+   **サンプリング経路に乗るので lock に pin した**（no_sync と同じ「黙って変わっては
+   ならない」クラス）。ref の sharding は placement-only なので pin しない。
+
+次 run で見るもの:
+
+- `teacher_prefetch/hit_rate` — 0.28〜0.46 からどこまで上がるか。`tchWait` /
+  `teacher-spill` — queue がターン 1 から埋まるため、`ROLLOUT_PREFETCH_TEACHER_CHUNK`
+  は 32 のままで再チューニング（3.3 節の表の取り直し）。
+- `teacher_forward/*` の `pcieRX` — 4,307 → 集団通信消滅でどこまで落ちるか。
+  `perf/max_memory_allocated_gb` — 93.902 からの増分が見積り内か。
+- vLLM の acceptance 指標と `gen` の s/step・`gen_util`。効果の主張は
+  `perf/throughput`（tok/s、warmup 除外 30 step 以上）でのみ行う（3.5 節）。
+- **3 arm 同時適用**（4 節の原則）。spec decode は生成を持つ全 arm、ターン単位化と
+  ZeRO-2 teacher は opd-grpo にも同じ変更を入れる。
