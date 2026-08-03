@@ -640,6 +640,38 @@ step 1（7,200 行）は偶然通り、step 2（6,880 行）で落ちた。
 **SFT arm（A6000 × 3）の系列が残っていただけ**。
 **チャートの凡例より run script を先に読むべきだった。**
 
+**⑧ spec decode を「config だけで入る」と判断し、エンジンを確認しなかった。**
+2.3(b) の decode テールに対する手として `engine_kwargs.vllm.speculative_config` を
+入れたが、**step 1 に届かず `init_workers` で落ちた**（sdar arm で実測）:
+
+```
+WARNING ... Methods determine_num_available_blocks,device_config not implemented
+            in <vllm.spec_decode.ngram_worker.NGramWorker object ...>
+NotImplementedError: Method 'sleep' is not implemented.
+  vllm_rollout_spmd.py:210  self.inference_engine.sleep(level=1)
+```
+
+`speculative_config` を渡すと vLLM は V0 の `SpecDecodeWorker` に差し替わり、
+これは `sleep()` を実装していない。一方 `vllm_rollout_spmd` はエンジンを
+`enable_sleep_mode=True` で作って直後に `sleep(level=1)` を呼ぶので、必ず落ちる。
+
+**判断の誤りは 2 段ある。**
+1. 5 節②で「`vllm==0.11.0` pin なので V0 は無い」と書いたのは *`VLLM_USE_V1` の
+   export が no-op である*ことの根拠であって、**実行中のエンジンが V1 である証明では
+   なかった**。トレースバックの `vllm/engine/llm_engine.py` /
+   `vllm/executor/uniproc_executor.py` / `vllm.spec_decode.*` はすべて V0 の経路で、
+   この環境は実際には V0 で動いている。前の誤りを根拠に次の結論を積んだ。
+2. **verl 側が要求するエンジン機能を確認しなかった。** この rollout は wake/sleep を
+   前提に組まれていて（`free_cache_engine=False`、`ROLLOUT_KEEP_VLLM_AWAKE`）、
+   エンジンの worker を差し替える設定はすべてその前提と衝突しうる。
+   「サンプリング分布を保存するか」だけを検証して、
+   **「そのエンジン構成が verl の呼ぶメソッドを持つか」を検証しなかった。**
+
+教訓は 2.4 節と同じ形をしている ―― **「理論上入れられる」と「この配置で動く」は別**。
+2.4 では Ray の worker 配置、ここでは vLLM の worker 差し替えだった。
+V1 エンジンなら spec decode は `v1/spec_decode` にあり sleep も実装されているので、
+**`VLLM_USE_V1=1` を全 arm で検証する別実験**として残す。
+
 ---
 
 ## 6. 本番での検証（step 1〜149）
@@ -766,7 +798,7 @@ export TASK_BALANCE_INTERLEAVE=1
 
 ---
 
-## 9. 実装済み・未計測の 3 機構
+## 9. 実装済み・未計測の 2 機構（＋起動しなかった 1 つ）
 
 3.5 節・5 節⑤の教訓により、**効果量はここに書かない**（まだ測っていない）。
 書くのは「何を変えたか」「精度クラス」「次 run で何を見るか」だけ。
@@ -775,7 +807,7 @@ export TASK_BALANCE_INTERLEAVE=1
 |---|---|---|
 | teacher prefetch のターン単位化 | `rollout_loop.py`（記録時に `_queue_row_for_prefetch`） | 既存 prefetch と同一（期待値同一・micro-batch 構成のみ） |
 | teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op`（run script; ノブは actor と共通の `get_sharding_strategy`） | **ビット同一**（配置と通信タイミングのみ） |
-| ngram speculative decoding | `engine_kwargs.vllm.speculative_config.*`（run script; lock に pin） | サンプリング分布を厳密保存・軌跡はビット非同一（vLLM batch 構成と同クラス） |
+| ~~ngram speculative decoding~~ | **撤回。このスタックでは起動しない**（下記 3） | — |
 
 根拠と設計:
 
@@ -792,14 +824,22 @@ export TASK_BALANCE_INTERLEAVE=1
    **増えるのは GPU 側であって、2.8 節で run を殺したホスト RAM ではない。**
    2 つの天井は別軸なので混同しないこと ―― この機構は step 150 の崖には効かないし、
    悪化もさせない。見るのは `perf/max_memory_allocated_gb` の方。
-3. **spec decode。** 2.3(b) の decode テールは帯域律速で、バッチを増やせない以上
-   「1 回の重みストリームあたりのトークン数」を増やすしかない。ngram draft ＋棄却
-   サンプリングは分布を厳密に保存し（temperature=1.0 / top_p=1 / top_k=-1 の純サンプリング
-   なので最も素直なケース）、この arm は old_log_prob も teacher KL も学習側 forward で
-   計算するため、vLLM の数値が損失に入る経路が無い。`engine_kwargs.vllm` の
-   パススルー（`vllm_rollout_spmd.py:161`）経由なのでコード変更なし。
-   **サンプリング経路に乗るので lock に pin した**（no_sync と同じ「黙って変わっては
-   ならない」クラス）。ref の sharding は placement-only なので pin しない。
+3. **spec decode は撤回した。設定ミスではなく、この verl + vLLM では動かない。**
+   `engine_kwargs.vllm.speculative_config` を渡すと vLLM は V0 の
+   `spec_decode.SpecDecodeWorker`（内側に `NGramWorker`）に差し替わる。この
+   ラッパーは `sleep()` を実装していない一方、`vllm_rollout_spmd` はエンジンを
+   `enable_sleep_mode=True` で作り、直後に `sleep(level=1)` を呼ぶ（`:210`）ので、
+   **step 1 に入る前に `init_workers` で
+   `NotImplementedError: Method 'sleep' is not implemented` で落ちる**（sdar arm で実測）。
+   `free_cache_engine=False` と `ROLLOUT_KEEP_VLLM_AWAKE` が依存する wake/sleep
+   サイクル全体がこのメソッドを要求するので、引数の不足ではなく構造的な非互換である。
+   狙い自体（2.3(b) の帯域律速な decode テールを、1 回の重みストリームあたりの
+   トークン数を増やして償却する）は有効で、棄却サンプリングは分布を厳密に保存し、
+   この arm は teacher KL を学習側 forward で計算するため vLLM の数値が損失に入る
+   経路も無い。**必要なのは V1 エンジン**（spec decode が `v1/spec_decode` にあり、
+   sleep も実装されている）。ただし `VLLM_USE_V1=1` は全フェーズのエンジンを
+   変えるので、**全 arm 同時の別実験**であって、ここで倒すノブではない。
+   → 5 節⑧に記録。
 
 次 run で見るもの:
 
@@ -823,7 +863,7 @@ export TASK_BALANCE_INTERLEAVE=1
   `teacher_forward` の s/step ＋ step 全体の壁時計で行う（3.3 節の表の取り直し）。
 - `teacher_forward/*` の `pcieRX` — 4,307 → 集団通信消滅でどこまで落ちるか。
   `perf/max_memory_allocated_gb` — 93.902 からの増分が見積り内か。
-- vLLM の acceptance 指標と `gen` の s/step・`gen_util`。効果の主張は
-  `perf/throughput`（tok/s、warmup 除外 30 step 以上）でのみ行う（3.5 節）。
-- **3 arm 同時適用**（4 節の原則）。spec decode は生成を持つ全 arm、ターン単位化と
-  ZeRO-2 teacher は opd-grpo にも同じ変更を入れる。
+- 効果の主張は `perf/throughput`（tok/s、warmup 除外 30 step 以上）でのみ行う（3.5 節）。
+  `gen` は今回どちらの機構の対象でもないので、動かないのが正常。
+- **3 arm 同時適用**（4 節の原則）。ターン単位化と ZeRO-2 teacher は opd-grpo にも
+  同じ変更を入れる。

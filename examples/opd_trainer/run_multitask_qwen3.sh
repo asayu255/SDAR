@@ -90,22 +90,20 @@ set -x
 # micro-batch than the post-rollout path would put it in, which moves the last
 # bits of a packed GEMM — same class as no_sync_grad_accum, not bit-identical.
 #
-# Speculative decoding (engine_kwargs.vllm.speculative_config, pinned in the
-# expectations file): ngram / prompt-lookup drafting inside vLLM. Rejection
-# sampling preserves the sampling distribution EXACTLY — the draft only decides
-# how many target-model forwards a token costs, never which token is kept — and
-# this run samples with temperature=1.0 / top_p=1 / top_k=-1, the cleanest case.
-# The gain lands where gen's sm% is lowest: the decode tail, where a handful of
-# remaining sequences are pure HBM-bandwidth-bound and every accepted draft
-# token amortizes one full weight stream. Agent output is templated
-# ("Action: go to ...", <search>...</search>), so prompt-lookup acceptance is
-# high on this workload. Not bit-identical (the verification forward batches
-# tokens the serial decode would process one by one — same class as vLLM batch
-# composition), and the teacher KL is computed by the training-side forwards on
-# the sampled tokens, so vLLM numerics cannot enter the loss. Monitor vLLM's
-# acceptance metrics for the speedup actually realized; this arm's thin loop has
-# no old_log_prob phase, so the rollout_probs_diff drift check lives on the
-# arms that do (e.g. OPD+GRPO).
+# NO speculative decoding here, and it is not a tuning choice — it does not run
+# on this stack. Setting engine_kwargs.vllm.speculative_config swaps the vLLM V0
+# worker for spec_decode.SpecDecodeWorker (wrapping NGramWorker), which does not
+# implement sleep(); vllm_rollout_spmd builds the engine with
+# enable_sleep_mode=True and calls sleep(level=1) immediately (:210), so the run
+# dies in init_workers with "Method 'sleep' is not implemented" before step 1.
+# The whole wake/sleep cycle that free_cache_engine=False and
+# ROLLOUT_KEEP_VLLM_AWAKE depend on needs that method, so this is structural,
+# not a missing argument. The idea itself is sound for the decode tail
+# (rejection sampling preserves the sampling distribution exactly, and this arm
+# recomputes the teacher KL on the sampled tokens, so vLLM numerics cannot enter
+# the loss) — it needs the V1 engine, where spec decode lives in v1/spec_decode
+# and sleep is supported. VLLM_USE_V1=1 changes the engine for every phase, so
+# that is its own experiment on every arm at once, not a knob to flip here.
 #
 # Actor-update mechanisms (config, not env vars). These target the PCIe
 # collectives: tamago's two GPUs have no NVLink, so every FSDP all-gather and
@@ -195,10 +193,6 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min=2 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature=0.4 \
