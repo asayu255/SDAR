@@ -227,7 +227,7 @@ python3 -m verl.trainer.main_sdar \
     +algorithm.sdar.kl_loss_coef_by_task='{alfworld:0.01,search:0.001,webshop:0.01}' \
     +algorithm.sdar.skill_all=$skill_all \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=$group_size \
