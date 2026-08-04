@@ -103,16 +103,30 @@ fi
 # records cudagraph_capture_sizes as V1-only for the same reason -- so that is
 # its own experiment across all arms, not a knob to flip here.
 #
-# Reference policy placement (ref.fsdp_config below): §11 measured the ref phase
-# at 190 s with the highest PCIe traffic of any phase (2212/2742 MB/s) -- the
-# offloaded parameters pulled back from host for every micro-batch. This is
-# lever #2 of §11's ranking (~110 s): param_offload=False keeps the shards
-# resident. sharding_strategy=shard_grad_op removes what offloading's removal
-# leaves behind -- FULL_SHARD still re-all-gathers the shards across GPUs per
-# micro-batch; ZeRO-2 does not reshard after forward and the ref has no
-# backward, so it gathers once per phase and stays whole. Bit-identical either
-# way (placement only). Cost: the gathered ref (~3.4 GB/GPU) on top of the
-# shards; §11 reserved 66.7 GB of 80, so it fits. Watch max_memory_reserved.
+# Reference policy placement (ref.fsdp_config below) stays OFFLOADED, and §11's
+# lever #2 has now been tried and reverted -- there is no GPU memory for it on
+# this host. Setting param_offload=False plus sharding_strategy=shard_grad_op
+# (resident shards ~1.1 GB/GPU, plus a gathered copy ~3.2 GB/GPU that ZeRO-2
+# does not reshard away) survived steps 1-2 and then OOMed in step 3's teacher
+# forward: 13.10 GiB wanted for the lm_head logits against 8.17 GiB free on a
+# 47.53 GiB card -- short by 4.93 GiB, which is what the two knobs had taken.
+#
+# Two things that measurement established, both worth keeping in mind before
+# retrying:
+#   - THE GPUS ARE NOT THE SAME SIZE. perf/max_memory_allocated_gb reported
+#     50.7 GiB while the card that OOMed has 47.53 GiB total, and
+#     max_memory_allocated can never exceed its device -- so rank 0 (the only
+#     rank that reports) sits on a BIGGER GPU than the one that runs out. The
+#     peak-memory metric has been describing the roomiest card, not the binding
+#     one. §11's "66.7 GB reserved of 80" is that same rank, not this limit.
+#   - THE BINDING ALLOCATION IS THE TEACHER LOGITS, not the ref. 13.10 GiB is
+#     16 rows x ~2.9k tokens x 151936 vocab in bf16, i.e.
+#     log_prob_micro_batch_size_per_gpu x (skill-augmented prompt length) x
+#     vocab, materialized whole by lm_head. Teacher prompts are the long ones
+#     (§11: mean 1719 tokens, webshop 2646, skill overhead ~1107). Even fully
+#     reverted the headroom is ~12.8 GiB against a 13.10 GiB request, so lever
+#     #2 needs LOG_PROB_MICRO_PER_GPU=8 (halves the logits tensor) to have room
+#     -- retry them together, not lever #2 alone.
 
 # --- Fair-comparison alignment with the single-task baselines -----------------
 # This is a joint multitask run (one shared model/optimizer over alfworld+search+
@@ -211,8 +225,7 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
-    actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

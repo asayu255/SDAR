@@ -375,17 +375,18 @@ largest phase — at which point re-sharding active rows per turn, and overlappi
 env stepping with generation, are the mechanisms that matter. Async rollout
 (§8) remains the structural answer to the long tail.
 
-## 12. Implemented from §11's ranking, plus one port (unmeasured), and one that could not start
+## 12. Three attempted after §11: one landed and measured, two reverted
 
-Three changes were attempted after §11's profile, on request; two landed. Per
-this report's own rule, no effect sizes here — they have not been measured on
-this arm. What follows is what changed, its accuracy class, and what to watch.
+| change | outcome |
+|---|---|
+| per-turn queueing for the old_log_prob prefetch (`rollout_loop.py`) | **landed and measured — reuse 23% → 46.5%**, now chunk-limited |
+| ref resident + ZeRO-2 (lever 2, extended) | **reverted — OOMed in step 3** |
+| ngram speculative decoding | **reverted — cannot start on this stack** |
 
-| change | where | accuracy class |
-|---|---|---|
-| ref resident + ZeRO-2 (lever 2, extended) | `ref.fsdp_config.param_offload=False` + `sharding_strategy=shard_grad_op` (run script; new yaml knob shared with the actor's) | bit-identical (placement only) |
-| per-turn queueing for the old_log_prob prefetch | `rollout_loop.py` (`_queue_row_for_prefetch` at record time) | same as mechanism A (expectation-identical, micro-batch composition only) |
-| ~~ngram speculative decoding~~ | **withdrawn — does not start on this stack** (see 3 below) | — |
+Accuracy classes were never at issue: the one that landed is mechanism A's own
+class (expectation-identical, micro-batch composition only), and both
+reversions are for reasons that have nothing to do with the numbers a run
+produces. What follows is what each measurement actually showed.
 
 Rationale, against §11's numbers:
 
@@ -399,15 +400,25 @@ Rationale, against §11's numbers:
    what FULL_SHARD leaves behind at ~4.3 GB/s sustained on its teachers before
    making the same change. Cost: the gathered ref (~3.4 GB/GPU) on top of its shards,
    against §11's 66.7 GB reserved of 80. Watch `max_memory_reserved`.
-2. **Per-turn queueing.** §11's `old_log_prob` line already shows the prefetch
-   working (reused 1608/6960 = 23 %) — capped because rows only queued when
-   their whole trajectory finished, which keeps alfworld's rows (the tail that
-   dominates the batch) out of the pool until turns 23-49. A turn's row is
-   final the moment it is recorded, so it now queues that turn. The cap moves
-   to `ROLLOUT_PREFETCH_LOGPROB_CHUNK × turns`; with the default chunk of 64
-   and ~50 turns that is ~3,200 of ~7,000 rows, so raising the chunk is the
-   next knob if `old_log_prob` is still the constraint. Requires
-   `ROLLOUT_PREFETCH_LOGPROB=1` as before (default off, unchanged).
+2. **Per-turn queueing — landed, and measured at 46.5 %.** §11's `old_log_prob`
+   line showed the prefetch reusing 1608/6960 = 23 %, capped because rows only
+   queued once their whole trajectory finished, which keeps alfworld's rows (the
+   tail that dominates the batch) out of the pool until turns 23-49. A turn's
+   row is final the moment it is recorded, so it now queues that turn. Measured
+   on the next run:
+
+   ```
+   [prefetch-logprob] reused 3237/6960 rows from rollout prefetch   (46.5%)
+   ```
+
+   **Exactly double, and the new cap is visible in the number.** One chunk is
+   issued per turn, so the ceiling is `ROLLOUT_PREFETCH_LOGPROB_CHUNK × turns` =
+   64 × ~50 = 3,200 — and 3,237 is that ceiling. The queue is no longer the
+   limiter; the chunk is. **`ROLLOUT_PREFETCH_LOGPROB_CHUNK=128` should roughly
+   double it again** (6,400 ceiling against ~7,000 rows), bounded then by
+   whether a bigger chunk still fits inside one `env.step` window — watch
+   `timing_s/old_log_prob` and the turn table's envstep column together.
+   Requires `ROLLOUT_PREFETCH_LOGPROB=1` as before (default off, unchanged).
 3. **Spec decode.** §11 puts `gen` at 72.4 % SM with the tail half-empty from
    turn 23 on — exactly the bandwidth-bound decode a draft-and-verify scheme
    amortizes. Rejection sampling preserves the sampling distribution exactly;
