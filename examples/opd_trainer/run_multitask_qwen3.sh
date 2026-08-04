@@ -46,8 +46,26 @@ set -x
 #   offload fix). ZeRO-2 does not reshard after forward, and the teachers have
 #   no backward, so each teacher is gathered once and then stays whole; the
 #   per-micro-batch collective disappears. Placement only, bit-identical logits.
-#   Costs up to 3 * 3.4GB gathered per GPU on top of the shards; watch
-#   perf/max_memory_allocated_gb (93.9GB before this) after enabling.
+#   Costs up to 3 * 3.4GB gathered per GPU on top of the shards; measured at
+#   +8.2GB (89.3 -> 97.5 max_memory_allocated) on the 2-GPU run.
+#
+#   ref.log_prob_micro_batch_size_per_gpu is 8, not 16, and that is a MEMORY
+#   bound rather than a throughput choice. compute_ref_topk_log_prob runs the
+#   teacher through lm_head, which materializes the full vocab: at 16 rows of
+#   webshop-length prompts that is 16 * ~2.3k tokens * 151936 * bf16 =
+#   10.47 GiB in one allocation, and step 136 OOMed on exactly that with
+#   9.50 GiB free. 8 halves it to ~5.2 GiB. The ref micro batch does NOT enter
+#   adjust_batch's lcm here (batch_size_divisor only includes it when
+#   use_kl_in_reward or actor.use_kl_loss is set, and this arm has neither), so
+#   changing it moves no padding and no data -- per-row log probs are
+#   independent under rmpad. Drop to 4 if a longer-prompt task is added.
+#
+#   Why that allocation is tighter than it used to be: ROLLOUT_PREFETCH_TEACHER
+#   moves the teacher forward INTO the rollout, where vLLM is awake and holding
+#   its KV cache, instead of after it where the engine has been slept. Per-turn
+#   queueing then took the share that runs in that tighter regime from about
+#   half to essentially all (hit_rate 0.53 -> 0.99). Same work, less headroom --
+#   so the micro batch has to be sized for the awake-engine case.
 #
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
@@ -201,7 +219,7 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \

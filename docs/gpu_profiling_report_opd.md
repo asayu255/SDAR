@@ -886,7 +886,58 @@ teacher の分（上の 2 の見積り 3.4 GB/体 と整合）。`gen` フェー
 変わらない**（5 節⑤）。30 step 以上で `perf/throughput` を取り直すこと。
 残り 174 step に外挿すれば約 1.4 時間。
 
-### 9.2 まだ残っている枠
+### 9.2 step 136 で OOM した。機構が teacher forward の「実行環境」を変えていた
+
+9.1 の直後、**step 136 の teacher prefetch チャンクで GPU OOM**:
+
+```
+teacher_webshop_compute_ref_topk_log_prob -> lm_head
+torch.OutOfMemoryError: Tried to allocate 10.47 GiB.
+GPU 0 has a total capacity of 94.97 GiB of which 9.50 GiB is free.
+（PyTorch reserved 84.26 GiB / allocated 74.67 GiB）
+```
+
+**10.47 GiB の正体は teacher のロジット**である。`compute_ref_topk_log_prob` は
+`lm_head` を通すので語彙全体が実体化し、
+`ref.log_prob_micro_batch_size_per_gpu=16` × webshop 級のプロンプト長 ≈ 2.3k トークン
+× 151,936 × bf16 = 10.47 GiB がひとつのアロケーションになる。webshop の teacher で
+落ちているのは、**チャンクがタスク別にまとまる**（`_teacher_prefetch_chunk`）ため、
+最長プロンプトのタスクだけで埋まったチャンクが最悪ケースを作るから。
+step 135 は webshop の行シェアが 0.271（step 126 は 0.194）と高かった。
+
+**なぜ以前は落ちなかったのか ―― ここが今回の設計上の見落とし。**
+
+`ROLLOUT_PREFETCH_TEACHER` は teacher forward を **rollout の中**へ移す機構である。
+rollout 中は **vLLM が起きていて KV キャッシュを掴んでいる**（`gpu_memory_utilization=0.6`、
+`ROLLOUT_KEEP_VLLM_AWAKE=1`）。post-rollout の `teacher_forward` フェーズは、
+セッションが閉じてエンジンが sleep した後に走るので、**空きメモリの前提がまるで違う**。
+
+- ターン単位化の前: hit_rate 0.28〜0.53 ―― teacher 仕事の**半分近くは post-rollout**、
+  つまり広い方の環境で走っていた。
+- ターン単位化の後: hit_rate 0.991 ―― **ほぼ全部が狭い方**で走る。
+
+**仕事の総量は変えていない。走る場所を変えた。** 9.1 で測った −29.8 s はその移動の
+利得だが、同じ移動が「vLLM が起きている間に 10 GiB のアロケーションを要求する」
+という代償を持っていた。**「どこに仕事を入れられるか」は 2.4 節で配置の問題として
+扱ったが、「入れた先にメモリがあるか」は見ていなかった。** 5 節①と同じ形の誤りである。
+
+**対処:** `ref.log_prob_micro_batch_size_per_gpu` を 16 → **8**（run script）。
+ピークが約 5.2 GiB に半減し、空き 9.50 GiB に対して余裕ができる。
+このアームは `use_kl_in_reward` も `actor.use_kl_loss` も false なので、
+`batch_size_divisor` は ref の micro を lcm に入れない（`utils.py:168`）＝
+**adjust_batch のパディングもデータも動かない**。rmpad 下の log-prob は行ごとに
+独立なので値も実質同一。より長いプロンプトのタスクを足すなら 4 まで下げる。
+
+**ZeRO-2 teacher は残した。** 9.1 で pcieRX 768 → 208 の効果が出ており、
+外せば +8.2 GiB 戻せるので、micro 8 でまだ落ちるならこちらが次の緩衝材になる。
+
+**メモリ指標は当てにならない。** `perf/max_memory_allocated_gb` は 99.549 を報告して
+いるが、落ちた GPU の全容量は 94.97 GiB で、`max_memory_allocated()` が自分の
+デバイス容量を超えることはない。**この指標は単一デバイスの値として読んではいけない**
+（sdar arm でも同じ矛盾が出ており、あちらは GPU のサイズ自体が揃っていない）。
+メモリの判断は **OOM メッセージの数字**か、`nvidia-smi` で直接見ること。
+
+### 9.3 まだ残っている枠
 
 - **GPU-idle な glue が 46.9 s 残っている**が、hit_rate 0.991 なので teacher 仕事は
   もう無い。埋めるには別種の仕事が要る ―― pure OPD の薄いループには old_log_prob
