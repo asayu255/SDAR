@@ -17,10 +17,28 @@ set -x
 # Loss: policy_loss = pg_loss * pg_loss_coef + teacher_kl_loss * kl_loss_coef.
 #   - actor.pg_loss_coef=1.0 keeps the GRPO policy gradient (env-reward
 #     advantages; adv_estimator=grpo required); set 0 to recover pure OPD.
+#   - algorithm.opd.kl_loss_coef=0.01 makes the GRPO policy gradient the primary
+#     objective and the distillation a regulariser beside it, rather than two
+#     full-strength objectives summed. 0.01 is where a KL regulariser sits next
+#     to this policy gradient elsewhere in this repo: the GRPO baseline arm
+#     (examples/sdar_trainer) runs its reference KL at kl_loss_coef=0.001 with
+#     per-task {alfworld:0.01, search:0.001, webshop:0.01}.
+#     It is a STARTING value, not a measured one -- topk_kl is a dense reverse KL
+#     over k=20 and is a much larger quantity than the single-token low_var_kl
+#     those numbers were chosen for, so equal coefficients do not mean equal
+#     influence. Both terms are logged already weighted and per task
+#     (actor/pg_loss_weighted, actor/teacher_kl_loss_weighted), so read their
+#     ratio at step 1 and retune HERE and in the expectations file together.
 #   - algorithm.opd.kl_loss_type: low_var_kl (single-token estimator) or
 #     topk_kl (dense top-k+tail reverse KL; support size algorithm.opd.topk).
 #   - use_kl_loss=False / entropy_coeff=0 keep the other terms off;
 #     use_teacher_kl_loss is force-injected in main_opd_grpo.py.
+#     NOTE this is where the arm departs from the GRPO baseline by more than a
+#     coefficient: that arm runs entropy_coeff=0.001 (the yaml default, which it
+#     never overrides) AND a reference-KL term. Both are off here. So this arm is
+#     a clean "pure OPD + policy gradient" -- its only difference from the OPD arm
+#     is pg_loss_coef -- but it is NOT a clean "GRPO + distillation". Read the
+#     comparison against the OPD arm; against the GRPO arm three things differ.
 #   - algorithm.opd.normalize_loss_by_task: each task contributes 1/3 of the
 #     loss. Without it the token-mean hands alfworld ~69% and search ~4% of the
 #     gradient, purely because of the 50/15/4-turn episode caps -- a weighting
@@ -233,7 +251,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.teacher_paths.alfworld=$HOME/checkpoints/teachers/alfworld_step300 \
     +algorithm.opd.teacher_paths.search=$HOME/checkpoints/teachers/search_step300 \
     +algorithm.opd.teacher_paths.webshop=$HOME/checkpoints/teachers/webshop_step300 \
-    +algorithm.opd.kl_loss_coef=1.0 \
+    +algorithm.opd.kl_loss_coef=0.01 \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     +algorithm.opd.normalize_loss_by_task=True \

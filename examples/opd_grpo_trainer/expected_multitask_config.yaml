@@ -17,7 +17,20 @@
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
 "algorithm.opd.kl_loss_type": topk_kl
-"algorithm.opd.kl_loss_coef": 1.0
+# The GRPO policy gradient is the primary objective on this arm and the
+# distillation is a regulariser beside it, rather than two full-strength
+# objectives summed: pg_loss_coef stays 1.0 and the teacher KL comes in at 0.01.
+# That is the scale a KL regulariser sits at next to this policy gradient
+# elsewhere in the repo -- the GRPO baseline arm runs its reference KL at 0.001
+# with per-task {alfworld:0.01, search:0.001, webshop:0.01}.
+#
+# A STARTING value, not a measured one. topk_kl is a dense reverse KL over k=20,
+# a far larger quantity than the single-token low_var_kl those numbers were
+# picked for, so equal coefficients do not mean equal influence. It is pinned
+# because it decides what the experiment is, not because it is settled: read
+# actor/pg_loss_weighted against actor/teacher_kl_loss_weighted at step 1 and
+# change this together with the run script if the ratio is not what was wanted.
+"algorithm.opd.kl_loss_coef": 0.01
 "algorithm.opd.topk": 20
 # Per-task normalisation of the loss. The plain token-mean weights a task by its
 # share of response tokens, measured at 69/27/4% for alfworld/webshop/search on
@@ -33,7 +46,7 @@
 # effective values after main_opd_grpo's injection into the actor config
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
 "actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
-"actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
+"actor_rollout_ref.actor.teacher_kl_loss_coef": 0.01
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 "actor_rollout_ref.actor.normalize_loss_by_task": true
 
