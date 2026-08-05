@@ -2,7 +2,11 @@
 
 自分用の作業記録。`docs/gpu_profiling_report.md`（multitask SFT arm）の姉妹編。
 tamago の 2 GPU で Qwen3-1.7B の pure on-policy distillation を回すにあたり、
-step 予算の内訳を計測して 3 つの機構を入れた過程と、その途中で分かったこと。
+step 予算の内訳を計測して 5 つの機構を入れた過程と、その途中で分かったこと。
+
+**結論から:** 単位仕事あたりの速度は **+13.9%**（`perf/throughput` 3,321 → 3,594 → 3,782 tok/s）。
+**`s/step` は 517.2 → 548.3 → 496.3 と単調でないので、これを結果として引用してはいけない**
+―― run ごとに step あたりのトークン量が最大 +43% 違う（3.5 節）。
 
 **SFT arm とはホストが違う。** SFT 側は RTX A6000 48 GB × 3、こちらは tamago の
 2 GPU で、`perf/max_memory_allocated_gb` は 93.9 GB ある。**s/step も util も
@@ -25,7 +29,7 @@ arm 間で横並び比較してはいけない。** 比較すべきは task succ
 | 系列長 | prompt 最大 4096 / response 最大 512（合計 4608） |
 | 損失 | per-task teacher-KL のみ（`topk_kl`, k=20）。`pg_loss_coef=0` / `entropy_coeff=0` / `use_kl_loss=False` を `main_opd` が強制注入 |
 | 1 step の規模 | 6,880〜7,200 行（`adjust_batch` 後） |
-| 実測 | **548.3 s/step**（100 step 累積平均）、`TOTAL (run) sm 74.4` |
+| 実測 | 3 機構時点: **548.3 s/step**（100 step 累積）、`TOTAL sm 74.4` → 5 機構: **496.3 s/step**（150 step 累積）、`TOTAL sm 73.9`。**s/step はトークン量が違うので比較不可**（3.5 節） |
 
 ---
 
@@ -519,13 +523,16 @@ OPD と offline-KD で**同じモジュールを共有**しているので、arm
 
 `perf/throughput`（per-GPU、定義は両 run で同一）で見る:
 
-| | steps | tok/s 平均 | 範囲 |
-|---|---:|---:|---|
-| baseline | 92–96（5 点） | **3,321** | 3,207 〜 3,491 |
-| 変更後 | 100–148（**49 点**） | **3,594** | 3,332 〜 3,942 |
+| 構成 | steps | n | tok/s 平均 | 対 baseline |
+|---|---|---:|---:|---:|
+| baseline（3.0 節） | 92–96 | 5 | **3,321** | — |
+| ＋ 3.1〜3.3 の 3 機構 | 100–148 | **49** | **3,594** | **+8.2%** |
+| ＋ 9 節の 2 機構（ターン単位化 / ZeRO-2 teacher） | 260–299 | **39** | **3,782** | **+13.9%** |
 
-**+8.2%。** 分布で見るとより明確で、**49 step 中 38 step（78%）が baseline の最大値
-3,491 を上回る**。下回った 11 step のうち最低の 3,332 は 13:00 のリトリーバ断の step。
+**累積 +13.9%。** 中間の +8.2% は分布で見るとより明確で、**49 step 中 38 step（78%）が
+baseline の最大値 3,491 を上回る**。下回った 11 step のうち最低の 3,332 は
+13:00 のリトリーバ断の step。最終段の +5.2%（3,594 → 3,782）は
+9.1 節の n=1 制御 A/B が出した +5.2% と一致した（9 節の「限界」を参照）。
 
 wandb のログ行は `perf/throughput` を含まないことがあるが、`global_seqlen/mean` と
 profiler の `TOTAL/step` から復元できる。baseline で検算すると
@@ -547,6 +554,7 @@ profiler の `TOTAL/step` から復元できる。baseline で検算すると
 | `update_actor` の sm | 82.4〜84.9 | 83.2 | 変化なし（手を入れていない） |
 | `TOTAL/step` の sm | 71.3〜73.7 | 74.4 | +1〜3 pt |
 | **throughput** | **3,321 tok/s** | **3,594 tok/s** | **+8.2%（49 step）** |
+| **throughput（9 節の 2 機構まで含む）** | **3,321 tok/s** | **3,782 tok/s** | **+13.9%（39 step）** |
 
 **ピークメモリ −27 GB は当初の見積りに入っていなかった効果。** teacher の常駐化は
 逆に +5.1 GB/GPU 増やすので、差し引き 32 GB 分を稼いだのは 3.2 節の
@@ -557,6 +565,13 @@ response-only 化である。`topk_kl` は `(total_nnz, 151936)` に対して `l
 **`s/step` そのものは 544.5（125 step 累積）で baseline の 517.2 より大きいままだが、
 それはトークン量が増えたからで、単位仕事あたりでは 8.2% 速い。** 速度の議論は
 必ず throughput で行うこと。
+
+**最終構成の `s/step` は 496.3（150 step 累積）で baseline の 517.2 を下回るが、
+これも「速くなった量」として引用してはいけない。** 3 つの run は
+step あたりのトークン量が 3.44 M / 4.89〜5.20 M / 4.7 M 級とばらついており、
+496.3 < 517.2 は改善と減量の合成である。**3 つの数字 517.2 → 548.3 → 496.3 が
+単調でないこと自体が、`s/step` が指標になっていない証拠**として読むこと。
+実際の短縮は throughput の 3,321 → 3,594 → 3,782（**+13.9%**）の方である。
 
 ---
 
@@ -674,7 +689,7 @@ V1 エンジンなら spec decode は `v1/spec_decode` にあり sleep も実装
 
 ---
 
-## 6. 本番での検証（step 1〜149）
+## 6. 本番での検証（step 1〜149、および再開後 125〜300）
 
 3 つの機構は本番で動作を確認済み。
 
@@ -711,15 +726,35 @@ step 94 の時点で既に 217.8 GB に達しており**、そこは問題なく
 
 15:11 にも短い断（`RemoteDisconnected` × 8）があり、全件 2 attempts / 9 s で復旧している。
 
-### 6.2 run の終わり方
+### 6.2 run の終わり方と、再開後の完走
 
-**step 150 の最初の validation でホスト RAM の OOM により停止**（2.8 節）。
+**1 回目の run は step 150 の最初の validation でホスト RAM の OOM により停止**（2.8 節）。
 学習そのものは step 149 まで完全に健全で、上表の指標はすべて安定していた。
-最後の checkpoint は `global_step_125`（`save_freq=25`）。`resume_mode: auto` なので
-同じコマンドで 125 から再開するが、**`trainer.test_freq=-1` を付けないと
-step 150 で同じ崖に落ちる。**
+最後の checkpoint は `global_step_125`（`save_freq=25`）。
 
-この run から得られた性能上の結論（3.5 節の +8.2%、1.3 節の phase 内訳、
+**対処は `trainer.test_freq=-1` を足して 125 から再開する**（`resume_mode: auto`）。
+このノブは intent lock に入っていないので、科学的な条件は動かない
+（`val_batch_size` も `val_per_task_batch_size` もロック側にあり、そのまま）。
+代償は **in-run validation が 1 度も走らないこと**で、評価は保存済み
+checkpoint に対するオフライン実行に回す（8 節）。
+
+**再開した run は `global_step_300` まで完走した。** 150 step 累積:
+
+| 指標 | 値 |
+|---|---|
+| `TOTAL/step` | **496.3 s**（sm 73.9） |
+| `gen` | 38,833.6 s = 52.2%（sm 66.7 / memBW 43.1） |
+| `update_actor` | 34,746.1 s = 46.7%（sm 83.6） |
+| `teacher_forward/alfworld` | **74.0 s = 0.1%**（ターン単位化で `gen` 側へ移動） |
+| `teacher_prefetch/hit_rate` | **0.989〜0.994** で 40 step 安定 |
+| `perf/max_memory_allocated_gb` | **103.060**（+9.2 GB、ZeRO-2 teacher の見積り通り） |
+| teacher spill | 7.1〜9.9% |
+
+`gen` の `memBW%` が約 35 → **43〜46** に上がっているのは、メモリ律速な teacher の
+仕事がそのフェーズの内側へ入ったからで、劣化ではない。**フェーズ境界が動いたときは
+フェーズ単体の数字を前後比較してはいけない**（9.2 節・5 節⑤と同じ形）。
+
+この run から得られた性能上の結論（3.5 節の +13.9%、1.3 節の phase 内訳、
 2.8 節のホスト RAM 制約）はすべて有効で、再取得の必要はない。
 
 ---
@@ -787,6 +822,9 @@ export TASK_BALANCE_INTERLEAVE=1
 
 - **validation の env teardown**（2.8 節）。`test_freq=-1` は回避策であって修正ではない。
   `close()` は実装済みだが episode schedule のステートと衝突する。
+- **保存済み checkpoint のオフライン評価。** `test_freq=-1` で完走させた結果、
+  この run には in-run validation の点が 1 つも無い。`global_step_{150,…,300}` に対して
+  別プロセスで評価を回すこと。**3 arm の比較はこの評価が揃うまで成立しない。**
 - **`GPU_PROFILER_TRACE` の多重 open**（2.7 節）。パスに rank を混ぜれば直る。未修正。
 - **`cudagraph_capture_sizes`**（V1 のみ）が decode テールに効くか。上記 1 の後。
 - **offline-KD arm の `experiment_name` 不一致**。
@@ -882,9 +920,20 @@ teacher の分（上の 2 の見積り 3.4 GB/体 と整合）。`gen` フェー
 **動かなかったもの:** `gen` と `update_actor` は横ばい。どちらも今回の 2 機構の対象では
 ないので正常（`gen` を狙う spec decode は 3 で撤回した）。
 
-**限界:** 各 1 step。仕事量を揃えたので `s/step` を引き算できるが、**n=1 であることは
-変わらない**（5 節⑤）。30 step 以上で `perf/throughput` を取り直すこと。
-残り 174 step に外挿すれば約 1.4 時間。
+**当初の限界と、その後の確認:** 上の比較は各 1 step で、仕事量を揃えたので
+`s/step` を引き算できるが n=1 であることは変わらない ―― と書いて
+「30 step 以上で `perf/throughput` を取り直すこと」を残していた。**取り直した。**
+
+steps 260–299（**n=39**）の `perf/throughput` 平均は **3,782 tok/s** で、
+3 機構のみの構成（steps 100–148、n=49）の 3,594 に対し **+5.2%**。
+**n=1 の制御 A/B が出した +5.2% と一致する。** 39 step 分の
+`teacher_prefetch/hit_rate` も 0.989〜0.994 の帯に収まり、
+`max_memory_allocated_gb 103.060` も ZeRO-2 teacher の +9.2 GB 見積りと整合した。
+この項目は解消済み ―― baseline からの累積は **+13.9%**（3.5 節）。
+
+**なお n=1 A/B が当たったのは、仕事量を突き合わせたからであって
+「1 step で十分だった」からではない。** 5 節⑤で誤ったのは、揃えていない 2 点の
+`s/step` を差として報告した方である。両者を混同しないこと。
 
 ### 9.2 step 136 で OOM した。機構が teacher forward の「実行環境」を変えていた
 
