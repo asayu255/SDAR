@@ -166,7 +166,8 @@ def import_file(original_path: str, explained_path: Path, priority: str | None) 
             skipped += 1
             continue
         annotation_lines = [
-            line for line in group["lines"]
+            line if line.startswith("[EXPLAIN]") else f"[EXPLAIN] {line}"
+            for line in group["lines"]
             if line and line not in source_comment_texts
         ]
         if not annotation_lines:
@@ -190,7 +191,10 @@ def import_file(original_path: str, explained_path: Path, priority: str | None) 
     source_docs = node_docstrings(ast.parse(source_text, filename=original_path))
     explained_docs = node_docstrings(ast.parse(explained_text, filename=str(explained_path)))
     for name, (_, doc) in explained_docs.items():
-        annotation_lines = japanese_doc_lines(doc)
+        annotation_lines = [
+            line if line.startswith("[EXPLAIN]") else f"[EXPLAIN] {line}"
+            for line in japanese_doc_lines(doc)
+        ]
         if not annotation_lines or name not in source_docs:
             continue
         anchor = source_docs[name][0]

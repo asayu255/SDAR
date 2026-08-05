@@ -95,7 +95,7 @@
     "original_path": "agent_system/multi_turn_rollout/rollout_loop.py",
     "review_status": "reviewed",
     "reason": "semantic annotation mapにpriority block解説あり",
-    "annotation_count": 3
+    "annotation_count": 128
   },
   {
     "priority": "B",

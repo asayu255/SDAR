@@ -859,6 +859,7 @@ CURATED = [
 # これらはユーザー提供の詳細解説から注釈mapを再構築しているため、
 # 旧CURATED blockを再適用すると同義コメントが重複する。
 ATTACHMENT_OVERRIDE_PATHS = {
+    "agent_system/multi_turn_rollout/rollout_loop.py",
     "verl/trainer/main_ppo.py",
     "verl/trainer/ppo/core_algos.py",
     "verl/trainer/ppo/ray_trainer.py",

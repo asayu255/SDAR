@@ -46,7 +46,11 @@ def main() -> None:
             continue
 
         target_bytes = target.read_bytes()
-        if b"[EXPLAIN]" in target_bytes:
+        expected = render_path(row, grouped.get(row["original_path"], []))
+        if target_bytes == expected:
+            # mapから正式に生成した注釈は、[EXPLAIN]付きでも通常合格とする。
+            row["source_preservation"] = "passed"
+        elif b"[EXPLAIN]" in target_bytes:
             # Phase 1では旧mirrorを維持したままmapを先に導入する。
             if row["language"] == "notebook":
                 row["source_preservation"] = "passed_legacy_transition"
@@ -67,10 +71,6 @@ def main() -> None:
                 failures.append(row["original_path"])
             checked += 1
             continue
-
-        expected = render_path(row, grouped.get(row["original_path"], []))
-        if target_bytes == expected:
-            row["source_preservation"] = "passed"
         else:
             row["source_preservation"] = "failed"
             failures.append(row["original_path"])
