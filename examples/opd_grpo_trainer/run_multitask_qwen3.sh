@@ -17,28 +17,31 @@ set -x
 # Loss: policy_loss = pg_loss * pg_loss_coef + teacher_kl_loss * kl_loss_coef.
 #   - actor.pg_loss_coef=1.0 keeps the GRPO policy gradient (env-reward
 #     advantages; adv_estimator=grpo required); set 0 to recover pure OPD.
-#   - algorithm.opd.kl_loss_coef=0.01 makes the GRPO policy gradient the primary
-#     objective and the distillation a regulariser beside it, rather than two
-#     full-strength objectives summed. 0.01 is where a KL regulariser sits next
-#     to this policy gradient elsewhere in this repo: the GRPO baseline arm
-#     (examples/sdar_trainer) runs its reference KL at kl_loss_coef=0.001 with
-#     per-task {alfworld:0.01, search:0.001, webshop:0.01}.
-#     It is a STARTING value, not a measured one -- topk_kl is a dense reverse KL
-#     over k=20 and is a much larger quantity than the single-token low_var_kl
-#     those numbers were chosen for, so equal coefficients do not mean equal
-#     influence. Both terms are logged already weighted and per task
-#     (actor/pg_loss_weighted, actor/teacher_kl_loss_weighted), so read their
-#     ratio at step 1 and retune HERE and in the expectations file together.
+#   - algorithm.opd.kl_loss_coef=0.01 matches examples/grpo_opsd_trainer, which is
+#     the same shape of run: a GRPO policy gradient plus an on-policy distillation
+#     term. Every script there sets sdar_coef=0.01 and leaves pg_loss_coef at the
+#     1.0 default, and its distillation-only sibling (examples/opsd_trainer) keeps
+#     sdar_coef=0.01 while setting pg_loss_coef=0 -- i.e. the distillation
+#     coefficient does not change when the policy gradient is switched on; only
+#     pg_loss_coef does. This arm now follows the same rule. It was the one place
+#     the two families disagreed: OPD ran its distillation term at 1.0 in both the
+#     pure and the combined arm, so the combined arm was summing two
+#     full-strength objectives.
+#     Still worth measuring rather than trusting: topk_kl is a dense reverse KL
+#     over k=20, a different quantity from the SDAR loss 0.01 was chosen for. Both
+#     terms are logged already weighted and per task (actor/pg_loss_weighted,
+#     actor/teacher_kl_loss_weighted), so read their ratio at step 1 and retune
+#     HERE and in the expectations file together.
 #   - algorithm.opd.kl_loss_type: low_var_kl (single-token estimator) or
 #     topk_kl (dense top-k+tail reverse KL; support size algorithm.opd.topk).
 #   - use_kl_loss=False / entropy_coeff=0 keep the other terms off;
 #     use_teacher_kl_loss is force-injected in main_opd_grpo.py.
-#     NOTE this is where the arm departs from the GRPO baseline by more than a
-#     coefficient: that arm runs entropy_coeff=0.001 (the yaml default, which it
-#     never overrides) AND a reference-KL term. Both are off here. So this arm is
-#     a clean "pure OPD + policy gradient" -- its only difference from the OPD arm
-#     is pg_loss_coef -- but it is NOT a clean "GRPO + distillation". Read the
-#     comparison against the OPD arm; against the GRPO arm three things differ.
+#     NOT matched to grpo_opsd, deliberately and only here: that arm also runs a
+#     reference-KL term (use_kl_loss=True, kl_loss_coef=0.01) beside its
+#     distillation, whereas main_opd_grpo force-injects use_kl_loss=False. Two KL
+#     terms pulling the student toward two different targets is its own decision,
+#     so this stays as pure OPD has it. Flagged because the coefficient above now
+#     follows grpo_opsd and the KL structure does not.
 #   - algorithm.opd.normalize_loss_by_task: each task contributes 1/3 of the
 #     loss. Without it the token-mean hands alfworld ~69% and search ~4% of the
 #     gradient, purely because of the 50/15/4-turn episode caps -- a weighting

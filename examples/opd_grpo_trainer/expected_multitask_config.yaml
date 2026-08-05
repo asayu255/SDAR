@@ -17,17 +17,21 @@
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 
 "algorithm.opd.kl_loss_type": topk_kl
-# The GRPO policy gradient is the primary objective on this arm and the
-# distillation is a regulariser beside it, rather than two full-strength
-# objectives summed: pg_loss_coef stays 1.0 and the teacher KL comes in at 0.01.
-# That is the scale a KL regulariser sits at next to this policy gradient
-# elsewhere in the repo -- the GRPO baseline arm runs its reference KL at 0.001
-# with per-task {alfworld:0.01, search:0.001, webshop:0.01}.
+# Matches examples/grpo_opsd_trainer, the repo's other "GRPO policy gradient plus
+# an on-policy distillation term" run: every script there sets sdar_coef=0.01 and
+# leaves pg_loss_coef at the 1.0 default, and its distillation-only sibling
+# (examples/opsd_trainer) keeps sdar_coef=0.01 while setting pg_loss_coef=0. So in
+# that family the distillation coefficient is the same whether or not the policy
+# gradient is on, and pg_loss_coef alone distinguishes the arms.
 #
-# A STARTING value, not a measured one. topk_kl is a dense reverse KL over k=20,
-# a far larger quantity than the single-token low_var_kl those numbers were
-# picked for, so equal coefficients do not mean equal influence. It is pinned
-# because it decides what the experiment is, not because it is settled: read
+# OPD was the one family not following that rule: it ran the teacher KL at 1.0 in
+# both the pure and the combined arm, which made the combined arm a sum of two
+# full-strength objectives. 0.01 here restores the parallel -- pure OPD keeps 1.0,
+# this arm regularises with the same 0.01 grpo_opsd uses.
+#
+# Worth measuring rather than trusting: topk_kl is a dense reverse KL over k=20,
+# a different quantity from the SDAR loss 0.01 was picked for. Pinned because it
+# decides what the experiment is, not because it is settled -- read
 # actor/pg_loss_weighted against actor/teacher_kl_loss_weighted at step 1 and
 # change this together with the run script if the ratio is not what was wanted.
 "algorithm.opd.kl_loss_coef": 0.01
