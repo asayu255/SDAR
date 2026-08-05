@@ -354,7 +354,7 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_grpo_multitask' \
     trainer.experiment_name=sdar_multitask_opd_grpo_qwen3_1.7b \
-    trainer.n_gpus_per_node=3 \
+    trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
     trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_multitask \
