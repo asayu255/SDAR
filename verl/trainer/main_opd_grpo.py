@@ -220,6 +220,10 @@ class OPDGRPOTaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        # Re-read from the config rather than carrying a local across:
+        # inject_opd_grpo_config owns reading algorithm.opd, and it has already run
+        # (and asserted this key is present), so this is the same value it saw.
+        teacher_paths = config.algorithm.opd.teacher_paths
         teacher_paths_plain = (
             OmegaConf.to_container(teacher_paths, resolve=True)
             if OmegaConf.is_config(teacher_paths)
