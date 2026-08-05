@@ -1172,6 +1172,15 @@ class RayPPOTrainer:
             return
         self._env_schedules_fast_forwarded = True
 
+        # A val_only run never resets the training envs, so there is no schedule
+        # to replay. It has to be checked BEFORE touching self.envs: the train
+        # envs are a LazyEnvManager, and _leaf_envs' getattr(manager, "managers")
+        # would materialize all 360 of them -- the host RAM this run exists to
+        # not hold. See LazyEnvManager's docstring ("the train envs are likewise
+        # dead weight in a trainer.val_only run").
+        if bool(OmegaConf.select(self.config, "trainer.val_only", default=False)):
+            return
+
         envs = getattr(self, "envs", None)
         if envs is None or getattr(self, "global_steps", 0) <= 0:
             return
