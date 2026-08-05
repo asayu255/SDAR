@@ -222,6 +222,40 @@ def test_rollout_prefetch_pending_pool():
     print("A: rollout pending pool + take OK")
 
 
+def test_queue_row_for_prefetch_routes_by_mechanism():
+    """Rows enter exactly the pending pools whose mechanism is on.
+
+    The loop calls this once per recorded active row (record time, not
+    trajectory end), so the helper is also the single place that fixes the
+    queue-entry key format the trainer matches on: (str(traj_uid), int(step)).
+    """
+    row = {"input_ids": torch.zeros(4, dtype=torch.long)}
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    collector._logprob_prefetch_enabled = False
+    collector._teacher_prefetch_fn = None
+    collector._logprob_pending = []
+    collector._teacher_pending = []
+
+    # Both mechanisms off: recording a row queues nothing.
+    collector._queue_row_for_prefetch("t-0", 0, row)
+    assert not collector._logprob_pending and not collector._teacher_pending
+
+    # Teacher prefetch only (the pure-OPD configuration).
+    collector._teacher_prefetch_fn = lambda chunk: {}
+    collector._queue_row_for_prefetch(np.str_("t-0"), np.int64(3), row)
+    assert not collector._logprob_pending
+    assert collector._teacher_pending == [(("t-0", 3), row)]
+    key = collector._teacher_pending[0][0]
+    assert type(key[0]) is str and type(key[1]) is int  # trainer-side dict keys
+
+    # Both on: one call feeds both pools with the same entry.
+    collector._logprob_prefetch_enabled = True
+    collector._queue_row_for_prefetch("t-1", 0, row)
+    assert collector._logprob_pending == [(("t-1", 0), row)]
+    assert collector._teacher_pending[-1] == (("t-1", 0), row)
+    print("A: per-turn queue routing OK")
+
+
 # --------------------------------------------------------------------------- #
 # C: env reset prefetch consume / mismatch semantics
 # --------------------------------------------------------------------------- #
@@ -323,6 +357,7 @@ if __name__ == "__main__":
     test_prefetch_merge_all_and_none()
     test_prefetch_merge_duplicated_rows()
     test_rollout_prefetch_pending_pool()
+    test_queue_row_for_prefetch_routes_by_mechanism()
     test_env_reset_prefetch()
     test_env_kwargs_equal()
     test_compact_record_equivalence()

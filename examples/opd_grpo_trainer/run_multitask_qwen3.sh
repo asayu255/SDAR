@@ -70,20 +70,30 @@ set -x
 #   e.g.  ROLLOUT_KEEP_VLLM_AWAKE=1 ENV_RESET_PREFETCH=1 bash run_multitask_qwen3.sh
 #   Set any of the default-on ones to 0 to turn it off.
 #
-# ROLLOUT_PREFETCH_TEACHER scores finished trajectories with their task's teacher
-# during the rollout instead of after it. What it fills is the driver's own CPU
+# ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
+# rollout instead of after it. A turn's row is final the moment it is recorded
+# (later turns only append), so rows are queued per turn — not, as previously, at
+# trajectory end, which kept alfworld's rows out of the pool until episode end and
+# capped the hit rate at 0.28-0.46. What the scoring fills is the driver's own CPU
 # time — decode, envs.step, the next turn's tokenization — measured at 18% of the
 # rollout with the GPU at 0. It does NOT fill the alfworld generation tail: the
 # teachers share one WorkerDict per GPU with the rollout (init_workers ->
 # create_colocated_worker_cls) and a Ray actor runs one call at a time, so a
 # teacher call issued during generate_sequences would only queue behind it.
-# Bound accordingly — the whole teacher phase cannot disappear, only the part
-# that fits in the glue. ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128 rows) sets
-# how much is attempted per turn; the turn table's tchWait column shows what did
-# not fit. Frozen teachers, so the targets do not depend on when a row is scored,
-# but a row lands in a different micro-batch than the post-rollout path would put
-# it in, which moves the last bits of a packed GEMM — same class as
-# no_sync_grad_accum, not bit-identical.
+# Frozen teachers, so the targets do not depend on when a row is scored, but a row
+# lands in a different micro-batch than the post-rollout path would put it in,
+# which moves the last bits of a packed GEMM — same class as no_sync_grad_accum,
+# not bit-identical.
+#
+#   DO NOT LOWER ROLLOUT_PREFETCH_TEACHER_CHUNK (default 128). One chunk is
+#   issued per turn, so the rows that can be prefetched are capped at
+#   CHUNK * turns <= CHUNK * 50 against a step of 6,880-7,200 rows: 128 tops out
+#   near 0.91 hit rate, 32 near 0.23 — BELOW the 0.28-0.46 that trajectory-end
+#   queueing already reached. A small chunk was right while the queue was starved
+#   and is wrong now that per-turn queueing fills it from turn 1; the chunk is the
+#   only thing rate-limiting this. Lower it only if tchWait measurably worsens the
+#   step, and judge that on teacher_forward s/step plus wall clock, not on tchWait
+#   alone — tchWait is teacher work the trainer no longer has to do, not waste.
 #
 #   PICK ONE of ROLLOUT_PREFETCH_TEACHER / ROLLOUT_PREFETCH_LOGPROB on this
 #   recipe. Unlike pure OPD (which has no old_log_prob phase at all), OPD+GRPO

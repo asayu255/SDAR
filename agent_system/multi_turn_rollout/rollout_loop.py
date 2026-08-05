@@ -73,17 +73,18 @@ _ROLLOUT_DECODE_ACTIVE_ONLY = os.environ.get("ROLLOUT_DECODE_ACTIVE_ONLY", "1").
 # Default ON; set ROLLOUT_COMPACT_RECORD=0 for A/B.
 _ROLLOUT_COMPACT_RECORD = os.environ.get("ROLLOUT_COMPACT_RECORD", "1").strip().lower() in ("1", "true", "yes", "on")
 
-# Prefetch old_log_prob for trajectories that already finished, overlapped with
-# env.step: each turn, envs.step() (CPU/HTTP/IPC — GPU idle) runs in a background
-# thread while the driver issues actor_rollout_wg.compute_log_prob() on a bounded
-# chunk of finished-trajectory rows. The actor weights are frozen for the whole
-# rollout and are exactly the weights the trainer's old_log_prob phase would use
-# after it, so the prefetched values are computed by the same function on the
-# same weights and the same rows — only earlier. Accuracy class: same standard as
-# vLLM batch-composition changes (the micro-batch grouping differs from the
-# monolithic phase; per-row results are computed independently under rmpad).
-# Rows not prefetched by rollout end are computed by the trainer as usual.
-# Opt-in; OFF reproduces the current serial behavior exactly.
+# Prefetch old_log_prob for rows as they are recorded, overlapped with env.step:
+# each turn, envs.step() (CPU/HTTP/IPC — GPU idle) runs in a background thread
+# while the driver issues actor_rollout_wg.compute_log_prob() on a bounded chunk
+# of already-recorded rows. A turn's row is final the moment it is appended to
+# total_batch_list (later turns only append), and the actor weights are frozen
+# for the whole rollout and are exactly the weights the trainer's old_log_prob
+# phase would use after it, so the prefetched values are computed by the same
+# function on the same weights and the same rows — only earlier. Accuracy class:
+# same standard as vLLM batch-composition changes (the micro-batch grouping
+# differs from the monolithic phase; per-row results are computed independently
+# under rmpad). Rows not prefetched by rollout end are computed by the trainer
+# as usual. Opt-in; OFF reproduces the current serial behavior exactly.
 _ROLLOUT_PREFETCH_LOGPROB = os.environ.get("ROLLOUT_PREFETCH_LOGPROB", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Rows per prefetch call. Sized so one compute_log_prob chunk roughly fits inside
@@ -92,11 +93,15 @@ _ROLLOUT_PREFETCH_LOGPROB = os.environ.get("ROLLOUT_PREFETCH_LOGPROB", "0").stri
 # is still subtracted from the old_log_prob phase, but the overlap is lost.
 _ROLLOUT_PREFETCH_LOGPROB_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_LOGPROB_CHUNK", "64"))
 
-# Prefetch the per-task TEACHER forward for trajectories that already finished,
-# overlapped with the rollout's CPU glue. The teacher is frozen for the whole run,
-# so a finished trajectory's distillation targets can be computed the moment its
-# last turn is recorded instead of after the rollout; the trainer then only scores
-# what is left (see OPDRayTrainer.compute_teacher_log_probs).
+# Prefetch the per-task TEACHER forward for rows as they are recorded, overlapped
+# with the rollout's CPU glue. The teacher is frozen for the whole run and a
+# turn's row is final the moment it is recorded (later turns only append), so a
+# row's distillation targets can be computed that turn instead of after the
+# rollout; the trainer then only scores what is left (see
+# OPDRayTrainer.compute_teacher_log_probs). Queueing used to wait for the whole
+# trajectory to finish, which kept alfworld's rows -- the bulk of the batch --
+# out of the pool until episode end and capped the hit rate at 0.28-0.46; queued
+# per turn, nearly everything but the final turns is scoreable in the glue.
 #
 # The window this fills is the driver's own CPU time -- decode, envs.step, and the
 # next turn's tokenization -- NOT the generation tail. The teachers are colocated
@@ -666,6 +671,24 @@ class TrajectoryCollector:
         self._prefetched_log_probs = {}
         return prefetched
 
+    def _queue_row_for_prefetch(self, traj_uid, step_idx, row):
+        """Queue one recorded turn row for prefetched scoring.
+
+        Called at record time (see the loop): the row's tensors never change
+        after this point and the scoring weights are frozen, so scoring order
+        cannot affect the values -- only which micro-batch a row is packed into,
+        the accuracy class both prefetch paths already document. Each row is
+        queued exactly once, by construction (one call per append). No-op when
+        neither prefetch mechanism is on.
+        """
+        if not self._logprob_prefetch_enabled and self._teacher_prefetch_fn is None:
+            return
+        entry = ((str(traj_uid), int(step_idx)), row)
+        if self._logprob_prefetch_enabled:
+            self._logprob_pending.append(entry)
+        if self._teacher_prefetch_fn is not None:
+            self._teacher_pending.append(entry)
+
     def _launch_teacher_prefetch(self):
         """Start one chunk of teacher scoring in the background, if any is queued.
 
@@ -938,22 +961,23 @@ class TrajectoryCollector:
                     continue
                 total_batch_list[i].append(batch_list[i])
                 total_infos[i].append(infos[i])
+                if active_masks[i]:
+                    # A row is final the moment it is recorded: later turns only
+                    # append to total_batch_list[i], never rewrite earlier rows,
+                    # and both scoring models are frozen for the whole rollout
+                    # (the teacher for the whole run). Queue it now instead of at
+                    # trajectory end, so the ~45 glue windows can start draining
+                    # alfworld's rows from turn 1 rather than after turn 50.
+                    # step_idx matches the trainer's enumerate over this list:
+                    # with COMPACT_RECORD on, active rows form a prefix; with it
+                    # off, inactive rows are appended too and both sides count
+                    # them the same way.
+                    self._queue_row_for_prefetch(
+                        traj_uid[i], len(total_batch_list[i]) - 1, batch_list[i]
+                    )
 
             # Update done states
-            newly_done = np.logical_and(active_masks, dones)
             is_done = np.logical_or(is_done, dones)
-
-            if self._logprob_prefetch_enabled or self._teacher_prefetch_fn is not None:
-                # Trajectories that finished this turn now have all their rows
-                # final; queue them for prefetched scoring on later turns.
-                for i in np.nonzero(newly_done)[0]:
-                    for step_idx, row in enumerate(total_batch_list[i]):
-                        if row['active_masks']:
-                            entry = ((str(traj_uid[i]), step_idx), row)
-                            if self._logprob_prefetch_enabled:
-                                self._logprob_pending.append(entry)
-                            if self._teacher_prefetch_fn is not None:
-                                self._teacher_pending.append(entry)
 
             # Update observations for next step
             obs = next_obs
