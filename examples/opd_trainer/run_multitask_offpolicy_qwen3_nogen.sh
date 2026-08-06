@@ -37,6 +37,18 @@ set -x
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
 #   neither stage has an old_log_prob phase or a per-step train rollout.
 #
+
+# ref.fsdp_config.* IS INERT ON THIS ARM, in both stages, and the value below is
+# only there because the config schema carries it. Stage 1 loads the teacher as
+# the ACTOR_ROLLOUT model (main_opd_offpolicy_gen sets
+# actor_rollout_ref.model.path = gen.teacher_path) and registers only
+# Role.ActorRollout / Role.Critic; Stage 2 says so in main_opd_offpolicy directly
+# -- "off-policy OPD registers neither Role.RefPolicy nor teacher workers; the
+# teacher top-k signal is precomputed in the Stage-1 dataset". So the ref
+# placement knobs that pay off on the on-policy arms (param_offload=False,
+# sharding_strategy=shard_grad_op, a smaller ref micro batch) have no forward to
+# act on here. Do not port them expecting a speedup.
+#
 # ONE RETRIEVER, SHARED. env.search.search_url can point at the same server as
 # another concurrent run. What makes that safe is not the URL but the retry policy
 # beside it: env.search.max_retries=null waits for a timeout / refused connection /
