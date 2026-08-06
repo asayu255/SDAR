@@ -49,6 +49,15 @@ param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
 ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-5}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
+# The TEACHER/ref forward, not the rollout's, is what binds GPU memory here: its
+# lm_head materializes ref_log_prob_micro x (skill-augmented prompt length) x
+# 151936 in bf16, and 16 rows of that is the 13.10 GiB that OOMed step 3 when the
+# ref was made resident. 8 halves it. Kept SEPARATE from log_prob_micro_per_gpu on
+# purpose: adjust_batch's divisor is lcm(ref*W, rollout*W, ppo_micro*W), which at
+# W=3 is lcm(48,48,15)=240 today and lcm(24,48,15)=240 with only the ref lowered --
+# so this moves no padding and no data. Lowering BOTH (the header's earlier advice)
+# would take it to 120 and change what the step trains on.
+ref_log_prob_micro_per_gpu=${REF_LOG_PROB_MICRO_PER_GPU:-8}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-True}
@@ -71,9 +80,12 @@ if [ -n "$cudagraph_capture_sizes" ]; then
 fi
 # -----------------------------------------------------------------------------
 
-# --- Rollout/trainer overlap mechanisms (opt-in, env-var driven; live in code) --
-# These pair with ROLLOUT_KEEP_VLLM_AWAKE / ROLLOUT_SKIP_DONE_PREPROC /
-# TASK_BALANCE_INTERLEAVE from the earlier speedup work:
+# --- Rollout/trainer overlap mechanisms (env-var driven; live in code) ---------
+# ROLLOUT_KEEP_VLLM_AWAKE / TASK_BALANCE_INTERLEAVE / ENV_RESET_PREFETCH /
+# ROLLOUT_PREFETCH_LOGPROB are exported below rather than left to the operator:
+# forgetting one is silent, since the config-side mechanisms keep working and only
+# the rollout ones go quiet. Pass 0 to disable any of them.
+# ROLLOUT_SKIP_DONE_PREPROC / DECODE_ACTIVE_ONLY / COMPACT_RECORD default to on:
 #   ROLLOUT_PREFETCH_LOGPROB=1        A: prefetch old_log_prob for recorded rows
 #                                        while env.step runs (rows queue per turn
 #                                        as they are recorded, not at trajectory
@@ -103,13 +115,17 @@ fi
 # records cudagraph_capture_sizes as V1-only for the same reason -- so that is
 # its own experiment across all arms, not a knob to flip here.
 #
-# Reference policy placement (ref.fsdp_config below) stays OFFLOADED, and §11's
-# lever #2 has now been tried and reverted -- there is no GPU memory for it on
-# this host. Setting param_offload=False plus sharding_strategy=shard_grad_op
-# (resident shards ~1.1 GB/GPU, plus a gathered copy ~3.2 GB/GPU that ZeRO-2
-# does not reshard away) survived steps 1-2 and then OOMed in step 3's teacher
-# forward: 13.10 GiB wanted for the lm_head logits against 8.17 GiB free on a
-# 47.53 GiB card -- short by 4.93 GiB, which is what the two knobs had taken.
+# Reference policy placement (ref.fsdp_config below) is RESIDENT + ZeRO-2, on the
+# second attempt. The first one -- param_offload=False plus
+# sharding_strategy=shard_grad_op, resident shards ~1.1 GB/GPU plus a gathered
+# copy ~3.2 GB/GPU that ZeRO-2 does not reshard away -- survived steps 1-2 and
+# then OOMed in step 3's teacher forward: 13.10 GiB wanted for the lm_head logits
+# against 8.17 GiB free on a 47.53 GiB card, short by 4.93 GiB, which is what the
+# two knobs had taken. It is back together with the prerequisite the revert
+# identified: ref_log_prob_micro_per_gpu=8 halves that 13.10 GiB request to ~6.6,
+# which covers the 4.93 GiB the placement knobs cost with room over. Retrying the
+# placement alone is what does not work; retrying it with the micro batch is what
+# the revert commit said to do.
 #
 # Two things that measurement established, both worth keeping in mind before
 # retrying:
@@ -125,8 +141,11 @@ fi
 #     vocab, materialized whole by lm_head. Teacher prompts are the long ones
 #     (§11: mean 1719 tokens, webshop 2646, skill overhead ~1107). Even fully
 #     reverted the headroom is ~12.8 GiB against a 13.10 GiB request, so lever
-#     #2 needs LOG_PROB_MICRO_PER_GPU=8 (halves the logits tensor) to have room
-#     -- retry them together, not lever #2 alone.
+#     #2 needs the ref micro batch halved to have room -- retry them together,
+#     not lever #2 alone. That is what ref_log_prob_micro_per_gpu=8 above is; it
+#     is deliberately a SEPARATE knob from log_prob_micro_per_gpu, because
+#     lowering both would change adjust_batch's lcm from 240 to 120 and with it
+#     the padding rows the step trains on.
 
 # --- Fair-comparison alignment with the single-task baselines -----------------
 # This is a joint multitask run (one shared model/optimizer over alfworld+search+
@@ -152,7 +171,15 @@ experiment_name="sdar_multitask_qwen3_1.7b_instruct_coef${sdar_coef}_beta${gate_
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
-export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
+# On by default, for the same reason the FSDP knobs are yaml defaults: a 300-step
+# run gets restarted, and a mechanism that has to be exported by hand is one that
+# will eventually be missing from a restart. All four are accuracy-preserving (see
+# the mechanism block above); each still honours an explicit 0 from the caller.
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
+export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
+export ROLLOUT_PREFETCH_LOGPROB=${ROLLOUT_PREFETCH_LOGPROB:-1}
+export HIGHLIGHT_CONFIGS'<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
 
@@ -224,8 +251,9 @@ python3 -m verl.trainer.main_sdar \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_per_gpu \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$ref_log_prob_micro_per_gpu \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
