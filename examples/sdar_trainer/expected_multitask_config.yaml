@@ -145,13 +145,20 @@
 # retrieved document and becomes the <information> block the model is trained on,
 # with nothing in the metrics to say so.
 #
-# These are the current values (a bounded budget of 10). If this run ever shares
-# one retriever with another concurrent run, set max_retries to null — under a
-# shared retriever an exhausted budget is exactly what a load spike looks like.
-# 4xx and malformed JSON still fail at once either way, since waiting cannot turn
-# those into a document. See agent_system/.../skyrl_gym/tools/search.py.
+# max_retries is null: the client waits for a timeout / refused connection / 5xx
+# to clear instead of giving up. One retriever is shared between concurrent runs
+# here, and under a shared retriever an exhausted budget is exactly what a load
+# spike looks like -- so the bounded budget of 10 this used to carry made the
+# data a function of the other runs' load. 4xx and malformed JSON still fail at
+# once, since waiting cannot turn those into a document. A still-retrying request
+# logs every ~60s, so an intentional wait is not mistaken for a hang. See
+# agent_system/.../skyrl_gym/tools/search.py.
+#
+# timeout stays finite beside it: a peer that goes away without a FIN would
+# otherwise leave the socket waiting for the OS default, and a finite timeout
+# turns that into a connection error the retry loop handles.
 "env.search.timeout": 60
-"env.search.max_retries": 10
+"env.search.max_retries": null
 
 # ---- rollout sampling / validation protocol -----------------------------------
 "actor_rollout_ref.rollout.temperature": 1.0

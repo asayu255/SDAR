@@ -272,6 +272,7 @@ python3 -m verl.trainer.main_sdar \
     env.history_length=4 \
     env.rollout.n=$group_size \
     env.search.search_url='http://0.0.0.0:8000/retrieve' \
+    env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \
