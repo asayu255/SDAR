@@ -36,13 +36,13 @@
 
 | 機構 | 有効化 | Phase | 精度 |
 |---|---|---|---|
-| ① vLLM セッション | `ROLLOUT_KEEP_VLLM_AWAKE=1`（**要 export**） | 1 | ビット同一 |
+| ① vLLM セッション | `ROLLOUT_KEEP_VLLM_AWAKE=1`（script が export） | 1 | ビット同一 |
 | ② active-only preprocess | 既定 on | 1 | ビット同一 |
 | ③ prefix caching | `+rollout.enable_prefix_caching=True`（script 内） | 1 | ロスレス |
-| ④ タスク interleave 配置 | `TASK_BALANCE_INTERLEAVE=1`（**要 export**） | 1 | ビット同一 |
+| ④ タスク interleave 配置 | `TASK_BALANCE_INTERLEAVE=1`（script が export） | 1 | ビット同一 |
 | E2 active-only decode | 既定 on | 2 | ビット同一 |
 | E3 compact per-turn record | 既定 on | 2 | ビット同一 |
-| C env reset prefetch | `ENV_RESET_PREFETCH=1`（**要 export**） | 2 | ビット同一 |
+| C env reset prefetch | `ENV_RESET_PREFETCH=1`（script が export） | 2 | ビット同一 |
 | `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
 
 **teacher**
@@ -52,7 +52,7 @@
 | teacher の CPUOffload 解除 | `ref.fsdp_config.param_offload=False` | 4 | 配置のみ |
 | teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op` | 4 | ビット同一 |
 | response-only lse/topk/gather | コード（常時） | 4 | ビット同一 |
-| chunked teacher overlap（ターン単位） | `ROLLOUT_PREFETCH_TEACHER=1`（**要 export**） | 4 | 期待値同一 |
+| chunked teacher overlap（ターン単位） | `ROLLOUT_PREFETCH_TEACHER=1`（script が export） | 4 | 期待値同一 |
 
 **actor update**
 
@@ -75,10 +75,11 @@
 | `val_only` 時に train env を作らない | コード（常時） |
 | retriever の無限リトライ + TCP keepalive | `env.search.max_retries=null`（速度ではなくデータ品質） |
 
-**env var 系は run script が export しない。** `ROLLOUT_KEEP_VLLM_AWAKE` /
-`TASK_BALANCE_INTERLEAVE` / `ENV_RESET_PREFETCH` / `ROLLOUT_PREFETCH_TEACHER` は
-オペレータ側で立てる（5 節）。立て忘れると config だけの機構は効いたまま、rollout 系が
-全部 off になる ―― しかもエラーにはならない。
+**env var 系は run script が `${VAR:-1}` で export する。** `ROLLOUT_KEEP_VLLM_AWAKE` /
+`TASK_BALANCE_INTERLEAVE` / `ENV_RESET_PREFETCH` / `ROLLOUT_PREFETCH_TEACHER` の 4 つで、
+呼び出し側が 0 を渡せば従来どおり無効化できる。手で export する運用をやめたのは、
+**立て忘れがエラーにならない**ためである ―― config 側の機構は効いたまま rollout 系だけが
+全部 off になり、300 step の run が再起動されるたびにその危険がある。
 
 ### 1.2 稼働していない
 
@@ -596,13 +597,13 @@ B と spec decode はその 1 つの実験で一緒に検証すべき項目で�
 
 ## 5. 本番構成（pure OPD multitask）
 
-**プロセス env var**（run script は export しないので、オペレータ側で立てる）:
+**プロセス env var**（run script が `${VAR:-1}` で export する。手で立てる必要はない）:
 
 ```bash
-export ROLLOUT_KEEP_VLLM_AWAKE=1
-export ENV_RESET_PREFETCH=1
-export TASK_BALANCE_INTERLEAVE=1
-export ROLLOUT_PREFETCH_TEACHER=1     # chunk は既定 128（ターン単位化後は hit_rate 0.99 で足りる）
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
+export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
+export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}   # chunk は既定 128
 # 既定 on: ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD
 # 立てない: ROLLOUT_PREFETCH_LOGPROB（消費側が無い）、GPU_PROFILER_SYNC_PHASES（遅くなる）
 # 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1 GPU_PROFILER_ROLLUP_EVERY=1

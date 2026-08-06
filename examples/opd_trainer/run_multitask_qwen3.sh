@@ -82,14 +82,18 @@ set -x
 # file for why null is worse here. A request that is still retrying says so in
 # the log every ~60s, so an intentional wait is never mistaken for a hang.
 #
-# Throughput mechanisms (opt-in process env vars, accuracy-preserving; live in
-# code, not in the expectations file — see docs/optimization_phase2.md):
+# Throughput mechanisms (process env vars, accuracy-preserving; they live in code,
+# not in the expectations file — see docs/optimization_phase2.md). All four are
+# exported below rather than left to the operator: a 300-step run gets restarted,
+# and a mechanism that has to be exported by hand is one that will eventually be
+# missing from a restart. Set any of them to 0 to disable:
 #   ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
 #   ROLLOUT_PREFETCH_TEACHER=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
-#   old_log_prob phase, so prefetched values would never be consumed.
+#   old_log_prob phase, so prefetched values would never be consumed. It is not
+#   exported below for that reason.
 #
 # ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
 # rollout instead of after it. A turn's row is final the moment it is recorded
@@ -143,6 +147,14 @@ set -x
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+# On by default, for the same reason the FSDP knobs are literals below: a 300-step
+# run gets restarted, and a mechanism that has to be exported by hand is one that
+# will eventually be missing from a restart. All four are accuracy-preserving (see
+# the header); each still honours an explicit 0 from the caller.
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
+export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
+export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
