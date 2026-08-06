@@ -6,6 +6,10 @@ FSDP + colocated vLLM, `env.max_steps` 50 (per-task caps alfworld=50 / search=4 
 webshop=15), GRPO group_size=8, mixed batch 384 (128/task).
 Goal: raise GPU utilization / throughput **without changing accuracy**.
 
+For a cross-phase inventory of every mechanism in the repo, and a code-level
+walkthrough of the five below (what each one deletes, why it is accuracy-safe,
+and where it does *not* help), see `docs/speedup_mechanisms.md`.
+
 ---
 
 ## 1. Executive summary
