@@ -188,6 +188,8 @@ python3 -m verl.trainer.main_sft_multitask \
     env.history_length=4 \
     env.rollout.n=8 \
     env.search.search_url='http://100.86.45.30:8001/retrieve' \
+    env.search.timeout=600 \
+    env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
     env.multitask.max_steps.search=4 \

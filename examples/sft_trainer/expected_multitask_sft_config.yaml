@@ -122,6 +122,21 @@
 "env.multitask.history_length.webshop": 2
 "env.multitask.val_per_task_batch_size": 126
 
+# The retriever policy decides what enters the validation trajectories, so it is
+# pinned here rather than left with the machine knobs. Running out of retries does
+# NOT fail the run: the client hands the error string back as the retrieval
+# result, so "Search error: ..." lands in the <information> block, with nothing in
+# the metrics to say it happened. One retriever is shared between the arms, and
+# under a shared retriever an exhausted budget is exactly what a load spike looks
+# like -- so max_retries is null and the client waits. 4xx and malformed JSON
+# still fail at once, since waiting cannot turn those into a document.
+#
+# timeout stays finite beside it: a peer that goes away without a FIN would
+# otherwise leave the socket waiting for the OS default, and a finite timeout
+# turns that into a connection error the retry loop handles.
+"env.search.timeout": 600
+"env.search.max_retries": null
+
 # ---- rollout sampling / validation protocol ----------------------------------------
 "actor_rollout_ref.rollout.temperature": 1.0
 "actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
