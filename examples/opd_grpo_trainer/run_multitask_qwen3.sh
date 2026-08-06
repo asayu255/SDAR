@@ -61,6 +61,14 @@ set -x
 #   3.4GB per GPU. If a bigger student or a longer context leaves no room for
 #   that, put it back to True — this is a placement knob, the distillation
 #   targets are identical either way.
+#   ref.fsdp_config.sharding_strategy=shard_grad_op goes one step further: with
+#   the shards resident, FULL_SHARD still re-all-gathers each teacher's
+#   parameters over PCIe for EVERY micro-batch (teacher_forward's pcieRX sat at
+#   ~4.3 GB/s on the pure-OPD arm even after the offload fix). ZeRO-2 does not
+#   reshard after forward, and the teachers have no backward, so each is gathered
+#   once per phase and stays whole. Placement only, bit-identical logits; costs
+#   up to 3 * 3.4GB gathered per GPU on top of the shards, measured at +8.2GB
+#   there. Not pinned in the lock, same exemption as param_offload.
 #
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
@@ -84,12 +92,16 @@ set -x
 #
 # Throughput mechanisms (process env vars, accuracy-preserving; live in code, not
 # in the expectations file — see docs/optimization_phase2.md):
-#   opt-in:      ROLLOUT_KEEP_VLLM_AWAKE=1  ROLLOUT_PREFETCH_LOGPROB=1
-#                ENV_RESET_PREFETCH=1  TASK_BALANCE_INTERLEAVE=1
-#   default on:  ROLLOUT_PREFETCH_TEACHER  ROLLOUT_SKIP_DONE_PREPROC
-#                ROLLOUT_DECODE_ACTIVE_ONLY  ROLLOUT_COMPACT_RECORD
-#   e.g.  ROLLOUT_KEEP_VLLM_AWAKE=1 ENV_RESET_PREFETCH=1 bash run_multitask_qwen3.sh
-#   Set any of the default-on ones to 0 to turn it off.
+#   exported below: ROLLOUT_KEEP_VLLM_AWAKE=1  ENV_RESET_PREFETCH=1
+#                   TASK_BALANCE_INTERLEAVE=1
+#   default on:     ROLLOUT_PREFETCH_TEACHER  ROLLOUT_SKIP_DONE_PREPROC
+#                   ROLLOUT_DECODE_ACTIVE_ONLY  ROLLOUT_COMPACT_RECORD
+#   NOT set:        ROLLOUT_PREFETCH_LOGPROB — see the PICK ONE note below
+#   Set any of them to 0 to turn it off; the exports honour the caller's value.
+#   The first three used to be left for whoever launched the run to export, which
+#   is the wrong default for a 300-step run that gets restarted: forgetting them
+#   is silent, since the config-side mechanisms keep working and only the rollout
+#   ones go quiet.
 #
 # ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
 # rollout instead of after it. A turn's row is final the moment it is recorded
@@ -168,6 +180,16 @@ set -x
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+# On by default, for the same reason the FSDP knobs are literals below: a 300-step
+# run gets restarted, and a mechanism that has to be exported by hand is one that
+# will eventually be missing from a restart. All three are accuracy-preserving
+# (see the header); each still honours an explicit 0 from the caller.
+# ROLLOUT_PREFETCH_LOGPROB is deliberately absent -- ROLLOUT_PREFETCH_TEACHER is
+# already on by default and the two contend for the same glue window and the same
+# colocated WorkerDict (the PICK ONE note above).
+export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
+export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
@@ -247,6 +269,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

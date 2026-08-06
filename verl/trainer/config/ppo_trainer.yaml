@@ -124,15 +124,15 @@ actor_rollout_ref:
       # parameter size minus its shard. Pointless with param_offload=True, which
       # sends away exactly what this keeps resident (get_sharding_strategy warns).
       #
-      # ON by default. Only the ACTOR reads this key: ref / critic / reward_model
-      # have their own fsdp_config blocks and do not carry it, so they keep the
-      # mesh default. Set to null (or full_shard) here or per run if a model that
-      # fits under ZeRO-3 no longer fits under ZeRO-2.
+      # ON by default for the actor. ref carries its own copy of this key below
+      # (same get_sharding_strategy, different default); critic / reward_model do
+      # not, so they keep the mesh default. Set to null (or full_shard) here or
+      # per run if a model that fits under ZeRO-3 no longer fits under ZeRO-2.
       sharding_strategy: shard_grad_op # [null, full_shard, shard_grad_op]
       # Issue the NEXT FSDP unit's all-gather while the current one computes,
       # overlapping communication that would otherwise serialize. Scheduling only
       # -- the arithmetic is untouched -- so this is on by default. Same
-      # actor-only scope as sharding_strategy above.
+      # actor-only scope: ref / critic / reward_model do not carry this key.
       forward_prefetch: True
   ref:
     strategy: fsdp
@@ -144,6 +144,16 @@ actor_rollout_ref:
       # model) and removes a full model's worth of PCIe traffic per micro-batch,
       # which is worth it when the ref is small and the box has no NVLink.
       param_offload: False
+      # Same knob as actor.fsdp_config.sharding_strategy (get_sharding_strategy is
+      # shared): null keeps FULL_SHARD. shard_grad_op (ZeRO-2) stops resharding
+      # after forward -- and the ref/teacher path has no backward, so its
+      # parameters stay gathered across micro-batches instead of being re-all-
+      # gathered for every one. Placement only, bit-identical outputs; costs the
+      # unsharded parameter size per resident ref model. Worth it when the
+      # collectives run over PCIe (no NVLink) and the ref forward is
+      # communication-bound. Pointless with param_offload=True (the warning in
+      # get_sharding_strategy explains why).
+      sharding_strategy: null # [null, full_shard, shard_grad_op]
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
