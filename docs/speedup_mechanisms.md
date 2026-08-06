@@ -1,13 +1,14 @@
-# 実装済み高速化手法の総覧と Phase 1 詳解
+# 高速化手法の稼働状態と Phase 1 詳解
 
 この文書は 2 つの役割を持つ。
 
-1. **総覧** —— 現在このリポジトリに実装されている高速化機構を、フェーズをまたいで
-   1 か所に並べる。既存の 3 文書はそれぞれ別の作業単位の記録なので、「今どの機構が
-   入っているのか」を通しで読む場所が無かった。
+1. **稼働状態の切り分け** —— 実装されている高速化機構を、フェーズをまたいで 1 か所に並べ、
+   **今この構成で走っているもの / 走っていないもの**に分ける。既存の 3 文書はそれぞれ別の
+   作業単位の記録で、しかも実装だけあって発火していない機構・撤回した機構・削除した機構が
+   混ざっているため、稼働状態を通しで読む場所が無かった（1 節・4 節）。
 2. **Phase 1 の詳解** —— 5 機構（①〜⑤）が具体的にどのコードの何を消しているのか、
-   なぜ精度が変わらないのか、そして**どこには効かないのか**を、コード位置つきで書く。
-   `docs/optimization_report.md` は結果の表であって、機構の中身は書いていない。
+   なぜ精度が変わらないのか、そして**どこには効かないのか**を、コード位置つきで書く
+   （2 節・3 節）。`docs/optimization_report.md` は結果の表であって、機構の中身は書いていない。
 
 新しい計測や新しい主張は含まない。数値はすべて下記の 3 文書からの引用である。
 
@@ -20,79 +21,86 @@
 
 ---
 
-## 1. 全機構一覧
+## 1. 稼働状態
 
-### 1.1 Phase 1 —— rollout（`gen`）
+基準は **pure OPD multitask arm の本番構成**（`examples/opd_trainer/run_multitask_qwen3.sh`
+＋ `docs/gpu_profiling_report_opd.md` 7 節の再現手順）。arm による差は 1.4 節にまとめる。
 
-| # | 機構 | ノブ | 実測 | 精度 |
-|---|---|---|---|---|
-| ① | vLLM セッション | `ROLLOUT_KEEP_VLLM_AWAKE=1` | gen 738→562 s、gen/tok −24% | ビット同一 |
-| ② | active-only preprocess | `ROLLOUT_SKIP_DONE_PREPROC`（既定 on） | preproc 95.5→37 s/step（−61%） | ビット同一 |
-| ③ | prefix caching の config 化 | `+rollout.enable_prefix_caching=True` | marginal（既に on だった） | ロスレス |
-| ④ | タスク interleave 配置 | `TASK_BALANCE_INTERLEAVE=1` | DP 不均衡 20→8 pp、gen/tok −8% | ビット同一 |
-| ⑤ | FSDP param-offload 解除 | `PARAM_OFFLOAD=False` | small | ビット同一 |
+**「実装されている」と「走っている」は別である。** 実装だけあって一度も発火していない機構
+（B）、撤回した機構（spec decode）、削除した機構（Fix2 / query cache）が混ざっているので、
+まず稼働状態で分ける。フェーズの帰属は列として残す。
 
-合成で **gen wall 977→~520 s（−47%）、step −13%、throughput +7%**。詳解は 2 節。
+### 1.1 稼働中
 
-### 1.2 Phase 2 —— rollout の隙間埋め
+**rollout（`gen`）** —— ①〜⑤ の詳解は 2 節。
 
-| # | 機構 | ノブ（既定） | 内容 |
+| 機構 | 有効化 | Phase | 精度 |
 |---|---|---|---|
-| A | 完了軌跡の log-prob prefetch | `ROLLOUT_PREFETCH_LOGPROB`（off）、chunk 64 | `envs.step()` 中の GPU idle 窓で `old_log_prob` を先取り。**pure OPD では立てない**（薄いループに `old_log_prob` phase が無く、prefetch した値が消費されない） |
-| B | CUDA graph decode ノブ | `CUDAGRAPH_CAPTURE_SIZES`（unset） | V1 エンジン必須。現状 V0 なので**未発火** |
-| C | env reset prefetch | `ENV_RESET_PREFETCH=1`（off） | 次バッチの `envs.reset()` を学習フェーズと重畳。ビット同一 |
-| E2 | active-only decode | `ROLLOUT_DECODE_ACTIVE_ONLY`（on） | pad 行の decode をやめて `''` を直接埋める。ビット同一 |
-| E3 | compact per-turn record | `ROLLOUT_COMPACT_RECORD`（on） | `active_masks=False` 行を記録しない。ビット同一 |
+| ① vLLM セッション | `ROLLOUT_KEEP_VLLM_AWAKE=1`（**要 export**） | 1 | ビット同一 |
+| ② active-only preprocess | 既定 on | 1 | ビット同一 |
+| ③ prefix caching | `+rollout.enable_prefix_caching=True`（script 内） | 1 | ロスレス |
+| ④ タスク interleave 配置 | `TASK_BALANCE_INTERLEAVE=1`（**要 export**） | 1 | ビット同一 |
+| E2 active-only decode | 既定 on | 2 | ビット同一 |
+| E3 compact per-turn record | 既定 on | 2 | ビット同一 |
+| C env reset prefetch | `ENV_RESET_PREFETCH=1`（**要 export**） | 2 | ビット同一 |
+| `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
 
-試作後に削除：retriever query cache、並列プロンプト tokenizer。
+**teacher**
 
-### 1.3 Phase 3 —— actor update / PCIe collectives
-
-NVLink の無い 2 GPU ホストでは `update_actor` が全 phase 中で最大の PCIe 帯域
-（TX 10.5 GB/s、`gen` の 2.0 に対して）を出す。NCCL collectives は NVML から
-SM-busy に見えるので、sm% では「計算している」と「通信している」を区別できない。
-
-| 機構 | ノブ | 削減対象 | 精度 |
+| 機構 | 有効化 | Phase | 精度 |
 |---|---|---|---|
-| ZeRO-2 | `actor.fsdp_config.sharding_strategy=shard_grad_op` | gradient checkpointing 下の layer あたり all-gather 3 回→1 回 | 算術中立 |
-| `no_sync` 勾配蓄積 | `actor.no_sync_grad_accum=True` | mini-batch あたり reduce-scatter 12→1（60/5 時）。ZeRO-2 下では再 gather も消える | **ビット非同一**（加算順序、期待値同一） |
-| FSDP forward prefetch | `actor.fsdp_config.forward_prefetch=True` | 次ユニット all-gather の直列化 | スケジューリングのみ |
-| metric 読み出しの遅延化 | 常時 on | logger 専用スカラを 0-d GPU tensor のまま保持。step あたり約 450 回の host 同期を削除 | 値同一 |
+| teacher の CPUOffload 解除 | `ref.fsdp_config.param_offload=False` | 4 | 配置のみ |
+| teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op` | 4 | ビット同一 |
+| response-only lse/topk/gather | コード（常時） | 4 | ビット同一 |
+| chunked teacher overlap（ターン単位） | `ROLLOUT_PREFETCH_TEACHER=1`（**要 export**） | 4 | 期待値同一 |
 
-最初の 2 つは勾配経路上にあるため、性能ノブは intent lock に入れないという通常の
-規則に反して `examples/opd_trainer/expected_multitask_config.yaml` に pin してある。
+**actor update**
 
-### 1.4 Phase 4 —— OPD teacher
-
-| 機構 | 実装 | 実測 | 精度 |
+| 機構 | 有効化 | Phase | 精度 |
 |---|---|---|---|
-| teacher の CPUOffload 解除 | `fsdp_workers.py:372` | `teacher_forward` 67.4→40.1 s/step、pcieRX 8,204→4,307 | 配置のみ |
-| response-only lse/topk/gather | `dp_actor.py:114 response_row_selection` | 対象行 約 1/9、**ピークメモリ 121.2→93.9 GB** | ビット同一 |
-| chunked teacher overlap | `rollout_loop.py` + `opd_ray_trainer.py:254` | `gen` sm 56→65.3、hit_rate 0.28–0.46 | 期待値同一 |
-| prefetch のターン単位化 | `_queue_row_for_prefetch` | hit_rate 0.531→**0.991**、`teacher_forward` 33.7→**1.30 s**、**step −29.8 s** | 同上 |
-| teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op` | `gen` の pcieRX 768→208、メモリ +8.2 GB | ビット同一 |
+| ZeRO-2（actor） | `actor.fsdp_config.sharding_strategy=shard_grad_op` | 3 | 算術中立 |
+| `no_sync` 勾配蓄積 | `actor.no_sync_grad_accum=True` | 3 | **ビット非同一**（加算順序） |
+| FSDP forward prefetch | `actor.fsdp_config.forward_prefetch=True` | 3 | スケジューリングのみ |
+| metric 読み出しの遅延化 | コード（常時） | 3 | 値同一 |
+| param-offload 解除（actor） | `actor.fsdp_config.param_offload=False` | 1 | ビット同一 |
+| optimizer-offload 解除 | `actor.fsdp_config.optimizer_offload=False` | — | 同アルゴリズム |
 
-累積 throughput **3,321 → 3,594 → 3,782 tok/s（+13.9%）**。
+**ホスト RAM / 起動系**（速度指標には出ないが、無いと 300 step 完走しない）
 
-付随して `ref.log_prob_micro_batch_size_per_gpu` 16→8。これは高速化ではなく
-**OOM 対策**である（`lm_head` を通す teacher ロジットが 10.47 GiB の一括確保になった）。
+| 機構 | 有効化 |
+|---|---|
+| webshop worker の JVM heap 制限（`-Xmx512m -Xms64m -XX:+UseSerialGC`） | コード（常時、`SDAR_WEBSHOP_JVM_OPTIONS` で上書き可） |
+| `SimServer.user_sessions` の刈り取り | コード（常時） |
+| `LazyEnvManager`（env の遅延生成） | コード（常時） |
+| `val_only` 時に train env を作らない | コード（常時） |
+| retriever の無限リトライ + TCP keepalive | `env.search.max_retries=null`（速度ではなくデータ品質） |
 
-### 1.5 ホスト RAM / 起動系
+**env var 系は run script が export しない。** `ROLLOUT_KEEP_VLLM_AWAKE` /
+`TASK_BALANCE_INTERLEAVE` / `ENV_RESET_PREFETCH` / `ROLLOUT_PREFETCH_TEACHER` は
+オペレータ側で立てる（5 節）。立て忘れると config だけの機構は効いたまま、rollout 系が
+全部 off になる ―― しかもエラーにはならない。
 
-run を完走させるための変更。速度指標には現れないが、これが無いと 300 step 走らない。
+### 1.2 稼働していない
 
-- **webshop worker の JVM heap 制限** —— pyserini が worker ごとに JVM を起動し、
-  既定 max heap が物理 RAM の 1/4（256 GB ホストで 62 GB）。120 worker で 1.8 GB/step の
-  ドリフト。`_JAVA_OPTIONS=-Xmx512m -Xms64m -XX:+UseSerialGC`（`SDAR_WEBSHOP_JVM_OPTIONS`
-  で上書き可）
-- **`SimServer.user_sessions` の刈り取り** —— reset 時にクリア
-- **`LazyEnvManager`**（`env_manager.py:956`）—— env の遅延生成。multitask では 492 actor
-  のうち 252 が使われないまま常駐していた
-- **`val_only` 時に train env を作らない** —— `_fast_forward_env_schedules` をガード
-- **retriever の無限リトライ + TCP keepalive** —— 速度ではなくデータ品質（リトライ切れの
-  エラー文字列がそのまま `<information>` ブロックとして学習に入るのを防ぐ）
+| 機構 | 状態 | 理由 |
+|---|---|---|
+| A 完了軌跡の log-prob prefetch | **この arm では立てない** | pure OPD の薄いループに `old_log_prob` フェーズが無く、prefetch した値を消費する側がいない |
+| B CUDA-graph capture sizes | **未発火** | `CompilationConfig` は V1 の機能。この環境は実際には V0 で動いている。ノブは sdar script のみ露出 |
+| ngram speculative decoding | **撤回** | `SpecDecodeWorker` が `sleep()` 未実装で `init_workers` で落ちる |
+| Fix2 per-task generation | **削除済み** | Fix1 の利得を相殺、peak mem 51→55.6 GB |
+| async / continuous-batching rollout | **使えない** | on-policy 定義に反する。scaffolding のみ残る |
+| retriever query cache / 並列プロンプト tokenizer | **削除済み** | Phase 2 で試作後に撤去 |
+| chunked prefill | off | 次 run 候補（gen −5〜10% 見込み） |
+| KV 予算 `gpu_memory_utilization` 0.6→0.7 | 0.6 のまま | 次 run 候補（gen −3〜8%） |
+| `ppo_micro_batch_size_per_gpu` 5→10 | 5 のまま | 次 run 候補（`update_actor` −2〜3%） |
+| `reward` の overlap | 見送り | 2.3〜3.1 s/step で割に合わない |
+| `GPU_PROFILER_SYNC_PHASES` | 立てない | phase 境界で `synchronize()` するので実際に遅くなる |
+| `GPU_PROFILER_TRACE` | 使えない | 分散で多重 open する（未修正） |
 
-### 1.6 計測インフラ
+理由の詳細は 4 節。「次 run 候補」の 3 つは **3 arm 同時に入れる**前提である ―― 片方だけ
+有効にすると実験条件が揃わない。
+
+### 1.3 計測インフラ（常時利用可、既定 off）
 
 - `verl/utils/gpu_profiler.py`（`GPU_PROFILER=1`）—— phase タグつき NVML サンプラ。
   per-phase の SM% / memBW% / idle% / mem / power / clock / PCIe / **per-GPU SM**
@@ -103,6 +111,25 @@ run を完走させるための変更。速度指標には現れないが、こ�
 - `timing_s/update_actor_worker` —— ドライバの blocking `ray.get` に含まれる転送を分離
 - `flops_counter` への RTX A6000 / RTX PRO 6000 Blackwell 追加 —— 無いと
   `perf/mfu/actor` が `inf` で割って毎 step ちょうど `0.000` を出す
+
+### 1.4 arm による差
+
+| | pure OPD | sdar (GRPO) |
+|---|---|---|
+| A log-prob prefetch | 使わない | **使える**（`old_log_prob` フェーズがある） |
+| teacher 系 4 機構 | 使う | 該当なし（teacher が無い） |
+| B のノブ露出 | 無し | `CUDAGRAPH_CAPTURE_SIZES` env で渡せる（V0 なので無効） |
+| Phase 1 ①〜⑤ | 使う | 使う |
+| Phase 3（actor update） | 使う | 使う |
+
+### 1.5 既存文書との食い違い 1 件
+
+`docs/optimization_report.md` 4 節 / 7 節（Phase 1、sdar arm）は `OPTIMIZER_OFFLOAD` を
+「既定 True のまま（＝offload 有効）」と記録しているが、**現在の run script は両 arm とも
+`optimizer_offload=False`**（Adam を GPU 常駐）である。Phase 1 当時の判断が後で覆ったのか、
+script 更新時に doc が追従しなかったのかは記録から追えない。速度の主張には影響しないが、
+あちらの 7 節「Final production configuration」をそのまま再現手順として使うと現行 script と
+食い違う。この文書の 5 節が現行の構成である。
 
 ---
 
@@ -358,7 +385,8 @@ DP-IMBALANCE  mean |maxGPU-minGPU| during gen = 8.2 pp
 
 **①との対比。** ① は sm 60→51 と**下がって** 24% 速くなり、④ は sm 51→57 と**上がって**
 8% 速くなった。① で消えたのは冗長な重み同期という偽の仕事、④ で埋めたのは本物の idle。
-util を上げるも下げるも目標にはならない、という 5 節の結論はこの 2 例の対比から出ている。
+util を上げるも下げるも目標にはならない、という `optimization_report.md` 5 節の結論は
+この 2 例の対比から出ている。
 
 **却下された代案 —— Fix2（per-task generation）。** 同じ不均衡に対して「タスクごとに別々の
 `generate` を呼ぶ」案も実装して測った。狙いどおりタスク内は均質になったが、呼び出し回数が
@@ -496,38 +524,116 @@ turn 15 で終わったあと GPU の一部が空くのは事実だが、その�
 
 ---
 
-## 4. 採用しなかった / 撤回した手法
+## 4. 稼働していない機構 —— 状態と理由
 
-| 手法 | 判定 | 理由 |
+1.2 節の一覧の根拠。4 つの状態を区別する ―― **この arm では立てない**（他の arm では動く）、
+**未発火**（設定はあるがエンジンが無視する）、**撤回 / 削除**（コードから外した、または
+動かないと判明した）、**次 run 候補**（入れる予定があるが今は入っていない）。
+
+### 4.1 この arm では立てない
+
+**A 完了軌跡の log-prob prefetch**（`ROLLOUT_PREFETCH_LOGPROB`）。
+`envs.step()` をバックグラウンドスレッドに出し、その裏で記録済み行の `compute_log_prob` を
+先取りする機構。pure OPD の薄いループには `old_log_prob` フェーズが無いので、prefetch した
+値を消費する側がいない ―― 計算しても捨てるだけになる。sdar arm では有効。
+
+同じ glue 窓を pure OPD で埋めているのは teacher prefetch の方である。実装は共有されていて、
+`_queue_row_for_prefetch` が両方の pending リストに同じ entry を積み、有効な機構の側だけが
+ドレインする。
+
+### 4.2 未発火
+
+**B CUDA-graph capture sizes**（`CUDAGRAPH_CAPTURE_SIZES`）。
+passthrough は `vllm_rollout_spmd.py:170-183` に元からあり、Phase 2 が足したのは run script の
+ノブだけ。`enforce_eager=False` は両 arm とも設定済みなので **CUDA graph 自体は既に有効**で、
+B が制御するのは「どのバッチサイズを capture するか」である。
+
+しかし `CompilationConfig` は V1 エンジンの機能で、この環境は実際には **V0 で動いている**。
+渡しても無視される。
+
+ここには判断の誤りが記録されている（`gpu_profiling_report_opd.md` 5 節②→⑧）。一度
+「`environment.yml` は `vllm==0.11.0` を pin しており V0 は削除済み」と述べたが、spec decode の
+トレースバックが `vllm/engine/llm_engine.py` / `vllm/executor/uniproc_executor.py` /
+`vllm.spec_decode.*` ―― すべて V0 の経路を示した。
+
+> 5 節②で「pin なので V0 は無い」と書いたのは *`VLLM_USE_V1` の export が no-op である*
+> ことの根拠であって、**実行中のエンジンが V1 である証明ではなかった**。
+
+`VLLM_USE_V1=1` は全フェーズのエンジンを変えるので、3 arm 同時の別実験として残っている。
+B と spec decode はその 1 つの実験で一緒に検証すべき項目である。
+
+### 4.3 撤回 / 削除
+
+| 機構 | 経緯 |
+|---|---|
+| **ngram speculative decoding** | `engine_kwargs.vllm.speculative_config` を渡すと vLLM は V0 の `spec_decode.SpecDecodeWorker`（内側に `NGramWorker`）に差し替わる。このラッパーは `sleep()` を実装していない一方、`vllm_rollout_spmd` はエンジンを `enable_sleep_mode=True` で作り直後に `sleep(level=1)` を呼ぶので、**step 1 に入る前に `init_workers` で落ちる**。`free_cache_engine=False` と `ROLLOUT_KEEP_VLLM_AWAKE` が依存する wake/sleep サイクル全体がこのメソッドを要求するため、引数の不足ではなく構造的非互換 |
+| **Fix2 per-task generation** | 目的（タスク内の util 均質化）は達成したが、呼び出し回数が 3 倍になるオーバヘッドが Fix1 の利得を打ち消した ―― gen/tok は Fix1 のみ 0.496 に対し Fix1+Fix2 が 0.53〜0.57、peak mem 51→55.6 GB。ブランチから削除 |
+| **`OPTIMIZER_OFFLOAD=False`（Phase 1 の判定）** | sdar arm では「`update_actor` が compute-bound で速度改善ゼロ、peak mem 51→60 GB、KV preemption」として却下された。ただし**現行の run script は両 arm とも `optimizer_offload=False`** である（1.5 節） |
+| **retriever query cache** | Phase 2 で試作、その後削除 |
+| **並列プロンプト tokenizer** | 同上 |
+| **async / continuous-batching rollout** | sdar arm では「de-vectorize + token-level async engine で多週」として保留。pure OPD arm では**不可** ―― 生成と訓練を重ねるとは訓練中のポリシーで生成していないということで、この arm の存在意義そのものを壊す。実装面でも `AsyncActorRolloutRefWorker.generate_sequences` が `NotImplementedError` を投げる |
+
+### 4.4 次 run 候補
+
+| 手 | 見込み | 備考 |
 |---|---|---|
-| Fix2 per-task generation | **削除** | 目的は達成したが呼び出しオーバヘッドで Fix1 の利得を相殺。peak mem 51→55.6 GB |
-| `OPTIMIZER_OFFLOAD=False` | 既定 True のまま | `update_actor` は compute-bound で無効。peak mem 51→60 GB |
-| ngram speculative decoding | **撤回** | `speculative_config` を渡すと V0 の `SpecDecodeWorker` に差し替わり `sleep()` 未実装。wake/sleep に依存する rollout 設計との構造的非互換 |
-| async / continuous-batching rollout | sdar arm は保留 / pure OPD arm は**不可** | 前者は de-vectorize + token-level async engine で多週。後者は on-policy 定義違反 |
-| `reward` の overlap | 見送り | 2.3〜3.1 s/step で割に合わない |
-| retriever query cache、並列プロンプト tokenizer | 試作後**削除** | Phase 2 で入れたが外した |
-| chunked prefill / KV 予算 0.7 / `ppo_micro_batch` 5→10 | **次 run** | 3 arm 同時に入れる（片方だけだと実験条件が揃わない） |
+| chunked prefill 有効化 | `gen` −5〜10% | サンプリング分布は不変。ビット同一ではない |
+| KV 予算 `gpu_memory_utilization` 0.6 → 0.7 | `gen` −3〜8% | OOM 判定は `max_memory_reserved 145.3 GB` から逆算 |
+| `ppo_micro_batch_size_per_gpu` 5 → 10 | `update_actor` −2〜3% | `adjust_batch` の lcm が 160 → 320 になり padding が増える |
+
+**3 つとも 3 arm 全部に同時に入れること。** いずれも損失の計算式を変えないが、片方の arm
+だけ有効にすると「実験条件が揃っていない」と言われる余地を作る。
+
+到達点の見積りは `gpu_profiling_report_opd.md` 2.6 節 ―― sm 82〜85%、〜490 s/it。
+
+### 4.5 計測側で立てないもの
+
+- `GPU_PROFILER_SYNC_PHASES` —— phase 境界ごとに `device.synchronize()` を入れるので、本来
+  重なる処理を直列化して**実際に遅くなる**。帰属としては読めても速度としては読めない
+- `GPU_PROFILER_TRACE` —— 分散では多重 open する（パスに rank を混ぜれば直るが未修正）
 
 ---
 
-## 5. 本番構成（OPD multitask）
+## 5. 本番構成（pure OPD multitask）
+
+**プロセス env var**（run script は export しないので、オペレータ側で立てる）:
 
 ```bash
 export ROLLOUT_KEEP_VLLM_AWAKE=1
 export ENV_RESET_PREFETCH=1
 export TASK_BALANCE_INTERLEAVE=1
-export ROLLOUT_PREFETCH_TEACHER=1        # chunk は既定 128（hit_rate 0.99 で足りている）
-# ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD は既定 on
-# ROLLOUT_PREFETCH_LOGPROB は pure OPD では立てない
-# 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1
+export ROLLOUT_PREFETCH_TEACHER=1     # chunk は既定 128（ターン単位化後は hit_rate 0.99 で足りる）
+# 既定 on: ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD
+# 立てない: ROLLOUT_PREFETCH_LOGPROB（消費側が無い）、GPU_PROFILER_SYNC_PHASES（遅くなる）
+# 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1 GPU_PROFILER_ROLLUP_EVERY=1
+bash examples/opd_trainer/run_multitask_qwen3.sh env.search.search_url=http://<host>:8000/retrieve
 ```
 
-config 側は `sharding_strategy=shard_grad_op`（actor / ref 両方）、`no_sync_grad_accum=true`、
-`forward_prefetch=true`、`ref.param_offload=false`。最初の 2 つは勾配経路上にあるため
-`examples/opd_trainer/expected_multitask_config.yaml` の intent lock に pin されている。
+**config**（すべて run script 内のリテラル引数）:
+
+```
+actor_rollout_ref.actor.fsdp_config.param_offload=False
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
++actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op
++actor_rollout_ref.actor.fsdp_config.forward_prefetch=True
++actor_rollout_ref.actor.no_sync_grad_accum=True
+actor_rollout_ref.ref.fsdp_config.param_offload=False
+actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op
+actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8      # メモリ上限。速度ノブではない
++actor_rollout_ref.rollout.enable_prefix_caching=True
+actor_rollout_ref.rollout.enable_chunked_prefill=False
+actor_rollout_ref.rollout.enforce_eager=False
+actor_rollout_ref.rollout.free_cache_engine=False
+actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+actor_rollout_ref.rollout.max_model_len=4608
+```
+
+`sharding_strategy` と `no_sync_grad_accum`（actor 側）は勾配経路上にあるため、性能ノブは
+intent lock に入れないという規則の例外として
+`examples/opd_trainer/expected_multitask_config.yaml` に pin してある。ref 側の 2 つは
+ビット同一なので pin していない。
 
 ---
-
 ## 6. 数値の読み方
 
 この一連の作業で 3 回同じ形の誤りを踏んだので、結論だけ書いておく。詳細は
