@@ -76,12 +76,50 @@ NVML の `sm_util` は **「1 つ以上のカーネルが乗っていた時間�
 
 wandb のチャートで 45% まで落ちる点があり、その正体を追った。
 
-trace CSV を突き合わせた結果、落ち込みは step 境界にのみ現れ、内訳は
+trace CSV の低いサンプルには、いずれも `actor.*` のどの phase タグも付いていなかった。
+つまり **`update_actor` の外側**にいる。落ち込みは step 境界にしか現れない。
 
-- step 後のメトリクス計算（`(idle/other)` phase、約 0.5 s）
-- Ray のバッチ dispatch（`update_actor − update_actor_worker` = 0.7〜1.1 s）
+隣接する 2 つの区間からなる:
+
+```
+[step N-1 の計算  GPU 98%]
+     ↓ ray.get が返る
+[882-891 行 メトリクス計算・wandb 送信 / next() バッチ準備]  ← (idle/other)
+     ↓ 858 行に入る
+[batch を object store へ直列化、worker が pull]   ← update_actor だが GPU は空
+     ↓
+[step N の forward  GPU 98%]
+```
+
+| 区間 | 時間 | 出どころ |
+|---|---:|---|
+| `(idle/other)` | 1 秒未満（0.5〜0.6 s） | ドライバ側 phase 表 |
+| Ray の dispatch | 0.94 s | `update_actor − update_actor_worker` |
 
 合計で wall clock の **約 0.4%**。チャート上の目立ち方と実コストが 2 桁乖離していた。
+
+**GPU は止まっていない。** `(idle/other)` の `sm%` は 47.5（step 1）/ 61.8（step 2）で、
+前 step の末尾のカーネルが非同期に流れている。チャートの底が 0% でなく 45% なのは
+これが理由で、`(idle/other)` という名前は「GPU が idle」ではなく
+「**phase スタックが空**」の意味である。
+
+**測定の限界を 2 つ明記しておく。**
+
+1. **`(idle/other)` の内訳は分離していない。** このバケットに入るのは 882-891 行
+   （`compute_opd_data_metrics` ×2 / timing / throughput / `logger.log`）と
+   `next()`（バッチ準備）の 2 つで、どちらが支配的かは測っていない。
+   `_timer("batch_wait")` を `next()` に巻けば確定する。
+   なお 859-880 行は `step` とラベルされるはずのところ、`step` phase は 3 step とも
+   **0 サンプル**だったので、0.3 s 未満として候補から外れる。
+2. **`(idle/other)` の値そのものの誤差が ±0.3 s ある。** 同じ表の `cpu%` が
+   `update_actor` の 4 に対して **100**、つまりドライバの Python が 1 コアを
+   占有していてサンプラースレッドがスケジュールされない。interval 0.1 s に対し
+   実際の `dt` は約 0.3 s で、飛んだ区間は「採取できた時点の phase」に丸ごと
+   計上される。**測ろうとしている量と同じ桁の帰属誤差**である。
+
+それでもこの節の結論は変わらない。誤差を最も悲観的に取って 0.9 s としても
+転送と合わせて 1.84 s = 0.44%。**精度が足りない測定でも、桁が 2 つ違えば
+判断には十分**というのがここでの理屈である。
 
 この過程で 2 回誤診している（後述）。教訓は **「グラフで目立つ = 効く」ではない**、
 および **落ち込みの幅ではなく面積を見る**。
@@ -151,22 +189,86 @@ A40 と同じ GA102 なので 154.8 TFLOPS（BF16 dense tensor）を追加した
 
 | # | 機構 | 効果 | 精度への影響 | commit |
 |---|---|---|---|---|
-| 1 | FSDP ZeRO-2（`shard_grad_op`） | forward→backward 間の再 all-gather 除去 | 中立 | `cb60d7b` |
-| 2 | `no_sync` 勾配蓄積 | **−45 s/step** | 丸め順序のみ | `154e8dd` |
-| 3 | `forward_prefetch` | all-gather 発行の前倒し | 中立 | `960a16a` `ebd67d2` |
+| 1 | FSDP ZeRO-2（`shard_grad_op`） | 層あたり 3 回の all-gather を 1 回に | 中立 | `cb60d7b` |
+| 2 | `forward_prefetch` | all-gather 発行の前倒し | 中立 | `960a16a` `ebd67d2` |
+| 3 | `no_sync` 勾配蓄積 | **−45 s/step** | 丸め順序のみ | `154e8dd` |
 | 4 | メトリクス遅延集約 | **−13.5 s/step** | 中立（かつバグ修正） | `65797f7` |
 | 5 | pool の shard 分割ロード | ピーク 360 GiB → 常駐+最大 shard | 完全同一 | `360317a` |
 | 6 | pool のオフラインキャッシュ | 339.5 → 136.5 GiB、起動から 79 分削除 | ビット同一 | `47fb1e6` |
 | 7 | バッチ prefetch | dispatch と計算の重畳 | ビット同一 | 既存機構 |
 
-### 3.1 `no_sync` 勾配蓄積（最大の効果）
+1〜3 は FSDP の通信、4 は CPU-GPU 同期、5〜7 はデータ供給。**互いに独立ではなく、
+特に 1 と 3 は片方だけでは意味が変わる**（3.3 節）。
 
-`gradient_accumulation=2` のとき、既定の FSDP は micro-batch ごとに勾配を
-reduce-scatter する。つまり mini-batch あたり 2 回。
-FSDP の `no_sync()` を最後の micro-batch 以外に掛ければ 1 回で済む。
+以下、機構ごとに「何を変えたか / なぜ効くか / 実装 / 効果 / 精度 / 注意点」で記す。
 
-これは通信回数を半減させるだけだと思っていたが、実際には **forward も速くなった**
-（115 → 93.6 s）。理由を torch 2.13 のソースで確認した。
+### 3.1 FSDP ZeRO-2（`sharding_strategy=shard_grad_op`）
+
+**何を変えたか。** FSDP の既定は 1 次元メッシュで `FULL_SHARD`（ZeRO-3）。これを
+`SHARD_GRAD_OP`（ZeRO-2）に変えた。`verl/workers/fsdp_workers.py:88` の
+`get_sharding_strategy` に config からの上書きを足してある（既定は変えていない）。
+
+**なぜ効くか。** ZeRO-3 はパラメータを常時シャードで持ち、使う直前に all-gather して
+使い終わったら即座に捨てる。gradient checkpointing が有効だと、1 つの層は
+1 micro-batch あたり **3 回**触られる:
+
+1. forward
+2. backward 前の再計算（checkpoint の復元）
+3. backward 本体
+
+ZeRO-3 では 3 回とも all-gather が要る。ZeRO-2 は forward の後に reshard しないので
+**1 回で済む**。残る集団通信は勾配の reduce-scatter だけになる。
+
+**効果。** 単独では測っていない（`cb60d7b` は計測基盤を入れる前）。ただし 3.3 節の
+`no_sync` が forward まで速くした理由がこの設定に依存しているので、実質的には
+セットで −45 s に寄与している。
+
+**精度。** 中立。all-gather はバイトを動かすだけで、forward / backward のカーネルが
+見る入力は同一。勾配も同じ `reduce_dtype` の同じ reduce-scatter で縮約される。
+
+**代償。** メモリ。パラメータが micro-batch の backward の間ずっと unsharded で
+居座るので、ピークが「unsharded パラメータ − そのシャード」ぶん増える。
+1.7B・bf16 なら 3.4 GB × (1 − 1/3) ≈ **+2.3 GB**。
+
+**注意点。** 勾配経路に乗る設定なので、性能ノブでありながら
+`expected_multitask_sft_config.yaml` に記載した。run の同一性が
+このファイルから見えない場所に依存すべきではないため。
+
+### 3.2 `forward_prefetch`
+
+**何を変えたか。** FSDP のコンストラクタ引数 1 つ。`fsdp_workers.py:376`（actor）と
+`:1130`（critic）で config から読むようにした。既定は upstream どおり `False`。
+
+```python
+forward_prefetch=bool(fsdp_config.get("forward_prefetch", False)),
+```
+
+**なぜ効くか。** 既定では、FSDP ユニット N の計算が終わってからユニット N+1 の
+all-gather を発行する。つまり通信と計算が直列になる。`forward_prefetch=True` は
+**N の計算中に N+1 の all-gather を発行する**ので、通信が計算の裏に隠れる。
+
+NVLink があれば通信が短いので効果は小さいが、**この構成は PCIe（しかも一部は
+UPI 越え、2.4 節）なので隠す価値のある長さがある**。
+
+**効果。** 単独では測っていない。487 s の測定時点で既に有効だったため、
+それ以降の比較には現れない。
+
+**精度。** 中立。all-gather の発行タイミングが変わるだけで、演算も通信内容も同一。
+
+**注意点。** レポート 5 節 ③ に書いたとおり、これを「未検証の改善案」として提示した
+のは誤りだった。**測定済み構成の内容を把握していなかった**ことによる。
+
+### 3.3 `no_sync` 勾配蓄積（最大の効果）
+
+**何を変えたか。** `gradient_accumulation` 個の micro-batch のうち、**最後以外を
+FSDP の `no_sync()` の中で回す**ようにした。`actor_rollout_ref.actor.no_sync_grad_accum=True`
+で有効、既定は `False`。
+
+**なぜ効くか（表層）。** 既定の FSDP は micro-batch ごとに勾配を reduce-scatter する。
+`gradient_accumulation=2` なら mini-batch あたり 2 回。`no_sync` を掛ければ **1 回**で済む。
+
+**なぜ効くか（実際）。** 上の説明だけなら backward しか速くならないはずだが、実測では
+**forward も 115 → 93.6 s に縮んだ**。理由を torch 2.13 のソースで確認した。
 
 ```python
 # torch/distributed/fsdp/_runtime_utils.py
@@ -184,6 +286,10 @@ def _should_free_in_backward(state, handle) -> bool:
 **パラメータが unsharded のまま残る**。したがって次の micro-batch は all-gather を
 やり直さない。**reduce-scatter だけでなく all-gather も半減する。**
 
+**これは 3.1 節の ZeRO-2 に依存している。** ZeRO-3 のままだと
+`_should_free_in_backward` の第 2 項が真になり、`no_sync` 中でも reshard されるので
+all-gather は減らない。**1 と 3 は組み合わせて初めてこの効果になる。**
+
 さらに `_post_backward_hook` を読むと:
 
 ```python
@@ -195,12 +301,11 @@ if not state._sync_gradients:
 ```
 
 `flat_param.grad` が **unsharded のまま累積される**。1.7B・bf16 なら
-sharded 1.13 GB → unsharded 3.4 GB、差し引き **約 +2.3 GB** のメモリと引き換え。
-これが後の OOM の一因になり、micro batch を 5 に下げる判断につながった。
+sharded 1.13 GB → unsharded 3.4 GB、差し引き **約 +2.3 GB**。
 
-実装は `dp_actor.py` の `_grad_sync_context`。FSDP1 の `no_sync()` は
-`TrainingState.IDLE` を要求するので backward だけを包むことができず、
-micro-batch の**境界**で enter / exit する必要がある。
+**実装上の制約。** FSDP1 の `no_sync()` は `TrainingState.IDLE` を要求する。forward が
+モジュールを `FORWARD_BACKWARD` に移してしまうので、**backward だけを包むことは
+できない**。micro-batch の**境界**で enter / exit する必要がある。
 
 ```python
 if self.no_sync_grad_accum:
@@ -213,43 +318,152 @@ if self.no_sync_grad_accum:
         accum_ctx = None
 ```
 
-**演算的には中立ではない。** unsharded の micro-batch 勾配を先に足してから 1 回
-reduce-scatter するので、shard ごとに reduce-scatter して足す場合と浮動小数点の
-結合順序が変わる。差は丸め誤差レベルだが、勾配の作り方が変わる以上
-`expected_multitask_sft_config.yaml` に載せた。
+`_grad_sync_context` は FSDP1 なら `module.no_sync()`、FSDP2 なら
+`_fsdp2_no_sync(module)`、どちらでもなければ `None` を返す。`None` のときに
+enter を丸ごと飛ばせるよう、yield ではなく return にしてある。
+`update_policy` の入口で `_sync_gradients = True` に戻す防御も入れた（前 step が
+例外で抜けた場合に備えて）。
 
-### 3.2 メトリクス遅延集約（ついでにバグ修正だった）
+**効果。** fwd −21.4 s、bwd −23.4 s、合わせて **−45 s/step**。
+ここから all-gather 総量 ≈ 43 s（fwd の 37%）、reduce-scatter 総量 ≈ 47 s
+（bwd の 15%）と逆算できる。
 
-`actor/sft_loss` 等の per-task メトリクスを micro-batch ループの中で `.item()` して
-いたため、micro-batch ごとに CPU-GPU 同期が入っていた。`torch.Tensor` のまま溜めて
-最後に 1 回 `torch.stack(...).mean().item()` する形に変えた。−13.5 s。
+**精度。** **中立ではない。** unsharded の micro-batch 勾配を先に足してから 1 回
+reduce-scatter するので、シャードごとに reduce-scatter して足す場合と浮動小数点の
+結合順序が変わる。差は丸め誤差レベルで期待値は同一だが、勾配の作り方が変わる以上
+`expected_multitask_sft_config.yaml` に記載した。
 
-**同時に実害のあるバグが直った。** `actor/sft_loss_weighted` はループ内で
-**代入**していたので最後の micro-batch の値しか残らない。
-`_balance_batch` の並べ替え後、最後の micro-batch は adjust_batch の padding 行
-（重み 0）だけになることが多く、**0.000 が記録され続けていた**。
-padding が 3 行しかなかった step 5 でだけ 0.492 が出て、それで気づいた。
+**注意点。** +2.3 GB が後の OOM の一因になり、micro batch を 5 に下げる判断に
+つながった（8 節）。**OOM が出たら最初に戻すべきノブ**である。
+
+### 3.4 メトリクス遅延集約
+
+**何を変えたか。** `actor/sft_loss` などの per-task メトリクスを micro-batch ループの
+中で `.item()` していたのを、`torch.Tensor` のまま溜めて最後に 1 回だけ読むように変えた。
+
+```python
+deferred_metrics = {}
+
+def _defer(name, value):
+    deferred_metrics.setdefault(name, []).append(value.detach())
+
+# ... ループの外で
+{name: torch.stack(values).mean().item() for name, values in deferred_metrics.items()}
+```
+
+**なぜ効くか。** `.item()` は GPU → CPU の同期点である。呼ぶたびに CPU が
+「そこまでのカーネルが全部終わる」のを待つので、**CPU が先回りしてカーネルを
+積んでおけなくなる**。micro-batch ごとに数個ずつ呼んでいたので、step あたり
+数百回の同期が入っていた。
+
+**効果。** `actor.task_metrics` が 33 → 19.5 s（**−13.5 s**）。加えて `actor.fwd` の
+`idle%` が 0.8、`maxGap` が 0.6 s まで下がった（同期が消えて CPU が先行できるように
+なったぶん）。fwd/bwd の短縮のうちどれだけがこれによるものかは分離していない。
+
+**副産物 — 実害のあるバグが直った。** `actor/sft_loss_weighted` はループ内で
+**代入**していたので最後の micro-batch の値しか残らない。`_balance_batch` の
+並べ替え後、最後の micro-batch は adjust_batch の padding 行（重み 0）だけに
+なることが多く、**0.000 が記録され続けていた**。padding が 3 行しかなかった step 5 で
+だけ 0.492 が出て、それで気づいた。
 
 「メトリクスがゼロ」を書式の問題だと思い込みかけたが、実際には集計の欠陥だった。
 
-### 3.3 pool の扱い（起動時間とホスト RAM）
+**精度。** 中立。学習には一切影響しない（ログの値が正しくなっただけ）。
 
-Stage 1 の出力は 90 shard・339.5 GiB。これを毎回読んで、adjust_batch の padding 行と
-この arm の損失が読まない列（`prompts` / `response_mask` / `teacher_topk_*`）を捨てて
-136.5 GiB にしていた。**毎起動・毎再起動で 2.4 倍のディスク I/O と unpickle を払っていた。**
+### 3.5 pool の shard 分割ロード
 
-- **shard を concat しない**（`360317a`）: 軌跡 → (shard 番号, 行番号) の索引を持ち、
-  抽選時に必要な shard からだけ `select_idxs` する。ピークが
-  「常駐 + 全体のコピー」から「常駐 + 最大 shard（3.8 GiB）」になった。
-- **フィルタを 1 回だけ行う**（`47fb1e6`, `scripts/cache_teacher_pool.py`）:
-  トレーナがメモリ上に作るのと同じ DataProto をそのままディスクに書く。
-  入力 1 ファイルにつき出力 1 ファイル、同じ basename・同じ行順なので
-  `sorted(glob)` の順序が変わらず、**軌跡の抽選列がビット単位で同一**
-  （`tests/trainer/test_cache_teacher_pool.py` で 5 step 分をテンソル比較して確認）。
-  79 分が起動から消えた。
+**何を変えたか。** タスクごとに全シャードを 1 つの DataProto に `concat` していたのを
+やめ、**シャードのリストのまま保持して索引で引く**ようにした。
 
-キャッシュは arm 固有（SFT 版には top-k が無い）なので `_cache_manifest.json` に
-arm を記録している。
+```python
+self._task_shards[task]              # [DataProto, ...] 30個
+self._task_to_traj_rows[task][uid]   # (shard_idx, np.array([行番号...]))
+```
+
+**なぜ必要だったか。** `concat` の最中は「元の 30 個」と「結合後の 1 個」が同時に
+存在する。36,000 軌跡では **ピーク約 360 GiB**、ホスト RAM 515 GB に対して危険域だった。
+
+**実装。** `_gather_trajs`（`opd_offpolicy_ray_trainer.py:557`）が、必要なシャードから
+だけ行を抜いて抽選順に並べ直す。
+
+```python
+order = np.argsort(shard_of, kind="stable")      # シャードごとにまとめる
+parts = [shards[int(s)].select_idxs(row_of[order[ordered_shard == s]].tolist())
+         for s in np.unique(ordered_shard)]
+merged = DataProto.concat(parts)
+return merged.select_idxs(np.argsort(order, kind="stable").tolist())   # 抽選順に戻す
+```
+
+**最後の 1 行が本質。** シャード別に集めると行がシャード順に並び、`adjust_batch` が
+複製する行も `_balance_batch` の分割位置も変わってしまう。順序を戻すことで
+**「同等」ではなく「同一」**になり、プールがディスク上でどう分割されていようと
+下流から区別できない。代償は step バッチ（数千行）1 個ぶんの追加コピー。
+
+**効果。** ピーク 360 GiB → **常駐 136.5 + 最大シャード 3.8 = 140.4 GiB**。
+
+**精度。** 完全同一。
+
+### 3.6 pool のオフラインキャッシュ
+
+**何を変えたか。** 起動のたびにやっていたフィルタを 1 回だけ実行してディスクに置く
+`scripts/cache_teacher_pool.py` を追加した。
+
+**なぜ必要だったか。** トレーナは読み込み直後に 2 種類のものを捨てていた。
+
+- **padding 行** — 生成時の `adjust_batch` が既存行を複製して足したもの。残すと
+  同じ turn を 2 回学習する
+- **使わない列** — `prompts`（4096 列、on-policy のダンプ専用）、`response_mask`
+  （`attention_mask` から再計算できる）、`teacher_topk_logprobs` / `teacher_topk_ids`
+  （KD の損失専用、SFT の NLL は読まない）
+
+339.5 GiB 読んで 136.5 GiB しか使わない。**捨てる 203 GiB を毎起動・毎再起動で
+読んで unpickle していた**（79 分）。
+
+**実装。** トレーナがメモリ上に作るのと同じ DataProto を、そのまま
+`save_to_disk` する。トレーナ側は変更なし — キャッシュを読むと
+「padding 行 0 件、落とす列なし」と判定してそのまま通す。
+
+**なぜ結果が変わらないか。** 入力 1 ファイルにつき出力 1 ファイル、**同じ basename・
+同じ行順**。したがって `sorted(glob)` が同じ順序を返し、軌跡の抽選母集団
+（＝ファイルを順に見て初めて出会った順）が変わらない。
+`tests/trainer/test_cache_teacher_pool.py` が両 arm・5 step 分をテンソル比較して確認。
+
+**効果。** 起動から **79 分が消えた**。ディスク 339.5 → 136.5 GiB（0.40x）。
+
+**注意点。** キャッシュは **arm 固有**。SFT 版には top-k が無いので KD run が読むと
+壊れる。`_cache_manifest.json` に arm を記録してある。
+また、トレーナは `data_dir` の `*.pt` を無条件に glob するので、**別 run のシャードが
+紛れ込むと静かに混ざる**（`traj_uid` の重複検査は別 run の軌跡を素通りさせる）。
+`--only <task>` は再構築時に source に無い出力を削除する。
+
+### 3.7 バッチ prefetch
+
+**何を変えたか。** step k+1 の抽選と `_prepare_batch` を、step k の `update_actor` の
+裏でバックグラウンドスレッドに実行させる。`OFFPOLICY_BATCH_PREFETCH=1`。
+
+**なぜ効くか。** `update_actor` は blocking な `ray.get` であり、**GIL を持たない**。
+その間 Python スレッドは自由に動ける。
+
+**実装**（`_prepared_batch_iter`）。深さ 1 の `queue.Queue` と `Semaphore(1)`。
+
+```python
+room.release()      # バッチを使う前に解放 → 次のバッチが update_actor 中に作られる
+```
+
+`room` を「バッチを yield する前」に解放しているのが要点で、後にすると次の準備が
+`update_actor` の後ろにずれる。
+
+**ビット同一性の根拠。** 準備スレッドは 1 本だけ・深さ 1 なので、抽選も準備も
+**step 順に、単一スレッドで**実行される。したがって乱数列（`default_rng(data.seed)` と
+global numpy RNG）の消費順が逐次実行と同じになる。
+
+**効果。** **未測定。** `update_actor` の外側の総時間が 1 秒未満、という上限しか
+分かっていない（2.2 節）。`_timer("batch_wait")` を `next()` に巻けば確定する。
+
+**注意点。** 準備済みバッチがもう 1 つメモリに載る。数千行なので数百 MB。
+また `d1750e5` の resume 対応は、**prefetch スレッドを作る前に**replay を走らせる
+必要がある（replay が両方の RNG 列の唯一の消費者である間に、step 順で終わらせる
+ため）。
 
 ---
 
@@ -342,6 +556,18 @@ position を右パディングを突き抜けて振り続ける（`vllm_rollout_
 | 300 step の想定所要 | 40.6 時間 | 34.6 時間 |
 
 **−15%。** うち no_sync が −45 s、メトリクス遅延集約が −13.5 s。
+
+**この分解は推論であって測定ではない。** 2 つは同じ run で同時に入ったので、
+「task_metrics の −13.5 s は遅延集約、fwd/bwd の −45 s は no_sync」という帰属は
+機構から説明が付くというだけである。分離するには
+`++actor_rollout_ref.actor.no_sync_grad_accum=False` で数 step 走らせて比べればよい
+（20 分程度）。
+
+**前後で `sm%` は比較していない。** 改良前の run の phase 表は残していないが、
+取っていたとしても使えない。`sm_util` は NCCL のカーネルも busy に数えるので、
+集団通信を減らす改良は **busy 率ではなく busy な時間そのもの**を削る（2.1 節）。
+前後ともほぼ 98% になることが期待され、差は出ない。本来これを示すべき指標は MFU だが、
+両方の run で分母のバグにより 0.000 だった（2.5 節）。`3d21864` 以降は使える。
 
 残っている余地は response-only lm_head の −20〜30 s 程度で、
 それを入れても 1.2 倍には届かない。**通信律速の下限（2.4 節）がすぐそこにある。**
