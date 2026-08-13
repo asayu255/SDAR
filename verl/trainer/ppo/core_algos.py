@@ -118,6 +118,7 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: str = True,
     compute_mean_std_cross_steps: bool = True,
+    padding_mask: torch.Tensor = None,
 ):
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -132,8 +133,17 @@ def compute_grpo_outcome_advantage(
             If True, the advantage is scaled by the std, as in the original GRPO.
             If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
         compute_mean_std_cross_steps: bool
-            If True (more stable), the mean and std are computed across steps within one group. 
+            If True (more stable), the mean and std are computed across steps within one group.
             If False (i.e., standard episode-level adv), the mean and std are computed across trajectories within one group.
+        padding_mask: `(torch.Tensor)` or None
+            shape is (bs,). True for the rows ``adjust_batch`` appended as copies
+            to reach a DP/micro-divisible count. Those rows carry their original's
+            uid, so leaving them in would count one trajectory-turn twice when the
+            group's mean/std is formed -- and that mean/std is what every REAL row
+            of the group is then measured against. They are excluded from the
+            statistic here and still receive an advantage below, computed from the
+            statistic their originals produced. ``None`` reproduces the previous
+            behaviour exactly.
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -150,6 +160,12 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
+            # adjust_batch's copies carry their original's uid; counting them here
+            # would move the yardstick every REAL row of the group is measured
+            # against. They still get an advantage below, from their original's
+            # statistic.
+            if padding_mask is not None and bool(padding_mask[i]):
+                continue
             if (index[i], traj_index[i]) in seen_pairs:
                 continue
             id2score[index[i]].append(scores[i])
