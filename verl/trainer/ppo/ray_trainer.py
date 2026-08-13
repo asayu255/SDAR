@@ -67,6 +67,7 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
+from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 WorkerType = Type[Worker]
 
@@ -280,6 +281,68 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def assert_grpo_groups_are_one_prompt(data: DataProto) -> None:
+    """A GRPO group must be the rollouts of ONE prompt. Check that it still is.
+
+    ``uid`` is assigned by POSITION, not by content: ``vanilla_multi_turn_loop``
+    starts a new uid every ``env.rollout.n`` rows and never looks at what is in
+    them. That is only correct because three separate things agree --
+
+      * the env workers are seeded ``seed + (i // group_n)``, so each block of
+        ``group_n`` consecutive environments is the same game instance;
+      * ``gen_batch.repeat(..., interleave=True)`` expands one prompt into
+        ``group_n`` ADJACENT rows rather than striding;
+      * ``env.rollout.n`` and the env manager's ``group_n`` are the same number.
+
+    Break any one and the groups silently become blends of unrelated prompts --
+    possibly of different tasks. Nothing raises: GRPO keeps normalising each row
+    against a meaningless baseline, the loss stays finite, and the metrics look
+    ordinary. This is the cheapest structural evidence that the agreement holds.
+
+    Two invariants, both derived from the batch itself so no config is needed:
+
+    1. every uid carries exactly one ``task_name``. A group spanning tasks is the
+       catastrophic form of the failure and cannot be a legitimate layout.
+    2. every uid covers the same number of distinct ``traj_uid``. Group sizes are
+       uniform by construction -- ``filter_group_data`` keeps or drops WHOLE
+       groups, and ``adjust_batch``'s copies share their original's traj_uid, so
+       neither changes the count.
+
+    A no-op on recipes without those columns (plain verl has no task_name), which
+    is also where the positional convention does not apply.
+    """
+    non_tensor = data.non_tensor_batch
+    if "uid" not in non_tensor or "traj_uid" not in non_tensor or "task_name" not in non_tensor:
+        return
+
+    uid = non_tensor["uid"]
+    task = non_tensor["task_name"]
+    traj = non_tensor["traj_uid"]
+
+    tasks_per_uid = defaultdict(set)
+    trajs_per_uid = defaultdict(set)
+    for i in range(len(uid)):
+        tasks_per_uid[uid[i]].add(task[i])
+        trajs_per_uid[uid[i]].add(traj[i])
+
+    mixed = {u: sorted(t) for u, t in tasks_per_uid.items() if len(t) > 1}
+    assert not mixed, (
+        f"GRPO group spans more than one task: {dict(list(mixed.items())[:3])}. "
+        f"uid is assigned by position (a new group every env.rollout.n rows), so "
+        f"this means the row order no longer matches the env layout -- check that "
+        f"env.rollout.n equals the env manager's group_n and that gen_batch.repeat "
+        f"still uses interleave=True."
+    )
+
+    sizes = {len(t) for t in trajs_per_uid.values()}
+    assert len(sizes) == 1, (
+        f"GRPO groups have different numbers of trajectories: {sorted(sizes)}. "
+        f"Groups are uniform by construction (filter_group_data keeps or drops "
+        f"whole groups; adjust_batch's copies reuse their original's traj_uid), so "
+        f"a mix means the positional grouping has drifted from the env layout."
+    )
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
     """Compute advantage estimates for policy optimization.
 
@@ -326,6 +389,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             # If multi-turn, replace the mask with the relevant part of loss_mask
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
+        assert_grpo_groups_are_one_prompt(data)
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -333,6 +397,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             index=data.non_tensor_batch["uid"],
             traj_index=data.non_tensor_batch['traj_uid'],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            # Absent when the batch was already divisible, which is the same thing
+            # as "no copies were added".
+            padding_mask=data.batch.get(PADDING_ROW_KEY, None),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
