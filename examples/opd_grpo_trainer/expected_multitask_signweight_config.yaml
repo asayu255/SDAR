@@ -1,0 +1,185 @@
+# Expected effective config for the OPD+GRPO multitask run WITH cross-teacher
+# sign weighting (examples/opd_grpo_trainer/run_multitask_signweight_qwen3.sh).
+#
+# This file is the machine-readable INTENT of the experiment. main_opd_grpo
+# validates the composed Hydra config against every key below AFTER its own
+# config injection (verl/utils/expected_config.py) and aborts on any mismatch,
+# so a wrong default / typo'd override / shadowed injection fails in seconds
+# instead of producing a mislabeled multi-hour run.
+#
+# Rules:
+#   - Keys are dotted paths into the composed config; values are the expected
+#     effective values.
+#   - Only SCIENTIFIC knobs live here (they define what the experiment *is*).
+#     Performance knobs (micro batch sizes, offload, prefix caching,
+#     max_model_len, gpu_memory_utilization, ...) are intentionally NOT listed
+#     so machine tuning never requires touching this file.
+#   - To change a setting intentionally: edit the run script AND this file in
+#     the same commit. A run-script-only edit will (by design) refuse to start.
+
+"algorithm.opd.kl_loss_type": topk_kl
+# Matches examples/grpo_opsd_trainer, the repo's other "GRPO policy gradient plus
+# an on-policy distillation term" run: every script there sets sdar_coef=0.01 and
+# leaves pg_loss_coef at the 1.0 default, and its distillation-only sibling
+# (examples/opsd_trainer) keeps sdar_coef=0.01 while setting pg_loss_coef=0. So in
+# that family the distillation coefficient is the same whether or not the policy
+# gradient is on, and pg_loss_coef alone distinguishes the arms.
+#
+# OPD was the one family not following that rule: it ran the teacher KL at 1.0 in
+# both the pure and the combined arm, which made the combined arm a sum of two
+# full-strength objectives. 0.01 here restores the parallel -- pure OPD keeps 1.0,
+# this arm regularises with the same 0.01 grpo_opsd uses.
+#
+# Worth measuring rather than trusting: topk_kl is a dense reverse KL over k=20,
+# a different quantity from the SDAR loss 0.01 was picked for. Pinned because it
+# decides what the experiment is, not because it is settled -- read
+# actor/pg_loss_weighted against actor/teacher_kl_loss_weighted at step 1 and
+# change this together with the run script if the ratio is not what was wanted.
+"algorithm.opd.kl_loss_coef": 0.01
+"algorithm.opd.topk": 20
+# Per-task normalisation of the loss. The plain token-mean weights a task by its
+# share of response tokens, measured at 69/27/4% for alfworld/webshop/search on
+# this mixture purely because of the 50/15/4-turn episode caps; the per-row
+# weights in attach_task_loss_weights make it 1/3 each. On this arm it applies to
+# the GRPO policy gradient as well as the teacher KL -- weighting only one of them
+# would silently change their ratio, which pg_loss_coef is supposed to control.
+# Data composition, batch sizes and step count are untouched, so this arm still
+# differs from the pure-OPD, SFT and offline-KD arms in nothing but the loss --
+# which is exactly why it is pinned: the arms must agree on it or the comparison
+# confounds the objective with the task weighting.
+"algorithm.opd.normalize_loss_by_task": true
+# effective values after main_opd_grpo's injection into the actor config
+"actor_rollout_ref.actor.use_teacher_kl_loss": true
+"actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
+"actor_rollout_ref.actor.teacher_kl_loss_coef": 0.01
+"actor_rollout_ref.actor.teacher_kl_topk": 20
+"actor_rollout_ref.actor.normalize_loss_by_task": true
+
+# ---- GRPO side ----------------------------------------------------------------
+"algorithm.adv_estimator": grpo
+"algorithm.use_kl_in_reward": false
+"actor_rollout_ref.actor.pg_loss_coef": 1.0
+"actor_rollout_ref.actor.use_kl_loss": false
+"actor_rollout_ref.actor.entropy_coeff": 0
+"actor_rollout_ref.actor.use_sdl_loss": false
+"actor_rollout_ref.actor.use_sdar_loss": false
+"actor_rollout_ref.actor.use_invalid_action_penalty": true
+"actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
+"actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
+  alfworld: 0.1
+  search: 0.01
+  webshop: 0.1
+
+# ---- teachers -------------------------------------------------------------------
+"algorithm.opd.teacher_paths.alfworld": "$HOME/checkpoints/teachers/alfworld_step300"
+"algorithm.opd.teacher_paths.search": "$HOME/checkpoints/teachers/search_step300"
+"algorithm.opd.teacher_paths.webshop": "$HOME/checkpoints/teachers/webshop_step300"
+
+# ---- model / optimization -------------------------------------------------------
+"actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
+"actor_rollout_ref.actor.optim.lr": 1.0e-6
+"actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
+"actor_rollout_ref.actor.ppo_mini_batch_size": 60
+# Throughput knobs that nonetheless sit on the GRADIENT path, so they are pinned
+# here even though the rule above exempts performance settings. ZeRO-2 is
+# arithmetic-neutral; no_sync_grad_accum reduces once per mini-batch instead of
+# once per micro-batch, which reorders the partial sums (same expectation,
+# different last bits). Neither may change silently between runs.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+"actor_rollout_ref.actor.no_sync_grad_accum": true
+
+# ---- data -----------------------------------------------------------------------
+"data.train_batch_size": 45
+"data.val_batch_size": 126
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.enable": true
+"data.task_balance.per_task_batch_size": 15
+"data.task_balance.num_batches": 300
+"data.task_balance.tasks": [alfworld, search, webshop]
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment ------------------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 1
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.tasks": [alfworld, search, webshop]
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+"env.multitask.val_per_task_batch_size": 126
+# On an exhausted retry budget the client does NOT fail the run: the error text is
+# substituted for the retrieved document and becomes the <information> block the
+# model sees, with nothing in the metrics to say so. That makes the retry policy a
+# property of the DATA, which is why it is pinned here rather than left with the
+# performance knobs. max_retries: null retries a timeout / refused connection / 5xx
+# until the retriever answers, so no turn can be trained on an error string; 4xx and
+# malformed JSON still fail at once, since waiting cannot turn those into a document.
+#
+# timeout is generous but finite on purpose. null would also wait, but a connection
+# that dies without being closed (a retriever restart) then blocks forever with
+# nothing to detect it -- and the rollout's turn barrier waits on the slowest env, so
+# one dead socket stalls every trajectory in the step. A finite timeout turns that
+# into one more retry against the restarted server.
+"env.search.timeout": 600
+"env.search.max_retries": null
+
+# ---- rollout sampling / validation protocol ----------------------------------------
+"actor_rollout_ref.rollout.temperature": 1.0
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
+
+# ---- cross-teacher sign weighting ------------------------------------------------
+# The only thing that differs from expected_multitask_config.yaml. Pinned because
+# it defines what this arm IS: with enable=false the run is byte-for-byte the plain
+# OPD+GRPO arm, so an accidental false here would silently produce a duplicate of
+# the control under this arm's name.
+"algorithm.opd.sign_weight.enable": true
+# position: per-token weight on the KL; the target stays the on-task teacher, so
+#   the fixed point is unchanged and the mechanism can only reallocate learning.
+# target:   the teacher's top-k distribution is reweighted and renormalised, moving
+#   the fixed point to ~ w(v)*p_teacher(v).
+# These are different scientific claims, not a tuning knob -- read the arm's name
+# against this value before believing a result.
+"algorithm.opd.sign_weight.mode": position
+# Symmetric on purpose: 1 +- 0.25. An asymmetric pair (trusting a teacher's
+# endorsement more than its rejection, as SDAR argues) is defensible but would make
+# the mean weight depend on which states are common, which is one more thing to
+# separate from the effect being measured.
+"algorithm.opd.sign_weight.agree_weight": 1.25
+"algorithm.opd.sign_weight.disagree_weight": 0.75
+# In nats. |log pi_m - log pi_0| below this counts as "task m's RL never touched
+# this token"; 0.1 is roughly a 10% change in the token's probability. This is the
+# knob the mechanism is most sensitive to, and it is set from reasoning rather than
+# measurement: read sign_weight/frac_neutral_* on the first step and change it here
+# together with the run script if nearly everything (or nearly nothing) is neutral.
+"algorithm.opd.sign_weight.deadzone": 0.1
+# The pre-RL policy the shifts are measured against. MUST be the checkpoint the
+# three teachers were fine-tuned from -- a different base makes delta the sum of
+# "what the task's RL did" and "how the two bases differ", and the sign then says
+# nothing about task-specific learning.
+"algorithm.opd.sign_weight.base_path": Qwen/Qwen3-1.7B
+
+# ---- run identity ------------------------------------------------------------------
+"trainer.total_training_steps": 300
+"trainer.project_name": verl_agent_opd_grpo_signweight_multitask
+# experiment_name is pinned as part of the run identity: renaming (or reusing a
+# name for a different config) requires touching this file next to the knobs.
+"trainer.experiment_name": sdar_multitask_opd_grpo_signweight_qwen3_1.7b

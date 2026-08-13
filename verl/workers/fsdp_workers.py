@@ -893,6 +893,39 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_ref_topk_log_prob_at_ids(self, data: DataProto):
+        """This model's log-probs at ids supplied by the caller, not its own top-k.
+
+        Used to put several frozen models on one support so their policy shifts
+        can be compared: the on-task teacher picks the ids, then the base policy
+        and the off-task teachers are scored on exactly those
+        (``verl/trainer/ppo/sign_weights.py``). The ids arrive per row in
+        ``data.batch["teacher_topk_ids"]``.
+        """
+        assert self._is_ref
+        assert "teacher_topk_ids" in data.batch, (
+            "compute_ref_topk_log_prob_at_ids needs teacher_topk_ids in the batch"
+        )
+        data = data.to(get_torch_device().current_device())
+
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            logprob = self.ref_policy.compute_topk_log_prob_at_ids(data=data)
+            output = DataProto.from_dict(tensors={"topk_logprobs_at_ids": logprob})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
+            self.ref_policy.actor_module._handle.reshard(True)
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         # only support save and load ckpt for actor

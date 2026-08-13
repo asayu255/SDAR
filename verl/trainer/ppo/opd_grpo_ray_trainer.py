@@ -302,6 +302,14 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     # tag rows with their task so the actor can split its metrics
                     self._attach_task_ids(batch)
 
+                    # ---- Cross-teacher sign agreement (no-op unless enabled) ----
+                    # After _attach_task_ids so the per-task normalisation can read
+                    # task_ids, and after the teacher forward so the on-task top-k
+                    # ids exist to score the other models on.
+                    if self.sign_weight_enabled:
+                        with _timer("sign_weight_forward", timing_raw):
+                            self.compute_sign_weights(batch, metrics=metrics)
+
                     with _timer("update_actor", timing_raw):
                         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable

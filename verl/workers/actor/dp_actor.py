@@ -32,6 +32,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_by_task_weights, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, compute_policy_loss_per_token, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
+from verl.trainer.ppo.sign_weights import SIGN_WEIGHT_KEY
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import gpu_profiler
@@ -620,6 +621,64 @@ class DataParallelPPOActor(BasePPOActor):
         return topk_logprob, topk_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_topk_log_prob_at_ids(self, data: DataProto):
+        """Frozen-model log-probs at token ids chosen by *another* model.
+
+        ``compute_topk_log_prob`` asks a teacher for its own top-k, which is the
+        right question when that teacher is the distillation target. Comparing
+        several models at a position needs the opposite: one shared set of ids
+        that every model is scored on, or the values are not commensurable. The
+        multitask sign-agreement weights (``verl/trainer/ppo/sign_weights.py``)
+        use the on-task teacher's top-k as that shared support and call this for
+        the base policy and the off-task teachers.
+
+        The ids ride in ``data.batch["teacher_topk_ids"]`` rather than in
+        ``meta_info`` because they are per row: they have to be split, and under
+        ``use_dynamic_bsz`` reordered, along with the sequences they belong to.
+
+        Returns:
+            (bs, response_length, k) full-vocab log-softmax at the given ids.
+        """
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "teacher_topk_ids"]
+        batch = data.select(batch_keys=select_keys).batch
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        assert not has_multi_modal_inputs, "top-k KL is not supported for multi-modal inputs"
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        else:
+            micro_batches = batch.split(micro_batch_size)
+
+        logprob_lst = []
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                _, _, topk_out = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    topk_ids=micro_batch["teacher_topk_ids"],
+                )
+            logprob_lst.append(topk_out)
+
+        logprob = torch.concat(logprob_lst, dim=0)
+        if use_dynamic_bsz:
+            indices = list(itertools.chain.from_iterable(indices))
+            assert len(indices) == logprob.size(0), f"{len(indices)} vs. {logprob.size()}"
+            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+            logprob = logprob[revert_indices]
+
+        return logprob
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -935,6 +994,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 ref_logprob=data["teacher_log_probs"],
                                 kl_penalty=teacher_kl_loss_type,
                             )
+                        if SIGN_WEIGHT_KEY in data:
+                            # Multitask cross-teacher sign agreement, "position"
+                            # mode (verl/trainer/ppo/sign_weights.py): a positive
+                            # per-token scalar, computed by the driver from the
+                            # frozen teachers and the base policy, that says how
+                            # hard to learn this position. It does not depend on
+                            # the student, so it scales the gradient without
+                            # moving what the loss is minimised by. The "target"
+                            # mode of the same mechanism needs nothing here: it
+                            # rewrites teacher_topk_logprobs upstream and reaches
+                            # the loss through the line above.
+                            teacher_kld = teacher_kld * data[SIGN_WEIGHT_KEY].to(teacher_kld.dtype)
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         if task_agg_scale is None:
