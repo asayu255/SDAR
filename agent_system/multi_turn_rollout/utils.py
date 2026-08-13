@@ -163,6 +163,12 @@ def compute_log_prob_with_prefetch(actor_rollout_wg, batch: DataProto, prefetche
     )
 
 
+# Column ``adjust_batch(mode="copy")`` writes to flag the rows it appended.
+# Present ONLY when padding was actually added -- a batch that was already
+# divisible returns unchanged, so readers must treat "absent" as "no padding".
+PADDING_ROW_KEY = "is_padding_row"
+
+
 def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
     world_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
     size_divisor_rollout = config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu * world_size
@@ -204,6 +210,20 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
         dup_proto = data.select_idxs(dup_indices)
 
         adjusted_batch = DataProto.concat([data, dup_proto])
+        # Mark which rows are the copies. This is the only place that knows, and
+        # the knowledge does not survive as a row *count*: _balance_batch reorders
+        # the batch before anything downstream reads it, so "index >= bs" stops
+        # meaning anything. A column moves with its rows through that reorder.
+        #
+        # What needs it: GRPO's group statistics. A copy carries its original's
+        # uid, so it lands in the same group and is counted a second time when the
+        # group mean/std is formed -- and that mean/std is then applied to the
+        # REAL rows of that group. Giving the copy weight 0 in the loss does not
+        # undo this: what was perturbed is the yardstick, not the copy's own
+        # contribution. See compute_grpo_outcome_advantage.
+        is_padding = torch.zeros(len(adjusted_batch), dtype=torch.bool)
+        is_padding[bs:] = True
+        adjusted_batch.batch[PADDING_ROW_KEY] = is_padding
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
