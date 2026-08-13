@@ -57,6 +57,10 @@ _ARMS = {
         os.path.join(_ARM_DIR, "run_multitask_signweight_qwen3.sh"),
         os.path.join(_ARM_DIR, "expected_multitask_signweight_config.yaml"),
     ),
+    "signweight_target": (
+        os.path.join(_ARM_DIR, "run_multitask_signweight_target_qwen3.sh"),
+        os.path.join(_ARM_DIR, "expected_multitask_signweight_target_config.yaml"),
+    ),
 }
 _SCRIPT, _LOCK = _ARMS["plain"]
 
@@ -107,7 +111,8 @@ def test_the_run_script_satisfies_the_intent_lock(arm, home, monkeypatch):
     assert mismatches == [], [f"{k}: config={got!r} expected={want!r}" for k, got, want in mismatches]
 
 
-def test_the_two_arms_differ_only_in_the_sign_weighting(monkeypatch):
+@pytest.mark.parametrize("arm", ["signweight", "signweight_target"])
+def test_each_weighted_arm_differs_from_the_control_only_in_the_weighting(arm, monkeypatch):
     """The comparison this branch exists to make.
 
     The sign-weighting arm is only a control-and-treatment pair with the plain
@@ -120,7 +125,7 @@ def test_the_two_arms_differ_only_in_the_sign_weighting(monkeypatch):
     home = "/opt/home/ohara"
     monkeypatch.setenv("HOME", home)
     plain = OmegaConf.to_container(_effective_config(home, _ARMS["plain"][0]), resolve=True)
-    signed = OmegaConf.to_container(_effective_config(home, _ARMS["signweight"][0]), resolve=True)
+    signed = OmegaConf.to_container(_effective_config(home, _ARMS[arm][0]), resolve=True)
 
     def flat(d, prefix=""):
         out = {}
@@ -186,17 +191,23 @@ def test_the_script_passes_every_key_the_lock_pins_for_this_arm(monkeypatch):
         assert OmegaConf.select(cfg, key) == want, key
 
 
-def test_the_sign_weight_script_passes_the_knobs_that_define_that_arm(monkeypatch):
-    """Same idea for the new arm: a key dropped from both script and lock would
-    pass the blanket check while silently turning the arm back into its control."""
+@pytest.mark.parametrize("arm,mode", [("signweight", "position"), ("signweight_target", "target")])
+def test_the_sign_weight_script_passes_the_knobs_that_define_that_arm(arm, mode, monkeypatch):
+    """Same idea for the new arms: a key dropped from both script and lock would
+    pass the blanket check while silently turning the arm back into its control.
+
+    ``mode`` is asserted per arm because it is the one knob whose value decides
+    which of the two claims the run is evidence for -- a target-mode result filed
+    under the position-mode name would be a different paper.
+    """
     home = "/opt/home/ohara"
     monkeypatch.setenv("HOME", home)
     from omegaconf import OmegaConf
 
-    cfg = _effective_config(home, _ARMS["signweight"][0])
+    cfg = _effective_config(home, _ARMS[arm][0])
     expected = {
         "algorithm.opd.sign_weight.enable": True,
-        "algorithm.opd.sign_weight.mode": "position",
+        "algorithm.opd.sign_weight.mode": mode,
         "algorithm.opd.sign_weight.agree_weight": 1.25,
         "algorithm.opd.sign_weight.disagree_weight": 0.75,
         "algorithm.opd.sign_weight.deadzone": 0.1,
