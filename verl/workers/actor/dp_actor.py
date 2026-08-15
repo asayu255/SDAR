@@ -138,6 +138,35 @@ def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: 
     return sel, indices[sel], seq_pos[sel] - lo
 
 
+def _supports_logits_to_keep(module) -> bool:
+    """Does the wrapped HF model's forward take ``logits_to_keep``?
+
+    Checked once at construction so ``response_only_logits`` fails at worker init
+    rather than in the first micro-batch. The model arrives wrapped (FSDP, and
+    possibly torch.compile), so unwrap to the module that actually defines
+    forward; the loop is bounded because a broken wrapper chain must not hang
+    startup.
+    """
+    import inspect
+
+    inner = module
+    for _ in range(8):
+        nxt = None
+        for attr in ("_fsdp_wrapped_module", "_orig_mod", "module"):
+            candidate = getattr(inner, attr, None)
+            if candidate is not None and candidate is not inner:
+                nxt = candidate
+                break
+        if nxt is None:
+            break
+        inner = nxt
+    try:
+        params = inspect.signature(inner.forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "logits_to_keep" in params or "num_logits_to_keep" in params
+
+
 def _grad_sync_context(module, active: bool):
     """FSDP's no_sync() for one micro-batch, or None when it does not apply.
 
@@ -212,11 +241,79 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+        # Run lm_head on the response rows only. Everything _forward_micro_batch
+        # returns is sliced to [:, -response_length-1:-1] before it leaves, so the
+        # prompt rows' logits are computed, materialized at (rows, vocab) and then
+        # dropped -- and on this mixture prompts are ~3x responses, so that is
+        # about three quarters of the vocab projection, forward and backward, plus
+        # the largest activation in the step. The transformer body still runs on
+        # every token (causal attention: a response position reads the prompt's
+        # KV); only the projection moves behind the row selection.
+        self.response_only_logits = bool(self.config.get("response_only_logits", False))
+        if self.response_only_logits:
+            if not self.use_remove_padding:
+                raise ValueError("response_only_logits requires use_remove_padding=True")
+            if self.use_fused_kernels:
+                raise ValueError("response_only_logits and use_fused_kernels are mutually exclusive")
+            if self.use_ulysses_sp:
+                raise ValueError("response_only_logits is not supported with ulysses sequence parallel")
+            if not _supports_logits_to_keep(actor_module):
+                raise ValueError(
+                    "response_only_logits needs a model whose forward accepts `logits_to_keep` "
+                    "with a tensor index (transformers >= 4.51 for Qwen3). Set it to False, or "
+                    "upgrade transformers. Failing here rather than silently falling back: the "
+                    "fallback is the slow path this flag exists to avoid."
+                )
+            print("Actor response_only_logits=True (lm_head on response rows only)")
+
+    def _topk_from_response_logits(
+        self, logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length, topk_k, topk_ids
+    ):
+        """Top-k distillation outputs from logits that already cover only the
+        response rows.
+
+        ``sel_indices`` are those rows' positions in the flattened (batch, seqlen)
+        grid, so ``pad_input`` scatters them straight back into the window the
+        caller slices. A window position missing from the packed batch (response
+        padding) is zero-filled, which is what the full-logits path produced there
+        too.
         """
+        lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
+        if topk_k is not None:
+            tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)  # (n_resp, k)
+            # Use float32 for pad_input: bf16 cannot represent vocab ids
+            # (>256) exactly, and float32 keeps log-probs precise.
+            t_lp_rmpad = (tvals - lse).float()
+            full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            return (
+                full_t_lp[:, -response_length - 1 : -1, :],
+                full_t_id[:, -response_length - 1 : -1, :].round().long(),
+            )
+        # Read topk_ids (bs, response_len, k) directly at each selected row's
+        # (sample, response-slot). The original path scattered it into a
+        # (bs, seqlen, k) zero tensor and gathered that back through `indices`,
+        # which is the same map computed the long way round.
+        ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
+        s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
+        full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
+        return full_s_lp[:, -response_length - 1 : -1, :]
+
+    def _forward_micro_batch(
+        self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, need_log_prob=True
+    ) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+        """
+        Args:
+            need_log_prob: when False the sampled-token log-prob is not computed and
+                ``None`` is returned in its place. Only honoured on the
+                ``response_only_logits`` path (elsewhere it is a by-product of work
+                that happens anyway). Pure top-k distillation never reads it: the KL
+                is built from the top-k gather, and with pg_loss_coef=0 /
+                use_kl_loss=False nothing else in update_policy touches it.
+
         Returns:
             entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+            log_probs: # (bs, response_len), or None when need_log_prob=False
             topk_out: optional top-k output for distillation KL. None unless
                 topk_k or topk_ids is given. When ``topk_k`` is set (teacher mode):
                 a tuple (topk_logprob, topk_ids) each (bs, response_len, k), where
@@ -286,6 +383,15 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                # Response-only vocab projection. `sel` indexes the packed rows that
+                # survive the final slice; handing it to the model as logits_to_keep
+                # makes lm_head run on those hidden states only. The transformer body
+                # is untouched -- it must still see every token.
+                resp_only = self.response_only_logits and not multi_modal_inputs
+                if resp_only:
+                    sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
+                    extra_args["logits_to_keep"] = sel
+
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -294,6 +400,52 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                if resp_only:
+                    # (n_resp, vocab): already restricted, so nothing below needs to
+                    # re-select. Values are identical to indexing the full logits --
+                    # lm_head is a per-position linear map, so selecting the rows
+                    # before or after it is the same arithmetic.
+                    logits_resp = output.logits.squeeze(0)
+                    logits_resp.div_(temperature)
+
+                    log_probs = None
+                    if need_log_prob:
+                        log_probs_resp = logprobs_from_logits(
+                            logits=logits_resp,
+                            labels=input_ids_rmpad_rolled[sel],
+                            inplace_backward=False,  # topk/entropy below read logits_resp
+                        )
+                        full_log_probs = pad_input(
+                            hidden_states=log_probs_resp.unsqueeze(-1),
+                            indices=sel_indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                        log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+
+                    if calculate_entropy:
+                        entropy_resp = self.compute_entropy_from_logits(logits_resp)
+                        full_entropy = pad_input(
+                            hidden_states=entropy_resp.unsqueeze(-1),
+                            indices=sel_indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                        entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+
+                    if topk_k is not None or topk_ids is not None:
+                        topk_out = self._topk_from_response_logits(
+                            logits_resp=logits_resp,
+                            sel_indices=sel_indices,
+                            sel_slot=sel_slot,
+                            batch_size=batch_size,
+                            seqlen=seqlen,
+                            response_length=response_length,
+                            topk_k=topk_k,
+                            topk_ids=topk_ids,
+                        )
+                    return entropy, log_probs, topk_out
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -372,29 +524,21 @@ class DataParallelPPOActor(BasePPOActor):
                     #
                     # Cost: one (n_resp, vocab) copy of the selected logits. It is a
                     # quarter of logits_rmpad, which is live either way.
+                    #
+                    # response_only_logits goes one step further and never builds the
+                    # prompt rows' logits at all; this path stays for the runs that
+                    # do not enable it (and for ulysses/multimodal, which it excludes).
                     sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
-                    logits_resp = logits_rmpad[sel]  # (n_resp, vocab)
-                    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
-                    if topk_k is not None:
-                        tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)  # (n_resp, k)
-                        # Use float32 for pad_input: bf16 cannot represent vocab ids
-                        # (>256) exactly, and float32 keeps log-probs precise.
-                        t_lp_rmpad = (tvals - lse).float()
-                        full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        topk_out = (
-                            full_t_lp[:, -response_length - 1 : -1, :],
-                            full_t_id[:, -response_length - 1 : -1, :].round().long(),
-                        )
-                    else:
-                        # Read topk_ids (bs, response_len, k) directly at each selected
-                        # row's (sample, response-slot). The old path scattered it into a
-                        # (bs, seqlen, k) zero tensor and gathered that back through
-                        # `indices`, which is the same map computed the long way round.
-                        ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
-                        s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
-                        full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        topk_out = full_s_lp[:, -response_length - 1 : -1, :]
+                    topk_out = self._topk_from_response_logits(
+                        logits_resp=logits_rmpad[sel],
+                        sel_indices=sel_indices,
+                        sel_slot=sel_slot,
+                        batch_size=batch_size,
+                        seqlen=seqlen,
+                        response_length=response_length,
+                        topk_k=topk_k,
+                        topk_ids=topk_ids,
+                    )
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -753,8 +897,29 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
+                    # The sampled-token log-prob is dead weight in pure top-k
+                    # distillation: the KL is built from the top-k gather, and every
+                    # other consumer here (policy gradient, reference KL, sdl, sdar,
+                    # the single-token teacher estimator) is switched off. Computing
+                    # it means a log-softmax + gather over the full vocabulary for
+                    # every row, whose only surviving use below is reading .device
+                    # and .dtype off the result.
+                    need_log_prob = not (
+                        pg_loss_coef == 0
+                        and teacher_topk_kl
+                        and use_teacher_kl_loss
+                        and not self.config.use_kl_loss
+                        and not self.config.get("use_sdl_loss", False)
+                        and not self.config.get("use_sdar_loss", False)
+                    )
                     with _actor_phase("actor.fwd"):
-                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
+                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            topk_ids=fwd_topk_ids,
+                            need_log_prob=need_log_prob,
+                        )
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -780,8 +945,11 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     else:
                         # Pure teacher-KL distillation: no policy-gradient signal.
+                        # Take device/dtype from whichever tensor the forward
+                        # actually produced -- log_prob is None when it was skipped.
                         old_log_prob = data.get("old_log_probs", None)
-                        zero = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+                        probe = log_prob if log_prob is not None else student_topk_logprobs
+                        zero = torch.zeros((), device=probe.device, dtype=probe.dtype)
                         pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
 
                     if entropy_coeff != 0:

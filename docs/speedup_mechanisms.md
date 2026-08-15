@@ -44,6 +44,15 @@
 | E3 compact per-turn record | 既定 on | 2 | ビット同一 |
 | C env reset prefetch | `ENV_RESET_PREFETCH=1`（script が export） | 2 | ビット同一 |
 | `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
+| rollout log-prob を作らない | `rollout.return_rollout_log_probs=False` | 5 | 生成トークン不変 |
+| session 中の `empty_cache` 抑止 | コード（常時、session 中のみ） | 5 | ビット同一 |
+
+**5 期の 2 件は「読まれない結果を作るのをやめた」もの。** `rollout_log_probs` の消費者は
+`RayPPOTrainer.fit` の drift 検査（`rollout_probs_diff`）だけで、比較対象の `old_log_prob`
+フェーズを持たない pure OPD では一度も読まれないまま、毎ターン全生成トークンを Python で
+走査して組み立てていた。`empty_cache` は `generate_sequences` の末尾で session 判定の外に
+あり、vLLM を起こしたままにする ① を入れてもなお毎ターン走って同期を強制していた。
+どちらも drift 検査を回す arm では従来どおりにしておくこと。
 
 **teacher**
 
@@ -53,6 +62,9 @@
 | teacher の ZeRO-2 化 | `ref.fsdp_config.sharding_strategy=shard_grad_op` | 4 | ビット同一 |
 | response-only lse/topk/gather | コード（常時） | 4 | ビット同一 |
 | chunked teacher overlap（ターン単位） | `ROLLOUT_PREFETCH_TEACHER=1`（script が export） | 4 | 期待値同一 |
+| chunk サイズの glue 追従 | `ROLLOUT_PREFETCH_TEACHER_ADAPTIVE=1`（既定 on） | 5 | 値に触れない |
+| **response-only `lm_head`** | `actor.response_only_logits=True` / `ref.response_only_logits=True` | 5 | **ビット非同一**（GEMM 形状） |
+| 死んだ sampled-token log-prob の削除 | コード（`pg_loss_coef=0` ＋ topk_kl のときのみ） | 5 | 値不変（未使用値の削除） |
 
 **actor update**
 
@@ -603,8 +615,9 @@ B と spec decode はその 1 つの実験で一緒に検証すべき項目で�
 export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
 export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
-export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}   # chunk は既定 128
+export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 # 既定 on: ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD
+#          ROLLOUT_PREFETCH_TEACHER_ADAPTIVE（chunk を glue に追従。128 が下限 / 512 が上限）
 # 立てない: ROLLOUT_PREFETCH_LOGPROB（消費側が無い）、GPU_PROFILER_SYNC_PHASES（遅くなる）
 # 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1 GPU_PROFILER_ROLLUP_EVERY=1
 bash examples/opd_trainer/run_multitask_qwen3.sh env.search.search_url=http://<host>:8000/retrieve
@@ -618,10 +631,14 @@ actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op
 +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True
 +actor_rollout_ref.actor.no_sync_grad_accum=True
++actor_rollout_ref.actor.response_only_logits=True
 actor_rollout_ref.ref.fsdp_config.param_offload=False
 actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op
++actor_rollout_ref.ref.response_only_logits=True
 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8      # メモリ上限。速度ノブではない
 +actor_rollout_ref.rollout.enable_prefix_caching=True
++actor_rollout_ref.rollout.return_rollout_log_probs=False       # drift 検査を回す arm では True
+actor_rollout_ref.rollout.disable_log_stats=False              # 計測。vLLM 内部統計を出す
 actor_rollout_ref.rollout.enable_chunked_prefill=False
 actor_rollout_ref.rollout.enforce_eager=False
 actor_rollout_ref.rollout.free_cache_engine=False

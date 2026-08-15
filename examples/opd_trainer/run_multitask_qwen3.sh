@@ -144,6 +144,42 @@ set -x
 #   fsdp_config.forward_prefetch=True — issue the next FSDP unit's all-gather
 #     while the current one computes. Scheduling only, arithmetic untouched, so
 #     it is a plain performance knob and is not pinned.
+#
+# Wasted-work removals (config; all of them delete computation whose result was
+# already being thrown away, so none of them changes a value that reaches the
+# loss).
+#   actor.response_only_logits=True / ref.response_only_logits=True — run lm_head
+#     on the response rows only. Everything the actor and teacher forwards return
+#     is sliced to [-response_length-1:-1], and prompts are ~3x responses here, so
+#     roughly three quarters of the vocab projection was built at (rows, 151936)
+#     and dropped — forward and backward, and it is the step's largest activation.
+#     The transformer body still runs on every token: a response position attends
+#     to the prompt's KV, so that part cannot be skipped. On the teacher this also
+#     shrinks the allocation that OOMed at step 136 (section 9.2), because the
+#     prefetch runs it while vLLM is awake and holding its KV cache. Same
+#     arithmetic, different GEMM shape — the accuracy class of a micro-batch
+#     change, so it goes into every arm at once.
+#   rollout.return_rollout_log_probs=False — stop asking vLLM for the sampled
+#     token's log-prob. Its only consumer is the rollout-vs-actor drift check in
+#     RayPPOTrainer.fit, and this arm's thin loop has no old_log_prob phase to
+#     compare against, so the column was built (a Python loop over every generated
+#     token, every turn) and never read. Sampled tokens are unaffected. Leave it
+#     True on arms that run the drift check.
+#   rollout.disable_log_stats=False — MEASUREMENT, not a speedup. Turns on vLLM's
+#     own statistics (prefill/decode token counts, preemptions, running batch,
+#     prefix-cache hits). generate_sequences is opaque to both profilers — the
+#     engine is a separate library inside a Ray worker — and it is ~52% of the
+#     step, so this is the only way to see inside it. Costs log volume.
+#
+# ROLLOUT_PREFETCH_TEACHER_ADAPTIVE=1 (default) sizes each teacher chunk from the
+# glue window it will run under instead of using one constant. The two are badly
+# matched: turns 0-4 hold ~45% of the rollout's CPU glue while the queue is barely
+# filled, and from turn 5 the glue collapses to ~0.4s/turn while the backlog peaks
+# — which left the glue only ~34% busy at hit_rate 0.99, with 21.6s/step of
+# tchWait spill. Set to 0 to go back to the fixed
+# ROLLOUT_PREFETCH_TEACHER_CHUNK; that value is still the floor, and
+# ROLLOUT_PREFETCH_TEACHER_CHUNK_MAX (512) the ceiling. Chunking only decides how
+# many already-final rows are scored per call, so it cannot change a value.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -215,7 +251,10 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
+    +actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    +actor_rollout_ref.rollout.return_rollout_log_probs=False \
+    actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -235,6 +274,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
+    +actor_rollout_ref.ref.response_only_logits=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \

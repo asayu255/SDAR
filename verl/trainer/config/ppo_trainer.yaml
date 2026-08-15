@@ -64,6 +64,17 @@ actor_rollout_ref:
     invalid_action_penalty_coef_by_task: null
     use_kl_loss: False # True for GRPO
     use_torch_compile: True # False to disable torch compile
+    # Run lm_head on the response rows only, by handing the row selection to the
+    # model as `logits_to_keep`. Everything the actor forward returns is sliced to
+    # the response window, so the prompt rows' logits are built at (rows, vocab)
+    # and dropped -- ~3/4 of the vocab projection on a prompt-heavy mixture, in
+    # both directions, plus the step's largest activation. The transformer body is
+    # unchanged (a response position must still attend to the prompt's KV), so the
+    # arithmetic is the same; only the GEMM shape moves, which puts this in the
+    # same accuracy class as a micro-batch size change. Requires
+    # use_remove_padding, rules out fused kernels / ulysses SP / multimodal, and
+    # needs a model whose forward takes a tensor `logits_to_keep`.
+    response_only_logits: False
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
     pg_loss_coef: 1.0 # scale of the policy-gradient loss; set 0 for pure distillation (OPD)
@@ -134,6 +145,14 @@ actor_rollout_ref:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
     use_torch_compile: ${actor_rollout_ref.actor.use_torch_compile}
+    # Same knob as actor.response_only_logits, for the reference / OPD teacher
+    # forward. It matters more here: compute_ref_topk_log_prob runs the teacher
+    # through lm_head, and that allocation is what OOMed at step 136 when the
+    # prefetch moved it inside the rollout (vLLM awake, holding its KV cache).
+    # Restricting it to the response rows cuts the spike by about the prompt
+    # share. NOT set from the actor's value -- the two models are sized and
+    # scheduled separately.
+    response_only_logits: False
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
@@ -166,6 +185,15 @@ actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     disable_log_stats: True
+    # Ask the engine for the sampled token's log-prob and return it as
+    # `rollout_log_probs`. Its only consumer is the rollout-vs-actor drift check in
+    # RayPPOTrainer.fit (`rollout_probs_diff`), which needs an `old_log_prob` phase
+    # to compare against. Recipes without one (pure OPD: the loss is teacher KL on
+    # the training-side forward) never read it, and producing it costs vLLM the
+    # per-token log-prob plus a Python loop over every generated token, every turn.
+    # Leave True wherever the drift check runs; set False only when nothing reads
+    # the column -- the sampled tokens themselves are identical either way.
+    return_rollout_log_probs: True
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     # for hf rollout
     do_sample: True

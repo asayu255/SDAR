@@ -156,8 +156,14 @@ driver タグの合計は 508.7 s で、**未計上は 0.6 s** ―― 1.2 節で
   SFT arm の「削るべきは backward」という結論は、**この phase については正しい**。
 - **`actor.optim` の PCIe が突出。** 2.9 s（0.6%）しかないのに
   `pcieTX 14,924 / pcieRX 9,585` で、他のどの phase の 5〜7 倍。
-  optimizer state が CPU 側にあり更新のたびに全量を往復させている。
   **時間比で見ると完全に見逃す**部分で、ここは今回手を入れていない。
+  当初これを「optimizer state が CPU 側にあり毎回往復している」と書いたが、
+  **その説明は成立しない** —— run script は `optimizer_offload=False` で Adam は
+  GPU 常駐である。より当たりそうなのは backward の reduce-scatter の尾が
+  この phase の窓で drain していることで（`_actor_phase` の注記どおり、
+  kernel launch は非同期なので phase 境界は 1 launch queue 分ずれる）、
+  だとすればこれは `actor.optim` のコストではない。8 節の追跡項目としては残すが、
+  2.9 s しかないので優先度は最低。
 - **`reward` は `sm 0.0 / memBW 0.0 / cpu 100`。** GPU が完全に遊ぶ純 CPU 区間で、
   4 節で overlap 候補としながら見送った根拠。
 - **`gen` の `memBW/sm = 0.59` に対し `update_actor` は `0.38`。**
@@ -813,7 +819,7 @@ export TASK_BALANCE_INTERLEAVE=1
 |---|---|---|---|
 | 1 | **`gen` の内訳** | `disable_log_stats=False` で vLLM 自身の統計（prefill/decode トークン数、preemption 回数、running batch 推移）を出す | 失点の 65% を占める場所の内訳が推定から実測になる。**最優先** |
 | 2 | `actor.fwd` を model / lse+topk+gather に分割 | `_actor_phase` を `_forward_micro_batch` の中に 2 個 | 3.2 節の効果を直接測れる（今はメモリでしか語れない） |
-| 3 | `actor.optim` の PCIe を追う | optimizer state の配置を確認 | 1.3 節の突出（他 phase の 5〜7 倍）の正体 |
+| 3 | `actor.optim` の PCIe を追う | `GPU_PROFILER_SYNC_PHASES=1` で境界を締めて再測 | 1.3 節の突出（他 phase の 5〜7 倍）の正体。`optimizer_offload=False` なので CPU 往復説は棄却済み、残る仮説は backward の collective 尾の染み出し |
 | — | KL のタグ | — | **不要と確定**（≲1 s、1.2 節） |
 
 いずれも再起動が必要。
@@ -1058,3 +1064,78 @@ rollout 中は **vLLM が起きていて KV キャッシュを掴んでいる**�
   のまま手つかず。spec decode は 5 節⑧の理由で入らなかったので、
   **V1 エンジンの検証が次の一手。**
 
+
+---
+
+## 10. 捨てていた計算を消す（未計測、実装のみ）
+
+9.3 の「glue はもう埋まっている」は**誤り**だった。turn table を 40 rollout ぶん
+集計すると、glue の実効 sm は **34%** しかない。分解すると `gen` phase の 67.2% は
+
+```
+0.744 × 71.7(生成窓)  +  0.085 × ~95(tchWait)  +  0.172 × ~34(glue)  =  67.2
+```
+
+で、**glue を 100% 埋めても phase の上限は 78.5%**。失点の主因は最初から glue では
+なく、生成窓そのものが 71.7% しか出ていないこと（＝ decode テール）だった。
+
+同時に、**GPU が「忙しい」区間の中に、結果が捨てられている計算が 3 か所あった**。
+sm% では原理的に見えない類のもので、実装のみ済み・**効果は未計測**である。
+
+### 10.1 入れたもの
+
+| # | 機構 | 何を消したか | 精度 |
+|---|---|---|---|
+| 0 | `rollout.disable_log_stats=False` | （計測）vLLM 内部統計を出す | — |
+| 1 | teacher chunk の glue 追従 | 固定 128 → 前ターンの glue × 実測 rows/s（128〜512） | 値に触れない |
+| 2 | `rollout.return_rollout_log_probs=False` | 毎ターン全生成トークンを Python 走査して作る `rollout_log_probs`。消費者は drift 検査だけで、この arm には比較対象の `old_log_prob` phase が無い | 生成トークン不変 |
+| 3 | reward の decode 省略 | `num_examine=0` のとき捨てられる約 14,000 回/step の `tokenizer.decode` | reward tensor 不変 |
+| 5 | **response-only `lm_head`** | prompt 行の語彙射影。`(rows, 151936)` を作って捨てていた。forward/backward 両方、かつ step 最大の活性 | **ビット非同一**（GEMM 形状） |
+| 5b | 死んだ sampled-token log-prob | `pg_loss_coef=0` ＋ topk_kl では `log_prob` の唯一の用途が `.device` / `.dtype` の取得だった | 値不変 |
+| 6 | session 中の `empty_cache` 抑止 | ① で vLLM を起こしたままにしてもなお毎ターン走っていた同期 | ビット同一 |
+
+**5 が本命。** transformer 本体は削れない —— response の位置は prompt の KV を読むので、
+因果 attention の下では prompt トークンも全層通す必要がある。**削れるのは射影だけ**で、
+`logits_to_keep` に行選択を渡して `lm_head` をその手前に移す。lm_head は位置ごとの
+線形写像なので、選んでから掛けても掛けてから選んでも同じ値になる。
+prompt が全トークンの約 75% なので射影の約 3/4 が消える。
+
+teacher 側にも同じ knob を入れた。9.2 の 10.47 GiB のスパイクは
+`compute_ref_topk_log_prob` が `lm_head` を通すことによるもので、**その大半が
+prompt 行**だった。ここが縮めば `ref.log_prob_micro_batch_size_per_gpu` を 8 から
+戻す余地と、`gpu_memory_utilization` を 0.6 から上げる余地が同時に生まれる
+（4 節の「次 run」候補は、**この順序でしか安全に入らない**）。
+
+### 10.2 精度について
+
+5 だけがビット非同一で、理由は GEMM の形状が変わることだけである
+（`no_sync_grad_accum` と同じクラス）。student の勾配と teacher の targets の
+両方に乗るので **intent lock に固定**し、3 arm 同時に入れる。他は値が動かない。
+
+`_supports_logits_to_keep` が worker 起動時に模型の forward を検査し、
+非対応なら**即座に落とす**。黙って従来経路に落ちると「速いはずが速くない」run が
+静かに走ることになり、5 節⑤で記録した誤りと同じ形になるため。
+
+### 10.3 残っている枠（優先順）
+
+1. **`gen` の decode テール** —— 50 ターン中 `active ≤ 100` の 39 本が `gen` 壁時計の
+   **70.5%** を食い、1 系列あたりのコストが head の **2.6 倍**。手つかず。
+   spec decode は V0 では起動せず、**V1 エンジン検証が前提**。#0 の統計が
+   その設計材料になる
+2. gradient checkpointing の A/B（`bwd/fwd = 2.56`）。5 でメモリが空いた**後**
+3. `ppo_micro_batch_size_per_gpu` 5 → 8。`adjust_batch` の lcm が 160 → 32 になり
+   padding 行が約 3.6% → 0.5% に落ちる副次効果つき（10 は lcm 160 のままなので
+   8 の方が筋が良い）
+4. preprocess の batch tokenizer 化。ただし preproc を縮めると glue が縮んで
+   `tchWait` が増えるので、5 の後
+5. chunked prefill / KV 予算。**3 arm 同時**
+
+### 10.4 検証方法
+
+`s/step` で語らないこと（3.5 節）。同一 checkpoint・同一 step の n=1 制御 A/B で
+`perf/throughput` と phase 内訳を取り、そのうえで 30 step 以上の throughput で
+確認する ―― 9.1 → 9 節「限界」でやった手順そのものである。
+**`sm%` は成果指標ではない**：5 は sm% が横ばいか下がったまま実行時間だけ縮む
+可能性が高い（2.5 節）。見るのは `actor.fwd` / `actor.bwd` の壁時計と
+`perf/max_memory_allocated_gb`、それに #0 で新しく見えるようになる
+vLLM の prefill/decode トークン数と preemption 回数。

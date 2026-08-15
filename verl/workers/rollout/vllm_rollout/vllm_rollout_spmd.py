@@ -209,9 +209,17 @@ class vLLMRollout(BaseRollout):
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
+        # Whether to ask the engine for the sampled token's log-prob. See
+        # rollout.return_rollout_log_probs in ppo_trainer.yaml: the column is only
+        # read by the rollout-vs-actor drift check, so recipes without an
+        # old_log_prob phase pay for it and never look at it.
+        self.return_rollout_log_probs = bool(config.get("return_rollout_log_probs", True))
+
         kwargs = dict(
             n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
+            # 0 => just the sampled token's own log-prob (the actor recomputes the
+            # rest). None => the engine returns no log-probs at all.
+            logprobs=0 if self.return_rollout_log_probs else None,
             max_tokens=config.response_length,
         )
 
@@ -330,19 +338,21 @@ class vLLMRollout(BaseRollout):
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []
-            rollout_log_probs = []
+            rollout_log_probs = [] if self.return_rollout_log_probs else None
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
-                    curr_log_prob = []
-                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                        curr_log_prob.append(logprob[response_ids[i]].logprob)
-                    rollout_log_probs.append(curr_log_prob)
+                    if rollout_log_probs is not None:
+                        curr_log_prob = []
+                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                            curr_log_prob.append(logprob[response_ids[i]].logprob)
+                        rollout_log_probs.append(curr_log_prob)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = rollout_log_probs.to(torch.float32)
+            if rollout_log_probs is not None:
+                rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+                rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -371,17 +381,17 @@ class vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                'rollout_log_probs': rollout_log_probs, # we will recompute old log prob with actor
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        tensors = {
+            "prompts": idx,
+            "responses": response,
+            "input_ids": seq,  # here input_ids become the whole sentences
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        if rollout_log_probs is not None:
+            # we will recompute old log prob with actor
+            tensors["rollout_log_probs"] = rollout_log_probs
+        batch = TensorDict(tensors, batch_size=batch_size)
 
         # free vllm cache engine
         if (

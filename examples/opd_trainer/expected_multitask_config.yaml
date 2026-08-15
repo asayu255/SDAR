@@ -69,11 +69,26 @@
 # different last bits). Neither may change silently between runs.
 "actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
 "actor_rollout_ref.actor.no_sync_grad_accum": true
-# ref.fsdp_config.{param_offload,sharding_strategy} are NOT pinned: like the
-# other placement knobs they are bit-identical, i.e. covered by the exemption
-# above. Speculative decoding WOULD belong here (it sits on the sampling path,
-# so it must not differ silently between compared runs) but it cannot run on
-# this stack at all -- see the run script for why -- so there is nothing to pin.
+# response_only_logits is pinned for the same reason. Restricting lm_head to the
+# response rows computes exactly the values the full projection did -- lm_head is
+# per-position, so selecting before or after it is the same arithmetic -- but the
+# GEMM changes shape, which moves the last bits like a micro-batch change does.
+# It also sits on both the student's gradient and the teacher's targets, so the
+# two must not diverge between compared runs.
+"actor_rollout_ref.actor.response_only_logits": true
+"actor_rollout_ref.ref.response_only_logits": true
+# NOT pinned, and deliberately so:
+#   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
+#     bit-identical, covered by the exemption above.
+#   rollout.return_rollout_log_probs -- decides whether a column nothing in this
+#     arm reads is built. The sampled tokens are identical either way.
+#   rollout.disable_log_stats -- logging volume only.
+#   ROLLOUT_PREFETCH_TEACHER_{CHUNK,CHUNK_MAX,ADAPTIVE} -- these only decide how
+#     many already-final rows one prefetch call scores, so like the chunk size
+#     they cannot change a value.
+# Speculative decoding WOULD belong here (it sits on the sampling path, so it
+# must not differ silently between compared runs) but it cannot run on this stack
+# at all -- see the run script for why -- so there is nothing to pin.
 
 # ---- data -----------------------------------------------------------------------
 "data.train_batch_size": 45
