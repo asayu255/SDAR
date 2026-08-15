@@ -100,13 +100,22 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         self._load_checkpoint()
         self._fast_forward_env_schedules()
 
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        # val_only is checked on its own, not nested under val_before_train. The
+        # run scripts end with trainer.val_before_train=False (the initial eval
+        # costs a full validation pass and says nothing a resumed run does not
+        # already know), and with the check nested a "validate this checkpoint and
+        # stop" command skipped the block entirely and fell through to TRAINING
+        # from the checkpoint -- which looks like a working run right up until the
+        # numbers that were asked for never appear.
+        val_only = bool(self.config.trainer.get("val_only", False))
+        if self.val_reward_fn is not None and (val_only or self.config.trainer.get("val_before_train", True)):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        if val_only:
+            assert self.val_reward_fn is not None, "trainer.val_only=True but no validation reward fn is configured"
+            return
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="OPD+GRPO Training")
         self.global_steps += 1
