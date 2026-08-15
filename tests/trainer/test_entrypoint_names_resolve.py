@@ -44,6 +44,16 @@ ENTRY_POINTS = [
     "verl/trainer/main_opd_grpo.py",
     "verl/trainer/main_opd.py",
     "verl/trainer/main_ppo.py",
+    # The trainers themselves, for the same reason and by the same class of bug:
+    # cherry-picking a val_only change onto a branch that already had it applied
+    # the diff in reverse, taking the `val_only = ...` binding out while leaving
+    # the `if val_only:` that reads it. fit() runs after _load_checkpoint(), so
+    # every run on that branch loaded its models and then died on
+    # ``NameError: name 'val_only' is not defined``. The whole tests/trainer tree
+    # passed while it was broken -- nothing else here parses a fit() body.
+    "verl/trainer/ppo/opd_grpo_ray_trainer.py",
+    "verl/trainer/ppo/opd_ray_trainer.py",
+    "verl/trainer/ppo/ray_trainer.py",
 ]
 
 
@@ -78,12 +88,20 @@ def _bound_names(node, nested):
             bound.update((a.asname or a.name).split(".")[0] for a in child.names)
         elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bound.add(child.name)
+            # A nested def's PARAMETERS are bound inside it, and the outer walk
+            # sees its body, so they have to be collected here or every helper
+            # closure reports its own arguments as undefined. (This used to sit
+            # in a later elif that the branch above made unreachable -- harmless
+            # while only the three small main_*.py files were checked, and a
+            # wall of false positives the moment a real trainer was added.)
+            if nested and not isinstance(child, ast.ClassDef):
+                bound |= _all_args(child)
+        elif isinstance(child, ast.Lambda) and nested:
+            bound |= _all_args(child)
         elif isinstance(child, ast.ExceptHandler) and child.name:
             bound.add(child.name)
         elif isinstance(child, (ast.Global, ast.Nonlocal)):
             bound.update(child.names)
-        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and nested:
-            bound |= _all_args(child)
     return bound
 
 

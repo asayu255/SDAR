@@ -29,6 +29,26 @@ set -x
 # enable=False reproduces the plain arm exactly: no base worker is built, no
 # extra forward runs, and nothing is written into the batch.
 #
+# CHECKPOINT DIRECTORY. Arm-specific, and it has to be: the checkpoint path is
+# default_local_dir/global_step_N and trainer.resume_mode defaults to "auto", so
+# two arms sharing this directory do not merely overwrite each other's
+# checkpoints -- the second one silently RESUMES FROM THE FIRST. A control arm
+# started after this one in the same directory would be a continuation of the
+# treatment wearing the control's name, and nothing in the logs would say so.
+# The key is deliberately NOT pinned in the lock, so an intentional resume can
+# pass a different path on the command line.
+#
+# This note lives up here rather than beside the argument it describes, and that
+# is not a style choice. A `#` line inside the trainer's argument list is not a
+# comment: the preceding line ends in `\`, so the shell joins them and the `#`
+# ENDS THE COMMAND. Everything below it -- default_local_dir, save_freq,
+# test_freq, total_training_steps, val_before_train, and "$@", i.e. every
+# override the caller passed -- is dropped from the python invocation and then
+# run as a shell command of its own. The intent lock catches it (the dropped
+# total_training_steps no longer matches the pinned 300), so it fails at startup
+# rather than running something else, but it fails for a reason that has nothing
+# to do with what is wrong. Keep the argument list free of comments.
+#
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block and NO ${VAR:-default} fallback, so
 # there is exactly one place to read or edit a setting. One-off overrides can
@@ -394,17 +414,6 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    # Arm-specific: the checkpoint path is default_local_dir/global_step_N and
-    # trainer.resume_mode defaults to "auto", so two arms sharing this directory
-    # do not merely overwrite each other's checkpoints -- the second one silently
-    # RESUMES FROM THE FIRST. A control arm started after this one in the same
-    # directory would be a continuation of the treatment wearing the control's
-    # name, and nothing in the logs would say so.
-    #
-    # The run in flight when this was split out still writes to the shared
-    # ...opd_grpo_multitask directory; to resume it, pass that path back on the
-    # command line (this key is deliberately NOT pinned in the lock so that
-    # override is possible).
     trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \

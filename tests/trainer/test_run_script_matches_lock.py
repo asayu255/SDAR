@@ -73,12 +73,24 @@ def _overrides(home, script=None):
     ``...coef_by_task='{alfworld:0.1,...}'`` reaches Hydra as a dict rather than
     as a string that happens to contain braces. Skipping either step validates
     arguments no run ever passes.
+
+    A ``#`` line ENDS the argument list, because that is what it does in the
+    shell: the previous line's ``\\`` joins the two, so the ``#`` starts a comment
+    that runs to the newline and the command stops there -- everything below is
+    dropped from the invocation and then executed as a command of its own,
+    ``"$@"`` (every override the caller passed) included. This used to ``continue``
+    past such a line, which is the exact failure the docstring above warns about:
+    for months it composed a config from arguments the shell never delivered, and
+    reported the signweight arm as matching its lock while that arm could not
+    start at all.
     """
     body = open(script or _SCRIPT).read().split("python3 -m verl.trainer.main_opd_grpo", 1)[1]
     out = []
     for line in body.splitlines():
         line = line.strip().rstrip("\\").strip().replace('"$@"', "").strip()
-        if not line or line.startswith("#"):
+        if line.startswith("#"):  # the shell stops here; so do we
+            break
+        if not line:
             continue
         if "=" not in line:  # end of the argument list
             break
@@ -94,6 +106,36 @@ def _effective_config(home, script=None):
     with initialize_config_dir(config_dir=_CONFIG_DIR, version_base=None):
         cfg = compose(config_name="ppo_trainer", overrides=_overrides(home, script))
     return inject_opd_grpo_config(cfg)
+
+
+@pytest.mark.parametrize("arm", sorted(_ARMS))
+def test_no_arm_hides_a_comment_inside_its_argument_list(arm):
+    """A ``#`` between two continued lines silently truncates the command.
+
+    The lock check above would also catch it -- the dropped
+    ``total_training_steps`` stops matching the pinned 300 -- but it reports a
+    config mismatch, which points at the lock rather than at the eleven lines of
+    prose sitting in the middle of the invocation. This says what is actually
+    wrong. It is a real failure, not a style rule: everything below the comment,
+    ``"$@"`` included, is dropped from the python call and then run as a shell
+    command, so the caller's own overrides never reach the trainer.
+    """
+    script, _ = _ARMS[arm]
+    body = open(script).read().split("python3 -m verl.trainer.main_opd_grpo", 1)[1]
+    # Where the command ends is decided by the backslashes, not by the content:
+    # a line ending in one continues, and the first line that does not is the
+    # command's last. Comments below that point are ordinary prose.
+    offenders = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            offenders.append(f"{stripped[:60]!r}")
+        if not stripped.endswith("\\"):
+            break
+    assert not offenders, (
+        f"{os.path.basename(script)} has comments inside the trainer argument list, which "
+        f"the shell reads as end-of-command: {offenders}. Move them into the file header."
+    )
 
 
 @pytest.mark.parametrize("arm", sorted(_ARMS))
