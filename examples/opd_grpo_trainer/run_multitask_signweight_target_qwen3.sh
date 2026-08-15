@@ -345,7 +345,18 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_multitask \
+    # Arm-specific: the checkpoint path is default_local_dir/global_step_N and
+    # trainer.resume_mode defaults to "auto", so two arms sharing this directory
+    # do not merely overwrite each other's checkpoints -- the second one silently
+    # RESUMES FROM THE FIRST. A control arm started after this one in the same
+    # directory would be a continuation of the treatment wearing the control's
+    # name, and nothing in the logs would say so.
+    #
+    # The run in flight when this was split out still writes to the shared
+    # ...opd_grpo_multitask directory; to resume it, pass that path back on the
+    # command line (this key is deliberately NOT pinned in the lock so that
+    # override is possible).
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_target_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \

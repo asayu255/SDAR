@@ -139,9 +139,22 @@ def test_each_weighted_arm_differs_from_the_control_only_in_the_weighting(arm, m
     allowed = {k for k in differing if k.startswith("algorithm.opd.sign_weight.")}
     # the run identity has to differ too, or the two arms would overwrite each
     # other's checkpoints and metrics
-    allowed |= {"trainer.project_name", "trainer.experiment_name", "trainer.expected_config"}
+    allowed |= {
+        "trainer.project_name",
+        "trainer.experiment_name",
+        "trainer.expected_config",
+        "trainer.default_local_dir",
+    }
     assert differing == allowed, sorted(differing - allowed)
     assert any(k.startswith("algorithm.opd.sign_weight.") for k in differing), "the arms are identical"
+    # Not merely allowed to differ -- required to. The checkpoint path is
+    # default_local_dir/global_step_N and trainer.resume_mode defaults to "auto",
+    # so a shared directory does not just overwrite: the arm started second
+    # RESUMES FROM the arm started first and reports it under its own name.
+    assert a["trainer.default_local_dir"] != b["trainer.default_local_dir"], (
+        "arms must not share a checkpoint directory; resume_mode=auto would make "
+        "the second one continue the first"
+    )
 
 
 def test_the_lock_still_catches_a_drifting_run_script(monkeypatch):
