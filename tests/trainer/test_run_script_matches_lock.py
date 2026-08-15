@@ -195,6 +195,14 @@ def test_each_weighted_arm_differs_from_the_control_only_in_the_weighting(arm, m
         "trainer.n_gpus_per_node",
         "trainer.nnodes",
     }
+    # Same exemption the lock files state for themselves ("performance knobs
+    # (micro batch sizes, offload, prefix caching, ...) are intentionally NOT
+    # listed"): they are how a run is fitted onto the GPUs it got. The per-task
+    # loss weights already multiply by gradient_accumulation, so the objective is
+    # invariant to the split; only the reduction order moves. Matching them is
+    # still the right thing for a control/treatment pair, and the comment beside
+    # n_gpus_per_node says so.
+    allowed |= {k for k in differing if "micro_batch_size" in k}
     # Subset, not equality: an allowance the arms happen to agree on (both on the
     # same GPU count, say) is not a failure. What must not happen is a difference
     # outside the list.
