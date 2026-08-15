@@ -76,6 +76,7 @@ __all__ = [
     "reweight_teacher_logprobs",
     "normalize_per_task",
     "sign_state_metrics",
+    "target_shift_metrics",
 ]
 
 # Column the driver writes and ``DataParallelPPOActor.update_policy`` reads in
@@ -296,6 +297,57 @@ def reweight_teacher_logprobs(
     z = (p * candidate_weight).sum(dim=-1, keepdim=True) + tail  # (bs, resp, 1)
     z = z.clamp(min=eps)
     return on_task_logprob.detach().to(torch.float32) + torch.log(candidate_weight.clamp(min=eps)) - torch.log(z)
+
+
+def target_shift_metrics(
+    original_logprob: torch.Tensor,
+    reweighted_logprob: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    prefix: str = "sign_weight",
+    eps: float = 1e-8,
+) -> dict:
+    """How far ``target`` mode actually moved the distillation target, and how.
+
+    Two numbers, because a gain from this arm invites two different objections
+    and they need separating.
+
+    ``target_kl`` is ``KL(teacher || reweighted target)`` -- the size of the
+    intervention, in the same units as ``actor/teacher_kl_loss``. Their ratio
+    says what fraction of the student's remaining distance to its target the
+    reweighting is responsible for moving.
+
+    ``target_entropy_delta`` is the change in the target's entropy. This is the
+    sharper objection: if reweighting systematically sharpened (or flattened) the
+    teacher, the arm would be a temperature change wearing a mechanism's name,
+    and a sign-shuffle control would NOT catch it -- shuffling destroys the
+    sharpening along with the sign content, so both hypotheses predict the same
+    null. A near-zero delta here is what licenses reading the shuffle control as
+    a test of the sign content specifically.
+
+    Both are identically zero when every weight is neutral, since the reweighting
+    is then the identity (``Z = sum(p) + tail = 1``).
+    """
+    p = original_logprob.detach().exp().to(torch.float32)
+    q = reweighted_logprob.detach().exp().to(torch.float32)
+    p_tail = (1.0 - p.sum(dim=-1)).clamp(min=eps, max=1.0)
+    q_tail = (1.0 - q.sum(dim=-1)).clamp(min=eps, max=1.0)
+
+    kl = (p * (p.clamp(min=eps).log() - q.clamp(min=eps).log())).sum(dim=-1)
+    kl = kl + p_tail * (p_tail.log() - q_tail.log())
+
+    def _entropy(r, tail):
+        return -(r * r.clamp(min=eps).log()).sum(dim=-1) - tail * tail.log()
+
+    delta_h = _entropy(q, q_tail) - _entropy(p, p_tail)
+
+    mask = response_mask.to(torch.bool)
+    if not bool(mask.any()):
+        return {}
+    return {
+        f"{prefix}/target_kl": float(kl[mask].mean()),
+        f"{prefix}/target_entropy_delta": float(delta_h[mask].mean()),
+    }
 
 
 def sign_state_metrics(

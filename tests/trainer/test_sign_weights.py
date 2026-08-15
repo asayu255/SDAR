@@ -40,6 +40,7 @@ try:
         position_weights,
         reweight_teacher_logprobs,
         sign_state_metrics,
+        target_shift_metrics,
     )
 except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
@@ -317,3 +318,46 @@ def test_state_metrics_are_shares_over_valid_tokens_only():
 def test_state_metrics_are_empty_for_an_all_padding_batch():
     _, state = _weights(on_delta=[1.0], off_deltas=[[1.0], [1.0]])
     assert sign_state_metrics(state, torch.zeros(1, 1)) == {}
+
+
+# --------------------------------------------------------------------------- #
+# How big the target-mode intervention is
+# --------------------------------------------------------------------------- #
+
+
+def test_target_shift_is_exactly_zero_when_nothing_is_flagged():
+    """The renormalisation is not a second intervention hiding behind the first.
+
+    With every weight neutral, Z = sum(p) + tail = 1 exactly, so the reweighting
+    is the identity and both shift metrics must be 0 -- otherwise a gain from this
+    arm could be attributed to "renormalising the top-k" rather than to the signs.
+    """
+    on_lp = torch.log(torch.tensor([0.5, 0.2, 0.1])).view(1, 1, 3)
+    same = reweight_teacher_logprobs(on_lp, torch.ones(1, 1, 3))
+    out = target_shift_metrics(on_lp, same, torch.ones(1, 1))
+    assert out["sign_weight/target_kl"] == pytest.approx(0.0, abs=1e-6)
+    assert out["sign_weight/target_entropy_delta"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_target_shift_reports_a_positive_kl_once_weights_bite():
+    on_lp = torch.log(torch.tensor([0.5, 0.2, 0.1])).view(1, 1, 3)
+    cand_w = torch.tensor([AGREE, DISAGREE, 1.0]).view(1, 1, 3)
+    out = target_shift_metrics(on_lp, reweight_teacher_logprobs(on_lp, cand_w), torch.ones(1, 1))
+    assert out["sign_weight/target_kl"] > 0.0
+
+
+def test_target_shift_entropy_delta_has_the_right_sign():
+    """Sharpening must read negative and flattening positive, so the metric can
+    actually catch "this arm is a temperature change"."""
+    on_lp = torch.log(torch.tensor([0.5, 0.2, 0.1])).view(1, 1, 3)
+    sharper = torch.tensor([AGREE, DISAGREE, DISAGREE]).view(1, 1, 3)  # mass onto the top
+    flatter = torch.tensor([DISAGREE, AGREE, AGREE]).view(1, 1, 3)  # mass off the top
+    d_sharp = target_shift_metrics(on_lp, reweight_teacher_logprobs(on_lp, sharper), torch.ones(1, 1))
+    d_flat = target_shift_metrics(on_lp, reweight_teacher_logprobs(on_lp, flatter), torch.ones(1, 1))
+    assert d_sharp["sign_weight/target_entropy_delta"] < 0
+    assert d_flat["sign_weight/target_entropy_delta"] > 0
+
+
+def test_target_shift_metrics_are_empty_for_an_all_padding_batch():
+    on_lp = torch.log(torch.tensor([0.5, 0.2])).view(1, 1, 2)
+    assert target_shift_metrics(on_lp, on_lp, torch.zeros(1, 1)) == {}

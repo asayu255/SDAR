@@ -48,6 +48,7 @@ from verl.trainer.ppo.sign_weights import (
     position_weights,
     reweight_teacher_logprobs,
     sign_state_metrics,
+    target_shift_metrics,
 )
 from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 from verl.utils import gpu_profiler
@@ -565,7 +566,12 @@ class OPDRayTrainer(RayPPOTrainer):
                     metrics["sign_weight/w_min"] = float(sel.min())
                     metrics["sign_weight/w_max"] = float(sel.max())
         else:
-            batch.batch["teacher_topk_logprobs"] = reweight_teacher_logprobs(on_lp.to(torch.float32), cand_w)
+            new_lp = reweight_teacher_logprobs(on_lp.to(torch.float32), cand_w)
+            if metrics is not None:
+                # Size and shape of the intervention, so a gain from this arm can
+                # be told apart from a temperature change. See target_shift_metrics.
+                metrics.update(target_shift_metrics(on_lp, new_lp, response_mask))
+            batch.batch["teacher_topk_logprobs"] = new_lp
 
     # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
