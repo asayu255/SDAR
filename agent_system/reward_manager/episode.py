@@ -54,9 +54,17 @@ class EpisodeRewardManager:
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+            # decode -- ONLY for the console sample below. The score is the env's
+            # episode reward and never looks at the text, so with num_examine=0
+            # (every training call: see main_opd) these two decodes produced
+            # ~2 * batch_size strings per step that nothing read. On the multitask
+            # OPD batch that is ~14k discarded decodes and most of this manager's
+            # runtime. Kept eager when num_examine>0 (validation) so the sample
+            # printing is unchanged.
+            prompt_str = response_str = None
+            if self.num_examine > 0:
+                prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+                response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
 
             # ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 

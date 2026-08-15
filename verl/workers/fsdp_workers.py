@@ -749,8 +749,16 @@ class ActorRolloutRefWorker(Worker):
 
         output = output.to("cpu")
 
-        # clear kv cache
-        get_torch_device().empty_cache()
+        # clear kv cache -- but NOT inside a rollout session. This call releases
+        # cached blocks back to the driver and forces a device synchronize, and it
+        # ran once per turn (~50x per rollout) even with the session holding vLLM
+        # awake, so every turn paid a sync plus the allocator re-acquiring the same
+        # blocks. It cannot free vLLM's KV cache either: the engine owns that, and
+        # empty_cache only returns *unused* cached blocks to the driver. The
+        # sharding manager's own note says to keep this to the wake/sleep
+        # boundaries; end_rollout_session() exits it, which does exactly that.
+        if not getattr(self, "_rollout_session_active", False):
+            get_torch_device().empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

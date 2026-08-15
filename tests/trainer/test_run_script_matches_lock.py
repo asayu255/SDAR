@@ -205,6 +205,11 @@ def test_the_script_passes_every_key_the_lock_pins_for_this_arm(monkeypatch):
         # gradient-path speedups
         "actor_rollout_ref.actor.fsdp_config.sharding_strategy": "shard_grad_op",
         "actor_rollout_ref.actor.no_sync_grad_accum": True,
+        # lm_head on the response rows only -- same arithmetic, different GEMM
+        # shape, and it sits on both the student's gradient and the teacher's
+        # targets, so the two must move together across compared runs
+        "actor_rollout_ref.actor.response_only_logits": True,
+        "actor_rollout_ref.ref.response_only_logits": True,
         # retry policy decides what enters the trajectory
         "env.search.max_retries": None,
         "env.search.timeout": 600,

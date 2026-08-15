@@ -122,12 +122,37 @@ _ROLLOUT_PREFETCH_LOGPROB_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_LOGPROB_C
 # have a teacher to route to. Validation rollouts never score a teacher either.
 _ROLLOUT_PREFETCH_TEACHER = os.environ.get("ROLLOUT_PREFETCH_TEACHER", "1").strip().lower() in ("1", "true", "yes", "on")
 
-# Rows per prefetch call. One chunk is issued per turn, so this trades window fit
-# against per-call overhead: too small and the ~45 usable turns cannot drain the
-# queue, too large and the turn runs past its CPU glue (that excess is still
-# subtracted from the teacher_forward phase -- it is moved, not wasted -- but the
-# overlap is lost). Watch the tchWait column of the turn table to tune it.
+# Rows per prefetch call, used as the FLOOR of the adaptive size below (and as the
+# fixed size when adaptation is off). One chunk is issued per turn, so this trades
+# window fit against per-call overhead: too small and the ~45 usable turns cannot
+# drain the queue, too large and the turn runs past its CPU glue (that excess is
+# still subtracted from the teacher_forward phase -- it is moved, not wasted -- but
+# the overlap is lost). Watch the tchWait column of the turn table.
 _ROLLOUT_PREFETCH_TEACHER_CHUNK = int(os.environ.get("ROLLOUT_PREFETCH_TEACHER_CHUNK", "128"))
+
+# Size each chunk from the glue window it will actually run under, instead of using
+# one constant for the whole rollout. The two are badly mismatched: measured over 40
+# rollouts, turns 0-4 hold ~45% of the step's 43.7s of CPU glue (turn 0 alone is
+# ~8s, mostly envs.step) while the queue has barely started filling, and from turn 5
+# the glue collapses to ~0.4s/turn while the backlog is at its largest. A constant
+# 128 therefore underfills the front (tchWait was 0.00 for turns 0-4) and overshoots
+# the tail (tchWait 21.6s/step of spill), leaving the glue only ~34% busy even at
+# hit_rate 0.99. In aggregate the work does fit -- ~37s of teacher against 43.7s of
+# glue -- so this is a packing problem, not a volume one.
+#
+# The controller is deliberately trivial: rows-per-second observed from the last
+# completed chunk, times the previous turn's glue seconds, clamped. It only decides
+# how many already-final rows are scored in one call, so it cannot change any value
+# -- same rows, same frozen teacher, only the micro-batch packing moves, which is
+# the accuracy class this mechanism already documents.
+_ROLLOUT_PREFETCH_TEACHER_ADAPTIVE = os.environ.get(
+    "ROLLOUT_PREFETCH_TEACHER_ADAPTIVE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Ceiling for the adaptive size. Bounds the worst-case activation spike of a single
+# teacher call (section 9.2's OOM was one oversized chunk landing while vLLM held
+# its KV cache) and the latency of the join that follows it.
+_ROLLOUT_PREFETCH_TEACHER_CHUNK_MAX = int(os.environ.get("ROLLOUT_PREFETCH_TEACHER_CHUNK_MAX", "512"))
 
 
 def _env_kwargs_equal(a, b) -> bool:
@@ -265,6 +290,15 @@ class TrajectoryCollector:
         self._prefetched_teacher = {}
         self._teacher_future = None
         self._teacher_executor = None
+        # Adaptive chunk state: rows/second measured from completed chunks, the
+        # size and start time of the chunk in flight, and the previous turn's glue
+        # (the window the NEXT chunk will run under). See
+        # _ROLLOUT_PREFETCH_TEACHER_ADAPTIVE.
+        self._teacher_rate = None
+        self._teacher_inflight_rows = 0
+        self._teacher_inflight_start = None
+        self._teacher_glue_s = None
+        self._teacher_glue_mark = None
         # ENV_RESET_PREFETCH state: one outstanding background envs.reset, launched
         # by the trainer between rollouts (see prefetch_env_reset).
         self._env_reset_prefetch = None
@@ -689,6 +723,30 @@ class TrajectoryCollector:
         if self._teacher_prefetch_fn is not None:
             self._teacher_pending.append(entry)
 
+    def _teacher_chunk_size(self) -> int:
+        """How many rows to score in the chunk about to be launched.
+
+        Fixed at _ROLLOUT_PREFETCH_TEACHER_CHUNK unless adaptation is on, in which
+        case: (rows/second measured from completed chunks) x (last turn's glue),
+        floored at the fixed size and capped at _..._CHUNK_MAX. Falls back to the
+        fixed size until a chunk has completed and a glue window has been seen.
+        """
+        if not _ROLLOUT_PREFETCH_TEACHER_ADAPTIVE:
+            return _ROLLOUT_PREFETCH_TEACHER_CHUNK
+        if self._teacher_rate is None or self._teacher_glue_s is None:
+            return _ROLLOUT_PREFETCH_TEACHER_CHUNK
+        want = int(self._teacher_rate * self._teacher_glue_s)
+        return max(_ROLLOUT_PREFETCH_TEACHER_CHUNK, min(want, _ROLLOUT_PREFETCH_TEACHER_CHUNK_MAX))
+
+    def note_teacher_glue_window(self, seconds: float):
+        """Record how long the GPU-idle window between two generations lasted.
+
+        This is what the next chunk gets to hide inside, so it is the target the
+        adaptive size aims at. Called once per turn by the rollout loop.
+        """
+        if seconds > 0:
+            self._teacher_glue_s = seconds
+
     def _launch_teacher_prefetch(self):
         """Start one chunk of teacher scoring in the background, if any is queued.
 
@@ -699,12 +757,14 @@ class TrajectoryCollector:
         """
         if self._teacher_prefetch_fn is None or self._teacher_future is not None:
             return
-        chunk = self._teacher_pending[:_ROLLOUT_PREFETCH_TEACHER_CHUNK]
+        chunk = self._teacher_pending[:self._teacher_chunk_size()]
         if not chunk:
             return
         del self._teacher_pending[:len(chunk)]
         if self._teacher_executor is None:
             self._teacher_executor = ThreadPoolExecutor(max_workers=1)
+        self._teacher_inflight_rows = len(chunk)
+        self._teacher_inflight_start = _now()
         self._teacher_future = self._teacher_executor.submit(self._teacher_prefetch_fn, chunk)
 
     def _join_teacher_prefetch(self) -> float:
@@ -715,12 +775,38 @@ class TrajectoryCollector:
         anyway -- but on Ray's queue, where the driver could not see the cost.
         The wait is reported per turn (tchWait) so an oversized chunk is visible
         rather than silently charged to generation.
+
+        A chunk that raised is logged and dropped, not propagated. The mechanism is
+        designed to degrade to the serial path -- compute_teacher_log_probs scores
+        whatever is missing from `prefetched` and its completeness guard raises on
+        anything left over -- so the values are identical either way, and killing
+        the step instead costs the whole rollout. This is not a silent failure
+        mode: an unscored row cannot reach the loss (the guard), and hit_rate drops
+        visibly in the metrics.
         """
         if self._teacher_future is None:
             return 0.0
         started = _now()
         future, self._teacher_future = self._teacher_future, None
-        self._prefetched_teacher.update(future.result())
+        try:
+            self._prefetched_teacher.update(future.result())
+        except Exception as exc:  # noqa: BLE001 - the trainer rescores these rows
+            print(
+                f"[rollout][teacher-prefetch] chunk of {self._teacher_inflight_rows} rows failed "
+                f"({type(exc).__name__}: {exc}); the trainer will score those rows in "
+                f"teacher_forward instead."
+            )
+            self._teacher_rate = None  # the timing of a failed chunk means nothing
+        else:
+            elapsed = _now() - (self._teacher_inflight_start or started)
+            if elapsed > 0 and self._teacher_inflight_rows:
+                rate = self._teacher_inflight_rows / elapsed
+                # Smooth so one slow turn (a retriever stall inside the glue) does
+                # not swing the next chunk.
+                self._teacher_rate = rate if self._teacher_rate is None else 0.5 * (self._teacher_rate + rate)
+        finally:
+            self._teacher_inflight_rows = 0
+            self._teacher_inflight_start = None
         return _now() - started
 
     def take_prefetched_teacher(self) -> Dict:
@@ -859,7 +945,12 @@ class TrajectoryCollector:
             batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
             # Everything above this line was driver-side CPU work with the GPU
             # parked, which is what the teacher chunk launched last turn has been
-            # covering. Collect it before issuing generation.
+            # covering. That span -- from the launch after the previous generation
+            # to here -- is the window the NEXT chunk gets to hide inside, so
+            # measure it before collecting, and collect before issuing generation.
+            if self._teacher_glue_mark is not None:
+                self.note_teacher_glue_window(_now() - self._teacher_glue_mark)
+                self._teacher_glue_mark = None
             _teacher_wait = self._join_teacher_prefetch()
             _gw0 = gpu_profiler.now()
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
@@ -868,7 +959,9 @@ class TrajectoryCollector:
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
             _m_gen = _now()  # end of GPU generation window
             # The GPU is now idle until the next generation; start the next chunk
-            # so it runs under the decode / envs.step / tokenize glue below.
+            # so it runs under the decode / envs.step / tokenize glue below, and
+            # mark the window so the turn after this one can size its chunk to it.
+            self._teacher_glue_mark = _m_gen
             self._launch_teacher_prefetch()
 
             # Scatter active outputs back to the full batch size for union/recording.
@@ -1122,6 +1215,12 @@ class TrajectoryCollector:
         self._teacher_pending = []
         self._prefetched_teacher = {}
         self._teacher_future = None
+        # The rate carries across rollouts (same teachers, same shapes), but the
+        # glue window does not: turn 0's is unlike any other turn's.
+        self._teacher_glue_s = None
+        self._teacher_glue_mark = None
+        self._teacher_inflight_rows = 0
+        self._teacher_inflight_start = None
 
         # Both prefetches want the same two scarce things: the CPU-glue window
         # between generations, and the colocated WorkerDict, where a Ray actor

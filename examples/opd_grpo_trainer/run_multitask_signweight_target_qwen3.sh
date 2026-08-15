@@ -162,6 +162,20 @@ set -x
 #   step, and judge that on teacher_forward s/step plus wall clock, not on tchWait
 #   alone — tchWait is teacher work the trainer no longer has to do, not waste.
 #
+#   ROLLOUT_PREFETCH_TEACHER_ADAPTIVE=1 (default) makes that 128 the FLOOR rather
+#   than the size: each chunk is sized from the glue window it will actually run
+#   under — (rows/second measured from the last completed chunk) x (the previous
+#   turn's glue seconds) — clamped between CHUNK and
+#   ROLLOUT_PREFETCH_TEACHER_CHUNK_MAX (512). One constant cannot fit both ends of
+#   a rollout: the early turns hold most of the CPU glue (turn 0 alone is seconds
+#   of envs.step) while the queue is barely filled, and the later turns collapse to
+#   a fraction of a second of glue while the backlog is at its largest, so a fixed
+#   size underfills the front and overshoots the tail. Per-turn queueing makes the
+#   front-loading worse, not better — the queue is full from turn 1, so the turns
+#   with the widest windows are exactly the ones a fixed 128 starves. Set it to 0
+#   to go back to the fixed size. Chunking only decides how many already-final
+#   rows one call scores, so like the chunk size itself it cannot change a value.
+#
 #   PICK ONE of ROLLOUT_PREFETCH_TEACHER / ROLLOUT_PREFETCH_LOGPROB on this
 #   recipe. Unlike pure OPD (which has no old_log_prob phase at all), OPD+GRPO
 #   runs both, and they want the same resource twice over: the same CPU-glue
@@ -172,6 +186,11 @@ set -x
 #   spent queueing. TEACHER is the one on by default here, so adding
 #   ROLLOUT_PREFETCH_LOGPROB=1 means running both; the rollout prints a warning
 #   when it sees that. Measure them separately before assuming either is free.
+#   Turning both on now costs one thing more than it used to: the adaptive chunk
+#   controller below sizes the teacher chunk from the WALL-CLOCK glue window, and
+#   with the log-prob prefetch also in it that window is not the teacher's to
+#   fill — so it would size chunks against time already spent and spill into
+#   tchWait. Set ROLLOUT_PREFETCH_TEACHER_ADAPTIVE=0 if you ever do run both.
 #
 # Dynamic (token-budget) micro-batching is wired below but OFF by default so the
 # fixed-batch objective is unchanged. It packs micro-batches to a token budget
@@ -211,6 +230,41 @@ set -x
 # student side the discarded work was inside the autograd graph), and
 # logger-only scalars stay as 0-d GPU tensors until the end of update_policy
 # instead of being read back per micro-batch (~450 forced host syncs a step).
+#
+# Wasted-work removals. Each deletes computation whose result was already being
+# thrown away, so none of them changes a value that reaches the loss.
+#   actor.response_only_logits=True / ref.response_only_logits=True — run lm_head
+#     on the response rows only, by handing the row selection to the model as
+#     `logits_to_keep`. Everything the actor and teacher forwards return is sliced
+#     to [-response_length-1:-1], and prompts are ~3x responses here, so roughly
+#     three quarters of the vocab projection was built at (rows, 151936) and
+#     dropped — forward and backward, and it is the step's largest activation. The
+#     transformer body still runs on every token: a response position attends to
+#     the prompt's KV, so that part cannot be skipped. On the teacher this also
+#     shrinks the allocation that OOMed at step 136 of the pure-OPD run, because
+#     ROLLOUT_PREFETCH_TEACHER (on by default here) runs it while vLLM is awake and
+#     holding its KV cache. lm_head is a per-position linear map, so selecting the
+#     rows before or after it is the same arithmetic — only the GEMM shape moves,
+#     which is the accuracy class of a micro-batch change, so both are PINNED in
+#     the intent lock and go into every arm at once.
+#   The reward manager no longer decodes prompts and responses to strings on
+#     training calls. EpisodeRewardManager built both for the num_examine console
+#     sample, which is 0 on every training call, against a score that is the env's
+#     episode reward and never looks at the text: ~14k discarded decodes a step.
+#     Validation (num_examine>0) prints exactly what it did before.
+#   generate_sequences no longer calls empty_cache inside a rollout session. It ran
+#     once per turn (~50x per rollout) even with ROLLOUT_KEEP_VLLM_AWAKE holding
+#     the engine up, forcing a device synchronize to hand back blocks the allocator
+#     immediately re-acquired — and it cannot free vLLM's KV cache anyway, since
+#     the engine owns that. end_rollout_session() still empties it at the boundary.
+#   On THIS arm the ref half of that flag covers more than the three teachers:
+#     the base policy and the off-task teacher scoring (sign_weight_forward/*)
+#     are built with role="ref" from the same actor_rollout_ref config, so all
+#     three of the extra frozen forwards this arm pays for shrink with it too.
+# NOT taken from pure OPD: rollout.return_rollout_log_probs=False. That arm's thin
+# loop has no old_log_prob phase, so nothing reads the column. THIS recipe runs the
+# rollout-vs-actor drift check in RayPPOTrainer.fit (rollout_probs_diff), which is
+# its only consumer — leave it on.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
@@ -284,6 +338,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.actor.no_sync_grad_accum=True \
+    actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
@@ -304,6 +359,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
+    actor_rollout_ref.ref.response_only_logits=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
