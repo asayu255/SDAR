@@ -416,12 +416,12 @@ python3 -m verl.trainer.main_opd_grpo \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_opd_grpo_signweight_target_multitask' \
+    trainer.project_name='verl_agent_opd_grpo_tmp_multitask' \
     trainer.experiment_name=sdar_multitask_opd_grpo_signweight_target_qwen3_1.7b \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_target_multitask \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_tmp_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
