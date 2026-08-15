@@ -586,15 +586,7 @@ class OPDRayTrainer(RayPPOTrainer):
         self._load_checkpoint()
         self._fast_forward_env_schedules()
 
-        # val_only is checked on its own, not nested under val_before_train. The
-        # run scripts set val_before_train=False (the initial eval costs a full
-        # validation pass and says nothing a resumed run does not already know),
-        # and with the check nested a "validate this checkpoint and stop" command
-        # silently fell through to TRAINING from the checkpoint instead -- which
-        # looks like it worked, right up until the numbers you wanted never
-        # appear.
-        val_only = bool(self.config.trainer.get("val_only", False))
-        if self.val_reward_fn is not None and (val_only or self.config.trainer.get("val_before_train", True)):
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
