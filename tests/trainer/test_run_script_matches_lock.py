@@ -144,8 +144,19 @@ def test_each_weighted_arm_differs_from_the_control_only_in_the_weighting(arm, m
         "trainer.experiment_name",
         "trainer.expected_config",
         "trainer.default_local_dir",
+        # Placement, not science: the global batch sizes are pinned, and the
+        # per-task loss weights already divide by the DP world size, so the
+        # objective is the same on any GPU count (bit-level reduction order
+        # aside). Allowed to differ because arms get scheduled on whatever is
+        # free -- but when an arm is used as another's CONTROL, match it anyway,
+        # so the pair differs in the weighting alone.
+        "trainer.n_gpus_per_node",
+        "trainer.nnodes",
     }
-    assert differing == allowed, sorted(differing - allowed)
+    # Subset, not equality: an allowance the arms happen to agree on (both on the
+    # same GPU count, say) is not a failure. What must not happen is a difference
+    # outside the list.
+    assert differing <= allowed, sorted(differing - allowed)
     assert any(k.startswith("algorithm.opd.sign_weight.") for k in differing), "the arms are identical"
     # Not merely allowed to differ -- required to. The checkpoint path is
     # default_local_dir/global_step_N and trainer.resume_mode defaults to "auto",
