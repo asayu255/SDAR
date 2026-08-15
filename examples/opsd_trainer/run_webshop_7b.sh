@@ -57,7 +57,7 @@ python3 -m verl.trainer.main_sdar \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
-    +actor_rollout_ref.actor.pg_loss_coef=0 \
+    actor_rollout_ref.actor.pg_loss_coef=0 \
     +algorithm.sdar.sdar_coef=$sdar_coef \
     +algorithm.sdar.gate_beta=$gate_beta \
     +algorithm.sdar.skills_dir=skills/webshop \

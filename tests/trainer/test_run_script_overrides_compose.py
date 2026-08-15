@@ -1,0 +1,118 @@
+"""Every override a run script passes must actually compose.
+
+A run script is only correct if Hydra accepts it, and one mistake in particular
+is invisible on inspection: `+key=value` means *append a new key*, so it raises
+
+    ConfigCompositionException: Could not append to config.
+    An item is already at 'actor_rollout_ref.actor.response_only_logits'.
+
+as soon as that key gains a default in ppo_trainer.yaml. The trap is that Hydra
+allows `+` when the existing value is null -- which is why
+`+actor_rollout_ref.actor.fsdp_config.sharding_strategy=...` has always worked --
+so adding a *non-null* default to a key some script passes with `+` breaks that
+script, in a different file, at startup. Nothing else in the suite catches it:
+the config loads fine, the expectations file agrees, and the arm simply refuses
+to launch.
+
+Two gates:
+  * compose the multitask arms' scripts against the real config, end to end;
+  * a static sweep over every example script for the same pattern, so a script
+    nobody is running today still fails loudly the moment the default lands.
+"""
+
+import os
+import re
+
+import pytest
+
+pytest.importorskip("torch")
+hydra = pytest.importorskip("hydra")
+yaml = pytest.importorskip("yaml")
+
+from hydra import compose, initialize_config_dir
+from hydra.errors import ConfigCompositionException
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+CONFIG_DIR = os.path.join(REPO, "verl", "trainer", "config")
+# main_opd and main_ppo both use config_name="ppo_trainer".
+CONFIG_NAME = "ppo_trainer"
+
+COMPOSED_SCRIPTS = [
+    "examples/opd_trainer/run_multitask_qwen3.sh",
+    "examples/sdar_trainer/run_multitask_qwen3.sh",
+]
+
+
+def _overrides(path):
+    """The Hydra arguments of the script's trainer invocation.
+
+    The command is one backslash-continued line, so read until a line that does
+    not continue. `$@` is the caller's trailing overrides and `$HOME` is expanded
+    by the shell before Hydra sees it, so do both here too.
+    """
+    text = open(os.path.join(REPO, path)).read()
+    marker = re.search(r"python3 -m verl\.trainer\.main_\w+", text)
+    if marker is None:
+        return None
+    tail = text[marker.start():]
+    lines = []
+    for raw in tail.splitlines():
+        lines.append(raw)
+        if not raw.rstrip().endswith("\\"):
+            break
+    cmd = " ".join(line.rstrip().rstrip("\\").strip() for line in lines)
+    cmd = re.sub(r"python3 -m verl\.trainer\.main_\w+", "", cmd).replace('"$@"', "")
+    return [os.path.expandvars(tok) for tok in cmd.split() if "=" in tok]
+
+
+@pytest.mark.parametrize("script", COMPOSED_SCRIPTS)
+def test_the_script_composes(script):
+    if not os.path.exists(os.path.join(REPO, script)):
+        pytest.skip(f"{script} not present on this branch")
+    overrides = _overrides(script)
+    assert overrides, f"no overrides parsed from {script}"
+    try:
+        with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+            compose(config_name=CONFIG_NAME, overrides=overrides)
+    except ConfigCompositionException as e:
+        pytest.fail(f"{script} does not compose:\n{e}")
+
+
+def _schema_value(cfg, dotted):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
+
+
+def test_no_script_appends_over_an_existing_non_null_default():
+    """The static form of the same rule, swept over every example script.
+
+    `+` is legal on a key the schema leaves null (that is how the optional FSDP
+    knobs are passed) and illegal on one that already has a value.
+    """
+    schema = yaml.safe_load(open(os.path.join(CONFIG_DIR, CONFIG_NAME + ".yaml")))
+    offenders = []
+    for dirpath, _, filenames in os.walk(os.path.join(REPO, "examples")):
+        for name in filenames:
+            if not name.endswith(".sh"):
+                continue
+            path = os.path.join(dirpath, name)
+            body = open(path).read()
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                for match in re.finditer(r"\+((?:\w+\.)+\w+)=", stripped):
+                    key = match.group(1)
+                    present, value = _schema_value(schema, key)
+                    if present and value is not None:
+                        offenders.append((os.path.relpath(path, REPO), key, value))
+
+    assert not offenders, (
+        "these scripts use '+' on a key that already has a non-null default, "
+        "so Hydra refuses to compose them:\n"
+        + "\n".join(f"  {s}: +{k}=  (schema default: {v!r})" for s, k, v in sorted(set(offenders)))
+    )

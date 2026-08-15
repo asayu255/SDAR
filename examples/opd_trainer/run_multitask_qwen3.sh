@@ -251,9 +251,9 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
-    +actor_rollout_ref.actor.response_only_logits=True \
+    actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    +actor_rollout_ref.rollout.return_rollout_log_probs=False \
+    actor_rollout_ref.rollout.return_rollout_log_probs=False \
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
@@ -274,7 +274,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \
-    +actor_rollout_ref.ref.response_only_logits=True \
+    actor_rollout_ref.ref.response_only_logits=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.invalid_action_penalty_coef_by_task='{alfworld:0.1,search:0.01,webshop:0.1}' \
