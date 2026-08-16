@@ -865,6 +865,45 @@ class TrajectoryCollector:
             return pending["future"].result()
         return envs.reset(kwargs=env_kwargs)
 
+    def _record_turn(self, batch, active_idx, active_masks, infos, traj_uid,
+                     total_batch_list, total_infos, batch_size):
+        """Append this turn's rows to their trajectories and queue them for scoring.
+
+        Only the rows that will actually be recorded are materialised. Finished
+        trajectories' rows carry active_masks=False and are dropped by
+        gather_rollout_data(), so slicing every column for them and then
+        discarding the dict is the whole cost for none of the result -- and by the
+        late turns of a 50-step episode they are most of the batch. Active rows
+        form a prefix of each trajectory's list, so the enumerate-based turn_step
+        and the last-active-entry scans in success_evaluator / filter_group_data
+        are unchanged.
+
+        Two index spaces meet here and they are not the same: ``i`` numbers the
+        BATCH row (which is what infos, traj_uid, active_masks and
+        total_batch_list are keyed by) while ``pos`` numbers the materialised
+        rows, which are only the recorded ones. Its own function because mixing
+        them up is silent when every row is active and an IndexError as soon as
+        one is not.
+        """
+        record_idx = active_idx if _ROLLOUT_COMPACT_RECORD else range(batch_size)
+        rows: list[dict] = to_list_of_dict(batch, record_idx)
+
+        for pos, i in enumerate(record_idx):
+            total_batch_list[i].append(rows[pos])
+            total_infos[i].append(infos[i])
+            if active_masks[i]:
+                # A row is final the moment it is recorded: later turns only
+                # append to total_batch_list[i], never rewrite earlier rows, and
+                # both scoring models are frozen for the whole rollout (the
+                # teacher for the whole run). Queue it now instead of at
+                # trajectory end, so the ~45 glue windows can start draining
+                # alfworld's rows from turn 1 rather than after turn 50.
+                # step_idx matches the trainer's enumerate over this list: with
+                # COMPACT_RECORD on, active rows form a prefix; with it off,
+                # inactive rows are appended too and both sides count them the
+                # same way.
+                self._queue_row_for_prefetch(traj_uid[i], len(total_batch_list[i]) - 1, rows[pos])
+
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -1053,34 +1092,16 @@ class TrajectoryCollector:
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
             
-            # Only the rows that will actually be recorded are materialised.
-            # Finished trajectories' rows carry active_masks=False and are dropped
-            # by gather_rollout_data(); slicing every column for them and then
-            # discarding the dict is the whole cost for none of the result, and by
-            # the late turns of a 50-step episode they are most of the batch.
-            # Active rows form a prefix of each trajectory's list, so the
-            # enumerate-based turn_step and the last-active-entry scans in
-            # success_evaluator / filter_group_data are unchanged.
-            record_idx = active_idx if _ROLLOUT_COMPACT_RECORD else range(batch_size)
-            batch_list: list[dict] = to_list_of_dict(batch, record_idx)
-
-            for pos, i in enumerate(record_idx):
-                total_batch_list[i].append(batch_list[pos])
-                total_infos[i].append(infos[i])
-                if active_masks[i]:
-                    # A row is final the moment it is recorded: later turns only
-                    # append to total_batch_list[i], never rewrite earlier rows,
-                    # and both scoring models are frozen for the whole rollout
-                    # (the teacher for the whole run). Queue it now instead of at
-                    # trajectory end, so the ~45 glue windows can start draining
-                    # alfworld's rows from turn 1 rather than after turn 50.
-                    # step_idx matches the trainer's enumerate over this list:
-                    # with COMPACT_RECORD on, active rows form a prefix; with it
-                    # off, inactive rows are appended too and both sides count
-                    # them the same way.
-                    self._queue_row_for_prefetch(
-                        traj_uid[i], len(total_batch_list[i]) - 1, batch_list[i]
-                    )
+            self._record_turn(
+                batch=batch,
+                active_idx=active_idx,
+                active_masks=active_masks,
+                infos=infos,
+                traj_uid=traj_uid,
+                total_batch_list=total_batch_list,
+                total_infos=total_infos,
+                batch_size=batch_size,
+            )
 
             # Update done states
             is_done = np.logical_or(is_done, dones)

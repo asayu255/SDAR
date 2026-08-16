@@ -231,3 +231,86 @@ def test_finished_rows_share_one_padding_filler():
     # ...and dropping the argument still produces a correct row on its own.
     solo = collector._placeholder_single_sample(item=0, gen_batch=gen_batch, obs=obs, template=template)
     assert torch.equal(solo["input_ids"], filler["input_ids"])
+
+
+def _record(collector, batch, active, batch_size, compact=True):
+    """Drive one turn's recording. Returns (total_batch_list, queued)."""
+    from agent_system.multi_turn_rollout import rollout_loop as rl
+
+    total_batch_list = [[] for _ in range(batch_size)]
+    total_infos = [[] for _ in range(batch_size)]
+    queued = []
+    collector._queue_row_for_prefetch = lambda uid, step, row: queued.append((uid, step, row))
+
+    active_masks = np.zeros(batch_size, dtype=bool)
+    active_masks[list(active)] = True
+    old = rl._ROLLOUT_COMPACT_RECORD
+    rl._ROLLOUT_COMPACT_RECORD = compact
+    try:
+        collector._record_turn(
+            batch=batch,
+            active_idx=np.array(sorted(active)),
+            active_masks=active_masks,
+            infos=[{"i": i} for i in range(batch_size)],
+            traj_uid=np.array([f"t{i}" for i in range(batch_size)], dtype=object),
+            total_batch_list=total_batch_list,
+            total_infos=total_infos,
+            batch_size=batch_size,
+        )
+    finally:
+        rl._ROLLOUT_COMPACT_RECORD = old
+    return total_batch_list, total_infos, queued
+
+
+def test_each_trajectory_records_its_own_row():
+    """Two index spaces meet in this loop: the BATCH row (what infos, traj_uid and
+    total_batch_list are keyed by) and the position within the materialised rows,
+    which are only the recorded ones. Using one for the other is silent while every
+    row is active and wrong the moment one is not."""
+    from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    batch = _turn_batch(6)
+    active = [1, 4, 5]
+
+    total_batch_list, total_infos, queued = _record(collector, batch, active, 6)
+
+    for i in range(6):
+        if i in active:
+            assert len(total_batch_list[i]) == 1
+            assert torch.equal(total_batch_list[i][0]["input_ids"], batch.batch["input_ids"][i])
+            assert total_batch_list[i][0]["traj_uid"] == f"t{i}"
+            assert total_infos[i] == [{"i": i}]
+        else:
+            assert total_batch_list[i] == [] and total_infos[i] == []
+
+    # The queued row is the very object that was recorded, for the right traj.
+    assert [uid for uid, _, _ in queued] == ["t1", "t4", "t5"]
+    assert all(step == 0 for _, step, _ in queued)
+    for (uid, _, row), i in zip(queued, active):
+        assert row is total_batch_list[i][0]
+
+
+def test_recording_every_row_still_works_with_compaction_off():
+    from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    batch = _turn_batch(4)
+
+    total_batch_list, total_infos, queued = _record(collector, batch, [0, 2], 4, compact=False)
+
+    # Every row is appended; only the active ones are queued.
+    assert all(len(rows) == 1 for rows in total_batch_list)
+    for i in range(4):
+        assert torch.equal(total_batch_list[i][0]["input_ids"], batch.batch["input_ids"][i])
+    assert [uid for uid, _, _ in queued] == ["t0", "t2"]
+    for (uid, _, row), i in zip(queued, [0, 2]):
+        assert row is total_batch_list[i][0]
+
+
+def test_a_turn_where_nothing_is_active_records_nothing():
+    from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    total_batch_list, total_infos, queued = _record(collector, _turn_batch(3), [], 3)
+    assert total_batch_list == [[], [], []] and queued == []
