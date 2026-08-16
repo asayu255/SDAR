@@ -216,11 +216,14 @@ class OPDRayTrainer(RayPPOTrainer):
             wg = all_wg[key]
             wg.init_model()
             self.teacher_wg[task] = wg
-            if self.student_indexed_topk:
+            if self.student_indexed_topk and not bool(self.config.trainer.get("val_only", False)):
                 # The actor resolves this teacher at ids the student picks, which
                 # needs its output projection at update time -- by which point the
                 # ref path has resharded it. One unsharded copy per teacher, taken
                 # once here, labelled with the task the cache will file it under.
+                # Not in a val_only run: nothing scores a teacher there, and this
+                # is 1.9 GB a rank held for the life of the process, next to a vLLM
+                # engine already sized to 0.6 of the card.
                 wg.register_teacher_lm_head(task)
 
         if self.use_rm:
