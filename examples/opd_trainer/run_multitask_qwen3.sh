@@ -164,17 +164,27 @@ set -x
 #     while the current one computes. Scheduling only, arithmetic untouched, so
 #     it is a plain performance knob and is not pinned.
 #
-# enable_gradient_checkpointing=False. Measured at step 1: update_actor is 53.5%
-# of the step at sm 94.7% -- work-bound, not gap-bound -- and actor.bwd alone is
-# 200.4s of it. Checkpointing makes backward recompute the forward, so it costs
-# ~3 units where storing costs 2; dropping it takes about a third off that
-# backward, ~67s of a 563s step. It is affordable because the card has room:
-# step 1 peaked at max_memory_allocated 93.9 GB / reserved 128.5 GB, and the
-# activations this keeps are ~13 GB (10 rows x ~690 real tokens x 28 layers).
-# NOT bit-identical -- a recomputed forward and a stored one differ in their last
-# bits under autocast -- so it is pinned and has to be the same across the arms
-# being compared. Put it back to True if a longer-prompt task or a bigger student
-# leaves no room; the targets are identical either way.
+# enable_gradient_checkpointing stays True, and the attempt to drop it is worth
+# recording because the reasoning that said it would fit was wrong.
+#
+# The case for dropping it is real: update_actor is 53.5% of the step at sm
+# 94.7% -- work-bound, not gap-bound -- and actor.bwd alone is 200.4s of a 563s
+# step. Checkpointing makes backward recompute the forward, ~3 units where
+# storing costs 2, so dropping it should take about a third off that backward.
+#
+# There is no room for it. The card is 94.97 GiB and step 1 peaked at
+# max_memory_allocated 93.9 GB -- 99% -- so the ~13 GB of activations it would
+# keep (10 rows x ~690 real tokens x 28 layers) OOMed in the first micro-batch,
+# on the logsumexp. What made this look affordable was reading
+# max_memory_reserved (128.5 GB) as if it were device memory: it is not. vLLM's
+# CuMemAllocator maps memory that PyTorch counts in its reserved total but the
+# device does not, so reserved can exceed the card. max_memory_allocated is the
+# number to read.
+#
+# Freeing the ~13 GB elsewhere is possible in principle -- gpu_memory_utilization
+# is 0.6 of 95 GiB, ~57 GB, and peak KV demand is ~40 GB -- but the margin is
+# thin enough that it needs measurement, not arithmetic. Do not try it without
+# first logging vLLM's KV usage (VLLM_LOGGING_LEVEL=INFO).
 #
 # actor.student_indexed_topk=True — NOT a speedup. It changes what the top-k KL
 # is computed over, so it belongs to the science, is pinned in
@@ -340,7 +350,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.pg_loss_coef=0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \

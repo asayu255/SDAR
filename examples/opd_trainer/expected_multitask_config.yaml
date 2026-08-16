@@ -88,10 +88,11 @@
 "actor_rollout_ref.actor.student_indexed_topk": true
 # enable_gradient_checkpointing sits on the gradient path even though it looks
 # like a pure memory knob: a recomputed forward and a stored one differ in their
-# last bits under autocast, the same class as no_sync_grad_accum. Measured off
-# because update_actor is 53.5% of the step at sm 94.7% -- work-bound -- and
-# checkpointing makes backward pay ~3 units where storing pays 2.
-"actor_rollout_ref.model.enable_gradient_checkpointing": false
+# last bits under autocast, the same class as no_sync_grad_accum. It is pinned
+# ON. Turning it off is worth ~a third of actor.bwd, but the card is 94.97 GiB
+# and the step already peaks at max_memory_allocated 93.9 GB, so the ~13 GB of
+# activations it would keep does not exist. See the run script.
+"actor_rollout_ref.model.enable_gradient_checkpointing": true
 # rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that has
 # nothing to do with log probs: this arm never runs compute_log_prob, so the
 # value's only effect is adjust_batch's divisor, lcm(rollout*2, rollout*2,

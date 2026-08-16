@@ -587,7 +587,7 @@ step あたりのトークン量が 3.44 M / 4.89〜5.20 M / 4.7 M 級とばら�
 |---|---|---|
 | `reward` の overlap | 見送り | 2.3〜3.1 s / step、`cpu% ≈ 103` で GPU は idle。300 step で約 12 分。走行中断の価値なし |
 | chunked prefill 有効化 | **次 run** | `gen` −5〜10% 見込み。サンプリング分布は不変 |
-| KV 予算 `gpu_memory_utilization` 0.6 → 0.7 | **次 run** | `gen` −3〜8%。OOM 判定は `max_memory_reserved 145.3 GB` から逆算 |
+| KV 予算 `gpu_memory_utilization` 0.6 → 0.7 | **次 run** | `gen` −3〜8%。**ただしここに書いた「`max_memory_reserved 145.3 GB` から逆算」は誤り** ―― reserved はデバイスメモリではない（5 節⑨）。判定は `max_memory_allocated` で取り直すこと |
 | `ppo_micro_batch_size_per_gpu` 5 → 10 | **次 run** | `update_actor` −2〜3%。`adjust_batch` の lcm が 160 → 320 になり padding が増える |
 | async / disaggregated RL | **不可** | on-policy 定義に反する（2.6 節） |
 
@@ -692,6 +692,36 @@ NotImplementedError: Method 'sleep' is not implemented.
 2.4 では Ray の worker 配置、ここでは vLLM の worker 差し替えだった。
 V1 エンジンなら spec decode は `v1/spec_decode` にあり sleep も実装されているので、
 **`VLLM_USE_V1=1` を全 arm で検証する別実験**として残す。
+
+**⑨ `max_memory_reserved` をデバイスメモリと読み、空きが 47 GB あると判断した。**
+`enable_gradient_checkpointing=False` を勧めた根拠がこれで、**次の step 1 の
+最初の micro-batch で OOM した**（`dp_actor.py` の `logsumexp`）:
+
+```
+torch.OutOfMemoryError: Tried to allocate 1.33 GiB.
+GPU 0 has a total capacity of 94.97 GiB of which 473.69 MiB is free.
+```
+
+見ていたのは `perf/max_memory_allocated_gb 93.9` と `max_memory_reserved_gb 128.5` で、
+後者を容量と取り違えて「128.5 のうち 93.9 しか使っていない」と読んだ。**カードは
+94.97 GiB しかない。** allocated 93.9 は既に **99%** であって、checkpointing を切って
+保持することになる約 13 GB の活性化（10 行 × 約 690 実トークン × 28 層）を置く場所は
+最初から無かった。
+
+**reserved が容量を超えうるのは、それがデバイスメモリの指標ではないから。**
+vLLM の `CuMemAllocator` は自前のプールを map し、PyTorch はそれを reserved に数えるが
+デバイス側の物理割り当てとは一致しない。この run では reserved 128.5、以前の run では
+145.3（6 節の表）―― **どちらも 94.97 GiB のカードを超えている**。超えた時点で
+「これは容量ではない」と気づけたはずだった。**読むべきは `max_memory_allocated`。**
+
+**さらに悪いのは、正しい数字がこのレポート自身に書いてあったこと。** 9.1 節の OOM
+トレースが `GPU 0 has a total capacity of 94.97 GiB` をそのまま引用している。
+5 節⑥で「『余裕がある』と言う前に分母を出すこと」と書いたのに、**同じレポートの中で
+分母を確認せずに余裕を宣言した**。教訓は⑥と同一で、今回は分母がリポジトリ内にあった。
+
+`gradient_checkpointing` は True に戻した。同じ commit で入れた
+`rollout.log_prob_micro_batch_size_per_gpu=10`（`adjust_batch` の除数を 160 → 20 に
+下げ、step あたり約 116 行の padding を約 10 行にする）は**メモリを使わないので残す**。
 
 ---
 
@@ -1123,9 +1153,13 @@ prompt 行**だった。ここが縮めば `ref.log_prob_micro_batch_size_per_gp
    spec decode は V0 では起動せず、**V1 エンジン検証が前提**。#0 の統計が
    その設計材料になる
 2. gradient checkpointing の A/B（`bwd/fwd = 2.56`）。5 でメモリが空いた**後**
-3. `ppo_micro_batch_size_per_gpu` 5 → 8。`adjust_batch` の lcm が 160 → 32 になり
-   padding 行が約 3.6% → 0.5% に落ちる副次効果つき（10 は lcm 160 のままなので
-   8 の方が筋が良い）
+   ―― **この「後」は飾りではない。** 順序を守らずに先に切って OOM させたのが
+   5 節⑨。allocated は 94.97 GiB のカードに対し 93.9 で、空ける前に置ける場所は無い
+3. `ppo_micro_batch_size_per_gpu` 5 → 10（**実施済み**）。除数は
+   `lcm(rollout_micro×W, rollout_micro×W, actor_micro×W)` なので、
+   `rollout.log_prob_micro_batch_size_per_gpu` を 16 → 10 に揃えた今は
+   `lcm(20,20,20) = 20`。step あたりの padding 行は 116 → 約 10 に落ちた
+   （8 を勧めていた旧記述は rollout 側が 16 だった頃の前提で、もう当たらない）
 4. preprocess の batch tokenizer 化。ただし preproc を縮めると glue が縮んで
    `tchWait` が増えるので、5 の後
 5. chunked prefill / KV 予算。**3 arm 同時**
