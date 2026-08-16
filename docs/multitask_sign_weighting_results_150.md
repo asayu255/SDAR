@@ -46,6 +46,48 @@ N=126 の2群差95%検出限界(≈0.107〜0.12)のちょうど上に乗って�
    target モードは固定点を教師から動かす唯一の変種であり、教師超えの拡大は機構の
    予測方向と整合する。
 
+## コード差分の全数監査(「重み付け以外が効いたのでは」)
+
+対照(1本目)の実行コード = `4dc5f9d`、処理の実行コード = `e75051f`(8/13 20:49 push、
+実行開始 20:56)。両者の差分を全件照合した結果:
+
+| 監査項目 | 結果 |
+|---|---|
+| 既存コード行の削除/改変 | **4ファイルすべて 0 行**(`opd_ray_trainer.py` / `opd_grpo_ray_trainer.py` / `dp_actor.py` / `fsdp_workers.py` はいずれも純追加) |
+| `core_algos.py`(損失・アドバンテージ本体) | **差分なし** |
+| `ray_trainer.py`(報酬・アドバンテージ) | **差分なし** |
+| `agent_system/`(ロールアウト・報酬・環境) | **差分なし** |
+| ロックの科学ノブ | `sign_weight.*` 6件 と run identity 2件のみ。**他は完全一致** |
+| バッチ構成(train/mini/micro/rollout.n) | **すべて一致** |
+| 実行引数 | `sign_weight.*` 6件、`expected_config` パス、実験名、そして `n_gpus_per_node` |
+
+**追加された非 sign_weight コードは、target モードでは一度も発火しない。**
+`dp_actor.py` の `teacher_kld * SIGN_WEIGHT_KEY` は position モード専用で、
+今回の走行では `SIGN_WEIGHT_KEY` がバッチに書かれていない。
+`compute_topk_log_prob_at_ids` / `compute_ref_topk_log_prob_at_ids` は
+勾配を持たない読み取り専用の採点関数で、損失には触れない。
+
+### 危うかった点(確認して否定)
+
+`d2645c1`「Keep adjust_batch's copies out of the GRPO group statistic」は
+**アドバンテージ正規化そのものを変える修正**で、対照ブランチに 8/13 10:30 —
+処理アーム開始の10時間前 — に入っていた。これが処理側だけに入っていれば
+交絡になっていたが、実行コミット `e75051f` のツリーを照合した結果、
+該当4ファイルはすべて修正前(`4dc5f9d`)と一致しており、**処理側にも入っていない**。
+対照・処理とも修正前のコードで走っている。
+
+### 残る唯一の差: `n_gpus_per_node` 3 → 2
+
+目的関数は不変(グローバルバッチは固定、per-task 重みが
+`task_dp_world_size * gradient_accumulation` を掛けて world size を打ち消す)。
+`ppo_mini_batch_size=60` も `train_batch_size×n=360` も 2/3 どちらでも割り切れる。
+
+**ただし無害ではない。**GPU 数が変われば vLLM のサンプリング実現値が変わるため、
+`data.seed=1` / `env.seed=1` が固定でも**ロールアウトの実現は別物**になる。
+つまり2本は「同一シードの比較」ではなく、**構造的に別シードの1本ずつ**である。
++0.111 のうちどれだけがシード実現差かは、この設計では原理的に分離できない。
+次のアームは GPU 数を揃えること。
+
 ## 検討して棄却した交絡: 「再正規化そのものが効いたのでは」
 
 target モードは `reweight_teacher_logprobs` の中で再正規化を行う。元の OPD には
