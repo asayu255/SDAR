@@ -277,11 +277,17 @@ export ALFWORLD_DATA=$HOME/data/alfworld
 # asserts on expandable segments outright ("Expandable segments are not
 # compatible with memory pool", pytorch#147851) -- the engine refuses to build.
 # This arm depends on that mechanism (free_cache_engine=False plus
-# ROLLOUT_KEEP_VLLM_AWAKE), so the two cannot coexist. Dropping the actor's
-# recomputed activations does allocate and free ~13 GB every micro-batch, which
-# is the pattern expandable segments exist for, but the previous run already
-# reserved 128.5 GB against 93.9 allocated -- ~35 GB of slack the caching
-# allocator can reuse -- so the default is expected to absorb it.
+# ROLLOUT_KEEP_VLLM_AWAKE), so the two cannot coexist. Nothing about the
+# gradient-checkpointing revert changes that: the assert fires in init_workers,
+# before any activation is allocated.
+#
+# The fragmentation argument that originally justified the export is also gone.
+# It rested on the actor allocating and freeing ~13 GB of activations every
+# micro-batch, which only happened with checkpointing off -- it is back on, so
+# that traffic does not exist. The second half of that argument was wrong on its
+# own terms as well: it read "reserved 128.5 GB against 93.9 allocated" as ~35 GB
+# of reusable slack. Reserved is not device memory here (the card is 94.97 GiB,
+# less than the reserved figure), so there was no such slack to count.
 # Traced off for this one line. `set -x` at the top of the file echoes every
 # command it runs, expansions included, so with tracing on this writes the real
 # key into whatever the run is tee'd to -- in plaintext, for every restart.
