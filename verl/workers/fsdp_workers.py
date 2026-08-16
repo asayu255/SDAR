@@ -997,13 +997,18 @@ class ActorRolloutRefWorker(Worker):
             live_mask=live_mask,
         )
 
-    def _register_teacher_lm_head(self, task: str):
+    def _register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):
         """Hand the process cache an unsharded copy of this teacher's projection.
 
         The ref path reshards after every call, so by the time the actor update runs
         the parameter cannot be indexed at arbitrary ids. One 622 MB copy per teacher
         for a 1.7B model, held for the run -- the alternative is an all-gather of the
         whole teacher inside every micro-batch.
+
+        ``slot``/``n_tasks`` put the copy straight into its slice of the stacked
+        projection the lookup reads. Cloning first and stacking later would hold
+        both layouts at once -- another ~1.9 GB, peaking before vLLM has sized its
+        KV cache, which is exactly when free memory is being measured.
         """
         from verl.workers.teacher_cache import get_teacher_cache
 
@@ -1018,13 +1023,16 @@ class ActorRolloutRefWorker(Worker):
             head = getattr(inner, "lm_head", None)
             if head is None:
                 raise RuntimeError("teacher has no lm_head; student_indexed_topk cannot resolve its log-probs")
-            get_teacher_cache().register_lm_head(task, head.weight.detach().clone())
+            if n_tasks is None:
+                get_teacher_cache().register_lm_head(task, head.weight.detach().clone())
+            else:
+                get_teacher_cache().register_lm_head(task, head.weight.detach(), slot=slot, n_tasks=n_tasks)
         self._teacher_lm_head_task = task
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def register_teacher_lm_head(self, task: str):
+    def register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):
         assert self._is_ref
-        self._register_teacher_lm_head(task)
+        self._register_teacher_lm_head(task, slot=slot, n_tasks=n_tasks)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_teacher_hidden_cache(self):

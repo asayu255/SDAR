@@ -143,6 +143,14 @@ class TeacherHiddenCache:
         self._temperature: Dict[int, float] = {}
         self._witness_ids: Dict[int, torch.Tensor] = {}
         self._witness_lp: Dict[int, torch.Tensor] = {}
+        # Entries are views into one packed tensor per put call. Held here too so
+        # _finalize can release each source the moment its last row has been
+        # copied into the contiguous store, instead of holding every source until
+        # the concatenation is finished.
+        self._chunks: Dict[int, list] = {}
+        self._chunk_of: Dict[int, int] = {}
+        self._chunk_refs: Dict[int, int] = {}
+        self._next_chunk = 0
         self._weights: Dict[str, torch.Tensor] = {}
         self._stacked = None   # (n_tasks * vocab, hidden), built on first read
         self._voff: Dict[str, int] = {}
@@ -150,17 +158,39 @@ class TeacherHiddenCache:
 
     # -- registration ----------------------------------------------------- #
 
-    def register_lm_head(self, task: str, weight: torch.Tensor):
+    def register_lm_head(self, task: str, weight: torch.Tensor, slot=None, n_tasks=None):
         """Keep an unsharded copy of a teacher's output projection.
 
         Needed because the ref path reshards after every call, so by the time the
         actor update runs the sharded parameter cannot be indexed at arbitrary
         ids. One copy per teacher, held for the run.
+
+        With ``slot``/``n_tasks`` the copy lands straight in its slice of the
+        stacked projection. Registering separately and stacking later means both
+        layouts exist at once -- ~1.9 GB of duplicate for a 1.7B teacher, and it
+        peaks while the allocator is still deciding how much vLLM gets. The caller
+        knows how many teachers there are, so it can say.
         """
-        self._weights[task] = weight
-        # A new teacher shifts every other one's slice of the stacked projection,
-        # so the offsets baked into the read-side tensors are no longer valid.
-        self._stacked = None
+        if n_tasks is not None:
+            v, hidden = weight.shape
+            if self._stacked is None:
+                self._stacked = torch.empty((n_tasks * v, hidden), dtype=weight.dtype, device=weight.device)
+            elif self._stacked.shape != (n_tasks * v, hidden):
+                raise ValueError(
+                    f"teacher lm_head {task} does not fit the stacked projection: expected "
+                    f"{tuple(self._stacked.shape)} for {n_tasks} teachers, got vocab {v} x hidden {hidden}"
+                )
+            off = int(slot) * v
+            self._stacked[off : off + v].copy_(weight)
+            self._voff[task] = off
+            self._weights[task] = self._stacked[off : off + v]
+        else:
+            if self._voff:
+                raise ValueError("teachers must all register with a slot or all without; this mixes the two")
+            self._weights[task] = weight
+            # A new teacher shifts every other one's slice of the stacked
+            # projection, so any offsets already baked in are no longer valid.
+            self._stacked = None
         self._final = None
 
     def _stack_heads(self):
@@ -173,6 +203,9 @@ class TeacherHiddenCache:
         teacher's slice instead makes the whole lookup one gather with no
         branching. The memory is the same 1.9 GB the three copies already cost;
         only the layout changes.
+
+        The fallback path for callers that registered without a slot: it builds
+        the same thing, but transiently holds both layouts.
         """
         if self._stacked is not None:
             return
@@ -277,7 +310,8 @@ class TeacherHiddenCache:
             # whole padded input for the step.
             for i in kept:
                 self._register(
-                    keys[i], task, h.new_empty((0, h.shape[-1])), lse.new_empty((0,)), None, None, 0, temperature
+                    keys[i], task, h.new_empty((0, h.shape[-1])), lse.new_empty((0,)), None, None, 0, temperature,
+                    chunk=None,
                 )
             return
         row_of = torch.repeat_interleave(torch.arange(len(kept), device=dev), lens)
@@ -287,6 +321,10 @@ class TeacherHiddenCache:
         # cache holds exactly the packed size and the padded input is free to go.
         h_packed = h.reshape(n * resp_len, -1)[flat]
         lse_packed = lse.reshape(n * resp_len)[flat]
+        chunk = self._next_chunk
+        self._next_chunk += 1
+        self._chunks[chunk] = [h_packed, lse_packed]
+        self._chunk_refs[chunk] = 0
 
         # The witness is a SAMPLE of rows, not a column: it is the teacher's own
         # top-k, which nothing downstream reads, and building it costs a
@@ -307,9 +345,11 @@ class TeacherHiddenCache:
                 w = w_of_row[i]
                 w_ids = witness_ids[w, : lens_l[j]]
                 w_lp = witness_lp[w, : lens_l[j]]
-            self._register(keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature)
+            self._register(
+                keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature, chunk=chunk
+            )
 
-    def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature):
+    def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature, chunk=None):
         self._h[key] = h
         self._lse[key] = lse
         self._len[key] = int(length)
@@ -318,6 +358,9 @@ class TeacherHiddenCache:
         if w_ids is not None:
             self._witness_ids[key] = w_ids
             self._witness_lp[key] = w_lp
+        if chunk is not None:
+            self._chunk_of[key] = chunk
+            self._chunk_refs[chunk] += 1
         self._final = None
 
     def clear(self):
@@ -328,6 +371,10 @@ class TeacherHiddenCache:
         self._temperature.clear()
         self._witness_ids.clear()
         self._witness_lp.clear()
+        self._chunks.clear()
+        self._chunk_of.clear()
+        self._chunk_refs.clear()
+        self._next_chunk = 0
         self._final = None
 
     def __len__(self):
@@ -347,6 +394,15 @@ class TeacherHiddenCache:
         times a step, and a ``.tolist()`` or an ``int(t)` there is a
         device-to-host sync that stalls the pipeline the whole rollout-overlap
         effort exists to keep full.
+
+        The store is filled row by row rather than concatenated, and each entry is
+        re-pointed at its slice as it is copied. Two reasons, both about memory:
+        a concatenation holds every source until it finishes, and leaving the
+        entries pointing at the old sources would keep the WHOLE cache alive twice
+        for the length of the actor update. Copying in key order drains one put's
+        packed tensor at a time -- keys are handed out in order, so a source is
+        released about as soon as it is exhausted -- and the peak is the store plus
+        one chunk instead of the store plus all of them.
         """
         if self._final is not None and self._final["device"] == device:
             return self._final
@@ -363,6 +419,25 @@ class TeacherHiddenCache:
 
         lens = torch.tensor([self._len[k] for k in keys], dtype=torch.long)
         offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
+        total = int(lens.sum())
+        probe = self._h[keys[0]]
+        store_h = torch.empty((total, probe.shape[-1]), dtype=probe.dtype, device=device)
+        store_lse = torch.empty((total,), dtype=self._lse[keys[0]].dtype, device=device)
+        off_l = offsets.tolist()
+        for i, k in enumerate(keys):
+            a, b = off_l[i], off_l[i] + self._len[k]
+            store_h[a:b].copy_(self._h[k])
+            store_lse[a:b].copy_(self._lse[k])
+            self._h[k] = store_h[a:b]
+            self._lse[k] = store_lse[a:b]
+            chunk = self._chunk_of.pop(k, None)
+            if chunk is not None:
+                self._chunk_refs[chunk] -= 1
+                if self._chunk_refs[chunk] == 0:
+                    # Last row out of that put's packed tensor; nothing references
+                    # it now, so the allocator gets it back before the next copy.
+                    del self._chunks[chunk], self._chunk_refs[chunk]
+
         self._final = {
             "device": device,
             "empty": False,
@@ -373,8 +448,8 @@ class TeacherHiddenCache:
             "slot_off": offsets.to(device),
             "slot_voff": torch.tensor([self._voff[self._task[k]] for k in keys], dtype=torch.long).to(device),
             "slot_temp": torch.tensor([self._temperature[k] for k in keys], dtype=torch.float32).to(device),
-            "h": torch.cat([self._h[k] for k in keys]).to(device),
-            "lse": torch.cat([self._lse[k] for k in keys]).to(device),
+            "h": store_h,
+            "lse": store_lse,
             "max_len": int(lens.max()),
         }
         return self._final

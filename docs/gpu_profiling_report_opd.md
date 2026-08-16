@@ -1247,6 +1247,20 @@ padding 行の id を −1 にする。witness は `compute_teacher_log_probs` �
 step 頭から `update_actor` の終わりまで GPU に載る。**9.2 で一度 OOM している**ので、
 300 step を回す前に 1 step の smoke test で `perf/max_memory_allocated_gb` を見ること。
 
+**二重保持を 2 か所で潰した**（どちらも精度には無関係、OOM とスループットの問題）：
+
+1. **finalize 時の hidden 二重保持。** 読み出し側は連続 buffer が要るが、`torch.cat` で
+   作ると元の put 単位 packed tensor を entry が参照し続け、**actor update の間ずっと
+   cache 本体をほぼ 2 セット**持つ。行ごとに copy して entry をその slice に張り替え、
+   ある chunk の最後の行が出た時点でその chunk を解放する。id は put 順に振られるので
+   key 昇順の copy は chunk を 1 つずつ枯らしていき、**ピークは「store ＋ chunk 1 個」
+   （約 1.8 GB ＋ 0.27 GB）**。`cat` なら「store ＋ 全 chunk」で 3.6 GB だった
+2. **head stack 時の 1.9 GB ピーク。** 各 teacher を個別に clone してから `cat` すると
+   両レイアウトが同時に存在する。しかもこれが起きるのは worker init 中 —— **vLLM が
+   free memory を測って KV cache を決める直前**である。`register_teacher_lm_head` に
+   slot を渡し、`summon_full_params` の中から**直接 stack 済み buffer の自分の slice へ
+   copy** するようにした（clone も `cat` も無くなる）
+
 ### 11.6 student-topK に付随して消した無駄
 
 **規定 ON**（`ppo_trainer.yaml`）。`teacher_kl_loss_type=topk_kl` のときだけ効き、
@@ -1274,6 +1288,6 @@ float32 である。
 ### 11.7 まだ未検証
 
 forward hook（`_capture_last_hidden`）と `FSDP.summon_full_params` 経路は
-**実機で一度も走っていない**。CPU 上の 46 tests（うち 3 つは本物の 2 プロセス gloo）で
+**実機で一度も走っていない**。CPU 上の 51 tests（うち 3 つは本物の 2 プロセス gloo）で
 値・所有権・番人は押さえてあるが、FSDP 実体の上での動作は別物である。
 1 step の smoke test を 300 step の前に必ず挟むこと。

@@ -212,7 +212,8 @@ class OPDRayTrainer(RayPPOTrainer):
             self.critic_wg.init_model()
 
         # Initialize teachers before the rollout engine (matches actor-last ordering).
-        for task, key in self._teacher_keys.items():
+        n_teachers = len(self._teacher_keys)
+        for slot, (task, key) in enumerate(self._teacher_keys.items()):
             wg = all_wg[key]
             wg.init_model()
             self.teacher_wg[task] = wg
@@ -224,7 +225,12 @@ class OPDRayTrainer(RayPPOTrainer):
                 # Not in a val_only run: nothing scores a teacher there, and this
                 # is 1.9 GB a rank held for the life of the process, next to a vLLM
                 # engine already sized to 0.6 of the card.
-                wg.register_teacher_lm_head(task)
+                #
+                # The slot is passed so the copy lands directly in its slice of the
+                # stacked projection the lookup reads, instead of being cloned on
+                # its own and stacked later -- that held both layouts at once, and
+                # peaked here, before vLLM measures free memory.
+                wg.register_teacher_lm_head(task, slot=slot, n_tasks=n_teachers)
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]

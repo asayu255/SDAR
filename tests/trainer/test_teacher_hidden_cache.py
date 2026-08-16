@@ -806,3 +806,99 @@ def test_the_lookup_makes_no_host_round_trip():
     finally:
         for name, original in originals.items():
             setattr(torch.Tensor, name, original)
+
+
+# --------------------------------------------------------------------------- #
+# 9. one copy, not two
+# --------------------------------------------------------------------------- #
+
+
+def _held_bytes(*tensors):
+    """Total distinct storage behind these tensors -- views of one buffer count once."""
+    seen = {}
+    for t in tensors:
+        if t is None:
+            continue
+        st = t.untyped_storage()
+        seen[st.data_ptr()] = st.nbytes()
+    return sum(seen.values())
+
+
+def test_finalizing_does_not_leave_a_second_copy_of_the_cache():
+    """The read side wants one contiguous buffer, but building it by concatenation
+    and leaving the entries pointing at the per-put tensors keeps the WHOLE cache
+    alive twice -- for the length of the actor update, next to its activations."""
+    cache, keys, W, h, lse = _filled_cache(n=8)
+    before = _held_bytes(*cache._h.values(), *cache._lse.values())
+    assert cache._chunks  # the per-put packed tensors, pre-finalize
+
+    cache.logprobs_at(keys, torch.randint(0, VOCAB, (8, L, K)))
+
+    after = _held_bytes(*cache._h.values(), *cache._lse.values(), cache._final["h"], cache._final["lse"])
+    assert after == before, f"cache is held twice: {before} -> {after}"
+    assert not cache._chunks, "the per-put tensors were not released"
+    store = cache._final["h"].untyped_storage().data_ptr()
+    assert all(cache._h[k].untyped_storage().data_ptr() == store for k in keys.tolist())
+
+
+def test_the_witness_still_reads_the_entries_after_they_are_repointed():
+    """check_witness reads self._h, which finalize rebinds. Same numbers, or the
+    rebind moved a row."""
+    cache, keys, *_ = _filled_cache(n=6)
+    before = cache.check_witness(atol=1e-3)
+    cache.logprobs_at(keys, torch.randint(0, VOCAB, (6, L, K)))
+    assert cache.check_witness(atol=1e-3) == pytest.approx(before, abs=1e-6)
+
+    cache._h[int(keys[2])][0] += 3.0
+    with pytest.raises(RuntimeError, match="witness"):
+        cache.check_witness(atol=1e-3)
+
+
+def test_a_head_registered_into_its_slot_is_never_duplicated():
+    """Cloning each teacher's projection and stacking them later holds both
+    layouts at once -- ~1.9 GB for three 1.7B teachers, peaking during worker init,
+    which is when vLLM measures free memory to size its KV cache."""
+    g = torch.Generator().manual_seed(31)
+    heads = {t: torch.randn((VOCAB, H), generator=g) for t in ("alfworld", "search")}
+
+    cache = TeacherHiddenCache()
+    for slot, (task, W) in enumerate(heads.items()):
+        cache.register_lm_head(task, W, slot=slot, n_tasks=len(heads))
+
+    assert cache._stacked.shape == (len(heads) * VOCAB, H)
+    assert cache._voff == {"alfworld": 0, "search": VOCAB}
+    # One allocation: the per-task handles are views into it, not copies beside it.
+    assert _held_bytes(*(cache.lm_head(t) for t in heads)) == cache._stacked.untyped_storage().nbytes()
+    for task, W in heads.items():
+        torch.testing.assert_close(cache.lm_head(task), W, rtol=0, atol=0)
+
+
+def test_slotted_and_unslotted_registration_must_not_be_mixed():
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", torch.randn(VOCAB, H), slot=0, n_tasks=2)
+    with pytest.raises(ValueError, match="slot"):
+        cache.register_lm_head("search", torch.randn(VOCAB, H))
+
+
+def test_slot_registration_answers_the_same_values_as_the_lazy_stack():
+    """The two registration paths must be interchangeable at the answer."""
+    g = torch.Generator().manual_seed(32)
+    tasks = ["alfworld", "search"]
+    heads = {t: torch.randn((VOCAB, H), generator=g) / H**0.5 for t in tasks}
+
+    built = []
+    for slotted in (False, True):
+        cache = TeacherHiddenCache()
+        for slot, task in enumerate(tasks):
+            if slotted:
+                cache.register_lm_head(task, heads[task].clone(), slot=slot, n_tasks=len(tasks))
+            else:
+                cache.register_lm_head(task, heads[task].clone())
+        for t_i, task in enumerate(tasks):
+            _, h, lse = _rowwise(2, seed=40 + t_i)
+            lse = torch.logsumexp(h.reshape(-1, H) @ heads[task].T, dim=-1).view(2, L)
+            cache.put(torch.arange(2 * t_i, 2 * t_i + 2), task, h, lse)
+        ids = torch.randint(0, VOCAB, (4, L, K), generator=torch.Generator().manual_seed(33))
+        built.append(cache.logprobs_at(torch.arange(4), ids)[0])
+
+    torch.testing.assert_close(built[0], built[1], rtol=0, atol=1e-6)
