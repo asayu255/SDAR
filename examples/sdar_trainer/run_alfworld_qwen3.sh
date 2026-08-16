@@ -13,7 +13,11 @@ val_data_size=126
 group_size=8
 experiment_name="sdar_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
 export ALFWORLD_DATA=$HOME/data/alfworld
-export WANDB_API_KEY=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
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \

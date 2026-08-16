@@ -26,7 +26,11 @@ val_data_size=128
 group_size=8
 export http_proxy=http://10.217.142.137:8080
 export https_proxy=http://10.217.142.137:8080
-export WANDB_API_KEY=your_key_here
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \

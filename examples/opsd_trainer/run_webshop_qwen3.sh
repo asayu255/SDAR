@@ -14,7 +14,11 @@ train_data_size=16
 val_data_size=128
 group_size=8
 experiment_name="opsd_qwen3_1.7b_coef${sdar_coef}_beta${gate_beta}_skillall${skill_all}"
-export WANDB_API_KEY=your_key_here
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \

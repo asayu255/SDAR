@@ -1,7 +1,11 @@
 set -x
 ENGINE=${1:-vllm}
 
-export WANDB_API_KEY=your_key_here
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 experiment_name='skill_grpo_qwen3_1.7b'

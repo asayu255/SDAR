@@ -19,7 +19,11 @@ export no_proxy=localhost,127.0.0.1,0.0.0.0,10.0.0.0/8,172.16.0.0/12,192.168.0.0
 export grpc_proxy=""
 export RAY_INCLUDE_DASHBOARD=0
 export RAY_DASHBOARD_AGENT_CHECK_PARENT_INTERVAL_S=30
-export WANDB_API_KEY=your_key_here
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 

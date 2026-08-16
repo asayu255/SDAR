@@ -212,7 +212,12 @@ set -x
 # many already-final rows are scored per call, so it cannot change a value.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
+# Traced off for this one line. `set -x` at the top of the file echoes every
+# command it runs, expansions included, so with tracing on this writes the real
+# key into whatever the run is tee'd to -- in plaintext, for every restart.
+{ set +x; } 2>/dev/null
 export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 # On by default, for the same reason the FSDP knobs are literals below: a 300-step
 # run gets restarted, and a mechanism that has to be exported by hand is one that
 # will eventually be missing from a restart. All four are accuracy-preserving (see

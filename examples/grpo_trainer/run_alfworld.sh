@@ -16,7 +16,11 @@ export ALFWORLD_DATA=$HOME/data/alfworld
 export http_proxy=http://10.217.142.137:8080
 
 export https_proxy=http://10.217.142.137:8080
-export WANDB_API_KEY=your_key_here
+# Traced off for this one line: `set -x` echoes expansions, so with tracing on
+# this writes the key into whatever the run is tee'd to.
+{ set +x; } 2>/dev/null
+export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+set -x
 # pip3 install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
 
 # We only use data preparation to indicate the modality and the data size.
