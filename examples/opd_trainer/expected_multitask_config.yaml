@@ -86,6 +86,18 @@
 # compares nothing. ref.student_indexed_topk follows the actor's value in
 # ppo_trainer.yaml and so is not listed separately.
 "actor_rollout_ref.actor.student_indexed_topk": true
+# enable_gradient_checkpointing sits on the gradient path even though it looks
+# like a pure memory knob: a recomputed forward and a stored one differ in their
+# last bits under autocast, the same class as no_sync_grad_accum. Measured off
+# because update_actor is 53.5% of the step at sm 94.7% -- work-bound -- and
+# checkpointing makes backward pay ~3 units where storing pays 2.
+"actor_rollout_ref.model.enable_gradient_checkpointing": false
+# rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that has
+# nothing to do with log probs: this arm never runs compute_log_prob, so the
+# value's only effect is adjust_batch's divisor, lcm(rollout*2, rollout*2,
+# actor*2). At 16 that is 160 and step 1 threw away 116 rows to reach it; at 10
+# it is 20. Which rows get dropped is data, so it belongs here.
+"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
 #     bit-identical, covered by the exemption above.

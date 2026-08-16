@@ -65,6 +65,14 @@ set -x
 #   changing it moves no padding and no data -- per-row log probs are
 #   independent under rmpad. Drop it again if a longer-prompt task is added.
 #
+#   rollout.log_prob_micro_batch_size_per_gpu is 10, and it is NOT a throughput
+#   knob here at all: this arm has no old_log_prob phase, so compute_log_prob is
+#   never called and the value's only effect is on adjust_batch's divisor,
+#   lcm(rollout*2, rollout*2, actor*2). At 16 that was lcm(32,32,20)=160 and step
+#   1 discarded 116 rows to reach it; at 10 it is lcm(20,20,20)=20, about 10.
+#   1.6% of the batch, for free. It DOES decide which rows are dropped, so it
+#   changes the data and is pinned.
+#
 #   actor.ppo_micro_batch_size_per_gpu is 10 for the same reason (it was 5), and
 #   this one is NOT free: it is a different packed GEMM, so gradients differ in
 #   their last bits -- the no_sync_grad_accum class, not bit-identical. It has to
@@ -156,6 +164,18 @@ set -x
 #     while the current one computes. Scheduling only, arithmetic untouched, so
 #     it is a plain performance knob and is not pinned.
 #
+# enable_gradient_checkpointing=False. Measured at step 1: update_actor is 53.5%
+# of the step at sm 94.7% -- work-bound, not gap-bound -- and actor.bwd alone is
+# 200.4s of it. Checkpointing makes backward recompute the forward, so it costs
+# ~3 units where storing costs 2; dropping it takes about a third off that
+# backward, ~67s of a 563s step. It is affordable because the card has room:
+# step 1 peaked at max_memory_allocated 93.9 GB / reserved 128.5 GB, and the
+# activations this keeps are ~13 GB (10 rows x ~690 real tokens x 28 layers).
+# NOT bit-identical -- a recomputed forward and a stored one differ in their last
+# bits under autocast -- so it is pinned and has to be the same across the arms
+# being compared. Put it back to True if a longer-prompt task or a bigger student
+# leaves no room; the targets are identical either way.
+#
 # actor.student_indexed_topk=True — NOT a speedup. It changes what the top-k KL
 # is computed over, so it belongs to the science, is pinned in
 # expected_multitask_config.yaml, and has to be identical across every arm being
@@ -242,6 +262,11 @@ set -x
 # many already-final rows are scored per call, so it cannot change a value.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
+# Activations are no longer recomputed (enable_gradient_checkpointing=False), so
+# the actor update allocates ~13 GB more and frees it every micro-batch. That is
+# the pattern the default allocator fragments on; expandable segments grow a
+# single mapping instead of caching a ladder of block sizes.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # Traced off for this one line. `set -x` at the top of the file echoes every
 # command it runs, expansions included, so with tracing on this writes the real
 # key into whatever the run is tee'd to -- in plaintext, for every restart.
@@ -310,7 +335,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.pg_loss_coef=0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
@@ -318,7 +343,7 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.actor.student_indexed_topk=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.return_rollout_log_probs=False \
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
