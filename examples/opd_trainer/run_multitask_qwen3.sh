@@ -49,21 +49,34 @@ set -x
 #   Costs up to 3 * 3.4GB gathered per GPU on top of the shards; measured at
 #   +8.2GB (89.3 -> 97.5 max_memory_allocated) on the 2-GPU run.
 #
-#   ref.log_prob_micro_batch_size_per_gpu is back to 16 (it was 8 for one run),
-#   and both numbers were MEMORY bounds rather than throughput choices.
-#   compute_ref_topk_log_prob runs the teacher through lm_head, which
-#   materialized the full vocabulary over every row of the sequence: at 16 rows
-#   of webshop-length prompts that was 16 * ~2.3k tokens * 151936 * bf16 =
-#   10.47 GiB in one allocation, and step 136 OOMed on exactly that with
-#   9.50 GiB free. What paid for going back up is ref.response_only_logits: the
-#   projection now runs on the response rows only, and prompts are ~75% of the
-#   tokens here, so the same 16 rows allocate about a quarter of that. Under
-#   student_indexed_topk it is smaller again -- the teacher's own top-k is built
-#   for two micro-batches a step instead of every row. The ref micro batch does
-#   NOT enter adjust_batch's lcm here (batch_size_divisor only includes it when
-#   use_kl_in_reward or actor.use_kl_loss is set, and this arm has neither), so
-#   changing it moves no padding and no data -- per-row log probs are
-#   independent under rmpad. Drop it again if a longer-prompt task is added.
+#   ref.log_prob_micro_batch_size_per_gpu is 4, and it is a MEMORY bound rather
+#   than a throughput choice. compute_ref_topk_log_prob runs the teacher through
+#   lm_head, which materializes the full vocabulary over the rows it projects,
+#   and that tensor is the widest thing either GPU allocates.
+#
+#   It has now OOMed twice, and the second time is the reason for 4. It was 16,
+#   justified by ref.response_only_logits: the projection runs on the response
+#   rows only, and at step 1 the responses were 20.5% of the tokens
+#   (139.1 of 678.9), so 16 rows cost about a fifth of the full-sequence figure.
+#   That justification decayed as the student trained. By step 18 the mean
+#   response was 257.0 (+85%) with 22.2% of rows at the 512 cap -- alfworld 276.4
+#   and 31.3% -- and a chunk of long rows put 16 * ~417 response tokens through
+#   lm_head: 6.7k * 151936 * fp32 = 3.77 GiB for the logits, and logsumexp wants
+#   a second buffer the same size. It asked for that 3.77 GiB with 3.49 GiB free.
+#
+#   4 makes the bound structural instead of empirical. data.max_response_length
+#   is 512 and is pinned, so 4 rows can never project more than 2,048 response
+#   tokens = 1.16 GiB, and the pair with the logsumexp temp is ~2.3 GiB. No
+#   further response-length growth can break it, which matters because the
+#   growth has not stopped -- clip_ratio went 0.010 -> 0.222 in 18 steps.
+#
+#   It costs almost nothing. The teachers are SHARD_GRAD_OP, so they do not
+#   reshard between micro-batches and smaller ones add no all-gather, only loop
+#   overhead; teacher_forward was 0.4-5.5 s of a ~500 s step. And the ref micro
+#   batch does NOT enter adjust_batch's lcm here (size_divisor_ref falls back to
+#   the rollout value unless use_kl_in_reward or actor.use_kl_loss is set, and
+#   this arm pins both False), so changing it moves no padding and no data --
+#   per-row log probs are independent under rmpad.
 #
 #   rollout.log_prob_micro_batch_size_per_gpu is 10, and it is NOT a throughput
 #   knob here at all: this arm has no old_log_prob phase, so compute_log_prob is
@@ -172,14 +185,23 @@ set -x
 # step. Checkpointing makes backward recompute the forward, ~3 units where
 # storing costs 2, so dropping it should take about a third off that backward.
 #
-# There is no room for it. The card is 94.97 GiB and step 1 peaked at
-# max_memory_allocated 93.9 GB -- 99% -- so the ~13 GB of activations it would
-# keep (10 rows x ~690 real tokens x 28 layers) OOMed in the first micro-batch,
-# on the logsumexp. What made this look affordable was reading
-# max_memory_reserved (128.5 GB) as if it were device memory: it is not. vLLM's
-# CuMemAllocator maps memory that PyTorch counts in its reserved total but the
-# device does not, so reserved can exceed the card. max_memory_allocated is the
-# number to read.
+# There is no room for it. The ~13 GB of activations it would keep (10 rows x
+# ~690 real tokens x 28 layers) OOMed in the first micro-batch of step 1, on the
+# logsumexp, against a 94.97 GiB card. That measurement is the evidence; what
+# made it look affordable beforehand was reading max_memory_reserved (128.5) as
+# if it were device memory.
+#
+# Neither perf/max_memory_* metric is a device-memory reading here, and the
+# reserved one is not the only offender: both are torch.cuda high-water marks
+# divided by 1024^3 (fsdp_workers.py:719, so the _gb suffix is really GiB), and
+# BOTH have printed numbers larger than the 94.97 GiB card -- reserved 144.588
+# and allocated 97.659 at step 18. vLLM's CuMemAllocator is a pluggable allocator,
+# so its pool lands in torch's accounting, while the physical pages behind it are
+# mapped and unmapped on wake/sleep underneath. The high-water mark can therefore
+# span memory that was never simultaneously resident. Read them as trends, not
+# capacities: for an actual occupancy number use nvidia-smi, or the accounting in
+# an OOM message ("this process has 91.38 GiB memory in use"), which is the
+# allocator's own view at the moment it failed.
 #
 # Freeing the ~13 GB elsewhere is possible in principle -- gpu_memory_utilization
 # is 0.6 of 95 GiB, ~57 GB, and peak KV demand is ~40 GB -- but the margin is
@@ -382,7 +404,7 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature=0.4 \
     +actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op \

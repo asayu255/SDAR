@@ -709,10 +709,22 @@ GPU 0 has a total capacity of 94.97 GiB of which 473.69 MiB is free.
 最初から無かった。
 
 **reserved が容量を超えうるのは、それがデバイスメモリの指標ではないから。**
-vLLM の `CuMemAllocator` は自前のプールを map し、PyTorch はそれを reserved に数えるが
-デバイス側の物理割り当てとは一致しない。この run では reserved 128.5、以前の run では
-145.3（6 節の表）―― **どちらも 94.97 GiB のカードを超えている**。超えた時点で
-「これは容量ではない」と気づけたはずだった。**読むべきは `max_memory_allocated`。**
+vLLM の `CuMemAllocator` は PyTorch の pluggable allocator として自前のプールを map する。
+PyTorch はそれを自分の統計に数えるが、その裏の物理ページは wake/sleep で map/unmap される。
+この run では reserved 128.5、以前の run では 145.3（6 節の表）―― **どちらも 94.97 GiB の
+カードを超えている**。超えた時点で「これは容量ではない」と気づけたはずだった。
+
+**そして「読むべきは `max_memory_allocated`」と書いたのも間違いだった（⑩ の run で判明）。**
+`perf/max_memory_allocated_gb` も step 18 で **97.659**、やはりカードを超える。両方とも
+`fsdp_workers.py:719` の `torch.cuda.max_memory_*() / 1024**3`（`_gb` 表記だが実体は GiB）で、
+**同時に常駐したことのないメモリを跨いだ high-water mark になりうる**。
+実際の占有を知りたいなら `nvidia-smi` か、OOM メッセージ自身の会計
+（`this process has 91.38 GiB memory in use`）を読むこと。`perf/max_memory_*` は
+**傾向を見る指標であって容量比較には使えない**。
+
+なお **gradient checkpointing を戻した結論自体は正しい**。根拠は「93.9 / 94.97 = 99%」の
+算術ではなく、**切った状態で step 1 の最初の micro-batch が実際に OOM したこと**である。
+誤っていたのは結論ではなく、結論を正当化するのに使った数字の方。
 
 **さらに悪いのは、正しい数字がこのレポート自身に書いてあったこと。** 9.1 節の OOM
 トレースが `GPU 0 has a total capacity of 94.97 GiB` をそのまま引用している。
@@ -722,6 +734,57 @@ vLLM の `CuMemAllocator` は自前のプールを map し、PyTorch はそれ�
 `gradient_checkpointing` は True に戻した。同じ commit で入れた
 `rollout.log_prob_micro_batch_size_per_gpu=10`（`adjust_batch` の除数を 160 → 20 に
 下げ、step あたり約 116 行の padding を約 10 行にする）は**メモリを使わないので残す**。
+
+**⑩ prefetch chunk の失敗を「落として続行してよい」と設計し、step 18 で run を殺した。**
+値の議論としては正しく、**collective の議論としては完全に間違っていた**。
+
+step 18 で teacher prefetch が OOM した:
+
+```
+teacher_alfworld_compute_ref_topk_log_prob -> dp_actor.py:484 logsumexp
+torch.OutOfMemoryError: Tried to allocate 3.77 GiB.
+GPU 0 has a total capacity of 94.97 GiB of which 3.49 GiB is free.
+```
+
+`_join_teacher_prefetch` はこれを握り潰し、`the trainer will score those rows in
+teacher_forward instead` と印字して rollout を続けた。根拠はこう書いてあった ――
+「compute_teacher_log_probs が取りこぼしを再計算し、completeness guard が残りを検出する。
+値は同一で、step を殺す方が高くつく」。**値については正しい。** しかし teacher forward は
+FSDP module であり、**OOM した rank 0 は all-gather を放棄した**。rank 1 は落ちない
+――待ち続ける:
+
+```
+[rank1] Watchdog caught collective operation timeout:
+  WorkNCCL(SeqNum=138581, OpType=_ALLGATHER_BASE, NumelIn=155583488, ...)
+  ran for 1800001 milliseconds before timing out.
+last enqueued work: rank1 138581 / rank0 138580   ← ちょうど 1 collective ずれている
+```
+
+`NumelOut=311166976 = 151936 × 2048`、つまり tied embedding / lm_head の all-gather。
+**30 分後に watchdog が rank 1 を abort し、actor が死に、run が死んだ。**
+chunk を落として得たものは何も無く、失ったのは 30 分と、OOM も chunk も指さない
+timeout traceback だけが残った状態である。
+
+**教訓は 2.4 節・8 節⑧と同じ形の三度目。**「理論上落としてよい」と「この配置で落としてよい」は
+別。判定軸は **driver 側で起きたか worker 内で起きたか**で、後者は例外なく致命的
+（この経路の worker 呼び出しは全て FSDP forward を通る）。`RayTaskError` /
+`ActorDiedError` を re-raise するよう修正し、mutation test で回帰を確認した。
+
+**なぜ step 18 だったのか ―― 応答長が伸びたから。** リークではない
+（`max_memory_allocated` は step 6〜18 で 97.659 に完全固定）。
+`response_length/mean` が **139.1 → 257.0（+85%）**、`clip_ratio` が
+**0.010 → 0.222**（alfworld は 276.4 / 0.313）。teacher の micro-batch は
+**行数**で切られていた（`ref.log_prob_micro_batch_size_per_gpu=16`,
+`log_prob_use_dynamic_bsz=False`）ので、lm_head が作る `(n_resp, 151936)` は
+応答長に比例して伸び続ける。3.77 GiB ÷ 151936 ÷ 4 B ≒ 6,660 token ≒ 16 行 × 417。
+
+**4 に下げて上界を構造的にした。** `data.max_response_length=512` は pin 済みの
+ハードキャップなので、4 行は **最大 2,048 response token = 1.16 GiB**（logsumexp の
+一時バッファと合わせて約 2.3 GiB）を超えられない。これ以上応答が伸びても壊れない
+――そして伸びは止まっていない。teacher は SHARD_GRAD_OP で micro-batch 間に reshard
+しないため、分割を細かくしても all-gather は増えず、コストはループ overhead だけ。
+除数にも入らない（`size_divisor_ref` は `use_kl_in_reward` / `actor.use_kl_loss` が
+両方 False のとき rollout 側の値にフォールバックする）。
 
 ---
 

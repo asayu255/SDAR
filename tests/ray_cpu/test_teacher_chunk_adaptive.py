@@ -20,15 +20,24 @@ so these tests are about scheduling and failure handling, not arithmetic:
 
   * the size tracks the glue window the chunk will run under, bounded by the
     fixed size (floor) and _..._CHUNK_MAX (ceiling);
-  * a chunk that raises is dropped, not propagated: compute_teacher_log_probs
-    rescores whatever is missing and its completeness guard raises on anything
-    left over, so failing loudly here would kill a step for no gain.
+  * a chunk that raises ON THE DRIVER is dropped, not propagated:
+    compute_teacher_log_probs rescores whatever is missing and its completeness
+    guard raises on anything left over, so failing loudly here would kill a step
+    for no gain;
+  * a chunk that raises INSIDE THE WORKER is fatal. That one is about collectives,
+    not values: the teacher forward is FSDP, so a rank that raises has walked out
+    of an all-gather the others are still in, and they will block there until the
+    NCCL watchdog aborts them. Dropping it does not save the run, it only delays
+    the same death by the watchdog timeout and loses the cause.
 
 Run:  python tests/ray_cpu/test_teacher_chunk_adaptive.py
 """
 
 import os
 import sys
+
+import pytest
+import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -91,17 +100,17 @@ def test_the_glue_window_only_records_positive_spans():
     assert c._teacher_glue_s == 1.5
 
 
-def test_a_failed_chunk_is_dropped_rather_than_propagated():
-    """A chunk that raises must not take the step down with it. Those rows were
-    already removed from the pending pool, so they simply miss the prefetch and
-    the trainer scores them in teacher_forward -- identical values, one slower
-    step. Silent corruption is not possible: an unscored row trips the
-    completeness guard in compute_teacher_log_probs."""
+def test_a_driver_side_failure_is_dropped_rather_than_propagated():
+    """A chunk that raises ON THE DRIVER must not take the step down with it. Those
+    rows were already removed from the pending pool, so they simply miss the prefetch
+    and the trainer scores them in teacher_forward -- identical values, one slower
+    step. Silent corruption is not possible: an unscored row trips the completeness
+    guard in compute_teacher_log_probs."""
     c = _collector()
 
     class _Boom:
         def result(self):
-            raise RuntimeError("simulated teacher OOM")
+            raise RuntimeError("simulated bookkeeping error")
 
     c._teacher_future = _Boom()
     c._teacher_inflight_rows = 128
@@ -114,6 +123,67 @@ def test_a_failed_chunk_is_dropped_rather_than_propagated():
     assert c._teacher_future is None
     assert c._teacher_rate is None, "a failed chunk's timing must not feed the controller"
     assert c._teacher_inflight_rows == 0
+
+
+def test_a_worker_side_failure_is_fatal_rather_than_dropped():
+    """A chunk that raises INSIDE THE WORKER must propagate.
+
+    This is the step-18 crash. The teacher forward is FSDP, so a rank that raises
+    (OOM in lm_head) abandons an all-gather the other rank is still sitting in.
+    Dropping the chunk let the rollout march on while rank 1 blocked in
+    _ALLGATHER_BASE for the full 1,800,000 ms NCCL watchdog timeout and then aborted
+    -- the run died anyway, half an hour later, with a traceback that named neither
+    the OOM nor the chunk. There is nothing to recover: rescoring on the serial path
+    needs the same process group.
+    """
+    ray_exc = pytest.importorskip("ray.exceptions")
+    c = _collector()
+
+    class _WorkerBoom:
+        def result(self):
+            raise ray_exc.RayTaskError(
+                "teacher_alfworld_compute_ref_topk_log_prob", "traceback", torch.OutOfMemoryError("CUDA OOM")
+            )
+
+    c._teacher_future = _WorkerBoom()
+    c._teacher_inflight_rows = 128
+    c._teacher_inflight_start = 0.0
+
+    with pytest.raises(RuntimeError, match="left an FSDP collective"):
+        c._join_teacher_prefetch()
+
+    assert c._teacher_future is None, "the future must be cleared even on the fatal path"
+    assert c._teacher_inflight_rows == 0
+
+
+def test_a_dead_worker_is_fatal_too():
+    """The same chunk loop saw ActorDiedError right after the OOM, once rank 1's
+    watchdog had aborted the process. Continuing to prefetch against a dead actor
+    just burns turns until something else notices."""
+    ray_exc = pytest.importorskip("ray.exceptions")
+    if not hasattr(ray_exc, "ActorDiedError"):
+        pytest.skip("this ray version has no ActorDiedError")
+    c = _collector()
+
+    class _Dead:
+        def result(self):
+            raise ray_exc.ActorDiedError()
+
+    c._teacher_future = _Dead()
+    c._teacher_inflight_rows = 128
+    c._teacher_inflight_start = 0.0
+
+    with pytest.raises(RuntimeError, match="no longer usable"):
+        c._join_teacher_prefetch()
+
+
+def test_the_worker_side_types_resolve_and_exclude_plain_errors():
+    """The discriminator is the whole fix, so pin what it does and does not match."""
+    types = RL._worker_side_errors()
+    assert types, "ray is installed here, so at least RayTaskError must resolve"
+    assert all(issubclass(t, BaseException) for t in types)
+    assert not isinstance(RuntimeError("driver-side"), types)
+    assert not isinstance(torch.OutOfMemoryError("bare, not from a worker"), types)
 
 
 def test_a_successful_chunk_updates_the_rate_and_merges_results():

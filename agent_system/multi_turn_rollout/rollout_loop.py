@@ -38,6 +38,33 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 # measured *during* generate_sequences (GEN-UTIL). Pairs with GPU_PROFILER=1.
 _ROLLOUT_TURN_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
 
+_WORKER_SIDE_ERRORS = None
+
+
+def _worker_side_errors():
+    """Exception types that mean "this was raised inside a worker, not on the driver".
+
+    Every call the driver makes into a WorkerDict here runs an FSDP forward, so a
+    worker-side exception means some rank walked out of a collective. That is not a
+    droppable failure (see _join_teacher_prefetch), and telling the two apart is the
+    only thing that decides whether the rollout may continue.
+
+    Resolved lazily and by name: which of these ray.exceptions defines varies by
+    version, and importing ray at module scope would pull it into CPU-only tests that
+    do not otherwise need it. An empty tuple (no ray) is safe -- `except ()` matches
+    nothing, so the driver-side branch keeps today's behaviour.
+    """
+    global _WORKER_SIDE_ERRORS
+    if _WORKER_SIDE_ERRORS is None:
+        try:
+            import ray.exceptions as _ray_exc
+        except ImportError:  # pragma: no cover - ray is a hard dep of the real run
+            _WORKER_SIDE_ERRORS = ()
+        else:
+            named = (getattr(_ray_exc, n, None) for n in ("RayTaskError", "ActorDiedError", "ActorUnavailableError"))
+            _WORKER_SIDE_ERRORS = tuple(t for t in named if isinstance(t, type) and issubclass(t, BaseException))
+    return _WORKER_SIDE_ERRORS
+
 # Accuracy-safe throughput optimization: skip the prompt tokenization for already
 # finished trajectories. Finished rows are excluded from generation
 # (batch_input[active_idx]) and dropped by gather_rollout_data() (active_masks=
@@ -788,13 +815,25 @@ class TrajectoryCollector:
         The wait is reported per turn (tchWait) so an oversized chunk is visible
         rather than silently charged to generation.
 
-        A chunk that raised is logged and dropped, not propagated. The mechanism is
-        designed to degrade to the serial path -- compute_teacher_log_probs scores
-        whatever is missing from `prefetched` and its completeness guard raises on
+        A chunk that raised ON THE DRIVER is logged and dropped, not propagated. The
+        mechanism is designed to degrade to the serial path -- compute_teacher_log_probs
+        scores whatever is missing from `prefetched` and its completeness guard raises on
         anything left over -- so the values are identical either way, and killing
         the step instead costs the whole rollout. This is not a silent failure
         mode: an unscored row cannot reach the loss (the guard), and hit_rate drops
         visibly in the metrics.
+
+        A chunk that raised INSIDE THE WORKER is fatal and is re-raised. That argument
+        above is about values, and it is correct about values; it is wrong about
+        collectives. The teacher forward is an FSDP module, so its ranks all-gather the
+        sharded parameters as they go. An exception on one rank -- the OOM this arm
+        actually hits, since lm_head materializes the whole vocabulary -- leaves that
+        rank out of a collective the others are still sitting in. They do not fail: they
+        block in that all-gather until the NCCL watchdog gives up (30 min by default)
+        and aborts the process, which kills the run anyway, 30 minutes later, with a
+        timeout traceback that names neither the OOM nor the chunk. Dropping the chunk
+        buys nothing here because the damage is already done by the time we see it.
+        Re-raising reaches the same end state immediately, with the cause attached.
         """
         if self._teacher_future is None:
             return 0.0
@@ -802,7 +841,17 @@ class TrajectoryCollector:
         future, self._teacher_future = self._teacher_future, None
         try:
             self._prefetched_teacher.update(future.result())
-        except Exception as exc:  # noqa: BLE001 - the trainer rescores these rows
+        except _worker_side_errors() as exc:
+            # No cleanup needed here: the `finally` below runs on the way out.
+            raise RuntimeError(
+                f"teacher prefetch chunk of {self._teacher_inflight_rows} rows raised inside the "
+                f"worker ({type(exc).__name__}), so a rank has "
+                f"left an FSDP collective and this process group is no longer usable. This is not "
+                f"recoverable by rescoring the rows on the serial path: the other ranks are blocked "
+                f"in the all-gather that rank abandoned, and will sit there until the NCCL watchdog "
+                f"aborts them. Failing now rather than in 30 minutes. Original error:\n{exc}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - driver-side, the trainer rescores these rows
             print(
                 f"[rollout][teacher-prefetch] chunk of {self._teacher_inflight_rows} rows failed "
                 f"({type(exc).__name__}: {exc}); the trainer will score those rows in "
