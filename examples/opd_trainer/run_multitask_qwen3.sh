@@ -49,16 +49,27 @@ set -x
 #   Costs up to 3 * 3.4GB gathered per GPU on top of the shards; measured at
 #   +8.2GB (89.3 -> 97.5 max_memory_allocated) on the 2-GPU run.
 #
-#   ref.log_prob_micro_batch_size_per_gpu is 8, not 16, and that is a MEMORY
-#   bound rather than a throughput choice. compute_ref_topk_log_prob runs the
-#   teacher through lm_head, which materializes the full vocab: at 16 rows of
-#   webshop-length prompts that is 16 * ~2.3k tokens * 151936 * bf16 =
+#   ref.log_prob_micro_batch_size_per_gpu is back to 16 (it was 8 for one run),
+#   and both numbers were MEMORY bounds rather than throughput choices.
+#   compute_ref_topk_log_prob runs the teacher through lm_head, which
+#   materialized the full vocabulary over every row of the sequence: at 16 rows
+#   of webshop-length prompts that was 16 * ~2.3k tokens * 151936 * bf16 =
 #   10.47 GiB in one allocation, and step 136 OOMed on exactly that with
-#   9.50 GiB free. 8 halves it to ~5.2 GiB. The ref micro batch does NOT enter
-#   adjust_batch's lcm here (batch_size_divisor only includes it when
+#   9.50 GiB free. What paid for going back up is ref.response_only_logits: the
+#   projection now runs on the response rows only, and prompts are ~75% of the
+#   tokens here, so the same 16 rows allocate about a quarter of that. Under
+#   student_indexed_topk it is smaller again -- the teacher's own top-k is built
+#   for two micro-batches a step instead of every row. The ref micro batch does
+#   NOT enter adjust_batch's lcm here (batch_size_divisor only includes it when
 #   use_kl_in_reward or actor.use_kl_loss is set, and this arm has neither), so
 #   changing it moves no padding and no data -- per-row log probs are
-#   independent under rmpad. Drop to 4 if a longer-prompt task is added.
+#   independent under rmpad. Drop it again if a longer-prompt task is added.
+#
+#   actor.ppo_micro_batch_size_per_gpu is 10 for the same reason (it was 5), and
+#   this one is NOT free: it is a different packed GEMM, so gradients differ in
+#   their last bits -- the no_sync_grad_accum class, not bit-identical. It has to
+#   be the same across the arms being compared. lcm(10*2, 16*2) = 160, the same
+#   divisor adjust_batch used at 5, so the padding row count does not move.
 #
 #   Why that allocation is tighter than it used to be: ROLLOUT_PREFETCH_TEACHER
 #   moves the teacher forward INTO the rollout, where vLLM is awake and holding
