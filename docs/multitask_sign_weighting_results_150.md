@@ -397,3 +397,89 @@ WebShop については**到達点を下げている**ので不十分。正確�
 これは §5 の理論(最適解に転移は無い)のより強い形の確認であり、
 同時に**アニーリングの必要性**を示している。ATOD (2606.27814) の
 annealed OPD→RL が同じ問題への処方箋であり、本機構と直交して併用できる。
+
+
+## なぜ AlfWorld↔WebShop で転移し、Search で起きないのか — データセット側の性質
+
+機構が測っているのは「on-task 教師の top-20 トークン上で、off-task 教師の
+policy shift の**符号**が一致するか」である。したがって効くのは入力の意味的近さではなく
+**出力分布の近さ**であり、それを決めるデータセットの性質は以下の3層。
+
+### 第1層: 応答フォーマットが同一(最も直接的)
+
+| | 生成すべきタグ |
+|---|---|
+| AlfWorld | `<think>` `</think>` `<action>` `</action>` |
+| WebShop | `<think>` `</think>` `<action>` `</action>`(**完全一致**) |
+| Search | `<think>` `</think>` + `<search>`/`<answer>` の**排他選択** |
+
+`projection.py` も AlfWorld と WebShop は行単位でほぼ同一(差は失敗時の切り出し長
+`[-30:]` vs `[-20:]` のみ)。Search は別実装(`<search>` XOR `<answer>`、両方あると無効)。
+
+機構は top-20 の**トークン**を見る。応答の骨格が同じなら、教師2人が同じ位置で
+同じ構造トークンに同じ向きの shift を持つ。これが `agree_pos` の主要な供給源である。
+step1 で `agree_neg`(0.030)より `agree_pos`(0.261)が圧倒的に多いのは、
+サポートが on-task 教師の top-20 =「教師が確率を上げたトークン」に偏るためで、
+その上位を占めるのが共有された構造トークンだと考えると整合する。
+
+### 第2層: 行動空間が列挙されるか(タスクの型そのものが違う)
+
+| | 行動の与えられ方 | 課題の型 |
+|---|---|---|
+| AlfWorld | `admissible_actions` がプロンプトに列挙 | **選択問題** |
+| WebShop | `available_actions` がプロンプトに列挙 | **選択問題** |
+| Search | 列挙なし。クエリ/答えを自由生成 | **生成問題** |
+
+これは第1層より深い差である。選択問題では、決定点での出力分布は
+「列挙された候補の先頭トークン」に集中する(`go`, `take`, `open`, `click`, `search[`)。
+2つの教師が同じ「候補集合から1つ選ぶ」形式で訓練されていれば、
+**探索を続けるか / 確定するか**という判断が同じ語彙で表現され、符号も揃う。
+
+Search は開語彙の自然言語生成なので、top-20 の中身が問題ごとに入れ替わる。
+off-task 教師がそこに意見を持つ理由がなく、`neutral_off_task_split` に落ちる。
+
+### 第3層: プロンプト文面の逐語共有
+
+履歴あり版テンプレートの語彙 Jaccard 一致率:
+
+| ペア | Jaccard | 逐語一致行 |
+|---|---|---|
+| **AlfWorld ↔ WebShop** | **0.798** | **2行**(履歴提示文と行動提示文がそのまま同一) |
+| AlfWorld ↔ Search | 0.320 | 0 |
+| WebShop ↔ Search | 0.304 | 0 |
+
+逐語一致している2行:
+- `Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}`
+- `Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.`
+
+同じ文面が同じ位置に来るので、その直後の状態が2教師で近くなる。
+**入力側の一致が、出力側の一致を支える。**
+
+### 第4層(補助的): 地平と報酬の密度
+
+| | 最大ターン | 報酬 |
+|---|---|---|
+| AlfWorld | 50 | 成功で 10、無効行動に −0.1 |
+| WebShop | 15 | 部分点あり(task_score)+ 無効行動に −0.1 |
+| Search | **4** | **strict EM の完全二値**(`format_score=0.0`、中間報酬なし) |
+
+AlfWorld/WebShop は「長い地平で探索し、いつ確定するか」を学ぶ課題であり、
+1本目のスキルライブラリ対応(Systematic Exploration ↔ Query Refinement、
+Terminate Only On Success ↔ Purchase Decisively)はこの共通性の言語化である。
+Search は4ターンで二値判定なので、学習されるのは「探索の打ち切り規律」ではなく
+クエリ設計であり、共有する余地が構造的に小さい。
+
+実測でもこの層は裏付けられる: 本機構が実際に動かしたのは
+**エピソード長 −0.84 turn(p=0.003)と 512 トークン打ち切り率の半減(p=2.5e-06)**、
+すなわち「だらだら続けず早く終える」であった。これは第4層が共有する規律そのもので、
+Search には(4ターン上限のため)そもそも学ぶ余地がない。
+
+### 帰結: 何が「共通知識」の実体か
+
+したがって「AlfWorld と WebShop は共通知識が多い」の内実は、意味的な近さ
+(家事 vs 買い物)ではなく、**同じ出力言語で書かれた同じ型の課題**であることに尽きる。
+反例予測として: 意味的には遠くても
+「`<think>/<action>` 形式・admissible actions 列挙・長い地平」を満たす第4のタスクを足せば、
+この機構は AlfWorld/WebShop と同様に転移するはずである。逆に、意味的に近い
+買い物タスクでも自由生成形式なら転移しない。**これは検証可能な予測であり、
+機構が意味ではなく形式に反応していることの決定的な検定になる。**
