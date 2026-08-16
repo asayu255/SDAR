@@ -903,7 +903,10 @@ class ActorRolloutRefWorker(Worker):
             out = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k, return_hidden=want_hidden)
             if want_hidden:
                 topk_logprob, topk_ids, hidden, lse = out
-                self._cache_teacher_hidden(cache_ids, hidden, lse, topk_ids, topk_logprob)
+                self._cache_teacher_hidden(
+                    cache_ids, hidden, lse, topk_ids, topk_logprob,
+                    attention_mask=data.batch["attention_mask"],
+                )
             else:
                 topk_logprob, topk_ids = out
             output = DataProto.from_dict(
@@ -918,12 +921,12 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
-    def _cache_teacher_hidden(self, cache_ids, hidden, lse, topk_ids, topk_logprob):
+    def _cache_teacher_hidden(self, cache_ids, hidden, lse, topk_ids, topk_logprob, attention_mask=None):
         """Keep this call's hidden states so the actor can score arbitrary ids later.
 
-        One entry per ROW, holding every response position, because that is the
-        granularity the student picks its top-k at: a row is scored once but every
-        position gets its own support set.
+        One entry per ROW, holding every response position that carries signal,
+        because that is the granularity the student picks its top-k at: a row is
+        scored once but every position gets its own support set.
 
         The teacher's own top-k goes in as the witness: recomputing it from ``hidden``
         and ``lse`` must reproduce ``topk_logprob``, and does not if the entry is ever
@@ -939,13 +942,21 @@ class ActorRolloutRefWorker(Worker):
         # Keying per position instead -- repeating the row's id across its
         # positions -- would leave each row with whichever position was written
         # last, and silently: the witness stored under the same key collapses with
-        # it and stays self-consistent. Padding positions are marked by a zero
-        # normaliser (pad_input zero-fills them, and a real logit row cannot
-        # produce one) and skipped by the witness; the row's own key stays valid.
+        # it and stays self-consistent.
+        #
+        # Only the response positions that are actually trained are kept.
+        # response_length is the cap, not the length: the mask over the same
+        # window the forward scored, [-response_length-1:-1], says which slots are
+        # real, and the rest is padding the loss never reads. At 512 cap against
+        # ~127 generated tokens, storing it padded costs about 4x.
         #
         # The temperature travels with the entry: ``lse`` normalises logits the
         # forward already divided, while ``hidden`` is raw, so the read side has to
         # redo the division. Same value this call passed in meta_info.
+        live_mask = None
+        if attention_mask is not None:
+            resp_len = lse.shape[1]
+            live_mask = attention_mask[:, -resp_len - 1 : -1].bool()
         cache.put(
             cache_ids.to("cpu"),
             task,
@@ -954,6 +965,7 @@ class ActorRolloutRefWorker(Worker):
             witness_ids=topk_ids.detach(),
             witness_lp=topk_logprob.detach(),
             temperature=self.config.rollout.temperature,
+            live_mask=live_mask,
         )
 
     def _register_teacher_lm_head(self, task: str):

@@ -502,3 +502,163 @@ def test_the_witness_now_covers_every_position():
 
     with pytest.raises(RuntimeError, match="witness"):
         cache.check_witness(atol=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# 7. only the trained part is kept
+# --------------------------------------------------------------------------- #
+
+PAD_L = 8  # response_length cap, well above what these rows actually use
+
+
+def _padded(lengths, seed=0, task="alfworld", base=500, use_mask=True):
+    """Rows whose live response positions are a prefix, the rest padding.
+
+    ``pad_input`` zero-fills the slots the packed batch never had, so padding
+    carries a zero hidden state and a zero normaliser -- the shape the real
+    forward hands over.
+    """
+    n = len(lengths)
+    W, h_flat, lse_flat = _teacher(seed=seed, n=n * PAD_L)
+    h, lse = h_flat.view(n, PAD_L, H).clone(), lse_flat.view(n, PAD_L).clone()
+    keep = torch.arange(PAD_L).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+    h[~keep] = 0
+    lse[~keep] = 0
+
+    full = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
+    wit_lp, wit_ids = torch.topk(full, K, dim=-1)
+
+    cache = TeacherHiddenCache()
+    cache.register_lm_head(task, W)
+    keys = torch.arange(base, base + n, dtype=torch.long)
+    cache.put(
+        keys, task, h, lse,
+        witness_ids=wit_ids.view(n, PAD_L, K), witness_lp=wit_lp.view(n, PAD_L, K),
+        live_mask=keep if use_mask else None,
+    )
+    return cache, keys, W, h, keep
+
+
+def test_only_the_real_response_positions_are_stored():
+    """response_length is a cap, not a length. Keeping the padding costs ~8x here
+    and the loss never reads it."""
+    lengths = [3, 1, PAD_L, 5]
+    cache, keys, *_ = _padded(lengths)
+
+    for key, want in zip(keys.tolist(), lengths):
+        assert cache._h[key].shape[0] == want
+        assert cache._lse[key].shape[0] == want
+        assert cache._witness_ids[key].shape[0] == want
+
+    # And the padded input is genuinely not held alive behind the entries: the
+    # storage they share is the packed size, not n * PAD_L.
+    held = {e.untyped_storage().data_ptr(): e.untyped_storage().nbytes() for e in cache._h.values()}
+    assert sum(held.values()) == sum(lengths) * H * cache._h[int(keys[0])].element_size()
+
+
+def test_an_all_padding_call_does_not_pin_the_padded_input():
+    """A zero-length slice is still a view, so it would hold the whole
+    (n, response_length, hidden) input alive for the step."""
+    cache, keys, *_ = _padded([0, 0], seed=7)
+    held = {e.untyped_storage().data_ptr(): e.untyped_storage().nbytes() for e in cache._h.values()}
+    assert sum(held.values()) == 0
+
+
+def test_padding_reads_back_as_zero_and_the_rest_reads_back_exact():
+    lengths = [3, 1, PAD_L, 5]
+    cache, keys, W, h, keep = _padded(lengths, seed=2)
+    ids = torch.randint(0, VOCAB, (len(lengths), PAD_L, K), generator=torch.Generator().manual_seed(9))
+
+    values, found = cache.logprobs_at(keys, ids)
+
+    assert torch.all(found == 1)
+    expected = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
+    expected = expected.gather(-1, ids.reshape(-1, K)).view(len(lengths), PAD_L, K)
+    torch.testing.assert_close(values[keep], expected[keep], rtol=0, atol=1e-5)
+    assert torch.all(values[~keep] == 0)
+
+
+def test_the_witness_still_covers_every_stored_position():
+    cache, keys, *_ = _padded([4, 2, 7], seed=3)
+    assert cache.check_witness(atol=1e-3) < 1e-3
+
+    key = int(keys[1])
+    cache._h[key][0] = cache._h[key][0] + 3.0
+    with pytest.raises(RuntimeError, match="witness"):
+        cache.check_witness(atol=1e-3)
+
+
+def test_the_mask_and_the_zero_normaliser_agree():
+    """``live_mask`` is the fact; a zero lse is the inference. They must not
+    disagree, or one of the two paths is storing the wrong slots."""
+    lengths = [6, 2, 3]
+    by_mask, keys, _, _, _ = _padded(lengths, seed=4, use_mask=True)
+    by_lse, _, _, _, _ = _padded(lengths, seed=4, use_mask=False)
+
+    for key in keys.tolist():
+        assert by_mask._len[key] == by_lse._len[key] == lengths[key - 500]
+        torch.testing.assert_close(by_mask._h[key], by_lse._h[key], rtol=0, atol=0)
+
+
+def test_a_holey_mask_is_refused_even_though_its_count_is_a_valid_length():
+    """The reason the mask is passed as a mask: a count would be reconstructed as
+    a prefix of that count, which is a different set of positions and silently
+    shifts everything after the hole."""
+    W, h_flat, lse_flat = _teacher(n=2 * PAD_L)
+    h, lse = h_flat.view(2, PAD_L, H).clone(), lse_flat.view(2, PAD_L).clone()
+    mask = torch.ones(2, PAD_L, dtype=torch.bool)
+    mask[0, 2] = False  # count is still PAD_L - 1, a perfectly plausible length
+
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+    with pytest.raises(RuntimeError, match="prefix"):
+        cache.put(torch.arange(2), "alfworld", h, lse, live_mask=mask)
+
+
+def test_a_row_whose_live_slots_are_not_a_prefix_is_refused():
+    """Packing reconstructs by prefix. Responses are right-padded so that holds,
+    but a hole would silently shift every position after it."""
+    W, h_flat, lse_flat = _teacher(n=2 * PAD_L)
+    h, lse = h_flat.view(2, PAD_L, H).clone(), lse_flat.view(2, PAD_L).clone()
+    lse[0, 2] = 0.0  # a hole in the middle, not a tail
+
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+    with pytest.raises(RuntimeError, match="prefix"):
+        cache.put(torch.arange(2), "alfworld", h, lse)
+
+
+def test_rows_of_different_lengths_survive_the_exchange_together():
+    """The packing is per row, so a batch mixing a 1-token row with a full one
+    must still come back aligned."""
+    lengths = [1, PAD_L, 4]
+    cache, keys, W, h, keep = _padded(lengths, seed=5)
+    ids = torch.randint(0, VOCAB, (3, PAD_L, K), generator=torch.Generator().manual_seed(12))
+
+    got = exchange_teacher_logprobs(cache, keys, ids, world_size=1)
+
+    expected = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
+    expected = expected.gather(-1, ids.reshape(-1, K)).view(3, PAD_L, K)
+    torch.testing.assert_close(got[keep], expected[keep], rtol=0, atol=1e-5)
+    assert torch.all(got[~keep] == 0)
+
+
+def test_a_shorter_request_than_the_stored_row_raises():
+    """Reconstruction indexes a flattened (n, resp_len) grid, so an entry longer
+    than the request would spill into the next row instead of failing."""
+    cache, keys, *_ = _padded([PAD_L, 2], seed=8)
+    ids = torch.randint(0, VOCAB, (2, PAD_L - 1, K))
+    with pytest.raises(RuntimeError, match="response_length"):
+        cache.logprobs_at(keys, ids)
+
+
+def test_an_all_padding_row_is_owned_and_empty():
+    """Owned-but-empty and nobody-owns-it are different answers: the second has
+    to raise, the first must not."""
+    cache, keys, *_ = _padded([0, 3], seed=6)
+    ids = torch.randint(0, VOCAB, (2, PAD_L, K))
+
+    values, found = cache.logprobs_at(keys, ids)
+    assert found.tolist() == [1, 1]
+    assert torch.all(values[0] == 0)
+    assert cache.check_witness(atol=1e-3) < 1e-3

@@ -133,6 +133,7 @@ class TeacherHiddenCache:
     def __init__(self):
         self._h: Dict[int, torch.Tensor] = {}
         self._lse: Dict[int, torch.Tensor] = {}
+        self._len: Dict[int, int] = {}
         self._task: Dict[int, str] = {}
         self._temperature: Dict[int, float] = {}
         self._witness_ids: Dict[int, torch.Tensor] = {}
@@ -157,16 +158,32 @@ class TeacherHiddenCache:
 
     # -- filling ---------------------------------------------------------- #
 
-    def put(self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None, temperature: float = 1.0):
-        """Store one call's rows, one entry per ROW.
+    def put(
+        self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None, temperature: float = 1.0,
+        live_mask=None,
+    ):
+        """Store one call's rows, one entry per ROW, packed to the real positions.
 
         A row is scored once but the student picks a top-k at every response
-        position, so an entry has to hold all of them: ``h`` is
-        (n, response_length, hidden) and ``lse`` is (n, response_length). Keying
+        position, so an entry has to hold all of them: ``h`` arrives as
+        (n, response_length, hidden) and ``lse`` as (n, response_length). Keying
         per position instead -- repeating the row's id across its positions --
         collapses the row to whichever position was written last, and does so
         silently, because the witness stored under the same key collapses with it
         and stays self-consistent.
+
+        What is NOT kept is the padding. ``response_length`` is the cap (512 here)
+        while a turn generates ~127 tokens, so three quarters of the padded form
+        is memory the loss never reads. Rows are gathered down to their real
+        prefix in one kernel and the entries are views into that; padding
+        positions are reconstructed as zeros on the way out, which is the value
+        they had.
+
+        ``live_mask`` should be the attention mask over the same window. Without
+        it the real positions are inferred from a non-zero normaliser, which is
+        what ``pad_input`` leaves behind -- true, but inference rather than the
+        fact. It is taken as a MASK and not as a length so that the prefix check
+        below has something to disagree with.
 
         ``temperature`` travels with the entry because ``lse`` normalises the
         scaled logits while ``h`` is raw; reading the entry back has to apply the
@@ -177,7 +194,27 @@ class TeacherHiddenCache:
                 f"expected per-row (n, response_length, hidden) / (n, response_length), got {tuple(h.shape)} / "
                 f"{tuple(lse.shape)}; a flattened cache silently keeps one position per row"
             )
-        for i, key in enumerate(int(c) for c in cache_ids):
+        n, resp_len = lse.shape
+        dev = h.device
+        slot = torch.arange(resp_len, device=dev)
+
+        real = (lse != 0) if live_mask is None else live_mask.to(dev).bool()
+        if real.shape != lse.shape:
+            raise ValueError(f"live_mask {tuple(real.shape)} does not match lse {tuple(lse.shape)}")
+        lens_t = real.sum(-1)
+        # Reconstruction assumes a prefix: the response is right-padded and the
+        # window opens on the last prompt token, so the live slots run 0..len-1.
+        # If that ever stops holding, the rows would be silently misaligned on the
+        # way back out, so check rather than assume.
+        if not torch.equal(real, slot.unsqueeze(0) < lens_t.unsqueeze(1)):
+            raise RuntimeError(
+                "teacher cache expects each row's live response positions to be a prefix (right-padded "
+                "responses); this batch has holes, so packing them would misalign the reconstruction."
+            )
+
+        keys = [int(c) for c in cache_ids]
+        kept = []
+        for i, key in enumerate(keys):
             if key < 0:
                 continue
             if key in self._h:
@@ -186,17 +223,59 @@ class TeacherHiddenCache:
                     f"repeat means a row was duplicated into this call -- most likely DP padding that was not "
                     f"marked -1."
                 )
-            self._h[key] = h[i]
-            self._lse[key] = lse[i]
-            self._task[key] = task
-            self._temperature[key] = float(temperature)
-            if witness_ids is not None:
-                self._witness_ids[key] = witness_ids[i]
-                self._witness_lp[key] = witness_lp[i]
+            kept.append(i)
+        if not kept:
+            return
+
+        rows = torch.tensor(kept, dtype=torch.long, device=dev)
+        lens = lens_t[rows]
+        offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), lens.cumsum(0)])
+        total = int(offsets[-1])
+        if total == 0:
+            # Every kept row is pure padding. Still register them: the exchange
+            # requires an owner for each key it is asked about, and "owned, empty"
+            # is a different answer from "nobody has it". Freshly allocated rather
+            # than a zero-length slice, which would be a view and would pin the
+            # whole padded input for the step.
+            for i in kept:
+                self._register(
+                    keys[i], task, h.new_empty((0, h.shape[-1])), lse.new_empty((0,)), None, None, 0, temperature
+                )
+            return
+        row_of = torch.repeat_interleave(torch.arange(len(kept), device=dev), lens)
+        flat = rows[row_of] * resp_len + (torch.arange(total, device=dev) - offsets[row_of])
+
+        # One gather each; the per-key entries below are views into these, so the
+        # cache holds exactly the packed size and the padded input is free to go.
+        h_packed = h.reshape(n * resp_len, -1)[flat]
+        lse_packed = lse.reshape(n * resp_len)[flat]
+        w_ids_packed = witness_ids.reshape(n * resp_len, -1)[flat] if witness_ids is not None else None
+        w_lp_packed = witness_lp.reshape(n * resp_len, -1)[flat] if witness_lp is not None else None
+
+        lens_l, off_l = lens.tolist(), offsets.tolist()
+        for j, i in enumerate(kept):
+            a, b = off_l[j], off_l[j + 1]
+            self._register(
+                keys[i], task, h_packed[a:b], lse_packed[a:b],
+                None if w_ids_packed is None else w_ids_packed[a:b],
+                None if w_lp_packed is None else w_lp_packed[a:b],
+                lens_l[j], temperature,
+            )
+
+    def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature):
+        self._h[key] = h
+        self._lse[key] = lse
+        self._len[key] = int(length)
+        self._task[key] = task
+        self._temperature[key] = float(temperature)
+        if w_ids is not None:
+            self._witness_ids[key] = w_ids
+            self._witness_lp[key] = w_lp
 
     def clear(self):
         self._h.clear()
         self._lse.clear()
+        self._len.clear()
         self._task.clear()
         self._temperature.clear()
         self._witness_ids.clear()
@@ -238,21 +317,39 @@ class TeacherHiddenCache:
                 continue
             by_task.setdefault(self._task[key], []).append((row, key))
 
+        dev = ids.device
+        flat_values = values.view(n * resp_len, k)
         for task, entries in by_task.items():
-            rows = torch.tensor([r for r, _ in entries], dtype=torch.long, device=ids.device)
-            h = torch.stack([self._h[key] for _, key in entries]).to(ids.device)      # (m, L, H)
-            lse = torch.stack([self._lse[key] for _, key in entries]).to(ids.device)  # (m, L)
-            m = rows.numel()
-            temps = torch.tensor(
-                [self._temperature.get(key, 1.0) for _, key in entries], dtype=torch.float32, device=ids.device
-            )
-            out = teacher_logprobs_from_hidden(
-                h.reshape(m * resp_len, -1), lse.reshape(m * resp_len), self.lm_head(task),
-                ids[rows].reshape(m * resp_len, k),
-                temperature=temps.repeat_interleave(resp_len),
-            )
-            values[rows] = out.view(m, resp_len, k)
+            rows = torch.tensor([r for r, _ in entries], dtype=torch.long, device=dev)
             found[rows] = 1
+            # Entries are packed to their real positions, so the work here is
+            # packed too: padding slots keep the zero they were already given, and
+            # the narrow GEMM never sees them.
+            stored = [self._len[key] for _, key in entries]
+            if max(stored) > resp_len:
+                # The reconstruction indexes a flattened (n, resp_len) grid, so a
+                # longer entry would spill into the next row rather than fail.
+                raise RuntimeError(
+                    f"teacher cache holds a row of {max(stored)} response positions but is being asked for "
+                    f"{resp_len}; the teacher and the actor disagree on response_length."
+                )
+            lens = torch.tensor(stored, dtype=torch.long, device=dev)
+            offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), lens.cumsum(0)])
+            total = int(offsets[-1])
+            if total == 0:
+                continue
+            row_of = torch.repeat_interleave(torch.arange(len(entries), device=dev), lens)
+            flat = rows[row_of] * resp_len + (torch.arange(total, device=dev) - offsets[row_of])
+
+            h = torch.cat([self._h[key] for _, key in entries]).to(dev)      # (T, H)
+            lse = torch.cat([self._lse[key] for _, key in entries]).to(dev)  # (T,)
+            temps = torch.tensor(
+                [self._temperature.get(key, 1.0) for _, key in entries], dtype=torch.float32, device=dev
+            )
+            flat_values[flat] = teacher_logprobs_from_hidden(
+                h, lse, self.lm_head(task), ids.reshape(n * resp_len, k)[flat],
+                temperature=temps.repeat_interleave(lens),
+            )
         return values, found
 
     def check_witness(self, atol: float = 1e-3) -> float:
@@ -266,18 +363,18 @@ class TeacherHiddenCache:
         """
         worst = 0.0
         for key, w_ids in self._witness_ids.items():
-            h, lse = self._h[key], self._lse[key]          # (L, H), (L,)
             # Every position of the row, not just one: a cache that keeps a single
             # position per row is exactly the failure this has to catch, and it is
-            # self-consistent at whichever position survived.
-            real = lse != 0
-            if not bool(real.any()):
+            # self-consistent at whichever position survived. Entries are already
+            # packed to the real positions, so this is all of them.
+            h, lse = self._h[key], self._lse[key]          # (len, H), (len,)
+            if h.shape[0] == 0:
                 continue
             got = teacher_logprobs_from_hidden(
-                h[real], lse[real], self.lm_head(self._task[key]), w_ids.to(h.device)[real],
+                h, lse, self.lm_head(self._task[key]), w_ids.to(h.device),
                 temperature=self._temperature.get(key, 1.0),
             )
-            err = (got - self._witness_lp[key].to(got.device).float()[real]).abs().max().item()
+            err = (got - self._witness_lp[key].to(got.device).float()).abs().max().item()
             worst = max(worst, err)
         if worst > atol:
             raise RuntimeError(

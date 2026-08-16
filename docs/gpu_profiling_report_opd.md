@@ -1214,23 +1214,42 @@ padding 行の id を −1 にする。witness は `compute_teacher_log_probs` �
 正規化定数なのに `h` は生のままなので、読み出し側で同じ除算をやり直す必要がある。
 `temperature=1.0` に固定しているので現状は無害だが、T≠1 で静かに壊れる形だった。
 
-### 11.5 費用
+### 11.5 費用 —— cache は「実際に学習される response 部分」だけを持つ
 
-| 項目 | rank あたり（約 3,500 行/rank、`response_length=512`、H=2048） |
-|---|---|
-| `h`（bf16） | **7.3 GB** |
-| witness ids（int64）＋ lp（fp32） | 0.43 GB |
-| `lse`（fp32） | 7 MB |
-| teacher lm_head の非 shard コピー × 3 | 1.9 GB（bf16） |
+`response_length=512` は**上限であって長さではない**。この run の実測は
+`global_seqlen/mean = 3,543,577` / 約 7,000 行 = **506 token/行**で、そのうち prompt が
+約 75%（10.1 節）なので **response は平均 127 token**。padding 込みで持つと
+**4 分の 3 は損失が一度も読まない領域**である。
+
+そこで entry は行の**実位置だけ**に詰める。書き込み時に 1 回の gather で packed 化し、
+各 key はその view を持つ（＝ padded 入力は即座に解放できる）。読み出しでは padding は
+ゼロで再構成する —— もともとその値だったので、値は変わらない。詰めたぶん
+`W[ids]` の gather と narrow GEMM も padding 位置を触らなくなる。
+
+| 項目 | padded | **packed（現状）** |
+|---|---|---|
+| `h`（bf16） | 7.3 GB | **1.8 GB** |
+| witness ids（int64）＋ lp（fp32） | 0.43 GB | **0.11 GB** |
+| `lse`（fp32） | 7 MB | 2 MB |
+| teacher lm_head の非 shard コピー × 3 | 1.9 GB | 1.9 GB（変わらず） |
+| **合計 / rank** | **9.6 GB** | **3.8 GB** |
+
+（rank あたり約 3,500 行、H=2048。行数と 75% は実測、127 token はそこからの導出。）
+
+実位置は `attention_mask[:, -response_length-1:-1]` から取る。`lse == 0` でも同じ集合に
+なる（`pad_input` がゼロ埋めするため）が、そちらは推論なので**両者が一致することを
+テストで固定**し、本番では mask を使う。詰め戻しは prefix を仮定する —— response は
+右詰めで、窓は最後の prompt トークンから開くので成り立つ —— が、**仮定せず検査する**：
+穴があれば書き込み時に例外になる。
+
+残る 1.9 GB は lm_head の非 shard コピー ×3 で、これは行数に依らない固定費である。
 
 step 頭から `update_actor` の終わりまで GPU に載る。**9.2 で一度 OOM している**ので、
 300 step を回す前に 1 step の smoke test で `perf/max_memory_allocated_gb` を見ること。
-`h` は padding 込みで持っているため、実トークン長だけを詰めれば約 5 倍縮む
-（＝ P1 の packed 行 cache）。
 
 ### 11.6 まだ未検証
 
 forward hook（`_capture_last_hidden`）と `FSDP.summon_full_params` 経路は
-**実機で一度も走っていない**。CPU 上の 31 tests（うち 3 つは本物の 2 プロセス gloo）で
+**実機で一度も走っていない**。CPU 上の 41 tests（うち 3 つは本物の 2 プロセス gloo）で
 値・所有権・番人は押さえてあるが、FSDP 実体の上での動作は別物である。
 1 step の smoke test を 300 step の前に必ず挟むこと。
