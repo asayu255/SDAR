@@ -338,3 +338,46 @@ def test_the_support_actually_differs_when_the_models_disagree():
 
     assert torch.all(teacher_indexed >= -1e-5) and torch.all(student_indexed >= -1e-5)
     assert (student_indexed - teacher_indexed).abs().max() > 1e-3
+
+
+# --------------------------------------------------------------------------- #
+# 5. wiring contracts
+# --------------------------------------------------------------------------- #
+
+
+def test_hidden_capture_requires_the_response_only_row_map():
+    """The hidden states come back on the packed rows response_only_logits
+    selects. Without it there is no row map, so this must refuse rather than
+    hand back something misaligned."""
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+    actor.response_only_logits = False
+    actor.actor_module = torch.nn.Linear(2, 2)
+
+    with pytest.raises(ValueError, match="response_only_logits"):
+        DataParallelPPOActor.compute_topk_log_prob(actor, data=None, topk_k=K, return_hidden=True)
+
+
+def test_the_cache_key_is_per_row_and_shared_by_its_positions():
+    """A row is scored once, so every response position of it reads the same
+    cache entry -- but with the position's own ids. Getting this wrong is the
+    mis-routing the witness exists to catch, so pin the expansion."""
+    bs, resp_len = 3, 4
+    cache_ids = torch.tensor([11, -1, 13], dtype=torch.long)
+    flat = cache_ids.reshape(bs, 1).expand(bs, resp_len).reshape(-1)
+
+    assert flat.tolist() == [11] * 4 + [-1] * 4 + [13] * 4
+    assert flat.numel() == bs * resp_len
+
+
+def test_padding_positions_are_filed_as_unscored():
+    """pad_input zero-fills positions the packed batch never had, and a real
+    logit row cannot produce a zero normaliser -- so a zero lse marks padding,
+    which must be stored as -1 rather than as a live entry."""
+    lse = torch.tensor([[1.5, 2.0, 0.0, 0.0], [0.9, 0.0, 0.0, 0.0]])
+    keys = torch.tensor([7, 8], dtype=torch.long).reshape(2, 1).expand(2, 4).reshape(-1)
+    real = lse.reshape(-1) != 0
+    filed = torch.where(real, keys, torch.full_like(keys, -1))
+
+    assert filed.tolist() == [7, 7, -1, -1, 8, -1, -1, -1]

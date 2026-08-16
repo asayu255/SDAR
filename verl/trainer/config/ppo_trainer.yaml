@@ -173,6 +173,12 @@ actor_rollout_ref:
     # share. NOT set from the actor's value -- the two models are sized and
     # scheduled separately.
     response_only_logits: False
+    # Mirrors actor.student_indexed_topk. When on, this teacher also keeps the
+    # hidden states and normaliser of every row it scores, so the actor can
+    # evaluate it at ids the student picks later. Requires response_only_logits
+    # (the row map comes from there) and costs one unsharded copy of the output
+    # projection per teacher, held for the run.
+    student_indexed_topk: ${actor_rollout_ref.actor.student_indexed_topk}
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}

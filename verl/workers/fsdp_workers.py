@@ -649,6 +649,9 @@ class ActorRolloutRefWorker(Worker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            # Set by register_teacher_lm_head when student_indexed_topk is on; the
+            # cache needs to know which teacher an entry belongs to.
+            self._teacher_lm_head_task = None
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -886,9 +889,23 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        # student_indexed_topk resolves this teacher at ids the student picks during
+        # its own training forward, which has not happened yet. Only the final gather
+        # depends on those ids, so keep what does not: the body's hidden states and
+        # the full-vocabulary normaliser. The top-k below is still returned -- it is
+        # what the trainer merges today, and it doubles as the witness that the cache
+        # still reproduces this forward (see verl/workers/teacher_cache.py).
+        cache_ids = data.batch.get("teacher_cache_ids", None) if "teacher_cache_ids" in data.batch.keys() else None
+        want_hidden = cache_ids is not None and bool(self.config.ref.get("student_indexed_topk", False))
+
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            topk_logprob, topk_ids = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k)
+            out = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k, return_hidden=want_hidden)
+            if want_hidden:
+                topk_logprob, topk_ids, hidden, lse = out
+                self._cache_teacher_hidden(cache_ids, hidden, lse, topk_ids, topk_logprob)
+            else:
+                topk_logprob, topk_ids = out
             output = DataProto.from_dict(
                 tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
             )
@@ -900,6 +917,83 @@ class ActorRolloutRefWorker(Worker):
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
+
+    def _cache_teacher_hidden(self, cache_ids, hidden, lse, topk_ids, topk_logprob):
+        """Keep this call's hidden states so the actor can score arbitrary ids later.
+
+        Flattened to one entry per (row, response position), because that is the
+        granularity the student picks its top-k at. The row's key is repeated across
+        its positions; padding positions (attention_mask 0) carry no signal and are
+        dropped, which is also what keeps this from being 512 slots per row.
+
+        The teacher's own top-k goes in as the witness: recomputing it from ``hidden``
+        and ``lse`` must reproduce ``topk_logprob``, and does not if the entry is ever
+        paired with the wrong row.
+        """
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        cache = get_teacher_cache()
+        if self._teacher_lm_head_task is None:
+            raise RuntimeError("teacher lm_head was never registered; see _register_teacher_lm_head")
+        task = self._teacher_lm_head_task
+
+        bs, resp_len = lse.shape
+        keys = cache_ids.reshape(bs, 1).expand(bs, resp_len).reshape(-1).to("cpu")
+        # A position is real if its normaliser is finite; pad_input zero-fills the
+        # rest, and a zero lse cannot come from a real logit row.
+        real = (lse.reshape(-1) != 0).to("cpu")
+        keys = torch.where(real, keys, torch.full_like(keys, -1))
+        cache.put(
+            keys,
+            task,
+            hidden.reshape(-1, hidden.size(-1)).detach(),
+            lse.reshape(-1).detach(),
+            witness_ids=topk_ids.reshape(-1, topk_ids.size(-1)).detach(),
+            witness_lp=topk_logprob.reshape(-1, topk_logprob.size(-1)).detach(),
+        )
+
+    def _register_teacher_lm_head(self, task: str):
+        """Hand the process cache an unsharded copy of this teacher's projection.
+
+        The ref path reshards after every call, so by the time the actor update runs
+        the parameter cannot be indexed at arbitrary ids. One 622 MB copy per teacher
+        for a 1.7B model, held for the run -- the alternative is an all-gather of the
+        whole teacher inside every micro-batch.
+        """
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        module = self.ref_policy.actor_module
+        with FSDP.summon_full_params(module, writeback=False, offload_to_cpu=False):
+            inner = module
+            for _ in range(8):
+                nxt = getattr(inner, "_fsdp_wrapped_module", None) or getattr(inner, "_orig_mod", None)
+                if nxt is None or nxt is inner:
+                    break
+                inner = nxt
+            head = getattr(inner, "lm_head", None)
+            if head is None:
+                raise RuntimeError("teacher has no lm_head; student_indexed_topk cannot resolve its log-probs")
+            get_teacher_cache().register_lm_head(task, head.weight.detach().clone())
+        self._teacher_lm_head_task = task
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def register_teacher_lm_head(self, task: str):
+        assert self._is_ref
+        self._register_teacher_lm_head(task)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_teacher_hidden_cache(self):
+        """Drop the previous step's entries. Called once per step by the trainer."""
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        get_teacher_cache().clear()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def check_teacher_hidden_cache(self, atol: float = 1e-3):
+        """Run the witness over everything cached this step. Raises on failure."""
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        return get_teacher_cache().check_witness(atol=atol)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

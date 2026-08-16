@@ -328,10 +328,15 @@ class DataParallelPPOActor(BasePPOActor):
         return out.view(bs, resp_len, k)
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, need_log_prob=True
+        self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None,
+        need_log_prob=True, return_lse=False,
     ) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
         """
         Args:
+            return_lse: alongside the top-k, hand back the full-vocabulary
+                logsumexp and the packed-row map, so a caller can evaluate this
+                model at ids chosen later without re-running it. Only on the
+                ``response_only_logits`` path -- the row map is what it produces.
             need_log_prob: when False the sampled-token log-prob is not computed and
                 ``None`` is returned in its place. Only honoured on the
                 ``response_only_logits`` path (elsewhere it is a by-product of work
@@ -473,6 +478,23 @@ class DataParallelPPOActor(BasePPOActor):
                             topk_k=topk_k,
                             topk_ids=topk_ids,
                         )
+                        if return_lse:
+                            # The caller wants to evaluate this model at ids chosen
+                            # later, which needs the normaliser and the row map --
+                            # the projection itself it can redo for 2*H*k.
+                            tlp, tids = topk_out
+                            topk_out = (
+                                tlp,
+                                tids,
+                                {
+                                    "lse": torch.logsumexp(logits_resp, dim=-1, keepdim=True).float(),
+                                    "sel": sel,
+                                    "sel_indices": sel_indices,
+                                    "batch_size": batch_size,
+                                    "seqlen": seqlen,
+                                    "response_length": response_length,
+                                },
+                            )
                     return entropy, log_probs, topk_out
 
                 if self.use_fused_kernels:
@@ -687,15 +709,60 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_topk_log_prob(self, data: DataProto, topk_k: int):
+    @contextmanager
+    def _capture_last_hidden(self, sink: dict):
+        """Grab the transformer body's output without asking for all 29 layers.
+
+        ``output_hidden_states=True`` would return every layer -- on a teacher
+        micro-batch that is gigabytes of tensors, 28/29 of them discarded. A
+        forward hook on the base model takes only what the projection consumes.
+        Registered on the unwrapped module so FSDP's own forward still runs
+        normally around it; a model whose body cannot be located falls back to
+        yielding nothing and the caller raises with a readable message.
+        """
+        inner = self.actor_module
+        for _ in range(8):
+            nxt = getattr(inner, "_fsdp_wrapped_module", None) or getattr(inner, "_orig_mod", None)
+            if nxt is None or nxt is inner:
+                break
+            inner = nxt
+        body = getattr(inner, "model", None)
+        if body is None:
+            yield
+            return
+
+        def _hook(_module, _inputs, output):
+            sink["h"] = output[0] if isinstance(output, tuple) else output.last_hidden_state
+
+        handle = body.register_forward_hook(_hook)
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    def compute_topk_log_prob(self, data: DataProto, topk_k: int, return_hidden: bool = False):
         """Teacher-side: per response token, the teacher's top-k token ids and the
         teacher's full-vocab log-softmax values at those ids.
+
+        Args:
+            return_hidden: also return the body's hidden states and the
+                full-vocabulary logsumexp at the scored positions, so the caller
+                can evaluate this teacher at ids chosen later (see
+                verl/workers/teacher_cache.py). The expensive work is unchanged --
+                only the last gather depends on the ids.
 
         Returns:
             topk_logprob: (bs, response_length, k)
             topk_ids:     (bs, response_length, k) int64
+            hidden, lse:  (bs, response_length, hidden) / (bs, response_length),
+                          only when ``return_hidden``
         """
         self.actor_module.eval()
+        if return_hidden and not self.response_only_logits:
+            raise ValueError(
+                "student_indexed_topk needs ref.response_only_logits=True: the hidden states are handed "
+                "back on the packed rows that path selects, and there is no row map without it."
+            )
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
@@ -714,24 +781,62 @@ class DataParallelPPOActor(BasePPOActor):
 
         topk_logprob_lst = []
         topk_ids_lst = []
+        hidden_lst = []
+        lse_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            with torch.no_grad():
-                _, _, topk_out = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=False, topk_k=topk_k)
-            tlp, tids = topk_out
+            sink = {}
+            with torch.no_grad(), self._capture_last_hidden(sink if return_hidden else {}):
+                _, _, topk_out = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    topk_k=topk_k,
+                    return_lse=return_hidden,
+                )
+            if return_hidden:
+                tlp, tids, extras = topk_out
+                if "h" not in sink:
+                    raise RuntimeError(
+                        "student_indexed_topk needs the teacher's hidden states, but the forward hook did "
+                        "not fire -- the model's transformer body could not be located under its wrappers."
+                    )
+                # Select the same packed rows the projection used, then scatter both
+                # back into (bs, response_length, ·) so they line up row-for-row with
+                # the top-k the caller also gets.
+                h_resp = sink["h"].squeeze(0)[extras["sel"]]  # (n_resp, hidden)
+                bs_, sl_, rl_ = extras["batch_size"], extras["seqlen"], extras["response_length"]
+                hidden_lst.append(
+                    pad_input(h_resp, indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, :]
+                )
+                lse_lst.append(
+                    pad_input(extras["lse"], indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, 0]
+                )
+            else:
+                tlp, tids = topk_out
             topk_logprob_lst.append(tlp)
             topk_ids_lst.append(tids)
 
         topk_logprob = torch.concat(topk_logprob_lst, dim=0)
         topk_ids = torch.concat(topk_ids_lst, dim=0)
+        hidden = torch.concat(hidden_lst, dim=0) if return_hidden else None
+        lse = torch.concat(lse_lst, dim=0) if return_hidden else None
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == topk_logprob.size(0), f"{len(indices)} vs. {topk_logprob.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             topk_logprob = topk_logprob[revert_indices]
             topk_ids = topk_ids[revert_indices]
+            if return_hidden:
+                # The hidden states are per row like the top-k, so they follow the
+                # same reordering; skipping this would file every entry under a
+                # neighbour's key, which is exactly what the witness catches.
+                hidden = hidden[revert_indices]
+                lse = lse[revert_indices]
 
+        if return_hidden:
+            return topk_logprob, topk_ids, hidden, lse
         return topk_logprob, topk_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
