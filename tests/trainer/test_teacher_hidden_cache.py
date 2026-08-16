@@ -27,6 +27,7 @@ torch = pytest.importorskip("torch")
 try:
     from verl.workers.teacher_cache import (
         TeacherHiddenCache,
+        assert_rows_were_owned_once,
         exchange_teacher_logprobs,
         teacher_logprobs_from_hidden,
     )
@@ -227,13 +228,52 @@ def test_single_process_exchange_returns_the_reference():
 
 
 def test_an_unowned_row_raises_instead_of_training_on_zero():
+    """The tally is read once per mini-batch rather than per micro-batch -- the
+    read is a synchronisation and the exchange runs inside the micro-batch loop --
+    but it is still read before the optimizer step, so an unresolved row cannot
+    reach the weights."""
     cache, keys, *_ = _filled_cache(n=8)
     ids = torch.randint(0, VOCAB, (8, L, K))
     asked = keys.clone()
     asked[2] = 424_242
 
+    exchange_teacher_logprobs(cache, asked, ids, world_size=1)
     with pytest.raises(RuntimeError, match="unanswered"):
-        exchange_teacher_logprobs(cache, asked, ids, world_size=1)
+        assert_rows_were_owned_once()
+
+
+def test_a_clean_exchange_leaves_nothing_for_the_check_to_raise_on():
+    cache, keys, *_ = _filled_cache(n=8)
+    ids = torch.randint(0, VOCAB, (8, L, K))
+    exchange_teacher_logprobs(cache, keys, ids, world_size=1)
+    assert_rows_were_owned_once()          # no raise
+    assert_rows_were_owned_once()          # ...and the tally was cleared
+
+
+def test_the_tally_survives_across_micro_batches():
+    """The whole point of deferring it: a bad row in ANY micro-batch of the
+    mini-batch must still be caught by the one read at the end."""
+    cache, keys, *_ = _filled_cache(n=8)
+    ids = torch.randint(0, VOCAB, (8, L, K))
+    exchange_teacher_logprobs(cache, keys[:4], ids[:4], world_size=1)   # clean
+    bad = keys[4:].clone()
+    bad[1] = 424_242
+    exchange_teacher_logprobs(cache, bad, ids[4:], world_size=1)        # not clean
+    exchange_teacher_logprobs(cache, keys[:4], ids[:4], world_size=1)   # clean again
+
+    with pytest.raises(RuntimeError, match="unanswered"):
+        assert_rows_were_owned_once()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ownership_tally():
+    """The tally is process-global and read once per mini-batch, so a test that
+    leaves one behind would fail the next one."""
+    from verl.workers import teacher_cache as _tc
+
+    _tc._OWNERSHIP = None
+    yield
+    _tc._OWNERSHIP = None
 
 
 def test_rows_never_queued_are_allowed_through():
@@ -291,6 +331,9 @@ def _worker(rank, world_size, port, mode, out):
 
         try:
             got = exchange_teacher_logprobs(cache, asked, ids)
+            # The ownership tally is read once per mini-batch, not inside the
+            # exchange -- reading it synchronises. This is that read.
+            assert_rows_were_owned_once()
             err = (got - _reference(h[theirs], W, ids)).abs().max().item()
             out.put((rank, "ok", err))
         except RuntimeError as exc:
@@ -662,3 +705,104 @@ def test_an_all_padding_row_is_owned_and_empty():
     assert found.tolist() == [1, 1]
     assert torch.all(values[0] == 0)
     assert cache.check_witness(atol=1e-3) < 1e-3
+
+
+# --------------------------------------------------------------------------- #
+# 8. the witness is a sample; the lookup is branch-free
+# --------------------------------------------------------------------------- #
+
+
+def test_the_witness_covers_only_the_sampled_rows_and_still_fires():
+    """The teacher's own top-k is not part of the answer under student indexing --
+    nothing reads it -- so it is built for a couple of micro-batches a step and
+    kept as a spot check. A mis-filed entry is a systematic routing failure, so a
+    handful of rows is enough to show it."""
+    n = 6
+    W, h_flat, lse_flat = _teacher(seed=11, n=n * L)
+    h, lse = h_flat.view(n, L, H), lse_flat.view(n, L)
+    full = torch.log_softmax(h_flat @ W.T, dim=-1)
+    wit_lp, wit_ids = torch.topk(full, K, dim=-1)
+    sampled = torch.tensor([0, 1])  # only the first micro-batch built it
+
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+    keys = torch.arange(n, dtype=torch.long)
+    cache.put(
+        keys, "alfworld", h, lse,
+        witness_rows=sampled,
+        witness_ids=wit_ids.view(n, L, K)[sampled], witness_lp=wit_lp.view(n, L, K)[sampled],
+    )
+
+    assert sorted(cache._witness_ids) == [0, 1]
+    assert cache.check_witness(atol=1e-3) < 1e-3
+
+    # Every row is still answerable -- only the check is sampled, not the store.
+    ids = torch.randint(0, VOCAB, (n, L, K), generator=torch.Generator().manual_seed(12))
+    values, found = cache.logprobs_at(keys, ids)
+    assert torch.all(found == 1)
+    torch.testing.assert_close(values, _reference(h, W, ids), rtol=0, atol=1e-5)
+
+    cache._h[1][0] = cache._h[1][0] + 3.0
+    with pytest.raises(RuntimeError, match="witness"):
+        cache.check_witness(atol=1e-3)
+
+
+def test_one_call_answers_rows_from_different_teachers():
+    """_balance_batch sorts by token count, not by task, so a micro-batch mixes
+    teachers. Grouping its rows by task would mean a mask, a nonzero and a
+    device-to-host sync inside the micro-batch loop; the ids carry each row's
+    offset into the stacked projection instead."""
+    tasks = ["alfworld", "search", "webshop"]
+    n_per = 3
+    cache = TeacherHiddenCache()
+    heads, hidden, keys = {}, {}, {}
+    for t_i, task in enumerate(tasks):
+        W, h_flat, lse_flat = _teacher(seed=20 + t_i, n=n_per * L)
+        heads[task] = W
+        hidden[task] = h_flat.view(n_per, L, H)
+        cache.register_lm_head(task, W)
+        keys[task] = torch.arange(100 * (t_i + 1), 100 * (t_i + 1) + n_per, dtype=torch.long)
+        cache.put(keys[task], task, hidden[task], lse_flat.view(n_per, L))
+
+    # Interleave, the way a balanced micro-batch would.
+    asked, owner = [], []
+    for i in range(n_per):
+        for task in tasks:
+            asked.append(int(keys[task][i]))
+            owner.append(task)
+    asked = torch.tensor(asked, dtype=torch.long)
+    ids = torch.randint(0, VOCAB, (len(asked), L, K), generator=torch.Generator().manual_seed(21))
+
+    values, found = cache.logprobs_at(asked, ids)
+
+    assert torch.all(found == 1)
+    for row, task in enumerate(owner):
+        want = _reference(hidden[task][row // len(tasks)].unsqueeze(0), heads[task], ids[row : row + 1])
+        torch.testing.assert_close(values[row : row + 1], want, rtol=0, atol=1e-5)
+
+
+def test_the_lookup_makes_no_host_round_trip():
+    """The read runs inside the micro-batch loop, thousands of times a step. A
+    .tolist() or an int(tensor) there is a device-to-host sync, which stalls the
+    very pipeline the rollout overlap exists to keep full."""
+    cache, keys, W, h, lse = _filled_cache(n=6)
+    ids = torch.randint(0, VOCAB, (6, L, K))
+    cache.logprobs_at(keys, ids)  # finalize once, outside the measurement
+
+    calls = []
+    originals = {name: getattr(torch.Tensor, name) for name in ("tolist", "item")}
+    for name, original in originals.items():
+        def traced(self, _o=original, _n=name):
+            calls.append(_n)
+            return _o(self)
+
+        setattr(torch.Tensor, name, traced)
+    try:
+        cache.logprobs_at(keys, ids)
+        assert calls == [], f"lookup synchronised via {sorted(set(calls))}"
+        # The trace itself has to work, or the assertion above proves nothing.
+        torch.zeros(1).item()
+        assert calls == ["item"]
+    finally:
+        for name, original in originals.items():
+            setattr(torch.Tensor, name, original)

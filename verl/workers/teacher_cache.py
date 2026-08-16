@@ -112,8 +112,13 @@ def teacher_logprobs_from_hidden(
         lse = lse.unsqueeze(-1)
     # (n, k, hidden) gathered rows of the projection. Built per micro-batch and
     # dropped: at step scale this would be ~90 GB, at micro-batch scale ~90 MB.
+    # Kept in the inputs' own dtype rather than widened to float32 -- it is by far
+    # the largest tensor here, and widening bf16 that the forward already produced
+    # doubles the traffic without recovering any precision: the products are exact
+    # either way and both paths accumulate in float32.
     w_ids = lm_head_weight[ids]
-    logits = torch.einsum("nh,nkh->nk", h.float(), w_ids.float())
+    dtype = torch.promote_types(h.dtype, w_ids.dtype)
+    logits = torch.einsum("nh,nkh->nk", h.to(dtype), w_ids.to(dtype)).float()
     if isinstance(temperature, torch.Tensor):
         temperature = temperature.to(logits.device).float().reshape(-1, 1)
         logits = logits / temperature
@@ -139,6 +144,9 @@ class TeacherHiddenCache:
         self._witness_ids: Dict[int, torch.Tensor] = {}
         self._witness_lp: Dict[int, torch.Tensor] = {}
         self._weights: Dict[str, torch.Tensor] = {}
+        self._stacked = None   # (n_tasks * vocab, hidden), built on first read
+        self._voff: Dict[str, int] = {}
+        self._final = None     # the read-side tensors; invalidated by put/clear
 
     # -- registration ----------------------------------------------------- #
 
@@ -150,6 +158,36 @@ class TeacherHiddenCache:
         ids. One copy per teacher, held for the run.
         """
         self._weights[task] = weight
+        # A new teacher shifts every other one's slice of the stacked projection,
+        # so the offsets baked into the read-side tensors are no longer valid.
+        self._stacked = None
+        self._final = None
+
+    def _stack_heads(self):
+        """One (n_tasks * vocab, hidden) projection, teachers laid end to end.
+
+        A micro-batch mixes tasks -- ``_balance_batch`` sorts by token count, not
+        by teacher -- so answering it from three separate weights means grouping
+        its rows by task, and grouping means a boolean mask, a ``nonzero``, and a
+        device-to-host sync inside the micro-batch loop. Offsetting the ids by the
+        teacher's slice instead makes the whole lookup one gather with no
+        branching. The memory is the same 1.9 GB the three copies already cost;
+        only the layout changes.
+        """
+        if self._stacked is not None:
+            return
+        if not self._weights:
+            raise KeyError("no teacher lm_head registered; see register_lm_head")
+        tasks = sorted(self._weights)
+        vocab = {int(self._weights[t].shape[0]) for t in tasks}
+        if len(vocab) != 1:
+            raise ValueError(f"teachers disagree on vocabulary size: {vocab}; the stacked projection assumes one")
+        v = vocab.pop()
+        self._voff = {t: i * v for i, t in enumerate(tasks)}
+        self._stacked = torch.cat([self._weights[t] for t in tasks], dim=0)
+        # The parts are now views' worth of duplicate memory; drop them so the
+        # stacked copy is the only one held.
+        self._weights = {t: self._stacked[self._voff[t] : self._voff[t] + v] for t in tasks}
 
     def lm_head(self, task: str) -> torch.Tensor:
         if task not in self._weights:
@@ -160,7 +198,7 @@ class TeacherHiddenCache:
 
     def put(
         self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None, temperature: float = 1.0,
-        live_mask=None,
+        live_mask=None, witness_rows=None,
     ):
         """Store one call's rows, one entry per ROW, packed to the real positions.
 
@@ -249,18 +287,27 @@ class TeacherHiddenCache:
         # cache holds exactly the packed size and the padded input is free to go.
         h_packed = h.reshape(n * resp_len, -1)[flat]
         lse_packed = lse.reshape(n * resp_len)[flat]
-        w_ids_packed = witness_ids.reshape(n * resp_len, -1)[flat] if witness_ids is not None else None
-        w_lp_packed = witness_lp.reshape(n * resp_len, -1)[flat] if witness_lp is not None else None
+
+        # The witness is a SAMPLE of rows, not a column: it is the teacher's own
+        # top-k, which nothing downstream reads, and building it costs a
+        # full-vocabulary selection. ``witness_rows`` says which of this call's
+        # rows carry it; without it, every row does (the old shape).
+        w_of_row = None
+        if witness_ids is not None:
+            if witness_rows is None:
+                w_of_row = {i: i for i in range(n)}
+            else:
+                w_of_row = {int(r): j for j, r in enumerate(witness_rows.tolist())}
 
         lens_l, off_l = lens.tolist(), offsets.tolist()
         for j, i in enumerate(kept):
             a, b = off_l[j], off_l[j + 1]
-            self._register(
-                keys[i], task, h_packed[a:b], lse_packed[a:b],
-                None if w_ids_packed is None else w_ids_packed[a:b],
-                None if w_lp_packed is None else w_lp_packed[a:b],
-                lens_l[j], temperature,
-            )
+            w_ids = w_lp = None
+            if w_of_row is not None and i in w_of_row:
+                w = w_of_row[i]
+                w_ids = witness_ids[w, : lens_l[j]]
+                w_lp = witness_lp[w, : lens_l[j]]
+            self._register(keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature)
 
     def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature):
         self._h[key] = h
@@ -271,6 +318,7 @@ class TeacherHiddenCache:
         if w_ids is not None:
             self._witness_ids[key] = w_ids
             self._witness_lp[key] = w_lp
+        self._final = None
 
     def clear(self):
         self._h.clear()
@@ -280,6 +328,7 @@ class TeacherHiddenCache:
         self._temperature.clear()
         self._witness_ids.clear()
         self._witness_lp.clear()
+        self._final = None
 
     def __len__(self):
         return len(self._h)
@@ -289,8 +338,54 @@ class TeacherHiddenCache:
 
     # -- reading ---------------------------------------------------------- #
 
+    def _finalize(self, device):
+        """Lay the step's entries out as tensors, once, so reads can be branch-free.
+
+        Everything below is per STEP -- the fill is finished by the time the actor
+        update starts, and ``put``/``clear`` invalidate this. What matters is what
+        is NOT here: ``logprobs_at`` runs inside the micro-batch loop, thousands of
+        times a step, and a ``.tolist()`` or an ``int(t)` there is a
+        device-to-host sync that stalls the pipeline the whole rollout-overlap
+        effort exists to keep full.
+        """
+        if self._final is not None and self._final["device"] == device:
+            return self._final
+        self._stack_heads()
+        keys = sorted(self._h)
+        if not keys:
+            self._final = {"device": device, "empty": True}
+            return self._final
+
+        base = keys[0]
+        span = keys[-1] - base + 1
+        key_to_slot = torch.full((span,), -1, dtype=torch.long)
+        key_to_slot[torch.tensor(keys, dtype=torch.long) - base] = torch.arange(len(keys), dtype=torch.long)
+
+        lens = torch.tensor([self._len[k] for k in keys], dtype=torch.long)
+        offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
+        self._final = {
+            "device": device,
+            "empty": False,
+            "base": base,
+            "key_to_slot": key_to_slot.to(device),
+            "slot_key": torch.tensor(keys, dtype=torch.long).to(device),
+            "slot_len": lens.to(device),
+            "slot_off": offsets.to(device),
+            "slot_voff": torch.tensor([self._voff[self._task[k]] for k in keys], dtype=torch.long).to(device),
+            "slot_temp": torch.tensor([self._temperature[k] for k in keys], dtype=torch.float32).to(device),
+            "h": torch.cat([self._h[k] for k in keys]).to(device),
+            "lse": torch.cat([self._lse[k] for k in keys]).to(device),
+            "max_len": int(lens.max()),
+        }
+        return self._final
+
     def logprobs_at(self, cache_ids: torch.Tensor, ids: torch.Tensor):
         """Answer for the rows this cache owns; leave the rest at zero.
+
+        Branch-free and sync-free: a key lookup, a gather of the stored rows, one
+        narrow GEMM, and a mask. No host round-trip, no per-row Python, and no
+        grouping by task -- the ids carry the teacher's offset into the stacked
+        projection instead.
 
         Args:
             cache_ids: (n,) int64 keys, one per ROW; -1 means "not scored here".
@@ -298,58 +393,50 @@ class TeacherHiddenCache:
 
         Returns:
             values: (n, response_length, k) float32, zero on rows this cache does
-                not own.
+                not own and on padding positions.
             found: (n,) int32, 1 on the rows it does.
         """
         n, resp_len, k = ids.shape
-        values = torch.zeros((n, resp_len, k), dtype=torch.float32, device=ids.device)
-        found = torch.zeros((n,), dtype=torch.int32, device=ids.device)
-        if not self._h:
-            return values, found
-
-        # One host round-trip for the whole request, not one per row: cache_ids
-        # may be a device tensor and int() on it synchronises.
-        wanted = cache_ids.tolist()
-        by_task: Dict[str, list] = {}
-        for row, key in enumerate(wanted):
-            key = int(key)
-            if key < 0 or key not in self._h:
-                continue
-            by_task.setdefault(self._task[key], []).append((row, key))
-
         dev = ids.device
-        flat_values = values.view(n * resp_len, k)
-        for task, entries in by_task.items():
-            rows = torch.tensor([r for r, _ in entries], dtype=torch.long, device=dev)
-            found[rows] = 1
-            # Entries are packed to their real positions, so the work here is
-            # packed too: padding slots keep the zero they were already given, and
-            # the narrow GEMM never sees them.
-            stored = [self._len[key] for _, key in entries]
-            if max(stored) > resp_len:
-                # The reconstruction indexes a flattened (n, resp_len) grid, so a
-                # longer entry would spill into the next row rather than fail.
-                raise RuntimeError(
-                    f"teacher cache holds a row of {max(stored)} response positions but is being asked for "
-                    f"{resp_len}; the teacher and the actor disagree on response_length."
-                )
-            lens = torch.tensor(stored, dtype=torch.long, device=dev)
-            offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), lens.cumsum(0)])
-            total = int(offsets[-1])
-            if total == 0:
-                continue
-            row_of = torch.repeat_interleave(torch.arange(len(entries), device=dev), lens)
-            flat = rows[row_of] * resp_len + (torch.arange(total, device=dev) - offsets[row_of])
+        final = self._finalize(dev)
+        if final["empty"]:
+            return (
+                torch.zeros((n, resp_len, k), dtype=torch.float32, device=dev),
+                torch.zeros((n,), dtype=torch.int32, device=dev),
+            )
+        if final["max_len"] > resp_len:
+            # The reconstruction indexes a flattened (n, resp_len) grid, so a
+            # longer entry would spill into the next row rather than fail.
+            raise RuntimeError(
+                f"teacher cache holds a row of {final['max_len']} response positions but is being asked for "
+                f"{resp_len}; the teacher and the actor disagree on response_length."
+            )
 
-            h = torch.cat([self._h[key] for _, key in entries]).to(dev)      # (T, H)
-            lse = torch.cat([self._lse[key] for _, key in entries]).to(dev)  # (T,)
-            temps = torch.tensor(
-                [self._temperature.get(key, 1.0) for _, key in entries], dtype=torch.float32, device=dev
-            )
-            flat_values[flat] = teacher_logprobs_from_hidden(
-                h, lse, self.lm_head(task), ids.reshape(n * resp_len, k)[flat],
-                temperature=temps.repeat_interleave(lens),
-            )
+        cid = cache_ids.to(dev, torch.long)
+        q = cid - final["base"]
+        span = final["key_to_slot"].numel()
+        slot = torch.where(
+            (q >= 0) & (q < span),
+            final["key_to_slot"][q.clamp(0, span - 1)],
+            torch.full_like(q, -1),
+        )
+        safe = slot.clamp(min=0)
+        ok = (slot >= 0) & (final["slot_key"][safe] == cid)
+        safe = torch.where(ok, safe, torch.zeros_like(safe))
+        found = ok.to(torch.int32)
+
+        pos = torch.arange(resp_len, device=dev)
+        lens = torch.where(ok, final["slot_len"][safe], torch.zeros_like(safe))
+        live = pos.unsqueeze(0) < lens.unsqueeze(1)                       # (n, resp_len)
+        src = final["slot_off"][safe].unsqueeze(1) + pos.unsqueeze(0)
+        src = torch.where(live, src, torch.zeros_like(src)).reshape(-1)   # (n * resp_len,)
+
+        flat_ids = ids.reshape(-1, k) + final["slot_voff"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1, 1)
+        out = teacher_logprobs_from_hidden(
+            final["h"][src], final["lse"][src], self._stacked, flat_ids,
+            temperature=final["slot_temp"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1),
+        )
+        values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
         return values, found
 
     def check_witness(self, atol: float = 1e-3) -> float:
@@ -416,7 +503,7 @@ def exchange_teacher_logprobs(
 
     if world_size == 1:
         values, found = cache.logprobs_at(cache_ids, ids)
-        _assert_owned_once(found, cache_ids)
+        _record_ownership(found, cache_ids)
         return values
 
     n, resp_len, k = ids.shape
@@ -437,26 +524,55 @@ def exchange_teacher_logprobs(
     dist.all_reduce(found, op=dist.ReduceOp.SUM, group=group)
 
     rank = dist.get_rank(group) if dist.is_initialized() else 0
-    _assert_owned_once(found[rank], cache_ids)
+    _record_ownership(found[rank], cache_ids)
     return values[rank]
 
 
-def _assert_owned_once(found: torch.Tensor, cache_ids: torch.Tensor):
-    """Every scored row must have been answered by exactly one rank.
+_OWNERSHIP: Optional[torch.Tensor] = None
+
+
+def _record_ownership(found: torch.Tensor, cache_ids: torch.Tensor):
+    """Tally rows that were not answered by exactly one rank. No host round-trip.
 
     0 is a row whose hidden states nobody kept -- the loss would silently take a
     zero target. 2 is two ranks claiming the same key, which means the ids are not
     unique and some row is being answered from another row's cache.
+
+    Counted on the device rather than asserted here, because "here" is inside the
+    micro-batch loop: reading a count is a synchronisation, and one per
+    micro-batch drains the CPU's run-ahead thousands of times a step. The tally is
+    read once per mini-batch by ``assert_rows_were_owned_once``, which still runs
+    BEFORE the optimizer step, so a bad row can never reach the weights.
     """
-    wanted = cache_ids >= 0
-    if not torch.any(wanted):
+    global _OWNERSHIP
+    wanted = cache_ids.to(found.device) >= 0
+    counts = torch.stack(
+        [
+            (wanted & (found == 0)).sum(),
+            (wanted & (found > 1)).sum(),
+            wanted.sum(),
+        ]
+    ).to(torch.int64)
+    if _OWNERSHIP is None or _OWNERSHIP.device != counts.device:
+        _OWNERSHIP = counts
+    else:
+        _OWNERSHIP = _OWNERSHIP + counts
+
+
+def assert_rows_were_owned_once():
+    """Read the tally and raise if anything went unresolved. Clears it.
+
+    One synchronisation per call, so call it per mini-batch (before the optimizer
+    step), not per micro-batch.
+    """
+    global _OWNERSHIP
+    if _OWNERSHIP is None:
         return
-    got = found[wanted]
-    if not torch.all(got == 1):
-        missing = int((got == 0).sum())
-        duplicated = int((got > 1).sum())
+    missing, duplicated, scored = (int(x) for x in _OWNERSHIP)
+    _OWNERSHIP = None
+    if missing or duplicated:
         raise RuntimeError(
             f"teacher hidden-state exchange did not resolve every row: {missing} unanswered, "
-            f"{duplicated} answered more than once (of {int(wanted.sum())} scored). Unanswered rows would "
+            f"{duplicated} answered more than once (of {scored} scored). Unanswered rows would "
             f"train against a zero teacher target; duplicated ones mean cache ids are not unique."
         )

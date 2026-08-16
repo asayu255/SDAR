@@ -22,12 +22,21 @@ from PIL import Image
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
-def to_list_of_dict(batch: DataProto) -> list[dict]:
+def to_list_of_dict(batch: DataProto, rows=None) -> list[dict]:
+    """One dict per row, aligned to ``rows`` when given.
+
+    ``rows`` exists because the caller usually keeps only the rows that are still
+    active: a finished trajectory's row is recorded nowhere, so slicing every
+    tensor of every column for it and then dropping the dict is the whole cost for
+    none of the result. In a 50-turn episode most rows are finished for most
+    turns.
+    """
     tensors = batch.batch
     non_tensor = batch.non_tensor_batch
-    batch_size = len(tensors['input_ids'])
+    if rows is None:
+        rows = range(len(tensors['input_ids']))
     save_list = []
-    for bs in range(batch_size):
+    for bs in rows:
         save_dict = dict()
         for key, val in tensors.items():
             save_dict[key] = val[bs]

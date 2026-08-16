@@ -141,3 +141,93 @@ def test_the_drift_check_guard_tolerates_the_missing_column():
     column off skips the check instead of raising."""
     off = _assemble(False)
     assert ("rollout_log_probs" in off.batch.keys()) is False
+
+
+# --------------------------------------------------------------------------- #
+# Finished trajectories' rows are never recorded, so they are never materialised
+# --------------------------------------------------------------------------- #
+
+
+def _turn_batch(batch_size, seqlen=8):
+    from tensordict import TensorDict
+
+    return DataProto(
+        batch=TensorDict(
+            {
+                "input_ids": torch.arange(batch_size * seqlen).view(batch_size, seqlen),
+                "responses": torch.arange(batch_size * 4).view(batch_size, 4),
+            },
+            batch_size=[batch_size],
+        ),
+        non_tensor_batch={"traj_uid": np.array([f"t{i}" for i in range(batch_size)], dtype=object)},
+    )
+
+
+def test_only_the_requested_rows_are_materialised():
+    """gather_rollout_data drops rows with active_masks=False, so slicing every
+    column for a finished trajectory and then discarding the dict is the whole
+    cost for none of the result. By the late turns of a 50-step episode those are
+    most of the batch."""
+    from agent_system.multi_turn_rollout.utils import to_list_of_dict
+
+    batch = _turn_batch(6)
+    active = [0, 3, 4]
+
+    rows = to_list_of_dict(batch, active)
+
+    assert len(rows) == len(active)
+    for pos, i in enumerate(active):
+        assert torch.equal(rows[pos]["input_ids"], batch.batch["input_ids"][i])
+        assert rows[pos]["traj_uid"] == f"t{i}"
+
+
+def test_omitting_the_rows_argument_keeps_every_row():
+    """The un-gated path (ROLLOUT_COMPACT_RECORD off) must be untouched."""
+    from agent_system.multi_turn_rollout.utils import to_list_of_dict
+
+    batch = _turn_batch(5)
+    assert len(to_list_of_dict(batch)) == 5
+    assert [r["traj_uid"] for r in to_list_of_dict(batch)] == [f"t{i}" for i in range(5)]
+
+
+def test_finished_rows_share_one_padding_filler():
+    """Their model inputs are pure padding, so every finished row's are the same
+    tensor. Collate copies them into the stacked batch either way."""
+    from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+    class _Tok:
+        pad_token_id = 7
+
+    template = {
+        "input_ids": torch.arange(6),
+        "attention_mask": torch.ones(6, dtype=torch.long),
+        "position_ids": torch.arange(6),
+    }
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    collector.tokenizer = _Tok()
+
+    filler = collector._padding_filler(template)
+
+    assert torch.equal(filler["input_ids"], torch.full((6,), 7))
+    assert torch.all(filler["attention_mask"] == 0)
+    assert torch.all(filler["position_ids"] == 0)
+
+    # Same object handed to every finished row, not a fresh fill each time.
+    class _Cfg(dict):
+        def get(self, k, d=None):
+            return d
+
+    collector.config = type("C", (), {"data": _Cfg()})()
+    gen_batch = DataProto(
+        batch=None,
+        non_tensor_batch={"data_source": np.array(["x", "x"], dtype=object)},
+    )
+    obs = {"text": ["a", "b"], "anchor": None}
+    rows = [
+        collector._placeholder_single_sample(item=i, gen_batch=gen_batch, obs=obs, template=template, filler=filler)
+        for i in range(2)
+    ]
+    assert rows[0]["input_ids"] is rows[1]["input_ids"] is filler["input_ids"]
+    # ...and dropping the argument still produces a correct row on its own.
+    solo = collector._placeholder_single_sample(item=0, gen_batch=gen_batch, obs=obs, template=template)
+    assert torch.equal(solo["input_ids"], filler["input_ids"])

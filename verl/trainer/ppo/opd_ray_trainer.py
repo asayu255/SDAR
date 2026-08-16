@@ -318,7 +318,16 @@ class OPDRayTrainer(RayPPOTrainer):
                 if self.student_indexed_topk
                 else None
             )
-            if self.teacher_topk_kl:
+            if self.teacher_topk_kl and self.student_indexed_topk:
+                # Nothing comes back but the row count: the support is the
+                # student's, so the values are resolved in the actor from the
+                # hidden states this call just cached. What used to travel here
+                # was (rows, 512, 20) log-probs plus the same in int64 ids --
+                # ~860 MB a step, merged into the batch and never read.
+                self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+                for key, _ in entries:
+                    out[key] = cache_id_for[key]
+            elif self.teacher_topk_kl:
                 scored = self._teacher_call(wg, sub, topk=True, cache_ids=ids)
                 tlp = scored.batch["teacher_topk_logprobs"]
                 tid = scored.batch["teacher_topk_ids"]
@@ -400,11 +409,17 @@ class OPDRayTrainer(RayPPOTrainer):
         resp_len = batch.batch["responses"].size(1)
         seen = [False] * bs
 
-        if self.teacher_topk_kl:
+        # Under student_indexed_topk the teacher's own top-k is not part of the
+        # answer -- the support comes from the student and the values are resolved
+        # in the actor -- so these two (bs, response_length, k) columns are not
+        # built, not merged and not shipped. At this batch size they were ~860 MB
+        # a step of pure transport.
+        merge_topk = self.teacher_topk_kl and not self.student_indexed_topk
+        if merge_topk:
             k = self.teacher_kl_topk
             teacher_topk_logprobs = torch.zeros((bs, resp_len, k), dtype=torch.float32)
             teacher_topk_ids = torch.zeros((bs, resp_len, k), dtype=torch.long)
-        else:
+        elif not self.teacher_topk_kl:
             teacher_log_probs = torch.zeros((bs, resp_len), dtype=torch.float32)
 
         # Every row gets a key, not just the prefetched ones. The rows the prefetch
@@ -420,7 +435,9 @@ class OPDRayTrainer(RayPPOTrainer):
                 hit = prefetched.get(key)
                 if hit is None:
                     continue
-                if self.teacher_topk_kl:
+                if self.student_indexed_topk:
+                    cache_ids[i] = hit
+                elif self.teacher_topk_kl:
                     if len(hit) == 3:
                         teacher_topk_logprobs[i], teacher_topk_ids[i], cache_ids[i] = hit
                     else:
@@ -454,7 +471,11 @@ class OPDRayTrainer(RayPPOTrainer):
             # compute and that transfer out by teacher.
             gpu_profiler.push_phase(f"teacher_forward/{task}")
             try:
-                if self.teacher_topk_kl:
+                if self.teacher_topk_kl and self.student_indexed_topk:
+                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
+                    for i in idxs:
+                        seen[i] = True
+                elif self.teacher_topk_kl:
                     out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
                     tlp = out.batch["teacher_topk_logprobs"]
                     tid = out.batch["teacher_topk_ids"]
@@ -478,11 +499,11 @@ class OPDRayTrainer(RayPPOTrainer):
                 f"available teachers: {sorted(self.teacher_wg.keys())}"
             )
 
-        if self.teacher_topk_kl:
+        if merge_topk:
             batch.batch["teacher_topk_logprobs"] = teacher_topk_logprobs
             batch.batch["teacher_topk_ids"] = teacher_topk_ids
-            if self.student_indexed_topk:
-                batch.batch["teacher_cache_ids"] = cache_ids
+        elif self.student_indexed_topk:
+            batch.batch["teacher_cache_ids"] = cache_ids
         else:
             batch.batch["teacher_log_probs"] = teacher_log_probs
 

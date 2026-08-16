@@ -267,7 +267,8 @@ class DataParallelPPOActor(BasePPOActor):
             print("Actor response_only_logits=True (lm_head on response rows only)")
 
     def _topk_from_response_logits(
-        self, logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length, topk_k, topk_ids
+        self, logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length, topk_k, topk_ids,
+        lse=None,
     ):
         """Top-k distillation outputs from logits that already cover only the
         response rows.
@@ -277,10 +278,18 @@ class DataParallelPPOActor(BasePPOActor):
         caller slices. A window position missing from the packed batch (response
         padding) is zero-filled, which is what the full-logits path produced there
         too.
+
+        ``lse`` is the full-vocabulary normaliser. It is a parameter because the
+        caller may already need it for its own reasons; computing it twice is a
+        second full reduction over (n_resp, vocab), which is the widest tensor in
+        the step.
         """
-        lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
+        if lse is None:
+            lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
         if topk_k is not None:
-            tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)  # (n_resp, k)
+            # sorted=False: the KL sums over the support, so the order within the
+            # k is never read.
+            tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1, sorted=False)  # (n_resp, k)
             # Use float32 for pad_input: bf16 cannot represent vocab ids
             # (>256) exactly, and float32 keeps log-probs precise.
             t_lp_rmpad = (tvals - lse).float()
@@ -461,27 +470,36 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
 
-                    if topk_k is not None or topk_ids is not None:
-                        topk_out = self._topk_from_response_logits(
-                            logits_resp=logits_resp,
-                            sel_indices=sel_indices,
-                            sel_slot=sel_slot,
-                            batch_size=batch_size,
-                            seqlen=seqlen,
-                            response_length=response_length,
-                            topk_k=topk_k,
-                            topk_ids=topk_ids,
-                        )
+                    if topk_k is not None or topk_ids is not None or return_lse:
+                        # One reduction over (n_resp, vocab), shared. This is the
+                        # widest tensor in the step, so computing the normaliser
+                        # here and again for `lse` below was a second full pass
+                        # over it for nothing.
+                        lse_resp = torch.logsumexp(logits_resp, dim=-1, keepdim=True)
+                        if topk_k is not None or topk_ids is not None:
+                            topk_out = self._topk_from_response_logits(
+                                logits_resp=logits_resp,
+                                sel_indices=sel_indices,
+                                sel_slot=sel_slot,
+                                batch_size=batch_size,
+                                seqlen=seqlen,
+                                response_length=response_length,
+                                topk_k=topk_k,
+                                topk_ids=topk_ids,
+                                lse=lse_resp,
+                            )
                         if return_lse:
                             # The caller wants to evaluate this model at ids chosen
                             # later, which needs the normaliser and the row map --
-                            # the projection itself it can redo for 2*H*k.
-                            tlp, tids = topk_out
+                            # the projection itself it can redo for 2*H*k. With
+                            # topk_k None the model's OWN top-k is not built at
+                            # all, which is a full-vocabulary selection saved.
+                            tlp, tids = topk_out if topk_k is not None else (None, None)
                             topk_out = (
                                 tlp,
                                 tids,
                                 {
-                                    "lse": torch.logsumexp(logits_resp, dim=-1, keepdim=True).float(),
+                                    "lse": lse_resp.float(),
                                     "sel": sel,
                                     "sel_indices": sel_indices,
                                     "batch_size": batch_size,
@@ -734,7 +752,9 @@ class DataParallelPPOActor(BasePPOActor):
         finally:
             handle.remove()
 
-    def compute_topk_log_prob(self, data: DataProto, topk_k: int, return_hidden: bool = False):
+    def compute_topk_log_prob(
+        self, data: DataProto, topk_k: int, return_hidden: bool = False, witness_micro_batches=None
+    ):
         """Teacher-side: per response token, the teacher's top-k token ids and the
         teacher's full-vocab log-softmax values at those ids.
 
@@ -744,12 +764,26 @@ class DataParallelPPOActor(BasePPOActor):
                 can evaluate this teacher at ids chosen later (see
                 verl/workers/teacher_cache.py). The expensive work is unchanged --
                 only the last gather depends on the ids.
+            witness_micro_batches: build the teacher's OWN top-k for that many
+                leading micro-batches only, and return it as a sample instead of a
+                full column. In this mode nothing downstream reads it: the support
+                comes from the student, and the teacher's top-k exists only to
+                check the cache against the forward that filled it. Building it is
+                a selection over the whole vocabulary and a scatter back to
+                (bs, response_length, k), so running it on every row is the
+                expensive way to do a spot check. Requires ``return_hidden``.
 
         Returns:
-            topk_logprob: (bs, response_length, k)
-            topk_ids:     (bs, response_length, k) int64
-            hidden, lse:  (bs, response_length, hidden) / (bs, response_length),
-                          only when ``return_hidden``
+            witness_micro_batches is None:
+                topk_logprob: (bs, response_length, k)
+                topk_ids:     (bs, response_length, k) int64
+                hidden, lse:  (bs, response_length, hidden) / (bs, response_length),
+                              only when ``return_hidden``
+            otherwise:
+                hidden, lse, witness_rows, witness_ids, witness_logprob -- where
+                ``witness_rows`` indexes the ORIGINAL row order (so it survives the
+                dynamic-batching reorder) and the other two are
+                (len(witness_rows), response_length, k).
         """
         self.actor_module.eval()
         if return_hidden and not self.response_only_logits:
@@ -757,6 +791,9 @@ class DataParallelPPOActor(BasePPOActor):
                 "student_indexed_topk needs ref.response_only_logits=True: the hidden states are handed "
                 "back on the packed rows that path selects, and there is no row map without it."
             )
+        sampled_witness = witness_micro_batches is not None
+        if sampled_witness and not return_hidden:
+            raise ValueError("witness_micro_batches only makes sense with return_hidden=True")
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
@@ -777,16 +814,20 @@ class DataParallelPPOActor(BasePPOActor):
         topk_ids_lst = []
         hidden_lst = []
         lse_lst = []
-        for micro_batch in micro_batches:
+        witness_rows_lst = []
+        row_cursor = 0
+        for mb_i, micro_batch in enumerate(micro_batches):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            n_rows = micro_batch["responses"].size(0)
+            want_topk = (not sampled_witness) or mb_i < witness_micro_batches
             sink = {}
             with torch.no_grad(), self._capture_last_hidden(sink if return_hidden else {}):
                 _, _, topk_out = self._forward_micro_batch(
                     micro_batch,
                     temperature=temperature,
                     calculate_entropy=False,
-                    topk_k=topk_k,
+                    topk_k=topk_k if want_topk else None,
                     return_lse=return_hidden,
                 )
             if return_hidden:
@@ -809,26 +850,50 @@ class DataParallelPPOActor(BasePPOActor):
                 )
             else:
                 tlp, tids = topk_out
-            topk_logprob_lst.append(tlp)
-            topk_ids_lst.append(tids)
+            if want_topk:
+                topk_logprob_lst.append(tlp)
+                topk_ids_lst.append(tids)
+                if sampled_witness:
+                    # Original row numbers: rearrange_micro_batches hands back, per
+                    # micro-batch, where each of its rows came from, so the sample
+                    # needs no revert of its own.
+                    witness_rows_lst.append(
+                        torch.as_tensor(indices[mb_i], dtype=torch.long)
+                        if use_dynamic_bsz
+                        else torch.arange(row_cursor, row_cursor + n_rows, dtype=torch.long)
+                    )
+            row_cursor += n_rows
 
-        topk_logprob = torch.concat(topk_logprob_lst, dim=0)
-        topk_ids = torch.concat(topk_ids_lst, dim=0)
         hidden = torch.concat(hidden_lst, dim=0) if return_hidden else None
         lse = torch.concat(lse_lst, dim=0) if return_hidden else None
+        if not sampled_witness:
+            topk_logprob = torch.concat(topk_logprob_lst, dim=0)
+            topk_ids = torch.concat(topk_ids_lst, dim=0)
+
         if use_dynamic_bsz:
-            indices = list(itertools.chain.from_iterable(indices))
-            assert len(indices) == topk_logprob.size(0), f"{len(indices)} vs. {topk_logprob.size()}"
-            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-            topk_logprob = topk_logprob[revert_indices]
-            topk_ids = topk_ids[revert_indices]
+            flat = list(itertools.chain.from_iterable(indices))
+            revert_indices = torch.tensor(get_reverse_idx(flat), dtype=torch.long)
+            if not sampled_witness:
+                assert len(flat) == topk_logprob.size(0), f"{len(flat)} vs. {topk_logprob.size()}"
+                topk_logprob = topk_logprob[revert_indices]
+                topk_ids = topk_ids[revert_indices]
             if return_hidden:
                 # The hidden states are per row like the top-k, so they follow the
                 # same reordering; skipping this would file every entry under a
                 # neighbour's key, which is exactly what the witness catches.
+                assert len(flat) == hidden.size(0), f"{len(flat)} vs. {hidden.size()}"
                 hidden = hidden[revert_indices]
                 lse = lse[revert_indices]
 
+        if sampled_witness:
+            if witness_rows_lst:
+                w_rows = torch.cat(witness_rows_lst)
+                w_ids = torch.concat(topk_ids_lst, dim=0)
+                w_lp = torch.concat(topk_logprob_lst, dim=0)
+            else:
+                w_rows = torch.empty(0, dtype=torch.long)
+                w_ids = w_lp = None
+            return hidden, lse, w_rows, w_ids, w_lp
         if return_hidden:
             return topk_logprob, topk_ids, hidden, lse
         return topk_logprob, topk_ids
@@ -1330,6 +1395,16 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
+
+                if student_indexed_topk:
+                    # Every row the exchange was asked about must have been
+                    # answered by exactly one rank. Checked here rather than in the
+                    # exchange itself: reading the tally synchronises, and this is
+                    # the last point before the weights move, so a row that went
+                    # unresolved still cannot reach them.
+                    from verl.workers.teacher_cache import assert_rows_were_owned_once
+
+                    assert_rows_were_owned_once()
 
                 with _actor_phase("actor.optim"):
                     grad_norm = self._optimizer_step()

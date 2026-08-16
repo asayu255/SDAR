@@ -1247,9 +1247,33 @@ padding 行の id を −1 にする。witness は `compute_teacher_log_probs` �
 step 頭から `update_actor` の終わりまで GPU に載る。**9.2 で一度 OOM している**ので、
 300 step を回す前に 1 step の smoke test で `perf/max_memory_allocated_gb` を見ること。
 
-### 11.6 まだ未検証
+### 11.6 student-topK に付随して消した無駄
+
+**規定 ON**（`ppo_trainer.yaml`）。`teacher_kl_loss_type=topk_kl` のときだけ効き、
+それを使う run script はこの arm だけなので他 arm への波及は無い。
+
+| # | 消したもの | なぜ無駄だったか | 精度 |
+|---|---|---|---|
+| 1 | **teacher 自身の topK** | student indexing では誰も読まない。全語彙の選択 ＋ 行ごとに 2 回の scatter を全行に対して行い、さらに **約 860 MB/step** を driver に送って捨てていた | 値不変（witness としてのみ、既定 2 micro-batch/step だけ構築） |
+| 2 | **LSE の二重計算** | topK 用と cache 用に同じ logsumexp を 2 回。step で最も横に広いテンソルに対する完全リダクション | ビット同一 |
+| 3 | `topk(sorted=False)` | KL は支持集合上の和なので k 内の順序は読まれない | 値不変（テストで置換不変性を固定） |
+| 4 | **lookup の host round-trip** | `logprobs_at` は micro-batch ループの中で **step あたり数千回**走る。そこでの `.tolist()` / `int(tensor)` は device→host 同期で、この一連の作業が守ろうとしている CPU の先行実行をそのつど止める | 値不変 |
+| 5 | **done 行の collate** | 終了済み軌跡の行は `gather_rollout_data` で捨てられる。50 ターンの後半ではバッチの大半がそれで、列ごとに slice して dict を作ってから捨てていた | 値不変 |
+
+4 の中身：teacher の 3 つの lm_head を `(3V, H)` として端から端まで並べ、ids に
+task のオフセットを足す。こうすると **task ごとのグルーピングが不要**になる ——
+micro-batch は `_balance_batch` によってタスク混在なので、3 つの重みを使い分けるには
+mask → `nonzero` → 同期が要る。メモリは既に払っている 1.9 GB のままで、配置が変わるだけ。
+所有権ガード（0 = 誰も持っていない、2 = 二重）は device 上で加算し、**mini-batch ごとに
+1 回**読む。optimizer step の直前なので、未解決の行が重みに届くことはない。
+
+また `w_ids` を float32 に広げるのをやめた（bf16 のまま、累積は float32）。ここで
+最大のテンソルで、広げても精度は戻らない —— 積はどちらでも厳密で、累積はどちらも
+float32 である。
+
+### 11.7 まだ未検証
 
 forward hook（`_capture_last_hidden`）と `FSDP.summon_full_params` 経路は
-**実機で一度も走っていない**。CPU 上の 41 tests（うち 3 つは本物の 2 プロセス gloo）で
+**実機で一度も走っていない**。CPU 上の 46 tests（うち 3 つは本物の 2 プロセス gloo）で
 値・所有権・番人は押さえてあるが、FSDP 実体の上での動作は別物である。
 1 step の smoke test を 300 step の前に必ず挟むこと。

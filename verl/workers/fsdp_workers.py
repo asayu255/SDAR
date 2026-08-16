@@ -652,6 +652,9 @@ class ActorRolloutRefWorker(Worker):
             # Set by register_teacher_lm_head when student_indexed_topk is on; the
             # cache needs to know which teacher an entry belongs to.
             self._teacher_lm_head_task = None
+            # Micro-batches per step that also build the teacher's own top-k,
+            # purely as a witness. Reset in clear_teacher_hidden_cache.
+            self._teacher_witness_budget = int(os.environ.get("TEACHER_WITNESS_MICRO_BATCHES", "2"))
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -892,26 +895,37 @@ class ActorRolloutRefWorker(Worker):
         # student_indexed_topk resolves this teacher at ids the student picks during
         # its own training forward, which has not happened yet. Only the final gather
         # depends on those ids, so keep what does not: the body's hidden states and
-        # the full-vocabulary normaliser. The top-k below is still returned -- it is
-        # what the trainer merges today, and it doubles as the witness that the cache
-        # still reproduces this forward (see verl/workers/teacher_cache.py).
+        # the full-vocabulary normaliser.
+        #
+        # In that mode the teacher's OWN top-k is not part of the answer -- nothing
+        # downstream reads it -- so it is built for a couple of micro-batches per
+        # step as a witness and for nothing else. It was a selection over the whole
+        # vocabulary plus two scatters back to (bs, response_length, k) for every
+        # row, and then ~860 MB/step of it travelled to the driver to be ignored.
         cache_ids = data.batch.get("teacher_cache_ids", None) if "teacher_cache_ids" in data.batch.keys() else None
         want_hidden = cache_ids is not None and bool(self.config.ref.get("student_indexed_topk", False))
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            out = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k, return_hidden=want_hidden)
             if want_hidden:
-                topk_logprob, topk_ids, hidden, lse = out
+                hidden, lse, w_rows, w_ids, w_lp = self.ref_policy.compute_topk_log_prob(
+                    data=data, topk_k=topk_k, return_hidden=True,
+                    witness_micro_batches=self._take_witness_budget(),
+                )
                 self._cache_teacher_hidden(
-                    cache_ids, hidden, lse, topk_ids, topk_logprob,
+                    cache_ids, hidden, lse, w_rows, w_ids, w_lp,
                     attention_mask=data.batch["attention_mask"],
                 )
+                # The driver only needs the row count back (it unpads by it); the
+                # values it used to merge here are now resolved in the actor.
+                output = DataProto.from_dict(
+                    tensors={"teacher_scored": torch.ones(len(data), 1, dtype=torch.bool)},
+                )
             else:
-                topk_logprob, topk_ids = out
-            output = DataProto.from_dict(
-                tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
-            )
+                topk_logprob, topk_ids = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k)
+                output = DataProto.from_dict(
+                    tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
+                )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -921,16 +935,30 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
-    def _cache_teacher_hidden(self, cache_ids, hidden, lse, topk_ids, topk_logprob, attention_mask=None):
+    def _take_witness_budget(self) -> int:
+        """How many of this call's micro-batches also build the teacher's own top-k.
+
+        A budget rather than a rate: the witness catches an entry filed under the
+        wrong row, which is a systematic failure of the routing, so any handful of
+        rows shows it. Spending it on the step's first calls keeps the check
+        cheap and keeps it running every step. Reset by
+        ``clear_teacher_hidden_cache``.
+        """
+        take = min(self._teacher_witness_budget, 1)
+        self._teacher_witness_budget -= take
+        return take
+
+    def _cache_teacher_hidden(self, cache_ids, hidden, lse, witness_rows, witness_ids, witness_lp,
+                              attention_mask=None):
         """Keep this call's hidden states so the actor can score arbitrary ids later.
 
         One entry per ROW, holding every response position that carries signal,
         because that is the granularity the student picks its top-k at: a row is
         scored once but every position gets its own support set.
 
-        The teacher's own top-k goes in as the witness: recomputing it from ``hidden``
-        and ``lse`` must reproduce ``topk_logprob``, and does not if the entry is ever
-        paired with the wrong row.
+        The teacher's own top-k goes in as the witness on the sampled rows:
+        recomputing it from ``hidden`` and ``lse`` must reproduce ``witness_lp``,
+        and does not if the entry is ever paired with the wrong row.
         """
         from verl.workers.teacher_cache import get_teacher_cache
 
@@ -962,8 +990,9 @@ class ActorRolloutRefWorker(Worker):
             task,
             hidden.detach(),
             lse.detach(),
-            witness_ids=topk_ids.detach(),
-            witness_lp=topk_logprob.detach(),
+            witness_rows=witness_rows,
+            witness_ids=None if witness_ids is None else witness_ids.detach(),
+            witness_lp=None if witness_lp is None else witness_lp.detach(),
             temperature=self.config.rollout.temperature,
             live_mask=live_mask,
         )
@@ -1003,6 +1032,7 @@ class ActorRolloutRefWorker(Worker):
         from verl.workers.teacher_cache import get_teacher_cache
 
         get_teacher_cache().clear()
+        self._teacher_witness_budget = int(os.environ.get("TEACHER_WITNESS_MICRO_BATCHES", "2"))
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def check_teacher_hidden_cache(self, atol: float = 1e-3):

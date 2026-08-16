@@ -457,7 +457,18 @@ class TrajectoryCollector:
         
         return row_dict
 
-    def _placeholder_single_sample(self, item, gen_batch, obs, template):
+    def _padding_filler(self, template):
+        """The model-input tensors every finished row gets, built once per turn."""
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        return {
+            'input_ids': torch.full_like(template['input_ids'], pad_token_id),
+            'attention_mask': torch.zeros_like(template['attention_mask']),
+            'position_ids': torch.zeros_like(template['position_ids']),
+        }
+
+    def _placeholder_single_sample(self, item, gen_batch, obs, template, filler=None):
         """Cheap stand-in for an already-finished trajectory's row.
 
         Reproduces only the *cheap* metadata that preprocess_single_sample sets
@@ -477,11 +488,11 @@ class TrajectoryCollector:
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = 0
+        if filler is None:
+            filler = self._padding_filler(template)
 
         row_dict = {
-            'input_ids': torch.full_like(template['input_ids'], pad_token_id),
-            'attention_mask': torch.zeros_like(template['attention_mask']),
-            'position_ids': torch.zeros_like(template['position_ids']),
+            **filler,
             'raw_prompt_ids': [pad_token_id],
             'anchor_obs': _obs_anchor,
             'index': item,
@@ -543,6 +554,11 @@ class TrajectoryCollector:
             template = processed[active_items[0]] if active_items else None
             for item in active_items:
                 processed_samples[item] = processed[item]
+            # The model-input tensors of a finished row are pure padding, so every
+            # such row's are the same tensor. Build them once and share the
+            # reference; collate copies them into the stacked batch either way, and
+            # nothing downstream reads or mutates them.
+            filler = self._padding_filler(template) if template is not None else {}
             for item in range(batch_size):
                 if not active_mask[item]:
                     processed_samples[item] = self._placeholder_single_sample(
@@ -550,6 +566,7 @@ class TrajectoryCollector:
                         gen_batch=gen_batch,
                         obs=obs,
                         template=template,
+                        filler=filler,
                     )
 
         # Aggregate batch data
@@ -1036,18 +1053,19 @@ class TrajectoryCollector:
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
             
-            # Update episode lengths for active environments
-            batch_list: list[dict] = to_list_of_dict(batch)
+            # Only the rows that will actually be recorded are materialised.
+            # Finished trajectories' rows carry active_masks=False and are dropped
+            # by gather_rollout_data(); slicing every column for them and then
+            # discarding the dict is the whole cost for none of the result, and by
+            # the late turns of a 50-step episode they are most of the batch.
+            # Active rows form a prefix of each trajectory's list, so the
+            # enumerate-based turn_step and the last-active-entry scans in
+            # success_evaluator / filter_group_data are unchanged.
+            record_idx = active_idx if _ROLLOUT_COMPACT_RECORD else range(batch_size)
+            batch_list: list[dict] = to_list_of_dict(batch, record_idx)
 
-            for i in range(batch_size):
-                if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
-                    # Finished trajectories' rows carry active_masks=False and are
-                    # dropped by gather_rollout_data(); skip materializing them.
-                    # Active rows form a prefix of each trajectory's list, so the
-                    # enumerate-based turn_step and the last-active-entry scans in
-                    # success_evaluator / filter_group_data are unchanged.
-                    continue
-                total_batch_list[i].append(batch_list[i])
+            for pos, i in enumerate(record_idx):
+                total_batch_list[i].append(batch_list[pos])
                 total_infos[i].append(infos[i])
                 if active_masks[i]:
                     # A row is final the moment it is recorded: later turns only

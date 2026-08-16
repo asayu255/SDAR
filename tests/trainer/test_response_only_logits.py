@@ -201,3 +201,62 @@ def test_capability_probe_terminates_on_a_self_referential_wrapper():
     a.module = b
     b.module = a
     assert _supports_logits_to_keep(a) is False
+
+
+# --------------------------------------------------------------------------- #
+# the normaliser is computed once
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def _pad_input_available(monkeypatch):
+    """dp_actor imports pad_input from flash_attn, which this environment lacks.
+    The scatter itself is what the code under test uses, and it is four lines."""
+    from verl.workers.actor import dp_actor
+
+    monkeypatch.setattr(dp_actor, "pad_input", _pad_input, raising=False)
+
+
+def _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length, topk_k, lse):
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    return DataParallelPPOActor._topk_from_response_logits(
+        None, logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length,
+        topk_k=topk_k, topk_ids=None, lse=lse,
+    )
+
+
+@pytest.mark.parametrize("trial", range(5))
+def test_a_supplied_normaliser_is_the_one_it_would_have_computed(trial, _pad_input_available):
+    """The caller needs the same logsumexp for its own reasons, and it is a full
+    reduction over the widest tensor in the step -- so it is passed in rather than
+    recomputed. Passing it must not change the answer."""
+    rng = torch.Generator().manual_seed(trial)
+    batch_size, prompt_len, response_len = 3, 7, 4
+    seqlen = prompt_len + response_len
+    mask = _ragged_mask(batch_size, prompt_len, response_len, rng)
+    indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+    sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_len)
+    logits_resp = torch.randn((sel.numel(), VOCAB), generator=rng)
+
+    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)
+    a = _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_len, 3, None)
+    b = _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_len, 3, lse)
+
+    torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+    assert torch.equal(a[1], b[1])
+
+
+def test_the_kl_does_not_read_the_order_within_the_top_k():
+    """Why sorted=False is safe: the KL sums over the support, so permuting the k
+    (independently per position) is the same number."""
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+
+    rng = torch.Generator().manual_seed(3)
+    s = torch.log_softmax(torch.randn((2, 4, 6), generator=rng), dim=-1) - 1.0
+    t = torch.log_softmax(torch.randn((2, 4, 6), generator=rng), dim=-1) - 1.0
+    perm = torch.argsort(torch.rand((2, 4, 6), generator=rng), dim=-1)
+
+    torch.testing.assert_close(
+        topk_kl_per_token(s, t), topk_kl_per_token(s.gather(-1, perm), t.gather(-1, perm)), rtol=0, atol=1e-6
+    )

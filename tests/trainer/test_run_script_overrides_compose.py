@@ -116,3 +116,35 @@ def test_no_script_appends_over_an_existing_non_null_default():
         "so Hydra refuses to compose them:\n"
         + "\n".join(f"  {s}: +{k}=  (schema default: {v!r})" for s, k, v in sorted(set(offenders)))
     )
+
+
+def test_the_composed_pure_opd_arm_uses_the_student_indexed_support():
+    """Which 20 tokens the coarse-grained KL is exact on is a property of the
+    experiment, not a tuning knob: the two settings are different (both valid)
+    lower bounds on the same reverse KL, so arms compared across them compare
+    nothing. Pinned in expected_multitask_config.yaml and asserted here against
+    the config the script actually composes."""
+    overrides = _overrides("examples/opd_trainer/run_multitask_qwen3.sh")
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(config_name=CONFIG_NAME, overrides=overrides)
+
+    assert cfg.actor_rollout_ref.actor.student_indexed_topk is True
+    # The teacher follows the actor -- one support, not two.
+    assert cfg.actor_rollout_ref.ref.student_indexed_topk is True
+    # ...and it needs the response-only row map on both sides.
+    assert cfg.actor_rollout_ref.actor.response_only_logits is True
+    assert cfg.actor_rollout_ref.ref.response_only_logits is True
+
+
+def test_the_default_is_on_and_the_teacher_follows_it():
+    """Default-ON, so a script that does not mention it still gets the tighter
+    bound; ref mirrors the actor so the two halves cannot disagree."""
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        base = compose(config_name=CONFIG_NAME, overrides=[])
+        assert base.actor_rollout_ref.actor.student_indexed_topk is True
+        assert base.actor_rollout_ref.ref.student_indexed_topk is True
+
+        off = compose(
+            config_name=CONFIG_NAME, overrides=["actor_rollout_ref.actor.student_indexed_topk=False"]
+        )
+        assert off.actor_rollout_ref.ref.student_indexed_topk is False

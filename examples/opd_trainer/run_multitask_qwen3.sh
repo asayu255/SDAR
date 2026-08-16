@@ -172,8 +172,27 @@ set -x
 #   cached h/lse once per step.
 #   Requires response_only_logits on both sides (the row map comes from there)
 #   and holds one unsharded 622 MB copy of each teacher's output projection for
-#   the run — 1.9 GB across the three, which is why this is affordable here and
-#   would not be on a larger teacher.
+#   the run — 1.9 GB across the three, laid end to end as one (3*V, H) tensor so a
+#   mixed micro-batch needs no grouping by task. It is affordable here and would
+#   not be on a larger teacher.
+#   It is now the DEFAULT in ppo_trainer.yaml, and passed here anyway so the
+#   support the arm trains against is visible at the call site.
+#   Three things it deletes, none of which changes a value:
+#     - the teacher's own top-k. Under student indexing nothing downstream reads
+#       it, so it is built for TEACHER_WITNESS_MICRO_BATCHES (2) micro-batches a
+#       step as a spot check and for nothing else. It was a selection over the
+#       whole vocabulary plus two scatters per row, and then ~860 MB/step of it
+#       travelled to the driver to be ignored.
+#     - the second logsumexp. The forward needed the normaliser for the top-k and
+#       again for the cache; it is one reduction over the widest tensor in the
+#       step, now computed once. topk(sorted=False) for the same reason the order
+#       is never read: the KL sums over the support.
+#     - the host round-trips in the lookup. It runs inside the micro-batch loop,
+#       thousands of times a step, and a .tolist() or an int(tensor) there is a
+#       device-to-host sync that drains the CPU run-ahead this whole effort exists
+#       to protect. The ownership guard is tallied on the device and read once per
+#       mini-batch instead — still before the optimizer step, so an unresolved row
+#       cannot reach the weights.
 #
 # Wasted-work removals (config; all of them delete computation whose result was
 # already being thrown away, so none of them changes a value that reaches the
