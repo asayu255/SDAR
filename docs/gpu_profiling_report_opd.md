@@ -1313,9 +1313,30 @@ nats は通らないことを直接固定）。
 なるので、**終了した軌跡が 1 本出た最初のターン**で落ちる。`_record_turn()` として
 切り出し、テストを 3 本追加。
 
-### 11.8 まだ未検証
+### 11.8 「静かなバグ」に対する防御
+
+実機で出た 2 件のうち **fp32 マスターでの再計算は、witness が鳴らなければ完全に静か**だった
+（全 teacher target に系統的な 0.25 nats）。**cache key 上書きも静かだった**。
+つまりこの機構の失敗モードの主流は「落ちない」側である。値の経路に対して 3 つの番人を置く。
+
+| 経路 | 番人 | 範囲 |
+|---|---|---|
+| h/lse が正しい行・位置・dtype・温度を再現するか | **witness** | サンプル（2 micro-batch/step）、teacher 自身の id |
+| どの rank が行を所有するか | **所有数 == 1** | 全行・全 micro-batch |
+| **その key が、いま訓練している行を指しているか** | **指紋** | 全行・全 micro-batch |
+
+3 番目が新しい。key が有効で所有数が 1 で witness も通るのに、**返ってくるのが別サンプルの
+（本物の）teacher log-prob** —— という失敗は前 2 つのどちらにも映らない。指紋は行自身の
+トークンから作るので、`teacher_cache_ids` 列がバッチとずれれば一致しない。**数値ではなく
+同一性の検査なので許容差の問題が無い。**
+
+実装は `found` の all_reduce に `(found, fingerprint)` として相乗りさせているので
+**micro-batch ループ内の collective は増えていない**。判定は所有数と同じく device 上で
+加算し、mini-batch ごとに 1 回だけ読む（optimizer step の前）。
+
+### 11.9 まだ未検証
 
 forward hook（`_capture_last_hidden`）と `FSDP.summon_full_params` 経路は
-**実機で一度も走っていない**。CPU 上の 55 tests（うち 3 つは本物の 2 プロセス gloo）で
+**実機で一度も走っていない**。CPU 上の 62 tests（うち 4 つは本物の 2 プロセス gloo）で
 値・所有権・番人は押さえてあるが、FSDP 実体の上での動作は別物である。
 1 step の smoke test を 300 step の前に必ず挟むこと。

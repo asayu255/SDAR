@@ -936,6 +936,7 @@ class ActorRolloutRefWorker(Worker):
                 self._cache_teacher_hidden(
                     cache_ids, hidden, lse, w_rows, w_ids, w_lp,
                     attention_mask=data.batch["attention_mask"],
+                    input_ids=data.batch["input_ids"],
                 )
                 # The driver only needs the row count back (it unpads by it); the
                 # values it used to merge here are now resolved in the actor.
@@ -970,7 +971,7 @@ class ActorRolloutRefWorker(Worker):
         return take
 
     def _cache_teacher_hidden(self, cache_ids, hidden, lse, witness_rows, witness_ids, witness_lp,
-                              attention_mask=None):
+                              attention_mask=None, input_ids=None):
         """Keep this call's hidden states so the actor can score arbitrary ids later.
 
         One entry per ROW, holding every response position that carries signal,
@@ -981,7 +982,7 @@ class ActorRolloutRefWorker(Worker):
         recomputing it from ``hidden`` and ``lse`` must reproduce ``witness_lp``,
         and does not if the entry is ever paired with the wrong row.
         """
-        from verl.workers.teacher_cache import get_teacher_cache
+        from verl.workers.teacher_cache import get_teacher_cache, row_fingerprint
 
         cache = get_teacher_cache()
         if self._teacher_lm_head_task is None:
@@ -1002,10 +1003,13 @@ class ActorRolloutRefWorker(Worker):
         # The temperature travels with the entry: ``lse`` normalises logits the
         # forward already divided, while ``hidden`` is raw, so the read side has to
         # redo the division. Same value this call passed in meta_info.
-        live_mask = None
+        live_mask = fingerprints = None
         if attention_mask is not None:
             resp_len = lse.shape[1]
             live_mask = attention_mask[:, -resp_len - 1 : -1].bool()
+            # What this row IS, so the actor can check that the key it holds names
+            # the row it is training. The key alone is taken on trust otherwise.
+            fingerprints = row_fingerprint(input_ids, attention_mask).to("cpu")
         cache.put(
             cache_ids.to("cpu"),
             task,
@@ -1016,6 +1020,7 @@ class ActorRolloutRefWorker(Worker):
             witness_lp=None if witness_lp is None else witness_lp.detach(),
             temperature=self.config.rollout.temperature,
             live_mask=live_mask,
+            fingerprints=fingerprints,
         )
 
     def _register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):

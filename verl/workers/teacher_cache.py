@@ -127,6 +127,20 @@ def teacher_logprobs_from_hidden(
     return logits - lse.float()
 
 
+def row_fingerprint(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """A cheap identity for a row, computed the same way on both sides.
+
+    Masked so it does not depend on how far the row happens to be padded, and
+    mixed with the token count so two rows that merely share a token multiset
+    still differ. It is not a hash against an adversary -- it only has to make two
+    DIFFERENT trajectory rows disagree, which a sum over a few thousand
+    six-figure token ids does comfortably.
+    """
+    mask = attention_mask.to(torch.long)
+    ids = input_ids.to(torch.long) * mask
+    return ids.sum(-1) * 1000003 + mask.sum(-1)
+
+
 class TeacherHiddenCache:
     """Process-local store of one step's teacher hidden states.
 
@@ -141,6 +155,7 @@ class TeacherHiddenCache:
         self._len: Dict[int, int] = {}
         self._task: Dict[int, str] = {}
         self._temperature: Dict[int, float] = {}
+        self._fingerprint: Dict[int, int] = {}
         self._witness_ids: Dict[int, torch.Tensor] = {}
         self._witness_lp: Dict[int, torch.Tensor] = {}
         # Entries are views into one packed tensor per put call. Held here too so
@@ -231,7 +246,7 @@ class TeacherHiddenCache:
 
     def put(
         self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None, temperature: float = 1.0,
-        live_mask=None, witness_rows=None,
+        live_mask=None, witness_rows=None, fingerprints=None,
     ):
         """Store one call's rows, one entry per ROW, packed to the real positions.
 
@@ -259,6 +274,15 @@ class TeacherHiddenCache:
         ``temperature`` travels with the entry because ``lse`` normalises the
         scaled logits while ``h`` is raw; reading the entry back has to apply the
         same scaling.
+
+        ``fingerprints`` is what the row WAS, independent of the key it is filed
+        under. The witness proves the stored h/lse still reproduce the teacher's
+        output; the ownership count proves exactly one rank answered. Neither
+        proves the key on the asking side names the row the asker is training --
+        a ``teacher_cache_ids`` column shifted against its batch passes both. The
+        fingerprint closes that: it is derived from the row's own tokens, so a key
+        pointing at another row disagrees, and it is an identity check rather than
+        a numeric one so no tolerance enters.
         """
         if h.dim() != 3 or lse.dim() != 2:
             raise ValueError(
@@ -311,7 +335,7 @@ class TeacherHiddenCache:
             for i in kept:
                 self._register(
                     keys[i], task, h.new_empty((0, h.shape[-1])), lse.new_empty((0,)), None, None, 0, temperature,
-                    chunk=None,
+                    chunk=None, fingerprint=None if fingerprints is None else int(fingerprints[i]),
                 )
             return
         row_of = torch.repeat_interleave(torch.arange(len(kept), device=dev), lens)
@@ -346,15 +370,17 @@ class TeacherHiddenCache:
                 w_ids = witness_ids[w, : lens_l[j]]
                 w_lp = witness_lp[w, : lens_l[j]]
             self._register(
-                keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature, chunk=chunk
+                keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature, chunk=chunk,
+                fingerprint=None if fingerprints is None else int(fingerprints[i]),
             )
 
-    def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature, chunk=None):
+    def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature, chunk=None, fingerprint=None):
         self._h[key] = h
         self._lse[key] = lse
         self._len[key] = int(length)
         self._task[key] = task
         self._temperature[key] = float(temperature)
+        self._fingerprint[key] = 0 if fingerprint is None else int(fingerprint)
         if w_ids is not None:
             self._witness_ids[key] = w_ids
             self._witness_lp[key] = w_lp
@@ -369,6 +395,7 @@ class TeacherHiddenCache:
         self._len.clear()
         self._task.clear()
         self._temperature.clear()
+        self._fingerprint.clear()
         self._witness_ids.clear()
         self._witness_lp.clear()
         self._chunks.clear()
@@ -448,6 +475,7 @@ class TeacherHiddenCache:
             "slot_off": offsets.to(device),
             "slot_voff": torch.tensor([self._voff[self._task[k]] for k in keys], dtype=torch.long).to(device),
             "slot_temp": torch.tensor([self._temperature[k] for k in keys], dtype=torch.float32).to(device),
+            "slot_fp": torch.tensor([self._fingerprint.get(k, 0) for k in keys], dtype=torch.long).to(device),
             "h": store_h,
             "lse": store_lse,
             "max_len": int(lens.max()),
@@ -470,6 +498,9 @@ class TeacherHiddenCache:
             values: (n, response_length, k) float32, zero on rows this cache does
                 not own and on padding positions.
             found: (n,) int32, 1 on the rows it does.
+            fingerprint: (n,) int64, what the owner recorded the row's tokens as;
+                0 where it does not own the row. The caller compares it against
+                the row it is actually training.
         """
         n, resp_len, k = ids.shape
         dev = ids.device
@@ -478,6 +509,7 @@ class TeacherHiddenCache:
             return (
                 torch.zeros((n, resp_len, k), dtype=torch.float32, device=dev),
                 torch.zeros((n,), dtype=torch.int32, device=dev),
+                torch.zeros((n,), dtype=torch.long, device=dev),
             )
         if final["max_len"] > resp_len:
             # The reconstruction indexes a flattened (n, resp_len) grid, so a
@@ -512,7 +544,8 @@ class TeacherHiddenCache:
             temperature=final["slot_temp"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1),
         )
         values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
-        return values, found
+        fingerprint = torch.where(ok, final["slot_fp"][safe], torch.zeros_like(safe))
+        return values, found, fingerprint
 
     def check_witness(self, atol: float = 1e-3, ulps: float = 8.0) -> float:
         """Recompute at the teacher's own top-k and return the largest deviation.
@@ -577,6 +610,7 @@ def exchange_teacher_logprobs(
     ids: torch.Tensor,
     group=None,
     world_size: Optional[int] = None,
+    fingerprints: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Get ``log p_t`` at each rank's ids from whichever rank cached that row.
 
@@ -591,6 +625,14 @@ def exchange_teacher_logprobs(
     Args:
         cache_ids: (n,) int64 keys, one per ROW; -1 for rows scored elsewhere.
         ids: (n, response_length, k) this rank's student-chosen token ids.
+        fingerprints: (n,) int64 derived from the tokens of the rows THIS rank is
+            training. The owner's fingerprint comes back with the values and must
+            match. Without it the key is taken on trust: the witness proves the
+            stored states still reproduce the teacher, and the ownership count
+            proves one rank answered, but neither notices a ``teacher_cache_ids``
+            column shifted against its batch -- the answer is then a real teacher
+            log-prob for the wrong row, which is the failure mode this whole
+            module exists to make loud.
 
     Returns:
         (n, response_length, k) float32 teacher log-probs for this rank's ids.
@@ -601,8 +643,8 @@ def exchange_teacher_logprobs(
         world_size = dist.get_world_size(group) if dist.is_initialized() else 1
 
     if world_size == 1:
-        values, found = cache.logprobs_at(cache_ids, ids)
-        _record_ownership(found, cache_ids)
+        values, found, owner_fp = cache.logprobs_at(cache_ids, ids)
+        _record_ownership(found, cache_ids, owner_fp, fingerprints)
         return values
 
     n, resp_len, k = ids.shape
@@ -613,29 +655,34 @@ def exchange_teacher_logprobs(
 
     # Answer every rank's request from this rank's cache; zeros elsewhere.
     values = torch.zeros((world_size, n, resp_len, k), dtype=torch.float32, device=ids.device)
-    found = torch.zeros((world_size, n), dtype=torch.int32, device=ids.device)
+    # (found, fingerprint) in one tensor so the identity check rides along on the
+    # reduce the count already needed -- no extra collective in the micro-batch loop.
+    meta = torch.zeros((world_size, n, 2), dtype=torch.int64, device=ids.device)
     for r in range(world_size):
-        v, f = cache.logprobs_at(all_cache_ids[r], all_ids[r])
+        v, f, fp = cache.logprobs_at(all_cache_ids[r], all_ids[r])
         values[r] = v
-        found[r] = f
+        meta[r, :, 0] = f
+        meta[r, :, 1] = fp
 
     dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
-    dist.all_reduce(found, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(meta, op=dist.ReduceOp.SUM, group=group)
 
     rank = dist.get_rank(group) if dist.is_initialized() else 0
-    _record_ownership(found[rank], cache_ids)
+    _record_ownership(meta[rank, :, 0], cache_ids, meta[rank, :, 1], fingerprints)
     return values[rank]
 
 
 _OWNERSHIP: Optional[torch.Tensor] = None
 
 
-def _record_ownership(found: torch.Tensor, cache_ids: torch.Tensor):
-    """Tally rows that were not answered by exactly one rank. No host round-trip.
+def _record_ownership(found, cache_ids, owner_fingerprint=None, fingerprints=None):
+    """Tally rows that were not answered by exactly one rank, or by the wrong row.
 
     0 is a row whose hidden states nobody kept -- the loss would silently take a
     zero target. 2 is two ranks claiming the same key, which means the ids are not
-    unique and some row is being answered from another row's cache.
+    unique and some row is being answered from another row's cache. A fingerprint
+    mismatch is the third way and the quietest: exactly one rank answered, with a
+    real teacher log-prob, for a different row than the asker is training.
 
     Counted on the device rather than asserted here, because "here" is inside the
     micro-batch loop: reading a count is a synchronisation, and one per
@@ -645,11 +692,16 @@ def _record_ownership(found: torch.Tensor, cache_ids: torch.Tensor):
     """
     global _OWNERSHIP
     wanted = cache_ids.to(found.device) >= 0
+    if fingerprints is None or owner_fingerprint is None:
+        mismatched = torch.zeros((), dtype=torch.bool, device=found.device)
+    else:
+        mismatched = wanted & (found == 1) & (owner_fingerprint != fingerprints.to(found.device))
     counts = torch.stack(
         [
             (wanted & (found == 0)).sum(),
             (wanted & (found > 1)).sum(),
             wanted.sum(),
+            mismatched.sum(),
         ]
     ).to(torch.int64)
     if _OWNERSHIP is None or _OWNERSHIP.device != counts.device:
@@ -667,11 +719,14 @@ def assert_rows_were_owned_once():
     global _OWNERSHIP
     if _OWNERSHIP is None:
         return
-    missing, duplicated, scored = (int(x) for x in _OWNERSHIP)
+    missing, duplicated, scored, mismatched = (int(x) for x in _OWNERSHIP)
     _OWNERSHIP = None
-    if missing or duplicated:
+    if missing or duplicated or mismatched:
         raise RuntimeError(
             f"teacher hidden-state exchange did not resolve every row: {missing} unanswered, "
-            f"{duplicated} answered more than once (of {scored} scored). Unanswered rows would "
-            f"train against a zero teacher target; duplicated ones mean cache ids are not unique."
+            f"{duplicated} answered more than once, {mismatched} answered for a DIFFERENT row "
+            f"(of {scored} scored). Unanswered rows would train against a zero teacher target; "
+            f"duplicated ones mean cache ids are not unique; a fingerprint mismatch means the key "
+            f"resolved cleanly but to another row's tokens, which is a real teacher log-prob "
+            f"attached to the wrong sample."
         )

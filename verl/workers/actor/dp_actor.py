@@ -308,7 +308,7 @@ class DataParallelPPOActor(BasePPOActor):
         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
         return full_s_lp[:, -response_length - 1 : -1, :]
 
-    def _teacher_logprobs_at(self, cache_ids, ids):
+    def _teacher_logprobs_at(self, cache_ids, ids, input_ids=None, attention_mask=None):
         """Teacher log-probs at ids the student just chose.
 
         The teacher's hidden states were cached wherever its forward ran, which is
@@ -321,14 +321,20 @@ class DataParallelPPOActor(BasePPOActor):
         Both sides work per ROW: one key locates the row's whole
         (response_length, hidden) block, and ``ids`` stays (bs, response_length, k).
         """
-        from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache
+        from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache, row_fingerprint
 
         if cache_ids is None:
             raise ValueError(
                 "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
                 "teacher hidden states; the batch has none."
             )
-        return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids)
+        # Derived from the rows being trained RIGHT HERE, so a key column shifted
+        # against its batch is caught. The key alone would resolve cleanly and
+        # return a real teacher log-prob for somebody else's sample.
+        fingerprints = None
+        if input_ids is not None and attention_mask is not None:
+            fingerprints = row_fingerprint(input_ids, attention_mask)
+        return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints)
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None,
@@ -1141,6 +1147,8 @@ class DataParallelPPOActor(BasePPOActor):
                             fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
                                 cache_ids=data.get("teacher_cache_ids", None),
                                 ids=student_topk_ids,
+                                input_ids=data["input_ids"],
+                                attention_mask=data["attention_mask"],
                             )
                     else:
                         student_topk_logprobs = student_topk_out

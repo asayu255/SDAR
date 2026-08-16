@@ -111,7 +111,7 @@ def test_the_cache_replays_the_temperature_it_was_filled_at():
     assert cache.check_witness(atol=1e-3) < 1e-3
 
     ids = torch.randint(0, VOCAB, (n, L, K), generator=torch.Generator().manual_seed(6))
-    values, found = cache.logprobs_at(keys, ids)
+    values, found, _ = cache.logprobs_at(keys, ids)
     expected = full.gather(-1, ids.reshape(-1, K)).view(n, L, K)
     assert torch.all(found == 1)
     torch.testing.assert_close(values, expected, rtol=0, atol=1e-5)
@@ -166,7 +166,7 @@ def test_lookup_answers_only_what_it_owns():
     asked[3] = 999_999  # a key this cache never saw
     asked[5] = -1  # a row that was never queued for scoring
 
-    values, found = cache.logprobs_at(asked, ids)
+    values, found, _ = cache.logprobs_at(asked, ids)
 
     assert found.tolist() == [1, 1, 1, 0, 1, 0, 1, 1]
     assert torch.all(values[3] == 0) and torch.all(values[5] == 0)
@@ -178,8 +178,8 @@ def test_a_row_answered_from_another_rows_entry_is_wrong_by_orders_of_magnitude(
     plausible log-prob. Only its distance from the teacher's own output shows it."""
     cache, keys, W, h, lse = _filled_cache(n=8)
     ids = torch.randint(0, VOCAB, (8, L, K))
-    correct, _ = cache.logprobs_at(keys, ids)
-    shifted, _ = cache.logprobs_at(keys.roll(1), ids)
+    correct, _, _ = cache.logprobs_at(keys, ids)
+    shifted, _, _ = cache.logprobs_at(keys.roll(1), ids)
 
     assert torch.isfinite(shifted).all(), "mis-routed values look perfectly normal"
     assert (shifted - correct).abs().max() > 1.0
@@ -324,13 +324,27 @@ def _worker(rank, world_size, port, mode, out):
         g = torch.Generator().manual_seed(11)
         ids = torch.randint(0, VOCAB, (total, L, K), generator=g)[theirs]
 
+        # A fingerprint per row, so the two-process path exercises the identity
+        # check as well as the ownership count.
+        from verl.workers.teacher_cache import row_fingerprint
+
+        tok = torch.randint(0, VOCAB, (total, 16), generator=torch.Generator().manual_seed(5))
+        msk = torch.ones((total, 16), dtype=torch.long)
+        all_fp = row_fingerprint(tok, msk)
+        for i, key in enumerate(all_keys[mine].tolist()):
+            cache._fingerprint[key] = int(all_fp[rank * n + i])
+        cache._final = None
+        fp = all_fp[theirs].clone()
+
         if mode == "orphan":
             asked[2] = 987_654  # nobody caches this
         elif mode == "duplicate":
             cache.put(asked[:1], "alfworld", h[theirs][:1], lse[theirs][:1])
+        elif mode == "shifted":
+            asked = asked.roll(1)  # resolves cleanly, to the wrong rows
 
         try:
-            got = exchange_teacher_logprobs(cache, asked, ids)
+            got = exchange_teacher_logprobs(cache, asked, ids, fingerprints=fp)
             # The ownership tally is read once per mini-batch, not inside the
             # exchange -- reading it synchronises. This is that read.
             assert_rows_were_owned_once()
@@ -373,6 +387,16 @@ def test_a_row_no_rank_owns_raises_on_every_rank():
     for rank, (status, msg) in res.items():
         assert status == "raised", f"rank {rank} should have raised, got {msg}"
         assert "unanswered" in msg
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="gloo spawn")
+def test_a_key_naming_another_rank_s_row_raises_across_processes():
+    """The cross-rank version of the quiet failure: the key resolves, one rank
+    owns it, and the log-prob returned belongs to a different sample."""
+    res = _run_two_ranks("shifted")
+    for rank, (status, msg) in res.items():
+        assert status == "raised", f"rank {rank} should have raised, got {msg}"
+        assert "DIFFERENT row" in msg
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="gloo spawn")
@@ -518,12 +542,12 @@ def test_every_position_of_a_row_gets_its_own_hidden_state():
     different log-probs, because they have different hidden states."""
     cache, keys, W, h, lse = _filled_cache(n=4)
     ids = torch.randint(0, VOCAB, (4, L, K))
-    values, _ = cache.logprobs_at(keys, ids)
+    values, _, _ = cache.logprobs_at(keys, ids)
 
     torch.testing.assert_close(values, _reference(h, W, ids), rtol=0, atol=1e-5)
     # ...and the row is genuinely not one position repeated.
     same_ids = ids[:, :1, :].expand(4, L, K).contiguous()
-    per_pos, _ = cache.logprobs_at(keys, same_ids)
+    per_pos, _, _ = cache.logprobs_at(keys, same_ids)
     assert (per_pos[:, 0, :] - per_pos[:, 1, :]).abs().max() > 1e-3
 
 
@@ -612,7 +636,7 @@ def test_padding_reads_back_as_zero_and_the_rest_reads_back_exact():
     cache, keys, W, h, keep = _padded(lengths, seed=2)
     ids = torch.randint(0, VOCAB, (len(lengths), PAD_L, K), generator=torch.Generator().manual_seed(9))
 
-    values, found = cache.logprobs_at(keys, ids)
+    values, found, _ = cache.logprobs_at(keys, ids)
 
     assert torch.all(found == 1)
     expected = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
@@ -701,7 +725,7 @@ def test_an_all_padding_row_is_owned_and_empty():
     cache, keys, *_ = _padded([0, 3], seed=6)
     ids = torch.randint(0, VOCAB, (2, PAD_L, K))
 
-    values, found = cache.logprobs_at(keys, ids)
+    values, found, _ = cache.logprobs_at(keys, ids)
     assert found.tolist() == [1, 1]
     assert torch.all(values[0] == 0)
     assert cache.check_witness(atol=1e-3) < 1e-3
@@ -738,7 +762,7 @@ def test_the_witness_covers_only_the_sampled_rows_and_still_fires():
 
     # Every row is still answerable -- only the check is sampled, not the store.
     ids = torch.randint(0, VOCAB, (n, L, K), generator=torch.Generator().manual_seed(12))
-    values, found = cache.logprobs_at(keys, ids)
+    values, found, _ = cache.logprobs_at(keys, ids)
     assert torch.all(found == 1)
     torch.testing.assert_close(values, _reference(h, W, ids), rtol=0, atol=1e-5)
 
@@ -773,7 +797,7 @@ def test_one_call_answers_rows_from_different_teachers():
     asked = torch.tensor(asked, dtype=torch.long)
     ids = torch.randint(0, VOCAB, (len(asked), L, K), generator=torch.Generator().manual_seed(21))
 
-    values, found = cache.logprobs_at(asked, ids)
+    values, found, _ = cache.logprobs_at(asked, ids)
 
     assert torch.all(found == 1)
     for row, task in enumerate(owner):
@@ -996,3 +1020,96 @@ def test_the_weight_used_to_recompute_must_be_the_one_the_forward_projected_with
     wrong.put(torch.arange(4), "alfworld", h, lse, witness_ids=wit_ids, witness_lp=wit_lp)
 
     assert right.check_witness() < wrong.check_witness()
+
+
+# --------------------------------------------------------------------------- #
+# 11. the key is checked against what the row actually is
+# --------------------------------------------------------------------------- #
+
+
+def _rows(n, seed=0, seqlen=12):
+    g = torch.Generator().manual_seed(seed)
+    input_ids = torch.randint(0, VOCAB, (n, seqlen), generator=g)
+    mask = torch.ones((n, seqlen), dtype=torch.long)
+    mask[:, :2] = 0                                  # left padding, as prompts have
+    return input_ids, mask
+
+
+def _fp_cache(n=6, seed=0, seqlen=12):
+    from verl.workers.teacher_cache import row_fingerprint
+
+    cache, keys, W, h, lse = _filled_cache(n=n, seed=seed, base=0)
+    input_ids, mask = _rows(n, seed=seed + 90, seqlen=seqlen)
+    fp = row_fingerprint(input_ids, mask)
+    for i, key in enumerate(keys.tolist()):
+        cache._fingerprint[key] = int(fp[i])
+    cache._final = None
+    return cache, keys, input_ids, mask, fp
+
+
+def test_two_different_rows_do_not_share_a_fingerprint():
+    from verl.workers.teacher_cache import row_fingerprint
+
+    input_ids, mask = _rows(64, seed=7, seqlen=40)
+    fp = row_fingerprint(input_ids, mask)
+    assert len(set(fp.tolist())) == 64
+
+
+def test_the_fingerprint_ignores_how_far_the_row_is_padded():
+    """The two sides may pad to different widths; only the live tokens count."""
+    from verl.workers.teacher_cache import row_fingerprint
+
+    input_ids, mask = _rows(4, seed=8, seqlen=10)
+    wide_ids = torch.cat([input_ids, torch.randint(0, VOCAB, (4, 6))], dim=-1)
+    wide_mask = torch.cat([mask, torch.zeros((4, 6), dtype=torch.long)], dim=-1)
+
+    assert torch.equal(row_fingerprint(input_ids, mask), row_fingerprint(wide_ids, wide_mask))
+
+
+def test_a_key_that_names_another_row_is_caught_even_though_it_resolves():
+    """The quiet failure this exists for: the key is valid, exactly one rank owns
+    it, the witness passes on the owner's side -- and the answer is a real teacher
+    log-prob belonging to a different sample."""
+    cache, keys, input_ids, mask, fp = _fp_cache(n=6, seed=11)
+    ids = torch.randint(0, VOCAB, (6, L, K))
+
+    exchange_teacher_logprobs(cache, keys, ids, world_size=1, fingerprints=fp)
+    assert_rows_were_owned_once()                       # aligned: no raise
+
+    shifted = keys.roll(1)                              # every key names its neighbour
+    exchange_teacher_logprobs(cache, shifted, ids, world_size=1, fingerprints=fp)
+    with pytest.raises(RuntimeError, match="DIFFERENT row"):
+        assert_rows_were_owned_once()
+
+
+def test_one_shifted_row_among_many_is_still_caught():
+    cache, keys, input_ids, mask, fp = _fp_cache(n=8, seed=12)
+    ids = torch.randint(0, VOCAB, (8, L, K))
+    asked = keys.clone()
+    asked[5] = int(keys[2])                             # one row points at another
+
+    exchange_teacher_logprobs(cache, asked, ids, world_size=1, fingerprints=fp)
+    with pytest.raises(RuntimeError, match="1 answered for a DIFFERENT row"):
+        assert_rows_were_owned_once()
+
+
+def test_rows_never_queued_are_not_fingerprint_checked():
+    """-1 rows are scored by the trainer instead; they have no owner and must not
+    be reported as mismatched."""
+    cache, keys, input_ids, mask, fp = _fp_cache(n=6, seed=13)
+    ids = torch.randint(0, VOCAB, (6, L, K))
+    asked = keys.clone()
+    asked[1] = -1
+    asked[4] = -1
+
+    exchange_teacher_logprobs(cache, asked, ids, world_size=1, fingerprints=fp)
+    assert_rows_were_owned_once()
+
+
+def test_without_fingerprints_the_exchange_behaves_as_before():
+    """The check is opt-in at the call site, so the guard cannot be what breaks a
+    caller that does not pass them."""
+    cache, keys, *_ = _fp_cache(n=4, seed=14)
+    ids = torch.randint(0, VOCAB, (4, L, K))
+    exchange_teacher_logprobs(cache, keys.roll(1), ids, world_size=1)
+    assert_rows_were_owned_once()
