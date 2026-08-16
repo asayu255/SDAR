@@ -145,6 +145,36 @@ set -x
 #     while the current one computes. Scheduling only, arithmetic untouched, so
 #     it is a plain performance knob and is not pinned.
 #
+# actor.student_indexed_topk=True — NOT a speedup. It changes what the top-k KL
+# is computed over, so it belongs to the science, is pinned in
+# expected_multitask_config.yaml, and has to be identical across every arm being
+# compared.
+#   The loss is a coarse-grained reverse KL: exact on a support set A, with
+#   everything outside A folded into one tail bucket. Reverse KL weights by the
+#   STUDENT's mass, and the error it drops is exactly
+#   tail_s * KL(p_s|Ā ‖ p_t|Ā) — a student-mass-weighted term. Taking A from the
+#   teacher's top-20 therefore leaves the student's own mass uncovered exactly
+#   where the student has drifted off the teacher, which is the regime the term
+#   exists to penalise; taking A from the student's top-20 covers it. Both are
+#   valid lower bounds on the same full KL (data processing), so this is a
+#   tighter bound, not a different objective.
+#   It costs no extra forward. The teacher's output splits as
+#   log p_t(v) = h·W_t[v] - lse_t, and only the last gather depends on the ids —
+#   ~1/42,000 of the teacher forward. So the teacher keeps running inside the
+#   rollout's CPU glue where it runs today, caching h and lse; the student's
+#   single training forward picks the ids; the teacher is resolved at them for
+#   2·H·k. What it does introduce is rank ownership: rows are regrouped by task,
+#   padded and reordered by _balance_batch between the two calls, so the rank
+#   that cached a row is not the rank that trains it. verl/workers/teacher_cache.py
+#   handles that with an all-gather exchange, a per-row answer count that must be
+#   exactly 1 (0 = a zero target nobody noticed, 2 = two ranks claiming one key),
+#   and a numerical witness that re-derives the teacher's own top-k from the
+#   cached h/lse once per step.
+#   Requires response_only_logits on both sides (the row map comes from there)
+#   and holds one unsharded 622 MB copy of each teacher's output projection for
+#   the run — 1.9 GB across the three, which is why this is affordable here and
+#   would not be on a larger teacher.
+#
 # Wasted-work removals (config; all of them delete computation whose result was
 # already being thrown away, so none of them changes a value that reaches the
 # loss).
@@ -252,6 +282,7 @@ python3 -m verl.trainer.main_opd \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
+    actor_rollout_ref.actor.student_indexed_topk=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.return_rollout_log_probs=False \
     actor_rollout_ref.rollout.disable_log_stats=False \

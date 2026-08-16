@@ -81,14 +81,21 @@ def teacher_logprobs_from_hidden(
     lse: torch.Tensor,
     lm_head_weight: torch.Tensor,
     ids: torch.Tensor,
+    temperature=1.0,
 ) -> torch.Tensor:
     """``log p_t`` at ``ids``, from the teacher's hidden states and its lse.
 
-    Equal to indexing a full ``log_softmax(h @ W.T)`` at the same ids, in exact
-    arithmetic: the projection is per-position linear and the normaliser is the
-    one the teacher already computed over the whole vocabulary. Only the GEMM
+    Equal to indexing a full ``log_softmax(h @ W.T / T)`` at the same ids, in
+    exact arithmetic: the projection is per-position linear and the normaliser is
+    the one the teacher already computed over the whole vocabulary. Only the GEMM
     shape differs (``h @ W[ids].T`` instead of ``h @ W.T``), which moves the last
     bits the way any repacking does.
+
+    ``temperature`` must be the same one the forward applied before taking its
+    logsumexp, because ``lse`` normalises the SCALED logits. ``h`` is cached raw,
+    so the scaling has to be redone here; forgetting it leaves the two halves of
+    ``logit - lse`` on different scales, which is silent at T=1 and wrong
+    everywhere else.
 
     Args:
         h: (n, hidden) teacher hidden states at the scored positions.
@@ -96,6 +103,7 @@ def teacher_logprobs_from_hidden(
             forward that produced ``h``.
         lm_head_weight: (vocab, hidden) the teacher's output projection.
         ids: (n, k) token ids to evaluate.
+        temperature: scalar, or (n,) / (n, 1) to allow a mixed batch.
 
     Returns:
         (n, k) float32 log-probs.
@@ -106,6 +114,11 @@ def teacher_logprobs_from_hidden(
     # dropped: at step scale this would be ~90 GB, at micro-batch scale ~90 MB.
     w_ids = lm_head_weight[ids]
     logits = torch.einsum("nh,nkh->nk", h.float(), w_ids.float())
+    if isinstance(temperature, torch.Tensor):
+        temperature = temperature.to(logits.device).float().reshape(-1, 1)
+        logits = logits / temperature
+    elif temperature != 1.0:
+        logits = logits / float(temperature)
     return logits - lse.float()
 
 
@@ -121,6 +134,7 @@ class TeacherHiddenCache:
         self._h: Dict[int, torch.Tensor] = {}
         self._lse: Dict[int, torch.Tensor] = {}
         self._task: Dict[int, str] = {}
+        self._temperature: Dict[int, float] = {}
         self._witness_ids: Dict[int, torch.Tensor] = {}
         self._witness_lp: Dict[int, torch.Tensor] = {}
         self._weights: Dict[str, torch.Tensor] = {}
@@ -143,15 +157,39 @@ class TeacherHiddenCache:
 
     # -- filling ---------------------------------------------------------- #
 
-    def put(self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None):
-        """Store one call's rows. ``cache_ids`` is (n,), ``h`` is (n, hidden)."""
-        ids_list = [int(c) for c in cache_ids]
-        for i, key in enumerate(ids_list):
+    def put(self, cache_ids, task: str, h, lse, witness_ids=None, witness_lp=None, temperature: float = 1.0):
+        """Store one call's rows, one entry per ROW.
+
+        A row is scored once but the student picks a top-k at every response
+        position, so an entry has to hold all of them: ``h`` is
+        (n, response_length, hidden) and ``lse`` is (n, response_length). Keying
+        per position instead -- repeating the row's id across its positions --
+        collapses the row to whichever position was written last, and does so
+        silently, because the witness stored under the same key collapses with it
+        and stays self-consistent.
+
+        ``temperature`` travels with the entry because ``lse`` normalises the
+        scaled logits while ``h`` is raw; reading the entry back has to apply the
+        same scaling.
+        """
+        if h.dim() != 3 or lse.dim() != 2:
+            raise ValueError(
+                f"expected per-row (n, response_length, hidden) / (n, response_length), got {tuple(h.shape)} / "
+                f"{tuple(lse.shape)}; a flattened cache silently keeps one position per row"
+            )
+        for i, key in enumerate(int(c) for c in cache_ids):
             if key < 0:
                 continue
+            if key in self._h:
+                raise RuntimeError(
+                    f"teacher cache id {key} written twice on this rank. Ids are assigned once per row, so a "
+                    f"repeat means a row was duplicated into this call -- most likely DP padding that was not "
+                    f"marked -1."
+                )
             self._h[key] = h[i]
             self._lse[key] = lse[i]
             self._task[key] = task
+            self._temperature[key] = float(temperature)
             if witness_ids is not None:
                 self._witness_ids[key] = witness_ids[i]
                 self._witness_lp[key] = witness_lp[i]
@@ -160,6 +198,7 @@ class TeacherHiddenCache:
         self._h.clear()
         self._lse.clear()
         self._task.clear()
+        self._temperature.clear()
         self._witness_ids.clear()
         self._witness_lp.clear()
 
@@ -172,36 +211,47 @@ class TeacherHiddenCache:
     # -- reading ---------------------------------------------------------- #
 
     def logprobs_at(self, cache_ids: torch.Tensor, ids: torch.Tensor):
-        """Answer for the entries this cache owns; leave the rest at zero.
+        """Answer for the rows this cache owns; leave the rest at zero.
 
         Args:
-            cache_ids: (n,) int64 keys being asked about; -1 means "not scored".
-            ids: (n, k) token ids to evaluate.
+            cache_ids: (n,) int64 keys, one per ROW; -1 means "not scored here".
+            ids: (n, response_length, k) token ids to evaluate.
 
         Returns:
-            values: (n, k) float32, zero where this cache does not own the key.
-            found: (n,) int32, 1 where it does.
+            values: (n, response_length, k) float32, zero on rows this cache does
+                not own.
+            found: (n,) int32, 1 on the rows it does.
         """
-        n, k = ids.shape
-        values = torch.zeros((n, k), dtype=torch.float32, device=ids.device)
+        n, resp_len, k = ids.shape
+        values = torch.zeros((n, resp_len, k), dtype=torch.float32, device=ids.device)
         found = torch.zeros((n,), dtype=torch.int32, device=ids.device)
         if not self._h:
             return values, found
 
-        # Group by task: the projection differs per teacher, the arithmetic does not.
+        # One host round-trip for the whole request, not one per row: cache_ids
+        # may be a device tensor and int() on it synchronises.
+        wanted = cache_ids.tolist()
         by_task: Dict[str, list] = {}
-        for pos in range(n):
-            key = int(cache_ids[pos])
+        for row, key in enumerate(wanted):
+            key = int(key)
             if key < 0 or key not in self._h:
                 continue
-            by_task.setdefault(self._task[key], []).append((pos, key))
+            by_task.setdefault(self._task[key], []).append((row, key))
 
         for task, entries in by_task.items():
-            rows = torch.tensor([p for p, _ in entries], dtype=torch.long, device=ids.device)
-            h = torch.stack([self._h[key] for _, key in entries]).to(ids.device)
-            lse = torch.stack([self._lse[key] for _, key in entries]).to(ids.device)
-            out = teacher_logprobs_from_hidden(h, lse, self.lm_head(task), ids[rows])
-            values[rows] = out
+            rows = torch.tensor([r for r, _ in entries], dtype=torch.long, device=ids.device)
+            h = torch.stack([self._h[key] for _, key in entries]).to(ids.device)      # (m, L, H)
+            lse = torch.stack([self._lse[key] for _, key in entries]).to(ids.device)  # (m, L)
+            m = rows.numel()
+            temps = torch.tensor(
+                [self._temperature.get(key, 1.0) for _, key in entries], dtype=torch.float32, device=ids.device
+            )
+            out = teacher_logprobs_from_hidden(
+                h.reshape(m * resp_len, -1), lse.reshape(m * resp_len), self.lm_head(task),
+                ids[rows].reshape(m * resp_len, k),
+                temperature=temps.repeat_interleave(resp_len),
+            )
+            values[rows] = out.view(m, resp_len, k)
             found[rows] = 1
         return values, found
 
@@ -216,10 +266,18 @@ class TeacherHiddenCache:
         """
         worst = 0.0
         for key, w_ids in self._witness_ids.items():
-            h = self._h[key].unsqueeze(0)
-            lse = self._lse[key].reshape(1, -1)[:, :1]
-            got = teacher_logprobs_from_hidden(h, lse, self.lm_head(self._task[key]), w_ids.unsqueeze(0).to(h.device))
-            err = (got.squeeze(0) - self._witness_lp[key].to(got.device).float()).abs().max().item()
+            h, lse = self._h[key], self._lse[key]          # (L, H), (L,)
+            # Every position of the row, not just one: a cache that keeps a single
+            # position per row is exactly the failure this has to catch, and it is
+            # self-consistent at whichever position survived.
+            real = lse != 0
+            if not bool(real.any()):
+                continue
+            got = teacher_logprobs_from_hidden(
+                h[real], lse[real], self.lm_head(self._task[key]), w_ids.to(h.device)[real],
+                temperature=self._temperature.get(key, 1.0),
+            )
+            err = (got - self._witness_lp[key].to(got.device).float()[real]).abs().max().item()
             worst = max(worst, err)
         if worst > atol:
             raise RuntimeError(
@@ -248,11 +306,11 @@ def exchange_teacher_logprobs(
     makes calling a collective from inside the micro-batch loop safe.
 
     Args:
-        cache_ids: (n,) int64 keys for this rank's rows; -1 for unscored rows.
-        ids: (n, k) this rank's student-chosen token ids.
+        cache_ids: (n,) int64 keys, one per ROW; -1 for rows scored elsewhere.
+        ids: (n, response_length, k) this rank's student-chosen token ids.
 
     Returns:
-        (n, k) float32 teacher log-probs for this rank's ids.
+        (n, response_length, k) float32 teacher log-probs for this rank's ids.
     """
     import torch.distributed as dist
 
@@ -264,14 +322,14 @@ def exchange_teacher_logprobs(
         _assert_owned_once(found, cache_ids)
         return values
 
-    n, k = ids.shape
+    n, resp_len, k = ids.shape
     all_cache_ids = [torch.empty_like(cache_ids) for _ in range(world_size)]
     all_ids = [torch.empty_like(ids) for _ in range(world_size)]
     dist.all_gather(all_cache_ids, cache_ids.contiguous(), group=group)
     dist.all_gather(all_ids, ids.contiguous(), group=group)
 
     # Answer every rank's request from this rank's cache; zeros elsewhere.
-    values = torch.zeros((world_size, n, k), dtype=torch.float32, device=ids.device)
+    values = torch.zeros((world_size, n, resp_len, k), dtype=torch.float32, device=ids.device)
     found = torch.zeros((world_size, n), dtype=torch.int32, device=ids.device)
     for r in range(world_size):
         v, f = cache.logprobs_at(all_cache_ids[r], all_ids[r])

@@ -77,6 +77,15 @@
 # two must not diverge between compared runs.
 "actor_rollout_ref.actor.response_only_logits": true
 "actor_rollout_ref.ref.response_only_logits": true
+# student_indexed_topk is pinned because it is not a performance knob at all: it
+# decides which 20 tokens the coarse-grained KL is exact on. Reverse KL weights
+# by the student's mass and the term it drops is tail_s * KL(p_s|A-bar || p_t|A-bar),
+# so a support taken from the student covers the student's mass and a support
+# taken from the teacher does not. Both are lower bounds on the same full KL, so
+# the two settings are different (valid) objectives -- comparing arms across them
+# compares nothing. ref.student_indexed_topk follows the actor's value in
+# ppo_trainer.yaml and so is not listed separately.
+"actor_rollout_ref.actor.student_indexed_topk": true
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
 #     bit-identical, covered by the exemption above.

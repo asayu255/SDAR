@@ -309,9 +309,8 @@ class DataParallelPPOActor(BasePPOActor):
         rank and sums the one answer that exists, raising if a row is unanswered or
         answered twice. See verl/workers/teacher_cache.py.
 
-        ``ids`` arrives as (bs, response_length, k); the exchange works on a flat
-        (n, k), so rows are repeated per position -- the cache key is per row and
-        every position of a row shares it.
+        Both sides work per ROW: one key locates the row's whole
+        (response_length, hidden) block, and ``ids`` stays (bs, response_length, k).
         """
         from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache
 
@@ -320,12 +319,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
                 "teacher hidden states; the batch has none."
             )
-        bs, resp_len, k = ids.shape
-        flat_keys = cache_ids.reshape(bs, 1).expand(bs, resp_len).reshape(-1)
-        out = exchange_teacher_logprobs(
-            get_teacher_cache(), flat_keys, ids.reshape(-1, k)
-        )
-        return out.view(bs, resp_len, k)
+        return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids)
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None,

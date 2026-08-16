@@ -921,10 +921,9 @@ class ActorRolloutRefWorker(Worker):
     def _cache_teacher_hidden(self, cache_ids, hidden, lse, topk_ids, topk_logprob):
         """Keep this call's hidden states so the actor can score arbitrary ids later.
 
-        Flattened to one entry per (row, response position), because that is the
-        granularity the student picks its top-k at. The row's key is repeated across
-        its positions; padding positions (attention_mask 0) carry no signal and are
-        dropped, which is also what keeps this from being 512 slots per row.
+        One entry per ROW, holding every response position, because that is the
+        granularity the student picks its top-k at: a row is scored once but every
+        position gets its own support set.
 
         The teacher's own top-k goes in as the witness: recomputing it from ``hidden``
         and ``lse`` must reproduce ``topk_logprob``, and does not if the entry is ever
@@ -937,19 +936,24 @@ class ActorRolloutRefWorker(Worker):
             raise RuntimeError("teacher lm_head was never registered; see _register_teacher_lm_head")
         task = self._teacher_lm_head_task
 
-        bs, resp_len = lse.shape
-        keys = cache_ids.reshape(bs, 1).expand(bs, resp_len).reshape(-1).to("cpu")
-        # A position is real if its normaliser is finite; pad_input zero-fills the
-        # rest, and a zero lse cannot come from a real logit row.
-        real = (lse.reshape(-1) != 0).to("cpu")
-        keys = torch.where(real, keys, torch.full_like(keys, -1))
+        # Keying per position instead -- repeating the row's id across its
+        # positions -- would leave each row with whichever position was written
+        # last, and silently: the witness stored under the same key collapses with
+        # it and stays self-consistent. Padding positions are marked by a zero
+        # normaliser (pad_input zero-fills them, and a real logit row cannot
+        # produce one) and skipped by the witness; the row's own key stays valid.
+        #
+        # The temperature travels with the entry: ``lse`` normalises logits the
+        # forward already divided, while ``hidden`` is raw, so the read side has to
+        # redo the division. Same value this call passed in meta_info.
         cache.put(
-            keys,
+            cache_ids.to("cpu"),
             task,
-            hidden.reshape(-1, hidden.size(-1)).detach(),
-            lse.reshape(-1).detach(),
-            witness_ids=topk_ids.reshape(-1, topk_ids.size(-1)).detach(),
-            witness_lp=topk_logprob.reshape(-1, topk_logprob.size(-1)).detach(),
+            hidden.detach(),
+            lse.detach(),
+            witness_ids=topk_ids.detach(),
+            witness_lp=topk_logprob.detach(),
+            temperature=self.config.rollout.temperature,
         )
 
     def _register_teacher_lm_head(self, task: str):

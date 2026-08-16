@@ -37,11 +37,13 @@ except Exception as e:  # pragma: no cover - environment without full deps
 H, VOCAB, K = 64, 512, 8
 
 
-def _teacher(seed=0, n=16):
+def _teacher(seed=0, n=16, temperature=1.0):
     g = torch.Generator().manual_seed(seed)
     W = torch.randn((VOCAB, H), generator=g) / H**0.5
     h = torch.randn((n, H), generator=g) / 2
-    lse = torch.logsumexp(h @ W.T, dim=-1)
+    # The forward divides before it normalises, so lse belongs to the scaled
+    # logits while h stays raw -- exactly the split the cache has to carry.
+    lse = torch.logsumexp(h @ W.T / temperature, dim=-1)
     return W, h, lse
 
 
@@ -64,6 +66,56 @@ def test_matches_a_full_vocabulary_log_softmax(trial):
     torch.testing.assert_close(got, reference, rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("temperature", [0.7, 1.3])
+def test_a_non_unit_temperature_scales_the_logits_not_just_the_normaliser(temperature):
+    """``lse`` comes from logits the forward already divided; ``h`` does not.
+
+    Subtracting one from the other without redoing the division is silent at
+    T=1 -- the run's pinned value -- and wrong at every other temperature, so the
+    scaling is carried on the entry rather than assumed.
+    """
+    W, h, lse = _teacher(seed=3, n=32, temperature=temperature)
+    ids = torch.randint(0, VOCAB, (32, K), generator=torch.Generator().manual_seed(4))
+
+    reference = torch.log_softmax(h @ W.T / temperature, dim=-1).gather(-1, ids)
+    torch.testing.assert_close(
+        teacher_logprobs_from_hidden(h, lse, W, ids, temperature=temperature), reference, rtol=0, atol=1e-5
+    )
+    # A per-row temperature is the same number, so a mixed batch stays legal.
+    torch.testing.assert_close(
+        teacher_logprobs_from_hidden(h, lse, W, ids, temperature=torch.full((32,), temperature)),
+        reference, rtol=0, atol=1e-5,
+    )
+    # And forgetting it is not a rounding difference: the residual is
+    # logit*(1 - 1/T), which here is ~0.3 nats against a 1e-5 tolerance, and grows
+    # with |logit| -- far larger on a real vocabulary than on this toy one.
+    assert (teacher_logprobs_from_hidden(h, lse, W, ids) - reference).abs().max() > 1e-2
+
+
+def test_the_cache_replays_the_temperature_it_was_filled_at():
+    """End to end through put/logprobs_at, where the witness is the tripwire."""
+    temperature = 0.6
+    n = 6
+    W, h_flat, lse_flat = _teacher(seed=5, n=n * L, temperature=temperature)
+    h, lse = h_flat.view(n, L, H), lse_flat.view(n, L)
+    full = torch.log_softmax(h_flat @ W.T / temperature, dim=-1)
+    wit_lp, wit_ids = torch.topk(full, K, dim=-1)
+
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+    keys = torch.arange(n, dtype=torch.long)
+    cache.put(keys, "alfworld", h, lse, witness_ids=wit_ids.view(n, L, K), witness_lp=wit_lp.view(n, L, K),
+              temperature=temperature)
+
+    assert cache.check_witness(atol=1e-3) < 1e-3
+
+    ids = torch.randint(0, VOCAB, (n, L, K), generator=torch.Generator().manual_seed(6))
+    values, found = cache.logprobs_at(keys, ids)
+    expected = full.gather(-1, ids.reshape(-1, K)).view(n, L, K)
+    assert torch.all(found == 1)
+    torch.testing.assert_close(values, expected, rtol=0, atol=1e-5)
+
+
 def test_the_normaliser_is_id_independent():
     """Why the teacher can run before the ids exist: lse is a full-vocabulary sum,
     so two disjoint id sets share it."""
@@ -80,19 +132,35 @@ def test_the_normaliser_is_id_independent():
 # --------------------------------------------------------------------------- #
 
 
+L = 3  # response positions per row
+
+
+def _rowwise(n, seed=0):
+    """(n, L, H) hidden states and their normalisers -- the real shape a row has."""
+    W, h, lse = _teacher(seed=seed, n=n * L)
+    return W, h.view(n, L, H), lse.view(n, L)
+
+
 def _filled_cache(n=12, task="alfworld", seed=0, base=1000):
-    W, h, lse = _teacher(seed=seed, n=n)
-    wit_lp, wit_ids = torch.topk(torch.log_softmax(h @ W.T, dim=-1), K, dim=-1)
+    W, h, lse = _rowwise(n, seed=seed)
+    flat = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
+    wit_lp, wit_ids = torch.topk(flat, K, dim=-1)
     cache = TeacherHiddenCache()
     cache.register_lm_head(task, W)
     keys = torch.arange(base, base + n, dtype=torch.long)
-    cache.put(keys, task, h, lse, witness_ids=wit_ids, witness_lp=wit_lp)
+    cache.put(keys, task, h, lse, witness_ids=wit_ids.view(n, L, K), witness_lp=wit_lp.view(n, L, K))
     return cache, keys, W, h, lse
+
+
+def _reference(h, W, ids):
+    n = h.shape[0]
+    flat = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1).gather(-1, ids.reshape(-1, ids.shape[-1]))
+    return flat.view(n, L, ids.shape[-1])
 
 
 def test_lookup_answers_only_what_it_owns():
     cache, keys, W, h, lse = _filled_cache(n=8)
-    ids = torch.randint(0, VOCAB, (8, K))
+    ids = torch.randint(0, VOCAB, (8, L, K))
     asked = keys.clone()
     asked[3] = 999_999  # a key this cache never saw
     asked[5] = -1  # a row that was never queued for scoring
@@ -101,15 +169,14 @@ def test_lookup_answers_only_what_it_owns():
 
     assert found.tolist() == [1, 1, 1, 0, 1, 0, 1, 1]
     assert torch.all(values[3] == 0) and torch.all(values[5] == 0)
-    reference = torch.log_softmax(h @ W.T, dim=-1).gather(-1, ids)
-    torch.testing.assert_close(values[0], reference[0], rtol=0, atol=1e-5)
+    torch.testing.assert_close(values[0], _reference(h, W, ids)[0], rtol=0, atol=1e-5)
 
 
 def test_a_row_answered_from_another_rows_entry_is_wrong_by_orders_of_magnitude():
     """Motivates the witness: mis-routing does not produce garbage, it produces a
     plausible log-prob. Only its distance from the teacher's own output shows it."""
     cache, keys, W, h, lse = _filled_cache(n=8)
-    ids = torch.randint(0, VOCAB, (8, K))
+    ids = torch.randint(0, VOCAB, (8, L, K))
     correct, _ = cache.logprobs_at(keys, ids)
     shifted, _ = cache.logprobs_at(keys.roll(1), ids)
 
@@ -154,15 +221,14 @@ def test_clear_drops_everything_between_steps():
 
 def test_single_process_exchange_returns_the_reference():
     cache, keys, W, h, lse = _filled_cache(n=8)
-    ids = torch.randint(0, VOCAB, (8, K))
+    ids = torch.randint(0, VOCAB, (8, L, K))
     got = exchange_teacher_logprobs(cache, keys, ids, world_size=1)
-    reference = torch.log_softmax(h @ W.T, dim=-1).gather(-1, ids)
-    torch.testing.assert_close(got, reference, rtol=0, atol=1e-5)
+    torch.testing.assert_close(got, _reference(h, W, ids), rtol=0, atol=1e-5)
 
 
 def test_an_unowned_row_raises_instead_of_training_on_zero():
     cache, keys, *_ = _filled_cache(n=8)
-    ids = torch.randint(0, VOCAB, (8, K))
+    ids = torch.randint(0, VOCAB, (8, L, K))
     asked = keys.clone()
     asked[2] = 424_242
 
@@ -174,7 +240,7 @@ def test_rows_never_queued_are_allowed_through():
     """hit_rate is not 1.0 -- the final turns' rows are scored by the trainer
     instead. Those carry -1 and must not trip the guard."""
     cache, keys, *_ = _filled_cache(n=8)
-    ids = torch.randint(0, VOCAB, (8, K))
+    ids = torch.randint(0, VOCAB, (8, L, K))
     asked = keys.clone()
     asked[1] = -1
     asked[6] = -1
@@ -196,34 +262,36 @@ def _worker(rank, world_size, port, mode, out):
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
         n = 6
+        total = n * world_size
         # Each rank CACHES one half of the rows but ASKS about the other half --
         # the ownership mismatch _balance_batch creates, in its purest form.
-        W, h, lse = _teacher(seed=7, n=n * world_size)
-        wit_lp, wit_ids = torch.topk(torch.log_softmax(h @ W.T, dim=-1), K, dim=-1)
-        all_keys = torch.arange(n * world_size, dtype=torch.long)
+        W, h, lse = _rowwise(total, seed=7)
+        flat = torch.log_softmax(h.reshape(-1, H) @ W.T, dim=-1)
+        wit_lp, wit_ids = torch.topk(flat, K, dim=-1)
+        wit_lp, wit_ids = wit_lp.view(total, L, K), wit_ids.view(total, L, K)
+        all_keys = torch.arange(total, dtype=torch.long)
+        mine = slice(rank * n, (rank + 1) * n)
 
         cache = TeacherHiddenCache()
         cache.register_lm_head("alfworld", W)
-        owned = all_keys[rank * n : (rank + 1) * n]
-        cache.put(owned, "alfworld", h[rank * n : (rank + 1) * n], lse[rank * n : (rank + 1) * n],
-                  witness_ids=wit_ids[rank * n : (rank + 1) * n], witness_lp=wit_lp[rank * n : (rank + 1) * n])
+        cache.put(all_keys[mine], "alfworld", h[mine], lse[mine],
+                  witness_ids=wit_ids[mine], witness_lp=wit_lp[mine])
         cache.check_witness(atol=1e-3)
 
         other = (rank + 1) % world_size
-        asked = all_keys[other * n : (other + 1) * n].clone()
+        theirs = slice(other * n, (other + 1) * n)
+        asked = all_keys[theirs].clone()
         g = torch.Generator().manual_seed(11)
-        ids = torch.randint(0, VOCAB, (world_size * n, K), generator=g)[other * n : (other + 1) * n]
+        ids = torch.randint(0, VOCAB, (total, L, K), generator=g)[theirs]
 
         if mode == "orphan":
             asked[2] = 987_654  # nobody caches this
         elif mode == "duplicate":
-            cache.put(asked[:1], "alfworld", h[other * n : other * n + 1], lse[other * n : other * n + 1])
+            cache.put(asked[:1], "alfworld", h[theirs][:1], lse[theirs][:1])
 
         try:
             got = exchange_teacher_logprobs(cache, asked, ids)
-            reference = torch.log_softmax(h @ W.T, dim=-1).gather(-1, ids)[0:0]  # placeholder
-            reference = torch.log_softmax(h[other * n : (other + 1) * n] @ W.T, dim=-1).gather(-1, ids)
-            err = (got - reference).abs().max().item()
+            err = (got - _reference(h[theirs], W, ids)).abs().max().item()
             out.put((rank, "ok", err))
         except RuntimeError as exc:
             out.put((rank, "raised", str(exc)))
@@ -305,8 +373,8 @@ def test_both_indexings_agree_when_the_two_top_k_sets_coincide():
     cache = TeacherHiddenCache()
     cache.register_lm_head("alfworld", W)
     keys = torch.arange(16, dtype=torch.long)
-    cache.put(keys, "alfworld", h, lse)
-    resolved = exchange_teacher_logprobs(cache, keys, s_ids, world_size=1)
+    cache.put(keys, "alfworld", h.unsqueeze(1), lse.unsqueeze(1))  # one position per row
+    resolved = exchange_teacher_logprobs(cache, keys, s_ids.unsqueeze(1), world_size=1).squeeze(1)
     student_indexed = topk_kl_per_token(s_lp.unsqueeze(1), resolved.unsqueeze(1))
 
     torch.testing.assert_close(student_indexed, teacher_indexed, rtol=0, atol=1e-5)
@@ -330,8 +398,8 @@ def test_the_support_actually_differs_when_the_models_disagree():
 
     cache = TeacherHiddenCache()
     cache.register_lm_head("alfworld", W)
-    cache.put(torch.arange(16), "alfworld", h, lse)
-    resolved = exchange_teacher_logprobs(cache, torch.arange(16), s_ids, world_size=1)
+    cache.put(torch.arange(16), "alfworld", h.unsqueeze(1), lse.unsqueeze(1))
+    resolved = exchange_teacher_logprobs(cache, torch.arange(16), s_ids.unsqueeze(1), world_size=1).squeeze(1)
 
     teacher_indexed = topk_kl_per_token(s_logsm.gather(-1, t_ids).unsqueeze(1), t_lp.unsqueeze(1))
     student_indexed = topk_kl_per_token(s_lp.unsqueeze(1), resolved.unsqueeze(1))
@@ -381,3 +449,56 @@ def test_padding_positions_are_filed_as_unscored():
     filed = torch.where(real, keys, torch.full_like(keys, -1))
 
     assert filed.tolist() == [7, 7, -1, -1, 8, -1, -1, -1]
+
+
+# --------------------------------------------------------------------------- #
+# 6. the three bugs the first cut had
+# --------------------------------------------------------------------------- #
+
+
+def test_a_flattened_put_is_refused():
+    """The original cut repeated the row's key across its response positions and
+    let the dict keep the last write, so every position of a row was evaluated
+    with the last token's hidden state -- and the witness, overwritten the same
+    way, stayed self-consistent and passed. Shape is the cheapest place to stop
+    that from being expressible."""
+    W, h, lse = _teacher(n=6)
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+
+    with pytest.raises(ValueError, match="per-row"):
+        cache.put(torch.arange(6), "alfworld", h, lse)  # (n, H) / (n,) -- flattened
+
+
+def test_every_position_of_a_row_gets_its_own_hidden_state():
+    """The behavioural half of the same bug: positions within a row must give
+    different log-probs, because they have different hidden states."""
+    cache, keys, W, h, lse = _filled_cache(n=4)
+    ids = torch.randint(0, VOCAB, (4, L, K))
+    values, _ = cache.logprobs_at(keys, ids)
+
+    torch.testing.assert_close(values, _reference(h, W, ids), rtol=0, atol=1e-5)
+    # ...and the row is genuinely not one position repeated.
+    same_ids = ids[:, :1, :].expand(4, L, K).contiguous()
+    per_pos, _ = cache.logprobs_at(keys, same_ids)
+    assert (per_pos[:, 0, :] - per_pos[:, 1, :]).abs().max() > 1e-3
+
+
+def test_a_duplicated_key_on_one_rank_is_refused_at_write_time():
+    """DP auto-padding repeats whole rows, cache id included. Catching it where
+    it is written names the cause; catching it in the exchange only reports that
+    some row was answered twice."""
+    cache, keys, W, h, lse = _filled_cache(n=4)
+    with pytest.raises(RuntimeError, match="written twice"):
+        cache.put(keys[:1], "alfworld", h[:1], lse[:1])
+
+
+def test_the_witness_now_covers_every_position():
+    """It has to: a cache that kept one position per row is self-consistent at
+    that position. Perturbing a non-final position must still be caught."""
+    cache, keys, *_ = _filled_cache(n=5)
+    key = int(keys[0])
+    cache._h[key][0] = cache._h[key][0] + 3.0  # position 0, not the last
+
+    with pytest.raises(RuntimeError, match="witness"):
+        cache.check_witness(atol=1e-3)

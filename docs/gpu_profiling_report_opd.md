@@ -1139,3 +1139,98 @@ prompt 行**だった。ここが縮めば `ref.log_prob_micro_batch_size_per_gp
 可能性が高い（2.5 節）。見るのは `actor.fwd` / `actor.bwd` の壁時計と
 `perf/max_memory_allocated_gb`、それに #0 で新しく見えるようになる
 vLLM の prefill/decode トークン数と preemption 回数。
+
+---
+
+## 11. top-k の支持集合を teacher から student へ（`student_indexed_topk`）
+
+**これは高速化ではない。** 損失そのものが変わる。3 arm 同時に入れ、
+intent lock（`expected_multitask_config.yaml`）に固定した。
+
+### 11.1 なぜ student 側が正しいか
+
+いま使っている損失は「粗視化した reverse KL」である。支持集合 A の上では厳密、
+A の外はすべて 1 個の tail bucket に潰す。落ちる誤差は恒等式で
+
+```
+KL_full − KL_A  =  tail_s · KL( p_s|Ā ‖ p_t|Ā )
+```
+
+—— **student の質量 `tail_s` で重み付けされている**。したがって A を teacher の
+top-20 から取ると、student が teacher から外れて質量を置いた場所がちょうど A の外に
+残る。それはこの項が罰するために存在する領域そのものである。A を student の top-20
+から取ればそこが覆われる。
+
+data processing により **どちらも full KL の下界で、常に ≥ 0**。つまりこれは
+「別の目的関数」ではなく **同じ KL のより締まった下界**である。
+
+### 11.2 なぜ追加 forward が 0 なのか
+
+teacher の出力は
+
+```
+log p_t(v) = h · W_t[v] − lse_t
+```
+
+と分解でき、**ids に依存するのは最後の gather だけ**である。その gather は
+`2·H·k`、teacher forward 全体の約 **1/42,000**。だから teacher は今と同じ場所 ——
+rollout の CPU glue の中 —— で走り続け、`h` と `lse` だけを置いていく。student は
+訓練 forward **1 回**で ids を選び、その ids で teacher を解決する。student forward は
+1 回のままで、FLOPs はどの案でも同一である（`lse` は全語彙和なので `lm_head` は
+どのみち避けられない）。変わるのは**スケジューリングとデータ移動だけ**。
+
+### 11.3 これが持ち込む唯一の新しい危険：rank 所有権
+
+teacher が走った rank と、その行を後で訓練する rank は**一致しない**。2 つの呼び出しの
+間で行は task ごとに束ね直され、`adjust_batch` で padding され、そのうえ
+`_balance_batch` が token 数を揃えるために並べ替える。**恒等写像になることは無い。**
+
+`verl/workers/teacher_cache.py` はこれを 2 つの独立な番人で押さえる。どちらも
+他方を包含しない —— 正しく自己整合な entry が誤った id の下に置かれれば witness は
+通り、正しい id の下で壊れた entry は count を通る。
+
+| 番人 | 問うこと | 破れ方 |
+|---|---|---|
+| 所有数（all-gather → SUM） | 「これは私が頼んだ行か」 | 0 = 誰も持っていない（**zero target**）、2 = 2 rank が同じ key を主張 |
+| witness（teacher 自身の top-k で再計算） | 「保存した h/lse は teacher が出した値をまだ再現するか」 | 別の行と組めば数 nat ずれる |
+
+### 11.4 実装した後に見つかった 3 つの誤り（すべて P0、修正済み）
+
+| # | 誤り | なぜ静かだったか | 何が起きていたか |
+|---|---|---|---|
+| 1 | **cache key の上書き** | witness も同じ key で上書きされるので**自己整合のまま通る** | 行の key を全 response 位置にわたって繰り返していたため、行全体が「最後のトークン」の h/lse に潰れていた。**速度問題ではなく、学習対象そのものが変わる** |
+| 2 | **prefetch miss 行が zero target** | 例外にならない | `sub = batch.select_idxs(idxs)` には `teacher_cache_ids` 列が無く（関数末尾で書かれる）、miss 行は cache されず −1 のまま。exchange が 0 を返し、`exp(0)=1` が全 k で立って tail 質量が負になり clamp に落ちる |
+| 3 | **DP padding が id を複製** | 所有数 2 として顕在化はする（が run が落ちる） | `auto_padding` は行を丸ごと複製するので `teacher_cache_ids` も複製され、2 rank が同じ key を cache する |
+
+修正：`put` は `(n, response_length, hidden)` / `(n, response_length)` の**行単位**しか
+受け付けず、平坦化された入力と重複 key を書き込み時に例外にする。witness は
+**全位置**を見る（padding は `lse == 0` で判定して飛ばす）。miss 行にも per-task loop で
+新しい id を振る。`_teacher_call` が `pad_dataproto_to_divisor` で明示的に padding し、
+padding 行の id を −1 にする。witness は `compute_teacher_log_probs` の**後**に
+移し（cache が完成するのはそこ）、**1 回**に減らした（cache はプロセス単位なので
+3 teacher に聞くと同じ entry を 3 回見ることになる）。
+
+あわせて `temperature` を entry に持たせた。`lse` は forward が割った**後**の logits の
+正規化定数なのに `h` は生のままなので、読み出し側で同じ除算をやり直す必要がある。
+`temperature=1.0` に固定しているので現状は無害だが、T≠1 で静かに壊れる形だった。
+
+### 11.5 費用
+
+| 項目 | rank あたり（約 3,500 行/rank、`response_length=512`、H=2048） |
+|---|---|
+| `h`（bf16） | **7.3 GB** |
+| witness ids（int64）＋ lp（fp32） | 0.43 GB |
+| `lse`（fp32） | 7 MB |
+| teacher lm_head の非 shard コピー × 3 | 1.9 GB（bf16） |
+
+step 頭から `update_actor` の終わりまで GPU に載る。**9.2 で一度 OOM している**ので、
+300 step を回す前に 1 step の smoke test で `perf/max_memory_allocated_gb` を見ること。
+`h` は padding 込みで持っているため、実トークン長だけを詰めれば約 5 倍縮む
+（＝ P1 の packed 行 cache）。
+
+### 11.6 まだ未検証
+
+forward hook（`_capture_last_hidden`）と `FSDP.summon_full_params` 経路は
+**実機で一度も走っていない**。CPU 上の 31 tests（うち 3 つは本物の 2 プロセス gloo）で
+値・所有権・番人は押さえてあるが、FSDP 実体の上での動作は別物である。
+1 step の smoke test を 300 step の前に必ず挟むこと。
