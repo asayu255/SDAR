@@ -299,6 +299,34 @@ class DataParallelPPOActor(BasePPOActor):
         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
         return full_s_lp[:, -response_length - 1 : -1, :]
 
+    def _teacher_logprobs_at(self, cache_ids, ids):
+        """Teacher log-probs at ids the student just chose.
+
+        The teacher's hidden states were cached wherever its forward ran, which is
+        not where this micro-batch is being trained: between the two calls the rows
+        are regrouped by task, padded, and reordered by ``_balance_batch`` to
+        equalise tokens per rank. ``exchange_teacher_logprobs`` therefore asks every
+        rank and sums the one answer that exists, raising if a row is unanswered or
+        answered twice. See verl/workers/teacher_cache.py.
+
+        ``ids`` arrives as (bs, response_length, k); the exchange works on a flat
+        (n, k), so rows are repeated per position -- the cache key is per row and
+        every position of a row shares it.
+        """
+        from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache
+
+        if cache_ids is None:
+            raise ValueError(
+                "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
+                "teacher hidden states; the batch has none."
+            )
+        bs, resp_len, k = ids.shape
+        flat_keys = cache_ids.reshape(bs, 1).expand(bs, resp_len).reshape(-1)
+        out = exchange_teacher_logprobs(
+            get_teacher_cache(), flat_keys, ids.reshape(-1, k)
+        )
+        return out.view(bs, resp_len, k)
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, need_log_prob=True
     ) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
@@ -749,8 +777,15 @@ class DataParallelPPOActor(BasePPOActor):
                 select_keys.append("kl_loss_coef")
         if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or (use_teacher_kl_loss and not teacher_topk_kl):
             select_keys.append("teacher_log_probs")
+        # Whose top-k the KL's support comes from. Student-indexed resolves the
+        # teacher from cached hidden states at update time, so the pre-scored
+        # columns are replaced by the cache key that locates them.
+        student_indexed_topk = teacher_topk_kl and bool(self.config.get("student_indexed_topk", False))
         if teacher_topk_kl:
-            select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
+            if student_indexed_topk:
+                select_keys.append("teacher_cache_ids")
+            else:
+                select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
         # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
         # so the loss metrics below can also be reported per task. Absent in single-task runs.
         task_id_names = data.meta_info.get("task_id_names", None)
@@ -896,7 +931,19 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
+                    # Whose top-k defines the KL's support. Teacher-indexed (the
+                    # default) hands the forward the ids the teacher already chose.
+                    # Student-indexed asks the forward for the student's OWN top-k
+                    # and resolves the teacher at those ids afterwards, from cached
+                    # hidden states -- see verl/workers/teacher_cache.py for why
+                    # that does not force the teacher to run second.
+                    fwd_topk_ids = None
+                    fwd_topk_k = None
+                    if teacher_topk_kl:
+                        if student_indexed_topk:
+                            fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
+                        else:
+                            fwd_topk_ids = data["teacher_topk_ids"]
                     # The sampled-token log-prob is dead weight in pure top-k
                     # distillation: the KL is built from the top-k gather, and every
                     # other consumer here (policy gradient, reference KL, sdl, sdar,
@@ -913,13 +960,27 @@ class DataParallelPPOActor(BasePPOActor):
                         and not self.config.get("use_sdar_loss", False)
                     )
                     with _actor_phase("actor.fwd"):
-                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(
+                        entropy, log_prob, student_topk_out = self._forward_micro_batch(
                             micro_batch=data,
                             temperature=temperature,
                             calculate_entropy=calculate_entropy,
                             topk_ids=fwd_topk_ids,
+                            topk_k=fwd_topk_k,
                             need_log_prob=need_log_prob,
                         )
+                    if student_indexed_topk and teacher_topk_kl:
+                        # The forward returned the student's own top-k: values (with
+                        # gradient) and the ids that chose them, from one logits
+                        # tensor -- there is no second student forward here.
+                        student_topk_logprobs, student_topk_ids = student_topk_out
+                        with _actor_phase("actor.teacher_lookup"):
+                            fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
+                                cache_ids=data.get("teacher_cache_ids", None),
+                                ids=student_topk_ids,
+                            )
+                    else:
+                        student_topk_logprobs = student_topk_out
+                        fwd_teacher_topk_logprobs = None
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -1015,10 +1076,18 @@ class DataParallelPPOActor(BasePPOActor):
                         # evaluated on the student's own on-policy responses. Only the student
                         # log-probs carry gradients; teacher values are detached upstream.
                         if teacher_topk_kl:
-                            # Dense reverse KL over the teacher's top-k support (+ tail bucket).
+                            # Dense reverse KL over the top-k support (+ tail bucket).
+                            # Both sides are full-vocabulary log-softmax values at the
+                            # SAME ids, whichever model chose them, so the tail is
+                            # 1 - sum in both cases and the formula is unchanged.
+                            teacher_topk_lp = (
+                                fwd_teacher_topk_logprobs
+                                if fwd_teacher_topk_logprobs is not None
+                                else data["teacher_topk_logprobs"]
+                            )
                             teacher_kld = topk_kl_per_token(
                                 student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=data["teacher_topk_logprobs"],
+                                teacher_topk_logprob=teacher_topk_lp,
                             )
                         else:
                             # Single-sampled-token estimator (low_var_kl / kl / mse / abs).
