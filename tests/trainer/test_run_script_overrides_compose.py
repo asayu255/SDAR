@@ -148,3 +148,22 @@ def test_the_default_is_on_and_the_teacher_follows_it():
             config_name=CONFIG_NAME, overrides=["actor_rollout_ref.actor.student_indexed_topk=False"]
         )
         assert off.actor_rollout_ref.ref.student_indexed_topk is False
+
+
+def test_no_script_exports_expandable_segments():
+    """vLLM's sleep/wake allocates through CuMemAllocator, which asserts outright
+    on expandable segments (pytorch#147851) -- the engine refuses to build. Every
+    script here runs vLLM with enable_sleep_mode, so this is not a tuning
+    trade-off, it is an incompatibility, and it costs a full worker init to find
+    out at runtime."""
+    import glob
+
+    offenders = []
+    for path in glob.glob(os.path.join(REPO, "examples", "**", "*.sh"), recursive=True):
+        for line in open(path):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "PYTORCH_CUDA_ALLOC_CONF" in stripped and "expandable_segments:True" in stripped:
+                offenders.append(os.path.relpath(path, REPO))
+    assert not offenders, f"expandable_segments is incompatible with vLLM sleep mode: {offenders}"

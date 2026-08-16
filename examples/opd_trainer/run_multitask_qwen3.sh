@@ -262,11 +262,16 @@ set -x
 # many already-final rows are scored per call, so it cannot change a value.
 
 export ALFWORLD_DATA=$HOME/data/alfworld
-# Activations are no longer recomputed (enable_gradient_checkpointing=False), so
-# the actor update allocates ~13 GB more and frees it every micro-batch. That is
-# the pattern the default allocator fragments on; expandable segments grow a
-# single mapping instead of caching a ladder of block sizes.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# NO PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here, and it is not a
+# tuning choice. vLLM's sleep/wake allocates through CuMemAllocator, which
+# asserts on expandable segments outright ("Expandable segments are not
+# compatible with memory pool", pytorch#147851) -- the engine refuses to build.
+# This arm depends on that mechanism (free_cache_engine=False plus
+# ROLLOUT_KEEP_VLLM_AWAKE), so the two cannot coexist. Dropping the actor's
+# recomputed activations does allocate and free ~13 GB every micro-batch, which
+# is the pattern expandable segments exist for, but the previous run already
+# reserved 128.5 GB against 93.9 allocated -- ~35 GB of slack the caching
+# allocator can reuse -- so the default is expected to absorb it.
 # Traced off for this one line. `set -x` at the top of the file echoes every
 # command it runs, expansions included, so with tracing on this writes the real
 # key into whatever the run is tee'd to -- in plaintext, for every restart.
