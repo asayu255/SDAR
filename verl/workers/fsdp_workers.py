@@ -138,6 +138,27 @@ def get_sharding_strategy(device_mesh, fsdp_config=None):
     return alternatives[requested]
 
 
+def _fsdp_param_dtype(module, default):
+    """The dtype FSDP casts parameters to for the forward.
+
+    ``summon_full_params`` returns the float32 masters, but the projection that
+    produced the log-probs ran at ``MixedPrecision.param_dtype``. Anything
+    recomputing that projection has to use the same one or it is doing different
+    arithmetic. Walks the wrapper chain because only the FSDP module carries it.
+    """
+    seen = module
+    for _ in range(8):
+        mp = getattr(seen, "mixed_precision", None)
+        dtype = getattr(mp, "param_dtype", None)
+        if dtype is not None:
+            return dtype
+        nxt = getattr(seen, "_fsdp_wrapped_module", None) or getattr(seen, "_orig_mod", None)
+        if nxt is None or nxt is seen:
+            break
+        seen = nxt
+    return default
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -1023,10 +1044,19 @@ class ActorRolloutRefWorker(Worker):
             head = getattr(inner, "lm_head", None)
             if head is None:
                 raise RuntimeError("teacher has no lm_head; student_indexed_topk cannot resolve its log-probs")
+            # Kept at the dtype the FORWARD projected in, not the dtype
+            # summon_full_params hands back. FSDP keeps float32 masters and casts
+            # to param_dtype for the forward, so the summoned weight is float32
+            # while lm_head actually ran in bfloat16. Recomputing from the float32
+            # copy is a different projection: the difference is ~eps_bf16 * |logit|,
+            # about 0.25 nats at the logit magnitudes this model reaches, which is
+            # what the witness caught on the first real run. Casting also halves
+            # what is held -- 1.9 GB across three teachers rather than 3.7.
+            weight = head.weight.detach().to(_fsdp_param_dtype(module, head.weight.dtype))
             if n_tasks is None:
-                get_teacher_cache().register_lm_head(task, head.weight.detach().clone())
+                get_teacher_cache().register_lm_head(task, weight.clone())
             else:
-                get_teacher_cache().register_lm_head(task, head.weight.detach(), slot=slot, n_tasks=n_tasks)
+                get_teacher_cache().register_lm_head(task, weight, slot=slot, n_tasks=n_tasks)
         self._teacher_lm_head_task = task
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

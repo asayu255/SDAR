@@ -514,16 +514,30 @@ class TeacherHiddenCache:
         values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
         return values, found
 
-    def check_witness(self, atol: float = 1e-3) -> float:
+    def check_witness(self, atol: float = 1e-3, ulps: float = 8.0) -> float:
         """Recompute at the teacher's own top-k and return the largest deviation.
 
-        The teacher returns its top-k anyway (the trainer ships it today), so this
-        costs one narrow GEMM over what is already cached. Consistent h/lse/W
-        reproduce those values to a few ULP; an entry paired with the wrong row is
-        off by whole nats. Raises past ``atol`` rather than reporting, because a
-        cache that fails this has been feeding wrong targets to the loss.
+        The teacher builds its top-k for a couple of micro-batches a step anyway,
+        so this costs one narrow GEMM over what is already cached. Consistent
+        h/lse/W reproduce those values to the precision they were stored at; an
+        entry paired with the wrong row is off by whole nats. Raises rather than
+        reporting, because a cache that fails this has been feeding wrong targets
+        to the loss.
+
+        The tolerance is relative to the LOGIT, not to the log-prob, and that is
+        the whole subtlety. The stored witness is ``logit - lse`` where both came
+        out of a bfloat16 forward, so it carries a bfloat16 quantum of |logit| --
+        0.25 nats where |logit| is 32, five orders of magnitude above the 1e-3
+        this used to demand. That is what the first real run tripped on, and no
+        recomputation can do better: the reference itself is that coarse. What a
+        recomputation CAN be held to is the storage precision, which is
+        ``ulps * eps(dtype) * |logit|``. A row scored from another row's entry
+        misses by ~10 nats at those magnitudes, ~40 eps, so the check still fires
+        by a wide margin -- and unlike rounding it misses on nearly every
+        position, which the message reports so the two are told apart on sight.
         """
-        worst = 0.0
+        worst = worst_ratio = 0.0
+        over = total = 0
         for key, w_ids in self._witness_ids.items():
             # Every position of the row, not just one: a cache that keeps a single
             # position per row is exactly the failure this has to catch, and it is
@@ -536,13 +550,23 @@ class TeacherHiddenCache:
                 h, lse, self.lm_head(self._task[key]), w_ids.to(h.device),
                 temperature=self._temperature.get(key, 1.0),
             )
-            err = (got - self._witness_lp[key].to(got.device).float()).abs().max().item()
-            worst = max(worst, err)
-        if worst > atol:
+            want = self._witness_lp[key].to(got.device).float()
+            err = (got - want).abs()
+            # |logit| = |log p + lse|, the magnitude the stored value was rounded at.
+            scale = (want + lse.to(want.device).float().unsqueeze(-1)).abs()
+            eps = torch.finfo(h.dtype).eps if h.dtype.is_floating_point else 0.0
+            tol = atol + ulps * eps * scale
+            worst = max(worst, float(err.max()))
+            worst_ratio = max(worst_ratio, float((err / tol).max()))
+            over += int((err > tol).sum())
+            total += err.numel()
+        if worst_ratio > 1.0:
             raise RuntimeError(
-                f"teacher hidden-state cache failed its witness check: max deviation {worst:.3e} > {atol:.0e}. "
-                f"The cached h/lse no longer reproduce the log-probs the teacher returned, so the ids being "
-                f"scored do not belong to the rows they are filed under."
+                f"teacher hidden-state cache failed its witness check: worst deviation {worst:.3e}, "
+                f"{worst_ratio:.1f}x the storage precision it was stored at, on {over}/{total} positions "
+                f"({100.0 * over / max(total, 1):.1f}%). Rounding misses a handful of positions by ~1x; a "
+                f"cache entry paired with the wrong row misses nearly all of them by tens of x. If this says "
+                f"nearly all, the ids being scored do not belong to the rows they are filed under."
             )
         return worst
 

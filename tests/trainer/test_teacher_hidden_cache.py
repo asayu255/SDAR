@@ -902,3 +902,97 @@ def test_slot_registration_answers_the_same_values_as_the_lazy_stack():
         built.append(cache.logprobs_at(torch.arange(4), ids)[0])
 
     torch.testing.assert_close(built[0], built[1], rtol=0, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# 10. the witness under the precision the forward actually runs at
+# --------------------------------------------------------------------------- #
+
+
+def _bf16_teacher(n, seed=0, logit_scale=6.0):
+    """The pipeline as the real forward runs it, in bfloat16.
+
+    lm_head projects under autocast, so the logits, their top-k and their
+    logsumexp are all bfloat16; the stored witness is ``(tvals - lse).float()``
+    and therefore carries a bfloat16 quantum of |logit|, not of the log-prob.
+    """
+    g = torch.Generator().manual_seed(seed)
+    W = (torch.randn((VOCAB, H), generator=g) / H**0.5 * logit_scale).bfloat16()
+    h = (torch.randn((n * L, H), generator=g)).bfloat16()
+    logits = (h.float() @ W.float().T).bfloat16()          # the forward's projection
+    lse = torch.logsumexp(logits, dim=-1, keepdim=True).bfloat16()
+    tvals, tids = torch.topk(logits, K, dim=-1, sorted=False)
+    return W, h.view(n, L, H), lse.squeeze(-1).view(n, L), (tvals - lse).float().view(n, L, K), tids.view(n, L, K)
+
+
+def _bf16_cache(n=4, seed=0):
+    W, h, lse, wit_lp, wit_ids = _bf16_teacher(n, seed=seed)
+    cache = TeacherHiddenCache()
+    cache.register_lm_head("alfworld", W)
+    keys = torch.arange(n, dtype=torch.long)
+    cache.put(keys, "alfworld", h, lse, witness_ids=wit_ids, witness_lp=wit_lp)
+    return cache, keys
+
+
+def test_a_bfloat16_forward_passes_the_witness():
+    """The end-to-end shape: bfloat16 logits, bfloat16 top-k and normaliser."""
+    cache, _ = _bf16_cache(seed=41)
+    cache.check_witness()
+
+
+def test_the_tolerance_admits_one_bfloat16_ulp_of_the_logit_and_nothing_like_a_nat():
+    """The first real run tripped on this, and the number it reported -- 0.250 --
+    is exactly one bfloat16 ULP at |logit| in [32, 64).
+
+    The stored witness is ``logit - lse`` out of a bfloat16 forward, so it carries
+    a bfloat16 quantum of |LOGIT|, not of the log-prob. Demanding 1e-3 of a
+    recomputation asked for precision the reference never had. What it can be held
+    to is the storage precision -- and a row read from another row's entry misses
+    by nats, which is still tens of times that.
+    """
+    cache, keys = _bf16_cache(seed=41)
+    key = int(keys[0])
+    logit = cache._witness_lp[key] + cache._lse[key].float().unsqueeze(-1)
+    ulp = torch.finfo(torch.bfloat16).eps * logit.abs()
+    assert float(ulp.max()) > 1e-2, "fixture logits are too small to show the quantum"
+
+    cache._witness_lp[key] = cache._witness_lp[key] + ulp
+    worst = cache.check_witness()                       # one ULP: passes
+    assert worst > 1e-2, "the old absolute 1e-3 would have rejected exactly this"
+
+    cache._witness_lp[key] = cache._witness_lp[key] + 10.0
+    with pytest.raises(RuntimeError, match="witness"):   # nats: does not
+        cache.check_witness()
+
+
+def test_a_mispaired_entry_still_fails_at_bfloat16():
+    """The tolerance moved by three orders of magnitude, so the thing it exists to
+    catch has to be re-checked at the new one."""
+    cache, keys = _bf16_cache(n=6, seed=42)
+    a, b = int(keys[1]), int(keys[4])
+    cache._h[a], cache._h[b] = cache._h[b], cache._h[a]
+
+    with pytest.raises(RuntimeError, match="witness") as exc:
+        cache.check_witness()
+    # And it is distinguishable from rounding on sight: rounding misses a handful
+    # of positions by ~1x, a mis-pairing misses nearly all of them by tens of x.
+    assert "x the storage precision" in str(exc.value)
+
+
+def test_the_weight_used_to_recompute_must_be_the_one_the_forward_projected_with():
+    """FSDP keeps float32 masters and casts to param_dtype for the forward, so
+    summon_full_params hands back a weight the projection never used. Recomputing
+    from it is different arithmetic -- ~eps_bf16 * |logit|, which is exactly the
+    0.25 nats the first run reported."""
+    W, h, lse, wit_lp, wit_ids = _bf16_teacher(4, seed=43)
+
+    right = TeacherHiddenCache()
+    right.register_lm_head("alfworld", W)
+    right.put(torch.arange(4), "alfworld", h, lse, witness_ids=wit_ids, witness_lp=wit_lp)
+
+    wrong = TeacherHiddenCache()
+    # A float32 master that rounds to the same bfloat16 weight the forward used.
+    wrong.register_lm_head("alfworld", W.float() + torch.finfo(torch.bfloat16).eps * W.float() / 2)
+    wrong.put(torch.arange(4), "alfworld", h, lse, witness_ids=wit_ids, witness_lp=wit_lp)
+
+    assert right.check_witness() < wrong.check_witness()
