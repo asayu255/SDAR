@@ -13,6 +13,17 @@
 #     offload, prefix caching, max_model_len, ...) are intentionally NOT
 #     listed. $HOME-derived paths (parquets, algorithm.sft.data_dir) are also
 #     not pinned (machine-dependent).
+#     ONE CAVEAT to that rule, worth knowing before tuning:
+#     ppo_micro_batch_size_per_gpu is not purely a performance knob on this arm.
+#     _step_batch_divisor pads the step batch to ppo_micro * world_size, so the
+#     micro size decides how many rows adjust_batch duplicates and therefore how
+#     many optimizer steps a batch becomes (measured: 71.5 mini-batches a step at
+#     micro=5 on 3 GPUs). It is left unpinned because the effect is small and
+#     tuning it is expected -- micro=5 was itself an OOM response, and
+#     response_only_logits may buy the headroom to put it back -- but a change to
+#     it is not free of the data the way the other performance knobs are.
+#     It was never entirely free: the divisor was already an lcm over the micro
+#     sizes before this arm narrowed it.
 #   - To change a setting intentionally: edit the run script AND this file in
 #     the same commit. A run-script-only edit will (by design) refuse to start.
 #

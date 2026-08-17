@@ -886,7 +886,7 @@ assert float(num_mini_batches).is_integer()
 `math.ceil` に変えてアサートを外した。**現構成では値が変わらない**（常に厳密除算だった）。
 GPU 数やマイクロバッチを変えた瞬間にランダムな step で落ちる地雷を外しただけである。
 
-#### 判断待ち: `rollout.log_prob_micro_batch_size_per_gpu=16` が padding を作っている
+#### 直した(2): step バッチの padding を、このループが必要とする分だけに
 
 **この arm は `compute_log_prob` を一度も呼ばない。** トレーナのループは
 `update_actor` だけで `old_log_prob` フェーズが無く、検証も
@@ -907,15 +907,48 @@ GPU 数やマイクロバッチを変えた瞬間にランダムな step で落�
 SFT では padding 行は重み 0 なので損失には効かないが、
 **forward と backward は満額払っている**。2.77% が完全な空回りである。
 
-`log_prob_micro_batch_size_per_gpu` を 5 に下げると divisor は 15 になり、
-padding は平均 7.5 行（0.17%）。**約 2.6% が戻る。**
+**当初は「`log_prob_micro_batch_size_per_gpu` を下げる」を考えたが、それは筋が悪い。**
+継承元のノブを触って副作用を避ける迂回であり、しかも off-policy KD arm も
+同じ値を使うので両アームを縛る。正しくは **Stage 2 が自分の制約から divisor を出す**ことである。
 
-**ただしこれは実行しない。** どの行が複製されるかと、1 step が何回の
-optimizer step になるか（平均 74 → 72）が変わるので、`no_sync_grad_accum` や
-`response_only_logits` と同じく**データ側の pin 対象**であり、
-かつ off-policy KD arm も同じ divisor を使うので**両アーム同時に変える**必要がある。
-pure OPD arm も同じ理由でこの値を pin している（あちらは 2 GPU で 16 → 10、
-divisor 160 → 20）。**入れるかどうかは実験設計の判断なので、ここでは報告に留める。**
+**実際の制約はどこまでか。** `_prepare_batch` の旧コメントは 2 つ挙げていた:
+
+1. `_balance_batch` の partitioner —— `get_seqlen_balanced_partitions(..., equal_size=True)`
+   は「行数が `k_partitions` で割り切れること」を要求する。**k_partitions は world_size = 3。**
+2. 「短い末尾ミニバッチは誤スケールする」—— **9.8 の切り上げ修正で否定された。**
+   重み付き SFT では割る定数と掛ける定数が同じなので相殺する。
+
+つまり残っているのは **3 で割り切れること**だけだった。
+`_step_batch_divisor` を足し、SFT アームのときだけ divisor を
+`ppo_micro × world_size = 15` にする（`adjust_batch` に `size_divisor` 引数を追加）。
+
+実測 300 step に当てはめた結果:
+
+| | divisor 240 | divisor 15 |
+|---|---:|---:|
+| padding | 122.4 行/step | **7.2 行/step** |
+| バッチ比 | 2.77% | 0.17% |
+| ミニバッチ数/step | 73.1 | 71.5 |
+
+**戻るのは 2.60%**（300 step で 34,575 行）。
+
+**なぜ 3 ではなく 15 か。** 3 まで落とせば padding は約 1 行になり、さらに
+micro batch size が完全にデータから外れる（利点）。しかし `ppo_micro × W` なら
+**すべての micro-batch が満杯のまま**で、新たに通る形は「短いミニバッチ」だけ ——
+これは pure OPD arm が本番で通している形である。3 にすると「短い micro-batch」という
+**どちらのアームでも一度も走ったことのない経路**が加わる。差は 0.14% なので、
+実績のある経路に留めた。必要になれば 3 に落とせる。
+
+**SFT アーム限定である。** 重みの無い経路（off-policy KD）には相殺が無く、
+短いミニバッチは実際に誤スケールする —— そこは旧コメントの後半が今も正しい。
+`use_sft_loss` が立っていないときは `None` を返して従来どおりの divisor に戻る。
+`use_dynamic_bsz`（トークン数で micro を切る）と、per-GPU の micro が
+未設定のときも同様。
+
+**代償。** どの行が複製されるかと、1 step が何回の optimizer step になるかが変わる。
+`ppo_micro_batch_size_per_gpu` は**このアームでは純粋な性能ノブではなくなった** ——
+ただし divisor はもともと micro サイズの lcm だったので、完全に自由だったわけでもない。
+expectations ファイルの「性能ノブは pin しない」規則の脇に、この例外を明記した。
 
 ### 9.9 次に残っているもの
 

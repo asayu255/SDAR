@@ -176,8 +176,17 @@ def batch_size_divisor(config, multi_modal: bool = False) -> int:
     return np.lcm.reduce(np.array([size_divisor_ref, size_divisor_rollout, size_divisor_actor])).item()
 
 
-def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
-    size_divisor = batch_size_divisor(config, "multi_modal_inputs" in data.non_tensor_batch)
+def adjust_batch(config, data: DataProto, mode="copy", size_divisor: int = None) -> DataProto:
+    """Round a batch to a multiple of ``size_divisor``, duplicating (or dropping) rows.
+
+    ``size_divisor`` defaults to :py:func:`batch_size_divisor`, which is the
+    multiple the *on-policy* pipeline needs: every worker call that batch will
+    pass through, including ``compute_log_prob``. A caller whose pipeline does not
+    make all of those calls can pass the smaller multiple it actually needs --
+    the padding is duplicated rows, so the difference is wasted compute.
+    """
+    if size_divisor is None:
+        size_divisor = batch_size_divisor(config, "multi_modal_inputs" in data.non_tensor_batch)
 
     # check if the batch size is divisible by the dp size, if not, delete the last few samples to make it divisible
     bs = len(data)

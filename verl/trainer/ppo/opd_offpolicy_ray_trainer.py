@@ -637,10 +637,10 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         prep_metrics = {}
         n_real = len(batch)
         # Stage 2 keeps adjust_batch: unlike Stage 1 it is load-bearing here.
-        # _balance_batch's partitioner requires a row count divisible by the DP
-        # world size, and update_policy scales every mini-batch by the *configured*
-        # gradient_accumulation, so a ragged final mini-batch would be mis-scaled.
-        batch = adjust_batch(self.config, batch)
+        # _balance_batch partitions with equal_size=True, which requires a row
+        # count divisible by the DP world size, and the dispatch chunks by it too.
+        # How much MORE than that it pads to is _step_batch_divisor's question.
+        batch = adjust_batch(self.config, batch, size_divisor=self._step_batch_divisor())
         batch.batch["response_mask"] = compute_response_mask(batch)
         # Must precede _balance_batch only in the sense that the weights are
         # computed from the pre-reorder row order; reorder() moves the column with
@@ -653,6 +653,50 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         # tag rows with their task so the actor can split its metrics
         self._attach_task_ids(batch)
         return batch, prep_metrics
+
+    def _step_batch_divisor(self):
+        """The multiple ``_prepare_batch`` pads the step batch up to.
+
+        ``None`` means the default: ``batch_size_divisor``, the lcm over every
+        worker call the ON-POLICY pipeline makes with this batch -- including
+        ``compute_log_prob``, whose ``rollout.log_prob_micro_batch_size_per_gpu``
+        this loop never uses, because it has no ``old_log_prob`` phase and
+        validation sets ``recompute_log_prob=False``. On the 3-GPU multitask run
+        that term contributes 48 and drags the divisor to 240, which cost a
+        measured 122.4 duplicated rows a step against 4260.8 real ones -- 2.77% of
+        the batch, forward and backward, for rows the SFT loss weights at zero
+        (wandb x7g9r7bx).
+
+        The weighted SFT path can pad to the micro batch instead, because a short
+        final MINI-batch is already correct for it: update_policy divides every
+        mini-batch by the CONFIGURED gradient_accumulation while the weights are
+        multiplied by the same constant, so the two cancel and a mini-batch
+        contributes the sum of its rows' weighted losses however many rows it
+        holds. That is the same argument that made num_mini_batches a ceiling in
+        ``_attach_sft_loss_weights``.
+
+        The unweighted path has no such cancellation -- there the configured
+        divisor really would mis-scale a short mini-batch -- so it keeps the full
+        divisor, and this stays an SFT-arm change.
+
+        ``ppo_micro * world_size`` rather than ``world_size`` alone, which is all
+        _balance_batch strictly needs. It leaves every MICRO-batch full, so the
+        only never-before-run shape this introduces is the short mini-batch, which
+        the pure-OPD arm already runs in production. Padding to world_size would
+        save a further ~0.14% of the batch and would also keep the micro batch size
+        out of the data entirely; it is available if that is ever worth exercising
+        a ragged micro-batch for.
+        """
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if not actor_cfg.get("use_sft_loss", False):
+            return None
+        micro = actor_cfg.get("ppo_micro_batch_size_per_gpu", None)
+        if not micro or actor_cfg.get("use_dynamic_bsz", False):
+            # Micro batches formed by token count, or sized by the deprecated
+            # global key: the row-count argument above does not apply.
+            return None
+        world_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        return int(micro) * world_size
 
     def _attach_sft_loss_weights(self, batch: DataProto, n_real: int, metrics: dict):
         """Give every row the weight that makes each task's share of the SFT loss 1/3.
