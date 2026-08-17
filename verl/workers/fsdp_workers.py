@@ -644,6 +644,24 @@ class ActorRolloutRefWorker(Worker):
                 async_save=self.config.actor.checkpoint.get("async_save", False),
             )
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def update_actor_async(self, data: DataProto):
+        """``update_actor``, with the driver getting a future instead of the result.
+
+        Same work, same worker, same order -- a Ray actor runs its tasks one at a
+        time, so a second call queued behind the first starts the instant the
+        first returns, with no driver round trip in between. That gap is what the
+        profiler sees as the once-per-step ``(idle/other)`` window with all GPUs
+        at zero: the driver reducing metrics and then re-serialising ~480 MB of
+        the next batch while nothing is running.
+
+        Callers must drain what they launched before anything reads worker state
+        that a queued call would change -- above all ``save_checkpoint``, which
+        would otherwise write the weights of a step later than the one it is
+        named for. See ``OffPolicyOPDRayTrainer.fit``.
+        """
+        return self.update_actor(data)
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares

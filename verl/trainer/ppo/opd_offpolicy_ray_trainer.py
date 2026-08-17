@@ -30,6 +30,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from pprint import pprint
 
 import numpy as np
@@ -96,6 +97,21 @@ def _env_flag(name: str, default: str = "0") -> bool:
 # Read once at import, like the other rollout knobs in this tree, so the
 # mechanism cannot change halfway through a run.
 _BATCH_PREFETCH = _env_flag("OFFPOLICY_BATCH_PREFETCH")
+
+# Opt-in: keep one update_actor queued behind the running one. A Ray actor
+# executes its calls in order and one at a time, so the queued call starts the
+# instant the running one returns -- where today the workers idle while the
+# driver reduces the finished step's metrics and re-serialises ~480 MB of the
+# next batch. Measured at 0.23 s resolution that gap is the whole of the
+# once-per-step "(idle/other)" window with every GPU at 0, and the longest dips
+# in the run (docs/gpu_profiling_report.md 9.9).
+#
+# Same batches, same order, same worker: the actor cannot start step k+1 before
+# step k returns, so nothing about the arithmetic changes. What changes is that
+# timing_s/update_actor becomes a wait rather than the work, and that a step
+# whose retirement reads worker state is never run ahead of (_step_has_barrier).
+_ACTOR_PIPELINE = _env_flag("OFFPOLICY_ACTOR_PIPELINE")
+_ACTOR_PIPELINE_DEPTH = 2 if _ACTOR_PIPELINE else 1
 
 
 def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
@@ -899,6 +915,28 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             except queue.Empty:
                 pass
 
+    def _step_has_barrier(self, step: int) -> bool:
+        """Does retiring ``step`` do something a queued update_actor would spoil?
+
+        Saving reads the worker's weights and names the file after this step; a
+        call already queued behind it would have moved them on by the time the
+        state dict is taken, so the file would hold a later step under this
+        step's name. Validating generates from the same weights and has the same
+        problem. Both are rare -- twelve saves in three hundred steps, and this
+        arm does not validate in-loop at all -- so the pipeline simply does not
+        run ahead across them, and pays the driver-side gap on those steps only.
+        """
+        is_last = step >= self.total_training_steps
+        save_freq = self.config.trainer.save_freq
+        if save_freq > 0 and (is_last or step % save_freq == 0):
+            return True
+        test_freq = self.config.trainer.test_freq
+        if self.val_reward_fn is not None and test_freq > 0:
+            test_start_step = self.config.trainer.get("test_start_step", 0)
+            if is_last or (step >= test_start_step and step % test_freq == 0):
+                return True
+        return False
+
     def _should_validate_before_training(self):
         """Whether fit() runs a validation pass before entering the training loop.
 
@@ -949,7 +987,48 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self.global_steps += 1
         last_val_metrics = None
 
-        for batch, prep_metrics in self._prepared_batch_iter(skip=consumed_steps):
+        source = self._prepared_batch_iter(skip=consumed_steps)
+        inflight = deque()   # (future_or_output, batch, prep_metrics, step)
+        exhausted = False
+
+        def _launch(step):
+            """Hand one step's batch to the workers. Returns without waiting when
+            the pipeline is on, so the caller can go on to retire an earlier one."""
+            nonlocal exhausted
+            try:
+                batch, prep_metrics = next(source)
+            except StopIteration:
+                exhausted = True
+                return False
+            # update_policy scales student logits by this temperature (same value
+            # compute_log_prob would set); OPD sets it here for the thin loop too.
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+            if _ACTOR_PIPELINE:
+                handle = self.actor_rollout_wg.update_actor_async(batch)
+            else:
+                handle = self.actor_rollout_wg.update_actor(batch)
+            inflight.append((handle, batch, prep_metrics, step))
+            return True
+
+        launch_step = self.global_steps
+        while True:
+            # Keep one step queued behind the one running, so the workers never
+            # wait for the driver: a Ray actor starts a queued call the instant
+            # the current one returns, while dispatching from here costs the
+            # ~480 MB serialisation the GPUs would otherwise sit through. Not
+            # past a step that will touch worker state on retirement, though --
+            # see _step_has_barrier.
+            while not exhausted and len(inflight) < _ACTOR_PIPELINE_DEPTH:
+                if inflight and self._step_has_barrier(inflight[0][3]):
+                    break
+                if _launch(launch_step):
+                    launch_step += 1
+            if not inflight:
+                break
+
+            handle, batch, prep_metrics, step = inflight.popleft()
+            self.global_steps = step
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
@@ -961,12 +1040,13 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 # folded in here so the logged global_seqlen/* are unchanged.
                 metrics.update(prep_metrics)
 
+                # Under the pipeline this is the WAIT, not the work: the step
+                # after this one was dispatched before we got here, so part of
+                # the compute already overlapped the previous step's bookkeeping.
+                # timing_s/update_actor_worker is the column that still means what
+                # it says across both settings.
                 with _timer("update_actor", timing_raw):
-                    # update_policy scales student logits by this temperature (same value
-                    # compute_log_prob would set); OPD sets it here for the thin loop too.
-                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                    batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output = handle.get() if _ACTOR_PIPELINE else handle
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
@@ -1009,7 +1089,6 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
 
             logger.log(data=metrics, step=self.global_steps)
             progress_bar.update(1)
-            self.global_steps += 1
             if is_last_step:
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()

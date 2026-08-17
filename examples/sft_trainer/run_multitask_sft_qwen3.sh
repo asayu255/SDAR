@@ -84,6 +84,15 @@ set -x
 #     while step k is inside update_actor (a blocking ray.get, so it holds no
 #     GIL). Bit-identical to the sequential path; see _prepared_batch_iter for
 #     the two RNG invariants that make that true.
+#   OFFPOLICY_ACTOR_PIPELINE=1   — dispatches step k+1 to the workers before
+#     waiting on step k. A Ray actor runs its calls one at a time and in order,
+#     so the queued one starts the instant k returns instead of after the driver
+#     has reduced k's metrics and re-serialised ~480 MB. That driver window is
+#     the once-per-step all-GPUs-at-zero dip, and the longest dips in the run
+#     (0.23 s trace: 98.4% mean, every dip together 0.46%). Same batches, same
+#     order, same worker — the actor cannot start k+1 before k returns. It does
+#     NOT run ahead across a step that saves or validates, since a checkpoint
+#     taken with a call already queued would hold a later step's weights.
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on; they speed up the validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
@@ -154,6 +163,7 @@ export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
 # ROLLOUT_KEEP_VLLM_AWAKE=0 / OFFPOLICY_BATCH_PREFETCH=0 still turns either off.
 export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
+export OFFPOLICY_ACTOR_PIPELINE=${OFFPOLICY_ACTOR_PIPELINE:-1}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
