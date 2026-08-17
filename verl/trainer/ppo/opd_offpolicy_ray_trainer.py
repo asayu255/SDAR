@@ -341,6 +341,31 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         per_task_prompts = int(self.config.data.task_balance.per_task_batch_size)
         group_size = int(self.config.env.rollout.n)
         self.per_task_traj_per_step = per_task_prompts * group_size
+        self._maybe_load_offpolicy_data()
+
+    def _is_val_only(self):
+        return bool(self.config.trainer.get("val_only", False))
+
+    def _maybe_load_offpolicy_data(self):
+        """Load the Stage-1 pool unless this process only validates.
+
+        A val_only process scores a saved checkpoint: fit() validates once and
+        returns without ever drawing a training batch, so the pool it would draw
+        from is dead weight. It is not small dead weight -- 136.5 GiB resident for
+        the SFT arm, and the read that fills it is what
+        ``scripts/cache_teacher_pool.py`` exists to shorten. Skipping it is what
+        makes per-checkpoint evaluation cheap enough to run as its own process
+        (``examples/sft_trainer/eval_checkpoints.sh``), which is in turn what keeps
+        the multi-hour validation out of the training run's wall clock.
+
+        The pool directory does not even have to exist for such a run:
+        ``_resolve_data_dir`` checks the config key, which is the identity of the
+        arm, while the glob that needs the files lives in the load below.
+        """
+        if self._is_val_only():
+            print("[OPD-offpolicy] trainer.val_only: skipping the Stage-1 pool load "
+                  f"({self.teacher_data_dir}); this process only validates", flush=True)
+            return
         self._load_offpolicy_data()
 
     def _resolve_data_dir(self):
@@ -528,6 +553,16 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         ``per_task_traj_per_step`` whole trajectories per task (all their turn-rows),
         matching OPD's per-step trajectory count. Trajectory pools are reshuffled and
         recycled across steps (replay)."""
+        # A val_only process never reaches here (fit() returns after _validate), so
+        # arriving without a pool means the skip in __init__ fired for a run that
+        # does train. Checking the index this iterator is about to read -- rather
+        # than a flag beside it -- keeps the precondition and the check the same
+        # fact, and turns AttributeError on _task_to_trajs into the reason for it.
+        assert getattr(self, "_task_to_trajs", None), (
+            "the Stage-1 pool was not loaded: this process was built with "
+            "trainer.val_only=True, which skips the load, but it is now drawing a "
+            "training batch. Drop trainer.val_only to train."
+        )
         seed = int(self.config.data.get("seed", 1))
         rng = np.random.default_rng(seed)
         pools = {t: rng.permutation(trajs) for t, trajs in self._task_to_trajs.items()}
@@ -808,6 +843,22 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             except queue.Empty:
                 pass
 
+    def _should_validate_before_training(self):
+        """Whether fit() runs a validation pass before entering the training loop.
+
+        ``val_only`` implies it. A process asked to do nothing *but* validate, and
+        then told not to validate before training, has no work at all -- and that
+        is the combination the checkpoint-scoring path would otherwise hit, since
+        the training run it resumes from sets ``val_before_train=False``.
+
+        Making ``val_only`` sufficient on its own is also what keeps
+        ``eval_checkpoints.sh`` to overrides the run script does not already pass
+        (``val_only`` + ``resume_*``), so no key is handed to Hydra twice.
+        """
+        if self.val_reward_fn is None:
+            return False
+        return self._is_val_only() or bool(self.config.trainer.get("val_before_train", True))
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -826,12 +877,16 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         # already been incremented below, and the off-by-one would be silent.
         consumed_steps = self.global_steps
 
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        # The step this logs at is the checkpoint's own: _load_checkpoint parses it
+        # out of global_step_<N> and assigns self.global_steps, so a checkpoint
+        # scored after the fact lands on the training run's x-axis rather than at 0.
+        val_only = self._is_val_only()
+        if self._should_validate_before_training():
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
+            if val_only:
                 return
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="OPD-offpolicy Training")

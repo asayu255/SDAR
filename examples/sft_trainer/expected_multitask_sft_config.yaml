@@ -146,6 +146,28 @@
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
 
+# ---- when validation happens -------------------------------------------------------
+# Never inside the training loop. Validation here is a full agentic rollout, not
+# this arm's loss: on the 300-step run that validated at step 150 and 300 it took
+# 3.8 h a pass, 18% of the run's 42.5 h wall clock and 68.6% of all the GPU time
+# the run left idle (measured, wandb x7g9r7bx). It is run afterwards instead, one
+# process per checkpoint, by examples/sft_trainer/eval_checkpoints.sh -- which
+# passes THIS file too, so the protocol below is the protocol the checkpoints are
+# scored under.
+#
+# Pinned rather than left with the performance knobs because it decides what a run
+# measures, and because -1 is the kind of value that gets "helpfully" restored: a
+# test_freq that quietly goes positive again silently reintroduces the 7.6 h and
+# splits the evaluation across two mechanisms.
+#
+# It also has to hold for the eval process: a val_only run returns before the
+# training loop, so any positive value there would be dead config, and pinning one
+# value for both processes keeps the two from drifting apart.
+"trainer.test_freq": -1
+# Checkpoints are the evaluation's input, so the cadence that writes them belongs
+# next to it: 300 steps at save_freq=25 gives twelve, plus the final step.
+"trainer.save_freq": 25
+
 # ---- run identity ------------------------------------------------------------------
 "trainer.total_training_steps": 300
 "trainer.project_name": verl_agent_sft_multitask

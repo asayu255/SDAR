@@ -92,6 +92,32 @@ set -x
 #   which this loop never iterates (it draws from the fixed pool), and the
 #   validation dataloader takes no sampler at all.
 #
+# VALIDATION IS NOT PART OF THIS RUN (trainer.test_freq=-1). It happens after the
+# fact, one process per checkpoint, via examples/sft_trainer/eval_checkpoints.sh.
+#
+# The reason is measured, on the 300-step run that used test_freq=150 (wandb
+# x7g9r7bx, 42.5 h wall):
+#
+#   phase          wall     share   mean GPU util
+#   training      34.1 h    80.4%      96.5%
+#   validation     7.6 h    18.0%      46.0%   <- 2 passes, 3.8 h each
+#   checkpoint     0.7 h     1.6%       2.1%
+#   whole run     42.5 h               85.8%
+#
+# Two validations cost 7.6 h of the 42.5 h, and 68.6% of all the GPU time the run
+# left on the floor. They are that slow because validation is not this arm's loss:
+# it is a full agentic rollout (126 episodes x 3 tasks, alfworld to 50 turns),
+# whose turns alternate vLLM decode with env.step -- 42% of that window has the
+# GPUs at under 10%. Nothing about it depends on being inside the training loop:
+# it reads a checkpoint, and save_freq=25 writes twelve of them.
+#
+# Moving it out leaves the training run at a measured 96.5% for its whole length
+# and cuts 7.6 h off it, and the evaluation itself gets *more* correct: a fresh
+# process rebuilds the val envs from env.seed, so every checkpoint is scored on
+# the same episodes. Two validations in one process are not -- alfworld's
+# TextWorld game-file cycle is stateful and advances on each reset, so the second
+# pass draws different games than the first.
+#
 # DO NOT set GPU_PROFILER=1 for a real run. The profiler is entirely inert
 # without it (verl/utils/gpu_profiler.py; the phase tags in dp_actor.py return
 # immediately), but when on it starts an NVML sampler in the driver and in rank
@@ -220,7 +246,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.experiment_name=sdar_multitask_sft_multitask_qwen3_1.7b \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_sft_multitask \
     trainer.save_freq=25 \
-    trainer.test_freq=150 \
+    trainer.test_freq=-1 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"
