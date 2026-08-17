@@ -147,6 +147,18 @@ set -x
 # device synchronize at every phase boundary — which serializes work the run
 # would otherwise overlap. It is a measurement tool; leave it off and the run is
 # byte-identical to one built without it.
+#
+# TO MEASURE WHERE THE REMAINING ~1.5% GOES, run with
+#
+#   GPU_PROFILER=1 GPU_PROFILER_INTERVAL=0.2 GPU_PROFILER_TRACE=/tmp/trace.csv
+#
+# and read the traces with scripts/gpu_stall_scan.py /tmp/trace.*.csv. The glob
+# is not optional: there are two samplers, one per process, and each writes its
+# own pid-suffixed file. Do not summarise the trace by counting samples under a
+# threshold — utilization.gpu is the busy fraction of a trailing window, so a
+# stall shorter than that window never even reads 0 and time-under-a-line
+# reports a fraction of it. The scan integrates the deficit instead, which is
+# what makes a 0.2 s trace and wandb's 15 s system metrics agree.
 
 # The one variable in this file, and it is not a knob: an absolute path to this
 # script's own directory. The expectations file is read inside a Ray actor, after

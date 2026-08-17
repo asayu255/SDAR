@@ -9,6 +9,8 @@ No GPU is needed; the sampler is driven with a stub backend.
 """
 
 import importlib
+import os
+import pathlib
 import sys
 import time
 
@@ -65,21 +67,58 @@ def test_every_sample_lands_in_the_trace_with_its_phase(monkeypatch, tmp_path):
         sampler._stop.set()
         time.sleep(0.05)
 
-    rows = path.read_text().strip().splitlines()
-    assert rows[0] == "ts,clock,phase,sm_pct_per_gpu,membw_pct_per_gpu,driver_cpu_pct"
+    written = pathlib.Path(mod._trace_path_for_pid(str(path)))
+    rows = written.read_text().strip().splitlines()
+    header = rows[0].split(",")
+    assert header[:4] == ["ts", "clock", "pid", "phase"]
+    assert header[-1] == "driver_cpu_pct"
     body = [r.split(",") for r in rows[1:]]
     assert len(body) > 5, rows
+    assert all(len(r) == len(header) for r in body)
 
+    col = {name: i for i, name in enumerate(header)}
     # The phase column is the whole point: it says what the trainer was doing.
-    assert "update_actor" in {r[2] for r in body}
-    assert "step" in {r[2] for r in body}
+    assert "update_actor" in {r[col["phase"]] for r in body}
+    assert "step" in {r[col["phase"]] for r in body}
     # One column per GPU, so data-parallel imbalance stays visible.
-    assert body[0][3] == "97;97;97"
-    assert body[0][4] == "40;40;40"
-    assert body[0][5] == "55"
+    assert body[0][col["sm_pct_per_gpu"]] == "97;97;97"
+    assert body[0][col["membw_pct_per_gpu"]] == "40;40;40"
+    assert body[0][col["driver_cpu_pct"]] == "55"
+    assert body[0][col["pid"]] == str(os.getpid())
+    # Metrics this backend does not report stay empty rather than shifting the
+    # later columns along, which is what makes the file parseable by column name.
+    assert body[0][col["power_w_per_gpu"]] == ";;"
     # Monotonic timestamps, so a dip can be located against an external chart.
     stamps = [float(r[0]) for r in body]
     assert stamps == sorted(stamps)
+
+
+def test_the_trace_path_carries_the_pid_so_two_samplers_cannot_clobber(monkeypatch, tmp_path):
+    """A sampler starts in the driver AND in rank 0's worker.
+
+    Both would open one path "w" from different processes with independent file
+    offsets, and each would overwrite the other's bytes -- leaving about one
+    sampler's worth of rows stitched from two streams. Aggregate means survive
+    that; treating consecutive rows as consecutive in time does not.
+    """
+    mod = _fresh(monkeypatch, GPU_PROFILER="1")
+
+    assert mod._trace_path_for_pid("/tmp/t.csv") == f"/tmp/t.{os.getpid()}.csv"
+    assert mod._trace_path_for_pid("/tmp/t") == f"/tmp/t.{os.getpid()}.csv"
+    # different processes -> different files, which is the entire guarantee
+    assert mod._trace_path_for_pid("/tmp/t.csv") != f"/tmp/t.{os.getpid() + 1}.csv"
+
+    path = tmp_path / "trace.csv"
+    mod = _fresh(monkeypatch, GPU_PROFILER="1", GPU_PROFILER_TRACE=str(path),
+                 GPU_PROFILER_INTERVAL="0.02")
+    sampler = _sampler_with_stub(mod)
+    try:
+        time.sleep(0.08)
+    finally:
+        sampler._stop.set()
+        time.sleep(0.05)
+    assert not path.exists()                                       # never the bare name
+    assert pathlib.Path(mod._trace_path_for_pid(str(path))).exists()
 
 
 def test_a_broken_trace_file_never_takes_the_run_down(monkeypatch, tmp_path):

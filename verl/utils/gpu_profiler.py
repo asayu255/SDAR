@@ -79,13 +79,18 @@ Env vars
                                not when the GPU finished it, and the boundaries
                                smear. Exact attribution, but it serializes what
                                the run would overlap -- the totals get slower.
-  GPU_PROFILER_TRACE=<path>    also append every raw sample to this CSV
-                               (ts, clock, phase, per-GPU sm%, per-GPU memBW%,
-                               driver cpu%). The tables above are per-step
-                               aggregates reset at each boundary, so they say a
-                               gap happened and how long it was but not *when*;
-                               the trace is what lines a dip seen on an external
-                               monitor up against the phase that produced it.
+  GPU_PROFILER_TRACE=<path>    also write every raw sample to a CSV (ts, clock,
+                               pid, phase, and per-GPU sm%, memBW%, power W, SM
+                               clock, PCIe RX, NVLink). The tables above are
+                               per-step aggregates reset at each boundary, so
+                               they say a gap happened and how long it was but
+                               not *when*; the trace is what lines a dip seen on
+                               an external monitor up against the phase that
+                               produced it. The pid is inserted before the
+                               extension (``/tmp/t.csv`` -> ``/tmp/t.1234.csv``)
+                               because two processes sample -- see
+                               ``_trace_path_for_pid``. Analyse with
+                               ``scripts/gpu_stall_scan.py``.
 """
 
 import atexit
@@ -363,6 +368,34 @@ _METRICS = (
     "nvlink_mb_s",
 )
 
+# Per-GPU columns of the trace, in file order. sm/memBW came first and stay
+# first so traces written before the others existed still parse.
+_TRACE_PER_GPU = (
+    ("sm_pct_per_gpu", "sm_util", "{:.0f}"),
+    ("membw_pct_per_gpu", "mem_bw_util", "{:.0f}"),
+    ("power_w_per_gpu", "power_w", "{:.0f}"),
+    ("smclk_mhz_per_gpu", "sm_clock_mhz", "{:.0f}"),
+    ("pcie_rx_mb_s_per_gpu", "pcie_rx_mb_s", "{:.0f}"),
+    ("nvlink_mb_s_per_gpu", "nvlink_mb_s", "{:.0f}"),
+)
+_TRACE_HEADER = "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct\n"
+
+
+def _trace_path_for_pid(path: str) -> str:
+    """One trace file per process.
+
+    A sampler starts in the driver (``ray_trainer._timer``) and again in rank 0's
+    worker (``dp_actor._actor_phase``). They are different processes holding
+    different file offsets, so opening one path ``"w"`` from both makes each
+    overwrite the other's bytes: the file ends up with roughly ONE sampler's
+    worth of rows, stitched together from two streams at whatever offset each
+    had reached. Aggregate means survive that -- both samplers read the same
+    devices -- but anything that treats consecutive rows as consecutive in time
+    does not, and that is most of what a per-sample trace is for.
+    """
+    root, ext = os.path.splitext(path)
+    return f"{root}.{os.getpid()}{ext or '.csv'}"
+
 
 class _Sampler:
     def __init__(self, backend, interval, host=None):
@@ -385,12 +418,13 @@ class _Sampler:
         self._cum_steps = 0
         self._trace = None
         if _TRACE_PATH:
+            path = _trace_path_for_pid(_TRACE_PATH)
             try:
-                self._trace = open(_TRACE_PATH, "w", buffering=1)
-                self._trace.write("ts,clock,phase,sm_pct_per_gpu,membw_pct_per_gpu,driver_cpu_pct\n")
-                print(f"[gpu-profiler] per-sample trace -> {_TRACE_PATH}", flush=True)
+                self._trace = open(path, "w", buffering=1)
+                self._trace.write(_TRACE_HEADER)
+                print(f"[gpu-profiler] per-sample trace -> {path}", flush=True)
             except OSError as e:
-                print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={_TRACE_PATH}: {e}", flush=True)
+                print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={path}: {e}", flush=True)
         self._thread = threading.Thread(target=self._run, name="gpu-profiler", daemon=True)
         self._thread.start()
 
@@ -450,12 +484,14 @@ class _Sampler:
         if self._trace is None:
             return
         try:
-            sm = ";".join("" if g.get("sm_util") is None else f"{g['sm_util']:.0f}" for g in per_gpu)
-            bw = ";".join("" if g.get("mem_bw_util") is None else f"{g['mem_bw_util']:.0f}" for g in per_gpu)
+            cols = [
+                ";".join("" if g.get(key) is None else fmt.format(g[key]) for g in per_gpu)
+                for _, key, fmt in _TRACE_PER_GPU
+            ]
             cpu = (host or {}).get("cpu_pct")
             self._trace.write(
-                f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{phase},"
-                f"{sm},{bw},{'' if cpu is None else f'{cpu:.0f}'}\n"
+                f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{os.getpid()},{phase},"
+                f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'}\n"
             )
             # Flushed every row: the interesting runs are the ones that end in a
             # crash or a Ctrl-C, and a buffered tail would lose exactly those.
