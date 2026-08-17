@@ -784,8 +784,38 @@ class DataParallelPPOActor(BasePPOActor):
         # reduce_metrics would have.
         deferred_metrics = {}
 
-        def _defer(name, value):
-            deferred_metrics.setdefault(name, []).append(value.detach())
+        def _defer(name, value, weight=None):
+            deferred_metrics.setdefault(name, []).append(
+                (value.detach(), None if weight is None else weight.detach())
+            )
+
+        def _defer_task(name, loss_mat, mask):
+            """A task's token-mean for this micro-batch, deferred with its presence.
+
+            Written out rather than calling agg_loss so an absent task yields 0
+            instead of 0/0: the read at the end divides the sum of the values by
+            the number of micro-batches the task appeared in, which is the same
+            average the per-task metric has always reported -- it just no longer
+            needs the device to tell the host which micro-batches those were.
+            """
+            den = mask.sum()
+            value = (loss_mat * mask).sum() / den.clamp(min=1)
+            _defer(name, value, weight=(den > 0).to(value.dtype))
+
+        # Whether the per-task metric loop can run over ALL tasks, including the
+        # ones with no rows in this micro-batch, and so skip the device read that
+        # would say which those are. It can exactly when every metric it computes
+        # is deferred: the branches below that call .item() inside the loop would
+        # turn an empty task into a NaN, and would be paying a sync each anyway.
+        # That is the off-policy distillation shape -- distillation or SFT loss
+        # only, no policy gradient, entropy, reference KL or SD terms.
+        sync_free_task_metrics = (
+            pg_loss_coef == 0
+            and self.config.entropy_coeff == 0
+            and not self.config.use_kl_loss
+            and not self.config.get("use_sdl_loss", False)
+            and not self.config.get("use_sdar_loss", False)
+        )
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -1021,7 +1051,9 @@ class DataParallelPPOActor(BasePPOActor):
                         # separately anyway: this phase is where the backward's
                         # queued reduce-scatter tail drains.
                         with _actor_phase("actor.task_metrics"), torch.no_grad():
-                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                            for task, rows in iter_task_row_masks(
+                                task_ids, task_id_names, include_absent=sync_free_task_metrics
+                            ):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
 
@@ -1083,15 +1115,15 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    _defer(
+                                    _defer_task(
                                         f"actor/teacher_kl_loss/{task}",
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        teacher_kld[rows], task_response_mask,
                                     )
 
                                 if self.config.get("use_sft_loss", False):
-                                    _defer(
+                                    _defer_task(
                                         f"actor/sft_loss/{task}",
-                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        -log_prob[rows], task_response_mask,
                                     )
 
                                 append_to_dict(metrics, task_metrics)
@@ -1109,13 +1141,25 @@ class DataParallelPPOActor(BasePPOActor):
 
                 with _actor_phase("actor.optim"):
                     grad_norm = self._optimizer_step()
-                data = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, data)
+                # Deferred like the rest: reading it here is a host sync per
+                # optimizer step -- 71 of them a step on this arm -- for a number
+                # nothing but the logger looks at. The isfinite check inside
+                # _optimizer_step still syncs, because the branch it feeds decides
+                # whether the update is applied at all.
+                _defer("actor/grad_norm", grad_norm)
         self.actor_optimizer.zero_grad()
         # The one read for everything deferred above. torch.stack forces a single
         # host sync here instead of one per micro-batch.
-        for name, values in deferred_metrics.items():
-            metrics[name] = torch.stack(values).mean().item()
+        # One host sync for the whole call. Entries carrying a presence weight are
+        # summed and divided by how many micro-batches actually held the task,
+        # which is the mean the unweighted path took over exactly those.
+        for name, entries in deferred_metrics.items():
+            values = torch.stack([value for value, _ in entries])
+            if entries[0][1] is None:
+                metrics[name] = values.mean().item()
+            else:
+                present = torch.stack([weight for _, weight in entries])
+                metrics[name] = (values.sum() / present.sum().clamp(min=1)).item()
         if _PROFILE_STAGES:
             # One table per update_policy call. The driver's boundary phase
             # ("step") never pops in this process, so the report is asked for
