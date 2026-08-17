@@ -34,49 +34,153 @@
 
 ## 1. 最近接競合(新規性判定に直接効く4本)
 
-### 1.1 PromptSD (2607.18293) — **最近接競合。原稿の扱いが最も危険**
+### 1.1 PromptSD (2607.18293) — **最近接競合。ただし精読すると競合の実体は小さい**
 
-**正式タイトル**: *One Student, Many Teachers: Multi-Task On-Policy Distillation via Soft-Prompt Privileged Context*
+**正式タイトル**: *One Student, Many Teachers: Multi-Task On-Policy Distillation via
+Soft-Prompt Privileged Context*
+**著者**: Yingzi Ma, Zichen Zhu, Ming Jiang, Chaowei Xiao(10ページ・図5、2026-06-30 投稿)
 
-**設定**: 4タスク(Math / Science / Tooluse / Biology)。生徒1本に対しタスク別教師4本。
+#### 設定
 
-**機構**:
+- **生徒**: Qwen3-1.7B-Base(**本プロジェクトと同一モデル・同一サイズ**)+ Phi-4-mini-instruct
+- **4タスク**: Science(4択MCQ+推論, n=507)/ Tooluse(ReAct on Stable-Diffusion, n=97)/
+  Biology(SciKnowEval 4択, n=50)/ Math(MATH-500, n=500)
+- **比較対象**: SDFT / OPSD / SDPO(観測ベース)、RLVR、LoRA(r=16)、FFT、
+  Qwen-4B/8B(クロスサイズ)
+
+#### 機構
+
 教師は「**生徒と同一の凍結バックボーン + タスク別の学習可能ソフトプロンプト**」である。
-タスク $k$ の教師は $\pi_{\theta + P_k^\star}$ と書かれ、$\theta$ は生徒と共有・凍結、
-$P_k^\star$ だけが訓練される。原文の主張は
-"preserves the student's exact representational geometry"。
-FFT 教師・LoRA 教師・別モデル教師はいずれも劣る対照条件として提示されている。
+$L \times d$ の連続埋め込み $P$ を入力に前置し、
 
-つまり**転移の源泉は「教師と生徒が同じ表現空間を共有していること」= coverage 型**である。
+$$\pi_{\theta+P}(\cdot \mid x) = \pi_\theta\big(\cdot \mid [P; E(x)]\big)$$
+
+$\theta$ は**完全凍結**で、$P$ だけを SFT で学習する:
+
+$$\mathcal{L}_{\text{PT}}(P) = -\mathbb{E}_{(x,y)\sim\mathcal{D}}\big[\log \pi_{\theta+P}(y\mid x)\big]$$
+
+蒸留は生徒自身のロールアウト上の reverse KL:
+
+$$\mathcal{L}_{\text{OPD}}(\theta) = \mathbb{E}_{x,\,Y_s\sim\pi_\theta}\Big[\textstyle\sum_t \mathrm{KL}(p_t \| q_t)\Big]$$
+
+マルチタスクは**タスクタグ $k$ による教師ルーティング**である:
+
+$$\mathcal{L}^{\text{multi}}_{\text{OPD}}(\theta) = \mathbb{E}_{(x,y,k),\,Y_s}\Big[\textstyle\sum_t \mathrm{KL}\big(p_t \| q_t^{(k)}\big)\Big]$$
+
+**2段階プロトコル**: Phase A でソフトプロンプトを学習(2000 step, lr 5e-3)→
+Phase B で凍結教師に対して OPD(600 step, lr 1e-5)。
+**推論時はプロンプトを全部捨てて $\pi_\theta$ 単体をデプロイする。**
+
+**ソフトプロンプトを選ぶ理由**(原文):
+> "PT occupies a uniquely favorable position for OPD: it trains a small set of continuous
+> embeddings prepended to the input while leaving all transformer weights frozen. ...
+> the soft prompt $P$ acts as a parametric form of observation, expressed in continuous
+> embedding space rather than discrete tokens, while keeping the transformer weights
+> identical to the student's."
+
+FFT / LoRA を退ける論拠は **off-manifold drift**:
+> "the same $\Delta W$ that enables capability absorption also perturbs the teacher's
+> distribution on out-of-task inputs, which the student inherits as catastrophic forgetting."
+
+つまり**教師は生徒の「自分自身 + 特権文脈」であり、OPSD(自己蒸留)の系譜に属する。**
 明示的な転移注入機構(重み・ゲート・合成)は持たない。
 
-**数値**:
-- Math: 単一タスク OPD 51.0% → マルチタスク 67.2%(**+16.2pp**)。ベースは 16.4%
-- **leave-one-teacher-out**: Math の教師とデータを**両方**除外しても Math 61.0%
-  → 他タスクの教師だけで対象タスクが大幅向上する直接証拠
-- ただし転移は一様に正ではない: Tooluse **−3.1**、Biology **−8.0**(マルチ vs 単一タスク OPD)
+#### 数値 — ここが決定的に重要
 
-**逐語引用**(原稿で使える):
-> "Multi-task exposure thus provides **positive cross-task transfer**: jointly training on
-> Science, Tooluse, and Biology rollouts reinforces the reasoning and instruction-following
-> Math latently requires"
+**単一タスク(Qwen3-1.7B-Base, Table 1)**
 
-**本研究との距離**:
+| | Science | Tooluse | Biology | Math | 平均 |
+|---|---|---|---|---|---|
+| Base | 29.3 | 7.2 | 32.0 | 16.4 | 21.2 |
+| OPD (PT) 単一タスク | 51.0 | **51.5** | **62.0** | 51.0 | 53.9 |
+| OPD (FFT) | 52.0 | 55.7 | 38.0 | 47.0 | 48.2 |
+| OPD (LoRA) | 49.3 | 18.6 | 28.0 | 55.4 | 37.8 |
+| **PromptSD(多タスク)** | **55.3** | 48.4 | 54.0 | **67.2** | **56.2** |
+
+**leave-one-teacher-out(Table 11)** — 対象タスクの**教師とデータを両方**除外し、
+残り3タスクだけで訓練したときの対象タスク性能:
+
+| タスク | Base | Cross-task only | **転移分** | 単一タスク OPD(PT) | PromptSD | 多−単 |
+|---|---|---|---|---|---|---|
+| Science | 29.3 | 34.3 | +5.0 | 51.0 | 55.3 | +4.3 |
+| Tooluse | 7.2 | **7.2** | **0.0** | 51.5 | 48.4 | **−3.1** |
+| Biology | 32.0 | 34.0 | +2.0 | 62.0 | 54.0 | **−8.0** |
+| Math | 16.4 | **61.0** | **+44.6** | 51.0 | 67.2 | **+16.2** |
+
+**読み方: 「正の跨タスク転移」は実質 Math 1タスクの現象である。**
+Tooluse の cross-task only は 7.2 で**ベースと完全に同値=転移ゼロ**、
+Biology +2.0、Science +5.0 はいずれも誤差帯。4タスク中3タスクでは転移していない。
+しかも多タスク化で Biology は **−8.0**、Tooluse は **−3.1** と**劣化**している。
+
+#### 著者自身の解釈 — elicitation であって injection ではない
+
+著者はこの非対称性を認識しており、**capability-injection と elicitation の二分法**で説明している。
+
+> "Only math is elicited."
+> "Math behaves as a **latent pretraining capability** that on-policy co-training on other
+> reasoning tasks **surfaces, rather than a skill that must be distilled**."
+
+つまり著者の主張は「他タスクの知識が Math に**移った**」ではなく、
+**「事前学習で既にあった Math 能力が、他タスクの共同訓練で表に出た」**である。
+Base 16.4 → cross-task only 61.0 という跳ね方も、注入というより解放と読むのが自然。
+
+これは本研究の **coverage / override** の二分法とほぼ同じ切り分けであり、
+**PromptSD の転移は coverage 型(というより elicitation 型)である**という
+こちらの位置づけを著者自身が裏書きしている。
+
+#### 著者が明示的に開けたままにしている穴
+
+(a) **どのタスク対で転移するかの予測則を与えていない。**
+capability-injection か elicitation かの事後的な二分法だけで、
+タスク対の親和性の体系的分析は無い。
+
+(b) **agentic 設定は範囲外。**Limitations に逐語:
+> "our four tasks ... do not yet cover open-ended generation, multilingual, **agentic**, or
+> multimodal settings, where the **capability-injection vs. elicitation distinction may take
+> different forms**."
+
+(c) **教師を増やすと特権文脈どうしが干渉しうる**と認めている:
+> "further scaling to many task-specific PT teachers may surface interference between
+> privileged contexts."
+
+(d) 生徒・教師とも同サイズ帯のみ(7B–70B は open question)。
+
+**(a) と (b) がそのまま本研究の入り口になる。**
+
+#### 本研究との距離
 
 | | PromptSD | 本研究 |
 |---|---|---|
-| 教師の作り方 | 同一凍結バックボーン + ソフトプロンプト | **独立に RL 訓練した単一タスク ckpt** |
-| 転移経路 | 共有表現(暗黙) | **教師間 policy shift の符号一致(明示)** |
+| 教師の作り方 | 同一凍結バックボーン + ソフトプロンプト(**自己蒸留**) | **独立に RL 訓練した単一タスク ckpt(異種教師)** |
+| 転移経路 | 共有表現 / 特権文脈(暗黙) | **教師間 policy shift の符号一致(明示)** |
+| 転移の型 | 著者いわく **elicitation**(潜在能力の顕在化) | **override**(他タスクの獲得内容の注入)を狙う |
 | 転移の制御 | 不可(混ぜれば起きる/起きない) | **候補ごとに増幅/減衰を選べる** |
-| 主張 | 「転移が起きた」 | **「どのタスク対で起き、どこで起きないかを事前に測れる量で予測する」** |
+| ドメイン | MCQ / 数学 / 単発ツール呼び出し | **長軌跡 agentic(著者が範囲外と明記した領域)** |
+| 主張 | 「4タスク中1タスクで転移が起きた」 | **「どのタスク対で起き、どこで起きないかを事前に測れる量で予測する」** |
 
-**原稿での書き方**:
-> PromptSD は多タスク OPD で正の跨タスク転移を報告した唯一の研究だが、
-> その教師は生徒と同一の凍結バックボーンにソフトプロンプトを付したものであり、
-> 転移は共有表現に由来する。独立に訓練された異種教師間で転移を起こす機構ではない。
+#### 原稿での書き方(推奨)
 
-⚠️ **原稿の現行記述「単OPSD手法でMOPD手法ではない」は誤り。**タイトルに Many Teachers と
-Multi-Task が入っている。ここを間違えると新規性主張ごと崩れる。
+> PromptSD は多タスク OPD で正の跨タスク転移を報告した唯一の研究である。
+> ただしその教師は生徒と同一の凍結バックボーンにソフトプロンプトを付した**自己蒸留**構成であり、
+> 転移が観測されたのは4タスク中 Math のみで、著者自身もこれを
+> 「潜在能力の elicitation であって注入ではない」と位置づけている
+> (leave-one-teacher-out で Tooluse はベースと同値、Biology・Science も誤差帯)。
+> また **agentic 設定は明示的に範囲外**とされ、どのタスク対で転移するかの予測則も与えられていない。
+> 本研究は独立に RL 訓練された異種教師間で、長軌跡 agentic タスクを対象に、
+> 転移の有無を事前に測れる量で予測することを目指す点で異なる。
+
+⚠️ **原稿の現行記述「単OPSD手法で、MOPD手法ではない」について。**
+「OPSD」という分類は**実は正しい**(教師=生徒+特権文脈の自己蒸留)。
+誤りは「**単**」の部分と「MOPD手法ではない」の部分で、
+タスクタグ $k$ による教師ルーティングを持つ**多教師・多タスク**構成である。
+訂正版: 「PromptSD は自己蒸留型の教師を多タスクにルーティングする手法であり、
+独立に訓練された異種教師を扱うものではない」。
+
+📌 **なお PromptSD は SDAR アーム(`festive-gates`)とも同族である。**
+どちらも「教師 = 生徒 + 特権文脈」の OPSD であり、
+違いは特権文脈が**連続(ソフトプロンプト)か離散(自然言語スキル)か**だけ。
+`docs/multitask_two_channel_proposal.md` のチャネル2側は PromptSD と正面から競合するので、
+そちらへピボットする場合はこの点を先に整理すること。
 
 ---
 
