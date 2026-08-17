@@ -25,7 +25,7 @@ arm 間で横並び比較してはいけない。** 比較すべきは task succ
 | GPU | tamago の 2 GPU（`trainer.n_gpus_per_node=2`）。**NVLink 無し、PCIe のみ** |
 | モデル | Qwen/Qwen3-1.7B（student）＋ 単一タスク RL の teacher 3 体 |
 | FSDP | ZeRO-2（`sharding_strategy=shard_grad_op`）、`no_sync_grad_accum=True`、`forward_prefetch=True` |
-| バッチ | `ppo_mini_batch_size=60`、`ppo_micro_batch_size_per_gpu=5`、`log_prob_micro_batch_size_per_gpu=16` |
+| バッチ | `ppo_mini_batch_size=60`、`ppo_micro_batch_size_per_gpu=5`、`ref.log_prob_micro_batch_size_per_gpu=16`（**現行は 4**。この表は計測当時の値で、⑩ で下げた ―― 5 節⑩） |
 | 系列長 | prompt 最大 4096 / response 最大 512（合計 4608） |
 | 損失 | per-task teacher-KL のみ（`topk_kl`, k=20）。`pg_loss_coef=0` / `entropy_coeff=0` / `use_kl_loss=False` を `main_opd` が強制注入 |
 | 1 step の規模 | 6,880〜7,200 行（`adjust_batch` 後） |
@@ -765,7 +765,7 @@ last enqueued work: rank1 138581 / rank0 138580   ← ちょうど 1 collective 
 chunk を落として得たものは何も無く、失ったのは 30 分と、OOM も chunk も指さない
 timeout traceback だけが残った状態である。
 
-**教訓は 2.4 節・8 節⑧と同じ形の三度目。**「理論上落としてよい」と「この配置で落としてよい」は
+**教訓は 2.4 節・⑧と同じ形の三度目。**「理論上落としてよい」と「この配置で落としてよい」は
 別。判定軸は **driver 側で起きたか worker 内で起きたか**で、後者は例外なく致命的
 （この経路の worker 呼び出しは全て FSDP forward を通る）。`RayTaskError` /
 `ActorDiedError` を re-raise するよう修正し、mutation test で回帰を確認した。
@@ -781,10 +781,22 @@ timeout traceback だけが残った状態である。
 **4 に下げて上界を構造的にした。** `data.max_response_length=512` は pin 済みの
 ハードキャップなので、4 行は **最大 2,048 response token = 1.16 GiB**（logsumexp の
 一時バッファと合わせて約 2.3 GiB）を超えられない。これ以上応答が伸びても壊れない
-――そして伸びは止まっていない。teacher は SHARD_GRAD_OP で micro-batch 間に reshard
-しないため、分割を細かくしても all-gather は増えず、コストはループ overhead だけ。
-除数にも入らない（`size_divisor_ref` は `use_kl_in_reward` / `actor.use_kl_loss` が
-両方 False のとき rollout 側の値にフォールバックする）。
+――そして伸びは止まっていない。除数にも入らないので値は動かない
+（`size_divisor_ref` は `use_kl_in_reward` / `actor.use_kl_loss` が両方 False のとき
+rollout 側の値にフォールバックする）。
+
+**ただし「コストはループ overhead だけ」と書いたのは、また外れた。** teacher は
+SHARD_GRAD_OP で micro-batch 間に reshard しないので all-gather は確かに増えないが、
+再開後の run で測ると **`perf/throughput` が 4565 → 4474（−2.0%）**、増分は全額が
+`tchWait` の 15.6 → 26.4 s/step だった（`preproc` / `gen` / `decode` / `envstep` /
+`update_actor` はいずれも不動、`hit_rate` も 0.978 → 0.974 で不動）。同じ行を prefetch で
+採点したまま採点が遅くなり、glue 窓（約 48 s）が既に埋まっていたので逃げ場が無かった、
+という形である。
+
+**`timing_s/teacher_forward` を見てこのノブを値付けしてはいけない**（+0.7 s しか動かない）。
+prefetch 導入後、この列は glue に隠しきれなかった残りしか持っていない。③・⑨ と同じ形
+――**指標が何を測っているかの読み違い**であって、値そのものは正しかった。表と取り戻す手は
+`docs/speedup_mechanisms.md` 7 節。
 
 ---
 

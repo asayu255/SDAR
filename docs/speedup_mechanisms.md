@@ -10,7 +10,10 @@
    なぜ精度が変わらないのか、そして**どこには効かないのか**を、コード位置つきで書く
    （2 節・3 節）。`docs/optimization_report.md` は結果の表であって、機構の中身は書いていない。
 
-新しい計測や新しい主張は含まない。数値はすべて下記の 3 文書からの引用である。
+1〜6 節に新しい計測や新しい主張は含まない。数値はすべて下記の 3 文書からの引用である。
+**7 節だけが例外で、そこには新しい計測がある** ―― step 18 の障害対応で入れた 2 機構と、
+その実測コストである。速度を上げた機構ではないが、rollout の内訳を実際に動かしたので、
+稼働中の機構として同じ場所に置く。
 
 | 文書 | 範囲 |
 |---|---|
@@ -65,6 +68,11 @@
 | chunk サイズの glue 追従 | `ROLLOUT_PREFETCH_TEACHER_ADAPTIVE=1`（既定 on） | 5 | 値に触れない |
 | **response-only `lm_head`** | `actor.response_only_logits=True` / `ref.response_only_logits=True` | 5 | **ビット非同一**（GEMM 形状） |
 | 死んだ sampled-token log-prob の削除 | コード（`pg_loss_coef=0` ＋ topk_kl のときのみ） | 5 | 値不変（未使用値の削除） |
+| prefetch chunk の worker 側失敗を致命化 | コード（常時） | 6 | 値に触れない（失敗時のみ） |
+| teacher forward の行数上限 | `ref.log_prob_micro_batch_size_per_gpu=4` | 6 | ビット同一 |
+
+**teacher の下 2 行は速度機構ではない**（**遅くする**）。step 18 で run を殺した 2 つの欠陥の
+修正で、rollout の内訳を実際に動かしたので同じ表に置いてある。機構と実測コストは 7 節。
 
 **actor update**
 
@@ -635,7 +643,7 @@ actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 actor_rollout_ref.ref.fsdp_config.param_offload=False
 actor_rollout_ref.ref.fsdp_config.sharding_strategy=shard_grad_op
 +actor_rollout_ref.ref.response_only_logits=True
-actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8      # メモリ上限。速度ノブではない
+actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4      # メモリ上限（7 節）。速度は下がる
 +actor_rollout_ref.rollout.enable_prefix_caching=True
 +actor_rollout_ref.rollout.return_rollout_log_probs=False       # drift 検査を回す arm では True
 actor_rollout_ref.rollout.disable_log_stats=False              # 計測。vLLM 内部統計を出す
@@ -654,7 +662,7 @@ intent lock に入れないという規則の例外として
 ---
 ## 6. 数値の読み方
 
-この一連の作業で 3 回同じ形の誤りを踏んだので、結論だけ書いておく。詳細は
+この一連の作業で 4 回同じ形の誤りを踏んだので、結論だけ書いておく。詳細は
 `gpu_profiling_report_opd.md` 5 節。
 
 1. **`s/step` は指標にならない。** run ごとに step あたりのトークン量が最大 43% 違う。
@@ -668,3 +676,107 @@ intent lock に入れないという規則の例外として
    `tchWait` は機構が動いている証拠にはなるが、どれだけ速くなったかではない。両方要る。
    そして少数 step の測定を「速くなった量」として報告してはいけない（2 点で +20% と述べ、
    49 点で +8.2% に落ち着いた例がある）
+4. **phase 列は、機構を 1 つ入れるだけで意味が変わる。** `timing_s/teacher_forward` は
+   prefetch を入れる前は teacher のコスト全部だったが、入れた後は **glue に隠しきれなかった
+   残りしか持っていない**。この列だけ見て teacher の micro-batch を「ほぼ無料」と値付けし、
+   実測すると 2.0% だった（7.3 節）。ノブを値付けする前に、そのコストが今どの列に入るのかを
+   確かめること ―― 名前は変わらないまま中身が移る
+
+---
+
+## 7. 追加機構 2 件 —— teacher prefetch の失敗経路と teacher forward の行数上限
+
+**両方とも速度機構ではない。片方は速度に中立、もう片方は測って 2.0% 遅い。**
+それでもここに書くのは、(a) rollout の内訳（`tchWait`）を実際に動かしたので 2 節・6 節の
+数字の読み方に直接関わること、(b) 「teacher の micro-batch を細かくしてもコストはループ
+overhead だけ」という**この文書の前提だった見積りが、実測で外れた**ことによる。
+
+経緯は `gpu_profiling_report_opd.md` 5 節⑩。300 step の run が step 18 で死んだとき、
+独立した欠陥が 2 つ同時に露出した ―― teacher prefetch chunk の OOM と、その OOM を
+握り潰した設計である。以下はその 2 つに対応する。
+
+### 7.1 worker 側で起きた prefetch 失敗を致命化する
+
+`_join_teacher_prefetch`（`agent_system/multi_turn_rollout/rollout_loop.py`）は、chunk が
+上げた例外を握り潰して rollout を継続していた。設計根拠は「取りこぼした行は
+`compute_teacher_log_probs` が serial 経路で再計算し、completeness guard が残りを検出する。
+**値は同一**だから、step を殺す方が高くつく」。
+
+値の議論としては正しい。**collective の議論としては誤り**だった。この経路の worker 呼び出しは
+すべて FSDP forward を通るので、worker 内の例外は「ある rank が all-gather から抜けた」を
+意味する。他の rank は abort しない ―― NCCL watchdog の 30 分を待ってから死ぬ。実際に
+step 18 で `SeqNum` が rank 間で 1 ずれ、1,800,001 ms 後に run ごと落ちた。
+
+修正は判定軸を 1 本入れただけである。
+
+| 例外の出どころ | 扱い | 根拠 |
+|---|---|---|
+| driver 側 | 従来どおり印字して drop | プロセスグループは無傷。serial 経路が同じ値を再計算する |
+| worker 内（`RayTaskError` / `ActorDiedError` / `ActorUnavailableError`） | **即 raise** | rank が collective を抜けている。再計算では直らない |
+
+型は `ray.exceptions` から**名前で遅延解決**する（版によって定義が違い、ray 非依存の CPU
+テストに import を持ち込まないため）。解決できなければ空タプルになり、`except ()` は何にも
+マッチしないので従来の挙動に落ちる。
+
+**速度への影響はゼロ**（正常系では 1 度も通らない）。回帰テストは
+`tests/ray_cpu/test_teacher_chunk_adaptive.py` に 3 件追加してある（worker 側 OOM /
+worker 死亡 / 型解決が plain な例外を拾わないこと）。新しい `except` 節を `except ()` に
+差し替える mutation を当てると、**その致命化 2 件だけが落ちて他は通る** ―― テストが
+実際にこの分岐を見ていることの確認である。
+
+### 7.2 teacher forward の行数上限を 16 → 4
+
+`compute_ref_topk_log_prob` の lm_head が作る `(n_resp, 151936)` fp32 が step 中で最も
+広い割り当てで、micro-batch は**行数**で切られている（`log_prob_use_dynamic_bsz=False`）。
+16 行は step 1 の応答長 139.1 を前提にした値で、学習が進んで応答が伸びると上界も伸びた
+――step 18 で mean 257.0 / clip 22.2%、16 × ~417 token → 3.77 GiB を 3.49 GiB free に
+要求して OOM した。
+
+4 にすると上界が**構造的**になる。`data.max_response_length=512` は pin 済みなので
+4 行は最大 2,048 response token = 1.16 GiB、logsumexp の一時バッファと合わせて約 2.3 GiB を
+超えられない。以後の応答長の伸びで壊れない。`adjust_batch` の除数にも入らないので
+（`size_divisor_ref` は `use_kl_in_reward` / `actor.use_kl_loss` が両方 False のとき rollout
+側にフォールバックする）、padding も落とす行も動かない ―― **ビット同一**。
+
+### 7.3 実測コスト —— 2.0%、全額が `tchWait`
+
+**16 行の run（step 18 で死亡）と 4 行の run の、step 1〜18 の平均**。同一 seed・同一データで、
+step あたりトークン量も 4,597,659 → 4,589,489（−0.2%）とほぼ揃っているので、6 節 1 の
+「`s/step` は指標にならない」に抵触せずに両方を並べられる区間である。
+
+| 指標（step 1〜18 平均） | 16 行 | 4 行 | 差 |
+|---|---|---|---|
+| `perf/throughput` | 4565 | 4474 | **−2.0%** |
+| `timing_s/step` | 502.8 | 512.5 | +9.6 s |
+| rollout TOTAL | 243.7 | 253.7 | +10.0 s |
+| ├ `preproc` | 22.2 | 22.1 | −0.1 s |
+| ├ `gen` | 179.9 | 178.9 | −1.0 s |
+| ├ **`tchWait`** | **15.6** | **26.4** | **+10.8 s** |
+| ├ `decode` | 1.8 | 1.8 | ±0 |
+| └ `envstep` | 24.3 | 24.5 | +0.2 s |
+| `timing_s/update_actor` | 249.7 | 248.7 | −1.0 s |
+| `timing_s/teacher_forward` | 1.10 | 1.81 | +0.7 s |
+| `teacher_prefetch/hit_rate` | 0.978 | 0.974 | ±0 |
+| `genGPU%`（全ターン平均） | 72.7 | 71.2 | −1.5 pt |
+| `perf/mfu/actor` | 0.27 | 0.27 | ±0 |
+
+**増分は 1 か所に集中している。** rollout の他 4 列も `update_actor` も動いていない
+（勾配経路に触れていないので当然）。`hit_rate` が変わらないことが効いていて、prefetch で
+採点する行数は同じまま、その採点が遅くなった分がそのまま `tchWait`（glue に隠しきれなかった
+teacher 時間）に出た、と読める。glue 窓（`preproc + decode + envstep` ≒ 48 s、両 run とも
+同じ）は 16 行の時点で既に 15.6 s の spill を出していた ―― つまり隠しきれる量を超えていた
+――ので、増えた分に逃げ場が無い。
+
+`timing_s/teacher_forward` が +0.7 s しか動いていないことに注意。**この列だけ見ると
+「ほぼ無料」に見える** ―― run script のコメントに実際そう書いてあり、それが誤りだった。
+teacher のコストは prefetch 導入以降、大半が `gen` の中に移っている。
+
+### 7.4 取り戻す手（未着手）
+
+`ref.log_prob_use_dynamic_bsz=True` ＋ `ref.log_prob_max_token_len_per_gpu` に切り替えると、
+上限が**行数ではなくトークン数**になる。4 行固定は「常に最悪ケースで割る」ので、応答が短い
+step でも 16 行相当をまとめられない分を毎 step 払っている。トークンで切れば OOM に対する
+構造的保証は同等のまま、短い step では大きくまとめられる。
+
+4.4 節の 3 候補と同じ扱いで、**3 arm 同時に入れること**。ビット同一ではない（micro-batch の
+分割が変わる）ので、片方の arm だけ変えると比較が壊れる。

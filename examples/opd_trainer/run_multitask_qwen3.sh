@@ -70,13 +70,28 @@ set -x
 #   further response-length growth can break it, which matters because the
 #   growth has not stopped -- clip_ratio went 0.010 -> 0.222 in 18 steps.
 #
-#   It costs almost nothing. The teachers are SHARD_GRAD_OP, so they do not
-#   reshard between micro-batches and smaller ones add no all-gather, only loop
-#   overhead; teacher_forward was 0.4-5.5 s of a ~500 s step. And the ref micro
-#   batch does NOT enter adjust_batch's lcm here (size_divisor_ref falls back to
-#   the rollout value unless use_kl_in_reward or actor.use_kl_loss is set, and
-#   this arm pins both False), so changing it moves no padding and no data --
-#   per-row log probs are independent under rmpad.
+#   It costs 2.0% of throughput, and that number is measured rather than
+#   estimated: over the same 18 steps of the same data, 4565 -> 4474 tokens/s.
+#   The whole of it lands in one column of the turn table -- tchWait went
+#   15.6 -> 26.4 s/step while preproc/gen/decode/envstep and update_actor all
+#   stayed put, and teacher_prefetch/hit_rate did not move (0.978 -> 0.974). So
+#   the same rows are still scored inside the rollout; scoring them just got
+#   slower, and the glue window they hide in (~48 s) was already full.
+#
+#   Do NOT read timing_s/teacher_forward to price this knob. That column moved
+#   by 0.7 s, because since the prefetch landed it only holds the rows the glue
+#   could not cover -- most of the teacher's cost is inside gen now. This
+#   comment used to say the knob "costs almost nothing" on exactly that basis.
+#   docs/speedup_mechanisms.md section 7 has the full table, and section 7.4 the
+#   way to get the 2% back (a token-based bound via ref.log_prob_use_dynamic_bsz,
+#   which needs all three arms changed together).
+#
+#   What it does NOT cost: any change to a value. The teachers are SHARD_GRAD_OP,
+#   so they do not reshard between micro-batches and smaller ones add no
+#   all-gather. And the ref micro batch does NOT enter adjust_batch's lcm here
+#   (size_divisor_ref falls back to the rollout value unless use_kl_in_reward or
+#   actor.use_kl_loss is set, and this arm pins both False), so changing it moves
+#   no padding and no data -- per-row log probs are independent under rmpad.
 #
 #   rollout.log_prob_micro_batch_size_per_gpu is 10, and it is NOT a throughput
 #   knob here at all: this arm has no old_log_prob phase, so compute_log_prob is
