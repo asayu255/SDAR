@@ -856,7 +856,68 @@ response-only 化（teacher 側の lse/topk/gather）が
 2.5 節）を前後で比べて確定させること。** 活性が減るぶん micro=5 → 10 に
 戻せる可能性があり、そちらの方が効果として大きいかもしれない。
 
-### 9.8 次に残っているもの
+### 9.8 adjust_batch まわり —— 直したものと、判断待ちのもの
+
+同じ照合で `adjust_batch` に関する指摘が 2 件出た。片方は潜在的なクラッシュ、
+もう片方は**実測 2.77% の無駄**だが run の同一性に触る。
+
+#### 直した: ミニバッチ数を厳密除算から切り上げに
+
+`_attach_sft_loss_weights` は
+
+```python
+num_mini_batches = len(batch) / mini_batch_size
+assert float(num_mini_batches).is_integer()
+```
+
+としていた。`adjust_batch` が丸める先は
+`lcm(log_prob_micro × W, ppo_micro × W)` であって `ppo_mini_batch_size` ではない。
+**現構成（3 GPU）では divisor が 240 で 60 がこれを割り切るため、たまたま常に成立する。**
+しかし 2 GPU にすると divisor は 160 になり、60 との lcm は 480 ——
+**3 step に 1 回しか成立しない**。pure OPD arm はこれで step 2 で落ちている。
+
+短いミニバッチで終わること自体に問題はない。`update_policy` は
+`batch.split(ppo_mini_batch_size)` で切るので短い末尾は通常の状態であり、
+**損失は*設定値*の `gradient_accumulation` で割られ、重みは同じ定数で掛けられる**ので
+両者は相殺し、ミニバッチは行数に関わらずその行の重み付き損失の和をちょうど寄与する。
+`num_mini_batches` が決めるのは全体のスケールだけなので、
+**そのバッチが何回の optimizer step になるか＝切り上げ**でなければならない。
+
+`math.ceil` に変えてアサートを外した。**現構成では値が変わらない**（常に厳密除算だった）。
+GPU 数やマイクロバッチを変えた瞬間にランダムな step で落ちる地雷を外しただけである。
+
+#### 判断待ち: `rollout.log_prob_micro_batch_size_per_gpu=16` が padding を作っている
+
+**この arm は `compute_log_prob` を一度も呼ばない。** トレーナのループは
+`update_actor` だけで `old_log_prob` フェーズが無く、検証も
+`recompute_log_prob: False` である。したがって
+`rollout.log_prob_micro_batch_size_per_gpu=16` の**唯一の効果は
+`adjust_batch` の divisor を決めること**で、16 × 3 = 48 と
+`ppo_micro × W` = 15 の lcm で **240** になる。
+
+`adjust_batch(mode="copy")` はその倍数まで**行を複製して埋める**。実測（x7g9r7bx）:
+
+| | 値 |
+|---|---:|
+| 実行 | 4,260.8 行/step |
+| padding | **122.4 行/step**（最大 239） |
+| 割合 | **2.77%**（最大 5.76%） |
+
+平均 122.4 ≈ 240/2 で、余りが一様に散る形と一致する。
+SFT では padding 行は重み 0 なので損失には効かないが、
+**forward と backward は満額払っている**。2.77% が完全な空回りである。
+
+`log_prob_micro_batch_size_per_gpu` を 5 に下げると divisor は 15 になり、
+padding は平均 7.5 行（0.17%）。**約 2.6% が戻る。**
+
+**ただしこれは実行しない。** どの行が複製されるかと、1 step が何回の
+optimizer step になるか（平均 74 → 72）が変わるので、`no_sync_grad_accum` や
+`response_only_logits` と同じく**データ側の pin 対象**であり、
+かつ off-policy KD arm も同じ divisor を使うので**両アーム同時に変える**必要がある。
+pure OPD arm も同じ理由でこの値を pin している（あちらは 2 GPU で 16 → 10、
+divisor 160 → 20）。**入れるかどうかは実験設計の判断なので、ここでは報告に留める。**
+
+### 9.9 次に残っているもの
 
 * **学習フェーズの 96.5%**: 残り 3.5% は step 境界と micro=5 の起動オーバーヘッド。
   2.2 節のとおり面積は小さい。

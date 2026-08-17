@@ -13,6 +13,8 @@ Covered (CPU-only; Ray / workers are bypassed):
 If the verl stack (numpy/torch/...) is not installed, the module is skipped.
 """
 
+import math
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -175,6 +177,33 @@ def _attach_weights(batch, n_real, mini_batch_size):
     metrics = {}
     trainer._attach_sft_loss_weights(batch, n_real=n_real, metrics=metrics)
     return batch.batch["sft_loss_weight"], metrics
+
+
+def test_a_short_final_mini_batch_is_allowed_and_scales_by_the_optimizer_steps():
+    """adjust_batch rounds to lcm(log_prob_micro * W, ppo_micro * W), which is not
+    in general a multiple of ppo_mini_batch_size -- on 2 GPUs that lcm is 160
+    against a mini-batch of 60, so most steps end short. The assert that used to
+    stand here fired on those and took the pure-OPD run down at step 2.
+
+    Nothing is wrong with them. update_policy splits with
+    batch.split(ppo_mini_batch_size), so the scale has to be the number of
+    optimizer steps the batch becomes -- the ceiling, not an exact quotient.
+    """
+    rows = {"alfworld": 7, "webshop": 5, "search": 4}   # 16 rows, mini-batch 6
+    batch = _weight_batch(rows, {"alfworld": 4, "webshop": 4, "search": 4})
+    assert len(batch) % 6 != 0, "the point of this test is the ragged tail"
+
+    weights, _ = _attach_weights(batch, n_real=len(batch), mini_batch_size=6)
+
+    # 16 rows at 6 per mini-batch is three optimizer steps, the last one short.
+    num_mini_batches = math.ceil(len(batch) / 6)
+    assert num_mini_batches == 3
+    row_tokens = batch.batch["response_mask"].sum(-1)
+    task_names = batch.non_tensor_batch["task_name"]
+    for task in rows:
+        sel = torch.from_numpy(np.asarray(task_names == task))
+        budget = float((weights[sel] * row_tokens[sel]).sum())
+        assert budget == pytest.approx(num_mini_batches / len(rows), rel=1e-6), task
 
 
 def test_sft_weights_give_every_task_an_equal_share():

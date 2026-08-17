@@ -25,6 +25,7 @@ Two stages, sharing all data / env / config / teacher / loss machinery with OPD:
 """
 
 import glob
+import math
 import os
 import queue
 import threading
@@ -693,12 +694,23 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         tasks = sorted({t for t in task_names[:n_real] if t is not None})
         assert tasks, "no task names on the real rows of the SFT batch"
 
+        # The batch is not in general a multiple of the mini-batch size and does
+        # not need to be. adjust_batch rounds to lcm(log_prob_micro * W,
+        # ppo_micro * W) -- 240 against a mini-batch of 60 on the 3-GPU multitask
+        # run, where 60 divides it and every batch happens to come out exact, but
+        # on 2 GPUs the divisor is 160 and only about one step in three does. The
+        # assert that used to be here fired on the others, which took the pure-OPD
+        # run down at step 2.
+        #
+        # A short final mini-batch needs no correction here: update_policy divides
+        # every mini-batch by the CONFIGURED gradient_accumulation and these
+        # weights are multiplied by the same constant, so the two cancel and a
+        # mini-batch contributes exactly the sum of its rows' weighted losses
+        # however many rows it holds. num_mini_batches only sets the overall
+        # scale, so what it has to equal is the number of optimizer steps the
+        # batch becomes -- which is what batch.split() produces, i.e. the ceiling.
         mini_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-        num_mini_batches = len(batch) / mini_batch_size
-        assert float(num_mini_batches).is_integer(), (
-            f"batch of {len(batch)} rows is not divisible by ppo_mini_batch_size "
-            f"{mini_batch_size}; the per-step loss scale would drift between steps"
-        )
+        num_mini_batches = math.ceil(len(batch) / mini_batch_size)
 
         weights = torch.zeros(len(batch), dtype=torch.float32)
         for task in tasks:
