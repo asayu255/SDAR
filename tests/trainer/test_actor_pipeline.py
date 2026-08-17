@@ -161,6 +161,76 @@ def test_depth_one_is_the_old_serial_order():
     assert events == [e for s in range(1, 7) for e in (("launch", s), ("retire", s))]
 
 
+def _run_timed(pipeline, n_steps=4, work=0.05, bookkeeping=0.01):
+    """fit()'s loop shape with the timers, so what they cover is testable.
+
+    Both settings put the work somewhere different -- with the pipeline off the
+    dispatch blocks and IS the work, with it on the wait is -- and the timers
+    have to cover it either way. The first version of this loop launched outside
+    them, which read back as timing_s/update_actor 0.000, timing_s/step 0.002 and
+    perf/throughput 7e8 on a real run.
+    """
+    import time
+    from collections import deque
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _timer(name, raw):
+        t0 = time.perf_counter()
+        yield
+        raw[name] = time.perf_counter() - t0
+
+    class _Future:
+        def get(self):
+            time.sleep(work)
+            return "out"
+
+    source = iter(range(n_steps))
+    inflight, exhausted, launch_step = deque(), False, 1
+    depth = 2 if pipeline else 1
+
+    def _launch(step):
+        nonlocal exhausted
+        try:
+            next(source)
+        except StopIteration:
+            exhausted = True
+            return False
+        if pipeline:
+            handle = _Future()          # returns at once
+        else:
+            time.sleep(work)            # blocking dispatch: the work is here
+            handle = "out"
+        inflight.append((handle, step))
+        return True
+
+    out = []
+    while not (exhausted and not inflight):
+        raw = {}
+        with _timer("step", raw):
+            with _timer("update_actor", raw):
+                while not exhausted and len(inflight) < depth:
+                    if _launch(launch_step):
+                        launch_step += 1
+                if not inflight:
+                    break
+                handle, step = inflight.popleft()
+                _ = handle.get() if pipeline else handle
+            time.sleep(bookkeeping)
+        out.append((step, raw["update_actor"], raw["step"]))
+    return out
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_the_timers_cover_the_work_in_both_settings(pipeline):
+    steps = _run_timed(pipeline)
+
+    assert [s for s, _, _ in steps] == [1, 2, 3, 4]
+    for step, update_actor, whole_step in steps:
+        assert update_actor > 0.02, f"step {step}: update_actor timer missed the work"
+        assert whole_step > update_actor, f"step {step}: step timer must contain update_actor"
+
+
 def test_back_to_back_barriers_still_drain():
     events = _run_pipeline(6, depth=2, is_barrier=lambda s: s in (3, 4))
 

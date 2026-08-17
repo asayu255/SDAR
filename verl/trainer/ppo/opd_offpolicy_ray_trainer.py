@@ -1012,41 +1012,44 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             return True
 
         launch_step = self.global_steps
-        while True:
-            # Keep one step queued behind the one running, so the workers never
-            # wait for the driver: a Ray actor starts a queued call the instant
-            # the current one returns, while dispatching from here costs the
-            # ~480 MB serialisation the GPUs would otherwise sit through. Not
-            # past a step that will touch worker state on retirement, though --
-            # see _step_has_barrier.
-            while not exhausted and len(inflight) < _ACTOR_PIPELINE_DEPTH:
-                if inflight and self._step_has_barrier(inflight[0][3]):
-                    break
-                if _launch(launch_step):
-                    launch_step += 1
-            if not inflight:
-                break
-
-            handle, batch, prep_metrics, step = inflight.popleft()
-            self.global_steps = step
+        while not (exhausted and not inflight):
             metrics = {}
             timing_raw = {}
-            is_last_step = self.global_steps >= self.total_training_steps
 
+            # Both the dispatch and the wait are inside the timers. With the
+            # pipeline off the dispatch IS the work -- update_actor blocks -- so
+            # leaving it outside would leave timing_s/update_actor and
+            # timing_s/step reading zero and perf/throughput reading nonsense.
             with _timer("step", timing_raw):
+                with _timer("update_actor", timing_raw):
+                    # Keep one step queued behind the one running, so the workers
+                    # never wait for the driver: a Ray actor starts a queued call
+                    # the instant the current one returns, while dispatching from
+                    # here costs the ~480 MB serialisation the GPUs would
+                    # otherwise sit through. Not past a step that will touch
+                    # worker state on retirement -- see _step_has_barrier.
+                    while not exhausted and len(inflight) < _ACTOR_PIPELINE_DEPTH:
+                        if inflight and self._step_has_barrier(inflight[0][3]):
+                            break
+                        if _launch(launch_step):
+                            launch_step += 1
+                    if not inflight:
+                        break
+                    handle, batch, prep_metrics, step = inflight.popleft()
+                    # Under the pipeline this waits only for what the previous
+                    # step's bookkeeping did not already cover, so the column
+                    # holds dispatch + wait rather than the work.
+                    # timing_s/update_actor_worker is what still means the work
+                    # itself across both settings.
+                    actor_output = handle.get() if _ACTOR_PIPELINE else handle
+
+                self.global_steps = step
+                is_last_step = self.global_steps >= self.total_training_steps
                 # Batch preparation (adjust_batch / response_mask / balance /
                 # token count) already happened in _prepared_batch_iter -- on the
                 # prefetch thread when it is enabled. Its balance statistics are
                 # folded in here so the logged global_seqlen/* are unchanged.
                 metrics.update(prep_metrics)
-
-                # Under the pipeline this is the WAIT, not the work: the step
-                # after this one was dispatched before we got here, so part of
-                # the compute already overlapped the previous step's bookkeeping.
-                # timing_s/update_actor_worker is the column that still means what
-                # it says across both settings.
-                with _timer("update_actor", timing_raw):
-                    actor_output = handle.get() if _ACTOR_PIPELINE else handle
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
