@@ -78,6 +78,14 @@ actor_rollout_ref:
       loss_mode: "vanilla"
     checkpoint:
       contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+      # Write the staged shards on a background thread. Only the state-dict build
+      # and the device copy stay on the training thread; measured on 3xA6000 with
+      # Qwen3-1.7B that is ~20 s of a 198 s save, the other ~178 s being pickling
+      # and disk with the GPUs at their idle floor. The bytes on disk are the same
+      # ones, written later. Requires the trainer's fit() to call
+      # _flush_pending_checkpoint, which is what publishes
+      # latest_checkpointed_iteration.txt once the write has landed.
+      async_save: False
     optim:
       lr: 1e-6
       lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
@@ -215,6 +223,7 @@ critic:
   loss_agg_mode: ${actor_rollout_ref.actor.loss_agg_mode}
   checkpoint:
     contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+    async_save: False  # see actor_rollout_ref.actor.checkpoint.async_save
 
 reward_model:
   enable: False

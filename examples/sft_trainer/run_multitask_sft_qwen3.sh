@@ -118,6 +118,19 @@ set -x
 # TextWorld game-file cycle is stateful and advances on each reset, so the second
 # pass draws different games than the first.
 #
+# CHECKPOINTS ARE WRITTEN IN THE BACKGROUND
+# (actor.checkpoint.async_save=True). A save took 198 s in the run above, of which
+# only the first ~20 s used the GPU -- building the sharded state dict and copying
+# it to host memory. For the other ~178 s the cards sat at 0.0% SM and their 28 W
+# idle floor while torch.save pickled to disk, twelve times over. The write now
+# runs on a background thread over those CPU copies, and the training loop goes
+# straight on to the next step.
+#
+# The same bytes land in the same files; what moves is when. The one visible
+# consequence is that latest_checkpointed_iteration.txt is published a step late,
+# by _flush_pending_checkpoint, because a tracker written before the shards are on
+# disk is a tracker that can name a half-written checkpoint to a resume.
+#
 # DO NOT set GPU_PROFILER=1 for a real run. The profiler is entirely inert
 # without it (verl/utils/gpu_profiler.py; the phase tags in dp_actor.py return
 # immediately), but when on it starts an NVML sampler in the driver and in rank
@@ -245,6 +258,7 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.project_name='verl_agent_sft_multitask' \
     trainer.experiment_name=sdar_multitask_sft_multitask_qwen3_1.7b \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_sft_multitask \
+    actor_rollout_ref.actor.checkpoint.async_save=True \
     trainer.save_freq=25 \
     trainer.test_freq=-1 \
     trainer.total_training_steps=300 \

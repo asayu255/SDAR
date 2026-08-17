@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import threading
 import warnings
 from typing import Optional, Union
 
@@ -28,6 +29,12 @@ from verl.utils.fs import copy_to_local, is_non_local
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_state_ctx
 
 from .checkpoint_manager import BaseCheckpointManager
+
+
+def _write_shards(writes):
+    """Pickle each ``(state_dict, path)`` to disk. No device or collective work."""
+    for state_dict, path in writes:
+        torch.save(state_dict, path)
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -46,6 +53,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             Pre-/post-processing artifact handler.
         checkpoint_contents (list[str], optional):
             Components to include; must contain 'model', 'optimizer', 'extra'.
+        async_save (bool):
+            Write the staged shards on a background thread instead of blocking
+            the training loop on them. See :py:meth:`save_checkpoint`.
     """
 
     def __init__(
@@ -55,6 +65,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin] = None,
         checkpoint_contents: Optional[list] = None,
+        async_save: bool = False,
         **kwargs,
     ):
         if checkpoint_contents is None:
@@ -72,6 +83,66 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             processing_class=processing_class,
             checkpoint_contents=checkpoint_contents,
         )
+        # Only meaningful where the state dicts are staged to CPU, which is the
+        # same condition the configs below use: with offload_to_cpu=False the
+        # shards handed to torch.save are the live device tensors, and writing
+        # them while the next step updates them would save a mix of two steps.
+        self.async_save = bool(async_save) and is_cuda_available
+        if async_save and not self.async_save:
+            warnings.warn(
+                "async checkpoint saving needs the CPU-staged state dict "
+                "(offload_to_cpu), which is only used on CUDA; saving synchronously",
+                stacklevel=2,
+            )
+        self._pending_save = None   # (thread, path) of the write still in flight
+        self._pending_error = None  # exception it died with, re-raised on the main thread
+
+    def _start_async_write(self, writes, local_path: str):
+        """Hand the staged shards to a background thread and return.
+
+        ``writes`` holds CPU copies produced by the offload_to_cpu state dict, so
+        the thread reads memory the training loop no longer touches. It runs no
+        collective and issues no device work, which is what makes it safe to run
+        beside the next step -- a barrier from here would be a second thread
+        entering NCCL and is exactly what this must not do.
+        """
+        assert self._pending_save is None, "a checkpoint write is already in flight"
+
+        def _run():
+            try:
+                _write_shards(writes)
+            except BaseException as e:  # noqa: BLE001 - re-raised on the main thread
+                self._pending_error = e
+
+        thread = threading.Thread(
+            target=_run, name=f"ckpt-write-rank{self.rank}", daemon=True
+        )
+        self._pending_save = (thread, local_path)
+        thread.start()
+
+    def wait_for_pending_save(self):
+        """Block until the background write finishes; re-raise what it caught.
+
+        Returns the path that was being written, or ``None`` if nothing was in
+        flight. Safe to call at any time, including when ``async_save`` is off.
+
+        Callers must reach this before treating a checkpoint as complete. A
+        failure that is only recorded on the writer thread would otherwise let a
+        run finish reporting success with no usable checkpoint on disk, which is
+        the failure mode this whole mechanism could plausibly introduce.
+        """
+        pending, self._pending_save = self._pending_save, None
+        path = None
+        if pending is not None:
+            thread, path = pending
+            thread.join()
+        error, self._pending_error = self._pending_error, None
+        if error is not None:
+            raise RuntimeError(
+                f"[rank-{self.rank}]: background checkpoint write failed"
+                + (f" ({path})" if path else "")
+            ) from error
+        return path
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
         """
@@ -138,6 +209,30 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         Rotates old checkpoints, keeping at most `max_ckpt_to_keep`.
 
+        With ``async_save`` the three ``torch.save`` calls run on a background
+        thread and this returns once the shards are staged. Measured on this arm
+        (3xA6000, Qwen3-1.7B, wandb x7g9r7bx) a save took 198 s, of which only the
+        first ~20 s touched the GPU at all -- building the sharded state dict and
+        copying it to host memory. The remaining ~178 s had SM at 0.0%, the memory
+        controller at 0.0% and the cards at their 28 W idle floor: pure pickling
+        and disk I/O, with the training loop blocked behind it for no reason.
+
+        What stays on this thread is what cannot leave it: ``state_dict()`` is a
+        collective and a device copy, and the barriers are NCCL collectives, which
+        must be issued from one thread in the same order on every rank. What moves
+        is only the write of tensors that are already CPU copies, so the next
+        step's updates cannot reach them.
+
+        Two obligations come with it, both on the caller:
+
+        * ``wait_for_pending_save()`` must run before anything treats the
+          checkpoint as complete -- above all before the
+          ``latest_checkpointed_iteration.txt`` that a resume reads, which would
+          otherwise be able to name a half-written directory. This method calls it
+          on entry, so the write is also drained before the rotation below deletes
+          anything and before a second save stages another copy.
+        * the process must not exit with a write in flight.
+
         Args:
             local_path: Target directory for checkpoint files.
             hdfs_path: Unused (for API compatibility).
@@ -146,6 +241,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         """
         if local_path is None:
             return
+
+        # Before the rotation below removes a directory and before this stages a
+        # second copy of the shards: at most one save is ever in flight.
+        self.wait_for_pending_save()
 
         # record the previous global step
         self.previous_global_step = global_step
@@ -180,9 +279,15 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}")
                 print(f"[rank-{self.rank}]: Saving optim to {os.path.abspath(optim_path)}")
                 print(f"[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}")
-                torch.save(model_state_dict, model_path)
-                torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
-                torch.save(extra_state_dict, extra_path)
+                writes = [
+                    (model_state_dict, model_path),
+                    (optimizer_state_dict, optim_path),  # TODO: address optimizer is None
+                    (extra_state_dict, extra_path),
+                ]
+                if self.async_save:
+                    self._start_async_write(writes, local_path)
+                else:
+                    _write_shards(writes)
 
         if self.rank == 0:
             if fsdp_version(self.model) == 1:
@@ -202,7 +307,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             model_config.save_pretrained(local_path)
             self.processing_class.save_pretrained(local_path)
 
-        # wait for everyone to dump to local
+        # wait for everyone to dump to local -- under async_save, to have *staged*
+        # it: the shards land later, and wait_for_pending_save() is what says they
+        # are there. Nothing below reads them, and the hf_model branch works off a
+        # fresh full state dict rather than the files.
         torch.distributed.barrier()
 
         if "hf_model" in self.checkpoint_contents:

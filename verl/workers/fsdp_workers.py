@@ -641,6 +641,7 @@ class ActorRolloutRefWorker(Worker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
+                async_save=self.config.actor.checkpoint.get("async_save", False),
             )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -955,6 +956,22 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def wait_for_checkpoint(self):
+        """Block until this rank's background checkpoint write has landed.
+
+        A no-op unless ``actor.checkpoint.async_save`` is on, where
+        save_checkpoint returns once the shards are staged in host memory. The
+        driver dispatches this to every rank, so the ray.get returns only when the
+        whole checkpoint is on disk -- which is the condition
+        ``latest_checkpointed_iteration.txt`` asserts, and the reason writing that
+        file has to wait for this rather than for save_checkpoint.
+
+        Raises whatever the writer thread caught, on this thread.
+        """
+        assert self._is_actor
+        return self.checkpoint_manager.wait_for_pending_save()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1210,6 +1227,7 @@ class CriticWorker(Worker):
             lr_scheduler=self.critic_lr_scheduler,
             processing_class=self.processor if self.processor is not None else self.tokenizer,
             checkpoint_contents=self.config.checkpoint.contents,
+            async_save=self.config.checkpoint.get("async_save", False),
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1283,6 +1301,15 @@ class CriticWorker(Worker):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def wait_for_checkpoint(self):
+        """Block until this rank's background checkpoint write has landed.
+
+        The critic's half of the actor method of the same name; see it for why the
+        tracker file waits on this and not on save_checkpoint.
+        """
+        return self.checkpoint_manager.wait_for_pending_save()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True):

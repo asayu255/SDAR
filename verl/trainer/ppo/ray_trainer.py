@@ -1101,10 +1101,57 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # The tracker names this step only once the shards for it are on disk. With
+        # async_save the worker call above returns while they are still being
+        # written, so publishing the step here would let a crash leave a tracker
+        # pointing at a half-written directory -- and a resume reads the tracker.
+        # _flush_pending_checkpoint is where it gets written instead; with
+        # async_save off that is right here, unchanged.
+        self._pending_checkpoint_step = self.global_steps
+        if not self._async_checkpoint_save():
+            self._flush_pending_checkpoint()
+
+    def _async_checkpoint_save(self):
+        """Whether any worker's checkpoint write can still be in flight on return."""
+        return bool(
+            OmegaConf.select(self.config, "actor_rollout_ref.actor.checkpoint.async_save", default=False)
+            or (self.use_critic and OmegaConf.select(self.config, "critic.checkpoint.async_save", default=False))
+        )
+
+    def _flush_pending_checkpoint(self):
+        """Wait for the background checkpoint write, then publish the tracker.
+
+        Call this after the step's compute rather than before it: the write is
+        what the compute is meant to hide, and joining first would hand back
+        exactly the time async_save saves. Measured, the write is ~178 s of a
+        ~415 s step, so by the end of the next step it has long finished and this
+        costs nothing.
+
+        A trainer that enables async_save without calling this still stays
+        correct: the next _save_checkpoint joins before staging, so the tracker
+        lags a save interval instead of a step. It must still be called once more
+        after the loop, or the last checkpoint is never published.
+        """
+        step = getattr(self, "_pending_checkpoint_step", None)
+        if step is None:
+            return
+        # Only where a write can be outstanding. Kept off the synchronous path so
+        # that it stays what it was, down to the round trips -- and so that a
+        # worker group without this method (megatron) is never asked for it.
+        if self._async_checkpoint_save():
+            # Dispatched to every rank, so this returns only when all of them have
+            # finished writing -- and re-raises on this thread anything a writer
+            # thread caught, which would otherwise let the run end reporting
+            # success with no usable checkpoint.
+            self.actor_rollout_wg.wait_for_checkpoint()
+            if self.use_critic:
+                self.critic_wg.wait_for_checkpoint()
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
+            f.write(str(step))
+        self._pending_checkpoint_step = None
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

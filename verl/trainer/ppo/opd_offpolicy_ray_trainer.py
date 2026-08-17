@@ -914,6 +914,14 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
+                # Publish the previous step's checkpoint, now that update_actor has
+                # given its background write a whole step to land in (~178 s of
+                # writing against a ~415 s step). Here rather than before
+                # update_actor because the point is to overlap the two: joining
+                # first would give back exactly what async_save saves. A no-op
+                # unless actor.checkpoint.async_save is on and a save is pending.
+                self._flush_pending_checkpoint()
+
                 # Checkpoint before validating, the reverse of the on-policy loop.
                 # Neither touches the weights, so the checkpoint still holds exactly
                 # what gets evaluated -- but validation is the far more failure-prone
@@ -949,4 +957,14 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             if is_last_step:
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
-                return
+                break
+
+        # The last step saves and then leaves the loop, so nothing else would ever
+        # publish that checkpoint. This is the one flush that is allowed to block:
+        # there is no next step to hide the write behind.
+        #
+        # Deliberately not in a finally. A run that dies here leaves the tracker
+        # naming the previous checkpoint, which is the outcome to want -- the
+        # shards of the current one may be half-written, and an exception raised
+        # while unwinding another would bury the failure that actually stopped it.
+        self._flush_pending_checkpoint()
