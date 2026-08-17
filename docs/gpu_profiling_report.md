@@ -792,7 +792,71 @@ pickle 律速ならスレッドが GIL を握る時間が長く、`OFFPOLICY_BAT
 また、この 36 分は `save_freq` を 25 → 50 にしても半減する。そちらは無改造だが
 resume 粒度と評価点が減る。
 
-### 9.7 次に残っているもの
+### 9.7 pure OPD arm から移した 3 機構
+
+`claude/pure-opd-multitask` の `docs/speedup_mechanisms.md` と照合したところ、
+**あちらで稼働しているのにこちらに無い機構が 3 つ**あった。teacher 系や
+`old_log_prob` 依存のものは SFT には該当しないが、この 3 つは該当する。
+
+#### `actor.response_only_logits`（最大。学習ステップに効く）
+
+`_forward_micro_batch` が返すものは**すべて** `[:, -response_length-1:-1]` に
+切られる。`use_remove_padding=True` なので transformer 本体のパディングは既に
+除かれているが、**`lm_head` は packed された全トークンに対して
+`(rows, 151936)` を作り、その 75.7% を捨てていた**（prompt 平均 662.8 /
+response 平均 212.6、4 節）。forward と backward の両方で、しかも step 中で
+最大の活性テンソルである。
+
+`logits_to_keep` に**行番号のテンソル**を渡すと HF が
+`slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep`
+で解決するので、lm_head だけを応答行に絞れる。transformer 本体は全トークンを
+見たまま（因果 attention なので応答位置は prompt の KV を読む）。
+
+**精度は「同じ演算・違う GEMM 形状」。** lm_head は位置ごとの線形写像なので、
+行を選ぶのが射影の前でも後でも値は同じ。ただし GEMM の形が変わるので
+最下位ビットは micro-batch を変えたときと同じように動く。
+したがって `expected_multitask_sft_config.yaml` に pin した ——
+`no_sync_grad_accum` を pin したのと同じ理由である。
+
+**これは性能ノブである以上に arm 間の一貫性の問題だった。** pure OPD arm は
+これを本番構成で有効にし、intent lock で `true` に固定している。SFT arm に
+無い状態では、**「SFT と KD は損失以外すべて同一」という run script の主張が
+成り立っていなかった**。あちらの文書も「so it goes into every arm at once」と
+書いている。
+
+#### `rollout.return_rollout_log_probs=False`（評価プロセスに効く）
+
+vLLM に sampled token の log-prob を要求し、生成トークンごとの Python ループで
+列を組み立てていた。**唯一の消費者は `RayPPOTrainer.fit` の
+rollout-vs-actor drift 検査**で、この arm の薄いループには比較対象の
+`old_log_prob` フェーズが無い。作って捨てていた。
+生成トークン自体は変わらない。drift 検査を回す arm では `True` のままにすること。
+
+#### rollout session 中の `empty_cache` 抑止（評価プロセスに効く）
+
+`generate_sequences` の末尾の `empty_cache()` が session 判定の外にあり、
+vLLM を起こしたままにする ① を入れてもなお**毎ターン走ってデバイス同期を
+強制していた**（1 rollout に約 50 回）。しかも vLLM の KV は解放できない
+（エンジンが所有しており、`empty_cache` が返すのは*未使用*ブロックだけ）。
+session 機構はこちらにもあったのに、この抑止だけが抜けていた。
+
+#### 併せて `flops_counter` に RTX PRO 6000 Blackwell を追加
+
+A6000 は追加済みだった（`3d21864`）が Blackwell が無く、そのホストで回すと
+2.5 節と同じ形で `perf/mfu/actor` がまた `0.000` になる。
+
+#### 未計測であることの明示
+
+**3 つとも、この arm では効果を測っていない。** 移植元の pure OPD arm では
+response-only 化（teacher 側の lse/topk/gather）が
+**ピークメモリ 121.2 → 93.9 GB** を出しているが、それは別の機構
+（同じ「応答行だけ」の考え方を top-k KL に適用したもの）の数字であり、
+`lm_head` 版の単独計測ではない。こちらでの効果は
+**`actor.fwd` / `actor.bwd` の時間と `max_memory_allocated`（`nvidia-smi` を正とする、
+2.5 節）を前後で比べて確定させること。** 活性が減るぶん micro=5 → 10 に
+戻せる可能性があり、そちらの方が効果として大きいかもしれない。
+
+### 9.8 次に残っているもの
 
 * **学習フェーズの 96.5%**: 残り 3.5% は step 境界と micro=5 の起動オーバーヘッド。
   2.2 節のとおり面積は小さい。

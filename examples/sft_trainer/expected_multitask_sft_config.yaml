@@ -81,6 +81,15 @@
 # arms may adopt it independently (it does not interact with the loss); measured
 # at -45 s of a 415 s step here, at the cost of holding the unsharded gradient.
 "actor_rollout_ref.actor.no_sync_grad_accum": true
+# response_only_logits is pinned for the same reason. Restricting lm_head to the
+# response rows computes exactly the values the full projection did -- lm_head is
+# per-position, so selecting before or after it is the same arithmetic -- but the
+# GEMM changes shape, which moves the last bits like a micro-batch change does.
+# Unlike the two above it is NOT a free choice per arm: it sits on the gradient,
+# and the pure-OPD arm pins it true (examples/opd_trainer/expected_multitask_config
+# .yaml on claude/pure-opd-multitask), so an arm that left it off would differ from
+# the arm it is compared against in something other than the loss.
+"actor_rollout_ref.actor.response_only_logits": true
 
 # ---- model / optimization -------------------------------------------------------
 "actor_rollout_ref.model.path": Qwen/Qwen3-1.7B

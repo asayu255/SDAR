@@ -208,6 +208,7 @@ python3 -m verl.trainer.main_sft_multitask \
     +actor_rollout_ref.actor.fsdp_config.sharding_strategy=shard_grad_op \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
+    actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -217,6 +218,7 @@ python3 -m verl.trainer.main_sft_multitask \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.return_rollout_log_probs=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.adv_estimator=grpo \
