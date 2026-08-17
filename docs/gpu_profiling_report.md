@@ -1064,6 +1064,55 @@ step 内の位置で割ると:
 **`timing_s/update_actor_worker`**（worker 側の実時間）の方である。
 7 節の教訓と同じ形なので明記しておく。
 
+#### 実測 —— 谷は消えた
+
+4 step ずつの A/B（0.1 秒プロファイラ、rank 0 の worker 側の表）。
+
+| | OFF | ON |
+|---|---|---|
+| `(idle/other)` wall | 1.6 / 2.9 / 1.6 / 3.1 s | **0.2 s、または行ごと消滅** |
+| `(idle/other)` share | 0.4〜0.8% | **0.1% / 0%** |
+| `(idle/other)` sm | 97.7 / 56.5 / 66.5 / 72.0 | **100.0** |
+| **TOTAL sm** | 97.5 / 96.9 / 97.2 / 97.0 | **98.5 / 98.5** |
+
+**step 境界のフェーズが表から消えた。** 残った 0.2 秒も sm 100% で、
+「そこに居た」だけで GPU は動いている。
+
+**もう 1 つの直接証拠。** ON の step 2 は `timing_s/step` 347.8 秒に対して
+`timing_s/update_actor_worker` 348.7 秒 —— **step の壁時計が worker の計算時間より
+短い**。次の step の計算が前の step の後片付けと重なっていなければ起こらない。
+
+#### 同じ run で micro=5 → 10 も入っている（交絡）
+
+この ON run は `ppo_micro_batch_size_per_gpu` も 10 に上げてある。
+**分離して読むこと。**
+
+* `(idle/other)` の消滅は**パイプラインの効果**。micro サイズはドライバ側の
+  境界に関係しない。
+* `timing_s/update_actor_worker` 392 → 355 秒（**−9.4%**）は
+  **micro=5 → 10 の効果**。パイプラインは worker の仕事量を変えない。
+
+**micro=10 が OOM しなかったこと自体が `response_only_logits` の確認**でもある。
+8 節が OOM 対策で 10 → 5 に落としたのを、活性メモリが減ったことで戻せた
+（`max_memory_allocated` 39.6 GB。ただし 2.5 節のとおりこの指標は
+rank 間 max なので `nvidia-smi` を正とすること）。
+
+#### ベースラインからの累積
+
+| | x7g9r7bx | 今回 |
+|---|---:|---:|
+| `perf/throughput` | 3,043 tok/s | **3,580〜3,602** |
+| `perf/mfu/actor` | 0.254 | **0.291〜0.294** |
+| `timing_s/update_actor_worker` | 408.8 s | **348.7〜360.1** |
+| `sft/padding_rows` | 122.4 | **8 / 18** |
+
+**throughput +18%。** MFU の分子は lm_head を全トークン分数え続けているので
+**絶対値は過大**だが、A/B では分子が不変なので**上昇率は速度向上と一致する**。
+
+損失は step 1 で `actor/sft_loss` 1.054（OFF）→ 1.055（ON）、
+per-task も 1.180 → 1.190 / 0.739 → 0.719 と 1% 内。micro サイズが変われば
+GEMM の形も per-micro-batch の平均も変わるので、この程度の差は想定どおりである。
+
 ### 9.10 次に残っているもの
 
 * **学習フェーズの 96.5%**: 残り 3.5% は step 境界と micro=5 の起動オーバーヘッド。
