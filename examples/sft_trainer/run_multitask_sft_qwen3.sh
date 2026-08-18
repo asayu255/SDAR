@@ -169,6 +169,20 @@ set -x
 # out of band -- but the rollout is still constructed on every rank, so the
 # assert fires at init_model, before the first step.
 #
+# ACTOR_PASS_CU_SEQLENS=1 (the default) hands the packed-sequence boundaries to
+# the attention instead of letting it re-derive them. Handed position_ids, HF's
+# flash-attention path works out on the DEVICE whether the sequences are packed
+# and how long the longest is, then reads both on the HOST because flash-attn
+# needs Python ints -- one device-to-host sync per layer per forward, doubled
+# because gradient checkpointing recomputes the forward inside the backward. The
+# trace measures ~80 D2H copies per micro-batch, each trailed by ~147 us with the
+# device empty: 0.38% of wall, about a third of the whole idle deficit.
+# unpad_input already computed both, once. Set ACTOR_PASS_CU_SEQLENS=0 to rule it
+# out -- if the two ways of deriving the boundaries ever disagreed the symptom
+# would be a loss curve rather than an exception. It is off automatically under
+# Ulysses SP (the sequence is split after that point, so the boundaries would be
+# stale) and on a transformers whose entry point does not name the kwargs.
+#
 # A MEASUREMENT RUN IS NOT THE BARE SCRIPT. Three of this file's defaults are
 # production defaults, and each one silently changes what a measurement means.
 # Copy this whole block rather than the parts you remember:
