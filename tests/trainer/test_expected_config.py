@@ -148,6 +148,18 @@ def test_committed_expectations_files_self_consistent():
         if kl_key in expectations and actor_kl_key in expectations:
             assert expectations[kl_key] == expectations[actor_kl_key], rel
 
+        # Same coupling for the sign-weight knobs. They are authored under
+        # algorithm.opd with the other scientific settings and copied onto the
+        # actor by main_opd, because the weights are built inside the training
+        # forward; the two copies disagreeing would mean the run used one value
+        # and the lock recorded the other.
+        for knob in ("enable", "mode", "agree_weight", "agree_neg_weight",
+                     "disagree_weight", "deadzone"):
+            a = f"algorithm.opd.sign_weight.{knob}"
+            b = f"actor_rollout_ref.actor.sign_weight.{knob}"
+            if a in expectations and b in expectations:
+                assert expectations[a] == expectations[b], (rel, knob)
+
         # Drift ANY scalar key to a sentinel -> exactly that key must trip.
         drift_key = next(
             key for key, val in expectations.items() if not isinstance(val, (dict, list))

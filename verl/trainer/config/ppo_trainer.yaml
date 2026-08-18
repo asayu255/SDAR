@@ -363,6 +363,12 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  # One line per validation instance (index, task, score), so a later
+  # comparison between two arms can be PAIRED instead of a difference of two
+  # means. The pairing key is the row's position in the pass, which is stable
+  # because the validation loader is built shuffle=False over a fixed file.
+  # No dump if null.
+  val_instance_log_dir: null
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

@@ -1,6 +1,52 @@
 set -x
 
-# Pure OPD multitask (alfworld + search + webshop), Qwen3-1.7B.
+# Pure OPD multitask (alfworld + search + webshop), Qwen3-1.7B,
+# WITH CROSS-TEACHER SIGN WEIGHTING IN TARGET MODE.
+
+# ---------------------------------------------------------------------------
+# CROSS-TEACHER SIGN WEIGHTING -- TARGET MODE.
+#
+# Identical to run_multitask_qwen3.sh except for algorithm.opd.sign_weight.* and
+# the run's own identity, so the two differ in the weighting of the teacher KL
+# and in nothing else -- same teachers, same data, same batch sizes, same eval
+# protocol. That is what makes the plain arm the control for this one.
+#
+# What the weighting does (verl/trainer/ppo/sign_weights.py): each teacher is a
+# single-task RL fine-tune of one base policy, so sign(log pi_m - log pi_0) says
+# whether task m's RL raised or lowered a candidate token here. The support is
+# the STUDENT's top-k -- the same one the KL already uses -- and all four models
+# (on-task teacher, two off-task teachers, base) are read on it.
+#
+# The two modes DO NOT share a weight table, and that is the point:
+#
+#   position  one scalar per token multiplies the per-token KL. A KL term has no
+#             direction, so agreement counts the same whether the teachers agreed
+#             to raise a token or to lower it: (+,+) and (-,-) both get 1.25. The
+#             minimiser is still the on-task teacher, so this changes how hard
+#             each position is learned and never what the student converges to.
+#   target    the teacher's own probability at that candidate is reweighted and
+#             the distribution renormalised, moving the fixed point to
+#             ~ w(v) p_teacher(v). Here the weight multiplies a PROBABILITY, so
+#             direction is the whole content: (+,+) gets 1.25 and (-,-) gets
+#             0.75. This is the variant that can inject an off-task opinion --
+#             and the one that can inject a wrong one.
+#
+# Conflict is NOT weighted in either arm (disagree_weight=1.0). Target mode
+# refuses any other value rather than pick a direction silently: deferring to the
+# objecting teachers means lowering a token the on-task teacher raised and
+# RAISING one it lowered, and one factor below 1.0 does the second backwards.
+#
+# Cost: three extra frozen forwards per step (the base over all rows, each
+# teacher over the 2/3 of rows that are not its own task), and the hidden-state
+# cache holds four models per row instead of one. enable=False reproduces the
+# plain arm exactly: no base worker is built, no extra forward runs, and nothing
+# is written into the batch.
+#
+# CHECKPOINT DIRECTORY. Arm-specific, and it has to be: the path is
+# default_local_dir/global_step_N and trainer.resume_mode defaults to "auto", so
+# two arms sharing this directory do not merely overwrite each other's
+# checkpoints -- the second one silently RESUMES FROM THE FIRST.
+# ---------------------------------------------------------------------------
 #
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block and NO ${VAR:-default} fallback, so
@@ -14,7 +60,7 @@ set -x
 # Teacher and checkpoint paths are written relative to $HOME so the same script
 # resolves correctly on either machine.
 #
-# INTENT LOCK: examples/opd_trainer/expected_multitask_config.yaml pins the
+# INTENT LOCK: examples/opd_trainer/expected_multitask_signweight_target_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
 # protocol). main_opd validates the composed config against it after its own
 # injection and refuses to start on any mismatch. To change such a knob, edit
@@ -356,7 +402,7 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --seed 1
 
 python3 -m verl.trainer.main_opd \
-    +trainer.expected_config=examples/opd_trainer/expected_multitask_config.yaml \
+    +trainer.expected_config=examples/opd_trainer/expected_multitask_signweight_target_config.yaml \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -435,6 +481,13 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     +algorithm.opd.normalize_loss_by_task=True \
+    +algorithm.opd.sign_weight.enable=True \
+    +algorithm.opd.sign_weight.mode=target \
+    +algorithm.opd.sign_weight.agree_weight=1.25 \
+    +algorithm.opd.sign_weight.agree_neg_weight=0.75 \
+    +algorithm.opd.sign_weight.disagree_weight=1.0 \
+    +algorithm.opd.sign_weight.deadzone=0.1 \
+    +algorithm.opd.sign_weight.base_path=Qwen/Qwen3-1.7B \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \
@@ -454,13 +507,13 @@ python3 -m verl.trainer.main_opd \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_opd_multitask' \
-    trainer.experiment_name=opd_multitask_qwen3_1.7b \
+    trainer.project_name='verl_agent_opd_signweight_multitask' \
+    trainer.experiment_name=opd_multitask_signweight_target_qwen3_1.7b \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_multitask \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_qwen3_1.7b \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_signweight_target_multitask \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_signweight_target_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
