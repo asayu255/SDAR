@@ -40,6 +40,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.metric.memory import per_rank_memory_metrics
+from verl.workers.actor.dp_actor import _actor_phase
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -665,8 +666,18 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        # Support all hardwares
-        data = data.to(get_torch_device().current_device())
+        # Support all hardwares.
+        #
+        # Tagged because this is the near side of the step boundary that survived
+        # pipelining. The driver already dispatches step k+1 before it logs step
+        # k, so nothing it does explains a gap here -- but a Ray actor runs its
+        # calls one at a time, so the worker cannot start moving k+1's batch onto
+        # the device until k has returned. Whatever that costs is unhideable from
+        # the driver side, and until it is measured it is indistinguishable from
+        # the Ray deserialisation that precedes it (which lands outside this
+        # phase, as (idle/other), because it happens before the method body).
+        with _actor_phase("actor.h2d"):
+            data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:

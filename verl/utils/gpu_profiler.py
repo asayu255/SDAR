@@ -788,6 +788,14 @@ _PHASE_ORDER = [
     "reward",
     # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
     # execution order so the interior of a step reads top to bottom.
+    #
+    # actor.h2d is the first thing a step does and the one a Ray actor cannot
+    # overlap: calls run one at a time, so moving the batch onto the device
+    # happens strictly after the previous step returned, whatever the driver is
+    # doing at that moment. Whatever is left OUTSIDE it -- still tagged
+    # (idle/other) in a worker trace -- is Ray deserialising the argument before
+    # the method body runs, which no phase inside the body can reach.
+    "actor.h2d",
     "actor.fwd",
     "actor.bwd",
     "actor.task_metrics",

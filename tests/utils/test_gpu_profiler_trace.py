@@ -151,3 +151,26 @@ def test_an_unwritable_path_is_reported_and_ignored(monkeypatch, tmp_path):
         assert sampler._thread.is_alive()
     finally:
         sampler._stop.set()
+
+
+def test_the_h2d_phase_reads_first_in_the_interior_of_a_step(monkeypatch):
+    """actor.h2d is the near side of the step boundary that pipelining cannot
+    reach: a Ray actor runs its calls one at a time, so the worker only starts
+    moving step k+1's batch onto the device after step k has returned -- however
+    early the driver dispatched it. The table has to show it before actor.fwd or
+    the interior of a step stops reading in execution order."""
+    mod = _fresh(monkeypatch, GPU_PROFILER="1")
+    order = [p for p in mod._PHASE_ORDER if p.startswith("actor.")]
+
+    assert order == ["actor.h2d", "actor.fwd", "actor.bwd", "actor.task_metrics", "actor.optim"]
+
+
+def test_a_phase_the_report_does_not_know_still_gets_a_row(monkeypatch):
+    """Anything unlisted is appended rather than dropped, so instrumenting a new
+    stage never silently loses its samples."""
+    mod = _fresh(monkeypatch, GPU_PROFILER="1")
+    by_phase = {"actor.fwd": mod._acc_new(1), "actor.somethingnew": mod._acc_new(1)}
+    for acc in by_phase.values():
+        acc["wall"], acc["n"] = 1.0, 1
+
+    mod._print_report(by_phase, 1, "t", 0.2)   # must not raise
