@@ -154,7 +154,20 @@ set -x
 #
 # and read the traces with scripts/gpu_stall_scan.py /tmp/trace.*.csv. The glob
 # is not optional: there are two samplers, one per process, and each writes its
-# own pid-suffixed file. Do not summarise the trace by counting samples under a
+# own pid-suffixed file.
+#
+# DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. It is the
+# obvious answer to the allocator reserving more than the model needs, and vLLM
+# refuses to start under it:
+#
+#   AssertionError: Expandable segments are not compatible with memory pool.
+#   (vllm/device_allocator/cumem.py, pytorch/pytorch#147851)
+#
+# vLLM v1 allocates through its own CuMemAllocator so sleep()/wake_up() can
+# unmap physical pages, and that allocator asserts expandable segments are off.
+# This arm never generates -- it trains from pre-made trajectories and validates
+# out of band -- but the rollout is still constructed on every rank, so the
+# assert fires at init_model, before the first step. Do not summarise the trace by counting samples under a
 # threshold — utilization.gpu is the busy fraction of a trailing window, so a
 # stall shorter than that window never even reads 0 and time-under-a-line
 # reports a fraction of it. The scan integrates the deficit instead, which is
