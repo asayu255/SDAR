@@ -342,3 +342,43 @@ Ray 自身の per-worker ログに重複除去前の stdout がある:
 ```bash
 grep -h "step-gpu" /tmp/ray/session_latest/logs/worker-*.out
 ```
+
+
+---
+
+## 7. 結果（run 5asi02yu）
+
+`BALANCE_MINIBATCH=1` と cu_seqlens の受け渡しを入れた 3 step:
+
+```
+perf/mfu/actor                    0.339  0.338  0.338     (対 0.314-0.316)
+global_seqlen/minibatch_wait_frac 0.001  0.000  0.000     (対 0.125)
+minibatch_spread_mean             17.2   13.3   11.1 tok  (対 ~4,200)
+gpu-profiler update_actor         sm 98.8% → 99.2%, idle 0.0%, maxGap 0.0
+```
+
+**MFU +7.6%。** ただし予測は +16.5% だった —— NCCL の待ち時間は全部が
+そのまま wall-clock の節約に変換されるわけではない。理由は測っていないので
+書かない。**2 つの変更が同じ run に入っているので、内訳も分離できていない**
+（分けるなら `BALANCE_MINIBATCH=0` か `ACTOR_PASS_CU_SEQLENS=0` の片方だけ
+落とした run が要る）。
+
+学習側の指標も見ておく: `sft_loss` 1.086/1.123/1.086（対 1.050/1.085/1.066）、
+`grad_norm` 44.2/44.6/37.4（対 50.7/51.6/43.4）。**grad_norm が下がっている
+のは層化の効果として筋が通る** —— 各 mini-batch が長さの偏った塊ではなく
+全長域のサンプルになるので、勾配の分散が下がる。損失が僅かに高いのは
+どの行が同じ mini-batch に入るかが変わったためで、同じ軌跡ではない
+（ビット同一でないことは最初から分かっている）。
+
+### カウンタが仕事をした
+
+step 2 で `stall/cuda_mallocs/rank1: 62`、同じ step で
+`memory_reserved_gb/rank1` が 53.4 → 66.3 GiB。**rank 1 だけがセグメントを
+62 回増やしている。** `cudaMalloc` は device-synchronizing なので、これは
+まさに 3.2 節 (B)-1 が予測した「1 rank だけが記録更新級の micro-batch を
+引いてプールを伸ばす」形である。深い dip がこの step に出ているかは
+wandb の GPU サンプルと突き合わせて確認する。
+
+step 3 では `rank0: 4`、他は 0。`gc_gen2` は全 rank で 1-2、
+`dynamo_graphs` は全 step 0 —— **torch.compile の再コンパイルは
+起きていない**ので、3.2 節 (B)-2 はこの run では棄却される。
