@@ -16,6 +16,8 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+from verl.utils import nsys_capture
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -31,8 +33,19 @@ def run_sft_multitask(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs)
+        if nsys_capture.enabled():
+            # The ranks are Ray actors, not children of this launcher, so
+            # wrapping the launch command in `nsys profile` reaches nothing that
+            # touches a GPU. Ray's _nsight plugin wraps each worker process
+            # instead; the capture ranges dp_actor opens are what keep the report
+            # to a handful of micro-batches. Reports land in the Ray session's
+            # logs/nsight directory, one per process.
+            ray_init_kwargs["runtime_env"]["_nsight"] = nsys_capture.nsight_runtime_env()
+            print(f"[nsys] workers will run under Nsight: "
+                  f"{ray_init_kwargs['runtime_env']['_nsight']}", flush=True)
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     runner = SFTMultiTaskTaskRunner.remote()
     ray.get(runner.run.remote(config))

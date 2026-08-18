@@ -167,7 +167,21 @@ set -x
 # unmap physical pages, and that allocator asserts expandable segments are off.
 # This arm never generates -- it trains from pre-made trajectories and validates
 # out of band -- but the rollout is still constructed on every rank, so the
-# assert fires at init_model, before the first step. Do not summarise the trace by counting samples under a
+# assert fires at init_model, before the first step.
+#
+# WHEN NVML IS NOT ENOUGH, run a few micro-batches under Nsight:
+#
+#   ACTOR_NSYS_MICRO=20 ACTOR_NSYS_SKIP=40 bash examples/sft_trainer/run_...sh
+#
+# The sampler above cannot go below ~330 ms and one micro-batch's forward is
+# ~1.1 s of about 500 kernels, so a 0.3-1.0 s stall lands inside a single
+# actor.fwd sample and cannot be placed more precisely than "in that phase".
+# ACTOR_NSYS_MICRO puts every rank under Ray's _nsight plugin, opens a capture
+# range around that many micro-batches, and names the phases with NVTX -- which
+# is what makes the collectives visible by name, and so what decides whether one
+# rank is slow or the other two are waiting for it. Reports land one per process
+# in the Ray session's logs/nsight directory. Measurement only: leave both unset
+# and not a single NVTX push happens. Do not summarise the trace by counting samples under a
 # threshold — utilization.gpu is the busy fraction of a trailing window, so a
 # stall shorter than that window never even reads 0 and time-under-a-line
 # reports a fraction of it. The scan integrates the deficit instead, which is
