@@ -1,16 +1,27 @@
 set -uo pipefail
 
-# The whole sign-weighting experiment, in the order it has to run.
+# The sign-weighting experiment, mid-point first:
 #
-#   1. position arm, 300 steps
-#   2. target arm, 300 steps
-#   3. position arm, validation at 150 and 300
-#   4. target arm, validation at 150 and 300
+#   1. position arm  -> step 150         5. position arm  150 -> 300
+#   2. validate position @ 150           6. validate position @ 300
+#   3. target arm    -> step 150         7. target arm    150 -> 300
+#   4. validate target @ 150             8. validate target @ 300
+#      + validate the CONTROL @ 150/300 (instance logs) between 4 and 5
 #
-# Serial on purpose: two GPUs, and each arm wants both. Roughly 70-75h per
-# training arm at the measured 35-37h/150 steps, so the two trainings alone are
-# about six days. RUN IT DETACHED -- tmux, or:
+# Mid-point first because the primary comparison is against the control's
+# 150-step numbers: this ordering has the first comparable result after
+# ~1.5 days and both arms compared at 150 after ~3, instead of every number
+# arriving at the end of day 5.
 #
+# HOW 150 IS REACHED. trainer.stop_after_steps=150, NOT total_training_steps=150.
+# total_training_steps is pinned in the intent lock and also sets the LR
+# schedule (warmup is 10% of total), so a 150-step run would refuse to start
+# and, if forced, would put a different LR trajectory into steps 15-30 than the
+# control had. stop_after_steps only decides when this process exits; the
+# continuation resumes from the step-150 checkpoint with schedule, data order
+# and objective identical to a straight 300-step run interrupted by a crash.
+#
+# Serial on purpose: two GPUs, each arm wants both. RUN IT DETACHED:
 #   nohup bash examples/opd_trainer/run_signweight_sequence.sh > ~/logs/seq.log 2>&1 &
 #
 # Before running:
@@ -19,49 +30,56 @@ set -uo pipefail
 #   export RAY_memory_usage_threshold=0.98
 #   export RAY_memory_monitor_refresh_ms=500
 #
-# GPU_PROFILER=1 / ROLLOUT_TURN_TIMING=1 are deliberately NOT set here. They are
-# right for a shakedown run and wrong for a six-day one: the per-turn table is
-# written every turn of every step.
-#
-# RESUMABLE. Every phase is skipped if its output already exists, and training
-# resumes from its own last checkpoint (resume_mode defaults to auto, and the two
-# arms have separate directories). So after a crash, a machine reboot, or a
-# deliberate stop, re-running this same command picks up where it left off
-# instead of starting the sequence again.
+# RESUMABLE. Every phase is skipped when its output already exists (training: the
+# phase's checkpoint; validation: its per-instance jsonl), and training resumes
+# from its own last checkpoint. Re-running this same command after a crash or a
+# deliberate stop continues instead of starting over.
 #
 # Run a subset by naming phases:
-#   bash examples/opd_trainer/run_signweight_sequence.sh train_position
-#   bash examples/opd_trainer/run_signweight_sequence.sh val_position val_target
+#   bash examples/opd_trainer/run_signweight_sequence.sh train_position_150
+#   bash examples/opd_trainer/run_signweight_sequence.sh val_control
 #
 # Overridable from the environment:
 #   SEARCH_URL   the retriever (default below)
 #   LOG_DIR      where the per-phase logs go
-#   VAL_STEPS    which checkpoints to evaluate (default "150 300")
-#   TOTAL_STEPS  the step a training phase is considered finished at
+#   MID_STEPS    the pause point (default 150; must be a save_freq multiple)
+#   TOTAL_STEPS  the step a training arm is considered finished at
 
 SEARCH_URL=${SEARCH_URL:-http://100.86.45.30:8001/retrieve}
 LOG_DIR=${LOG_DIR:-$HOME/logs}
-VAL_STEPS=${VAL_STEPS:-"150 300"}
+MID_STEPS=${MID_STEPS:-150}
 TOTAL_STEPS=${TOTAL_STEPS:-300}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 if [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "FATAL: WANDB_API_KEY is not set. A six-day run that logs to console only" >&2
-    echo "       is a six-day run whose curves nobody can read afterwards." >&2
+    echo "FATAL: WANDB_API_KEY is not set. A multi-day run that logs to console only" >&2
+    echo "       is a multi-day run whose curves nobody can read afterwards." >&2
     exit 1
 fi
 
 mkdir -p "$LOG_DIR"
 
-# arm -> script, checkpoint directory. Kept in one place because a mismatch here
-# is the failure that does not announce itself: trainer.resume_mode is "auto", so
-# an arm pointed at another arm's directory does not overwrite it, it CONTINUES
-# it and reports the result under its own name.
+# arm -> script, checkpoint directory, experiment name (= instance-log subdir).
+# One place, because a mismatch does not announce itself: resume_mode is "auto",
+# so an arm pointed at another arm's directory does not overwrite it, it
+# CONTINUES it and reports the result under its own name.
 script_of() {
-    echo "$REPO/examples/opd_trainer/run_multitask_signweight_$1_qwen3.sh"
+    case "$1" in
+        control) echo "$REPO/examples/opd_trainer/run_multitask_qwen3.sh" ;;
+        *)       echo "$REPO/examples/opd_trainer/run_multitask_signweight_$1_qwen3.sh" ;;
+    esac
 }
 ckpt_of() {
-    echo "$HOME/checkpoints/verl_agent_opd_signweight_$1_multitask"
+    case "$1" in
+        control) echo "$HOME/checkpoints/verl_agent_opd_multitask" ;;
+        *)       echo "$HOME/checkpoints/verl_agent_opd_signweight_$1_multitask" ;;
+    esac
+}
+exp_of() {
+    case "$1" in
+        control) echo "opd_multitask_qwen3_1.7b" ;;
+        *)       echo "opd_multitask_signweight_$1_qwen3_1.7b" ;;
+    esac
 }
 
 banner() {
@@ -72,20 +90,15 @@ banner() {
     echo "==============================================================="
 }
 
-# Ray does not always take its cluster down with the process that started it, and
-# the next phase then fails to bind or, worse, attaches to a half-dead cluster
-# holding the GPUs. Between phases, not before the first: a running job elsewhere
-# on this host is not this script's to kill.
+# Ray does not always take its cluster down with the process that started it.
 tidy_ray() {
     ray stop --force >/dev/null 2>&1 || true
     sleep 10
 }
 
 preflight() {
-    # env.search.max_retries=null means the client WAITS for the retriever instead
-    # of giving up -- which is right (an exhausted budget puts the error text into
-    # the <information> block the model trains on), and which also means a
-    # retriever that is simply down looks exactly like a hang. Say so up front.
+    # max_retries=null means the client WAITS for the retriever rather than
+    # training on its error text, so a retriever that is down looks like a hang.
     local host_port=${SEARCH_URL#*://}
     host_port=${host_port%%/*}
     local host=${host_port%%:*}
@@ -94,82 +107,105 @@ preflight() {
         echo "[preflight] retriever reachable at $host:$port"
     else
         echo "[preflight] WARNING: cannot reach the retriever at $host:$port." >&2
-        echo "[preflight] max_retries=null means the run will WAIT rather than fail," >&2
-        echo "[preflight] so a rollout that never progresses is the symptom." >&2
+        echo "[preflight] max_retries=null means the run will WAIT rather than fail." >&2
     fi
 }
 
 train_arm() {
-    local mode=$1
-    local ckpt done_marker log
+    local mode=$1 stop=$2
+    local ckpt log
     ckpt=$(ckpt_of "$mode")
-    done_marker="$ckpt/global_step_$TOTAL_STEPS"
-    log="$LOG_DIR/opd_signweight_${mode}_train.log"
+    log="$LOG_DIR/opd_signweight_${mode}_train_to${stop}.log"
 
-    if [ -d "$done_marker" ]; then
-        banner "SKIP training $mode -- $done_marker already exists"
+    # Done when this phase's checkpoint exists -- or a LATER one does, since a
+    # finished 300 makes "get to 150" moot on a resumed sequence.
+    if [ -d "$ckpt/global_step_$stop" ] || [ -d "$ckpt/global_step_$TOTAL_STEPS" ]; then
+        banner "SKIP training $mode -> $stop (checkpoint already exists)"
         return 0
     fi
-    banner "TRAIN $mode -> $TOTAL_STEPS steps"
+    banner "TRAIN $mode -> step $stop (of $TOTAL_STEPS)"
     echo "  log:        $log"
     echo "  checkpoints:$ckpt"
-    # test_freq=-1: no mid-run validation. The evaluation phases below do it from
-    # the checkpoints instead, so a validation pass never sits in the middle of a
-    # training step's timing, and re-evaluating costs no training time.
+    local extra=()
+    if [ "$stop" -lt "$TOTAL_STEPS" ]; then
+        extra+=("trainer.stop_after_steps=$stop")
+    fi
+    # test_freq=-1: no mid-run validation; the val phases below do it from the
+    # checkpoints, so re-evaluating never costs training time.
     bash "$(script_of "$mode")" \
         env.search.search_url="$SEARCH_URL" \
         trainer.test_freq=-1 \
+        "${extra[@]}" \
         2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
     if [ "$rc" -ne 0 ]; then
         echo "FATAL: training $mode exited $rc; see $log" >&2
         return "$rc"
     fi
-    if [ ! -d "$done_marker" ]; then
-        echo "FATAL: training $mode returned 0 but $done_marker is missing." >&2
+    if [ ! -d "$ckpt/global_step_$stop" ]; then
+        echo "FATAL: training $mode returned 0 but $ckpt/global_step_$stop is missing." >&2
         return 1
     fi
 }
 
 val_arm() {
-    local mode=$1
-    local ckpt step log
+    local mode=$1 step=$2
+    local ckpt marker log
     ckpt=$(ckpt_of "$mode")
-    for step in $VAL_STEPS; do
-        if [ ! -d "$ckpt/global_step_$step" ]; then
-            echo "FATAL: $ckpt/global_step_$step does not exist; train $mode first." >&2
-            return 1
-        fi
-        log="$LOG_DIR/opd_signweight_${mode}_val_$step.log"
-        banner "VALIDATE $mode @ step $step"
-        echo "  log: $log"
-        # val_only is checked on its own rather than under val_before_train, so
-        # this evaluates the checkpoint and stops. It used to fall through to
-        # TRAINING from the checkpoint, which looks like it worked right up until
-        # the numbers never appear.
-        bash "$(script_of "$mode")" \
-            env.search.search_url="$SEARCH_URL" \
-            trainer.resume_mode=resume_path \
-            trainer.resume_from_path="$ckpt/global_step_$step" \
-            trainer.val_only=True \
-            2>&1 | tee "$log"
-        local rc=${PIPESTATUS[0]}
-        if [ "$rc" -ne 0 ]; then
-            echo "FATAL: validation $mode @ $step exited $rc; see $log" >&2
-            return "$rc"
-        fi
-        tidy_ray
-    done
+    marker="$HOME/val_instances/$(exp_of "$mode")/val_step$step.jsonl"
+    log="$LOG_DIR/opd_signweight_${mode}_val_$step.log"
+
+    if [ -f "$marker" ]; then
+        banner "SKIP validation $mode @ $step ($marker already exists)"
+        return 0
+    fi
+    if [ ! -d "$ckpt/global_step_$step" ]; then
+        echo "FATAL: $ckpt/global_step_$step does not exist; train $mode first." >&2
+        [ "$mode" = "control" ] && echo "       (the control was trained in an earlier experiment; check the path)" >&2
+        return 1
+    fi
+    banner "VALIDATE $mode @ step $step"
+    echo "  log:     $log"
+    echo "  instance rows: $marker"
+    bash "$(script_of "$mode")" \
+        env.search.search_url="$SEARCH_URL" \
+        trainer.resume_mode=resume_path \
+        trainer.resume_from_path="$ckpt/global_step_$step" \
+        trainer.val_only=True \
+        2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then
+        echo "FATAL: validation $mode @ $step exited $rc; see $log" >&2
+        return "$rc"
+    fi
+    if [ ! -f "$marker" ]; then
+        echo "WARNING: validation ran but $marker was not written; the paired analysis" >&2
+        echo "         needs it -- check trainer.val_instance_log_dir in the run script." >&2
+    fi
+    tidy_ray
 }
 
-phase_train_position() { train_arm position; }
-phase_train_target()   { train_arm target; }
-phase_val_position()   { val_arm position; }
-phase_val_target()     { val_arm target; }
+phase_train_position_150() { train_arm position "$MID_STEPS"; }
+phase_val_position_150()   { val_arm position "$MID_STEPS"; }
+phase_train_target_150()   { train_arm target "$MID_STEPS"; }
+phase_val_target_150()     { val_arm target "$MID_STEPS"; }
+# The control's instance rows: its original run predates val_instance_log_dir,
+# and without them the treatment rows have nothing to pair against.
+phase_val_control()        { val_arm control "$MID_STEPS" && val_arm control "$TOTAL_STEPS"; }
+phase_train_position_300() { train_arm position "$TOTAL_STEPS"; }
+phase_val_position_300()   { val_arm position "$TOTAL_STEPS"; }
+phase_train_target_300()   { train_arm target "$TOTAL_STEPS"; }
+phase_val_target_300()     { val_arm target "$TOTAL_STEPS"; }
 
 PHASES=("$@")
 if [ ${#PHASES[@]} -eq 0 ]; then
-    PHASES=(train_position train_target val_position val_target)
+    PHASES=(
+        train_position_150 val_position_150
+        train_target_150 val_target_150
+        val_control
+        train_position_300 val_position_300
+        train_target_300 val_target_300
+    )
 fi
 
 preflight
@@ -179,7 +215,8 @@ first=1
 for phase in "${PHASES[@]}"; do
     if ! declare -F "phase_$phase" >/dev/null; then
         echo "FATAL: unknown phase '$phase'." >&2
-        echo "       known: train_position train_target val_position val_target" >&2
+        echo "       known: train_position_150 val_position_150 train_target_150 val_target_150" >&2
+        echo "              val_control train_position_300 val_position_300 train_target_300 val_target_300" >&2
         exit 2
     fi
     [ "$first" -eq 1 ] || tidy_ray
@@ -196,15 +233,6 @@ banner "SEQUENCE COMPLETE"
 echo "wandb project: verl_agent_opd_signweight_multitask"
 echo
 echo "Per-instance validation rows, for the PAIRED comparison:"
-for mode in position target; do
-    echo "  $mode:  \$HOME/val_instances/opd_multitask_signweight_${mode}_qwen3_1.7b/val_step{150,300}.jsonl"
+for mode in position target control; do
+    echo "  $mode: \$HOME/val_instances/$(exp_of "$mode")/val_step{$MID_STEPS,$TOTAL_STEPS}.jsonl"
 done
-echo "  control: \$HOME/val_instances/opd_multitask_qwen3_1.7b/val_step{150,300}.jsonl"
-echo
-echo "The control's rows have to exist for the pairing to be worth anything. If"
-echo "that arm was run before val_instance_log_dir was added, re-validate it:"
-echo "  bash examples/opd_trainer/run_multitask_qwen3.sh \\"
-echo "    env.search.search_url=$SEARCH_URL \\"
-echo "    trainer.resume_mode=resume_path \\"
-echo "    trainer.resume_from_path=\$HOME/checkpoints/verl_agent_opd_multitask/global_step_150 \\"
-echo "    trainer.val_only=True"

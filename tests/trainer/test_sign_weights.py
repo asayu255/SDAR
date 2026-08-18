@@ -523,3 +523,25 @@ def test_position_pre_normalisation_mean_is_reported_per_task():
     m = st.metrics()
     assert m["sign_weight/alfworld/w_mean_pre_norm"] == pytest.approx(1.2)
     assert m["sign_weight/search/w_mean_pre_norm"] == pytest.approx(1.0)
+
+
+def test_teacher_coverage_is_the_mean_covered_mass():
+    """Sum of the teacher's probability over the support, averaged per token.
+
+    The ceiling on target mode's leverage: the mass_frac_* shares are fractions
+    OF this, so a run where the support covers little of the teacher would look
+    identical to one where it covers all of it without this number beside them.
+    """
+    on = torch.log(torch.tensor([[[0.5, 0.3]], [[0.15, 0.05]]]))  # covers 0.8 / 0.2
+    base = torch.full((2, 1, 2), -2.0)
+    off = torch.stack([base + 1.0, base + 1.0], dim=-1)
+    _, state = candidate_weights(
+        on, off, base, mode="target", agree_weight=AGREE, agree_neg_weight=AGREE_NEG,
+        disagree_weight=1.0, deadzone=DEADZONE,
+    )
+    st = SignWeightStats()
+    st.update_candidates(
+        state=state, on_task_logprob=on, off_task_logprobs=off, base_logprob=base,
+        response_mask=torch.ones(2, 1), deadzone=DEADZONE,
+    )
+    assert st.metrics()["sign_weight/teacher_coverage"] == pytest.approx(0.5, abs=1e-5)

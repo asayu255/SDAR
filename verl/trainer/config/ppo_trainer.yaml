@@ -369,6 +369,11 @@ trainer:
   # because the validation loader is built shuffle=False over a fixed file.
   # No dump if null.
   val_instance_log_dir: null
+  # Exit cleanly after this many steps (0 = run to total_training_steps). A
+  # process-lifetime knob, not a science knob: the LR schedule, data order and
+  # lock still come from total_training_steps, and a resumed run continues
+  # exactly as after a crash. Must land on a save_freq multiple. OPD loop only.
+  stop_after_steps: 0
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

@@ -155,6 +155,7 @@ rollout → compute_teacher_log_probs → _attach_task_ids
 | `sign_weight/<task>/frac_<state>` | タスク別。「AlfWorld だけ効いた」を機構側の数字で裏付ける |
 | `frac_neutral_off_task_split` vs `_silent` | 前者は他タスクが食い違う、後者は $\epsilon$ が証拠を飲んだ。**別物** |
 | `sign_weight/mass_frac_<state>` | **確率質量**加重。目標を動かすのは $w\cdot p_i$ なので、実効的な大きさはこちら |
+| `sign_weight/teacher_coverage` (+タスク別) | 生徒 top-20 上の教師質量 $\sum_{v\in S}p_i(v)$。**target の梃子の天井**。`mass_frac_*` はこの中の構成比なので、これ無しでは過大に読める |
 
 ### 介入の大きさ(target)
 | 指標 | 読み方 |
@@ -209,6 +210,11 @@ rollout → compute_teacher_log_probs → _attach_task_ids
 | 対照 | `run_multitask_qwen3.sh` | 純OPD |
 | position | `run_multitask_signweight_position_qwen3.sh` | 固定点を動かさない = **target の対照** |
 | target | `run_multitask_signweight_target_qwen3.sh` | 固定点を動かす |
+
+走行は**150 → 評価 → 300 の順**（`run_signweight_sequence.sh`）。150 で止めるのは
+`trainer.stop_after_steps` であって `total_training_steps` ではない — 後者は lock 固定で、
+かつ warmup(総step の10%)を変えて LR 軌道が対照とずれる。前者はプロセスの寿命だけを決め、
+再開後はクラッシュ復帰と同一の継続になる。
 
 3本すべて同一コード・`data.seed=1` なので、step $k$ では同じプロンプトを見る(統計をペア検定で
 やるべき理由)。position が target の対照になるのが本構成の要点:

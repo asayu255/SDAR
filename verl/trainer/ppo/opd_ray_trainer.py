@@ -732,6 +732,23 @@ class OPDRayTrainer(RayPPOTrainer):
             assert self.val_reward_fn is not None, "trainer.val_only=True but no validation reward fn is configured"
             return
 
+        # Exit cleanly after this many steps, so a run can pause at a mid-point
+        # checkpoint and be resumed later by the same command. This is NOT the
+        # way to run a shorter experiment -- total_training_steps stays what the
+        # lock pins, because it also sets the LR schedule (warmup is 10% of
+        # total): a run launched with total=150 would put a different LR
+        # trajectory into steps 15-30 than the 300-step control had. Stopping
+        # here instead leaves schedule, data order and objective identical to a
+        # straight run interrupted by a crash, which the resume path already
+        # handles exactly.
+        stop_after = int(self.config.trainer.get("stop_after_steps", 0) or 0)
+        if stop_after and 0 < self.config.trainer.save_freq:
+            assert stop_after % self.config.trainer.save_freq == 0, (
+                f"trainer.stop_after_steps={stop_after} is not a checkpoint step "
+                f"(save_freq={self.config.trainer.save_freq}); stopping there would "
+                "discard the tail since the last save"
+            )
+
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="OPD Training")
         self.global_steps += 1
         last_val_metrics = None
@@ -963,6 +980,12 @@ class OPDRayTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+                if stop_after and self.global_steps > stop_after:
+                    # The step just finished IS stop_after (global_steps has moved
+                    # past it) and its checkpoint was saved above.
+                    pprint(f"Stopping after step {stop_after} as requested (trainer.stop_after_steps); resume to continue to {self.total_training_steps}.")
+                    progress_bar.close()
+                    return
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()

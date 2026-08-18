@@ -640,6 +640,13 @@ class SignWeightStats:
                     out[f"{head}/mass_frac_{sname}"] = self.mass.get((tid, sid), 0.0) / mass_denom
             out[f"{head}/n_candidates"] = denom
             out[f"{head}/n_tokens"] = n_tok
+            # Mean teacher mass covered by the support, per token. THE ceiling on
+            # target mode's leverage: everything the rewrite can move lives inside
+            # this, and 1 - it is the tail's share of Z. The mass_frac_* above are
+            # shares OF this covered mass, so without it they overstate a
+            # mechanism whose support covers little of the teacher.
+            if n_tok > 0:
+                out[f"{head}/teacher_coverage"] = mass_denom / n_tok
 
         for tid, n in self.pos_n.items():
             if n <= 0:
