@@ -218,6 +218,65 @@ def log_seqlen_unbalance(seqlen_list: List[int], partitions: List[List[int]], pr
     }
 
 
+def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]], minibatch_rows: int, prefix):
+    """How balanced the MINI-BATCHES are across ranks, which is a different
+    question from how balanced the ranks are.
+
+    ``get_seqlen_balanced_partitions`` equalises each rank's total over the whole
+    batch, and ``log_seqlen_unbalance`` reports that it succeeded -- typically to
+    within a single token. But the ranks do not meet once per batch. They meet at
+    the gradient reduce and optimizer step that end every mini-batch, and each
+    mini-batch is a contiguous slice of the rank's rows: ``dataloader =
+    batch.split(ppo_mini_batch_size)``. Whether slice k holds the same number of
+    tokens on every rank is not something the whole-batch balance constrains, and
+    ``_check_and_sort_partitions`` sorts each partition by original index, which
+    discards the length ordering the partitioner worked in.
+
+    Every rank waits for the slowest one at each of those meetings, so the loss is
+    the sum over mini-batches of (slowest - mean), not (whole-batch max - min).
+    That is what ``wait_frac`` reports, as a fraction of one rank's tokens. It
+    assumes the time a mini-batch takes is proportional to its tokens, which is
+    close enough for the packed forward this arm runs, and it is an upper bound
+    on what any per-mini-batch rebalancing could recover -- NOT a measured stall.
+
+    ``wait_frac_sorted`` is the same number if each rank's rows were ordered by
+    length instead of by index, so slice k holds the k-th longest rows on every
+    rank. The gap between the two is the headroom, measured rather than assumed.
+    """
+    if minibatch_rows <= 0:
+        return {}
+    per_rank = [[seqlen_list[i] for i in partition] for partition in partitions]
+
+    def _chunk_sums(rows):
+        return [sum(rows[i : i + minibatch_rows]) for i in range(0, len(rows), minibatch_rows)]
+
+    def _wait(ordered):
+        chunks = [_chunk_sums(rows) for rows in ordered]
+        n = min(len(c) for c in chunks)
+        waited = total = 0.0
+        spreads = []
+        for k in range(n):
+            column = [c[k] for c in chunks]
+            mean = sum(column) / len(column)
+            waited += max(column) - mean
+            total += mean
+            spreads.append(max(column) - min(column))
+        return waited, total, spreads
+
+    waited, total, spreads = _wait(per_rank)
+    # Descending, because that is the order a fix would use: the k-th longest row
+    # of every rank lands in mini-batch k, so the columns match by construction.
+    sorted_waited, sorted_total, _ = _wait([sorted(rows, reverse=True) for rows in per_rank])
+    if not total:
+        return {}
+    return {
+        f"{prefix}/minibatch_spread_mean": sum(spreads) / len(spreads),
+        f"{prefix}/minibatch_spread_max": max(spreads),
+        f"{prefix}/minibatch_wait_frac": waited / total,
+        f"{prefix}/minibatch_wait_frac_sorted": (sorted_waited / sorted_total) if sorted_total else 0.0,
+    }
+
+
 def ceildiv(a, b):
     return -(a // -b)
 

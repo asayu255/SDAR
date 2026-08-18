@@ -60,7 +60,11 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
 )
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    get_seqlen_balanced_partitions,
+    log_minibatch_unbalance,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -1275,6 +1279,34 @@ class RayPPOTrainer:
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        # The whole-batch balance above is exact to about a token, and says
+        # nothing about where the ranks actually meet: at the gradient reduce
+        # and optimizer step that end every mini-batch, of which there are
+        # train_rows / ppo_mini_batch_size per step. Each is a contiguous slice
+        # of the rank's rows, and the partitioner's length ordering is discarded
+        # by _check_and_sort_partitions, so slice k can hold very different
+        # token counts on different ranks while the totals still match. That
+        # difference is a wait on every rank but the slowest, and it is
+        # invisible to utilization.gpu, which counts a spinning collective as
+        # busy. Measured here rather than inferred, because it is free to do so.
+        minibatch_rows = self._minibatch_rows_per_rank(world_size)
+        if minibatch_rows:
+            metrics.update(log_minibatch_unbalance(
+                seqlen_list=global_seqlen_lst, partitions=global_partition_lst,
+                minibatch_rows=minibatch_rows, prefix=logging_prefix))
+
+    def _minibatch_rows_per_rank(self, world_size: int) -> int:
+        """Rows in one rank's mini-batch, or 0 if this arm has no actor to ask.
+
+        ppo_mini_batch_size is a global row count in the driver's config and is
+        divided by world_size inside the worker (fsdp_workers), so the division
+        has to be repeated here rather than read off.
+        """
+        try:
+            mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        except Exception:  # noqa: BLE001 - a metric must never break a step
+            return 0
+        return int(mini) // world_size if mini else 0
 
     def fit(self):
         """

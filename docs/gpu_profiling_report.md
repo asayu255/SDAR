@@ -1237,3 +1237,56 @@ python3 scripts/gpu_stall_scan.py /tmp/trace.*.csv
 これ以上詰まらない。rank ローカルの CPU 処理（micro-batch の H2D、
 ページキャッシュ）が第一候補だが、**候補のまま書いておく** ——
 この arm では測らずに原因を言って 3 回外している（5 節）。
+
+### 9.12 rank は揃っている。mini-batch は揃っていない
+
+`global_seqlen/balanced_min` と `balanced_max` は実 run で **1 トークンしか
+違わない**。これを「rank 間は揃っている」と読んでいたが、その読み方が
+間違っていた。
+
+rank が合流するのは batch ごとではない。**mini-batch ごと**である
+(`dp_actor.py:1151` の `_optimizer_step`、1 step あたり 66 回)。そして
+mini-batch は rank の行の連続スライス
+(`dataloader = batch.split(ppo_mini_batch_size)`) で、スライス k が
+どの rank でも同じトークン数になる保証はどこにも無い。むしろ
+`_check_and_sort_partitions` が `sorted(partition)` で **元インデックス順に
+並べ直す** ので、KK partitioner が使った長さ順は捨てられる。
+
+差はそのまま、最も遅い rank 以外の待ち時間になる。そして
+**NVML には見えない** —— 回っている collective は `utilization.gpu` では
+busy に数えられるので、3 枚とも 99-100% を出したまま待てる。
+今まで「1% しか落ちていない」と読んでいた区間に、これは含まれない。
+
+#### 計測器を足した（推測をやめた）
+
+`log_minibatch_unbalance` (`verl/utils/seqlen_balancing.py`) を
+`_balance_batch` から呼ぶ。既に手元にある `global_seqlen_lst` と
+partition から出るので追加コストはゼロ:
+
+| metric | 意味 |
+| --- | --- |
+| `global_seqlen/minibatch_spread_mean` / `_max` | mini-batch ごとの rank 間トークン差 |
+| `global_seqlen/minibatch_wait_frac` | Σ(最遅 − 平均) / Σ平均。1 rank 分のトークンに対する待ちの割合 |
+| `global_seqlen/minibatch_wait_frac_sorted` | 各 rank の行を長さ順にした場合の同じ値 = **伸びしろ** |
+
+`wait_frac` は「時間 ∝ トークン数」を仮定した**上界**であって、実測した
+ストールではない。分けて書いておく —— この arm では測らずに原因を言って
+3 回外している（5 節）。
+
+#### シミュレーションの見積もり（実測ではない）
+
+step 1 のログの per-task 統計（min / mean / max）に合わせた有界分布で
+実 partitioner を回すと:
+
+```
+whole-batch balanced spread : 1 token         <- 実 run のログと一致
+per-mini-batch spread  mean : 3137 tokens
+straggler wait              : 10.1%
+the same, rows length-sorted: 0.0%
+```
+
+較正できる唯一の量（whole-batch spread = 1 トークン）は実 run と一致する。
+ただし ~10% は 3 つの理由で上振れしうる: mini-batch には optimizer step の
+ようなトークン数に依存しない固定費があること、分散を (min, mean, max) から
+しか合わせていないこと、そして時間 ∝ トークン数が近似であること。
+**本当の数字は次の run が metric で出す。プロファイラは要らない。**
