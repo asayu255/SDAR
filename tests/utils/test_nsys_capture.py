@@ -27,7 +27,7 @@ import pytest
 
 
 def _fresh(monkeypatch, **env):
-    for key in ("ACTOR_NSYS_MICRO", "ACTOR_NSYS_SKIP"):
+    for key in ("ACTOR_NSYS_MICRO", "ACTOR_NSYS_SKIP", "ACTOR_NSYS_TRACE"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -162,3 +162,14 @@ def test_the_runtime_env_limits_the_report_to_the_capture_range(monkeypatch):
     # This host cannot do CPU IP sampling ("not supported, disabling"), so osrt
     # is the only remaining way to see what the host was blocked on.
     assert "osrt" in env["t"]
+
+
+def test_the_trace_list_can_drop_osrt_without_a_code_change(monkeypatch):
+    """osrt is the suspect for the "Wrong event order" import failure, and
+    ruling it in or out should not cost a commit and a pull."""
+    mod = _fresh(monkeypatch, ACTOR_NSYS_MICRO="1",
+                 ACTOR_NSYS_TRACE="cuda,cudnn,cublas,nvtx")
+
+    assert mod.nsight_runtime_env()["t"] == "cuda,cudnn,cublas,nvtx"
+    # the rest of the config is unchanged, so the two runs stay comparable
+    assert mod.nsight_runtime_env()["capture-range-end"] == "stop-shutdown"

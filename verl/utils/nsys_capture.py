@@ -68,6 +68,13 @@ def _int_env(name: str, default: int = 0) -> int:
 
 _MICRO = _int_env("ACTOR_NSYS_MICRO", 0)
 _SKIP = _int_env("ACTOR_NSYS_SKIP", 40)
+# Overridable because osrt is the one entry here that is suspected of breaking
+# the import: the first real capture died in QdstrmImporter with "Wrong event
+# order has been detected", and the offending records were TraceProcessEvents
+# carrying syscall return values -- osrt's shape. Dropping it costs the host-side
+# detail and keeps everything else, so it is worth being able to try without a
+# code change: ACTOR_NSYS_TRACE=cuda,cudnn,cublas,nvtx
+_TRACE = os.environ.get("ACTOR_NSYS_TRACE", "cuda,cudnn,cublas,nvtx,osrt").strip()
 
 _seen = 0
 _running = False
@@ -92,7 +99,8 @@ def nsight_runtime_env() -> dict:
         # what the host was doing during a gap. The CUDA API trace still shows
         # whether it stopped submitting or blocked in a synchronize, and osrt is
         # what turns "blocked" into which call -- a futex, a read, a condvar.
-        "t": "cuda,cudnn,cublas,nvtx,osrt",
+        # ACTOR_NSYS_TRACE drops it if it turns out to be what breaks the import.
+        "t": _TRACE,
         "o": "'actor_rank_%p'",
         "capture-range": "cudaProfilerApi",
         # stop-shutdown, not stop: end the session at cudaProfilerStop instead of
