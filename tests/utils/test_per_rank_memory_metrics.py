@@ -31,14 +31,20 @@ _GB = 1024.0**3
 class _Device:
     """The get_torch_device() surface this helper uses."""
 
-    def __init__(self, allocated_gb, reserved_gb):
+    def __init__(self, allocated_gb, reserved_gb, retries=0, ooms=0, stats=True):
         self._a, self._r = allocated_gb * _GB, reserved_gb * _GB
+        self._stats = {"num_alloc_retries": retries, "num_ooms": ooms} if stats else None
 
     def max_memory_allocated(self):
         return self._a
 
     def max_memory_reserved(self):
         return self._r
+
+    def memory_stats(self):
+        if self._stats is None:
+            raise RuntimeError("no memory_stats on this backend")
+        return self._stats
 
     def current_device(self):
         return "cpu"
@@ -54,11 +60,15 @@ def test_without_distributed_it_reports_this_ranks_own_numbers():
 
 
 def _fake_all_gather(per_rank):
-    """Stand in for torch.distributed with a fixed set of per-rank readings."""
+    """Stand in for torch.distributed with a fixed set of per-rank readings.
+
+    Each entry is (allocated, reserved) or (allocated, reserved, retries, ooms).
+    """
 
     def all_gather(out_list, local, *a, **kw):
-        for tensor, (alloc, res) in zip(out_list, per_rank):
-            tensor.copy_(torch.tensor([alloc, res], dtype=tensor.dtype))
+        for tensor, row in zip(out_list, per_rank):
+            row = tuple(row) + (0.0, 0.0)
+            tensor.copy_(torch.tensor(row[:4], dtype=tensor.dtype))
 
     return all_gather
 
@@ -135,3 +145,39 @@ def test_a_single_gpu_run_still_produces_the_rank0_key(dist3):
 
     assert m["perf/memory_allocated_gb/rank0"] == pytest.approx(30.0)
     assert m["perf/memory_allocated_spread_gb"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# The allocator's own counters
+# --------------------------------------------------------------------------- #
+def test_alloc_retries_are_reported_per_rank(dist3):
+    """num_alloc_retries counts the times a malloc missed the cache and the
+    allocator had to cudaFree and retry. cudaFree synchronizes the device, so
+    each retry is a queue drain in the middle of a micro-batch -- exactly the
+    thing an NVML sampler sees as "sm 0 at full power" and cannot name."""
+    dist3([(39.9, 45.8, 12, 0), (24.1, 29.4, 0, 0), (28.6, 34.2, 3, 0)])
+    m = per_rank_memory_metrics(_Device(39.9, 45.8, retries=12))
+
+    assert m["perf/alloc_retries/rank0"] == pytest.approx(12)
+    assert m["perf/alloc_retries/rank1"] == pytest.approx(0)
+    assert m["perf/alloc_retries/rank2"] == pytest.approx(3)
+    assert m["perf/max_alloc_retries"] == pytest.approx(12)
+    assert m["perf/max_alloc_ooms"] == pytest.approx(0)
+
+
+def test_a_clean_run_reports_zero_retries(dist3):
+    """Zero is the finding that kills the hypothesis, so it has to be logged
+    rather than absent."""
+    dist3([(30.0, 36.0, 0, 0)] * 3)
+    m = per_rank_memory_metrics(_Device(30.0, 36.0))
+
+    assert m["perf/max_alloc_retries"] == 0
+    assert all(m[f"perf/alloc_retries/rank{i}"] == 0 for i in range(3))
+
+
+def test_a_backend_without_memory_stats_does_not_break_the_step():
+    """A diagnostic must never be able to fail a training step."""
+    m = per_rank_memory_metrics(_Device(30.0, 36.0, stats=False))
+
+    assert m["perf/max_alloc_retries"] == 0
+    assert m["perf/max_memory_allocated_gb"] == pytest.approx(30.0)

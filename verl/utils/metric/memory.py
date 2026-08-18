@@ -34,7 +34,16 @@ exactly that. The caching allocator never gives the peak back either
 arms never take), so ``nvidia-smi`` shows a ratchet: whatever a rank once
 reached, it keeps.
 
-One all-gather of two floats per step is what makes any of that visible.
+One all-gather of four floats per step is what makes any of that visible.
+
+The other two floats are the allocator's own counters. ``num_alloc_retries``
+increments every time a malloc could not be served from the cache and the
+allocator had to release cached blocks back to the driver and try again -- and
+``cudaFree`` synchronizes the device, so each retry is a full queue drain in the
+middle of a micro-batch. That is the difference between "this phase is slow" and
+"this phase keeps stopping the GPU to go shopping for memory", and no amount of
+NVML sampling can tell them apart from outside. ``num_ooms`` is the same counter
+one step further along: an allocation that failed even after the retry.
 """
 
 import torch
@@ -44,37 +53,60 @@ __all__ = ["per_rank_memory_metrics"]
 _GB = 1024.0**3
 
 
-def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
-    """Peak allocated/reserved for every rank, plus the spread across them.
+def _allocator_counters(device) -> tuple:
+    """(num_alloc_retries, num_ooms) for this rank, 0 when unavailable.
 
-    ``device`` is the module returned by ``get_torch_device()``. Both figures are
-    high-water marks since the process started, not the current step's peak, so
-    they only ever climb -- the spread between ranks is the informative part.
+    Never lets a diagnostic take the run down: any backend without
+    ``memory_stats`` just reports zeros.
+    """
+    try:
+        stats = device.memory_stats()
+    except Exception:
+        return 0.0, 0.0
+    return float(stats.get("num_alloc_retries", 0)), float(stats.get("num_ooms", 0))
+
+
+def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
+    """Peak allocated/reserved and allocator retries for every rank.
+
+    ``device`` is the module returned by ``get_torch_device()``. The memory
+    figures are high-water marks since the process started, not the current
+    step's peak, so they only ever climb -- the spread between ranks is the
+    informative part. The retry counter is cumulative for the same reason: what
+    matters is whether it moves between steps.
 
     Falls back to this rank's own numbers when torch.distributed is not up, so
     single-process runs and tests keep working.
     """
     allocated = device.max_memory_allocated() / _GB
     reserved = device.max_memory_reserved() / _GB
+    retries, ooms = _allocator_counters(device)
 
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return {
             f"{prefix}/max_memory_allocated_gb": allocated,
             f"{prefix}/max_memory_reserved_gb": reserved,
+            f"{prefix}/max_alloc_retries": retries,
+            f"{prefix}/max_alloc_ooms": ooms,
         }
 
     world_size = torch.distributed.get_world_size()
-    local = torch.tensor([allocated, reserved], dtype=torch.float64, device=device.current_device())
+    local = torch.tensor([allocated, reserved, retries, ooms], dtype=torch.float64,
+                         device=device.current_device())
     gathered = [torch.empty_like(local) for _ in range(world_size)]
     torch.distributed.all_gather(gathered, local)
-    pairs = [g.tolist() for g in gathered]
+    rows = [g.tolist() for g in gathered]
 
     metrics = {}
-    for rank, (alloc, res) in enumerate(pairs):
+    for rank, (alloc, res, retry, oom) in enumerate(rows):
         metrics[f"{prefix}/memory_allocated_gb/rank{rank}"] = alloc
         metrics[f"{prefix}/memory_reserved_gb/rank{rank}"] = res
-    allocs = [a for a, _ in pairs]
-    reserveds = [r for _, r in pairs]
+        metrics[f"{prefix}/alloc_retries/rank{rank}"] = retry
+        metrics[f"{prefix}/alloc_ooms/rank{rank}"] = oom
+    allocs = [r[0] for r in rows]
+    reserveds = [r[1] for r in rows]
+    metrics[f"{prefix}/max_alloc_retries"] = max(r[2] for r in rows)
+    metrics[f"{prefix}/max_alloc_ooms"] = max(r[3] for r in rows)
     # Named so reduce_metrics' key convention ("max" -> np.max, "min" -> np.min)
     # is right rather than merely harmless: these already ARE the cross-rank
     # extremes, and reducing a scalar leaves them alone.
