@@ -33,7 +33,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils import gpu_profiler, nsys_capture
+from verl.utils import actor_capture, gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
@@ -99,7 +99,7 @@ def _actor_phase(name: str):
     # the question an Nsight trace answers is which rank the other two are
     # waiting for, and a timeline labelled on rank 0 alone cannot answer it.
     # Both are no-ops unless their own env var is set.
-    with nsys_capture.phase(name):
+    with actor_capture.phase(name):
         if not _PROFILE_STAGES:
             yield
             return
@@ -859,7 +859,7 @@ class DataParallelPPOActor(BasePPOActor):
                 # enumerate(), plus the Nsight window and one named range per
                 # micro-batch. Wrapping the iterator leaves the body untouched;
                 # a no-op unless ACTOR_NSYS_MICRO is set.
-                for micro_idx, data in nsys_capture.iter_micro_batches(micro_batches):
+                for micro_idx, data in actor_capture.iter_micro_batches(micro_batches):
                     if self.no_sync_grad_accum:
                         if micro_idx == 0 and n_micro > 1:
                             accum_ctx = _grad_sync_context(self.actor_module, True)

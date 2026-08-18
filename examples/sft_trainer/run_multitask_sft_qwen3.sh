@@ -169,19 +169,44 @@ set -x
 # out of band -- but the rollout is still constructed on every rank, so the
 # assert fires at init_model, before the first step.
 #
-# WHEN NVML IS NOT ENOUGH, run a few micro-batches under Nsight:
+# WHEN NVML IS NOT ENOUGH, trace a few micro-batches of every rank. The sampler
+# above cannot go below ~330 ms and one micro-batch's forward is ~1.1 s of about
+# 500 kernels, so a 0.3-1.0 s stall lands inside a single actor.fwd sample and
+# cannot be placed more precisely than "in that phase". Two backends, same
+# window, and both are inert unless their own count is set:
 #
 #   ACTOR_NSYS_MICRO=20 ACTOR_NSYS_SKIP=40 bash examples/sft_trainer/run_...sh
 #
-# The sampler above cannot go below ~330 ms and one micro-batch's forward is
-# ~1.1 s of about 500 kernels, so a 0.3-1.0 s stall lands inside a single
-# actor.fwd sample and cannot be placed more precisely than "in that phase".
-# ACTOR_NSYS_MICRO puts every rank under Ray's _nsight plugin, opens a capture
-# range around that many micro-batches, and names the phases with NVTX -- which
-# is what makes the collectives visible by name, and so what decides whether one
-# rank is slow or the other two are waiting for it. Reports land one per process
-# in the Ray session's logs/nsight directory. Measurement only: leave both unset
-# and not a single NVTX push happens. Do not summarise the trace by counting samples under a
+# puts every rank under Ray's _nsight plugin, opens a capture range around that
+# many micro-batches, and names the phases with NVTX -- which is what makes the
+# collectives visible by name, and so what decides whether one rank is slow or
+# the other two are waiting for it. Reports land one per process in the Ray
+# session's logs/nsight directory. Nsight sees the most (driver, OS runtime),
+# but collection writes a .qdstrm that a separate QdstrmImporter has to convert,
+# and on this host that conversion has failed with "Wrong event order has been
+# detected" -- leaving three intact 39 MB captures nothing can read. If it does,
+# ACTOR_NSYS_TRACE=cuda,cudnn,cublas,nvtx drops osrt, the suspect.
+#
+#   ACTOR_TORCH_MICRO=6 ACTOR_TORCH_SKIP=40 bash examples/sft_trainer/run_...sh
+#
+# is the backend with nothing outside the process: torch.profiler writes a
+# finished Chrome trace from inside each rank, so there is no conversion left to
+# fail, and record_shapes puts the per-op tensor shapes in the file -- the direct
+# test of whether a slow rank was handed more tokens. It sees less than Nsight
+# and its own CUPTI start-up perturbs the first captured micro-batch, so ask for
+# a few more than you need and read from the second. Traces go to
+# ACTOR_TORCH_DIR (default /tmp/actor_trace), one per rank; read them with
+#
+#   python3 scripts/actor_trace_summary.py /tmp/actor_trace
+#
+# which prints, per micro-batch and per rank, the device's real busy time (the
+# union across streams, not the sum), the NCCL share, and the idle complement --
+# then names the rank everyone else waited for and splits its lateness into
+# extra work versus a stall, because those want different fixes. Keep MICRO
+# small: the trace is a few hundred MB for a handful of micro-batches.
+#
+# Measurement only: leave all of them unset and not a single NVTX push or
+# profiler call happens. Do not summarise the NVML trace by counting samples under a
 # threshold — utilization.gpu is the busy fraction of a trailing window, so a
 # stall shorter than that window never even reads 0 and time-under-a-line
 # reports a fraction of it. The scan integrates the deficit instead, which is

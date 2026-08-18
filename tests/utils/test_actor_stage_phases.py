@@ -81,13 +81,23 @@ def test_the_instrumented_stages_are_the_ones_the_report_orders():
     Read from the file rather than inspect.getsource: update_policy is wrapped by
     GPUMemoryLogger, which does not use functools.wraps, so getsource returns the
     decorator's inner function and finds nothing.
+
+    Both files, because the stages are not all in one. actor.h2d is instrumented
+    in fsdp_workers, not dp_actor: it covers moving the batch onto the device,
+    which happens in the worker's update_actor before dp_actor is entered at all.
+    Scanning only dp_actor made the ordering list look like it named a stage
+    nobody produced.
     """
+    from verl.workers import fsdp_workers
+
     from verl.utils import gpu_profiler
 
-    source = open(mod.__file__.replace(".pyc", ".py")).read()
-    used = {line.split('_actor_phase("')[1].split('"')[0]
-            for line in source.splitlines()
-            if '_actor_phase("' in line and not line.strip().startswith("def ")}
+    used = set()
+    for module in (mod, fsdp_workers):
+        source = open(module.__file__.replace(".pyc", ".py")).read()
+        used |= {line.split('_actor_phase("')[1].split('"')[0]
+                 for line in source.splitlines()
+                 if '_actor_phase("' in line and not line.strip().startswith("def ")}
     assert used, "update_policy is not instrumented"
     assert used <= set(gpu_profiler._PHASE_ORDER), used - set(gpu_profiler._PHASE_ORDER)
     # Every stage the report orders should actually be produced, or the ordering
