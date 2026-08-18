@@ -1284,12 +1284,21 @@ class DataParallelPPOActor(BasePPOActor):
                                     response_mask=response_mask,
                                     task_ids=task_ids,
                                 )
-                                # By the PREVIOUS step's per-task means: this one's
+                                # By the PREVIOUS call's per-task means: this one's
                                 # are not known until every micro-batch has run, and
                                 # normalising by a micro-batch's own mean would make
                                 # the objective depend on how the batch was split.
-                                sign_position_weight = normalize_per_task(
-                                    pos_w, response_mask, task_ids, means=self._sign_position_means
+                                # Before the first call there is no such mean, and
+                                # the micro-batch's own is exactly the wrong
+                                # fallback, so the first step runs unnormalised --
+                                # sign_weight/*/w_mean_pre_norm records by how much.
+                                sign_position_weight = (
+                                    normalize_per_task(
+                                        pos_w, response_mask, task_ids,
+                                        means=self._sign_position_means,
+                                    )
+                                    if self._sign_position_means is not None
+                                    else pos_w
                                 )
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")

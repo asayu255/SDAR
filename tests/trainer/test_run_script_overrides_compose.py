@@ -64,7 +64,19 @@ def _overrides(path):
             break
     cmd = " ".join(line.rstrip().rstrip("\\").strip() for line in lines)
     cmd = re.sub(r"python3 -m verl\.trainer\.main_\w+", "", cmd).replace('"$@"', "")
-    return [os.path.expandvars(tok) for tok in cmd.split() if "=" in tok]
+
+    def _unquote(tok):
+        # The shell removes a matching pair of surrounding quotes before Hydra
+        # sees the value, and for a structured value that is the difference
+        # between a dict and a string: '{alfworld:0.1,...}' composes as a nested
+        # config, "'{alfworld:0.1,...}'" as one opaque token whose sub-keys then
+        # read as missing.
+        key, _, value = tok.partition("=")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        return f"{key}={value}"
+
+    return [_unquote(os.path.expandvars(tok)) for tok in cmd.split() if "=" in tok]
 
 
 @pytest.mark.parametrize("script", COMPOSED_SCRIPTS)

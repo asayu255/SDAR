@@ -152,3 +152,56 @@ def test_the_comparison_would_notice_a_drifting_arm():
     control = _effective(CONTROL)
     drifted = _effective(ARMS[1][1], extra=["actor_rollout_ref.actor.optim.lr=5e-6"])
     assert "actor_rollout_ref.actor.optim.lr" in _differing(control, drifted)
+
+
+@pytest.mark.parametrize("script", [CONTROL] + [s for _, s in ARMS])
+def test_each_arm_passes_its_own_intent_lock(script):
+    """The gate that decides whether the run starts at all.
+
+    main_opd validates the composed config against the lock AFTER its own
+    injection, so a knob that reaches the actor by a path the lock does not
+    expect fails here -- in a second, rather than after the teachers have loaded.
+    The injection is imported rather than reproduced: a copy of it in the test
+    would pass while the real one drifted.
+    """
+    from verl.trainer.main_opd import inject_opd_config
+    from verl.utils.expected_config import check_expected_config
+
+    home = "/opt/home/tester"
+    os.environ["HOME"] = home
+    overrides = _overrides(script)
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        cfg = compose(config_name="ppo_trainer", overrides=overrides)
+    inject_opd_config(cfg)
+    lock = os.path.join(REPO, cfg.trainer.expected_config)
+    assert check_expected_config(cfg, lock) == [], check_expected_config(cfg, lock)
+
+
+@pytest.mark.parametrize("mode,script", ARMS)
+def test_the_injection_carries_the_weighting_to_the_actor(mode, script):
+    """The weights are built in the actor's forward, so settings that stop at
+    algorithm.opd would leave the mechanism configured and inert."""
+    from verl.trainer.main_opd import inject_opd_config
+
+    os.environ["HOME"] = "/opt/home/tester"
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        cfg = compose(config_name="ppo_trainer", overrides=_overrides(script))
+    inject_opd_config(cfg)
+    assert cfg.actor_rollout_ref.actor.sign_weight.enable is True
+    assert cfg.actor_rollout_ref.actor.sign_weight.mode == mode
+    assert float(cfg.actor_rollout_ref.actor.sign_weight.agree_weight) == 1.25
+    assert float(cfg.actor_rollout_ref.actor.sign_weight.agree_neg_weight) == 0.75
+
+
+def test_the_control_never_gains_the_weighting_by_accident():
+    """enable=false is not enough on the control: the key must not be there at
+    all, so the actor's own check ("is there a sign_cache_ids column") is the
+    only thing that could ever turn it on."""
+    from verl.trainer.main_opd import inject_opd_config
+
+    os.environ["HOME"] = "/opt/home/tester"
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        cfg = compose(config_name="ppo_trainer", overrides=_overrides(CONTROL))
+    inject_opd_config(cfg)
+    assert "sign_weight" not in cfg.algorithm.opd
+    assert "sign_weight" not in cfg.actor_rollout_ref.actor

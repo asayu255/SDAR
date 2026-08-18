@@ -9,12 +9,50 @@ reference-KL and reward signals are all disabled so no other signal enters the l
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     run_opd(config)
+
+
+def inject_opd_config(config) -> None:
+    """Force the pure-distillation invariants onto the composed config.
+
+    A module-level function rather than an inline block because it is the
+    difference between what a script asks for and what the run actually gets:
+    the intent lock validates the config AFTER this, and a test that wants to
+    know whether an arm will start has to apply the same thing rather than a
+    copy of it that can drift.
+    """
+    opd_cfg = config.algorithm.get("opd", {})
+    with open_dict(config):
+        config.actor_rollout_ref.actor.use_teacher_kl_loss = True
+        config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
+        config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
+        # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
+        config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
+        # Equal per-task share of the teacher-KL loss, instead of the token-count
+        # share the plain token-mean gives. Scientific knob, so it is surfaced
+        # under algorithm.opd like the other loss settings and pinned in the
+        # expectations file rather than left to the actor's default.
+        config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
+            "normalize_loss_by_task", False
+        )
+        # Cross-teacher sign agreement. The weights are built inside the
+        # actor's forward -- that is where the student's top-k exists -- so the
+        # settings have to reach the actor config, while staying authored under
+        # algorithm.opd with the other scientific knobs.
+        sign_cfg = opd_cfg.get("sign_weight", None)
+        if sign_cfg is not None:
+            config.actor_rollout_ref.actor.sign_weight = sign_cfg
+        config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
+        config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
+        config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term
+        config.actor_rollout_ref.actor.use_sdl_loss = False
+        config.actor_rollout_ref.actor.use_sdar_loss = False
+        config.algorithm.use_kl_in_reward = False                # reward never shapes the loss
 
 
 def run_opd(config) -> None:
@@ -53,34 +91,7 @@ class OPDTaskRunner:
             "(pass via +algorithm.opd.teacher_paths.<task>=/path)"
         )
 
-        # Inject the pure-distillation invariants so no signal other than the
-        # per-task teacher KL can flow into the actor loss.
-        with open_dict(config):
-            config.actor_rollout_ref.actor.use_teacher_kl_loss = True
-            config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
-            config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
-            # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
-            config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
-            # Equal per-task share of the teacher-KL loss, instead of the token-count
-            # share the plain token-mean gives. Scientific knob, so it is surfaced
-            # under algorithm.opd like the other loss settings and pinned in the
-            # expectations file rather than left to the actor's default.
-            config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
-                "normalize_loss_by_task", False
-            )
-            # Cross-teacher sign agreement. The weights are built inside the
-            # actor's forward -- that is where the student's top-k exists -- so the
-            # settings have to reach the actor config, while staying authored under
-            # algorithm.opd with the other scientific knobs.
-            sign_cfg = opd_cfg.get("sign_weight", None)
-            if sign_cfg is not None:
-                config.actor_rollout_ref.actor.sign_weight = sign_cfg
-            config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
-            config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
-            config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term
-            config.actor_rollout_ref.actor.use_sdl_loss = False
-            config.actor_rollout_ref.actor.use_sdar_loss = False
-            config.algorithm.use_kl_in_reward = False                # reward never shapes the loss
+        inject_opd_config(config)
 
         # Fail-fast intent check: validate the EFFECTIVE config (after the
         # injection above) against the version-controlled expectations file.
