@@ -314,10 +314,11 @@ def test_the_ranks_are_checked_to_be_on_the_same_micro_batch(tmp_path, capsys):
 
 def test_the_recorded_shapes_give_the_per_micro_token_count(tmp_path, capsys):
     """_balance_batch equalises tokens per rank over the whole batch, and the
-    micro-batches are a plain chunk of that -- so the per-micro counts can still
-    differ across ranks while the totals match. The ranks synchronise every
-    micro-batch, so that difference is a real wait no per-rank balance removes.
-    Reading it off the trace rather than a derived number is the point."""
+    mini-batches are a contiguous chunk of that -- so the per-chunk counts can
+    still differ across ranks while the per-rank totals match. The ranks meet at
+    the gradient reduce ending each mini-batch, so that difference is a real wait
+    no whole-batch balance removes. Reading it off the trace rather than a
+    derived number is the point."""
     def rank_events(tokens):
         return [_micro(40, 0, 1000), _kernel("gemm", 0, 900),
                 _embedding(10, 5, tokens)]

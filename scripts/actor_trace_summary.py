@@ -352,12 +352,18 @@ def report(by_rank, top):
               for rank, rows in by_rank.items()}
     if any(shaped.values()):
         print("\n== tokens per micro-batch, from the recorded shapes ==")
-        print("  _balance_batch equalises tokens per RANK over the whole batch, "
-              "then the micro-batches\n  are a plain chunk of that -- so rank 0's "
-              "micro k and rank 1's micro k need not match,\n  even though the "
-              "totals do. The ranks synchronise every micro-batch, so a per-micro\n"
-              "  difference is a real wait that a per-rank balance cannot remove. "
-              "These are the shapes\n  torch recorded, not a derived number.\n")
+        print("  _balance_batch equalises tokens per RANK over the WHOLE batch, "
+              "and the mini-batches are\n  then a contiguous chunk of that -- so "
+              "rank 0's chunk k and rank 1's chunk k need not\n  match, even "
+              "though the per-rank totals do. The ranks meet at the gradient "
+              "reduce that\n  ends each mini-batch, so a per-chunk difference is a "
+              "real wait that a whole-batch\n  balance cannot remove. (During "
+              "accumulation they do NOT meet every micro-batch: under\n  "
+              "shard_grad_op with no_sync the parameters stay unsharded and no "
+              "collective runs until\n  the last one. With micro == mini there is "
+              "one micro-batch per mini-batch and the two\n  granularities "
+              "coincide.) These are the shapes torch recorded, not a derived "
+              "number.\n")
         for counter in counters:
             line = f"{counter:>6}"
             for rank in ranks:
