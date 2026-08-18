@@ -39,7 +39,7 @@ set -uo pipefail
 #   VAL_STEPS    which checkpoints to evaluate (default "150 300")
 #   TOTAL_STEPS  the step a training phase is considered finished at
 
-SEARCH_URL=${SEARCH_URL:-http://100.86.45.30:8000/retrieve}
+SEARCH_URL=${SEARCH_URL:-http://100.86.45.30:8001/retrieve}
 LOG_DIR=${LOG_DIR:-$HOME/logs}
 VAL_STEPS=${VAL_STEPS:-"150 300"}
 TOTAL_STEPS=${TOTAL_STEPS:-300}
