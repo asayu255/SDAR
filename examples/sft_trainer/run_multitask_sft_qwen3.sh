@@ -344,7 +344,23 @@ set -x
 SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export ALFWORLD_DATA=$HOME/data/alfworld
-export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
+# A placeholder here is worse than nothing. wandb validates WANDB_API_KEY before
+# it consults any other source, so "your_key_here" does not merely fail to
+# authenticate -- it hard-fails init and blocks the ~/.netrc that `wandb login`
+# writes. And it fails LATE: the workers build, the model loads, vLLM starts,
+# and the run dies in trainer.fit() at the Tracking() call, minutes in, with a
+# traceback that names an authentication error rather than a missing export.
+# Leave the variable unset instead and let wandb find the key itself.
+if [ -z "${WANDB_API_KEY:-}" ]; then
+  unset WANDB_API_KEY
+  # -qs returns non-zero for a missing file as well as for a missing entry, which
+  # is the condition wanted: warn unless a wandb credential is actually there.
+  if ! grep -qs "api.wandb.ai" "$HOME/.netrc"; then
+    echo "[wandb] no WANDB_API_KEY and no ~/.netrc entry -- run 'wandb login' once," >&2
+    echo "        or export WANDB_API_KEY before this script, or pass" >&2
+    echo "        trainer.logger=[console] to run without wandb." >&2
+  fi
+fi
 # On by default, for the same reason the two FSDP knobs are literals below: a
 # 300-step run gets restarted, and a mechanism that has to be exported by hand is
 # one that will eventually be missing from a restart. Both are accuracy-
