@@ -60,6 +60,18 @@ _MICRO_RE = re.compile(r"^micro/(\d+)/(\d+)$")
 # ~7,900 kernels per micro-batch the sub-millisecond holes are the ambient
 # floor, and listing them would bury the ones with a cause.
 _GAP_FLOOR_US = 1000.0
+# Decade buckets, because the question is which order of magnitude holds the
+# time, not the exact shape: ~10 us is a kernel launch, ~100 us is a Python-side
+# op, ~10 ms is something blocking.
+_BUCKETS = ((10.0, "<10us"), (100.0, "10-100us"), (1000.0, "0.1-1ms"),
+            (10000.0, "1-10ms"), (float("inf"), ">10ms"))
+
+
+def _bucket(width):
+    for edge, name in _BUCKETS:
+        if width < edge:
+            return name
+    return ">10ms"
 _NCCL_RE = re.compile(r"nccl", re.IGNORECASE)
 
 
@@ -230,10 +242,15 @@ def gap_causes(rows, kernels, runtime, skip_first=True):
                 best, share = name, overlap
         return best, (share / (hi - lo) if hi > lo else 0.0)
 
-    by_before, by_runtime, listed = {}, {}, []
+    by_before, by_runtime, listed, hist = {}, {}, [], {}
     for row in rows:
         if skip_first and row is rows[0]:
             continue                      # the profiler's own CUPTI start-up
+        for lo, hi in row.get("all_gaps", ()):
+            hist.setdefault(_bucket(hi - lo), [0, 0.0])
+            entry = hist[_bucket(hi - lo)]
+            entry[0] += 1
+            entry[1] += hi - lo
         for lo, hi in row.get("gaps", ()):
             width = hi - lo
             i = bisect.bisect_right(end_t, lo + 1) - 1
@@ -246,7 +263,7 @@ def gap_causes(rows, kernels, runtime, skip_first=True):
             by_before[label] = by_before.get(label, 0.0) + width
             by_runtime[key] = by_runtime.get(key, 0.0) + width
             listed.append((width, row["micro"], before, key, share))
-    return by_before, by_runtime, listed
+    return by_before, by_runtime, listed, hist
 
 
 def analyse(path, shapes_of=("aten::embedding",)):
@@ -305,6 +322,11 @@ def analyse_with_context(path, shapes_of=("aten::embedding",)):
             "carry_ms": (sum(e - s for s, e in busy_any) - sum(e - s for s, e in busy)) / 1e3,
             "kernels": len(mine),
             "gaps": every,
+            # Every hole, floor included. Whether the sub-millisecond majority is
+            # a uniform per-kernel floor or a few thousand medium ones decides
+            # whether the fix is "fewer kernels" or "find the medium ones", and
+            # a list that starts at 1 ms cannot tell those apart.
+            "all_gaps": holes,
             "gap_ms": (biggest[1] - biggest[0]) / 1e3 if biggest else 0.0,
             "gap_at": biggest[0] if biggest else None,
             "gap_host": _innermost_over(cpu_ops, biggest) if biggest else "-",
@@ -493,7 +515,7 @@ def report_causes(causes, top):
           f"under {_GAP_FLOOR_US / 1000:.0f} ms are omitted:\n  at ~7,900 kernels "
           "a micro-batch they are the launch-overhead floor, not events.\n")
     for rank in sorted(causes):
-        by_before, by_runtime, listed = causes[rank]
+        by_before, by_runtime, listed, hist = causes[rank]
         total = sum(by_before.values()) or 1.0
         print(f"  rank {rank}: {len(listed)} gaps, {total / 1e3:.0f} ms total")
         for label, width in sorted(by_before.items(), key=lambda kv: -kv[1]):
@@ -501,6 +523,14 @@ def report_causes(causes, top):
         for call, width in sorted(by_runtime.items(), key=lambda kv: -kv[1])[:4]:
             print(f"      host in {_short(call, 30):30s} {width / 1e3:7.0f} ms  "
                   f"{100 * width / total:5.1f}%")
+        whole = sum(w for _, w in hist.values()) or 1.0
+        print(f"      -- every hole, floor included: {whole / 1e3:.0f} ms --")
+        for _, name in _BUCKETS:
+            count, width = hist.get(name, (0, 0.0))
+            if not count:
+                continue
+            print(f"      {name:>10s}  {count:7d} holes  {width / 1e3:7.0f} ms  "
+                  f"{100 * width / whole:5.1f}%   mean {width / count:6.1f} us")
     every = sorted((g for c in causes.values() for g in c[2]), reverse=True)[:top]
     if every:
         print("\n  the largest, individually:")

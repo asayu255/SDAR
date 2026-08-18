@@ -396,7 +396,7 @@ def test_a_gap_the_host_spent_inside_cudamalloc_is_labelled_as_such(tmp_path):
         _kernel("gemm", 2900, 1400, correlation=9),
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, by_runtime, listed = summary.gap_causes(rows, kernels, runtime)
+    by_before, by_runtime, listed, _ = summary.gap_causes(rows, kernels, runtime)
 
     assert by_before["compute kernel"] == 2000.0          # 2 ms hole
     assert by_runtime["cudaMalloc"] == 2000.0             # ...and its cause
@@ -416,7 +416,7 @@ def test_a_gap_after_a_device_to_host_copy_is_separated_from_the_rest(tmp_path):
         _kernel("gemm", 4200, 2200),          # 0.2 ms hole, and runs to the end
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, _, listed = summary.gap_causes(rows, kernels, runtime)
+    by_before, _, listed, _ = summary.gap_causes(rows, kernels, runtime)
 
     # the 0.2 ms hole between the two gemms is under the floor and not an event
     assert by_before == {"Memcpy DtoH": 2500.0}
@@ -432,7 +432,33 @@ def test_the_profiler_start_up_window_is_left_out_of_the_totals(tmp_path):
         _micro(41, 5000, 3000), _kernel("gemm", 5000, 2000),  # 1 ms real gap
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, _, listed = summary.gap_causes(rows, kernels, runtime)
+    by_before, _, listed, _ = summary.gap_causes(rows, kernels, runtime)
 
     assert sum(by_before.values()) == 1000.0       # the 1 ms only, not the 4 ms
     assert all(micro != 40 for _, micro, _, _, _ in listed)
+
+
+def test_the_histogram_separates_a_launch_floor_from_discrete_holes(tmp_path):
+    """The question the 1 ms floor cannot answer.
+
+    Sixty percent of the in-micro idle is sub-millisecond, and "a uniform
+    per-kernel launch floor" and "a few thousand medium holes" are different
+    problems with different fixes -- fewer kernels versus find the holes. Only
+    the count per decade tells them apart, so every hole is bucketed regardless
+    of the reporting floor.
+    """
+    events = [_micro(40, 0, 100), _kernel("warmup", 0, 90), _micro(41, 100, 10000)]
+    at = 100
+    for _ in range(20):                      # 20 x (100 us kernel + 5 us hole)
+        events.append(_kernel("gemm", at, 100))
+        at += 105
+    events.append(_kernel("gemm", at + 2000, 5000))     # one 2 ms hole
+    rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
+    _, _, listed, hist = summary.gap_causes(rows, kernels, runtime)
+
+    assert hist["<10us"][0] == 19            # 20 kernels, 19 holes between them
+    assert hist["1-10ms"][0] == 1            # and the one real hole
+    # the floor is 95 us of the total against the hole's 2 ms: a histogram says
+    # which to chase, a >=1 ms list would have shown only the hole
+    assert hist["<10us"][1] == 95.0
+    assert len(listed) == 1
