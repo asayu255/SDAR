@@ -1293,6 +1293,11 @@ the same, rows length-sorted: 0.0%
 
 ### 9.13 スパイクではなかった —— 損失の 16.5% は NCCL の中で待っている
 
+> スパイク（＝使用率が落ちる現象）そのものの調査経過は
+> **[docs/spike_investigation.md](spike_investigation.md)** に分離した。
+> この節が扱うのは、その調査中に見つかった**別の**損失である。
+> 回っている collective は NVML から busy に見えるので、これはスパイクではない。
+
 torch profiler で step 1 の micro-batch 40〜59（3 rank、各 597 MB）を取り、
 `scripts/actor_trace_summary.py` で読んだ結果。
 
