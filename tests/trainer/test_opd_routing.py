@@ -48,6 +48,32 @@ class _FakeTeacherWG:
         return DataProto.from_dict(tensors={"ref_log_prob": out})
 
 
+class _FakeTopkTeacherWG:
+    """The topk branch's worker group, which answers a different method.
+
+    Same marker convention as _FakeTeacherWG so the assertions read the same
+    way, plus the ids tensor carries the original index on its own -- the two
+    together are what show a row was routed AND restored.
+    """
+
+    def __init__(self, code):
+        self.code = code
+        self.calls = []
+        self.topk_k = None
+
+    def compute_ref_topk_log_prob(self, sub):
+        first_tok = sub.batch["responses"][:, 0].float()
+        self.calls.append(first_tok.tolist())
+        self.topk_k = sub.meta_info["topk_k"]
+        bs, resp_len = sub.batch["responses"].shape
+        logprobs = torch.zeros((bs, resp_len, self.topk_k), dtype=torch.float32)
+        ids = torch.zeros((bs, resp_len, self.topk_k), dtype=torch.long)
+        logprobs[:, :, 0] = (self.code * 1000.0 + first_tok).unsqueeze(1)
+        ids[:, :, 0] = first_tok.long().unsqueeze(1)
+        return DataProto.from_dict(tensors={"teacher_topk_logprobs": logprobs,
+                                            "teacher_topk_ids": ids})
+
+
 def _make_batch(task_names, resp_len=4):
     bs = len(task_names)
     # responses[i, 0] == i  -> lets us recover the original index after routing.
@@ -59,12 +85,19 @@ def _make_batch(task_names, resp_len=4):
     )
 
 
-def _make_trainer(teacher_wg):
+def _make_trainer(teacher_wg, topk=0):
     from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 
     # Bypass the heavy __init__; we only exercise compute_teacher_log_probs.
     trainer = object.__new__(OPDRayTrainer)
     trainer.teacher_wg = teacher_wg
+    # Anything __init__ would have set and the method under test reads has to be
+    # set here too, or the bypass turns a routing test into an AttributeError.
+    # It is a parameter rather than a constant because the two branches route
+    # through different worker calls and write different keys: pinning the
+    # fixture to one would leave the other with no coverage at all.
+    trainer.teacher_topk_kl = bool(topk)
+    trainer.teacher_kl_topk = topk
     return trainer
 
 
@@ -76,7 +109,10 @@ def test_routing_assigns_correct_teacher_and_restores_order():
     task_names = ["webshop", "alfworld", "search", "alfworld_easy", "search/nq"]
     batch = _make_batch(task_names)
 
-    out = trainer.compute_teacher_log_probs(batch)
+    # It writes into the batch and returns nothing; reading a return value here
+    # is what made these tests fail with 'NoneType' object is not subscriptable.
+    trainer.compute_teacher_log_probs(batch)
+    out = batch.batch["teacher_log_probs"]
 
     code_by_task = {"alfworld": 1, "search": 2, "webshop": 3}
     norm = ["webshop", "alfworld", "search", "alfworld", "search"]
@@ -90,7 +126,8 @@ def test_empty_task_slice_is_skipped():
     trainer = _make_trainer(teachers)
     batch = _make_batch(["alfworld", "search"])  # no webshop samples
 
-    out = trainer.compute_teacher_log_probs(batch)
+    trainer.compute_teacher_log_probs(batch)
+    out = batch.batch["teacher_log_probs"]
 
     assert teachers["webshop"].calls == []  # never invoked
     assert out[0, 0].item() == pytest.approx(1000.0)  # alfworld, idx 0
@@ -182,3 +219,38 @@ def test_topk_kl_nonnegative_and_student_only_gradient():
     kl.sum().backward()
     assert s_logits.grad is not None
     assert t_logits.grad is None  # teacher provides no gradient
+
+
+def test_topk_routing_writes_both_tensors_in_the_original_order():
+    """The other branch of compute_teacher_log_probs.
+
+    It calls a different method on the worker group and writes two tensors
+    instead of one, so nothing the tests above assert reaches it -- the routing
+    and the reordering are implemented separately in each branch and can drift
+    apart independently.
+    """
+    teachers = {"alfworld": _FakeTopkTeacherWG(1), "search": _FakeTopkTeacherWG(2)}
+    trainer = _make_trainer(teachers, topk=4)
+    batch = _make_batch(["search", "alfworld", "search/nq"])
+
+    trainer.compute_teacher_log_probs(batch)
+
+    logprobs = batch.batch["teacher_topk_logprobs"]
+    ids = batch.batch["teacher_topk_ids"]
+    assert logprobs.shape == (3, 4, 4)          # (bs, resp_len, k)
+    assert ids.shape == (3, 4, 4)
+    # marker = code*1000 + original index, so this asserts the right teacher AND
+    # that the row came back to where it started
+    for i, code in enumerate((2, 1, 2)):
+        assert logprobs[i, 0, 0].item() == pytest.approx(code * 1000.0 + i)
+        assert ids[i, 0, 0].item() == i
+    # and k reached the worker, or the teacher would return the wrong width
+    assert all(wg.topk_k == 4 for wg in teachers.values())
+
+
+def test_topk_routing_still_refuses_a_task_with_no_teacher():
+    """The guard is written once per branch too."""
+    trainer = _make_trainer({"alfworld": _FakeTopkTeacherWG(1)}, topk=4)
+
+    with pytest.raises(ValueError, match="No teacher configured"):
+        trainer.compute_teacher_log_probs(_make_batch(["alfworld", "search"]))
