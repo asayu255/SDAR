@@ -48,7 +48,7 @@ one step further along: an allocation that failed even after the retry.
 
 import torch
 
-__all__ = ["per_rank_memory_metrics"]
+__all__ = ["per_rank_memory_metrics", "device_footprint_gb"]
 
 _GB = 1024.0**3
 
@@ -116,3 +116,20 @@ def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
     metrics[f"{prefix}/min_memory_reserved_gb"] = min(reserveds)
     metrics[f"{prefix}/memory_allocated_spread_gb"] = max(allocs) - min(allocs)
     return metrics
+
+
+def device_footprint_gb(device) -> float:
+    """Device memory in use right now, the way nvidia-smi counts it.
+
+    ``max_memory_allocated`` is what the model asked for and
+    ``max_memory_reserved`` is a counter that can outlive the pages behind it
+    (vLLM's CuMemAllocator unmaps out of band, which is how a 48 GiB card
+    reports 66 GiB reserved). Neither answers "how much of the card is gone".
+    ``mem_get_info`` does: it is the driver's own free/total, so it counts the
+    CUDA context, every allocator's pool, and any other process on the device.
+
+    Differencing it across a build is how to price a component that this arm
+    pays for and never uses.
+    """
+    free, total = device.mem_get_info()
+    return (total - free) / _GB

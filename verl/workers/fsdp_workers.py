@@ -39,7 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
-from verl.utils.metric.memory import per_rank_memory_metrics
+from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
 from verl.workers.actor.dp_actor import _actor_phase
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
@@ -614,7 +614,27 @@ class ActorRolloutRefWorker(Worker):
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            # Priced, because this arm may not be buying anything. The
+            # off-policy loops train from pre-made trajectories and validate out
+            # of band (trainer.test_freq=-1), so generate_sequences is never
+            # called -- yet the engine is built on every rank, sleeps itself at
+            # construction, and still holds a CUDA context, whatever survives
+            # sleep(level=1), and the allocator high-water mark its profiling run
+            # left behind. That is device memory the actor could be spending on a
+            # larger micro batch, and nothing else here reports it: allocated
+            # only counts this process's live tensors and reserved is a counter
+            # that outlives its pages.
+            before = device_footprint_gb(get_torch_device())
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            after = device_footprint_gb(get_torch_device())
+            print(
+                f"[rollout-footprint] rank {self.rank}: building the "
+                f"{self.config.rollout.name} rollout took the device from "
+                f"{before:.2f} to {after:.2f} GiB in use (+{after - before:.2f} GiB, "
+                f"gpu_memory_utilization={self.config.rollout.gpu_memory_utilization}, "
+                f"enforce_eager={self.config.rollout.enforce_eager})",
+                flush=True,
+            )
 
         if self._is_ref:
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)

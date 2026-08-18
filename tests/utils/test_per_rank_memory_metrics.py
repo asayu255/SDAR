@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from verl.utils.metric import reduce_metrics
-from verl.utils.metric.memory import per_rank_memory_metrics
+from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
 
 _GB = 1024.0**3
 
@@ -181,3 +181,35 @@ def test_a_backend_without_memory_stats_does_not_break_the_step():
 
     assert m["perf/max_alloc_retries"] == 0
     assert m["perf/max_memory_allocated_gb"] == pytest.approx(30.0)
+
+
+# --------------------------------------------------------------------------- #
+# What the card actually lost
+# --------------------------------------------------------------------------- #
+def test_device_footprint_is_used_not_free():
+    """mem_get_info returns (free, total); the useful number is the difference.
+
+    Getting this backwards would price a component as its own negation, which is
+    exactly the kind of thing that reads plausible in a log line.
+    """
+    class _Dev:
+        def mem_get_info(self):
+            return (8 * _GB, 48 * _GB)      # 8 free of 48
+
+    assert device_footprint_gb(_Dev()) == pytest.approx(40.0)
+
+
+def test_device_footprint_counts_every_process_not_just_this_one():
+    """It is the driver's own accounting, so it includes the CUDA context and
+    any allocator's pool -- which is the whole point when pricing vLLM, whose
+    memory never appears in this process's max_memory_allocated."""
+    class _Dev:
+        def __init__(self, used):
+            self.used = used
+
+        def mem_get_info(self):
+            return ((48 - self.used) * _GB, 48 * _GB)
+
+    before, after = device_footprint_gb(_Dev(6.0)), device_footprint_gb(_Dev(14.5))
+
+    assert after - before == pytest.approx(8.5)     # what building it cost
