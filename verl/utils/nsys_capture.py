@@ -95,7 +95,12 @@ def nsight_runtime_env() -> dict:
         "t": "cuda,cudnn,cublas,nvtx,osrt",
         "o": "'actor_rank_%p'",
         "capture-range": "cudaProfilerApi",
-        "capture-range-end": "stop",
+        # stop-shutdown, not stop: end the session at cudaProfilerStop instead of
+        # leaving it attached for the rest of the run. The report is then written
+        # at that moment (so a later Ctrl-C cannot lose it), and nothing after the
+        # window can reach the event stream -- which is the shape of the
+        # "Wrong event order has been detected" import failure this hit.
+        "capture-range-end": "stop-shutdown",
         "stop-on-exit": "true",
     }
 

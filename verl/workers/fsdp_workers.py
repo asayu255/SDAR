@@ -630,7 +630,7 @@ class ActorRolloutRefWorker(Worker):
             print(
                 f"[rollout-footprint] rank {self.rank}: building the "
                 f"{self.config.rollout.name} rollout took the device from "
-                f"{before:.2f} to {after:.2f} GiB in use (+{after - before:.2f} GiB, "
+                f"{before:.2f} to {after:.2f} GiB in use ({after - before:+.2f} GiB, "
                 f"gpu_memory_utilization={self.config.rollout.gpu_memory_utilization}, "
                 f"enforce_eager={self.config.rollout.enforce_eager})",
                 flush=True,

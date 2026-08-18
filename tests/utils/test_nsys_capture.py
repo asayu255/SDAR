@@ -154,7 +154,9 @@ def test_the_runtime_env_limits_the_report_to_the_capture_range(monkeypatch):
     env = mod.nsight_runtime_env()
 
     assert env["capture-range"] == "cudaProfilerApi"
-    assert env["capture-range-end"] == "stop"
+    # shutdown, so the report is written at the window's end and nothing after
+    # it can reach the event stream
+    assert env["capture-range-end"] == "stop-shutdown"
     assert "nvtx" in env["t"]
     assert "cuda" in env["t"]
     # This host cannot do CPU IP sampling ("not supported, disabling"), so osrt
