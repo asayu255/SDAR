@@ -81,10 +81,14 @@ def _sft_config(data_dir="/some/dir", **actor_overrides):
     return OmegaConf.create({"algorithm": {"sft": sft}, "actor_rollout_ref": {"actor": actor}})
 
 
-def test_resolve_data_dir_reads_sft_namespace():
+def test_resolve_data_dir_reads_sft_namespace(tmp_path):
+    # A real directory, because the resolver now also checks the pool is there:
+    # a path that does not exist used to survive until the glob, minutes later.
+    pool = tmp_path / "teacher_traj"
+    pool.mkdir()
     trainer = object.__new__(MultiTaskSFTTrainer)
-    trainer.config = _sft_config()
-    assert trainer._resolve_data_dir() == "/some/dir"
+    trainer.config = _sft_config(data_dir=str(pool))
+    assert trainer._resolve_data_dir() == str(pool)
 
     trainer.config = _sft_config(data_dir=None)
     with pytest.raises(AssertionError):
@@ -278,3 +282,44 @@ def test_sft_weights_zero_the_padding_rows():
         assert float((weights[sel] * row_tokens[sel]).sum()) == pytest.approx(
             num_mini_batches / len(rows), rel=1e-6
         )
+
+
+# --------------------------------------------------------------------------- #
+# The pool directory, checked before anything expensive runs
+# --------------------------------------------------------------------------- #
+def test_an_empty_data_dir_is_its_own_failure(tmp_path):
+    """`++algorithm.sft.data_dir=$POOL` with POOL unset reaches Hydra as "".
+
+    Every `is not None` check passes, so the run built both datasets, spent
+    ~20 s filtering 52k prompts, and then failed at the glob with
+    "no Stage-1 <task>.pt files found in " -- nothing after the "in", because
+    the path was the empty string. Naming that case is the whole point.
+    """
+    from verl.trainer.ppo.sft_multitask_ray_trainer import check_teacher_data_dir
+
+    with pytest.raises(AssertionError, match="EMPTY"):
+        check_teacher_data_dir("")
+    with pytest.raises(AssertionError, match="EMPTY"):
+        check_teacher_data_dir("   ")
+
+
+def test_a_missing_key_and_a_wrong_path_say_different_things(tmp_path):
+    from verl.trainer.ppo.sft_multitask_ray_trainer import check_teacher_data_dir
+
+    with pytest.raises(AssertionError, match="requires algorithm.sft.data_dir"):
+        check_teacher_data_dir(None)
+    with pytest.raises(AssertionError, match="not a directory"):
+        check_teacher_data_dir(str(tmp_path / "typo"))
+
+
+def test_a_directory_of_symlinks_is_accepted(tmp_path):
+    """A measurement run points at a couple of shards symlinked out of the real
+    pool; that has to pass, since it is the fast path this arm uses."""
+    from verl.trainer.ppo.sft_multitask_ray_trainer import check_teacher_data_dir
+
+    pool, probe = tmp_path / "pool", tmp_path / "probe"
+    pool.mkdir(), probe.mkdir()
+    (pool / "alfworld_0000.pt").write_bytes(b"")
+    (probe / "alfworld_0000.pt").symlink_to(pool / "alfworld_0000.pt")
+
+    assert check_teacher_data_dir(str(probe)) == str(probe)

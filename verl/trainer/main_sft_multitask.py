@@ -50,12 +50,13 @@ class SFTMultiTaskTaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        from verl.trainer.ppo.sft_multitask_ray_trainer import check_teacher_data_dir
+
         sft_cfg = config.algorithm.get("sft", {})
-        data_dir = sft_cfg.get("data_dir", None)
-        assert data_dir is not None, (
-            "multitask SFT requires algorithm.sft.data_dir "
-            "(directory of Stage-1 <task>.pt files; pass via +algorithm.sft.data_dir=/path)"
-        )
+        # Before the datasets are built: filtering the val set alone takes ~20 s,
+        # and a pool directory that is missing, empty or misspelled is knowable
+        # now. See check_teacher_data_dir for why "empty" gets its own message.
+        data_dir = check_teacher_data_dir(sft_cfg.get("data_dir", None))
 
         # Inject the pure-SFT invariants: cross-entropy on teacher tokens is the
         # only training signal.

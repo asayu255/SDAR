@@ -54,10 +54,40 @@ class MultiTaskSFTTrainer(OffPolicyOPDRayTrainer):
             "entry point (main_opd_offpolicy) for the distillation arm"
         )
 
-        data_dir = self.config.algorithm.get("sft", {}).get("data_dir", None)
-        assert data_dir is not None, (
-            "multitask SFT requires algorithm.sft.data_dir "
-            "(directory of Stage-1 <task>.pt teacher-trajectory files; "
-            "pass via +algorithm.sft.data_dir=/path)"
-        )
-        return data_dir
+        return check_teacher_data_dir(self.config.algorithm.get("sft", {}).get("data_dir", None))
+
+
+def check_teacher_data_dir(data_dir):
+    """The pool directory, or an assertion that says which way it was wrong.
+
+    Three failures look alike from the config and are minutes apart in
+    consequence, so they are separated here. Missing is a run that never named
+    the pool. EMPTY is the one that costs time: ``--data_dir=$PROBE`` with
+    ``PROBE`` unset expands to nothing, Hydra stores "", every ``is not None``
+    check passes, and the run gets as far as globbing before it fails with
+    "no Stage-1 <task>.pt files found in " and nothing after "in". Absent is a
+    typo, which the glob would also report as an empty directory.
+
+    All three are cheap to detect and all three are worth catching before the
+    dataset filtering, which takes about twenty seconds before anything here
+    would otherwise run.
+    """
+    import os
+
+    assert data_dir is not None, (
+        "multitask SFT requires algorithm.sft.data_dir "
+        "(directory of Stage-1 <task>.pt teacher-trajectory files; "
+        "pass via +algorithm.sft.data_dir=/path)"
+    )
+    assert str(data_dir).strip(), (
+        "algorithm.sft.data_dir is EMPTY. An unset shell variable expands to "
+        "nothing, so '++algorithm.sft.data_dir=$POOL' with POOL unset reaches "
+        "Hydra as '' and passes every not-None check. Export the variable or "
+        "pass the path literally."
+    )
+    assert os.path.isdir(str(data_dir)), (
+        f"algorithm.sft.data_dir={data_dir!r} is not a directory. It must hold "
+        "the Stage-1 <task>.pt teacher-trajectory files (or symlinks to a "
+        "subset of them, for a short measurement run)."
+    )
+    return data_dir
