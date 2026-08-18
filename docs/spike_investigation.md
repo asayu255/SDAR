@@ -326,13 +326,37 @@ python3 scripts/gpu_stall_scan.py /tmp/trace.*.csv
 ## 6. 実行方法（計測用の完全なコマンド）
 
 スクリプトの既定は本番用であり、そのまま回すと計測にならない。
+GPU 側で `git pull` してから:
 
 ```bash
+cd ~/SDAR
+git fetch origin claude/gpu-utilization-optimization-j1piv8
+git checkout claude/gpu-utilization-optimization-j1piv8
+git pull origin claude/gpu-utilization-optimization-j1piv8
+
+BALANCE_MINIBATCH=1 \
 bash examples/sft_trainer/run_multitask_sft_qwen3.sh \
   ++algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_probe \
   ++actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=20 \
   ++trainer.resume_mode=disable
 ```
+
+`BALANCE_MINIBATCH=1` だけが明示指定を要る（既定オフ）。これが MFU
+0.315 → 0.339 を出した変更で、これを落とすと 7 節の数字と比較できない。
+`ACTOR_PASS_CU_SEQLENS=1` と `ACTOR_GC_FREEZE=1` は既定オンなので何も要らない。
+
+**起動直後、学習が始まる前に決め手の数字が出る**（8.4 節）:
+
+```bash
+grep "host-gc" /tmp/ray/session_latest/logs/worker-*.out
+# [host-gc] rank 0: froze XXXXXXX objects (N collected, manual=False) in T s
+```
+
+`froze` が 500 万オーダーなら gen-2 GC が原因で確定（かつこの run で既に修正済み）、
+10 万オーダーなら gen-2 GC は原因ではあり得ないので allocator へ移る。
+
+A/B を取るなら 2 本目を `ACTOR_GC_FREEZE=0` で回して `stall/gc_gen2` と
+solo excursion の増減を比べる。
 
 stall watch は既定でオンで、何も設定は要らない。出力は
 `/tmp/actor_stall/rank<N>_pid<P>.log`（Ray のコンソール重複除去で
