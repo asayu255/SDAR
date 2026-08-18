@@ -169,6 +169,30 @@ set -x
 # out of band -- but the rollout is still constructed on every rank, so the
 # assert fires at init_model, before the first step.
 #
+# THE STALL WATCH IS ON BY DEFAULT and needs nothing set. It times every
+# micro-batch of every step on every rank with two CUDA events, reads them back
+# only once they have completed (query(), never synchronize, so it cannot create
+# the stall it is looking for), and prints a line when one is an outlier against
+# the running median:
+#
+#   [stall] rank 1 micro 812 at 1787038…: gpu 5900 ms (median 1010),
+#           gap 12 ms (median 3), host 40 ms -> inside the micro-batch, host ran ahead
+#
+# gap vs gpu says whether the device was idle BETWEEN micro-batches (the
+# optimizer step, the gradient reduce, the next batch's H2D) or slow inside one.
+# host vs gpu says whether the host was blocked too, which is the difference
+# between something upstream of the device and a collective wait. Tune with
+# ACTOR_STALL_FACTOR (default 3.0, x the running median) and ACTOR_STALL_MIN_MS
+# (default 500); ACTOR_STALL_FACTOR=0 turns it off.
+#
+# This is the instrument for the dips, and the capture backends below are not.
+# The dips are five events in 68 minutes at unpredictable positions inside their
+# steps; a capture window pinned to micro-batch 40 of step 1 has essentially no
+# chance of holding one. The first Nsight capture demonstrated both halves of
+# that: it caught no dip, and it WAS the largest dip in the run -- 30 s of total
+# node idle inside its own window, step MFU 0.278 against 0.317 for every step
+# after it. Use the watch to find which micro-batch, then aim a capture at it.
+#
 # WHEN NVML IS NOT ENOUGH, trace a few micro-batches of every rank. The sampler
 # above cannot go below ~330 ms and one micro-batch's forward is ~1.1 s of about
 # 500 kernels, so a 0.3-1.0 s stall lands inside a single actor.fwd sample and

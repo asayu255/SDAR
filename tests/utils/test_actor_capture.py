@@ -35,7 +35,8 @@ import pytest
 
 def _fresh(monkeypatch, **env):
     for key in ("ACTOR_NSYS_MICRO", "ACTOR_NSYS_SKIP", "ACTOR_NSYS_TRACE",
-                "ACTOR_TORCH_MICRO", "ACTOR_TORCH_SKIP", "ACTOR_TORCH_DIR"):
+                "ACTOR_TORCH_MICRO", "ACTOR_TORCH_SKIP", "ACTOR_TORCH_DIR",
+                "ACTOR_STALL_FACTOR", "ACTOR_STALL_MIN_MS"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -51,12 +52,30 @@ class _Calls:
     call, only in their sequence.
     """
 
-    def __init__(self, rank=0, export_raises=None, profile_raises=None):
+    def __init__(self, rank=0, export_raises=None, profile_raises=None, cuda=False,
+                 timings=(), gaps=(), ready=True):
         self.log = []
+        self.cuda = cuda
+        self.timings = list(timings)     # gpu_ms per micro-batch, in order
+        self.gaps = list(gaps)           # device-idle ms before each micro-batch
+        self.ready = ready               # what Event.query() answers
+        self.events = []
         self.rank = rank
         self.exported = []
         self._export_raises = export_raises
         self._profile_raises = profile_raises
+
+    def _clock(self):
+        """Advance by the next requested micro-batch duration on every second
+        record(), so open/close pairs come out as the caller specified."""
+        if not hasattr(self, "_t"):
+            self._t, self._i = 0.0, 0
+        if len(self.events) % 2 == 1:                 # closing an open pair
+            self._t += self.timings[self._i] if self._i < len(self.timings) else 1000.0
+            self._i += 1
+        else:
+            self._t += self.gaps[self._i] if self._i < len(self.gaps) else 1.0
+        return self._t
 
     def _profile(self, **kwargs):
         if self._profile_raises is not None:
@@ -93,8 +112,34 @@ class _Calls:
             finally:
                 self.log.append("rf-end")
 
+        calls = self
+
+        class _Event:
+            """torch.cuda.Event, with the timeline the test asked for.
+
+            elapsed_time is driven off the recorded order rather than a clock, so
+            a run of micro-batches with one slow one in it is exactly
+            reproducible -- which is the only way to assert on a detector whose
+            whole job is picking an outlier out of a distribution.
+            """
+
+            def __init__(self, enable_timing=False):
+                self.at = None
+
+            def record(self):
+                self.at = calls._clock()
+                calls.events.append(self)
+
+            def query(self):
+                return calls.ready
+
+            def elapsed_time(self, other):
+                return other.at - self.at
+
         torch = types.ModuleType("torch")
         torch.cuda = types.SimpleNamespace(
+            is_available=lambda: self.cuda,
+            Event=_Event,
             profiler=types.SimpleNamespace(
                 start=lambda: self.log.append("start"),
                 stop=lambda: self.log.append("stop"),
@@ -368,3 +413,152 @@ def test_a_trace_that_cannot_be_written_does_not_take_the_run_down(monkeypatch, 
 
     assert items == list(enumerate(range(3)))
     assert mod._torch_prof is None                # released, not left recording
+
+
+# --- the stall watch ---------------------------------------------------------
+#
+# The capture backends above are aimed instruments: they cover a fixed window,
+# and the first Nsight capture proved what that costs. The dips being chased are
+# five events in 68 minutes of training, several seconds long, at unpredictable
+# positions inside their steps -- a window pinned to micro-batch 40 of step 1 has
+# essentially no chance of holding one, and the capture itself became the largest
+# stall in the run. So the watch is the opposite: cheap enough to leave on for
+# the whole 300 steps, and it says where to aim the others.
+
+
+def test_the_watch_is_on_by_default_and_the_captures_are_not(monkeypatch):
+    """Inverted defaults, deliberately. Leaving a capture on costs a run; leaving
+    the watch off costs the one event it existed to see."""
+    mod = _fresh(monkeypatch)
+
+    assert mod.stall_watch_enabled()
+    assert not mod.enabled()
+
+
+def test_it_can_be_turned_off(monkeypatch):
+    mod = _fresh(monkeypatch, ACTOR_STALL_FACTOR="0")
+    calls = _Calls(cuda=True).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(30)):
+        pass
+
+    assert calls.events == []          # not even an Event was constructed
+
+
+def test_a_steady_run_reports_nothing(monkeypatch, capsys):
+    """A detector that fires on ordinary jitter is a detector nobody reads."""
+    mod = _fresh(monkeypatch)
+    _Calls(cuda=True, timings=[1000, 1050, 980, 1010, 1100, 990] * 8).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(40)):
+        pass
+
+    assert "[stall]" not in capsys.readouterr().out
+
+
+def test_the_first_micro_batches_are_not_reported(monkeypatch, capsys):
+    """Warm-up is all outliers -- allocator growth, cudnn autotune, the first
+    all-gather. Reporting those buries the rare mid-run event under startup."""
+    mod = _fresh(monkeypatch)
+    _Calls(cuda=True, timings=[9000, 8000, 7000] + [1000] * 30).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+
+    assert "[stall]" not in capsys.readouterr().out
+
+
+def test_one_slow_micro_batch_is_found_in_a_run_of_normal_ones(monkeypatch, capsys):
+    """The whole point: pick the outlier out of the distribution, without having
+    been told in advance where in the run to look."""
+    mod = _fresh(monkeypatch)
+    timings = [1000] * 20
+    timings[15] = 6000                        # the event
+    _Calls(cuda=True, timings=timings).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+
+    out = [line for line in capsys.readouterr().out.splitlines() if "[stall]" in line]
+    assert len(out) == 1, out
+    assert "micro 15" in out[0]
+    assert "gpu 6000 ms (median 1000)" in out[0]
+    assert "inside the micro-batch" in out[0]
+
+
+def test_a_gap_between_micro_batches_is_told_apart_from_a_slow_one(monkeypatch, capsys):
+    """Different fixes. Inside the micro-batch points at the forward; between
+    them points at the optimizer step, the gradient reduce, or the next batch's
+    H2D -- and only the device timeline can tell them apart, since both look the
+    same from the step's wall time."""
+    mod = _fresh(monkeypatch)
+    gaps = [1] * 20
+    gaps[14] = 4000                           # device idle BEFORE micro 14
+    _Calls(cuda=True, timings=[1000] * 20, gaps=gaps).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+
+    out = [line for line in capsys.readouterr().out.splitlines() if "[stall]" in line]
+    assert len(out) == 1, out
+    assert "gap 4000 ms" in out[0]
+    assert "BETWEEN micro-batches" in out[0]
+
+
+def test_it_says_whether_the_host_was_blocked_too(monkeypatch, capsys):
+    """The question the dips turn on. A host that ran ahead means the device
+    itself was slow -- a collective wait. A host blocked for the same span means
+    whatever stopped is upstream of the device entirely, and no amount of
+    rebalancing GPU work will touch it."""
+    mod = _fresh(monkeypatch)
+    timings = [1000] * 20
+    timings[15] = 6000
+    _Calls(cuda=True, timings=timings).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+
+    # the stub's host clock is real time, so the body returns instantly: the host
+    # ran far ahead of a 6 s device span, and the line has to say so
+    assert "host ran ahead" in capsys.readouterr().out
+
+
+def test_an_event_that_has_not_finished_is_left_alone(monkeypatch, capsys):
+    """query() is used rather than synchronize() precisely so the watch cannot
+    create the stall it is looking for. An unfinished event must therefore wait,
+    not be forced."""
+    mod = _fresh(monkeypatch)
+    calls = _Calls(cuda=True, timings=[1000] * 10 + [9000] + [1000] * 10, ready=False)
+    calls.install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(21)):
+        pass
+
+    assert "[stall]" not in capsys.readouterr().out     # nothing read back yet
+    assert calls.events                                  # but the timing was recorded
+
+
+def test_a_host_without_a_gpu_costs_nothing_and_does_not_crash(monkeypatch):
+    """dp_actor's loop runs wherever the tests do."""
+    mod = _fresh(monkeypatch)
+    calls = _Calls(cuda=False).install(monkeypatch, mod)
+
+    items = list(mod.iter_micro_batches(range(10)))
+
+    assert items == list(enumerate(range(10)))
+    assert calls.events == []
+
+
+def test_the_watch_runs_even_with_a_capture_backend_on(monkeypatch, capsys, tmp_path):
+    """They answer different questions and neither replaces the other: the watch
+    says which micro-batch, the capture says what was in it."""
+    mod = _fresh(monkeypatch, ACTOR_TORCH_MICRO="2", ACTOR_TORCH_SKIP="0",
+                 ACTOR_TORCH_DIR=str(tmp_path))
+    timings = [1000] * 20
+    timings[15] = 6000
+    _Calls(cuda=True, timings=timings).install(monkeypatch, mod)
+
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+
+    assert "[stall]" in capsys.readouterr().out

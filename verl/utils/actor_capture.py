@@ -79,6 +79,7 @@ process lands in the Ray session's ``logs/nsight`` directory.
 """
 
 import os
+import time
 from contextlib import contextmanager
 
 __all__ = [
@@ -109,6 +110,16 @@ _NSYS_SKIP = _int_env("ACTOR_NSYS_SKIP", 40)
 # code change: ACTOR_NSYS_TRACE=cuda,cudnn,cublas,nvtx
 _NSYS_TRACE = os.environ.get("ACTOR_NSYS_TRACE", "cuda,cudnn,cublas,nvtx,osrt").strip()
 
+# The stall watch is on by default, unlike the two capture backends, because
+# the thing it is looking for is rare: five events in 68 minutes of training,
+# at unpredictable positions inside their steps. A capture window fixed at
+# micro-batch 40 of step 1 has essentially no chance of containing one -- which
+# is why the first Nsight capture said nothing about the spike, and why timing
+# every micro-batch of every step is the instrument this needs instead. Two
+# CUDA event records per micro-batch is a few microseconds against a ~1 s body.
+_STALL_FACTOR = float(os.environ.get("ACTOR_STALL_FACTOR", "3.0") or 0)
+_STALL_MIN_MS = float(os.environ.get("ACTOR_STALL_MIN_MS", "500") or 0)
+
 _TORCH_MICRO = _int_env("ACTOR_TORCH_MICRO", 0)
 _TORCH_SKIP = _int_env("ACTOR_TORCH_SKIP", 40)
 _TORCH_DIR = os.environ.get("ACTOR_TORCH_DIR", "/tmp/actor_trace")
@@ -118,6 +129,8 @@ _nsys_running = False
 _nsys_finished = False
 _torch_prof = None
 _torch_finished = False
+
+_watch = None       # _StallWatch, built on the first micro-batch that has a device
 
 
 def nsys_enabled() -> bool:
@@ -130,6 +143,10 @@ def torch_enabled() -> bool:
 
 def enabled() -> bool:
     return nsys_enabled() or torch_enabled()
+
+
+def stall_watch_enabled() -> bool:
+    return _STALL_FACTOR > 0
 
 
 def nsight_runtime_env() -> dict:
@@ -223,6 +240,109 @@ def _torch_stop():
         print(f"[torch-capture] trace lost: {exc!r}", flush=True)
 
 
+class _StallWatch:
+    """Times every micro-batch of every step, on every rank, and reports outliers.
+
+    Built for the shape of the thing being chased. The dips are rare (five in 68
+    minutes), several seconds long, land at unpredictable positions inside a
+    step, and show on all three cards at once. None of that survives a capture
+    window pinned to micro-batch 40 of step 1, so the only instrument that can
+    see one is one cheap enough to leave on for the whole run.
+
+    Two CUDA events per micro-batch, read back only once they have completed --
+    ``query()`` never blocks, so the host is not synchronised and the timing does
+    not create the stall it is looking for. Three numbers come out and they
+    separate the hypotheses:
+
+      gpu_ms   the micro-batch's span on the device timeline.
+      gap_ms   device-timeline idle between the previous micro-batch ending and
+               this one starting. A stall here is BETWEEN micro-batches -- the
+               optimizer step, the gradient reduce, the next batch's H2D.
+      host_ms  the same span in host wall time. host ~= gpu means the host was
+               blocked too, so whatever stopped is upstream of the device; host
+               << gpu means the host ran ahead and the device itself was slow,
+               which is what a collective wait looks like.
+    """
+
+    _KEEP = 64          # samples behind the running median
+
+    def __init__(self, device_module):
+        self._cuda = device_module
+        self._pending = []            # (counter, start_ev, end_ev, host_start, host_end)
+        self._recent = []             # completed gpu_ms, for the median
+        self._recent_gap = []
+        self._prev_end = None         # to measure the gap across micro-batches
+        self._reported = 0
+
+    @staticmethod
+    def _median(values):
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        return ordered[len(ordered) // 2]
+
+    def open(self, counter):
+        event = self._cuda.Event(enable_timing=True)
+        event.record()
+        return [counter, event, None, time.time(), None]
+
+    def close(self, entry):
+        entry[2] = self._cuda.Event(enable_timing=True)
+        entry[2].record()
+        entry[4] = time.time()
+        self._pending.append(entry)
+        self._drain()
+
+    def _drain(self):
+        """Read back whatever has finished. Never waits: an event that is not
+        ready yet is simply left for the next micro-batch to pick up."""
+        while self._pending and self._pending[0][2].query():
+            counter, start_ev, end_ev, host_start, host_end = self._pending.pop(0)
+            gpu_ms = start_ev.elapsed_time(end_ev)
+            gap_ms = self._prev_end.elapsed_time(start_ev) if self._prev_end is not None else 0.0
+            self._prev_end = end_ev
+            self._judge(counter, gpu_ms, gap_ms, (host_end - host_start) * 1e3, host_end)
+            self._recent.append(gpu_ms)
+            self._recent_gap.append(gap_ms)
+            del self._recent[: -self._KEEP]
+            del self._recent_gap[: -self._KEEP]
+
+    _WARMUP = 8         # micro-batches to establish a baseline before judging
+
+    def _judge(self, counter, gpu_ms, gap_ms, host_ms, at):
+        # The first micro-batches of a run are all outliers -- allocator growth,
+        # cudnn autotune, the first all-gather -- and reporting them buries the
+        # rare mid-run event this exists to catch under startup noise.
+        if len(self._recent) < self._WARMUP:
+            return
+        # Against the running median rather than a fixed threshold: a micro-batch
+        # is ~1 s here but that is a property of this batch size and this model,
+        # and a number baked in for one arm is a number that silently reports
+        # everything or nothing on the next.
+        median = self._median(self._recent)
+        median_gap = self._median(self._recent_gap)
+        slow = median and gpu_ms > _STALL_FACTOR * median and gpu_ms - median > _STALL_MIN_MS
+        gapped = gap_ms > _STALL_MIN_MS and (not median_gap or gap_ms > _STALL_FACTOR * median_gap)
+        if not (slow or gapped):
+            return
+        self._reported += 1
+        print(f"[stall] rank {_rank()} micro {counter} at {at:.3f}: "
+              f"gpu {gpu_ms:.0f} ms (median {median:.0f}), "
+              f"gap {gap_ms:.0f} ms (median {median_gap:.0f}), "
+              f"host {host_ms:.0f} ms -> "
+              f"{'BETWEEN micro-batches' if gapped else 'inside the micro-batch'}, "
+              f"{'host blocked too' if host_ms > 0.8 * gpu_ms else 'host ran ahead'}",
+              flush=True)
+
+
+def _watch_for(module):
+    """One watch per process, built lazily so a CPU-only import stays free."""
+    global _watch
+    if _watch is None:
+        _watch = _StallWatch(module.cuda)
+    return _watch
+
+
 @contextmanager
 def phase(name: str):
     """Name a stretch of the timeline, so a gap can be attributed to a phase.
@@ -252,30 +372,37 @@ def phase(name: str):
 
 @contextmanager
 def micro_batch(index: int):
-    """One micro-batch, and each backend's start/stop.
+    """One micro-batch: the stall watch, and each capture backend's start/stop.
 
     The counter is per process and spans mini-batches, so SKIP and MICRO are
     counted in micro-batches of the step rather than in anything the caller has
     to track. ``index`` is the position within the current mini-batch and only
     labels the range. The two backends share the counter but not their
     thresholds, so they can cover the same window or different ones.
+
+    The stall watch is independent of both and on by default -- it is what runs
+    for the whole 300 steps, and the capture backends are what get aimed once it
+    has said where to aim them.
     """
     global _seen, _nsys_running, _nsys_finished
-    if not enabled():
+    if not enabled() and not stall_watch_enabled():
         yield
         return
     import torch
 
-    if nsys_enabled() and not _nsys_running and not _nsys_finished and _seen >= _NSYS_SKIP:
-        torch.cuda.profiler.start()
-        _nsys_running = True
-        print(f"[nsys] capture started at micro-batch {_seen} (pid {os.getpid()})", flush=True)
-    if torch_enabled() and _torch_prof is None and not _torch_finished and _seen >= _TORCH_SKIP:
-        _torch_start()
+    watching = stall_watch_enabled() and torch.cuda.is_available()
+    if enabled():
+        if nsys_enabled() and not _nsys_running and not _nsys_finished and _seen >= _NSYS_SKIP:
+            torch.cuda.profiler.start()
+            _nsys_running = True
+            print(f"[nsys] capture started at micro-batch {_seen} (pid {os.getpid()})", flush=True)
+        if torch_enabled() and _torch_prof is None and not _torch_finished and _seen >= _TORCH_SKIP:
+            _torch_start()
 
     started_at = _seen
     _seen += 1
     label = f"micro/{started_at}/{index}"
+    entry = _watch_for(torch).open(started_at) if watching else None
     if _nsys_running:
         torch.cuda.nvtx.range_push(label)
     try:
@@ -285,6 +412,10 @@ def micro_batch(index: int):
         else:
             yield
     finally:
+        if entry is not None:
+            # Before the capture bookkeeping, so a stopped capture's report write
+            # does not land inside the micro-batch this is timing.
+            _watch_for(torch).close(entry)
         if _nsys_running:
             torch.cuda.nvtx.range_pop()
             if _seen >= _NSYS_SKIP + _NSYS_MICRO:
