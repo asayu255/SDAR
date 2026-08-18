@@ -213,8 +213,15 @@ set -x
 #
 # It also prints one line per step whatever happens:
 #
-#   [step-gpu] rank 0 step 12: 66 micro-batches, busy 312.4 s, idle 4.81 s
-#              (before-step 1.52, before-mini 2.10, interior 1.19) = 1.52% of 317.2 s
+#   [step-gpu] rank 0 step 12: 66 micro-batches, in-micro 312.4 s, outside 4.81 s
+#              (before-step 1.52, before-mini 2.10, interior 1.19; optim 4.20,
+#               unaccounted 0.61 s) = 0.19% idle of 317.2 s
+#
+# "outside", not "idle": the gradient reduce and the optimizer step run in the
+# window between two micro-batches, and on a 1.7B model sharded three ways that
+# is 50-80 ms of real kernels per mini-batch -- 5.75 s of a 346 s step. Reported
+# as idle it puts a 1.7% noise floor under everything. optim is measured
+# separately; unaccounted is what is left, and that is the real idle.
 #
 # That is the half the outlier detector cannot do. An outlier needs the seconds
 # to be concentrated in one micro-batch; the same seconds spread thinly over
@@ -231,6 +238,11 @@ set -x
 #
 #   tail -f /tmp/actor_stall/rank*.log
 #   grep -h "^\[step-gpu\]" /tmp/actor_stall/rank*.log | sort -t' ' -k5 -n
+#
+# For a run already going without those files, Ray's own per-worker logs have the
+# undeduplicated stdout:
+#
+#   grep -h "step-gpu" /tmp/ray/session_latest/logs/worker-*.out
 #
 # This is the instrument for the dips, and the capture backends below are not.
 # The dips are five events in 68 minutes at unpredictable positions inside their

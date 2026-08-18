@@ -262,9 +262,12 @@ class _StallWatch:
     separate the hypotheses:
 
       gpu_ms   the micro-batch's span on the device timeline.
-      gap_ms   device-timeline idle between the previous micro-batch ending and
-               this one starting. A stall here is BETWEEN micro-batches -- the
-               optimizer step, the gradient reduce, the next batch's H2D.
+      gap_ms   device time between the previous micro-batch ending and this one
+               starting. NOT idle: the gradient reduce and the optimizer step run
+               there, and on a 1.7B model sharded three ways that is 50-80 ms of
+               real kernels per mini-batch. ``span`` measures the optimizer step
+               separately so the two can be told apart -- what is left after
+               subtracting it is the part where the device had nothing to do.
       host_ms  the same span in host wall time. host ~= gpu means the host was
                blocked too, so whatever stopped is upstream of the device; host
                << gpu means the host ran ahead and the device itself was slow,
@@ -287,6 +290,7 @@ class _StallWatch:
         # against one median flags them every single time: 300 lines a run, with
         # the five events that matter buried in them.
         self._recent_gap = {"step": [], "mini": [], "interior": []}
+        self._spans = []              # named work inside the gaps, e.g. the optimizer step
         self._prev_end = None         # to measure the gap across micro-batches
         self._new_step = True
         self._reported = 0
@@ -294,13 +298,29 @@ class _StallWatch:
         self._acc = None
         self._reset_acc()
 
+    def open_span(self):
+        event = self._cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def close_span(self, name, start_event):
+        end = self._cuda.Event(enable_timing=True)
+        end.record()
+        self._spans.append((name, start_event, end))
+        self._drain_spans()
+
+    def _drain_spans(self):
+        while self._spans and self._spans[0][2].query():
+            name, start, end = self._spans.pop(0)
+            self._acc["spans"][name] = self._acc["spans"].get(name, 0.0) + start.elapsed_time(end)
+
     def _reset_acc(self):
         # partial: this step's first gap had no predecessor to measure from, so
         # its before-step number is absent rather than zero. True only for the
         # run's first step, and reporting 0.00 there reads as "the boundary is
         # free" -- which is exactly the wrong conclusion to hand someone.
         self._acc = {"n": 0, "gpu": 0.0, "step": 0.0, "mini": 0.0, "interior": 0.0,
-                     "partial": self._prev_end is None}
+                     "spans": {}, "partial": self._prev_end is None}
 
     def new_step(self):
         """Called once per update_policy.
@@ -314,17 +334,25 @@ class _StallWatch:
         sees both.
         """
         self._drain()
+        self._drain_spans()
         if self._acc["n"]:
             a = self._acc
-            idle = a["step"] + a["mini"] + a["interior"]
-            span = a["gpu"] + idle
+            outside = a["step"] + a["mini"] + a["interior"]
+            span = a["gpu"] + outside
+            known = sum(a["spans"].values())
             before_step = "n/a" if a["partial"] else f"{a['step'] / 1e3:.2f}"
+            named = "".join(f" {k} {v / 1e3:.2f}," for k, v in sorted(a["spans"].items()))
+            # "outside the micro-batches", not "idle": the gradient reduce and the
+            # optimizer step run in that window and are real kernels. Only what is
+            # left after the named spans is time the device had nothing to do,
+            # which is the number this whole exercise is about.
             self._say(
                 f"[step-gpu] rank {_rank()} step {self._step}: {a['n']} micro-batches, "
-                f"busy {a['gpu'] / 1e3:.1f} s, idle {idle / 1e3:.2f} s "
+                f"in-micro {a['gpu'] / 1e3:.1f} s, outside {outside / 1e3:.2f} s "
                 f"(before-step {before_step}, before-mini {a['mini'] / 1e3:.2f}, "
-                f"interior {a['interior'] / 1e3:.2f}) = {100 * idle / span:.2f}% of "
-                f"{span / 1e3:.1f} s")
+                f"interior {a['interior'] / 1e3:.2f};{named or ' no named spans,'} "
+                f"unaccounted {(outside - known) / 1e3:.2f} s) "
+                f"= {100 * (outside - known) / span:.2f}% idle of {span / 1e3:.1f} s")
         self._reset_acc()
         self._step += 1
         self._new_step = True
@@ -418,6 +446,25 @@ class _StallWatch:
             f"host {host_ms:.0f} ms -> "
             f"{'BEFORE this micro-batch' if gapped else 'inside the micro-batch'}, "
             f"{'host blocked too' if host_ms > 0.8 * gpu_ms else 'host ran ahead'}")
+
+
+@contextmanager
+def span(name: str):
+    """Time a named stretch of device work that falls between micro-batches.
+
+    The gap the watch measures is not idle -- the gradient reduce and the
+    optimizer step live there. Without measuring them the baseline reads as 1.7%
+    "idle" when nearly all of it is work, and a real stall has to clear that
+    invented noise floor to be noticed.
+    """
+    if _watch is None:
+        yield
+        return
+    start = _watch.open_span()
+    try:
+        yield
+    finally:
+        _watch.close_span(name, start)
 
 
 def new_step():

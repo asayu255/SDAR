@@ -53,12 +53,16 @@ class _Calls:
     """
 
     def __init__(self, rank=0, export_raises=None, profile_raises=None, cuda=False,
-                 timings=(), gaps=(), ready=True):
+                 timings=(), gaps=(), ready=True, deltas=None):
         self.log = []
         self.cuda = cuda
         self.timings = list(timings)     # gpu_ms per micro-batch, in order
         self.gaps = list(gaps)           # device-idle ms before each micro-batch
         self.ready = ready               # what Event.query() answers
+        # An explicit ms-per-record timeline, for tests whose event order is not
+        # a plain open/close alternation -- a named span inside a gap records two
+        # more events between one micro-batch's close and the next one's open.
+        self.deltas = list(deltas) if deltas is not None else None
         self.events = []
         self.rank = rank
         self.exported = []
@@ -70,6 +74,10 @@ class _Calls:
         record(), so open/close pairs come out as the caller specified."""
         if not hasattr(self, "_t"):
             self._t, self._i = 0.0, 0
+        if self.deltas is not None:
+            self._t += self.deltas[self._i] if self._i < len(self.deltas) else 0.0
+            self._i += 1
+            return self._t
         if len(self.events) % 2 == 1:                 # closing an open pair
             self._t += self.timings[self._i] if self._i < len(self.timings) else 1000.0
             self._i += 1
@@ -657,12 +665,12 @@ def test_every_step_gets_a_summary_even_when_no_outlier_fires(monkeypatch, capsy
     lines = [l for l in capsys.readouterr().out.splitlines() if "[step-gpu]" in l]
     assert len(lines) == 3, lines
     assert "4 micro-batches" in lines[-1]
-    assert "busy 4.0 s" in lines[-1]
-    assert "idle 0.80 s" in lines[-1]                      # 500 + 3x100
+    assert "in-micro 4.0 s" in lines[-1]
+    assert "outside 0.80 s" in lines[-1]                      # 500 + 3x100
     assert "before-step 0.50" in lines[-1]
     assert "before-step n/a" in lines[0]        # the run's first step cannot know it
     assert "interior 0.30" in lines[-1]
-    assert "16.67% of 4.8 s" in lines[-1]
+    assert "16.67% idle of 4.8 s" in lines[-1]   # nothing named, so all of it
 
 
 def test_a_loss_spread_over_every_micro_batch_shows_in_the_summary(monkeypatch, capsys):
@@ -682,8 +690,8 @@ def test_a_loss_spread_over_every_micro_batch_shows_in_the_summary(monkeypatch, 
     out = capsys.readouterr().out
     assert "[stall]" not in out                            # nothing is an outlier
     lines = [l for l in out.splitlines() if "[step-gpu]" in l]
-    assert "idle 0.02 s" in lines[0]                       # ...and the two steps
-    assert "idle 4.02 s" in lines[1]                       # are plainly different
+    assert "outside 0.02 s" in lines[0]                    # ...and the two steps
+    assert "outside 4.02 s" in lines[1]                    # are plainly different
 
 
 def test_the_first_step_does_not_claim_the_boundary_was_free(monkeypatch, capsys):
@@ -744,3 +752,41 @@ def test_an_unwritable_log_directory_does_not_take_the_run_down(monkeypatch, tmp
 
     assert items == list(enumerate(range(12)))
     assert "[step-gpu]" in capsys.readouterr().out      # console still works
+
+
+def test_the_optimizer_step_is_not_counted_as_idle(monkeypatch, capsys):
+    """The correction that decides what the baseline means.
+
+    The window between two micro-batches holds the gradient reduce and the
+    optimizer step, and on a 1.7B model sharded three ways that is 50-80 ms of
+    real kernels per mini-batch -- 5.75 s of a 346 s step, reported as "idle".
+    A stall then has to clear an invented 1.7% noise floor to look like anything.
+    Naming the span subtracts it, and what is left is time the device had nothing
+    to do.
+    """
+    mod = _fresh(monkeypatch)
+    # per record(): micro opens (700 ms since the last close), micro runs 1000 ms,
+    # the optimizer starts at once and runs 600 ms. Four mini-batches of one.
+    calls = _Calls(cuda=True, deltas=[700, 1000, 0, 600] * 4)
+    calls.install(monkeypatch, mod)
+
+    mod.new_step()
+    for _ in range(4):
+        for _ in mod.iter_micro_batches(range(1)):
+            pass
+        with mod.span("optim"):          # after the micro-batch, as dp_actor does
+            pass
+    mod.new_step()
+
+    line = [l for l in capsys.readouterr().out.splitlines() if "[step-gpu]" in l][0]
+    assert "in-micro 4.0 s" in line                  # 4 x 1000 ms of forward/backward
+    assert "outside 3.90 s" in line                  # 3 gaps of 600 + 700, plus the first
+    assert "optim 2.40," in line                     # 4 x 600 ms, named
+    assert "unaccounted 1.50 s" in line              # what the device really had nothing to do
+
+
+def test_span_is_free_when_nothing_is_watching(monkeypatch):
+    """dp_actor wraps the optimizer step unconditionally."""
+    mod = _fresh(monkeypatch, ACTOR_STALL_FACTOR="0")
+    with mod.span("optim"):
+        pass

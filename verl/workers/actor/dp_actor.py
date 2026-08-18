@@ -1155,7 +1155,13 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 with _actor_phase("actor.optim"):
-                    grad_norm = self._optimizer_step()
+                    # Timed separately because it runs in the window between two
+                    # micro-batches, which the stall watch would otherwise report
+                    # as idle -- a reduce-scatter plus an Adam update over 570M
+                    # parameters is 50-80 ms of real kernels, and calling that
+                    # idle puts a noise floor under the stalls being looked for.
+                    with actor_capture.span("optim"):
+                        grad_norm = self._optimizer_step()
                 # Deferred like the rest: reading it here is a host sync per
                 # optimizer step -- 71 of them a step on this arm -- for a number
                 # nothing but the logger looks at. The isfinite check inside
