@@ -183,6 +183,25 @@ set -x
 # Ulysses SP (the sequence is split after that point, so the boundaries would be
 # stale) and on a transformers whose entry point does not name the kwargs.
 #
+# ACTOR_GC_FREEZE=1 (the default) runs one gc.collect() and then gc.freeze()
+# once the model, optimizer and FSDP wrap exist, so generation-2 collections
+# stop walking objects that live for the whole run and can never be freed. The
+# sweep freezes the interpreter, and the forward has synchronisation points that
+# drain the launch queue, so a host stop of that length lands on the device as
+# an equally long stop: one card at sm 0 while the other two spin in the
+# collective reading 100. That is the measured signature of the 14 solo
+# excursions of 0.6-0.8 s. Startup prints "[host-gc] rank N: froze X objects",
+# and X * 0.12 us (measured cost per tracked object) is the sweep cost removed
+# -- which is also the number that decides whether gen-2 GC could have been the
+# cause at all. ACTOR_GC_FREEZE=0 restores stock behaviour exactly, so the pair
+# is the A/B; stall/gc_gen2 is already logged per rank per step.
+#
+# ACTOR_GC_MANUAL=1 (off) additionally disables automatic collection and runs
+# one explicit sweep per step at the boundary, where before-step is 0.24-0.71 s
+# of already-lost device time. It moves the residual cost rather than removing
+# it, and it lets a cycle-heavy step grow the heap until the next boundary, so
+# it stays off until measured.
+#
 # A MEASUREMENT RUN IS NOT THE BARE SCRIPT. Three of this file's defaults are
 # production defaults, and each one silently changes what a measurement means.
 # Copy this whole block rather than the parts you remember:
