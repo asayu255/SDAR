@@ -87,7 +87,12 @@ def nsight_runtime_env() -> dict:
     names across; without it the timeline is anonymous kernels.
     """
     return {
-        "t": "cuda,cudnn,cublas,nvtx",
+        # osrt earns its place on this host: nsys reports "CPU IP/backtrace
+        # sampling not supported" here, so there are no Python stacks to say
+        # what the host was doing during a gap. The CUDA API trace still shows
+        # whether it stopped submitting or blocked in a synchronize, and osrt is
+        # what turns "blocked" into which call -- a futex, a read, a condvar.
+        "t": "cuda,cudnn,cublas,nvtx,osrt",
         "o": "'actor_rank_%p'",
         "capture-range": "cudaProfilerApi",
         "capture-range-end": "stop",

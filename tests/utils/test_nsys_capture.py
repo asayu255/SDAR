@@ -157,3 +157,6 @@ def test_the_runtime_env_limits_the_report_to_the_capture_range(monkeypatch):
     assert env["capture-range-end"] == "stop"
     assert "nvtx" in env["t"]
     assert "cuda" in env["t"]
+    # This host cannot do CPU IP sampling ("not supported, disabling"), so osrt
+    # is the only remaining way to see what the host was blocked on.
+    assert "osrt" in env["t"]
