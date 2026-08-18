@@ -67,6 +67,29 @@ _BUCKETS = ((10.0, "<10us"), (100.0, "10-100us"), (1000.0, "0.1-1ms"),
             (10000.0, "1-10ms"), (float("inf"), ">10ms"))
 
 
+_FAMILY = (
+    ("Memcpy DtoH", "Memcpy DtoH"), ("Memcpy HtoD", "Memcpy HtoD"),
+    ("nccl", "NCCL"), ("flash_fwd", "flash attn fwd"), ("flash_bwd", "flash attn bwd"),
+    ("gemm", "gemm"), ("reduce_kernel", "reduce"), ("elementwise", "elementwise"),
+    ("vectorized", "elementwise"), ("index", "index/gather"), ("cat", "cat"),
+    ("softmax", "softmax"), ("norm", "norm"),
+)
+
+
+def _kernel_family(name):
+    """Collapse a template-instantiated kernel name to something countable.
+
+    A trace has thousands of distinct names -- every dtype and tile size is its
+    own instantiation -- so grouping by raw name produces a list as long as the
+    hole list it was meant to summarise.
+    """
+    low = name.lower()
+    for needle, family in _FAMILY:
+        if needle.lower() in low:
+            return family
+    return "other"
+
+
 def _bucket(width):
     for edge, name in _BUCKETS:
         if width < edge:
@@ -243,14 +266,24 @@ def gap_causes(rows, kernels, runtime, skip_first=True):
         return best, (share / (hi - lo) if hi > lo else 0.0)
 
     by_before, by_runtime, listed, hist = {}, {}, [], {}
+    per_bucket = {}                       # bucket -> {kernel name: total width}
     for row in rows:
         if skip_first and row is rows[0]:
             continue                      # the profiler's own CUPTI start-up
         for lo, hi in row.get("all_gaps", ()):
-            hist.setdefault(_bucket(hi - lo), [0, 0.0])
-            entry = hist[_bucket(hi - lo)]
+            bucket = _bucket(hi - lo)
+            hist.setdefault(bucket, [0, 0.0])
+            entry = hist[bucket]
             entry[0] += 1
             entry[1] += hi - lo
+            # Which kernel ended before it, per bucket. The decade histogram says
+            # WHERE the time is; this says what the device had just finished each
+            # time, which is the only thing in the trace that can name a
+            # population of ten thousand holes too small to list individually.
+            i = bisect.bisect_right(end_t, lo + 1) - 1
+            name = _kernel_family(ends[i][1]) if i >= 0 else "-"
+            shelf = per_bucket.setdefault(bucket, {})
+            shelf[name] = shelf.get(name, 0.0) + (hi - lo)
         for lo, hi in row.get("gaps", ()):
             width = hi - lo
             i = bisect.bisect_right(end_t, lo + 1) - 1
@@ -263,7 +296,7 @@ def gap_causes(rows, kernels, runtime, skip_first=True):
             by_before[label] = by_before.get(label, 0.0) + width
             by_runtime[key] = by_runtime.get(key, 0.0) + width
             listed.append((width, row["micro"], before, key, share))
-    return by_before, by_runtime, listed, hist
+    return by_before, by_runtime, listed, hist, per_bucket
 
 
 def analyse(path, shapes_of=("aten::embedding",)):
@@ -515,7 +548,7 @@ def report_causes(causes, top):
           f"under {_GAP_FLOOR_US / 1000:.0f} ms are omitted:\n  at ~7,900 kernels "
           "a micro-batch they are the launch-overhead floor, not events.\n")
     for rank in sorted(causes):
-        by_before, by_runtime, listed, hist = causes[rank]
+        by_before, by_runtime, listed, hist, per_bucket = causes[rank]
         total = sum(by_before.values()) or 1.0
         print(f"  rank {rank}: {len(listed)} gaps, {total / 1e3:.0f} ms total")
         for label, width in sorted(by_before.items(), key=lambda kv: -kv[1]):
@@ -531,6 +564,11 @@ def report_causes(causes, top):
                 continue
             print(f"      {name:>10s}  {count:7d} holes  {width / 1e3:7.0f} ms  "
                   f"{100 * width / whole:5.1f}%   mean {width / count:6.1f} us")
+            shelf = per_bucket.get(name, {})
+            top3 = sorted(shelf.items(), key=lambda kv: -kv[1])[:3]
+            if top3:
+                print("                  after: " + ", ".join(
+                    f"{fam} {100 * w / width:.0f}%" for fam, w in top3))
     every = sorted((g for c in causes.values() for g in c[2]), reverse=True)[:top]
     if every:
         print("\n  the largest, individually:")

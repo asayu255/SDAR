@@ -396,7 +396,7 @@ def test_a_gap_the_host_spent_inside_cudamalloc_is_labelled_as_such(tmp_path):
         _kernel("gemm", 2900, 1400, correlation=9),
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, by_runtime, listed, _ = summary.gap_causes(rows, kernels, runtime)
+    by_before, by_runtime, listed, _, _ = summary.gap_causes(rows, kernels, runtime)
 
     assert by_before["compute kernel"] == 2000.0          # 2 ms hole
     assert by_runtime["cudaMalloc"] == 2000.0             # ...and its cause
@@ -416,7 +416,7 @@ def test_a_gap_after_a_device_to_host_copy_is_separated_from_the_rest(tmp_path):
         _kernel("gemm", 4200, 2200),          # 0.2 ms hole, and runs to the end
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, _, listed, _ = summary.gap_causes(rows, kernels, runtime)
+    by_before, _, listed, _, _ = summary.gap_causes(rows, kernels, runtime)
 
     # the 0.2 ms hole between the two gemms is under the floor and not an event
     assert by_before == {"Memcpy DtoH": 2500.0}
@@ -432,7 +432,7 @@ def test_the_profiler_start_up_window_is_left_out_of_the_totals(tmp_path):
         _micro(41, 5000, 3000), _kernel("gemm", 5000, 2000),  # 1 ms real gap
     ]
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    by_before, _, listed, _ = summary.gap_causes(rows, kernels, runtime)
+    by_before, _, listed, _, _ = summary.gap_causes(rows, kernels, runtime)
 
     assert sum(by_before.values()) == 1000.0       # the 1 ms only, not the 4 ms
     assert all(micro != 40 for _, micro, _, _, _ in listed)
@@ -454,7 +454,7 @@ def test_the_histogram_separates_a_launch_floor_from_discrete_holes(tmp_path):
         at += 105
     events.append(_kernel("gemm", at + 2000, 5000))     # one 2 ms hole
     rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
-    _, _, listed, hist = summary.gap_causes(rows, kernels, runtime)
+    _, _, listed, hist, per_bucket = summary.gap_causes(rows, kernels, runtime)
 
     assert hist["<10us"][0] == 19            # 20 kernels, 19 holes between them
     assert hist["1-10ms"][0] == 1            # and the one real hole
@@ -462,3 +462,33 @@ def test_the_histogram_separates_a_launch_floor_from_discrete_holes(tmp_path):
     # which to chase, a >=1 ms list would have shown only the hole
     assert hist["<10us"][1] == 95.0
     assert len(listed) == 1
+
+
+def test_the_small_holes_are_named_by_what_the_device_just_finished(tmp_path):
+    """Ten thousand holes of 40 us cannot be listed, and a decade histogram says
+    where the time is without saying what it is. Grouping by the kernel that
+    ended before each one is the only naming the trace supports at that count --
+    collapsed to families, since every dtype and tile size is its own template
+    instantiation and raw names would be as long as the hole list."""
+    events = [_micro(40, 0, 100), _kernel("warmup", 0, 90), _micro(41, 100, 20000)]
+    at = 100
+    for _ in range(10):                     # flash bwd, each followed by 40 us
+        events.append(_kernel("void flash::flash_bwd_dot_do_o_kernel<true>", at, 100))
+        at += 140
+    for _ in range(5):                      # gemm, each followed by 40 us
+        events.append(_kernel("ampere_bf16_s16816gemm_bf16_256x128", at, 100))
+        at += 140
+    rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
+    _, _, _, _, per_bucket = summary.gap_causes(rows, kernels, runtime)
+
+    shelf = per_bucket["10-100us"]
+    assert shelf["flash attn bwd"] == 10 * 40.0
+    assert shelf["gemm"] == 4 * 40.0        # the last gemm's hole runs to the window end
+
+
+def test_kernel_families_collapse_template_instantiations():
+    assert summary._kernel_family("ampere_bf16_s16816gemm_bf16_256x128_ldg8") == "gemm"
+    assert summary._kernel_family("Memcpy DtoH (Device -> Pinned)") == "Memcpy DtoH"
+    assert summary._kernel_family("ncclDevKernel_AllGather_RING_LL") == "NCCL"
+    assert summary._kernel_family("void at::native::reduce_kernel<128, 4>") == "reduce"
+    assert summary._kernel_family("something_nobody_listed") == "other"
