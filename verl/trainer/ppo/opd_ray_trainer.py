@@ -48,6 +48,12 @@ from verl.utils.metric import reduce_metrics
 
 from agent_system.multi_turn_rollout import adjust_batch
 
+# Rows per call in the sign-weight passes. The teacher's forward returns every
+# row's hidden states in one tensor, so this bounds the transient that tensor and
+# its concatenation make -- the standing cost is the cache, which is the same
+# either way. 512 matches the ceiling the rollout prefetch already runs at.
+_SIGN_WEIGHT_FORWARD_CHUNK = max(1, int(os.environ.get("SIGN_WEIGHT_FORWARD_CHUNK", "512")))
+
 # Overlap envs.reset() for the next rollout with this step's GPU training phases.
 # The reset is pure CPU / subprocess / HTTP work and the env managers are idle
 # between rollouts; the reset still runs exactly once per rollout and in the same
@@ -648,12 +654,27 @@ class OPDRayTrainer(RayPPOTrainer):
         )
 
         def _cache(wg, idxs, column_for):
-            ids = torch.empty(len(idxs), dtype=torch.long)
-            for j, i in enumerate(idxs):
-                self._teacher_cache_counter += 1
-                ids[j] = self._teacher_cache_counter
-                sign_cache_ids[i, column_for(i)] = self._teacher_cache_counter
-            self._teacher_call(wg, lean.select_idxs(idxs), topk=True, cache_ids=ids)
+            # In row chunks, NOT one call per model. compute_topk_log_prob keeps
+            # every micro-batch's hidden states in a list and concatenates them
+            # before the cache packs anything, so one call over the whole batch
+            # builds a (rows_per_rank, response_length, hidden) tensor -- and,
+            # during the concat, two of them. At this batch size that is tens of
+            # GB on a card that has just finished a rollout, and it is what OOMed
+            # the first run of this arm. The teacher prefetch never hit it because
+            # it scores at most a few hundred rows per call; this is the same
+            # bound, applied to the passes that run after the rollout.
+            #
+            # The chunk changes nothing a value depends on: the forward is per
+            # row, each row gets its own key either way, and the chunk is a
+            # multiple of the DP world size so micro-batches keep their shape.
+            for start in range(0, len(idxs), _SIGN_WEIGHT_FORWARD_CHUNK):
+                part = idxs[start : start + _SIGN_WEIGHT_FORWARD_CHUNK]
+                ids = torch.empty(len(part), dtype=torch.long)
+                for j, i in enumerate(part):
+                    self._teacher_cache_counter += 1
+                    ids[j] = self._teacher_cache_counter
+                    sign_cache_ids[i, column_for(i)] = self._teacher_cache_counter
+                self._teacher_call(wg, lean.select_idxs(part), topk=True, cache_ids=ids)
 
         gpu_profiler.push_phase("sign_weight_forward/base")
         try:

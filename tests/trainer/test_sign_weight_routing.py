@@ -27,11 +27,13 @@ class _FakeRefWG:
         self.name = name
         self.rows = []  # original indices, in call order
         self.cache_ids = []
+        self.call_sizes = []  # rows per call, which is what bounds the transient
 
     def compute_ref_topk_log_prob(self, sub):
         first_tok = sub.batch["responses"][:, 0]
         self.rows.extend(first_tok.tolist())
         self.cache_ids.extend(sub.batch["teacher_cache_ids"].tolist())
+        self.call_sizes.append(len(first_tok))
         return DataProto.from_dict(
             tensors={"teacher_scored": torch.ones(len(first_tok), 1, dtype=torch.bool)}
         )
@@ -171,3 +173,48 @@ def test_alias_task_names_are_normalised_before_routing():
     assert teachers["alfworld"].rows == [1, 2]
     assert teachers["search"].rows == [0, 2]
     assert teachers["webshop"].rows == [0, 1]
+
+
+# --------------------------------------------------------------------------- #
+# Chunking
+# --------------------------------------------------------------------------- #
+
+
+def test_the_passes_are_issued_in_bounded_chunks(monkeypatch):
+    """One call per model would build a hidden-state tensor for the whole batch.
+
+    compute_topk_log_prob holds every micro-batch's hidden states in a list and
+    concatenates them before the cache packs anything, so a single call over the
+    step's rows materialises (rows_per_rank, response_length, hidden) -- twice,
+    during the concat. That is what OOMed the first run of this arm, on a card
+    that had just finished a rollout. The rollout's own teacher prefetch never hit
+    it because it scores a few hundred rows per call; this is the same bound.
+    """
+    import verl.trainer.ppo.opd_ray_trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "_SIGN_WEIGHT_FORWARD_CHUNK", 2)
+    teachers, base, batch = _fixture(TASKS)
+
+    assert len(TASKS) == 6
+    assert base.call_sizes == [2, 2, 2], base.call_sizes
+    assert max(base.call_sizes) <= 2
+    for wg in teachers.values():
+        assert max(wg.call_sizes) <= 2, wg.name
+    # And the rows are still all there, once each.
+    assert sorted(base.rows) == list(range(len(TASKS)))
+
+
+def test_chunking_changes_nothing_about_the_columns(monkeypatch):
+    """The chunk is a scheduling bound, so the batch it writes must be identical."""
+    import verl.trainer.ppo.opd_ray_trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "_SIGN_WEIGHT_FORWARD_CHUNK", 10_000)
+    _, _, whole = _fixture(TASKS)
+    monkeypatch.setattr(trainer_mod, "_SIGN_WEIGHT_FORWARD_CHUNK", 2)
+    _, _, chunked = _fixture(TASKS)
+
+    # Keys are drawn from a monotone counter, so they differ in value between two
+    # runs; what has to match is which model filled which column, and the labels.
+    assert whole.batch["sign_off_tasks"].tolist() == chunked.batch["sign_off_tasks"].tolist()
+    assert whole.batch["sign_cache_ids"].shape == chunked.batch["sign_cache_ids"].shape
+    assert bool((chunked.batch["sign_cache_ids"] >= 0).all())
