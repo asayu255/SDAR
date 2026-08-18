@@ -51,6 +51,14 @@ MID_STEPS=${MID_STEPS:-150}
 TOTAL_STEPS=${TOTAL_STEPS:-300}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
+# Profiling stays OFF for the sequence no matter what the launching shell has
+# exported. The per-step stage tables (and their CUDA-event overhead) are for
+# diagnosing one run, not for a multi-day sequence, and a GPU_PROFILER=1 left
+# over in the shell would silently switch them back on. Run a single arm by
+# hand with GPU_PROFILER=1 if a profile is ever wanted.
+export GPU_PROFILER=0
+export GPU_PROFILER_SYNC_PHASES=0
+
 if [ -z "${WANDB_API_KEY:-}" ]; then
     echo "FATAL: WANDB_API_KEY is not set. A multi-day run that logs to console only" >&2
     echo "       is a multi-day run whose curves nobody can read afterwards." >&2
@@ -211,7 +219,6 @@ fi
 preflight
 banner "SEQUENCE: ${PHASES[*]}"
 
-first=1
 for phase in "${PHASES[@]}"; do
     if ! declare -F "phase_$phase" >/dev/null; then
         echo "FATAL: unknown phase '$phase'." >&2
@@ -219,8 +226,10 @@ for phase in "${PHASES[@]}"; do
         echo "              val_control train_position_300 val_position_300 train_target_300 val_target_300" >&2
         exit 2
     fi
-    [ "$first" -eq 1 ] || tidy_ray
-    first=0
+    # Before EVERY phase, the first included: a cluster left over from an
+    # earlier shell keeps that shell's environment (GPU_PROFILER and all), and
+    # workers inherit from the raylet, not from this script.
+    tidy_ray
     if ! "phase_$phase"; then
         echo >&2
         echo "SEQUENCE STOPPED at '$phase'. Fix it, then re-run the same command --" >&2
