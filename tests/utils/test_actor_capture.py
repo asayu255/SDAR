@@ -660,6 +660,7 @@ def test_every_step_gets_a_summary_even_when_no_outlier_fires(monkeypatch, capsy
     assert "busy 4.0 s" in lines[-1]
     assert "idle 0.80 s" in lines[-1]                      # 500 + 3x100
     assert "before-step 0.50" in lines[-1]
+    assert "before-step n/a" in lines[0]        # the run's first step cannot know it
     assert "interior 0.30" in lines[-1]
     assert "16.67% of 4.8 s" in lines[-1]
 
@@ -683,3 +684,21 @@ def test_a_loss_spread_over_every_micro_batch_shows_in_the_summary(monkeypatch, 
     lines = [l for l in out.splitlines() if "[step-gpu]" in l]
     assert "idle 0.02 s" in lines[0]                       # ...and the two steps
     assert "idle 4.02 s" in lines[1]                       # are plainly different
+
+
+def test_the_first_step_does_not_claim_the_boundary_was_free(monkeypatch, capsys):
+    """The run's first micro-batch has no predecessor, so its before-step gap is
+    0.0 by construction. Printing that as a number reads as "the step boundary
+    costs nothing on the device" -- which is a conclusion, and the wrong one."""
+    mod = _fresh(monkeypatch)
+    _Calls(cuda=True, timings=[1000] * 12, gaps=[400] + [1] * 11).install(monkeypatch, mod)
+
+    for _ in range(3):
+        mod.new_step()
+        for _ in mod.iter_micro_batches(range(4)):
+            pass
+    mod.new_step()
+
+    lines = [l for l in capsys.readouterr().out.splitlines() if "[step-gpu]" in l]
+    assert "before-step n/a" in lines[0]
+    assert "before-step n/a" not in lines[1]     # and only the first

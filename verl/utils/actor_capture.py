@@ -287,7 +287,12 @@ class _StallWatch:
         self._reset_acc()
 
     def _reset_acc(self):
-        self._acc = {"n": 0, "gpu": 0.0, "step": 0.0, "mini": 0.0, "interior": 0.0}
+        # partial: this step's first gap had no predecessor to measure from, so
+        # its before-step number is absent rather than zero. True only for the
+        # run's first step, and reporting 0.00 there reads as "the boundary is
+        # free" -- which is exactly the wrong conclusion to hand someone.
+        self._acc = {"n": 0, "gpu": 0.0, "step": 0.0, "mini": 0.0, "interior": 0.0,
+                     "partial": self._prev_end is None}
 
     def new_step(self):
         """Called once per update_policy.
@@ -305,9 +310,10 @@ class _StallWatch:
             a = self._acc
             idle = a["step"] + a["mini"] + a["interior"]
             span = a["gpu"] + idle
+            before_step = "n/a" if a["partial"] else f"{a['step'] / 1e3:.2f}"
             print(f"[step-gpu] rank {_rank()} step {self._step}: {a['n']} micro-batches, "
                   f"busy {a['gpu'] / 1e3:.1f} s, idle {idle / 1e3:.2f} s "
-                  f"(before-step {a['step'] / 1e3:.2f}, before-mini {a['mini'] / 1e3:.2f}, "
+                  f"(before-step {before_step}, before-mini {a['mini'] / 1e3:.2f}, "
                   f"interior {a['interior'] / 1e3:.2f}) = {100 * idle / span:.2f}% of "
                   f"{span / 1e3:.1f} s", flush=True)
         self._reset_acc()
