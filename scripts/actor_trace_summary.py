@@ -40,6 +40,7 @@ only durations of the same-numbered micro-batch, which are directly comparable.
 """
 
 import argparse
+import bisect
 import glob
 import json
 import os
@@ -55,6 +56,10 @@ _DEVICE_CATS = {"kernel", "gpu_memcpy", "gpu_memset"}
 # across torch versions.
 _ANNOTATION_CATS = {"user_annotation", "cpu_op"}
 _MICRO_RE = re.compile(r"^micro/(\d+)/(\d+)$")
+# Below this a gap is launch overhead between two kernels, not an event: at
+# ~7,900 kernels per micro-batch the sub-millisecond holes are the ambient
+# floor, and listing them would bury the ones with a cause.
+_GAP_FLOOR_US = 1000.0
 _NCCL_RE = re.compile(r"nccl", re.IGNORECASE)
 
 
@@ -68,7 +73,8 @@ def _is_span(event) -> bool:
 def read_trace(path):
     """One rank's file, split into what the tables need.
 
-    Returns (micros, kernels, cpu_ops, launch_ts, base_us, shapes). ``micros``
+    Returns (micros, kernels, cpu_ops, launch_ts, base_us, shapes, runtime).
+    ``micros``
     maps the micro-batch counter to its (start, end); ``launch_ts`` maps a CUDA
     correlation id to the host timestamp that launched it; ``base_us`` is the
     epoch the file's timestamps are relative to, which is what lets two ranks be
@@ -85,7 +91,7 @@ def read_trace(path):
     events = raw["traceEvents"] if isinstance(raw, dict) else raw
     base_us = (raw.get("baseTimeNanoseconds", 0) / 1e3) if isinstance(raw, dict) else 0.0
 
-    micros, kernels, cpu_ops, launch_ts, shapes = {}, [], [], {}, []
+    micros, kernels, cpu_ops, launch_ts, shapes, runtime = {}, [], [], {}, [], []
     for event in events:
         if not _is_span(event):
             continue
@@ -104,10 +110,16 @@ def read_trace(path):
                 shapes.append((start, name, args["Input Dims"]))
         elif cat in _DEVICE_CATS:
             kernels.append((start, end, name, correlation))
-        elif cat == "cuda_runtime" and correlation is not None:
-            launch_ts[correlation] = start
+        elif cat == "cuda_runtime":
+            # The span, not just the launch instant: a gap's cause is usually a
+            # runtime call the host was INSIDE for the gap's duration
+            # (cudaMalloc, cudaStreamSynchronize, cudaMemcpyAsync on pageable
+            # memory), and that is invisible if only the start is kept.
+            runtime.append((start, end, name))
+            if correlation is not None:
+                launch_ts[correlation] = start
 
-    return micros, kernels, cpu_ops, launch_ts, base_us, shapes
+    return micros, kernels, cpu_ops, launch_ts, base_us, shapes, runtime
 
 
 def merge(intervals):
@@ -185,7 +197,66 @@ def _bracket(kernels, when):
     return (before[2] if before else "-", after[2] if after else "-")
 
 
+def gap_causes(rows, kernels, runtime, skip_first=True):
+    """Every gap over the floor, labelled by what ended before it and what the
+    host was inside during it.
+
+    The largest-gap-per-micro-batch table names one hole in each window and says
+    nothing about whether it is representative. This aggregates all of them, so
+    "three of five happen to follow a D2H copy" becomes a share of total idle
+    rather than an impression from a top-8 list.
+
+    Attribution is deliberately two-sided. The kernel that ENDED before the gap
+    says what the device had just finished -- a Memcpy DtoH means the host was
+    about to read a device value and could not run ahead. The runtime call
+    covering the gap says what the host was blocked in, and it is the more
+    direct answer when there is one: cudaMalloc synchronizes the device, and a
+    20 ms cudaMalloc is a segment growth, not a launch.
+    """
+    ends = sorted((e, n) for s_, e, n, _ in kernels)
+    end_t = [x[0] for x in ends]
+    runtime = sorted(runtime)
+    rt_t = [r[0] for r in runtime]
+
+    def covering(lo, hi):
+        """The runtime call overlapping the most of [lo, hi), and its share."""
+        i = max(0, bisect.bisect_left(rt_t, lo) - 64)
+        best, share = None, 0.0
+        for start, end, name in runtime[i:]:
+            if start > hi:
+                break
+            overlap = min(end, hi) - max(start, lo)
+            if overlap > share:
+                best, share = name, overlap
+        return best, (share / (hi - lo) if hi > lo else 0.0)
+
+    by_before, by_runtime, listed = {}, {}, []
+    for row in rows:
+        if skip_first and row is rows[0]:
+            continue                      # the profiler's own CUPTI start-up
+        for lo, hi in row.get("gaps", ()):
+            width = hi - lo
+            i = bisect.bisect_right(end_t, lo + 1) - 1
+            before = ends[i][1] if i >= 0 else "-"
+            label = ("Memcpy DtoH" if "Memcpy DtoH" in before
+                     else "NCCL" if _NCCL_RE.search(before)
+                     else "compute kernel")
+            call, share = covering(lo, hi)
+            key = call if share >= 0.5 else "(host not in a runtime call)"
+            by_before[label] = by_before.get(label, 0.0) + width
+            by_runtime[key] = by_runtime.get(key, 0.0) + width
+            listed.append((width, row["micro"], before, key, share))
+    return by_before, by_runtime, listed
+
+
 def analyse(path, shapes_of=("aten::embedding",)):
+    """One rank's per-micro-batch rows. See ``analyse_with_context`` for the
+    extra parsed data ``gap_causes`` needs; this stays the plain reader so a
+    caller that only wants the tables is not handed a tuple to unpack."""
+    return analyse_with_context(path, shapes_of)[0]
+
+
+def analyse_with_context(path, shapes_of=("aten::embedding",)):
     """One rank's per-micro-batch numbers.
 
     Two attributions run side by side, and conflating them produced this tool's
@@ -203,7 +274,7 @@ def analyse(path, shapes_of=("aten::embedding",)):
     carry-in (busy time inside the window from kernels launched before it) is
     reported on its own so the boundary work is visible instead of mislabelled.
     """
-    micros, kernels, cpu_ops, launch_ts, base_us, shapes = read_trace(path)
+    micros, kernels, cpu_ops, launch_ts, base_us, shapes, runtime = read_trace(path)
     busy_all = merge([(s, e) for s, e, _, _ in kernels])
     rows = []
     for counter, window in sorted(micros.items()):
@@ -220,6 +291,7 @@ def analyse(path, shapes_of=("aten::embedding",)):
         busy_any = clip(busy_all, window)
         holes = sorted(gaps(busy_any, window), key=lambda g: g[1] - g[0], reverse=True)
         biggest = holes[0] if holes else None
+        every = [(lo, hi) for lo, hi in holes if hi - lo >= _GAP_FLOOR_US]
         shape = next((dims for at, name, dims in shapes
                       if window[0] <= at < window[1] and name in shapes_of), None)
         rows.append({
@@ -232,13 +304,14 @@ def analyse(path, shapes_of=("aten::embedding",)):
             "idle_ms": (wall - sum(e - s for s, e in busy_any)) / 1e3,
             "carry_ms": (sum(e - s for s, e in busy_any) - sum(e - s for s, e in busy)) / 1e3,
             "kernels": len(mine),
+            "gaps": every,
             "gap_ms": (biggest[1] - biggest[0]) / 1e3 if biggest else 0.0,
             "gap_at": biggest[0] if biggest else None,
             "gap_host": _innermost_over(cpu_ops, biggest) if biggest else "-",
             "gap_bracket": _bracket([(s, e, n) for s, e, n, _ in kernels], biggest[0])
                            if biggest else ("-", "-"),
         })
-    return rows
+    return rows, kernels, runtime
 
 
 def _rank_of(path) -> str:
@@ -407,6 +480,35 @@ def report(by_rank, top):
               f"nccl {nccl / 1e3:5.2f} s ({100 * nccl / wall:4.1f}%)")
 
 
+def report_causes(causes, top):
+    if not causes:
+        return
+    print("\n== what precedes every gap, not just the biggest ==")
+    print("  Two attributions. The kernel that ENDED before a gap says what the "
+          "device had just\n  finished: a Memcpy DtoH means the host was about "
+          "to read a device value and could\n  not run ahead of it. The runtime "
+          "call the host sat INSIDE for most of the gap is the\n  more direct "
+          "answer when there is one -- cudaMalloc synchronizes the device, so a "
+          "20 ms\n  cudaMalloc is a segment growth rather than a launch. Gaps "
+          f"under {_GAP_FLOOR_US / 1000:.0f} ms are omitted:\n  at ~7,900 kernels "
+          "a micro-batch they are the launch-overhead floor, not events.\n")
+    for rank in sorted(causes):
+        by_before, by_runtime, listed = causes[rank]
+        total = sum(by_before.values()) or 1.0
+        print(f"  rank {rank}: {len(listed)} gaps, {total / 1e3:.0f} ms total")
+        for label, width in sorted(by_before.items(), key=lambda kv: -kv[1]):
+            print(f"      after {label:16s} {width / 1e3:7.0f} ms  {100 * width / total:5.1f}%")
+        for call, width in sorted(by_runtime.items(), key=lambda kv: -kv[1])[:4]:
+            print(f"      host in {_short(call, 30):30s} {width / 1e3:7.0f} ms  "
+                  f"{100 * width / total:5.1f}%")
+    every = sorted((g for c in causes.values() for g in c[2]), reverse=True)[:top]
+    if every:
+        print("\n  the largest, individually:")
+        for width, micro, before, call, share in every:
+            print(f"      {width / 1e3:6.1f} ms  micro {micro:>3}  after {_short(before, 34)}")
+            print(f"                     host in {_short(call, 40)} ({100 * share:.0f}% of the gap)")
+
+
 def _expand(paths):
     out = []
     for path in paths:
@@ -436,11 +538,15 @@ def main(argv=None):
         print("no traces found", file=sys.stderr)
         return 1
 
-    by_rank = defaultdict(list)
+    by_rank, causes = defaultdict(list), {}
     for path in paths:
         print(f"reading {path} ({os.path.getsize(path) / (1 << 20):.1f} MiB)")
-        by_rank[_rank_of(path)] = analyse(path, tuple(args.shapes_of.split(",")))
+        rows, kernels, runtime = analyse_with_context(
+            path, tuple(args.shapes_of.split(",")))
+        by_rank[_rank_of(path)] = rows
+        causes[_rank_of(path)] = gap_causes(rows, kernels, runtime)
     report(by_rank, args.top)
+    report_causes(causes, args.top)
     return 0
 
 

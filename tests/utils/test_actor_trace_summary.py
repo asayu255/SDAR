@@ -51,9 +51,9 @@ def _kernel(name, ts, dur, correlation=None):
             "ts": ts, "dur": dur, "args": {"correlation": correlation}}
 
 
-def _launch(ts, correlation):
-    return {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel",
-            "pid": 1, "tid": 1, "ts": ts, "dur": 5, "args": {"correlation": correlation}}
+def _launch(ts, correlation, name="cudaLaunchKernel", dur=5):
+    return {"ph": "X", "cat": "cuda_runtime", "name": name,
+            "pid": 1, "tid": 1, "ts": ts, "dur": dur, "args": {"correlation": correlation}}
 
 
 def _micro(counter, ts, dur):
@@ -377,3 +377,62 @@ def test_the_optimizer_tail_is_carry_not_idle(tmp_path):
     # and the biggest gap is the real mid-window hole, not the head
     assert r41["gap_at"] > 1130
     assert r41["gap_bracket"][0] == "gemm"
+
+
+def test_a_gap_the_host_spent_inside_cudamalloc_is_labelled_as_such(tmp_path):
+    """The distinction that decides what to fix.
+
+    A gap after a compute kernel with the host in no runtime call is launch
+    overhead. The same gap with the host sitting inside cudaMalloc is a segment
+    growth -- cudaMalloc synchronizes the device, so it is a stall with a cause
+    and a fix, and only the runtime span tells them apart.
+    """
+    events = [
+        _micro(40, 0, 400), _kernel("warmup", 0, 380),
+        _micro(41, 400, 4000),
+        _kernel("gemm", 400, 500),
+        # 20 ms hole, and the host is inside cudaMalloc for all of it
+        _launch(910, correlation=9, name="cudaMalloc", dur=1980),
+        _kernel("gemm", 2900, 1400, correlation=9),
+    ]
+    rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
+    by_before, by_runtime, listed = summary.gap_causes(rows, kernels, runtime)
+
+    assert by_before["compute kernel"] == 2000.0          # 2 ms hole
+    assert by_runtime["cudaMalloc"] == 2000.0             # ...and its cause
+    assert listed[0][3] == "cudaMalloc"
+
+
+def test_a_gap_after_a_device_to_host_copy_is_separated_from_the_rest(tmp_path):
+    """A Memcpy DtoH before a gap means the host was about to read a device
+    value and could not run ahead of it -- a different mechanism from a gap
+    between two compute kernels, and one that a per-micro-batch 'largest gap'
+    table cannot weigh against the total."""
+    events = [
+        _micro(40, 0, 400), _kernel("warmup", 0, 380),
+        _micro(41, 400, 6000),
+        _kernel("Memcpy DtoH (Device -> Pinned)", 400, 100),
+        _kernel("gemm", 3000, 1000),          # 2.5 ms hole after the copy
+        _kernel("gemm", 4200, 2200),          # 0.2 ms hole, and runs to the end
+    ]
+    rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
+    by_before, _, listed = summary.gap_causes(rows, kernels, runtime)
+
+    # the 0.2 ms hole between the two gemms is under the floor and not an event
+    assert by_before == {"Memcpy DtoH": 2500.0}
+    assert len(listed) == 1
+
+
+def test_the_profiler_start_up_window_is_left_out_of_the_totals(tmp_path):
+    """The first captured micro-batch carries CUPTI's own start-up -- 400+ ms on
+    every rank. Counted in, it dwarfs every real gap and the shares become
+    meaningless."""
+    events = [
+        _micro(40, 0, 5000), _kernel("gemm", 4000, 1000),     # 4 ms of start-up
+        _micro(41, 5000, 3000), _kernel("gemm", 5000, 2000),  # 1 ms real gap
+    ]
+    rows, kernels, runtime = summary.analyse_with_context(_write(tmp_path, 0, events))
+    by_before, _, listed = summary.gap_causes(rows, kernels, runtime)
+
+    assert sum(by_before.values()) == 1000.0       # the 1 ms only, not the 4 ms
+    assert all(micro != 40 for _, micro, _, _, _ in listed)
