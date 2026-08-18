@@ -68,34 +68,46 @@ def _is_span(event) -> bool:
 def read_trace(path):
     """One rank's file, split into what the tables need.
 
-    Returns (micros, kernels, cpu_ops, launch_ts). ``micros`` maps the
-    micro-batch counter to its (start, end); ``launch_ts`` maps a CUDA
-    correlation id to the host timestamp that launched it.
+    Returns (micros, kernels, cpu_ops, launch_ts, base_us, shapes). ``micros``
+    maps the micro-batch counter to its (start, end); ``launch_ts`` maps a CUDA
+    correlation id to the host timestamp that launched it; ``base_us`` is the
+    epoch the file's timestamps are relative to, which is what lets two ranks be
+    put on one clock; ``shapes`` is every op's recorded input dims.
+
+    ``base_us`` is kept separate rather than folded into every timestamp on the
+    way in. It is ~1.8e15 microseconds, and adding it to each ``ts`` would round
+    the interval arithmetic to about 0.4 us of double precision -- fine for the
+    millisecond gaps this is looking for, but there is no reason to spend it
+    when only the cross-rank skew needs an absolute clock.
     """
     with open(path) as handle:
         raw = json.load(handle)
     events = raw["traceEvents"] if isinstance(raw, dict) else raw
+    base_us = (raw.get("baseTimeNanoseconds", 0) / 1e3) if isinstance(raw, dict) else 0.0
 
-    micros, kernels, cpu_ops, launch_ts = {}, [], [], {}
+    micros, kernels, cpu_ops, launch_ts, shapes = {}, [], [], {}, []
     for event in events:
         if not _is_span(event):
             continue
         cat = event.get("cat", "")
         name = event.get("name", "")
+        args = event.get("args") or {}
         start, end = float(event["ts"]), float(event["ts"]) + float(event["dur"])
-        correlation = (event.get("args") or {}).get("correlation")
+        correlation = args.get("correlation")
         if cat in _ANNOTATION_CATS:
             hit = _MICRO_RE.match(name)
             if hit:
                 micros[int(hit.group(1))] = (start, end)
             else:
                 cpu_ops.append((start, end, name))
+            if args.get("Input Dims"):
+                shapes.append((start, name, args["Input Dims"]))
         elif cat in _DEVICE_CATS:
             kernels.append((start, end, name, correlation))
         elif cat == "cuda_runtime" and correlation is not None:
             launch_ts[correlation] = start
 
-    return micros, kernels, cpu_ops, launch_ts
+    return micros, kernels, cpu_ops, launch_ts, base_us, shapes
 
 
 def merge(intervals):
@@ -173,9 +185,9 @@ def _bracket(kernels, when):
     return (before[2] if before else "-", after[2] if after else "-")
 
 
-def analyse(path):
+def analyse(path, shapes_of=("aten::embedding",)):
     """One rank's per-micro-batch numbers."""
-    micros, kernels, cpu_ops, launch_ts = read_trace(path)
+    micros, kernels, cpu_ops, launch_ts, base_us, shapes = read_trace(path)
     rows = []
     for counter, window in sorted(micros.items()):
         # Attribute a kernel to the micro-batch that *launched* it, not the one
@@ -191,8 +203,12 @@ def analyse(path):
         nccl = clip(merge([(s, e) for s, e, n in mine if _NCCL_RE.search(n)]), window)
         holes = sorted(gaps(busy, window), key=lambda g: g[1] - g[0], reverse=True)
         biggest = holes[0] if holes else None
+        shape = next((dims for at, name, dims in shapes
+                      if window[0] <= at < window[1] and name in shapes_of), None)
         rows.append({
             "micro": counter,
+            "start_abs_us": base_us + window[0],
+            "shape": shape,
             "wall_ms": wall / 1e3,
             "busy_ms": sum(e - s for s, e in busy) / 1e3,
             "nccl_ms": sum(e - s for s, e in nccl) / 1e3,
@@ -241,6 +257,45 @@ def report(by_rank, top):
                          f"{row['nccl_ms']:>8.1f} {row['idle_ms']:>8.1f}")
         print(line)
 
+    empty = [(rank, row) for rank, rows in by_rank.items() for row in rows
+             if row["kernels"] == 0]
+    if empty:
+        print(f"\n  !! {len(empty)} micro-batch(es) recorded no device work at all. "
+              "Those windows are\n     100% 'idle' by construction and say nothing "
+              "about a stall -- they mean the capture\n     caught no kernels, not "
+              "that the GPU was empty. They are left out of the gap table.")
+
+    print("\n== are the ranks even on the same micro-batch? ==")
+    print("  Every table below assumes rank N's micro k ran at the same time as "
+          "rank M's micro k.\n  The traces carry an epoch, so that can be checked "
+          "rather than assumed: skew is each\n  rank's start against the earliest, "
+          "and overlap is the share of the window they share.\n  Low overlap "
+          "invalidates the decomposition -- the ranks would be comparing different "
+          "work.\n")
+    print(f"{'micro':>6} | {'skew (ms)':>34} | {'overlap':>7}")
+    print("-" * 56)
+    aligned = True
+    for counter in counters:
+        rows = {rank: next((r for r in by_rank[rank] if r["micro"] == counter), None)
+                for rank in ranks}
+        rows = {k: v for k, v in rows.items() if v}
+        if len(rows) < 2 or any(not v["start_abs_us"] for v in rows.values()):
+            continue
+        first = min(v["start_abs_us"] for v in rows.values())
+        skews = " ".join(f"r{k}:{(v['start_abs_us'] - first) / 1e3:+8.1f}"
+                         for k, v in rows.items())
+        lo = max(v["start_abs_us"] for v in rows.values())
+        hi = min(v["start_abs_us"] + v["wall_ms"] * 1e3 for v in rows.values())
+        widest = max(v["wall_ms"] * 1e3 for v in rows.values())
+        overlap = max(0.0, hi - lo) / widest if widest else 0.0
+        aligned = aligned and overlap > 0.5
+        print(f"{counter:>6} | {skews:>34} | {100 * overlap:>6.0f}%")
+    if not aligned:
+        print("\n  !! some windows barely overlap. Read the next table with that "
+              "in mind: the ranks\n     were not doing the same micro-batch at the "
+              "same time, so 'who waited for whom'\n     is not a question this "
+              "data answers.")
+
     print("\n== who waits for whom ==")
     print("  The ranks leave a collective together, so the one that spent the "
           "LEAST time in NCCL is\n  the one everybody else was waiting for, and "
@@ -283,7 +338,8 @@ def report(by_rank, top):
           "and the wait is on the device side; '-' means the host was idle\n  too, "
           "which points outside this process entirely.\n")
     worst = sorted(
-        ((rank, row) for rank, rows in by_rank.items() for row in rows),
+        ((rank, row) for rank, rows in by_rank.items() for row in rows
+         if row["kernels"]),
         key=lambda pair: pair[1]["gap_ms"], reverse=True)[:top]
     for rank, row in worst:
         print(f"  rank {rank} micro {row['micro']:>4}  gap {row['gap_ms']:8.1f} ms "
@@ -291,6 +347,23 @@ def report(by_rank, top):
         print(f"      host: {_short(row['gap_host'], 60)}")
         print(f"      last kernel before: {_short(row['gap_bracket'][0])}")
         print(f"      first kernel after: {_short(row['gap_bracket'][1])}")
+
+    shaped = {rank: {r["micro"]: r["shape"] for r in rows if r["shape"]}
+              for rank, rows in by_rank.items()}
+    if any(shaped.values()):
+        print("\n== tokens per micro-batch, from the recorded shapes ==")
+        print("  _balance_batch equalises tokens per RANK over the whole batch, "
+              "then the micro-batches\n  are a plain chunk of that -- so rank 0's "
+              "micro k and rank 1's micro k need not match,\n  even though the "
+              "totals do. The ranks synchronise every micro-batch, so a per-micro\n"
+              "  difference is a real wait that a per-rank balance cannot remove. "
+              "These are the shapes\n  torch recorded, not a derived number.\n")
+        for counter in counters:
+            line = f"{counter:>6}"
+            for rank in ranks:
+                dims = shaped.get(rank, {}).get(counter)
+                line += f" | r{rank} {str(dims) if dims else '-':>22}"
+            print(line)
 
     print("\n== totals ==")
     for rank in ranks:
@@ -320,6 +393,11 @@ def main(argv=None):
                         help="Chrome trace files, globs, or a directory")
     parser.add_argument("--top", type=int, default=8,
                         help="how many of the largest gaps to describe")
+    parser.add_argument("--shapes-of", default="aten::embedding",
+                        help="comma-separated op names whose recorded input dims "
+                             "stand in for the micro-batch's token count "
+                             "(default aten::embedding, whose indices argument is "
+                             "the input_ids shape)")
     args = parser.parse_args(argv)
 
     paths = _expand(args.paths or ["/tmp/actor_trace"])
@@ -330,7 +408,7 @@ def main(argv=None):
     by_rank = defaultdict(list)
     for path in paths:
         print(f"reading {path} ({os.path.getsize(path) / (1 << 20):.1f} MiB)")
-        by_rank[_rank_of(path)] = analyse(path)
+        by_rank[_rank_of(path)] = analyse(path, tuple(args.shapes_of.split(",")))
     report(by_rank, args.top)
     return 0
 

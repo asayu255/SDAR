@@ -66,10 +66,18 @@ def _op(name, ts, dur):
             "ts": ts, "dur": dur}
 
 
-def _write(tmp_path, rank, events):
+def _write(tmp_path, rank, events, base_ns=0):
     path = tmp_path / f"actor_rank{rank}_pid999.json"
-    path.write_text(json.dumps({"schemaVersion": 1, "traceEvents": events}))
+    path.write_text(json.dumps({"schemaVersion": 1, "traceEvents": events,
+                                "baseTimeNanoseconds": base_ns}))
     return str(path)
+
+
+def _embedding(ts, dur, tokens):
+    """aten::embedding as torch records it under record_shapes: the weight's
+    dims, then the indices', whose last entry is the token count."""
+    return {"ph": "X", "cat": "cpu_op", "name": "aten::embedding", "pid": 1, "tid": 1,
+            "ts": ts, "dur": dur, "args": {"Input Dims": [[151936, 2048], [1, tokens]]}}
 
 
 def test_metadata_and_flow_events_are_not_intervals(tmp_path):
@@ -261,3 +269,73 @@ def test_end_to_end_over_three_ranks(tmp_path, capsys):
     assert "per micro-batch, per rank" in out
     assert "largest idle gap" in out
     assert out.count("micro-batches,") == 3      # one totals line per rank
+
+
+def test_a_window_with_no_device_work_is_not_reported_as_a_stall(tmp_path, capsys):
+    """A capture that recorded no kernels makes every window 100% "idle" by
+    construction. That is the profiler seeing nothing, not the GPU being empty,
+    and it would otherwise sit at the top of the gap table looking like the
+    largest stall in the run."""
+    events = [_micro(40, 0, 1000),                       # no kernels at all
+              _micro(41, 1000, 1000), _kernel("gemm", 1000, 900)]
+    summary.report({"0": summary.analyse(_write(tmp_path, 0, events))}, top=5)
+    out = capsys.readouterr().out
+
+    assert "recorded no device work at all" in out
+    assert "micro   40" not in out                       # kept out of the gap table
+    assert "micro   41" in out
+
+
+def test_the_ranks_are_checked_to_be_on_the_same_micro_batch(tmp_path, capsys):
+    """Every comparison below assumes rank N's micro k ran while rank M's did.
+    The traces carry an epoch, so it can be checked instead of assumed -- and if
+    they do not overlap, 'who waited for whom' is not a question the data
+    answers."""
+    events = [_micro(40, 0, 1000), _kernel("gemm", 0, 900)]
+    apart = {
+        "0": summary.analyse(_write(tmp_path, 0, events, base_ns=1_000_000_000_000_000)),
+        "1": summary.analyse(_write(tmp_path, 1, events, base_ns=1_000_000_005_000_000)),
+    }
+    summary.report(apart, top=2)
+    out = capsys.readouterr().out
+
+    assert "barely overlap" in out                       # 5 ms apart, 1 ms windows
+
+    together = {
+        "0": summary.analyse(_write(tmp_path, 0, events, base_ns=1_000_000_000_000_000)),
+        "1": summary.analyse(_write(tmp_path, 1, events, base_ns=1_000_000_000_100_000)),
+    }
+    summary.report(together, top=2)
+    out = capsys.readouterr().out
+
+    assert "barely overlap" not in out                   # 0.1 ms apart of 1 ms
+    assert "r1:    +0.1" in out
+
+
+def test_the_recorded_shapes_give_the_per_micro_token_count(tmp_path, capsys):
+    """_balance_batch equalises tokens per rank over the whole batch, and the
+    micro-batches are a plain chunk of that -- so the per-micro counts can still
+    differ across ranks while the totals match. The ranks synchronise every
+    micro-batch, so that difference is a real wait no per-rank balance removes.
+    Reading it off the trace rather than a derived number is the point."""
+    def rank_events(tokens):
+        return [_micro(40, 0, 1000), _kernel("gemm", 0, 900),
+                _embedding(10, 5, tokens)]
+
+    by_rank = {"0": summary.analyse(_write(tmp_path, 0, rank_events(9800))),
+               "1": summary.analyse(_write(tmp_path, 1, rank_events(10400)))}
+    summary.report(by_rank, top=2)
+    out = capsys.readouterr().out
+
+    assert "9800" in out and "10400" in out
+
+
+def test_the_op_the_shapes_come_from_is_selectable(tmp_path):
+    """aten::embedding is the default because it is where input_ids enter an HF
+    model, but the arm that packs sequences or the model that names it something
+    else should not need the script edited."""
+    events = [_micro(40, 0, 1000), _kernel("gemm", 0, 900), _embedding(10, 5, 9800)]
+    path = _write(tmp_path, 0, events)
+
+    assert summary.analyse(path)[0]["shape"] == [[151936, 2048], [1, 9800]]
+    assert summary.analyse(path, shapes_of=("aten::linear",))[0]["shape"] is None
