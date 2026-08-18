@@ -32,6 +32,13 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
+from verl.trainer.ppo.sign_weights import (
+    SignWeightStats,
+    candidate_weights,
+    normalize_per_task,
+    position_weights,
+    reweight_teacher_logprobs,
+)
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import gpu_profiler
@@ -226,6 +233,11 @@ class DataParallelPPOActor(BasePPOActor):
         if self.no_sync_grad_accum:
             print("Actor no_sync_grad_accum=True (one gradient reduce per mini-batch)")
 
+        # position-mode sign weighting divides by the previous call's per-task
+        # mean; None until one has been measured, which is what makes the first
+        # step run unnormalised rather than by a guess.
+        self._sign_position_means = None
+
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
@@ -307,6 +319,44 @@ class DataParallelPPOActor(BasePPOActor):
         s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
         return full_s_lp[:, -response_length - 1 : -1, :]
+
+    def _refresh_sign_position_means(self, stats, task_id_names):
+        """Per-task mean position weight, pooled over ranks, for the NEXT call.
+
+        ``position`` mode has to divide by a per-task mean or it cannot be told
+        apart from a larger ``teacher_kl_loss_coef``: the weight table has no
+        entry below 1.0, so the mean sits above 1 whenever anything agrees, and an
+        un-normalised arm would simply have distilled harder.
+
+        The mean it needs is step-global, and the weight only exists inside the
+        training forward, which sees one micro-batch at a time. Two ways out are
+        worse than this one: a micro-batch's own mean makes the objective depend
+        on how the batch was split, and a second forward to measure it first costs
+        the forward. The mean is a slow quantity -- the agreement rate moved from
+        0.26 to 0.17 over 150 steps -- so the previous call's value is the right
+        constant, and being a constant it cannot bias a gradient, only the
+        effective coefficient, by a fraction of a percent. The first step runs
+        unnormalised and ``sign_weight/*/w_mean_pre_norm`` says by how much.
+
+        Pooled across ranks because every rank has to divide by the SAME number:
+        rank-local means would scale each rank's share of the loss differently,
+        which is a change to the objective rather than to its normalisation.
+        """
+        import torch.distributed as dist
+
+        n = len(task_id_names) if task_id_names else 0
+        if n == 0:
+            return
+        acc = torch.zeros((n, 2), dtype=torch.float64, device=get_torch_device().current_device())
+        for tid, total in stats.pos_w.items():
+            if tid is None or not (0 <= tid < n):
+                continue
+            acc[tid, 0] = total
+            acc[tid, 1] = stats.pos_n.get(tid, 0.0)
+        if dist.is_initialized():
+            dist.all_reduce(acc, op=dist.ReduceOp.SUM)
+        means = {tid: float(acc[tid, 0] / acc[tid, 1]) for tid in range(n) if acc[tid, 1] > 0}
+        self._sign_position_means = means or None
 
     def _teacher_logprobs_at(self, cache_ids, ids, input_ids=None, attention_mask=None):
         """Teacher log-probs at ids the student just chose.
@@ -956,6 +1006,23 @@ class DataParallelPPOActor(BasePPOActor):
                 select_keys.append("teacher_cache_ids")
             else:
                 select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
+        # Cross-teacher sign agreement: the base policy and the row's off-task
+        # teachers, cached by the driver on the same rows and read here at the ids
+        # the student is about to pick. Absent -> the weighting never runs, which
+        # is what makes enable=false identical to the plain arm.
+        sign_cfg = self.config.get("sign_weight", None)
+        sign_enabled = bool(sign_cfg and sign_cfg.get("enable", False)) and "sign_cache_ids" in data.batch.keys()
+        if sign_enabled:
+            assert student_indexed_topk, (
+                "sign weighting is built on the student's top-k; it has nothing to "
+                "read without student_indexed_topk"
+            )
+            select_keys += ["sign_cache_ids", "sign_off_tasks"]
+        sign_mode = str(sign_cfg.get("mode", "target")) if sign_enabled else None
+        sign_agree = float(sign_cfg.get("agree_weight", 1.25)) if sign_enabled else 1.0
+        sign_agree_neg = float(sign_cfg.get("agree_neg_weight", 0.75)) if sign_enabled else 1.0
+        sign_disagree = float(sign_cfg.get("disagree_weight", 1.0)) if sign_enabled else 1.0
+        sign_deadzone = float(sign_cfg.get("deadzone", 0.1)) if sign_enabled else 0.0
         # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
         # so the loss metrics below can also be reported per task. Absent in single-task runs.
         task_id_names = data.meta_info.get("task_id_names", None)
@@ -1024,6 +1091,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         def _defer(name, value):
             deferred_metrics.setdefault(name, []).append(value.detach())
+
+        # Pooled across every micro-batch of this call and rendered once at the
+        # end. Ratios cannot be emitted per micro-batch: the reducer would average
+        # them, and a micro-batch with fewer valid tokens would weigh as much as a
+        # full one.
+        sign_stats = SignWeightStats(task_names=task_id_names) if sign_enabled else None
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -1153,6 +1226,71 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         student_topk_logprobs = student_topk_out
                         fwd_teacher_topk_logprobs = None
+
+                    # ---- cross-teacher sign agreement --------------------- #
+                    sign_position_weight = None
+                    sign_target_inputs = None
+                    if sign_enabled and fwd_teacher_topk_logprobs is not None:
+                        with _actor_phase("actor.sign_weight"):
+                            sign_ids = data["sign_cache_ids"]
+                            # Same exchange the on-task teacher went through, once
+                            # per model: the base policy in column 0, then this
+                            # row's off-task teachers. They were cached by the
+                            # driver on the rows they are off-task for, at the same
+                            # granularity, so the lookup is the same shape.
+                            planes = [
+                                self._teacher_logprobs_at(
+                                    cache_ids=sign_ids[:, c],
+                                    ids=student_topk_ids,
+                                    input_ids=data["input_ids"],
+                                    attention_mask=data["attention_mask"],
+                                )
+                                for c in range(sign_ids.size(1))
+                            ]
+                            base_logprob = planes[0]
+                            off_logprobs = torch.stack(planes[1:], dim=-1)
+                            candidate_weight, sign_state = candidate_weights(
+                                fwd_teacher_topk_logprobs,
+                                off_logprobs,
+                                base_logprob,
+                                mode=sign_mode,
+                                agree_weight=sign_agree,
+                                agree_neg_weight=sign_agree_neg,
+                                disagree_weight=sign_disagree,
+                                deadzone=sign_deadzone,
+                            )
+                            sign_stats.update_candidates(
+                                state=sign_state,
+                                on_task_logprob=fwd_teacher_topk_logprobs,
+                                off_task_logprobs=off_logprobs,
+                                base_logprob=base_logprob,
+                                response_mask=response_mask,
+                                deadzone=sign_deadzone,
+                                task_ids=task_ids,
+                                off_plane_tasks=data.get("sign_off_tasks", None),
+                            )
+                            if sign_mode == "target":
+                                # Keep the original: the diagnostics below measure
+                                # how far the rewrite moved the target, which is a
+                                # statement about the pair.
+                                sign_target_inputs = (fwd_teacher_topk_logprobs, candidate_weight)
+                                fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
+                                    fwd_teacher_topk_logprobs, candidate_weight
+                                )
+                            else:
+                                pos_w = position_weights(candidate_weight, fwd_teacher_topk_logprobs)
+                                sign_stats.update_position(
+                                    position_weight=pos_w,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                )
+                                # By the PREVIOUS step's per-task means: this one's
+                                # are not known until every micro-batch has run, and
+                                # normalising by a micro-batch's own mean would make
+                                # the objective depend on how the batch was split.
+                                sign_position_weight = normalize_per_task(
+                                    pos_w, response_mask, task_ids, means=self._sign_position_means
+                                )
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -1267,6 +1405,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 logprob=log_prob,
                                 ref_logprob=data["teacher_log_probs"],
                                 kl_penalty=teacher_kl_loss_type,
+                            )
+                        if sign_position_weight is not None:
+                            # position mode: a positive per-token scalar, computed
+                            # from frozen models, so it scales the gradient at this
+                            # position without moving what the loss is minimised by.
+                            # target mode needs nothing here -- it rewrote the
+                            # teacher's own values above and reaches the loss
+                            # through the line that built teacher_kld.
+                            teacher_kld = teacher_kld * sign_position_weight.to(teacher_kld.dtype)
+                        if sign_target_inputs is not None:
+                            sign_stats.update_target(
+                                on_task_logprob=sign_target_inputs[0],
+                                candidate_weight=sign_target_inputs[1],
+                                response_mask=response_mask,
+                                task_ids=task_ids,
+                                teacher_kl=teacher_kld,
                             )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
@@ -1419,6 +1573,11 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        if sign_stats is not None:
+            metrics.update(sign_stats.metrics())
+            metrics["sign_weight/mode_is_target"] = float(sign_mode == "target")
+            if sign_mode == "position":
+                self._refresh_sign_position_means(sign_stats, task_id_names)
         # The one read for everything deferred above. torch.stack forces a single
         # host sync here instead of one per micro-batch.
         for name, values in deferred_metrics.items():

@@ -822,6 +822,59 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
+    def _dump_val_instances(self, *, scores, task_names, data_sources, traj_uids, tool_callings):
+        """One line per validation instance, so a later comparison can be PAIRED.
+
+        The aggregate this function sits next to -- a mean per task -- is the only
+        thing the run has ever recorded, and it is not enough to compare two arms
+        with. Two failures came out of that directly: a continuous score
+        (webshop's) has no variance stored, so no interval and no z can be
+        computed for it afterwards at all; and two arms evaluate the SAME 126
+        instances in the same order, which a paired test (McNemar on the successes,
+        a paired t on the scores) can exploit for a large gain in power, but only
+        if which instance was which is still on disk.
+
+        The pairing key is ``val_index``, the row's position in the validation
+        pass. It is stable because the validation loader is built with
+        ``shuffle=False`` over a fixed file, and the file, its size and the seed
+        are all pinned in the intent lock -- so index i is the same problem in
+        every arm and at every step. ``traj_uid`` is written too but is NOT that
+        key: it identifies one rollout, not the instance behind it.
+
+        Off unless ``trainer.val_instance_log_dir`` is set. Roughly 380 lines of a
+        few hundred bytes per validation pass.
+        """
+        out_dir = self.config.trainer.get("val_instance_log_dir", None)
+        if not out_dir:
+            return
+        out_dir = os.path.expanduser(str(out_dir))
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"val_step{self.global_steps}.jsonl")
+        n = len(scores)
+        with open(path, "w") as f:
+            for i in range(n):
+                f.write(
+                    json.dumps(
+                        {
+                            "val_index": i,
+                            "step": self.global_steps,
+                            "experiment": self.config.trainer.get("experiment_name", None),
+                            "task": None if task_names[i] is None else str(task_names[i]),
+                            "data_source": str(data_sources[i]),
+                            "traj_uid": str(traj_uids[i]),
+                            # The episode return. Success is deliberately NOT
+                            # derived here: it is 1.0 == score on alfworld and
+                            # search but a threshold on webshop's continuous score,
+                            # and baking that choice into the log would make the
+                            # file only as good as the guess.
+                            "score": float(scores[i]),
+                            "tool_calling": float(tool_callings[i]),
+                        }
+                    )
+                    + "\n"
+                )
+        print(f"[val] wrote {n} instance rows to {path}")
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -933,6 +986,13 @@ class RayPPOTrainer:
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+        self._dump_val_instances(
+            scores=reward_tensor,
+            task_names=task_names,
+            data_sources=data_sources,
+            traj_uids=traj_uids,
+            tool_callings=tool_callings,
+        )
 
         # evaluate test_score based on data source
         data_source_reward = {}

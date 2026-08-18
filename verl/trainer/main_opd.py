@@ -68,6 +68,13 @@ class OPDTaskRunner:
             config.actor_rollout_ref.actor.normalize_loss_by_task = opd_cfg.get(
                 "normalize_loss_by_task", False
             )
+            # Cross-teacher sign agreement. The weights are built inside the
+            # actor's forward -- that is where the student's top-k exists -- so the
+            # settings have to reach the actor config, while staying authored under
+            # algorithm.opd with the other scientific knobs.
+            sign_cfg = opd_cfg.get("sign_weight", None)
+            if sign_cfg is not None:
+                config.actor_rollout_ref.actor.sign_weight = sign_cfg
             config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
             config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
             config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

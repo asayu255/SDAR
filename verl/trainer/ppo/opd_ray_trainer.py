@@ -581,6 +581,101 @@ class OPDRayTrainer(RayPPOTrainer):
             batch.batch["teacher_log_probs"] = teacher_log_probs
 
     # ------------------------------------------------------------------ #
+    # Cross-teacher sign agreement (optional; see sign_weights.py).
+    # ------------------------------------------------------------------ #
+    def compute_sign_weight_cache(self, batch: DataProto) -> None:
+        """Cache the base policy and every off-task teacher on the rows they have
+        to speak for, so the actor can read them at ids the student picks.
+
+        The weights need four models on one support, and the support is chosen
+        inside the training forward. Only the final gather depends on the ids, so
+        the same trick the on-task teacher already uses applies unchanged: each
+        model's hidden states and full-vocabulary normaliser are cached here, and
+        ``log p(v) = h . W[v] - lse`` is finished in the actor.
+
+        Cost is three extra frozen forwards a step -- the base over every row, and
+        each teacher over the 2/3 of rows that are NOT its own task. The on-task
+        pass already ran in :meth:`compute_teacher_log_probs` and is reused
+        through the same cache rather than repeated.
+
+        Writes two columns:
+
+        ``sign_cache_ids``  (bs, 1 + n_off) int64. Column 0 is the base policy;
+            columns 1.. are the row's off-task teachers in sorted task order. The
+            actor reads them positionally, so the layout has to be a function of
+            the row's own task and nothing else.
+        ``sign_off_tasks``  (bs, n_off) int64, the task id behind each of those
+            columns, in the same numbering as ``task_ids``. Only the diagnostics
+            need it -- the weights themselves do not care which teacher is which
+            -- but the pairwise agreement rates are the cheapest form of the
+            transferability matrix and they cannot be built without it.
+        """
+        if not self.sign_weight_enabled:
+            return
+
+        task_names = batch.non_tensor_batch.get("task_name", None)
+        assert task_names is not None, "sign weighting requires task_name for on/off-task routing"
+        normalized = [self._normalize_task_name(t) for t in task_names]
+        bs = len(normalized)
+        task_order = sorted(self.teacher_wg.keys())
+        n_off = len(task_order) - 1
+
+        # Same numbering the actor sees on task_ids, taken from the column rather
+        # than rebuilt: _attach_task_ids numbers the tasks PRESENT in the batch, so
+        # deriving it here from the teacher list would drift the moment a task is
+        # missing from a step.
+        id_names = batch.meta_info.get("task_id_names", None)
+        assert id_names is not None, "sign weighting reads task_id_names; call _attach_task_ids first"
+        task_id_of = {name: i for i, name in enumerate(id_names)}
+
+        column_of = {}
+        for own in task_order:
+            for c, other in enumerate([t for t in task_order if t != own]):
+                column_of[(own, other)] = 1 + c
+
+        sign_cache_ids = torch.full((bs, 1 + n_off), -1, dtype=torch.long)
+        off_tasks = torch.full((bs, n_off), -1, dtype=torch.long)
+        for i, own in enumerate(normalized):
+            for c, other in enumerate([t for t in task_order if t != own]):
+                off_tasks[i, c] = task_id_of.get(other, -1)
+
+        # Only what the forward reads. The batch at this point also carries the
+        # rollout's own columns, and every one of them would be shipped to the
+        # worker and padded with it.
+        lean = batch.select(
+            batch_keys=["responses", "input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=[],
+        )
+
+        def _cache(wg, idxs, column_for):
+            ids = torch.empty(len(idxs), dtype=torch.long)
+            for j, i in enumerate(idxs):
+                self._teacher_cache_counter += 1
+                ids[j] = self._teacher_cache_counter
+                sign_cache_ids[i, column_for(i)] = self._teacher_cache_counter
+            self._teacher_call(wg, lean.select_idxs(idxs), topk=True, cache_ids=ids)
+
+        gpu_profiler.push_phase("sign_weight_forward/base")
+        try:
+            _cache(self.base_wg, list(range(bs)), lambda i: 0)
+        finally:
+            gpu_profiler.pop_phase("sign_weight_forward/base")
+
+        for task in task_order:
+            idxs = [i for i, t in enumerate(normalized) if t != task]
+            if not idxs:
+                continue
+            gpu_profiler.push_phase(f"sign_weight_forward/{task}")
+            try:
+                _cache(self.teacher_wg[task], idxs, lambda i, m=task: column_of[(normalized[i], m)])
+            finally:
+                gpu_profiler.pop_phase(f"sign_weight_forward/{task}")
+
+        assert bool((sign_cache_ids >= 0).all()), "a row was left without one of its four models"
+        batch.batch["sign_cache_ids"] = sign_cache_ids
+        batch.batch["sign_off_tasks"] = off_tasks
+
+    # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
     # No old_log_prob / ref / values / advantage / reward-in-loss.
     # ------------------------------------------------------------------ #
@@ -759,6 +854,20 @@ class OPDRayTrainer(RayPPOTrainer):
                             metrics=metrics,
                         )
 
+                    # tag rows with their task so the actor can split its metrics.
+                    # Before the sign-weight pass rather than after: that pass files
+                    # its off-task planes under these ids, and rebuilding the
+                    # numbering separately would drift from this one.
+                    self._attach_task_ids(batch)
+
+                    # ---- Cross-teacher sign agreement (no-op unless enabled) ---- #
+                    # The weights themselves are built in the actor, where the
+                    # student's top-k exists; this only puts the other three models
+                    # into the same cache the on-task teacher is already in.
+                    if self.sign_weight_enabled:
+                        with _timer("sign_weight_forward", timing_raw):
+                            self.compute_sign_weight_cache(batch)
+
                     if self.student_indexed_topk:
                         # After the misses are scored, not before: the cache is only
                         # complete now. The witness confirms every entry still
@@ -767,9 +876,6 @@ class OPDRayTrainer(RayPPOTrainer):
                         # per process, so asking all three teachers would check the
                         # same entries three times.
                         next(iter(self.teacher_wg.values())).check_teacher_hidden_cache()
-
-                    # tag rows with their task so the actor can split its metrics
-                    self._attach_task_ids(batch)
 
                     with _timer("update_actor", timing_raw):
                         # update_policy scales the student logits by this temperature to
