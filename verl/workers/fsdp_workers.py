@@ -39,6 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.metric.memory import per_rank_memory_metrics
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -691,8 +692,13 @@ class ActorRolloutRefWorker(Worker):
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            # Every rank's, not just this one's: DataProto.concat keeps meta_info
+            # from the first worker, so a bare max_memory_allocated() here reaches
+            # wandb as rank 0's number under a name that reads like a reduction.
+            # The ranks are meant to match -- shard_grad_op replicates parameters
+            # and _balance_batch equalises rows and tokens -- so a spread is a
+            # finding, and it was invisible.
+            metrics.update(per_rank_memory_metrics(get_torch_device()))
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
