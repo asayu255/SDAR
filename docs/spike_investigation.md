@@ -504,23 +504,12 @@ gen-2 の掃引コストは追跡オブジェクト数にほぼ比例する。�
    2000000    4004811      468.3 ms      0.117
 ```
 
-**約 0.12 µs / object、きれいに線形。** つまり 0.7 秒の掃引には
-**約 580 万個**の追跡オブジェクトが要る。
-
-これが唯一の未測定量である。actor worker のヒープが 500 万個規模なら
-gen-2 GC で確定、10 万個規模なら掃引は 12 ms にしかならず
-**0.6〜0.8 秒のスパイクにはなり得ない**ので候補から落ち、
-allocator が残る。
-
-**その数字は次の run の起動時に出る。** `verl/utils/host_gc.py` の
-`freeze_permanent_heap()` が `gc.get_freeze_count()` を印字する:
-
-```
-[host-gc] rank 0: froze 5842113 objects (1204 collected, manual=False) in 0.83 s
-```
-
-`froze` × 0.12 µs が、1 回の gen-2 掃引から取り除かれるコストである。
-学習が始まる前に出るので、GPU を 1 step も回さずに決着する。
+**約 0.12 µs / object、きれいに線形。** ——ただし**この合成ヒープの数字は
+実機に当てはめてはいけなかった**。下の 8.7 で実測が出て 3.2 倍ずれていた。
+合成ヒープは同型の小さい dict / list ばかりで、実機は torch の module /
+tensor / weakref が並び、`tp_traverse` の重さもメモリ局所性も違う。
+**必要なのは実ヒープでの実測**であり、それは `freeze_permanent_heap()` が
+起動時に印字する。学習が始まる前に出るので GPU を 1 step も回さずに決着する。
 
 ### 8.5 打ち手（診断と修正が同じ 1 回の run になる）
 
@@ -542,9 +531,12 @@ allocator が残る。
 
 | 観測 | 結論 |
 | --- | --- |
-| `gc_gen2` → 0、solo excursion も消える | **gen-2 GC で確定、かつ修正済み** |
-| `gc_gen2` → 0、excursion は残る | gen-2 GC を棄却。allocator へ（`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`） |
-| `froze` が 10 万オーダー | 走らせるまでもなく gen-2 GC は棄却 |
+| solo excursion が消える | **gen-2 GC で確定、かつ修正済み** |
+| excursion は残る | gen-2 GC を棄却。allocator へ（`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`） |
+
+`stall/gc_gen2` は freeze 後も 0 にはならない —— 掃引は依然として走り、
+走査対象が恒久世代の分だけ減るだけである。**見るべきは回数ではなく
+excursion の有無。**
 
 ### 8.6 現時点の正直な要約
 
@@ -560,3 +552,37 @@ ambient 0.58% / discrete 0.32%（うち solo 0.13%）で、
 **大きいのは ambient の方**であり、それは `actor.bwd` に住んでいる
 （`actor.bwd` の損失 20.9 秒のうち excursion 由来は 0.4 秒だけ）。
 スパイクを完全に消しても 100% には届かない。
+
+### 8.7 実測（1 回目の起動、run 開始前）
+
+```
+[host-gc] rank 0: froze 1090474 objects (10 collected, manual=False) in 0.42 s
+[host-gc] rank 1: froze 1090403 objects (10 collected, manual=False) in 0.43 s
+[host-gc] rank 2: froze 1090446 objects (10 collected, manual=False) in 0.43 s
+```
+
+**約 109 万オブジェクト、3 rank で一致**（同じシャードを持つので当然）。
+そしてこの行にはもう一つ、より重要な数字が入っている: **`in 0.42 s`**。
+これは `gc.collect()`（引数なし = 世代 2 の full collection）を
+**実ヒープに対して**走らせた実測値である。
+
+| | オブジェクト数 | 1 掃引 | µs/object |
+| --- | --- | --- | --- |
+| 合成（8.4 の表） | 1.09 M 相当 | 0.13 s | 0.123 |
+| **実機（この行）** | **1.09 M** | **0.42 s** | **0.388** |
+
+**合成の見積もりは 3.2 倍甘かった。** 0.123 µs/object のまま当てはめれば
+109 万 → 0.13 秒で「0.6〜0.8 秒には足りない、棄却」と読んでいた。
+実測は 0.42 秒で、**帯のすぐ下**である。
+
+しかもこの 0.42 秒は**起動直後**、activation も autograd グラフも
+バッチの Python オブジェクトもまだ無い状態のヒープに対する値である。
+学習中の追跡集合はこれより**大きい**。
+
+結論: **gen-2 GC は棄却されない。0.6〜0.8 秒を出すだけの規模がある。**
+8.3 の発生率（9/9 rank-step）と合わせて、候補 2 つのうち gen-2 GC が
+規模でも率でも条件を満たし、allocator は率で落ちている。
+
+確定ではない —— 「規模が足りる」は「それが原因である」ではない。
+決着は同じ run が付ける: freeze は 109 万個を以後すべての掃引から外すので、
+**solo excursion が消えれば確定、残れば棄却**である。
