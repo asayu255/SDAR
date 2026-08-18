@@ -36,7 +36,7 @@ import pytest
 def _fresh(monkeypatch, **env):
     for key in ("ACTOR_NSYS_MICRO", "ACTOR_NSYS_SKIP", "ACTOR_NSYS_TRACE",
                 "ACTOR_TORCH_MICRO", "ACTOR_TORCH_SKIP", "ACTOR_TORCH_DIR",
-                "ACTOR_STALL_FACTOR", "ACTOR_STALL_MIN_MS"):
+                "ACTOR_STALL_FACTOR", "ACTOR_STALL_MIN_MS", "ACTOR_STALL_DIR"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -702,3 +702,45 @@ def test_the_first_step_does_not_claim_the_boundary_was_free(monkeypatch, capsys
     lines = [l for l in capsys.readouterr().out.splitlines() if "[step-gpu]" in l]
     assert "before-step n/a" in lines[0]
     assert "before-step n/a" not in lines[1]     # and only the first
+
+
+def test_every_line_also_reaches_a_per_rank_file(monkeypatch, tmp_path, capsys):
+    """The console loses two ranks of three.
+
+    Ray's log dedup matches on the message with numbers substituted, so the three
+    ranks' [step-gpu] lines are one pattern to it: it prints one and collapses the
+    others into "[repeated 2x across cluster]". Comparing ranks is the entire
+    point of the instrument, so it cannot depend on RAY_DEDUP_LOGS being
+    remembered on a command line.
+    """
+    mod = _fresh(monkeypatch, ACTOR_STALL_DIR=str(tmp_path))
+    timings = [1000] * 20
+    timings[15] = 6000
+    _Calls(cuda=True, rank=2, timings=timings).install(monkeypatch, mod)
+
+    mod.new_step()
+    for _ in mod.iter_micro_batches(range(20)):
+        pass
+    mod.new_step()
+
+    written = list(tmp_path.glob("rank2_pid*.log"))
+    assert len(written) == 1, list(tmp_path.iterdir())
+    body = written[0].read_text()
+    assert "[stall] rank 2 micro 15" in body
+    assert "[step-gpu] rank 2 step 0" in body
+    # and the console still gets them, so nothing has to be tailed to notice
+    out = capsys.readouterr().out
+    assert "[stall] rank 2 micro 15" in out
+
+
+def test_an_unwritable_log_directory_does_not_take_the_run_down(monkeypatch, tmp_path, capsys):
+    mod = _fresh(monkeypatch, ACTOR_STALL_DIR=str(tmp_path / "f" / "nope"))
+    (tmp_path / "f").write_text("not a directory")
+    _Calls(cuda=True, timings=[1000] * 12).install(monkeypatch, mod)
+
+    mod.new_step()
+    items = list(mod.iter_micro_batches(range(12)))
+    mod.new_step()
+
+    assert items == list(enumerate(range(12)))
+    assert "[step-gpu]" in capsys.readouterr().out      # console still works

@@ -169,6 +169,28 @@ set -x
 # out of band -- but the rollout is still constructed on every rank, so the
 # assert fires at init_model, before the first step.
 #
+# A MEASUREMENT RUN IS NOT THE BARE SCRIPT. Three of this file's defaults are
+# production defaults, and each one silently changes what a measurement means.
+# Copy this whole block rather than the parts you remember:
+#
+#   bash examples/sft_trainer/run_multitask_sft_qwen3.sh \
+#     ++algorithm.sft.data_dir=$HOME/data/verl-agent/sdar_multitask/teacher_traj_probe \
+#     ++actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=20 \
+#     ++trainer.resume_mode=disable
+#
+#   data_dir            the default is the full pool: 339.5 GiB read to keep
+#                       139.2 GiB, on every start. The probe pool is the same
+#                       phenomenon (the dips were first seen on it) at a
+#                       fraction of the startup.
+#   micro_batch_size    the default 10 measures MFU 0.292; 20 measures 0.317,
+#                       and 20 is the maximum (ppo_mini_batch_size 60 over 3
+#                       ranks is 20 rows). Comparing a run at 10 against a
+#                       remembered number at 20 is comparing nothing.
+#   resume_mode         the config default is auto, so a stale global_step_N in
+#                       trainer.default_local_dir is picked up silently: the run
+#                       starts mid-training, replays N draws (~2 s each), and the
+#                       first step's timings carry the replay.
+#
 # THE STALL WATCH IS ON BY DEFAULT and needs nothing set. It times every
 # micro-batch of every step on every rank with two CUDA events, reads them back
 # only once they have completed (query(), never synchronize, so it cannot create
@@ -200,6 +222,15 @@ set -x
 # both, and splits the idle into the three places it can come from. Tune with
 # ACTOR_STALL_FACTOR (default 3.0, x the running median) and ACTOR_STALL_MIN_MS
 # (default 500); ACTOR_STALL_FACTOR=0 turns it off.
+#
+# Every line also goes to ACTOR_STALL_DIR/rank<N>_pid<P>.log (default
+# /tmp/actor_stall), because the console shows one rank of three: Ray's log dedup
+# matches the message with its numbers substituted, so the three ranks' lines are
+# one pattern to it and two are collapsed into "[repeated 2x across cluster]".
+# Comparing ranks is the point, so read the files:
+#
+#   tail -f /tmp/actor_stall/rank*.log
+#   grep -h "^\[step-gpu\]" /tmp/actor_stall/rank*.log | sort -t' ' -k5 -n
 #
 # This is the instrument for the dips, and the capture backends below are not.
 # The dips are five events in 68 minutes at unpredictable positions inside their

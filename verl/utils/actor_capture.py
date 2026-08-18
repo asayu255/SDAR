@@ -119,6 +119,13 @@ _NSYS_TRACE = os.environ.get("ACTOR_NSYS_TRACE", "cuda,cudnn,cublas,nvtx,osrt").
 # CUDA event records per micro-batch is a few microseconds against a ~1 s body.
 _STALL_FACTOR = float(os.environ.get("ACTOR_STALL_FACTOR", "3.0") or 0)
 _STALL_MIN_MS = float(os.environ.get("ACTOR_STALL_MIN_MS", "500") or 0)
+# Every line also goes to a per-rank file, because the console loses two of the
+# three ranks. Ray's log dedup matches on the message with numbers substituted,
+# so "[step-gpu] rank 0 step 7: ..." and "[step-gpu] rank 1 step 7: ..." are one
+# pattern to it: it prints one and collapses the rest to "[repeated 2x across
+# cluster]". Comparing ranks is the entire point of this instrument, so it cannot
+# depend on RAY_DEDUP_LOGS being remembered on the command line.
+_STALL_DIR = os.environ.get("ACTOR_STALL_DIR", "/tmp/actor_stall")
 
 _TORCH_MICRO = _int_env("ACTOR_TORCH_MICRO", 0)
 _TORCH_SKIP = _int_env("ACTOR_TORCH_SKIP", 40)
@@ -268,6 +275,7 @@ class _StallWatch:
 
     def __init__(self, device_module):
         self._cuda = device_module
+        self._log = self._open_log()
         self._pending = []            # (counter, kind, start_ev, end_ev, host_start, host_end)
         self._recent = []             # completed gpu_ms, for the median
         # Gaps are not one population. The gap before the first micro-batch of a
@@ -311,14 +319,35 @@ class _StallWatch:
             idle = a["step"] + a["mini"] + a["interior"]
             span = a["gpu"] + idle
             before_step = "n/a" if a["partial"] else f"{a['step'] / 1e3:.2f}"
-            print(f"[step-gpu] rank {_rank()} step {self._step}: {a['n']} micro-batches, "
-                  f"busy {a['gpu'] / 1e3:.1f} s, idle {idle / 1e3:.2f} s "
-                  f"(before-step {before_step}, before-mini {a['mini'] / 1e3:.2f}, "
-                  f"interior {a['interior'] / 1e3:.2f}) = {100 * idle / span:.2f}% of "
-                  f"{span / 1e3:.1f} s", flush=True)
+            self._say(
+                f"[step-gpu] rank {_rank()} step {self._step}: {a['n']} micro-batches, "
+                f"busy {a['gpu'] / 1e3:.1f} s, idle {idle / 1e3:.2f} s "
+                f"(before-step {before_step}, before-mini {a['mini'] / 1e3:.2f}, "
+                f"interior {a['interior'] / 1e3:.2f}) = {100 * idle / span:.2f}% of "
+                f"{span / 1e3:.1f} s")
         self._reset_acc()
         self._step += 1
         self._new_step = True
+
+    @staticmethod
+    def _open_log():
+        try:
+            os.makedirs(_STALL_DIR, exist_ok=True)
+            path = os.path.join(_STALL_DIR, f"rank{_rank()}_pid{os.getpid()}.log")
+            handle = open(path, "a", buffering=1)      # line-buffered: readable live
+            print(f"[stall-watch] rank {_rank()} logging to {path}", flush=True)
+            return handle
+        except OSError as exc:      # a diagnostic must never take the run down
+            print(f"[stall-watch] no file log: {exc!r}", flush=True)
+            return None
+
+    def _say(self, line):
+        print(line, flush=True)
+        if self._log is not None:
+            try:
+                self._log.write(line + "\n")
+            except (OSError, ValueError):
+                self._log = None
 
     @staticmethod
     def _median(values):
@@ -382,13 +411,13 @@ class _StallWatch:
         if not (slow or gapped):
             return
         self._reported += 1
-        print(f"[stall] rank {_rank()} micro {counter} at {at:.3f}: "
-              f"gpu {gpu_ms:.0f} ms (median {median:.0f}), "
-              f"gap/{kind} {gap_ms:.0f} ms (median {median_gap:.0f}), "
-              f"host {host_ms:.0f} ms -> "
-              f"{'BEFORE this micro-batch' if gapped else 'inside the micro-batch'}, "
-              f"{'host blocked too' if host_ms > 0.8 * gpu_ms else 'host ran ahead'}",
-              flush=True)
+        self._say(
+            f"[stall] rank {_rank()} micro {counter} at {at:.3f}: "
+            f"gpu {gpu_ms:.0f} ms (median {median:.0f}), "
+            f"gap/{kind} {gap_ms:.0f} ms (median {median_gap:.0f}), "
+            f"host {host_ms:.0f} ms -> "
+            f"{'BEFORE this micro-batch' if gapped else 'inside the micro-batch'}, "
+            f"{'host blocked too' if host_ms > 0.8 * gpu_ms else 'host ran ahead'}")
 
 
 def new_step():
