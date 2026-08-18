@@ -178,10 +178,26 @@ set -x
 #   [stall] rank 1 micro 812 at 1787038…: gpu 5900 ms (median 1010),
 #           gap 12 ms (median 3), host 40 ms -> inside the micro-batch, host ran ahead
 #
-# gap vs gpu says whether the device was idle BETWEEN micro-batches (the
-# optimizer step, the gradient reduce, the next batch's H2D) or slow inside one.
-# host vs gpu says whether the host was blocked too, which is the difference
-# between something upstream of the device and a collective wait. Tune with
+# gap vs gpu says whether the device was idle BEFORE the micro-batch or slow
+# inside it, and gap/<kind> says which of the three places the idle came from:
+# gap/step spans two update_policy calls (the return to the driver, its logging,
+# the next batch's dispatch and H2D), gap/mini holds the gradient reduce and the
+# optimizer step, gap/interior is between two micro-batches of one mini-batch.
+# Each is judged only against its own kind -- they differ by construction and
+# happen on a fixed schedule, so one shared threshold reports the boundary every
+# step and buries the events that matter. host vs gpu says whether the host was
+# blocked too, which is the difference between something upstream of the device
+# and a collective wait.
+#
+# It also prints one line per step whatever happens:
+#
+#   [step-gpu] rank 0 step 12: 66 micro-batches, busy 312.4 s, idle 4.81 s
+#              (before-step 1.52, before-mini 2.10, interior 1.19) = 1.52% of 317.2 s
+#
+# That is the half the outlier detector cannot do. An outlier needs the seconds
+# to be concentrated in one micro-batch; the same seconds spread thinly over
+# sixty-six of them cost exactly as much and trip nothing. The running total sees
+# both, and splits the idle into the three places it can come from. Tune with
 # ACTOR_STALL_FACTOR (default 3.0, x the running median) and ACTOR_STALL_MIN_MS
 # (default 500); ACTOR_STALL_FACTOR=0 turns it off.
 #

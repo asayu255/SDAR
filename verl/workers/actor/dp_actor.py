@@ -699,6 +699,13 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        # The stall watch measures the gap before each micro-batch, and the one
+        # that spans two update_policy calls is a different animal from the ones
+        # inside a step: it holds the return to the driver, its logging, and the
+        # next batch's dispatch and H2D. Told where the boundary is, it compares
+        # like with like instead of flagging that gap every step.
+        actor_capture.new_step()
+
         # A call that died between entering and leaving no_sync would leave the
         # flag off, and every later step would then silently skip its gradient
         # reduce. Cheap to make each call start from a known state.

@@ -501,8 +501,8 @@ def test_a_gap_between_micro_batches_is_told_apart_from_a_slow_one(monkeypatch, 
 
     out = [line for line in capsys.readouterr().out.splitlines() if "[stall]" in line]
     assert len(out) == 1, out
-    assert "gap 4000 ms" in out[0]
-    assert "BETWEEN micro-batches" in out[0]
+    assert "gap/interior 4000 ms" in out[0]
+    assert "BEFORE this micro-batch" in out[0]
 
 
 def test_it_says_whether_the_host_was_blocked_too(monkeypatch, capsys):
@@ -562,3 +562,124 @@ def test_the_watch_runs_even_with_a_capture_backend_on(monkeypatch, capsys, tmp_
         pass
 
     assert "[stall]" in capsys.readouterr().out
+
+
+def test_the_step_boundary_gap_is_not_reported_every_step(monkeypatch, capsys):
+    """The hole this had before new_step().
+
+    Gaps come from three structurally different places: inside a mini-batch,
+    between mini-batches (the gradient reduce and optimizer step), and between
+    steps (the return to the driver, its logging, the next batch's H2D). The
+    last two are larger by construction and happen on a fixed schedule, so one
+    shared median flags them every single time -- 300 lines a run with the five
+    events that matter buried in them.
+    """
+    mod = _fresh(monkeypatch)
+    # four "steps" of five micro-batches: a 900 ms boundary gap, then 1 ms ones
+    gaps, timings = [], []
+    for _ in range(8):
+        gaps += [900, 1, 1, 1, 1]
+        timings += [1000] * 5
+    _Calls(cuda=True, timings=timings, gaps=gaps).install(monkeypatch, mod)
+
+    for step in range(8):
+        mod.new_step()
+        for _ in mod.iter_micro_batches(range(5)):
+            pass
+
+    assert "[stall]" not in capsys.readouterr().out
+
+
+def test_a_step_boundary_that_is_slow_FOR_A_BOUNDARY_still_reports(monkeypatch, capsys):
+    """...and separating the populations must not blind it to a real one."""
+    mod = _fresh(monkeypatch)
+    gaps, timings = [], []
+    for step in range(12):
+        gaps += [12000 if step == 10 else 900, 1, 1, 1, 1]
+        timings += [1000] * 5
+    _Calls(cuda=True, timings=timings, gaps=gaps).install(monkeypatch, mod)
+
+    for step in range(12):
+        mod.new_step()
+        for _ in mod.iter_micro_batches(range(5)):
+            pass
+
+    out = [l for l in capsys.readouterr().out.splitlines() if "[stall]" in l]
+    assert len(out) == 1, out
+    assert "gap/step 12000 ms (median 900)" in out[0]
+    assert "BEFORE this micro-batch" in out[0]
+
+
+def test_the_gradient_reduce_gap_is_its_own_population_too(monkeypatch, capsys):
+    """With micro < mini there are two micro-batches per mini-batch, so every
+    other gap holds the optimizer step. Judged together they are bimodal and the
+    larger half is flagged forever."""
+    mod = _fresh(monkeypatch)
+    gaps, timings = [], []
+    for _ in range(20):
+        gaps += [700, 1]          # index 0 carries the reduce, index 1 does not
+        timings += [1000, 1000]
+    _Calls(cuda=True, timings=timings, gaps=gaps).install(monkeypatch, mod)
+
+    mod.new_step()
+    for _ in range(20):
+        for _ in mod.iter_micro_batches(range(2)):
+            pass
+
+    assert "[stall]" not in capsys.readouterr().out
+
+
+def test_new_step_is_free_when_nothing_is_watching(monkeypatch):
+    """dp_actor calls it unconditionally at the top of update_policy."""
+    mod = _fresh(monkeypatch, ACTOR_STALL_FACTOR="0")
+    mod.new_step()          # must not raise with no watch built
+
+
+def test_every_step_gets_a_summary_even_when_no_outlier_fires(monkeypatch, capsys):
+    """The other half of the instrument, and the one that survives a loss that is
+    not concentrated. An outlier detector needs the seconds to be in one
+    micro-batch; the same seconds spread over sixty-six are exactly as expensive
+    and trip nothing. The running total sees both, and splits the idle into the
+    three places it can come from."""
+    mod = _fresh(monkeypatch)
+    gaps, timings = [], []
+    for _ in range(3):
+        gaps += [500, 100, 100, 100]          # 0.5 s boundary + 0.3 s interior
+        timings += [1000] * 4
+    _Calls(cuda=True, timings=timings, gaps=gaps).install(monkeypatch, mod)
+
+    for _ in range(3):
+        mod.new_step()
+        for _ in mod.iter_micro_batches(range(4)):
+            pass
+    mod.new_step()                             # flushes the last step
+
+    lines = [l for l in capsys.readouterr().out.splitlines() if "[step-gpu]" in l]
+    assert len(lines) == 3, lines
+    assert "4 micro-batches" in lines[-1]
+    assert "busy 4.0 s" in lines[-1]
+    assert "idle 0.80 s" in lines[-1]                      # 500 + 3x100
+    assert "before-step 0.50" in lines[-1]
+    assert "interior 0.30" in lines[-1]
+    assert "16.67% of 4.8 s" in lines[-1]
+
+
+def test_a_loss_spread_over_every_micro_batch_shows_in_the_summary(monkeypatch, capsys):
+    """The case that defeats the outlier detector by construction: no single
+    micro-batch is anywhere near 3x the median, and the step still loses four
+    seconds."""
+    mod = _fresh(monkeypatch)
+    _Calls(cuda=True, timings=[1000] * 40,
+           gaps=[1] * 20 + [201] * 20).install(monkeypatch, mod)
+
+    for step in range(2):
+        mod.new_step()
+        for _ in mod.iter_micro_batches(range(20)):
+            pass
+    mod.new_step()
+
+    out = capsys.readouterr().out
+    assert "[stall]" not in out                            # nothing is an outlier
+    lines = [l for l in out.splitlines() if "[step-gpu]" in l]
+    assert "idle 0.02 s" in lines[0]                       # ...and the two steps
+    assert "idle 4.02 s" in lines[1]                       # are plainly different

@@ -268,11 +268,51 @@ class _StallWatch:
 
     def __init__(self, device_module):
         self._cuda = device_module
-        self._pending = []            # (counter, start_ev, end_ev, host_start, host_end)
+        self._pending = []            # (counter, kind, start_ev, end_ev, host_start, host_end)
         self._recent = []             # completed gpu_ms, for the median
-        self._recent_gap = []
+        # Gaps are not one population. The gap before the first micro-batch of a
+        # step contains everything between two update_policy calls -- the return
+        # to the driver, its logging, the next batch's dispatch and H2D -- and the
+        # gap before the first micro-batch of a mini-batch contains the gradient
+        # reduce and the optimizer step. Both are structurally larger than an
+        # interior gap and both happen on a fixed schedule, so judging them
+        # against one median flags them every single time: 300 lines a run, with
+        # the five events that matter buried in them.
+        self._recent_gap = {"step": [], "mini": [], "interior": []}
         self._prev_end = None         # to measure the gap across micro-batches
+        self._new_step = True
         self._reported = 0
+        self._step = 0
+        self._acc = None
+        self._reset_acc()
+
+    def _reset_acc(self):
+        self._acc = {"n": 0, "gpu": 0.0, "step": 0.0, "mini": 0.0, "interior": 0.0}
+
+    def new_step(self):
+        """Called once per update_policy.
+
+        Two jobs. The step-boundary gap gets judged against other step-boundary
+        gaps rather than against a forward. And the step that just ended gets a
+        one-line summary, which is the half of this the outlier detector cannot
+        do: an outlier needs the loss to be concentrated in one micro-batch, and
+        the same seconds spread thinly over sixty-six of them is invisible to it
+        while being exactly as expensive. The summary is a running total, so it
+        sees both.
+        """
+        self._drain()
+        if self._acc["n"]:
+            a = self._acc
+            idle = a["step"] + a["mini"] + a["interior"]
+            span = a["gpu"] + idle
+            print(f"[step-gpu] rank {_rank()} step {self._step}: {a['n']} micro-batches, "
+                  f"busy {a['gpu'] / 1e3:.1f} s, idle {idle / 1e3:.2f} s "
+                  f"(before-step {a['step'] / 1e3:.2f}, before-mini {a['mini'] / 1e3:.2f}, "
+                  f"interior {a['interior'] / 1e3:.2f}) = {100 * idle / span:.2f}% of "
+                  f"{span / 1e3:.1f} s", flush=True)
+        self._reset_acc()
+        self._step += 1
+        self._new_step = True
 
     @staticmethod
     def _median(values):
@@ -281,35 +321,40 @@ class _StallWatch:
         ordered = sorted(values)
         return ordered[len(ordered) // 2]
 
-    def open(self, counter):
+    def open(self, counter, index):
+        kind = "step" if self._new_step else ("mini" if index == 0 else "interior")
+        self._new_step = False
         event = self._cuda.Event(enable_timing=True)
         event.record()
-        return [counter, event, None, time.time(), None]
+        return [counter, kind, event, None, time.time(), None]
 
     def close(self, entry):
-        entry[2] = self._cuda.Event(enable_timing=True)
-        entry[2].record()
-        entry[4] = time.time()
+        entry[3] = self._cuda.Event(enable_timing=True)
+        entry[3].record()
+        entry[5] = time.time()
         self._pending.append(entry)
         self._drain()
 
     def _drain(self):
         """Read back whatever has finished. Never waits: an event that is not
         ready yet is simply left for the next micro-batch to pick up."""
-        while self._pending and self._pending[0][2].query():
-            counter, start_ev, end_ev, host_start, host_end = self._pending.pop(0)
+        while self._pending and self._pending[0][3].query():
+            counter, kind, start_ev, end_ev, host_start, host_end = self._pending.pop(0)
             gpu_ms = start_ev.elapsed_time(end_ev)
             gap_ms = self._prev_end.elapsed_time(start_ev) if self._prev_end is not None else 0.0
             self._prev_end = end_ev
-            self._judge(counter, gpu_ms, gap_ms, (host_end - host_start) * 1e3, host_end)
+            self._judge(counter, kind, gpu_ms, gap_ms, (host_end - host_start) * 1e3, host_end)
+            self._acc["n"] += 1
+            self._acc["gpu"] += gpu_ms
+            self._acc[kind] += gap_ms
             self._recent.append(gpu_ms)
-            self._recent_gap.append(gap_ms)
+            self._recent_gap[kind].append(gap_ms)
             del self._recent[: -self._KEEP]
-            del self._recent_gap[: -self._KEEP]
+            del self._recent_gap[kind][: -self._KEEP]
 
     _WARMUP = 8         # micro-batches to establish a baseline before judging
 
-    def _judge(self, counter, gpu_ms, gap_ms, host_ms, at):
+    def _judge(self, counter, kind, gpu_ms, gap_ms, host_ms, at):
         # The first micro-batches of a run are all outliers -- allocator growth,
         # cudnn autotune, the first all-gather -- and reporting them buries the
         # rare mid-run event this exists to catch under startup noise.
@@ -320,19 +365,35 @@ class _StallWatch:
         # and a number baked in for one arm is a number that silently reports
         # everything or nothing on the next.
         median = self._median(self._recent)
-        median_gap = self._median(self._recent_gap)
+        peers = self._recent_gap[kind]
+        median_gap = self._median(peers)
         slow = median and gpu_ms > _STALL_FACTOR * median and gpu_ms - median > _STALL_MIN_MS
-        gapped = gap_ms > _STALL_MIN_MS and (not median_gap or gap_ms > _STALL_FACTOR * median_gap)
+        # A step-boundary gap is compared with other step-boundary gaps, and only
+        # once there are enough of them to have a baseline -- otherwise the first
+        # of each kind is reported for being the first of its kind.
+        gapped = (len(peers) >= self._WARMUP and gap_ms > _STALL_FACTOR * median_gap
+                  and gap_ms - median_gap > _STALL_MIN_MS)
         if not (slow or gapped):
             return
         self._reported += 1
         print(f"[stall] rank {_rank()} micro {counter} at {at:.3f}: "
               f"gpu {gpu_ms:.0f} ms (median {median:.0f}), "
-              f"gap {gap_ms:.0f} ms (median {median_gap:.0f}), "
+              f"gap/{kind} {gap_ms:.0f} ms (median {median_gap:.0f}), "
               f"host {host_ms:.0f} ms -> "
-              f"{'BETWEEN micro-batches' if gapped else 'inside the micro-batch'}, "
+              f"{'BEFORE this micro-batch' if gapped else 'inside the micro-batch'}, "
               f"{'host blocked too' if host_ms > 0.8 * gpu_ms else 'host ran ahead'}",
               flush=True)
+
+
+def new_step():
+    """Tell the watch a new update_policy has begun.
+
+    Free and safe to call when nothing is watching; without it the gap that
+    spans two steps is judged against the gaps inside one, which flags it every
+    step for being structurally larger.
+    """
+    if _watch is not None:
+        _watch.new_step()
 
 
 def _watch_for(module):
@@ -402,7 +463,7 @@ def micro_batch(index: int):
     started_at = _seen
     _seen += 1
     label = f"micro/{started_at}/{index}"
-    entry = _watch_for(torch).open(started_at) if watching else None
+    entry = _watch_for(torch).open(started_at, index) if watching else None
     if _nsys_running:
         torch.cuda.nvtx.range_push(label)
     try:
