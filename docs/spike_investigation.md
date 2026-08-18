@@ -598,3 +598,43 @@ ambient 0.58% / discrete 0.32%（うち solo 0.13%）で、
 確定ではない —— 「規模が足りる」は「それが原因である」ではない。
 決着は同じ run が付ける: freeze は 109 万個を以後すべての掃引から外すので、
 **solo excursion が消えれば確定、残れば棄却**である。
+
+---
+
+## 9. 除去策 —— どの機構をどの層が塞ぐか
+
+8 節の 4 制約（rank ごと独立 / ホストが投入を止めている / forward の途中 /
+コストほぼ固定）に合うのは「ホストを止める固定コストの操作」であり、
+この調査で挙がったそのクラスの機構は gen-2 GC・allocator 成長・
+再コンパイル（棄却済み）の 3 つ。除去は 1 つに賭けず、層で塞ぐ。
+**すべて既定オンで、`BALANCE_MINIBATCH=1` だけ明示が要る。**
+
+| 層 | 塞ぐもの | 状態 |
+| --- | --- | --- |
+| init 直後の freeze（`ACTOR_GC_FREEZE=1`） | 109 万個・実測 0.42 s の掃引本体。恒久オブジェクトを全掃引の対象から外す | 済み |
+| step 0 完了後の re-freeze（`ACTOR_GC_REFREEZE_STEP=1`） | warm-up 中に生まれる恒久物 —— Dynamo の guard/キャッシュ、Adam が初回 step で遅延確保する状態、FSDP の遅延構築物。init freeze は実行前なので見えない。カウンタの初回読みは仕様上 0 を返すため `dynamo_graphs=0` は step 0 のコンパイルを否定しない —— だからここも凍らせる | 今回 |
+| 毎 step 境界の collect（`ACTOR_GC_BOUNDARY_COLLECT=1`、自動 GC は残す） | 生存オブジェクトの pending を毎 step 排水し、CPython の自動 full collection（pending > 最古世代の 25%）が **forward の最中に**発火する条件を潰す。freeze 後の 1 掃引は ms 級で、before-step の実測 idle 0.24〜0.71 s の中で走るので無料 | 今回 |
+| cu_seqlens 手渡し（`ACTOR_PASS_CU_SEQLENS=1`） | forward の同期点 ~80 箇所/micro。同期点が減れば launch queue が深く保たれ、残る短いホスト停止はデバイスに映らない | 済み |
+| `BALANCE_MINIBATCH=1`（要明示） | 記録更新級 micro-batch（per-micro 最大 36k→18k トークン）。allocator 成長イベント（rank1 の 62 回 cudaMalloc の型）の発生源そのもの | 済み |
+| `ACTOR_GC_MANUAL=1`（既定オフ） | 上記でも残る場合の最終手段: 自動回収を切り境界掃引だけにする。ヒープ成長リスクがあるので測ってから | 実装済み・待機 |
+
+`ACTOR_GC_FREEZE=0` で GC の 3 層がまとめて素の挙動に戻る（A/B は 1 フラグ）。
+
+### 判定と、その先
+
+判定は **solo excursion の有無**で行う。`stall/gc_gen2` は 0 にならず、
+むしろ**増え得る**: freeze で最古世代の母数が減るぶん 25% 則が早く発火する。
+回数が増えて 1 回が 0.4 秒 → 数 ms になるのが成功であり、カウンタだけ見ると
+失敗に見える。
+
+この全層を通してなお 0.6〜0.8 秒の solo excursion が残るなら、gen-2 GC は
+棄却で、候補は allocator に戻る。その本命
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` は vLLM の CuMemAllocator
+が assert で拒否する（スクリプトヘッダ参照、pytorch/pytorch#147851）ので、
+道は 2 つ: 起動時にプールを峰まで温める warm-up パスを足すか、この arm では
+そもそも使われない rollout の構築をやめて expandable_segments を解禁するか
+（`val_before_train=False`・`test_freq=-1` なので run 中 vLLM は一度も推論
+しない —— 検証は別プロセス）。
+
+なおこのパッケージが対象にしたのはスパイク（0.13%）である。より大きい
+**ambient 0.58% は `actor.bwd` に住んでいて、手つかず**のまま残っている。

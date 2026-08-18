@@ -40,7 +40,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
-from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap
+from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.metric.stall_counters import per_rank_stall_counter_metrics
 from verl.workers.actor.dp_actor import _actor_phase
 from verl.utils.fsdp_utils import (
@@ -704,10 +704,22 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        # The step boundary is the one place in the step where this rank's device
-        # is idle by construction (measured: 0.24-0.71 s of before-step), so a
-        # sweep placed here costs nothing that was not already lost. A no-op
-        # unless ACTOR_GC_MANUAL turned the automatic collector off.
+        # Step boundary: the device is idle here by construction (before-step is
+        # a measured 0.24-0.71 s), so host-side GC work is free. Freeze once more
+        # to capture what the warm-up step created and keeps -- Dynamo caches,
+        # Adam's lazily allocated state, FSDP's deferred structures, all of it
+        # invisible to the init-time freeze -- then the per-step sweep, which
+        # after the freezes costs milliseconds and drains the survivor count
+        # that would otherwise trip a full collection mid-forward, where it
+        # lands on the device. See verl/utils/host_gc.py.
+        refrozen = refreeze_if_due()
+        if refrozen is not None:
+            print(
+                f"[host-gc] rank {self.rank}: re-froze +{refrozen['frozen_delta']} warm-up objects "
+                f"(total {refrozen['frozen_total']}, {refrozen['collected']} collected) "
+                f"in {refrozen['seconds']:.2f} s",
+                flush=True,
+            )
         collect_at_step_boundary()
 
         # Support all hardwares.

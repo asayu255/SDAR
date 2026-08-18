@@ -194,7 +194,25 @@ set -x
 # and X * 0.12 us (measured cost per tracked object) is the sweep cost removed
 # -- which is also the number that decides whether gen-2 GC could have been the
 # cause at all. ACTOR_GC_FREEZE=0 restores stock behaviour exactly, so the pair
-# is the A/B; stall/gc_gen2 is already logged per rank per step.
+# is the A/B; stall/gc_gen2 is already logged per rank per step. Do not expect
+# that counter to fall, though -- freezing empties what collections walk, it
+# does not stop them, and with the permanent set out of the oldest generation's
+# accounting CPython's 25%-pending rule can trip MORE often. Counter up, cost
+# per firing down from ~0.4 s to milliseconds, is the fix working.
+#
+# ACTOR_GC_REFREEZE_STEP=1 (the default) freezes once more at the boundary
+# after that many steps have completed. The init-time freeze runs before
+# anything has executed, so everything the warm-up step creates and keeps --
+# Dynamo's guards and caches, the state Adam allocates on its first step,
+# FSDP's deferred structures -- would otherwise sit in the ordinary
+# generations and re-inflate every later sweep. 0 disables the second freeze.
+#
+# ACTOR_GC_BOUNDARY_COLLECT=1 (the default) sweeps once per step at the
+# boundary, automatic collector left on. Post-freeze that sweep is
+# milliseconds, it runs inside the measured 0.24-0.71 s of before-step device
+# idle, and it drains the survivor count that trips CPython's automatic full
+# collection -- keeping gen-2 out of the middle of the forward, which is where
+# it lands on the device.
 #
 # ACTOR_GC_MANUAL=1 (off) additionally disables automatic collection and runs
 # one explicit sweep per step at the boundary, where before-step is 0.24-0.71 s

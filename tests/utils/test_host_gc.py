@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The gen-2 freeze: it must actually freeze, and it must be reversible.
+"""The gen-2 layers: they must actually act, once, and be reversible.
 
-Two things carry the weight. The freeze has to move the live set out of the
-collector's reach -- that is the whole mechanism, and a version that returns a
+Three things carry the weight. The freezes have to move the live set out of the
+collector's reach -- that is the whole mechanism, and a version returning a
 happy report without calling ``gc.freeze()`` would look identical in the log.
-And ``ACTOR_GC_FREEZE=0`` has to restore stock behaviour exactly, because that
-flag is the A/B that decides whether the solo excursions were this at all; if
-"off" still froze, the experiment could only ever confirm.
+The re-freeze has to fire exactly once, at the configured boundary, or it is
+either a leak amplifier (every step's transients frozen forever) or a no-op.
+And ``ACTOR_GC_FREEZE=0`` has to restore stock behaviour exactly -- all layers
+off together -- because that flag is the A/B that decides whether the solo
+excursions were this at all; if "off" still swept or froze, the experiment
+could only ever confirm.
 
 Every test unfreezes and re-enables in a finally, because these are process-wide
 interpreter settings and leaking them would silently change how every later test
@@ -104,35 +107,35 @@ def test_manual_disables_the_automatic_collector(monkeypatch):
     assert not gc.isenabled()
 
 
-def test_manual_needs_the_freeze_to_be_on(monkeypatch):
-    """``ACTOR_GC_FREEZE=0 ACTOR_GC_MANUAL=1`` must not disable the collector.
-
-    Off means off. A combination that silently turned automatic collection off
-    while reporting the feature disabled would be the worst of both: no freeze,
-    no sweeps, and a heap that grows until the step boundary.
+def test_freeze_off_disables_every_layer(monkeypatch):
+    """``ACTOR_GC_FREEZE=0`` must switch the whole package off, whatever the
+    other knobs say. Off means off: a combination that silently swept, froze,
+    or disabled the collector while reporting the feature disabled would make
+    the A/B able only to confirm.
     """
     monkeypatch.setenv("ACTOR_GC_FREEZE", "0")
     monkeypatch.setenv("ACTOR_GC_MANUAL", "1")
+    monkeypatch.setenv("ACTOR_GC_BOUNDARY_COLLECT", "1")
+    monkeypatch.setenv("ACTOR_GC_REFREEZE_STEP", "1")
     mod = _fresh()
 
+    gc.unfreeze()
     mod.freeze_permanent_heap()
 
     assert gc.isenabled()
     assert mod.collect_at_step_boundary() == 0.0
+    assert mod.refreeze_if_due() is None
+    assert mod.refreeze_if_due() is None
+    assert gc.get_freeze_count() == 0
 
 
-def test_boundary_collect_is_a_noop_under_automatic_collection(monkeypatch):
-    """With Python still collecting on its own schedule, a forced full sweep here
-    would be extra work, not relocated work."""
+def test_boundary_collect_runs_by_default(monkeypatch):
+    """The per-step sweep is part of the default package now: post-freeze it is
+    cheap, it runs in device-idle time, and draining the survivors is what keeps
+    the automatic full collection from firing mid-forward."""
     monkeypatch.delenv("ACTOR_GC_FREEZE", raising=False)
-    monkeypatch.setenv("ACTOR_GC_MANUAL", "0")
-    mod = _fresh()
-
-    assert mod.collect_at_step_boundary() == 0.0
-
-
-def test_boundary_collect_runs_when_manual(monkeypatch):
-    monkeypatch.setenv("ACTOR_GC_MANUAL", "1")
+    monkeypatch.delenv("ACTOR_GC_MANUAL", raising=False)
+    monkeypatch.delenv("ACTOR_GC_BOUNDARY_COLLECT", raising=False)
     mod = _fresh()
     mod.freeze_permanent_heap()
 
@@ -141,6 +144,77 @@ def test_boundary_collect_runs_when_manual(monkeypatch):
 
     assert elapsed >= 0.0
     assert gc.get_stats()[-1]["collections"] > before
+    assert gc.isenabled()
+
+
+def test_boundary_collect_has_an_off_switch(monkeypatch):
+    monkeypatch.setenv("ACTOR_GC_BOUNDARY_COLLECT", "0")
+    monkeypatch.delenv("ACTOR_GC_MANUAL", raising=False)
+    mod = _fresh()
+    mod.freeze_permanent_heap()
+
+    assert mod.collect_at_step_boundary() == 0.0
+
+
+def test_boundary_collect_ignores_the_off_switch_under_manual(monkeypatch):
+    """Manual mode turned the automatic collector off; the boundary sweep is its
+    replacement schedule and must run even when the default sweep is opted out,
+    or the heap never gets collected at all."""
+    monkeypatch.setenv("ACTOR_GC_MANUAL", "1")
+    monkeypatch.setenv("ACTOR_GC_BOUNDARY_COLLECT", "0")
+    mod = _fresh()
+    mod.freeze_permanent_heap()
+
+    before = gc.get_stats()[-1]["collections"]
+    elapsed = mod.collect_at_step_boundary()
+
+    assert elapsed >= 0.0
+    assert gc.get_stats()[-1]["collections"] > before
+
+
+def test_refreeze_fires_once_after_the_warmup_step(monkeypatch):
+    monkeypatch.delenv("ACTOR_GC_FREEZE", raising=False)
+    monkeypatch.delenv("ACTOR_GC_REFREEZE_STEP", raising=False)
+    mod = _fresh()
+    mod.freeze_permanent_heap()
+
+    # Lists, deliberately: the collector untracks dicts whose contents are all
+    # atomic, so 300 small dicts would vanish from the tracked set at the
+    # collect() inside the refreeze and the delta would read 1. Lists are never
+    # untracked, so these 300 are guaranteed to be what the second freeze takes.
+    born_in_step_zero = [[index] for index in range(300)]
+
+    assert mod.refreeze_if_due() is None            # boundary before step 0
+
+    report = mod.refreeze_if_due()                  # boundary before step 1
+    assert report is not None
+    assert report["frozen_delta"] >= 300            # the warm-up objects went in
+    assert report["frozen_total"] == gc.get_freeze_count()
+
+    assert mod.refreeze_if_due() is None            # once, and never again
+    assert mod.refreeze_if_due() is None
+    del born_in_step_zero
+
+
+def test_refreeze_step_is_configurable(monkeypatch):
+    monkeypatch.setenv("ACTOR_GC_REFREEZE_STEP", "3")
+    mod = _fresh()
+    mod.freeze_permanent_heap()
+
+    assert mod.refreeze_if_due() is None            # 0 steps completed
+    assert mod.refreeze_if_due() is None            # 1
+    assert mod.refreeze_if_due() is None            # 2
+    assert mod.refreeze_if_due() is not None        # 3 completed -> fire
+    assert mod.refreeze_if_due() is None
+
+
+def test_refreeze_zero_disables_the_second_freeze(monkeypatch):
+    monkeypatch.setenv("ACTOR_GC_REFREEZE_STEP", "0")
+    mod = _fresh()
+    mod.freeze_permanent_heap()
+
+    for _ in range(5):
+        assert mod.refreeze_if_due() is None
 
 
 def test_frozen_cycles_survive_a_collection(monkeypatch):
