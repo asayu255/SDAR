@@ -340,3 +340,40 @@ def test_the_op_the_shapes_come_from_is_selectable(tmp_path):
 
     assert summary.analyse(path)[0]["shape"] == [[151936, 2048], [1, 9800]]
     assert summary.analyse(path, shapes_of=("aten::linear",))[0]["shape"] is None
+
+
+def test_the_optimizer_tail_is_carry_not_idle(tmp_path):
+    """The artifact that produced this tool's one wrong conclusion.
+
+    The optimizer step is launched between two micro-batch annotations and its
+    kernels execute into the next window's head while the host sits at the first
+    sync point (unpad's nonzero). The device is fully busy; only the launch-based
+    attribution called it idle. It must land in carry, the true idle must exclude
+    it, and the biggest-gap table must not report the head.
+    """
+    events = [
+        _micro(40, 0, 1000),
+        _launch(100, correlation=1),
+        _kernel("gemm", 150, 800, correlation=1),
+        # optimizer, launched AFTER window 40 closes and BEFORE 41 opens...
+        _launch(1005, correlation=2),
+        _kernel("adam_fused", 1050, 80, correlation=2),
+        # ...still running when window 41 opens at 1100 (carry until 1130)
+        _micro(41, 1100, 1000),
+        _op("aten::nonzero", 1105, 30),           # host blocked behind the tail
+        _launch(1135, correlation=3),
+        _kernel("gemm", 1140, 900, correlation=3),
+        # and a real 60 us hole later in the window: 2040 -> 2100
+        _launch(2035, correlation=4),
+        _kernel("gemm_late", 2060, 40, correlation=4),
+    ]
+    rows = {r["micro"]: r for r in summary.analyse(_write(tmp_path, 0, events))}
+
+    r41 = rows[41]
+    assert r41["kernels"] == 2                       # ownership unchanged
+    assert r41["carry_ms"] == 0.03                   # the tail: 1100 -> 1130
+    # idle excludes the tail: window is 1000, resident 30+900+40 = 970
+    assert abs(r41["idle_ms"] - 0.03) < 1e-6
+    # and the biggest gap is the real mid-window hole, not the head
+    assert r41["gap_at"] > 1130
+    assert r41["gap_bracket"][0] == "gemm"

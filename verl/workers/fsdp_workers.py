@@ -40,6 +40,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
+from verl.utils.metric.stall_counters import per_rank_stall_counter_metrics
 from verl.workers.actor.dp_actor import _actor_phase
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
@@ -730,6 +731,13 @@ class ActorRolloutRefWorker(Worker):
             # and _balance_batch equalises rows and tokens -- so a spread is a
             # finding, and it was invisible.
             metrics.update(per_rank_memory_metrics(get_torch_device()))
+            # The deep-dip discriminators: which of {cudaMalloc segment growth,
+            # gen-2 GC, dynamo recompile} fired on this rank during this step.
+            # Each is a candidate mechanism for the sub-second in-micro-batch
+            # stalls, each increments a counter the process already keeps, and
+            # a dip on a step where exactly one of these moved is an attribution
+            # no profiler window has managed to catch.
+            metrics.update(per_rank_stall_counter_metrics(get_torch_device()))
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]

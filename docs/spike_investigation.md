@@ -142,24 +142,67 @@ device idle: rank0 2.22%  rank1 2.03%  rank2 2.18%
 
 **micro-batch の中（forward / backward）。** 総量 1.1%。
 
-現時点の最有力候補は **`aten::nonzero` による device→host 同期**:
+一度この節は「先頭の `aten::nonzero` 65.8 ms が正体」と書いたが、**それは
+summary ツールの帰属バグによる誤読だった**（4.7 節）。訂正後の分解は
+以下の通りで、実体は 2 つの母集団に分かれる。
 
-* micro-batch の先頭、3 rank 共通、**65.8 ms で値まで同一**、繰り返す
-* `nonzero` は出力サイズがデータ依存なので、ホストへのコピーを強制する
-* 候補は 2 箇所 —— `unpad_input` 内（`verl/utils/torch_functional.py:579`、
-  および flash-attn 側）と、`response_row_selection`
-  （`verl/workers/actor/dp_actor.py:140`、`response_only_logits=True` の経路）
-* 1 step 66〜77 micro-batch × 65.8 ms = 4.3〜5.1 秒 ≒ **350 秒 step の 1.2〜1.5%**
+#### (A) 一様な ambient —— 毎 micro-batch に 35〜90 ms、合計 ~1%
 
-**この 1 つで 1.1% の deficit がほぼ説明できる。** ただし断定はしない ——
-65.8 ms がぴったり同じ値で繰り返すのは単なる同期のコストとしては大きすぎ、
-機構が完全には分かっていない。
+トレースの per-micro idle 98〜158 ms から、誤帰属分（前 iteration の
+optimizer step の尻尾 ~66 ms、デバイスは busy）を引いた残り。NVML の
+deficit 1.13% ≒ 350 秒 step で 4 秒 ≒ 66〜77 micro で 50〜60 ms/micro と
+一致する。**バーストではなく、全 micro-batch に薄く塗られている。**
 
-未解決なのは、まれに出る深いサンプル（`sm=3/0/20` など）が
-この均一な 65.8 ms 群と同一のものなのか、別物なのか。トレースの窓には
-入らなかったので、まだ答えが無い。
+機構の候補（複合と考えられる）:
 
----
+1. **eager 起動オーバーヘッドの累積。** 1 micro-batch に ~7,840 カーネル。
+   残余 idle 35〜90 ms ÷ 7,840 = **カーネル間 4〜11 µs** で、Python の
+   dispatch + autograd + gradient checkpointing の再計算境界のコストと
+   ちょうど同じ桁。個々のギャップは NVML にも watch にも見えないサイズ。
+2. **同期点直後のパイプライン再充填。** `unpad_input` の `nonzero`
+   （forward 先頭）と `response_row_selection` の `nonzero`（lm_head 前）は
+   出力サイズがデータ依存なので device→host 同期を強制する。同期自体は
+   前段の仕事と重なって無害だが、**同期が明けた瞬間はキューが空**で、
+   ホストが再充填するまでの数 ms が毎回落ちる。1 micro に 2 箇所。
+3. **`CUDA_DEVICE_MAX_CONNECTIONS=1`**（verl の ppo runtime env 既定、
+   Megatron の TP 順序制御用）。ハードウェアキューを 1 本に制限するので、
+   FSDP の `forward_prefetch`（次層 all-gather と当該層 compute の重なり）を
+   阻害しうる。ただしこれが削るのは主に**重なり = NCCL 露出時間**（busy に
+   見える側）で、idle への寄与は小さい。要検証。
+
+#### (B) まれな深いイベント —— 0.3〜1 秒、~30 分に 1 回、micro-batch の中
+
+トレースの 111 秒窓には期待値 0.06 件で入らなかった（2.5 節）。機構候補は
+3 つあり、**それぞれがプロセス既存のカウンタを動かす**ので、per-step の
+カウンタ差分で判別できる（5 節の計器を実装済み）:
+
+1. **allocator のセグメント成長（`cudaMalloc`）。** `cudaMalloc` は
+   device-synchronizing で、数百 MB〜GB 級なら 0.1〜1 秒止まる。実測と
+   噛み合う点が多い: `memory_reserved` は step を跨いで実際に成長し続けて
+   いる（50.9→55.6→60.7→66.1 GiB）。成長を引き起こすのは**記録更新級の
+   micro-batch**（実測で 36k トークン、中央値の 2.4 倍）で、それが 1 rank
+   に落ちれば **solo の dip**、balance 後の 3 rank が同時にピーク更新すれば
+   **3 枚同時の dip** になる —— 観測された両方の署名を 1 機構で説明できる
+   唯一の候補。なお `num_alloc_retries` は動いていない（retry は
+   empty_cache 後の再試行だけを数える別カウンタで、通常のセグメント成長は
+   `num_device_alloc` に出る —— 以前この 2 つを混同して仮説を棄却しかけた）。
+2. **torch.compile の再コンパイル。** `use_torch_compile=True`
+   （log-prob/entropy 経路）。未見の shape で guard が落ちると再コンパイルが
+   走り、その間ホストは Python/Inductor に張り付いてデバイスは空になる。
+   rank ごとに shape 履歴が独立なので **solo になる**。判別特徴: 頻度が
+   run 後半に向かって**減衰する**はず（キャッシュが埋まるので）。
+3. **Python gen-2 GC。** 世代 2 の回収はホストを凍らせ、キューが枯れた
+   時点からデバイスが空く。rank 独立のタイミングなので solo。頻度は
+   アロケーション量依存で、~分オーダーに 1 回はありうる。
+
+共通の増幅器として、**(2) の同期点**がある: ホスト側の停止（GC・再コンパイル・
+スケジューラのヒッチ）は、キューに仕事が積んであれば無害だが、`nonzero` の
+同期直後はキューが空なので、**ホストの停止がそのままデバイスの停止になる**。
+
+なお深いイベントと (A) は独立ではない可能性がある: セグメント成長を起こす
+記録更新級 micro-batch は、mini-batch 単位のトークン偏り（9.13 節の 16.5% の
+原因）が作っている。`BALANCE_MINIBATCH=1` は per-micro の最大トークンを
+36k→18k に下げるので、**副作用として (B)-1 の発生源も減らすはず**である。
 
 ## 4. 間違えたこと
 
@@ -207,7 +250,24 @@ NCCL の待ち 16.5% を見つけた時、これを「スパイクの正体」�
 違う。**回っている collective は NVML から busy に見えるので、
 スパイク（＝使用率が落ちる現象）ではない。** 別の損失である。
 
-### 4.6 計測器が 3 回スパイクを作った
+### 4.6 「65.8 ms の nonzero が正体」と書いた（帰属バグ）
+
+`actor_trace_summary.py` は busy/idle を「**その窓の中で launch された**
+カーネル」だけから計算していた。micro-batch の窓はホスト時刻で開くので、
+**前 iteration の optimizer step（窓の外で launch、固定サイズ ~80 ms）の
+カーネルが窓の先頭で実行されている時間**が「idle」に化け、その間ホストが
+最初の同期点（`nonzero`）で待っているため「host: aten::nonzero」と表示された。
+
+誤読のサインは全部出ていた: watch（stream event 基準）は同じ時間帯を
+`gap/mini 81 ms ≈ optim 82 ms、unaccounted ≈ 0` と正しく分類していたし、
+65.8 ms が rank 間・micro 間で**値まで同一**なのは optimizer が固定サイズ
+だから。2 つの計器が食い違ったら、先に食い違いの理由を潰すべきだった。
+
+ツールは修正済み（occupancy は全カーネルの union から計算し、carry 列で
+optimizer の尻尾を明示する）。**手元の既存トレース 3 本に再実行すれば
+GPU 時間ゼロで検証できる。**
+
+### 4.7 計測器が 3 回スパイクを作った
 
 * Nsight のキャプチャ: step 1 で 30 秒のノード全停止
 * torch profiler の書き出し: micro 60 の前で 21.9 秒、3 rank 同時
@@ -219,39 +279,49 @@ NCCL の待ち 16.5% を見つけた時、これを「スパイクの正体」�
 
 ## 5. スパイク除去のために、次にやること
 
-### 5.1 `aten::nonzero` の同期を消せるか調べる（最有力）
+### 5.1 修正した summary を既存トレースに再実行（GPU 不要、まずこれ）
 
-65.8 ms × 66〜77 micro-batch で 1.2〜1.5%。**deficit 1.1% とほぼ一致する。**
+```bash
+git pull
+python3 scripts/actor_trace_summary.py /tmp/actor_trace
+```
 
-* `response_row_selection`（`dp_actor.py:140`）は `indices` が昇順で
-  `cu_seqlens` も手元にあるので、`nonzero` を使わずに選択を構成できる可能性がある
-* `unpad_input` 側の `nonzero` は flash-attn の API 境界にあるが、
-  verl は `torch_functional.py:579` に自前の実装も持っている
+carry 列（optimizer の尻尾）が ~66 ms/micro で出て、idle 列が実質値
+（~35〜90 ms/micro）に下がるはず。**gap 表から 65.8 ms の nonzero 行が消え、
+代わりに本物の最大ギャップ**（機構 (A)-1/2 のどれか）が名前付きで出る。
 
-まず**どちらの `nonzero` なのかを特定する**。トレースの host op は
-`aten::nonzero` としか出ないので、片方に NVTX / `record_function` を
-入れて 1 回取り直せば決まる。
+### 5.2 深いイベントはカウンタ差分で判別（実装済み、常時オン）
 
-### 5.2 深いサンプルが同一現象か確かめる
+`per_rank_stall_counter_metrics`（`verl/utils/metric/stall_counters.py`）が
+毎 step、rank ごとに 3 つの差分を wandb に出す:
 
-`sm=3/0/20` のような深いサンプルが、均一な 65.8 ms 群の一部なのか別物なのかは
-未解決。0.2 秒サンプラーを併走させれば 0.9 秒のイベントに 4〜5 サンプル乗るので、
-phase までは特定できる:
+| metric | 動いたら |
+| --- | --- |
+| `stall/cuda_mallocs/rank{N}` | その step でセグメント成長（cudaMalloc）があった |
+| `stall/gc_gen2/rank{N}` | gen-2 GC が走った |
+| `stall/dynamo_graphs/rank{N}` | torch.compile が新しいグラフを作った |
+
+**dip の出た step でどれか 1 つだけが動いていれば、それが答え。どれも
+動いていなければ 3 仮説とも棄却**で、候補はホストヒッチ×同期点に絞られる。
+持続時間と phase は 0.2 秒 NVML サンプラー併走で取る:
 
 ```bash
 GPU_PROFILER=1 GPU_PROFILER_INTERVAL=0.2 GPU_PROFILER_TRACE=/tmp/trace.csv bash ...
 python3 scripts/gpu_stall_scan.py /tmp/trace.*.csv
 ```
 
-stall watch と併走させても干渉しない（watch は synchronize しない）。
+### 5.3 ambient 側の打ち手（判明後）
 
-### 5.3 それでも足りなければ、窓を広げたトレース
-
-`ACTOR_TORCH_MICRO` を step 全体（66〜77）にすると 2 GB 級のトレースになるが、
-深い dip が入る確率は 3 倍になる。書き出しコスト（現状 21.9 秒）も 3 倍に
-なるので、その step は捨てる前提で。
-
----
+* (A)-2 の `nonzero` 同期は除去可能性がある: `response_row_selection` は
+  `cu_seqlens` が手元にあるので `nonzero` 無しで構成できる余地があり、
+  `unpad_input` も verl 自前実装（`torch_functional.py:579`）側なら差し替え
+  可能。ただし**効果は同期直後の再充填バブル数 ms × 2/micro** であって
+  65.8 ms ではない（4.6 節）。
+* (A)-1 は `use_fused_kernels`（現在 False）でカーネル数自体を減らすのが
+  正攻法。torch.compile のモデル本体適用と CUDA Graphs は varlen と
+  可変 shape のため現実的でない。
+* `CUDA_DEVICE_MAX_CONNECTIONS=1` は FSDP 構成では外す実験の価値がある
+  （Megatron 用の設定が runtime env 既定で全 arm に付いている）。
 
 ## 6. 実行方法（計測用の完全なコマンド）
 

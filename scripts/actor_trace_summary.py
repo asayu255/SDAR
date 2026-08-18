@@ -186,13 +186,28 @@ def _bracket(kernels, when):
 
 
 def analyse(path, shapes_of=("aten::embedding",)):
-    """One rank's per-micro-batch numbers."""
+    """One rank's per-micro-batch numbers.
+
+    Two attributions run side by side, and conflating them produced this tool's
+    one wrong conclusion so far. OWNERSHIP (whose work was it: kernel count,
+    nccl share) goes by the micro-batch that LAUNCHED the kernel, because the
+    queue runs behind the host and boundary kernels drift. OCCUPANCY (was the
+    device busy: idle, gaps) must NOT: a micro-batch window opens on the host's
+    clock, and kernels launched before it -- the previous iteration's optimizer
+    step, ~80 ms of fixed-size work here -- are still executing into its head.
+    Judged only by in-window launches, that head reads as a 65.8 ms "idle gap
+    with the host in aten::nonzero", identical on every rank and every
+    micro-batch: identical because the optimizer's size is fixed, and "idle"
+    only because the executing kernels belonged to no window. Occupancy is
+    therefore computed from the union of ALL kernels in the trace, and the
+    carry-in (busy time inside the window from kernels launched before it) is
+    reported on its own so the boundary work is visible instead of mislabelled.
+    """
     micros, kernels, cpu_ops, launch_ts, base_us, shapes = read_trace(path)
+    busy_all = merge([(s, e) for s, e, _, _ in kernels])
     rows = []
     for counter, window in sorted(micros.items()):
-        # Attribute a kernel to the micro-batch that *launched* it, not the one
-        # it happened to run in: kernels lag their launch, so the boundary
-        # kernels would otherwise drift into the next window.
+        # OWNERSHIP: the micro-batch that launched it.
         mine = []
         for start, end, name, correlation in kernels:
             when = launch_ts.get(correlation, start)
@@ -201,7 +216,9 @@ def analyse(path, shapes_of=("aten::embedding",)):
         wall = window[1] - window[0]
         busy = clip(merge([(s, e) for s, e, _ in mine]), window)
         nccl = clip(merge([(s, e) for s, e, n in mine if _NCCL_RE.search(n)]), window)
-        holes = sorted(gaps(busy, window), key=lambda g: g[1] - g[0], reverse=True)
+        # OCCUPANCY: anything resident, whoever launched it.
+        busy_any = clip(busy_all, window)
+        holes = sorted(gaps(busy_any, window), key=lambda g: g[1] - g[0], reverse=True)
         biggest = holes[0] if holes else None
         shape = next((dims for at, name, dims in shapes
                       if window[0] <= at < window[1] and name in shapes_of), None)
@@ -212,12 +229,14 @@ def analyse(path, shapes_of=("aten::embedding",)):
             "wall_ms": wall / 1e3,
             "busy_ms": sum(e - s for s, e in busy) / 1e3,
             "nccl_ms": sum(e - s for s, e in nccl) / 1e3,
-            "idle_ms": (wall - sum(e - s for s, e in busy)) / 1e3,
+            "idle_ms": (wall - sum(e - s for s, e in busy_any)) / 1e3,
+            "carry_ms": (sum(e - s for s, e in busy_any) - sum(e - s for s, e in busy)) / 1e3,
             "kernels": len(mine),
             "gap_ms": (biggest[1] - biggest[0]) / 1e3 if biggest else 0.0,
             "gap_at": biggest[0] if biggest else None,
             "gap_host": _innermost_over(cpu_ops, biggest) if biggest else "-",
-            "gap_bracket": _bracket(mine, biggest[0]) if biggest else ("-", "-"),
+            "gap_bracket": _bracket([(s, e, n) for s, e, n, _ in kernels], biggest[0])
+                           if biggest else ("-", "-"),
         })
     return rows
 
@@ -241,9 +260,14 @@ def report(by_rank, top):
     print("\n== per micro-batch, per rank ==")
     print("  the first captured micro-batch carries the profiler's own CUPTI "
           "start-up; read from the second.\n")
+    print("  busy = kernels this micro-batch launched; carry = kernels launched "
+          "before the window\n  still executing into it (the previous optimizer "
+          "step's tail); idle = nothing resident\n  from anyone. wall != busy + "
+          "carry + idle in general, since owned kernels can also\n  finish after "
+          "the window closes.\n")
     header = f"{'micro':>6}"
     for rank in ranks:
-        header += f" | {'r' + rank + ' wall':>10} {'busy':>8} {'nccl':>8} {'idle':>8}"
+        header += f" | {'r' + rank + ' wall':>10} {'busy':>8} {'nccl':>8} {'carry':>7} {'idle':>7}"
     print(header)
     print("-" * len(header))
     for counter in counters:
@@ -251,10 +275,11 @@ def report(by_rank, top):
         for rank in ranks:
             row = next((r for r in by_rank[rank] if r["micro"] == counter), None)
             if row is None:
-                line += f" | {'-':>10} {'-':>8} {'-':>8} {'-':>8}"
+                line += f" | {'-':>10} {'-':>8} {'-':>8} {'-':>7} {'-':>7}"
             else:
                 line += (f" | {row['wall_ms']:>10.1f} {row['busy_ms']:>8.1f} "
-                         f"{row['nccl_ms']:>8.1f} {row['idle_ms']:>8.1f}")
+                         f"{row['nccl_ms']:>8.1f} {row['carry_ms']:>7.1f} "
+                         f"{row['idle_ms']:>7.1f}")
         print(line)
 
     empty = [(rank, row) for rank, rows in by_rank.items() for row in rows
