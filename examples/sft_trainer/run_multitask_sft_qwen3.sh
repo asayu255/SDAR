@@ -233,6 +233,15 @@ set -x
 #   [stall] rank 1 micro 812 at 1787038…: gpu 5900 ms (median 1010),
 #           gap 12 ms (median 3), host 40 ms -> inside the micro-batch, host ran ahead
 #
+# THE LOG FILES ACCUMULATE ACROSS RUNS. The name is rank<N>_pid<P>.log, so each
+# run writes new files beside the old ones and `grep /tmp/actor_stall/rank*.log`
+# reads every run this machine has ever done. A stale line is not obviously
+# stale -- it carries an epoch timestamp, not a date. Ask the run which files
+# are its own instead of globbing:
+#
+#   grep -h "stall-watch" /tmp/ray/session_latest/logs/worker-*.out
+#   # [stall-watch] rank 0 logging to /tmp/actor_stall/rank0_pid601985.log
+#
 # gap vs gpu says whether the device was idle BEFORE the micro-batch or slow
 # inside it, and gap/<kind> says which of the three places the idle came from:
 # gap/step spans two update_policy calls (the return to the driver, its logging,

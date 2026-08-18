@@ -367,6 +367,18 @@ Ray 自身の per-worker ログに重複除去前の stdout がある:
 grep -h "step-gpu" /tmp/ray/session_latest/logs/worker-*.out
 ```
 
+**`/tmp/actor_stall/rank*.log` を glob してはいけない。** ファイル名は
+`rank<N>_pid<P>.log` なので run ごとに別ファイルが増え続け、glob は
+このマシンで走った全 run を読む。しかも古い行は epoch 秒しか持たないので
+一見して古いと分からない（実際、torch profiler がトレースを書いた
+21.9 秒の計測器スパイクを 4 時間後に「今の run の観測」と読み違えた）。
+今の run に自分のファイルを言わせる:
+
+```bash
+grep -h "stall-watch" /tmp/ray/session_latest/logs/worker-*.out
+# [stall-watch] rank 0 logging to /tmp/actor_stall/rank0_pid601985.log
+```
+
 
 ---
 
