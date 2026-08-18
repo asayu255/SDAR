@@ -61,6 +61,7 @@ from verl.utils.metric import (
     reduce_metrics,
 )
 from verl.utils.seqlen_balancing import (
+    deal_by_length,
     get_seqlen_balanced_partitions,
     log_minibatch_unbalance,
     log_seqlen_unbalance,
@@ -430,6 +431,15 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     if name not in timing_raw:
         timing_raw[name] = 0
     timing_raw[name] += timer.last
+
+
+# Deal each rank's rows length-first into its mini-batches so mini-batch k holds
+# the same token count on every rank. Off by default because it changes which
+# rows share a mini-batch and there are ~70 optimizer steps per training step --
+# an accuracy-neutral-looking change that is not bit-identical. Turn on with
+# BALANCE_MINIBATCH=1 and compare perf/mfu/actor, which is data-independent.
+_BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 class RayPPOTrainer:
@@ -1274,8 +1284,19 @@ class RayPPOTrainer:
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst, k_partitions=world_size, equal_size=True)
+        minibatch_rows = self._minibatch_rows_per_rank(world_size)
+        ordered = global_partition_lst
+        if _BALANCE_MINIBATCH and minibatch_rows:
+            # Balancing the rank totals leaves mini-batch k unrelated across
+            # ranks, and the ranks meet at the gradient reduce that ends every
+            # one of them. deal_by_length gives each rank the same length-ordered
+            # deal, so the columns match. OFF by default: it changes which rows
+            # share a mini-batch, and there are ~70 optimizer steps per training
+            # step, so the trajectory is not bit-identical.
+            ordered = [deal_by_length(global_seqlen_lst, p, minibatch_rows)
+                       for p in global_partition_lst]
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        global_idx = torch.tensor([j for partition in ordered for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
@@ -1289,10 +1310,11 @@ class RayPPOTrainer:
         # difference is a wait on every rank but the slowest, and it is
         # invisible to utilization.gpu, which counts a spinning collective as
         # busy. Measured here rather than inferred, because it is free to do so.
-        minibatch_rows = self._minibatch_rows_per_rank(world_size)
         if minibatch_rows:
+            # Measured on what was actually dispatched, so with BALANCE_MINIBATCH
+            # on the wait it reports is the one the run really paid.
             metrics.update(log_minibatch_unbalance(
-                seqlen_list=global_seqlen_lst, partitions=global_partition_lst,
+                seqlen_list=global_seqlen_lst, partitions=ordered,
                 minibatch_rows=minibatch_rows, prefix=logging_prefix))
 
     def _minibatch_rows_per_rank(self, world_size: int) -> int:

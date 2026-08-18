@@ -33,6 +33,7 @@ spread, and that its counterfactual is a real one.
 import random
 
 from verl.utils.seqlen_balancing import (
+    deal_by_length,
     get_seqlen_balanced_partitions,
     log_minibatch_unbalance,
     log_seqlen_unbalance,
@@ -58,8 +59,8 @@ def test_ranks_balanced_to_a_token_can_still_wait_on_every_mini_batch():
     # each of the two mini-batches: max 200, mean 101 -> 99 waited, of 101
     assert mini["p/minibatch_wait_frac"] == 99 / 101
     assert mini["p/minibatch_spread_max"] == 198
-    # and ordering both ranks by length removes all of it, which is the headroom
-    assert mini["p/minibatch_wait_frac_sorted"] == 0.0
+    # and dealing both ranks by length removes all of it, which is the headroom
+    assert mini["p/minibatch_wait_frac_dealt"] == 0.0
 
 
 def test_already_matched_mini_batches_report_no_wait():
@@ -129,5 +130,86 @@ def test_against_the_real_partitioner_on_a_realistic_batch():
     spread = whole["p/balanced_max"] - whole["p/balanced_min"]
     assert spread <= 3, spread                       # the ranks are balanced...
     assert mini["p/minibatch_wait_frac"] > 0.02      # ...and the mini-batches are not
-    # ordering each rank's rows by length is a real improvement, not a wash
-    assert mini["p/minibatch_wait_frac_sorted"] < mini["p/minibatch_wait_frac"] / 2
+    # dealing each rank's rows by length is a real improvement, not a wash
+    assert mini["p/minibatch_wait_frac_dealt"] < mini["p/minibatch_wait_frac"] / 2
+
+
+# --- the fix ----------------------------------------------------------------
+
+
+def _chunks(values, size):
+    return [sum(values[i : i + size]) for i in range(0, len(values), size)]
+
+
+def test_the_deal_cuts_on_the_boundaries_split_will_use():
+    """The detail that decides whether any of this survives.
+
+    batch.split(C) cuts at [C, C, ..., n % C]. Dealing into ceil(n / C)
+    equal-count buckets gives sizes C-1 and C, which split() then cuts across --
+    every bucket after the first straddles two mini-batches and the ordering is
+    lost at the first boundary.
+    """
+    seqlens = list(range(1, 91))            # 90 rows, C = 20 -> [20, 20, 20, 20, 10]
+    order = deal_by_length(seqlens, list(range(90)), 20)
+
+    assert sorted(order) == list(range(90))          # a permutation, nothing lost
+    counts = [20, 20, 20, 20, 10]
+    at = 0
+    for count in counts:                             # each cut lands on a full bucket
+        block = order[at : at + count]
+        assert len(block) == count
+        at += count
+
+
+def test_it_matches_the_columns_across_ranks():
+    """Three ranks, the same rule, the same row count -- so mini-batch k holds
+    each rank's k-th, (k+M)-th ... longest row and the sums line up. This is the
+    whole mechanism."""
+    random.seed(3)
+    seqlens = [int(random.lognormvariate(0, 0.6) * 900) for _ in range(1200)]
+    partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=3, equal_size=True)
+
+    before = log_minibatch_unbalance(seqlens, partitions, 20, prefix="p")
+    dealt = [deal_by_length(seqlens, p, 20) for p in partitions]
+    after = log_minibatch_unbalance(seqlens, dealt, 20, prefix="p")
+
+    assert before["p/minibatch_wait_frac"] > 0.02
+    assert after["p/minibatch_wait_frac"] < 0.005
+
+
+def test_it_does_not_pile_the_long_rows_into_the_first_mini_batches():
+    """Sorting and chunking contiguously matches the columns too, and is the
+    wrong fix: it makes the first mini-batch the longest rows in the batch. On a
+    real step that is 6.6x the smallest and 42% larger than anything the run sees
+    today, which is a peak-activation increase in exchange for a wait. Dealing
+    makes every mini-batch a stratified sample instead."""
+    random.seed(4)
+    seqlens = [int(random.lognormvariate(0, 0.6) * 900) for _ in range(1200)]
+    partition = list(range(1200))
+
+    contiguous = _chunks([seqlens[i] for i in sorted(partition, key=lambda i: -seqlens[i])], 20)
+    dealt = _chunks([seqlens[i] for i in deal_by_length(seqlens, partition, 20)], 20)
+
+    assert max(contiguous) / min(contiguous) > 4
+    assert max(dealt) / min(dealt) < 1.3
+    # and the peak mini-batch is smaller than what index order already produces,
+    # so the fix lowers the activation high-water mark rather than raising it
+    assert max(dealt) < max(_chunks([seqlens[i] for i in partition], 20))
+
+
+def test_a_partition_smaller_than_one_mini_batch_is_left_alone():
+    """Nothing to deal, and reordering it would change the trajectory for no
+    gain."""
+    assert deal_by_length([5, 1, 3], [0, 1, 2], 20) == [0, 1, 2]
+    assert deal_by_length([5, 1, 3], [0, 1, 2], 0) == [0, 1, 2]
+
+
+def test_dealing_is_a_pure_permutation():
+    """It must never lose, duplicate, or invent a row: the result indexes the
+    same batch."""
+    random.seed(5)
+    seqlens = [random.randint(1, 5000) for _ in range(437)]
+    out = deal_by_length(seqlens, list(range(437)), 20)
+
+    assert sorted(out) == list(range(437))
+    assert len(out) == 437

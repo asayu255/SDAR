@@ -218,6 +218,53 @@ def log_seqlen_unbalance(seqlen_list: List[int], partitions: List[List[int]], pr
     }
 
 
+def deal_by_length(seqlen_list: List[int], partition: List[int], minibatch_rows: int) -> List[int]:
+    """Reorder one rank's rows so its mini-batches match the other ranks'.
+
+    ``get_seqlen_balanced_partitions`` equalises the rank totals and then
+    ``_check_and_sort_partitions`` sorts each partition by original index,
+    discarding the length ordering it worked in. What survives is a rank total;
+    what does not is any relationship between rank A's k-th mini-batch and rank
+    B's. Since the ranks meet at the gradient reduce that ends every mini-batch,
+    that difference is a wait -- measured at 12.7% of a rank's tokens in a real
+    step, and invisible to utilization.gpu because a spinning collective is busy
+    to it.
+
+    Longest-first, dealt round-robin. Every rank runs the same rule over the same
+    number of rows, so mini-batch k holds each rank's k-th, (k+M)-th, (k+2M)-th
+    ... longest row and the columns match by construction.
+
+    The capacities are exactly what ``batch.split(minibatch_rows)`` will later
+    cut -- ``[C] * (n // C)`` plus a short tail. Dealing into ``ceil(n / C)``
+    equal-count buckets instead gives sizes C-1 and C, which split() then cuts
+    across, and the careful ordering is lost at the first boundary.
+
+    Sorting the rows and chunking them contiguously would also match the columns,
+    and is the wrong fix: it puts every long row in the first mini-batches, which
+    on a real step makes the largest mini-batch 6.6x the smallest and 42% larger
+    than anything the run sees today. Dealing makes each mini-batch a stratified
+    sample instead -- on that same step the largest is 1.17x the smallest, and
+    47% BELOW today's largest, so the peak activation footprint falls rather than
+    rises.
+
+    Returns the partition's indices in the new order. Same indices, same count.
+    """
+    n = len(partition)
+    if minibatch_rows <= 0 or n <= minibatch_rows:
+        return list(partition)
+    caps = [minibatch_rows] * (n // minibatch_rows)
+    if n % minibatch_rows:
+        caps.append(n % minibatch_rows)
+    buckets = [[] for _ in caps]
+    at = 0
+    for idx in sorted(partition, key=lambda i: -seqlen_list[i]):
+        while len(buckets[at]) >= caps[at]:
+            at = (at + 1) % len(caps)
+        buckets[at].append(idx)
+        at = (at + 1) % len(caps)
+    return [i for bucket in buckets for i in bucket]
+
+
 def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]], minibatch_rows: int, prefix):
     """How balanced the MINI-BATCHES are across ranks, which is a different
     question from how balanced the ranks are.
@@ -239,9 +286,9 @@ def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]],
     close enough for the packed forward this arm runs, and it is an upper bound
     on what any per-mini-batch rebalancing could recover -- NOT a measured stall.
 
-    ``wait_frac_sorted`` is the same number if each rank's rows were ordered by
-    length instead of by index, so slice k holds the k-th longest rows on every
-    rank. The gap between the two is the headroom, measured rather than assumed.
+    ``wait_frac_dealt`` is the same number under ``deal_by_length``, which is the
+    ordering a fix would actually use. The gap between the two is the headroom,
+    measured rather than assumed.
     """
     if minibatch_rows <= 0:
         return {}
@@ -264,16 +311,16 @@ def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]],
         return waited, total, spreads
 
     waited, total, spreads = _wait(per_rank)
-    # Descending, because that is the order a fix would use: the k-th longest row
-    # of every rank lands in mini-batch k, so the columns match by construction.
-    sorted_waited, sorted_total, _ = _wait([sorted(rows, reverse=True) for rows in per_rank])
+    dealt = [[seqlen_list[i] for i in deal_by_length(seqlen_list, partition, minibatch_rows)]
+             for partition in partitions]
+    sorted_waited, sorted_total, _ = _wait(dealt)
     if not total:
         return {}
     return {
         f"{prefix}/minibatch_spread_mean": sum(spreads) / len(spreads),
         f"{prefix}/minibatch_spread_max": max(spreads),
         f"{prefix}/minibatch_wait_frac": waited / total,
-        f"{prefix}/minibatch_wait_frac_sorted": (sorted_waited / sorted_total) if sorted_total else 0.0,
+        f"{prefix}/minibatch_wait_frac_dealt": (sorted_waited / sorted_total) if sorted_total else 0.0,
     }
 
 
