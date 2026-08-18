@@ -1113,3 +1113,25 @@ def test_without_fingerprints_the_exchange_behaves_as_before():
     ids = torch.randint(0, VOCAB, (4, L, K))
     exchange_teacher_logprobs(cache, keys.roll(1), ids, world_size=1)
     assert_rows_were_owned_once()
+
+
+def test_nbytes_counts_the_packed_sources_once():
+    """The entries are views into one packed tensor per put, so summing the views
+    would report the same memory once per row. The number exists because the
+    sign-weighting arms cache four models per row instead of one, and it is what
+    says whether the headroom is there before a step dies on it."""
+    cache = TeacherHiddenCache()
+    n, resp, hidden = 4, 6, 8
+    h = torch.randn(n, resp, hidden)
+    lse = torch.randn(n, resp).abs() + 1.0
+    cache.put(
+        cache_ids=torch.arange(1, n + 1),
+        task="alfworld",
+        h=h,
+        lse=lse,
+        live_mask=torch.ones(n, resp, dtype=torch.bool),
+    )
+    packed = h.numel() * h.element_size() + lse.numel() * lse.element_size()
+    assert cache.nbytes() == packed
+    cache.clear()
+    assert cache.nbytes() == 0

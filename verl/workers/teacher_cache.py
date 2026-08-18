@@ -410,6 +410,26 @@ class TeacherHiddenCache:
     def __contains__(self, key):
         return int(key) in self._h
 
+    def nbytes(self) -> int:
+        """Device memory the step's entries hold, for the metric that watches it.
+
+        Worth a number rather than an estimate because the sign-weighting arms
+        multiply it: they cache the base policy and each off-task teacher besides
+        the on-task one, so a row carries four models' hidden states instead of
+        one, on a box whose vLLM engine is already sized to 0.6 of the card. The
+        entries are views into the packed sources, so those are what is summed --
+        adding up the views would count the same memory once per row.
+        """
+        total = 0
+        for tensors in self._chunks.values():
+            for t in tensors:
+                total += t.numel() * t.element_size()
+        if self._final is not None:
+            for t in self._final.values():
+                if hasattr(t, "numel"):
+                    total += t.numel() * t.element_size()
+        return total
+
     # -- reading ---------------------------------------------------------- #
 
     def _finalize(self, device):

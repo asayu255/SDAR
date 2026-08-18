@@ -875,7 +875,21 @@ class OPDRayTrainer(RayPPOTrainer):
                         # none has drifted onto another row. One call -- the cache is
                         # per process, so asking all three teachers would check the
                         # same entries three times.
-                        next(iter(self.teacher_wg.values())).check_teacher_hidden_cache()
+                        cache_stats = next(iter(self.teacher_wg.values())).check_teacher_hidden_cache()
+                        # What the cache is holding, summed over ranks. The
+                        # weighted arms put four models per row into it instead of
+                        # one, next to a vLLM engine already sized to 0.6 of the
+                        # card, so this is the first number to read when a step
+                        # dies on memory -- and the one that says whether the
+                        # headroom is there before it does.
+                        per_rank = cache_stats if isinstance(cache_stats, list) else [cache_stats]
+                        per_rank = [r for r in per_rank if isinstance(r, dict)]
+                        if per_rank:
+                            metrics["teacher_cache/rows"] = sum(r["rows"] for r in per_rank)
+                            metrics["teacher_cache/gb"] = sum(r["bytes"] for r in per_rank) / 1e9
+                            metrics["teacher_cache/witness_max_err"] = max(
+                                r["witness_max_err"] for r in per_rank
+                            )
 
                     with _timer("update_actor", timing_raw):
                         # update_policy scales the student logits by this temperature to

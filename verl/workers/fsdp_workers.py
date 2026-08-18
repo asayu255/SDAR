@@ -1079,10 +1079,18 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def check_teacher_hidden_cache(self, atol: float = 1e-3):
-        """Run the witness over everything cached this step. Raises on failure."""
+        """Run the witness over everything cached this step. Raises on failure.
+
+        Returns the witness's worst error alongside what the cache is holding, so
+        the size is on the same call rather than a second round trip. The sign-
+        weighting arms cache four models per row instead of one, and that number
+        is the first thing to look at when a step dies on memory.
+        """
         from verl.workers.teacher_cache import get_teacher_cache
 
-        return get_teacher_cache().check_witness(atol=atol)
+        cache = get_teacher_cache()
+        worst = cache.check_witness(atol=atol)
+        return {"witness_max_err": worst, "rows": len(cache), "bytes": cache.nbytes()}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
