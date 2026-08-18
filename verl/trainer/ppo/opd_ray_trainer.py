@@ -41,6 +41,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
+from verl.trainer.ppo.sign_weights import SIGN_BASE_TASK
 from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 from verl.utils import gpu_profiler
 from verl.utils.metric import reduce_metrics
@@ -148,6 +149,37 @@ class OPDRayTrainer(RayPPOTrainer):
         # one; the cache is cleared each step regardless.
         self._teacher_cache_counter = 0
 
+        # ---- cross-teacher sign agreement (optional) ----------------------- #
+        # Off by default so every existing arm is untouched: with enable=false no
+        # base worker is built, no extra forward runs, and the loss is the one the
+        # arm had before.
+        sw_cfg = dict(opd_cfg.get("sign_weight", {}) or {})
+        self.sign_weight_enabled = bool(sw_cfg.get("enable", False))
+        self.sign_weight_mode = str(sw_cfg.get("mode", "target"))
+        self.base_policy_path = sw_cfg.get("base_path", None)
+        self.base_wg = None
+        if self.sign_weight_enabled:
+            assert self.sign_weight_mode in ("position", "target"), (
+                f"algorithm.opd.sign_weight.mode must be 'position' or 'target', got {self.sign_weight_mode!r}"
+            )
+            # The signal is the sign of log pi_m - log pi_0 on a support shared by
+            # all four models, and the shared support is the student's top-k. The
+            # single-token estimator produces no support at all, and the
+            # teacher-indexed variant resolves nothing in the actor, where the
+            # student's ids are: both would need a second, separate mechanism.
+            assert self.teacher_topk_kl and self.student_indexed_topk, (
+                "sign weighting requires algorithm.opd.kl_loss_type=topk_kl with "
+                "actor_rollout_ref.actor.student_indexed_topk=True (the student's "
+                "top-k is the support every model is scored on)"
+            )
+            assert self.base_policy_path, (
+                "sign weighting requires algorithm.opd.sign_weight.base_path "
+                "(the pre-RL policy the teachers' shifts are measured against)"
+            )
+            assert len(self.teacher_paths) >= 2, (
+                "sign weighting needs at least one off-task teacher besides the on-task one"
+            )
+
     # ------------------------------------------------------------------ #
     # Worker setup: actor_rollout (+ optional critic/rm) + N teachers.
     # ------------------------------------------------------------------ #
@@ -189,6 +221,22 @@ class OPDRayTrainer(RayPPOTrainer):
             )
             self.resource_pool_to_cls[teacher_pool][key] = teacher_cls
 
+        # The base policy the teachers were fine-tuned from. Built exactly like a
+        # teacher (same role="ref") but kept out of self.teacher_paths /
+        # self.teacher_wg, because those are keyed by task and drive the routing: a
+        # fourth entry there would have to survive _normalize_task_name and would
+        # then be looked up for rows that do not exist.
+        if self.sign_weight_enabled:
+            base_cfg = copy.deepcopy(self.config.actor_rollout_ref)
+            with open_dict(base_cfg):
+                base_cfg.model.path = self.base_policy_path
+                base_cfg.model.lora_rank = 0
+            self.resource_pool_to_cls[teacher_pool]["base_policy"] = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=base_cfg,
+                role="ref",
+            )
+
         if self.use_rm:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
@@ -212,7 +260,11 @@ class OPDRayTrainer(RayPPOTrainer):
             self.critic_wg.init_model()
 
         # Initialize teachers before the rollout engine (matches actor-last ordering).
-        n_teachers = len(self._teacher_keys)
+        # The base policy takes a slot in the same stacked projection as the
+        # teachers, so the count has to include it before the first registration:
+        # the stack is allocated once, at n_tasks * vocab, by whoever registers
+        # first.
+        n_teachers = len(self._teacher_keys) + (1 if self.sign_weight_enabled else 0)
         for slot, (task, key) in enumerate(self._teacher_keys.items()):
             wg = all_wg[key]
             wg.init_model()
@@ -231,6 +283,18 @@ class OPDRayTrainer(RayPPOTrainer):
                 # its own and stacked later -- that held both layouts at once, and
                 # peaked here, before vLLM measures free memory.
                 wg.register_teacher_lm_head(task, slot=slot, n_tasks=n_teachers)
+
+        if self.sign_weight_enabled:
+            self.base_wg = all_wg["base_policy"]
+            self.base_wg.init_model()
+            if self.student_indexed_topk and not bool(self.config.trainer.get("val_only", False)):
+                # Filed under a label that is deliberately not a task name: the
+                # cache picks an output projection by this string, and the routing
+                # picks a teacher by task name. A collision would silently score
+                # rows against the wrong model.
+                self.base_wg.register_teacher_lm_head(
+                    SIGN_BASE_TASK, slot=n_teachers - 1, n_tasks=n_teachers
+                )
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
