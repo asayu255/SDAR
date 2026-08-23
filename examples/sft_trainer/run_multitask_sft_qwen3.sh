@@ -183,17 +183,29 @@ set -x
 # hour, and writes nowhere near the real checkpoints:
 #
 #   ++trainer.default_local_dir=$HOME/checkpoints/sft_ckpt_probe \
-#   ++trainer.save_freq=5 \
+#   ++trainer.save_freq=1 \
 #   ++trainer.max_actor_ckpt_to_keep=2
 #
-# max_actor_ckpt_to_keep is not optional at this frequency: a checkpoint is
-# ~17-21 GB, and save_freq=5 over 300 steps would be sixty of them (~1.2 TB).
-# The rotation happens after the pending write is joined, so it never deletes a
-# directory that is still being written.
+# save_freq=1 because the question is only "does a write beside training slow
+# it down", and at 1 EVERY step runs beside a write: the loop flushes the
+# previous step's write and forks the next one each time round. Contention
+# cannot hide in one step out of five, and the answer is there at step 2 rather
+# than step 6. What it gives up is a clean in-run baseline -- step 1 is the only
+# step without a concurrent write and it is the warm-up -- but the comparison is
+# against the known ~297 s median and the signal is 120-220 s, so that costs
+# nothing. Follow up at save_freq=5 (steps 7-9 stay ordinary) if a like-for-like
+# number inside one run is wanted.
 #
-# save_freq=5 rather than 2 so that steps 7-9 are ordinary steps and give the
-# baseline the comparison needs; at 2 every step is either a save or the step
-# after one. Read the verdict from two lines:
+# max_actor_ckpt_to_keep is not optional at this frequency: a checkpoint is
+# ~17-21 GB and this writes one per step. The rotation happens after the pending
+# write is joined, so it never deletes a directory still being written.
+#
+# One failure mode is worth recognising rather than debugging: if the writer is
+# still contending, its write stretches past the step that was meant to hide it,
+# the next flush blocks waiting for it, and step times balloon instead of
+# settling. That runaway IS the negative result -- read it and stop the run.
+#
+# Read the verdict from two lines:
 #
 #   [ckpt-write] rank 0: fork writer finished global_step_5 in 176.3 s
 #     ~178 s   the writer has the disk to itself -- no contention
