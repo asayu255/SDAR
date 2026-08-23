@@ -113,20 +113,29 @@ def _finish_offload_to_cpu(obj, moved, name, mirror=None):
 
 
 def _into_mirror(tensor, name, mirror):
-    """Copy ``tensor`` to CPU, into the same memory as last save when possible.
+    """Copy ``tensor`` to CPU, into the same PINNED memory as the last save.
 
-    A fresh 4.6 GB pageable allocation is paid for in page faults as the copy
-    touches each new page; the mirror pays that once, on the first save. A slot
-    is keyed by name and replaced if the shape or dtype ever changes (it should
-    not -- optimizer state is fixed once allocated -- but a stale-shaped slot
-    silently truncating a tensor would corrupt the checkpoint, which is worse
-    than an allocation).
+    Two costs are being removed. A fresh allocation is paid for in page faults
+    as the copy touches each new page; the mirror pays that once. And a copy
+    into ordinary pageable memory cannot use DMA -- the driver stages it
+    through a bounce buffer at roughly 4 GB/s, which is what made the offload
+    walk 1.7-1.9 s for ~7 GB (measured, run 46o9xef3). Pinned pages let the
+    same copy go over PCIe at 12-25 GB/s.
+
+    Pinning is a finite resource and the allocation can fail; pageable is then
+    still correct, just slower, so a failure degrades rather than raises. A slot
+    whose shape or dtype changed is replaced rather than truncated into --
+    optimizer state is fixed once allocated, but a silently short copy would
+    corrupt the checkpoint, which is worse than an allocation.
     """
     if mirror is None:
         return tensor.detach().cpu()
     slot = mirror.get(name)
     if slot is None or slot.shape != tensor.shape or slot.dtype != tensor.dtype:
-        slot = torch.empty_like(tensor, device="cpu")
+        try:
+            slot = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+        except (RuntimeError, MemoryError):
+            slot = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
         mirror[name] = slot
     slot.copy_(tensor)
     return slot

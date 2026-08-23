@@ -457,3 +457,41 @@ def test_background_removal_deletes_and_never_blocks(tmp_path):
     while (tmp_path / "global_step_1").exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not (tmp_path / "global_step_1").exists(), "the background rm never landed"
+
+
+def test_pinning_failure_degrades_instead_of_raising(monkeypatch):
+    """Pinned pages are a finite resource and the allocation can fail.
+
+    Pageable is still correct, only slower, so a save must not die because the
+    host would not page-lock another 7 GB.
+    """
+    real_empty = torch.empty
+
+    def _refuse_to_pin(*args, **kwargs):
+        if kwargs.pop("pin_memory", False):
+            raise RuntimeError("cudaHostAlloc failed")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", _refuse_to_pin)
+    mirror = {}
+
+    out = mod._into_mirror(torch.arange(4, dtype=torch.float32), "optim.state.0.exp_avg", mirror)
+
+    assert torch.equal(out, torch.arange(4, dtype=torch.float32))
+    assert "optim.state.0.exp_avg" in mirror
+
+
+def test_a_pinned_mirror_is_still_plain_bytes_to_the_writer(tmp_path):
+    """The forked child cannot make a CUDA call, and it is handed mirror slots.
+
+    torch.save must therefore treat a mirror slot as ordinary CPU memory --
+    this is the same class of mistake that killed the child on run nbq51imk,
+    where a state dict entry turned out to need storage.cpu().
+    """
+    mirror = {}
+    slot = mod._into_mirror(torch.arange(6, dtype=torch.float32), "w", mirror)
+    target = str(tmp_path / "slot.pt")
+
+    torch.save({"w": slot}, target)
+
+    assert torch.equal(torch.load(target, weights_only=False)["w"], torch.arange(6, dtype=torch.float32))
