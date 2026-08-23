@@ -128,8 +128,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # the timeout once per save for the rest of a 300-step run would be far
         # worse than the contention this is trying to remove.
         self._fork_broken = False
-        self.last_write_seconds = None   # duration of the most recent write
+        self.last_write_seconds = None   # the writer's own time on the write
         self.last_writer_kind = None     # "fork" or "thread", for the same line
+        self._thread_write_seconds = None
 
     def _start_async_write(self, writes, local_path: str):
         """Hand the staged shards to a forked child (or a thread) and return.
@@ -151,9 +152,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if fork_writer_enabled() and not self._fork_broken and self._start_forked_write(writes, local_path):
             return
 
+        self._thread_write_seconds = None
+
         def _run():
+            write_started = time.monotonic()
             try:
                 _write_shards(writes)
+                self._thread_write_seconds = time.monotonic() - write_started
             except BaseException as e:  # noqa: BLE001 - re-raised on the main thread
                 self._pending_error = e
 
@@ -184,18 +189,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             os.close(read_fd)
             os.close(write_fd)
             self._fork_broken = True
-            warnings.warn(
-                f"[rank-{self.rank}]: could not fork a checkpoint writer ({exc!r}); "
-                "falling back to the writer thread",
-                stacklevel=2,
+            message = (
+                f"[ckpt-write] rank {self.rank}: could not fork a checkpoint writer "
+                f"({exc!r}); falling back to the writer thread"
             )
+            print(message, flush=True)
+            warnings.warn(message, stacklevel=2)
             return False
 
         if pid == 0:                                    # child
             status = 0
             try:
                 os.close(read_fd)
+                write_started = time.monotonic()
                 _write_shards(writes)
+                # The receipt. A clean exit status alone is not proof the shards
+                # were written -- waitpid can be robbed of the real status by a
+                # SIGCHLD-ignoring host process -- so the parent requires this
+                # line, and gets the child's own write time with it.
+                os.write(write_fd, f"ok {time.monotonic() - write_started:.1f}".encode())
             except BaseException:                       # noqa: BLE001 - reported over the pipe
                 status = 1
                 try:
@@ -210,17 +222,26 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             os._exit(status)
 
         os.close(write_fd)                              # parent
+        print(f"[ckpt-write] rank {self.rank}: forked writer pid {pid} started", flush=True)
         self._pending_save = ("fork", pid, read_fd, writes, local_path, time.monotonic())
         return True
 
     def _reap_forked_write(self, pid, err_fd, writes, path):
-        """Wait for the child, and write the shards here if it did not.
+        """Wait for the child; return its self-reported write seconds, or rewrite.
 
-        Any failure -- a non-zero exit, a signal, or a child that never finishes
-        -- ends the same way: the fork path is disabled for the rest of the run
-        and this thread writes the shards synchronously. The checkpoint is what
-        matters, and degrading to a synchronous write is exactly the behaviour
-        async_save started from. Only a failure of that rewrite is worth raising.
+        Success is the ``ok <seconds>`` line on the pipe, not the exit status.
+        The status can be fabricated -- a host process that ignores SIGCHLD robs
+        waitpid of the real one -- and an exit status says nothing about whether
+        the shards actually landed; the receipt is written by the child after
+        ``_write_shards`` returns, so it can only exist if they did.
+
+        Any failure -- no receipt, a non-zero exit, a signal, or a child that
+        never finishes -- ends the same way: the fork path is disabled for the
+        rest of the run and this thread writes the shards synchronously (None is
+        returned; the caller's duration then reflects that rewrite). The
+        checkpoint is what matters, and degrading to a synchronous write is
+        exactly the behaviour async_save started from. Only a failure of that
+        rewrite is worth raising.
         """
         deadline = time.monotonic() + _FORK_TIMEOUT_S
         interval = 0.01
@@ -260,17 +281,24 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         except OSError:
             pass
 
-        failed = timed_out or status is None or not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
-        if not failed:
-            return
+        receipt = detail.startswith("ok ")
+        dirty_exit = status is not None and not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
+        if receipt and not timed_out and not dirty_exit:
+            try:
+                return float(detail.split()[1])
+            except (IndexError, ValueError):
+                return None
 
         self._fork_broken = True
-        warnings.warn(
-            f"[rank-{self.rank}]: forked checkpoint writer failed ({detail or f'status {status}'}); "
-            f"writing {path} on this thread and using the writer thread from now on",
-            stacklevel=2,
+        message = (
+            f"[ckpt-write] rank {self.rank}: forked checkpoint writer failed "
+            f"({detail or f'status {status}'}); writing {path} on this thread "
+            "and using the writer thread from now on"
         )
+        print(message, flush=True)
+        warnings.warn(message, stacklevel=2)
         _write_shards(writes)
+        return None
 
     def wait_for_pending_save(self):
         """Block until the background write finishes; re-raise what it caught.
@@ -290,17 +318,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         path = None
         if pending is not None:
             started = pending[-1]
+            write_seconds = None
             if pending[0] == "fork":
                 _, pid, err_fd, writes, path, _ = pending
-                self._reap_forked_write(pid, err_fd, writes, path)
+                write_seconds = self._reap_forked_write(pid, err_fd, writes, path)
             else:
                 _, thread, path, _ = pending
                 thread.join()
-            # The one number that says whether the writer is contending with the
-            # training loop. Solo it is ~178 s; sharing the GIL with the next
-            # step stretched it to ~760 s (both sides slow each other down), so
-            # this reads as a verdict without waiting for a wandb query.
-            self.last_write_seconds = time.monotonic() - started
+                write_seconds = self._thread_write_seconds
+            # Two different numbers, and the first probe confused them: the time
+            # the writer spent writing (the child's or the thread's own clock),
+            # and the time from start to this flush -- which is roughly a whole
+            # step regardless of the write, because the flush only runs here.
+            # The 500 s the first probe printed was the second number wearing
+            # the first one's label.
+            flush_after = time.monotonic() - started
+            self.last_write_seconds = write_seconds if write_seconds is not None else flush_after
             # Names what actually wrote the shards. A fork whose child died was
             # rewritten here, and calling that "fork" would hide the one event
             # worth noticing in a log.
@@ -309,7 +342,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 self.last_writer_kind = "fork-failed-rewritten-by-parent"
             print(
                 f"[ckpt-write] rank {self.rank}: {self.last_writer_kind} writer finished "
-                f"{os.path.basename(str(path))} in {self.last_write_seconds:.1f} s",
+                f"{os.path.basename(str(path))}: write {self.last_write_seconds:.1f} s, "
+                f"start-to-flush {flush_after:.1f} s",
                 flush=True,
             )
         error, self._pending_error = self._pending_error, None

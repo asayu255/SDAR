@@ -266,3 +266,64 @@ def test_a_repaired_write_is_not_reported_as_a_fork(tmp_path, monkeypatch):
         m.wait_for_pending_save()
 
     assert m.last_writer_kind == "fork-failed-rewritten-by-parent"
+
+
+def test_the_reported_write_time_is_the_childs_not_the_flush_wait(tmp_path, monkeypatch):
+    """The first probe printed 500 s writes that were really ~200 s of writing.
+
+    start-to-flush is roughly a whole step no matter what the write did, because
+    the flush only runs at the step boundary. The number worth acting on is the
+    writer's own clock, which the child sends back on its receipt -- so a slow
+    parent must not inflate it.
+    """
+    m = _manager()
+    parent = os.getpid()
+    real = mod._write_shards
+
+    def _measured(w):
+        if os.getpid() != parent:
+            time.sleep(0.3)
+        return real(w)
+
+    monkeypatch.setattr(mod, "_write_shards", _measured)
+
+    m._start_async_write(_writes(tmp_path), str(tmp_path))
+    time.sleep(1.0)                      # the "step" the parent runs meanwhile
+    m.wait_for_pending_save()
+
+    assert 0.2 <= m.last_write_seconds <= 0.9, (
+        f"reported {m.last_write_seconds:.2f} s; the child slept 0.3 s while the "
+        "flush came 1.0 s after the start -- a value near 1.0 means the flush "
+        "wait got the write's label again"
+    )
+
+
+def test_a_clean_exit_without_the_receipt_is_a_failure(tmp_path, monkeypatch):
+    """Exit status 0 is not proof the shards were written.
+
+    waitpid can be robbed of the real status by a SIGCHLD-ignoring host process,
+    and a child that died before writing anything can still look clean. The
+    receipt is written after _write_shards returns, so requiring it means
+    "success" can only be claimed when the files exist.
+    """
+    m = _manager()
+    parent = os.getpid()
+    real = mod._write_shards
+    writes = _writes(tmp_path)
+
+    def _die_cleanly_in_the_child(w):
+        if os.getpid() != parent:
+            os._exit(0)                  # clean status, nothing written, no receipt
+        return real(w)
+
+    monkeypatch.setattr(mod, "_write_shards", _die_cleanly_in_the_child)
+
+    m._start_async_write(writes, str(tmp_path))
+    with pytest.warns(UserWarning, match="forked checkpoint writer failed"):
+        m.wait_for_pending_save()
+
+    for state, p in writes:
+        assert torch.equal(torch.load(p, weights_only=False)["w"], state["w"]), (
+            "the parent must rewrite when the receipt is missing"
+        )
+    assert m._fork_broken is True

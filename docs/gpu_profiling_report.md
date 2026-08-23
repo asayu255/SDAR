@@ -1437,3 +1437,31 @@ torch.save が訓練ループと GIL を奪い合い、297 s の step を 420〜
   コストは save ごとではなく**一度きり**。書き直しも失敗した場合だけ raise。
 * **判定** —— `CKPT_FORK_WRITER=0` との A/B。post-save step の
   `timing_s/update_actor_worker` が 420〜519 s から ~297 s に戻れば成功。
+
+#### プローブ結果（run nbq51imk、save_freq=1）: fork は勝っていた。子が一度死んだだけ
+
+| step | worker 時間 | mfu | 何が起きていたか |
+| --- | --- | --- | --- |
+| 1 | 310 s | 0.341 | save なし（クリーン） |
+| **2** | **305 s** | **0.339** | **fork の子が横で書いていた —— 汚染ゼロ** |
+| 2 の flush | +200 s | —— | 子が死んでいた: 親が同期で書き直し、fork 自己無効化 |
+| 3〜16 | 426〜512 s | 0.202〜0.215 | 以後すべて thread writer = 既知の GIL 競合 |
+
+**step 2 が偶然の A/B になった。** プロセス外の writer が横で走った唯一の
+step は素の 297〜310 s / mfu 0.34 で、汚染が完全に消えている。機構の主張
+（GIL を共有しなければ競合は消える）はこれで実測済み。残る問題は
+「子がなぜ即死したか」だけで、その traceback は最初の save の
+`forked checkpoint writer failed (...)` 行に印字されている。
+
+stall watch は thread 側の機構も特定した: save ごとに **~75 s と ~122 s の
+2 本のホスト停止**が step 先頭の micro-batch に着地する（合計 ~197 s ≈ solo
+書き込み時間）。つまり `torch.save` はファイル 1 本のシリアライズの間
+実質ずっと GIL を握り、**thread の「async」は同期 save を次の step の頭に
+塗り付けているだけ**である。rank によって idle 16% と 1.7% に割れるのは、
+同じ停止が最初の micro の「前」に落ちるか「中」に落ちるかの分類差にすぎない。
+
+計測側の訂正: 最初のプローブの `[ckpt-write] ... in 500 s` は書き込み時間
+ではなく **start-to-flush**（flush は step 境界でしか走らないので、書き込みが
+何をしようと ~1 step になる）だった。現在は writer 自身の時計を報告する
+（fork の子は receipt に載せて返し、この receipt が無い限り exit 0 でも
+失敗扱いで親が書き直す）。

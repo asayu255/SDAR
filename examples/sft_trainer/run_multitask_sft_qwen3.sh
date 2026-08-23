@@ -217,11 +217,19 @@ set -x
 #
 # Read the verdict from two lines:
 #
-#   [ckpt-write] rank 0: fork writer finished global_step_5 in 176.3 s
-#     ~178 s   the writer has the disk to itself -- no contention
-#     ~760 s   it is fighting the training loop for the GIL
-#     "fork-failed-rewritten-by-parent" means the child died and the parent
-#     rewrote the shards; the fork path is then off for the rest of the run.
+#   [ckpt-write] rank 0: fork writer finished actor: write 183.2 s, start-to-flush 501.0 s
+#     "write" is the writer's own clock (the fork child reports it on its
+#     receipt); start-to-flush is roughly a whole step no matter what the write
+#     did, because the flush only runs at the step boundary -- the first probe
+#     printed that number under the write's label and read 500 s writes that
+#     were really ~200 s.
+#     "fork writer"  + normal step times = the fix working.
+#     "thread writer" = the fork died at the first save and disabled itself;
+#     the reason was printed at that save ("could not fork ..." or "forked
+#     checkpoint writer failed (<child traceback>)"). Under the thread expect
+#     two host-blocked stalls per save (~75 s model + ~122 s optim: torch.save
+#     holds the GIL for effectively the whole per-file serialization), which
+#     the [stall] lines show as 75 s / 122 s micro-batches.
 #
 #   [step-gpu] rank 0 step 6: ... in-micro 290 s ...
 #     compare against steps 7-9. Equal is the fix working; 420-519 s against a
