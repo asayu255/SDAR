@@ -140,6 +140,12 @@ class _Offload:
         self.pairs = []             # (device snapshot, host mirror) for the side stream
 
     def stage(self, tensor, name):
+        if type(tensor) is not torch.Tensor:
+            # Tensor subclasses carry placement and dispatch rules a plain
+            # buffer cannot receive: DTensor refuses plain.copy_(dtensor)
+            # outright. Let the subclass move itself rather than crash a save
+            # -- slower, and correct for anything FSDP hands back.
+            return tensor.detach().cpu()
         host = _slot(self.mirror, name, tensor, pin=True)
         if self.snapshot is None:
             host.copy_(tensor)
@@ -717,15 +723,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         # every rank will save its own model and optim shard.
         #
-        # Under async_save the model's offload_to_cpu is OFF, deliberately: the
-        # measured breakdown (run 46o9xef3) was model build 3.0-3.5 s -- almost
-        # all of it FSDP's own per-tensor pageable D2H -- against 1.7-1.9 s for
-        # the walk moving 4.6 GB through the reused mirror. Letting state_dict
-        # return device tensors and the walk below carry them into the mirror
-        # does the same copy through recycled pages. The sync path keeps the
-        # stock offload: it has no walk and no mirror.
-        offload_model = is_cuda_available and not self.async_save
-        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=offload_model)
+        # The model keeps offload_to_cpu ON. Turning it off to route the model
+        # through the walk below looked like a 3 s win and was a crash: FSDP1's
+        # sharded model state dict is DTensors, and a plain reusable buffer
+        # cannot receive one -- "aten.copy_.default: got mixed torch.Tensor and
+        # DTensor" (run ke23u52t, all three ranks, first save). Only the
+        # optimizer stragglers reach the walk, and those are plain tensors.
+        # Overlapping the model's D2H needs a DTensor-aware snapshot that
+        # rebuilds the wrapper around a CPU local shard, which is a change to
+        # make against a GPU, not blind.
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

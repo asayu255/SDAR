@@ -601,3 +601,25 @@ class TestOverlappedCopy:
         # _manager builds the object directly, so mirror the constructor's read
         m._snapshot_ok = mod._SNAPSHOT_OFFLOAD
         assert m._snapshot_ok is False
+
+
+def test_a_tensor_subclass_never_reaches_the_plain_buffer():
+    """The crash on run ke23u52t: FSDP1's sharded model state dict is DTensors,
+    and ``plain_buffer.copy_(dtensor)`` raises rather than copying. Anything
+    that is not exactly a torch.Tensor has to move itself."""
+
+    class _Exotic(torch.Tensor):
+        """Stands in for DTensor: refuses to be the source of a plain copy_."""
+
+        moved = False
+
+        def detach(self):
+            type(self).moved = True
+            return torch.zeros(3)
+
+    offload = mod._Offload({}, {})
+    out = offload.stage(_Exotic(), "model.layers.0.weight")
+
+    assert _Exotic.moved, "the subclass must do its own move"
+    assert offload.pairs == [], "and must not be queued onto the side stream"
+    assert type(out) is torch.Tensor
