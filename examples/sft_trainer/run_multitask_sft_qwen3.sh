@@ -135,6 +135,11 @@ set -x
 # runs on a background thread over those CPU copies, and the training loop goes
 # straight on to the next step.
 #
+# FIXED (run emz6kvo7, forked writer): saves beside training now cost only the
+# ~7 s staging (first one ~20 s) -- worker 302-307 s / mfu 0.34 with a save
+# EVERY step. The paragraph below describes the writer-thread behaviour that
+# CKPT_FORK_WRITER=0 restores, kept because it is the measured baseline.
+#
 # Not free, though (run bgwezy3k, 11 saves): the writer thread shares the GIL
 # with the training loop, so the step after each save runs at ~420-519 s
 # against a 297 s median while the write stretches from its ~178 s solo time to

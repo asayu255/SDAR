@@ -1488,3 +1488,33 @@ RuntimeError: CUDA error: initialization error
 `[ckpt-write] rank N: moved K tensors (M MB) ... (model.buffers....)` と
 名前つきで印字されるので、次のプローブで「offload が何を取りこぼすか」も
 記録として残る。子はもうデバイスに触る理由が構造的に無い。
+
+#### プローブ 2（run emz6kvo7）: fork writer 動作確認、checkpoint 問題は解決
+
+```
+[ckpt-write] rank 0: moved 58 tensors (4588 MB) that offload_to_cpu left on
+              the device (optim.state.0.exp_avg, optim.state.0.exp_avg_sq, ...)
+[ckpt-write] rank 0: forked writer pid 1359587 started
+[ckpt-write] rank 0: fork writer finished actor: write 193.7 s, start-to-flush 317.9 s
+```
+
+**取りこぼしの正体は Adam の状態全部**だった。58 tensor / 4.6 GB —— この
+FSDP1 + shard_grad_op の経路では `ShardedOptimStateDictConfig(offload_to_cpu=
+True)` が optimizer state をまったく CPU に落としておらず、model 側ではなく
+optim 側が丸ごと GPU に残っていた。thread writer は毎 save これを黙って
+D2H しながら書いていたことになる。staging の走査がこれを名前つきで捕まえ、
+移してから writer に渡すので、子はもう死なない。
+
+| | probe 1（thread） | probe 2（fork） |
+| --- | --- | --- |
+| save と重なる step の worker | 426〜512 s | **302〜307 s** |
+| 同 mfu | 0.202〜0.215 | **0.341〜0.344** |
+| 書き込み自体（writer の時計） | 〜197 s（GIL 停止として） | 193.7 s（別プロセスで無害） |
+| 75 s / 122 s のホスト停止 | 毎 save 2 本 | **なし** |
+
+毎 step save（save_freq=1）でも worker が素の 302 s / mfu 0.34 —— probe 1 の
+step 2 で一瞬見えた「プロセス外 writer なら汚染ゼロ」が全 step で再現した。
+
+残るコストは staging だけ: 初回 20.4 s（state dict 初構築）、以後 ~7 s/save。
+save_freq=25 の本番換算で **~0.03%**（修正前 2.25%）。checkpoint の項は
+これで閉じる。
