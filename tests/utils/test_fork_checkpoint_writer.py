@@ -408,3 +408,35 @@ class TestFinishOffload:
         assert device == "cuda:0"
         assert isinstance(out["buffers"]["rope"], torch.Tensor)
         assert out["buffers"]["rope"].device.type == "cpu"
+
+
+def test_the_mirror_reuses_memory_across_saves():
+    """The stragglers are ~4.6 GB per save; a fresh pageable allocation each
+    time pays a page fault per copied page. The mirror must hand back the SAME
+    memory on the second save -- and must refuse to reuse a slot whose shape
+    changed, because a silently truncating copy corrupts the checkpoint."""
+    import collections
+
+    mirror = {}
+    first = mod._into_mirror(torch.arange(8, dtype=torch.float32), "optim.state.0.exp_avg", mirror)
+    second = mod._into_mirror(torch.arange(8, 16, dtype=torch.float32), "optim.state.0.exp_avg", mirror)
+
+    assert second.data_ptr() == first.data_ptr(), "second save must reuse the first save's pages"
+    assert torch.equal(second, torch.arange(8, 16, dtype=torch.float32)), "and carry the new values"
+
+    reshaped = mod._into_mirror(torch.zeros(4), "optim.state.0.exp_avg", mirror)
+    assert reshaped.data_ptr() != first.data_ptr(), "a shape change must abandon the slot, not truncate into it"
+    assert reshaped.shape == torch.Size([4])
+
+
+def test_the_walk_threads_the_mirror_through_nesting():
+    mirror = {}
+    state = {"state": {"0": {"exp_avg": torch.ones(4)}}}
+    moved = []
+    out1 = mod._finish_offload_to_cpu(state, moved, "optim", mirror)
+    # CPU tensors pass through untouched, so nothing lands in the mirror here --
+    # the CUDA branch is what feeds it, exercised on the GPU box. What must hold
+    # in CI is that passing a mirror changes nothing for already-CPU content.
+    assert moved == []
+    assert out1["state"]["0"]["exp_avg"] is state["state"]["0"]["exp_avg"]
+    assert mirror == {}

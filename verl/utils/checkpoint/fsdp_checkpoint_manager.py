@@ -67,7 +67,7 @@ def _write_shards(writes):
         torch.save(state_dict, path)
 
 
-def _finish_offload_to_cpu(obj, moved, name):
+def _finish_offload_to_cpu(obj, moved, name, mirror=None):
     """Return ``obj`` with every tensor on CPU, recording what had to move.
 
     ``offload_to_cpu`` on the sharded state-dict configs moves the sharded
@@ -88,27 +88,47 @@ def _finish_offload_to_cpu(obj, moved, name):
     holds these copies.
     """
     if _ShardedTensor is not None and isinstance(obj, _ShardedTensor):
-        for shard in obj.local_shards():
+        for index, shard in enumerate(obj.local_shards()):
             if shard.tensor.device.type != "cpu":
-                moved.append((f"{name}<shard>", str(shard.tensor.device),
+                moved.append((f"{name}<shard{index}>", str(shard.tensor.device),
                               shard.tensor.numel() * shard.tensor.element_size()))
-                shard.tensor = shard.tensor.detach().cpu()
+                shard.tensor = _into_mirror(shard.tensor, f"{name}<shard{index}>", mirror)
         return obj
     if isinstance(obj, torch.Tensor):
         if obj.device.type == "cpu":
             return obj
         moved.append((name, str(obj.device), obj.numel() * obj.element_size()))
-        return obj.detach().cpu()
+        return _into_mirror(obj, name, mirror)
     if isinstance(obj, dict):
-        return {key: _finish_offload_to_cpu(value, moved, f"{name}.{key}") for key, value in obj.items()}
+        return {key: _finish_offload_to_cpu(value, moved, f"{name}.{key}", mirror) for key, value in obj.items()}
     if isinstance(obj, torch.Size):
         return obj
     if isinstance(obj, tuple):
-        items = [_finish_offload_to_cpu(value, moved, f"{name}[{i}]") for i, value in enumerate(obj)]
+        items = [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", mirror) for i, value in enumerate(obj)]
         return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
     if isinstance(obj, list):
-        return [_finish_offload_to_cpu(value, moved, f"{name}[{i}]") for i, value in enumerate(obj)]
+        return [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", mirror) for i, value in enumerate(obj)]
     return obj
+
+
+def _into_mirror(tensor, name, mirror):
+    """Copy ``tensor`` to CPU, into the same memory as last save when possible.
+
+    A fresh 4.6 GB pageable allocation is paid for in page faults as the copy
+    touches each new page; the mirror pays that once, on the first save. A slot
+    is keyed by name and replaced if the shape or dtype ever changes (it should
+    not -- optimizer state is fixed once allocated -- but a stale-shaped slot
+    silently truncating a tensor would corrupt the checkpoint, which is worse
+    than an allocation).
+    """
+    if mirror is None:
+        return tensor.detach().cpu()
+    slot = mirror.get(name)
+    if slot is None or slot.shape != tensor.shape or slot.dtype != tensor.dtype:
+        slot = torch.empty_like(tensor, device="cpu")
+        mirror[name] = slot
+    slot.copy_(tensor)
+    return slot
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -180,6 +200,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         self.last_write_seconds = None   # the writer's own time on the write
         self.last_writer_kind = None     # "fork" or "thread", for the same line
         self._thread_write_seconds = None
+        # Persistent CPU destinations for the offload walk, keyed by tensor
+        # name. The stragglers are ~4.6 GB of Adam state, and allocating fresh
+        # pageable memory for them on every save costs page faults on every
+        # copied byte; reusing the same pages does not. Safe to reuse because
+        # save_checkpoint joins the pending write before staging again -- the
+        # writer (thread or forked child) is finished with these pages before
+        # anything overwrites them.
+        self._offload_mirror = {}
 
     def _start_async_write(self, writes, local_path: str):
         """Hand the staged shards to a forked child (or a thread) and return.
@@ -523,8 +551,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+                stage_started = time.perf_counter()
                 model_state_dict = self.model.state_dict()
+                model_built = time.perf_counter()
                 optimizer_state_dict = self.optimizer.state_dict() if self.optimizer is not None else None
+                optim_built = time.perf_counter()
                 lr_scheduler_state_dict = self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
 
                 extra_state_dict = {
@@ -545,10 +576,12 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 ]
                 if self.async_save:
                     moved = []
+                    walk_started = time.perf_counter()
                     writes = [
-                        (_finish_offload_to_cpu(state, moved, kind), target)
+                        (_finish_offload_to_cpu(state, moved, kind, self._offload_mirror), target)
                         for (state, target), kind in zip(writes, ("model", "optim", "extra"))
                     ]
+                    walk_done = time.perf_counter()
                     if moved:
                         sample = ", ".join(entry[0] for entry in moved[:4])
                         if len(moved) > 4:
@@ -560,6 +593,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                             flush=True,
                         )
                     self._start_async_write(writes, local_path)
+                    # The staging is the whole GPU-idle window a save costs now
+                    # (the write itself left the process), so where its seconds
+                    # go decides what to shrink next: "build" is FSDP
+                    # assembling the state dicts -- collectives, must stay on
+                    # this thread -- and "offload" is the D2H walk above, which
+                    # the mirror is meant to keep at copy speed.
+                    print(
+                        f"[ckpt-write] rank {self.rank}: staged in "
+                        f"{time.perf_counter() - stage_started:.1f} s "
+                        f"(model build {model_built - stage_started:.1f}, "
+                        f"optim build {optim_built - model_built:.1f}, "
+                        f"offload walk {walk_done - walk_started:.1f})",
+                        flush=True,
+                    )
                 else:
                     _write_shards(writes)
 
