@@ -135,6 +135,16 @@ set -x
 # runs on a background thread over those CPU copies, and the training loop goes
 # straight on to the next step.
 #
+# Not free, though (run bgwezy3k, 11 saves): the writer thread shares the GIL
+# with the training loop, so the step after each save runs at ~420-519 s
+# against a 297 s median while the write stretches from its ~178 s solo time to
+# ~760 s beside training. The driver's flush then blocks ~290 s, but the
+# pipeline has already dispatched the next step, so that wait costs almost no
+# GPU time -- the whole 4-step window works out to ~186 s of excess per save,
+# 2.25% of the run at save_freq=25. Halve save_freq to halve it; removing it
+# means writing from outside the process (a forked writer), since sync save is
+# worse (198 s x 12 = 2.6%) and the contention follows the GIL, not the disk.
+#
 # The same bytes land in the same files; what moves is when. The one visible
 # consequence is that latest_checkpointed_iteration.txt is published a step late,
 # by _flush_pending_checkpoint, because a tracker written before the shards are on

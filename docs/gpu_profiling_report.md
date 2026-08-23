@@ -1364,3 +1364,52 @@ Nsight のキャプチャ（step 1 で 30 秒のノード全停止、その step
 21.9 秒、3 rank 同時、中央値の 274 倍）、そして 0.2 秒サンプラーの
 `GPU_PROFILER_SYNC_PHASES`。**observer effect は仮説ではなく、この arm では
 実測で最大のイベントである。**
+
+### 9.14 checkpoint の本当のコスト —— 6.02% ではなく 2.25%、そして場所が違った
+
+run bgwezy3k（300 step、save_freq=25、async_save=True、11 save）の実測。
+
+最初の集計は「save の次の step が 781 s（median 297 s）」を見て
+**6.02%** と読んだが、これは二重計上だった。save の 2 つ後の step は
+driver 視点で **1 秒**しかない:
+
+| step | step_s | ua(driver) | ua(worker) | mfu |
+| --- | --- | --- | --- | --- |
+| 25 (save) | 304 | 282 | 283 | 0.346 |
+| 26 | 763 | 474 | **420** | 0.245 |
+| **27** | **1** | **1** | 289 | 0.345 |
+| 28 | 286 | 286 | 287 | 0.346 |
+
+pipeline は save の次の step に barrier を張らないので、step 27 は
+get(26) の前に dispatch 済みで、**driver が flush（wait_for_checkpoint）で
+~290 s 待つ間、worker は step 27 を普通に走らせている**。flush の待ちは
+ほぼ無料である。fast step を含めた 4-step 窓で数え直すと:
+
+```
+真の超過 = 186 s/save × 11 = 2,050 s = run の 2.25%
+```
+
+コストの ~90% は **update 26 の worker 内**にある: 背景スレッドの
+torch.save が訓練ループと GIL を奪い合い、297 s の step を 420〜519 s に
+膨らませる。書き込み自体も solo の ~178 s から **~760 s** に伸びる
+（双方向に遅くなる）。
+
+**汚染は書き込みの全期間ではなく、シリアライズ相だけで起きる。**
+書き込みスレッドは step 27 にも跨って生きているのに、27 の worker 時間は
+289 s と median より速い —— pure-I/O の尾部（GIL を放す）では訓練が
+全く遅くならない。この署名は原因が disk でも memory 帯域でもなく
+**GIL** であることを指す。
+
+打ち手の評価:
+
+* **sync save に戻す —— 悪化。** 198 s × 12 = 2.6% > 2.25%。async は
+  既に sync より良い。
+* **save_freq=50 —— 半減のみ**（2.25% → 1.1%）。
+* **プロセス分離（fork writer）—— 構造的に効くが無条件ではない。**
+  spawn は ShardedTensor を渡せない（平坦化はファイル形式が変わり
+  resume と eval_checkpoints.sh が壊れる）ので fork になるが、この
+  worker は CUDA・NCCL watchdog・vLLM のスレッドを抱えており、fork 時
+  ロック保持でデッドロックする尾部リスクがある。**timeout + 同期書き
+  直しのフォールバックが必須。** 成功すれば理論値は staging の
+  3.5〜22 s/save だけが残り、2.25% → ~0.2%。判定はいつも通り A/B:
+  実装後に post-save step の worker 時間が ~297 s に戻るかどうか。

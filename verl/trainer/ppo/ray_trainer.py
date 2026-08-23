@@ -1137,9 +1137,19 @@ class RayPPOTrainer:
 
         Call this after the step's compute rather than before it: the write is
         what the compute is meant to hide, and joining first would hand back
-        exactly the time async_save saves. Measured, the write is ~178 s of a
-        ~415 s step, so by the end of the next step it has long finished and this
-        costs nothing.
+        exactly the time async_save saves.
+
+        What it actually costs, measured on run bgwezy3k (11 saves): the block
+        here is long (~290 s -- beside training the write stretches to ~760 s,
+        not the ~178 s it takes solo) but nearly free, because the pipeline has
+        already dispatched the following step and the workers run it while this
+        thread waits; that step's own get() then returns in ~1 s. The real cost
+        of the async write is upstream of here: the writer thread contends with
+        the training loop inside the worker, inflating the post-save step from
+        ~297 s to 420-519 s. Net over a 4-step window: ~186 s per save, 2.25%
+        of that run. The contention shows only while the writer serializes (the
+        step overlapping its pure-I/O tail is not slowed at all), which points
+        at the GIL rather than the disk.
 
         A trainer that enables async_save without calling this still stays
         correct: the next _save_checkpoint joins before staging, so the tracker
