@@ -1413,3 +1413,27 @@ torch.save が訓練ループと GIL を奪い合い、297 s の step を 420〜
   直しのフォールバックが必須。** 成功すれば理論値は staging の
   3.5〜22 s/save だけが残り、2.25% → ~0.2%。判定はいつも通り A/B:
   実装後に post-save step の worker 時間が ~297 s に戻るかどうか。
+
+#### 実装: forked checkpoint writer
+
+`verl/utils/checkpoint/fsdp_checkpoint_manager.py`。`_start_async_write` が
+`threading.Thread` の代わりに `os.fork()` する（`CKPT_FORK_WRITER=1`、既定）。
+
+* **なぜ fork で spawn ではないか** —— spawn は state dict を pickle して
+  pipe で送る必要があり、それは避けたい作業そのもの。`ShardedTensor` は
+  shm 越しに渡せず、平坦化はファイル形式を変えて resume と
+  `eval_checkpoints.sh` を壊す。fork は copy-on-write なので**転送も
+  コピーも起きない**（子は読むだけなのでデータページは複製されず、
+  増えるのは Python オブジェクトヘッダの refcount 分だけ）。
+* **子がしてはいけないこと** —— fork 後の子には fork を呼んだスレッド
+  しか存在しないので、他スレッドがその瞬間に握っていたロックは永久に
+  解放されない。子は logging も CUDA も NCCL も Ray も触らず、
+  **`os._exit`** で抜ける（`sys.exit` だと atexit が走り、親がまだ所有
+  している CUDA コンテキストや stdio バッファを壊しにいく）。
+* **フォールバックが本体の安全装置** —— 非ゼロ終了・シグナル・
+  `CKPT_FORK_TIMEOUT_S`（既定 900 s）超過のいずれでも、子を SIGKILL し、
+  **親が同期的にシャードを書き直してから** flush を返す。同時に fork 経路を
+  run の残り全部で無効化するので、万一 fork が壊れている環境でも
+  コストは save ごとではなく**一度きり**。書き直しも失敗した場合だけ raise。
+* **判定** —— `CKPT_FORK_WRITER=0` との A/B。post-save step の
+  `timing_s/update_actor_worker` が 420〜519 s から ~297 s に戻れば成功。

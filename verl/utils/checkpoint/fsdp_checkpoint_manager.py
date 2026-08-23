@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import os
+import signal
 import threading
+import time
+import traceback
 import warnings
 from typing import Optional, Union
 
@@ -29,6 +32,28 @@ from verl.utils.fs import copy_to_local, is_non_local
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_state_ctx
 
 from .checkpoint_manager import BaseCheckpointManager
+
+
+# A background *thread* writing the checkpoint shares the GIL with the training
+# loop, and torch.save holds it for as long as it is pickling. Measured on run
+# bgwezy3k, that inflates the step after each save from a 297 s median to
+# 420-519 s -- 186 s of excess per save, 2.25% of the run. Writing from a forked
+# child removes the contention by construction: a separate interpreter has a
+# separate GIL, and fork's copy-on-write means the staged shards are not copied
+# or transferred, only read.
+#
+# Off with CKPT_FORK_WRITER=0, which restores the thread and is the A/B for
+# whether this helped. Also skipped where os.fork does not exist.
+_FORK_WRITER = os.environ.get("CKPT_FORK_WRITER", "1").lower() not in ("0", "false", "no", "")
+# How long wait_for_pending_save() will wait before it gives up on the child and
+# writes the shards itself. Generous on purpose: it is only reached a whole step
+# after the fork (~300 s), by which point a healthy write (~178 s solo) is long
+# done, so this fires only for a child that is stuck rather than slow.
+_FORK_TIMEOUT_S = float(os.environ.get("CKPT_FORK_TIMEOUT_S", "900"))
+
+
+def fork_writer_enabled() -> bool:
+    return _FORK_WRITER and hasattr(os, "fork")
 
 
 def _write_shards(writes):
@@ -94,19 +119,35 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 "(offload_to_cpu), which is only used on CUDA; saving synchronously",
                 stacklevel=2,
             )
-        self._pending_save = None   # (thread, path) of the write still in flight
+        # ("thread", thread, path) or ("fork", pid, err_fd, writes, path)
+        self._pending_save = None
         self._pending_error = None  # exception it died with, re-raised on the main thread
+        # One fork failure disables the fork path for the rest of the run. A
+        # process carrying CUDA, NCCL-watchdog and vLLM threads can fork a child
+        # that deadlocks on a lock no surviving thread will release, and paying
+        # the timeout once per save for the rest of a 300-step run would be far
+        # worse than the contention this is trying to remove.
+        self._fork_broken = False
 
     def _start_async_write(self, writes, local_path: str):
-        """Hand the staged shards to a background thread and return.
+        """Hand the staged shards to a forked child (or a thread) and return.
 
         ``writes`` holds CPU copies produced by the offload_to_cpu state dict, so
-        the thread reads memory the training loop no longer touches. It runs no
+        the writer reads memory the training loop no longer touches. It runs no
         collective and issues no device work, which is what makes it safe to run
         beside the next step -- a barrier from here would be a second thread
         entering NCCL and is exactly what this must not do.
+
+        A forked child is preferred because a thread does not actually get the
+        write off the critical path: it holds the GIL while pickling, so the next
+        step's kernel launches -- which are Python calls -- stall behind it. The
+        child has its own interpreter and cannot do that. The thread remains as
+        the fallback, and is what CKPT_FORK_WRITER=0 selects.
         """
         assert self._pending_save is None, "a checkpoint write is already in flight"
+
+        if fork_writer_enabled() and not self._fork_broken and self._start_forked_write(writes, local_path):
+            return
 
         def _run():
             try:
@@ -117,8 +158,117 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         thread = threading.Thread(
             target=_run, name=f"ckpt-write-rank{self.rank}", daemon=True
         )
-        self._pending_save = (thread, local_path)
+        self._pending_save = ("thread", thread, local_path)
         thread.start()
+
+    def _start_forked_write(self, writes, local_path: str) -> bool:
+        """Fork a child that writes the shards and exits. True if it started.
+
+        The child must touch nothing that belongs to the threads it did not
+        inherit. Only the forking thread survives a fork, so any lock another
+        thread held at that instant stays locked forever in the child -- which is
+        why the child does no logging, no CUDA, no NCCL, no Ray, and leaves via
+        ``os._exit`` so that no atexit handler runs and tries to tear down a CUDA
+        context or flush a stdio buffer this process still owns.
+
+        ``writes`` stays referenced by the parent as well. Copy-on-write means the
+        child reads the same physical pages rather than copying ~20 GB, and the
+        parent needs them anyway to rewrite the shards itself if the child fails.
+        """
+        read_fd, write_fd = os.pipe()
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            os.close(read_fd)
+            os.close(write_fd)
+            self._fork_broken = True
+            warnings.warn(
+                f"[rank-{self.rank}]: could not fork a checkpoint writer ({exc!r}); "
+                "falling back to the writer thread",
+                stacklevel=2,
+            )
+            return False
+
+        if pid == 0:                                    # child
+            status = 0
+            try:
+                os.close(read_fd)
+                _write_shards(writes)
+            except BaseException:                       # noqa: BLE001 - reported over the pipe
+                status = 1
+                try:
+                    os.write(write_fd, traceback.format_exc()[-4096:].encode())
+                except BaseException:                   # noqa: BLE001 - nothing left to report with
+                    pass
+            finally:
+                try:
+                    os.close(write_fd)
+                except BaseException:                   # noqa: BLE001
+                    pass
+            os._exit(status)
+
+        os.close(write_fd)                              # parent
+        self._pending_save = ("fork", pid, read_fd, writes, local_path)
+        return True
+
+    def _reap_forked_write(self, pid, err_fd, writes, path):
+        """Wait for the child, and write the shards here if it did not.
+
+        Any failure -- a non-zero exit, a signal, or a child that never finishes
+        -- ends the same way: the fork path is disabled for the rest of the run
+        and this thread writes the shards synchronously. The checkpoint is what
+        matters, and degrading to a synchronous write is exactly the behaviour
+        async_save started from. Only a failure of that rewrite is worth raising.
+        """
+        deadline = time.monotonic() + _FORK_TIMEOUT_S
+        interval = 0.01
+        status = None
+        timed_out = False
+        while True:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:                   # already reaped; treat as success
+                done, status = pid, 0
+            if done:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(interval)
+            interval = min(interval * 2, 0.2)
+
+        detail = ""
+        if timed_out:
+            for sig in (signal.SIGKILL, None):
+                if sig is None:
+                    break
+                try:
+                    os.kill(pid, sig)
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+            detail = f"writer did not finish within {_FORK_TIMEOUT_S:.0f}s"
+        else:
+            try:
+                detail = os.read(err_fd, 65536).decode(errors="replace").strip()
+            except OSError:
+                detail = ""
+        try:
+            os.close(err_fd)
+        except OSError:
+            pass
+
+        failed = timed_out or status is None or not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
+        if not failed:
+            return
+
+        self._fork_broken = True
+        warnings.warn(
+            f"[rank-{self.rank}]: forked checkpoint writer failed ({detail or f'status {status}'}); "
+            f"writing {path} on this thread and using the writer thread from now on",
+            stacklevel=2,
+        )
+        _write_shards(writes)
 
     def wait_for_pending_save(self):
         """Block until the background write finishes; re-raise what it caught.
@@ -127,15 +277,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         flight. Safe to call at any time, including when ``async_save`` is off.
 
         Callers must reach this before treating a checkpoint as complete. A
-        failure that is only recorded on the writer thread would otherwise let a
-        run finish reporting success with no usable checkpoint on disk, which is
-        the failure mode this whole mechanism could plausibly introduce.
+        failure that is only recorded on the writer would otherwise let a run
+        finish reporting success with no usable checkpoint on disk, which is the
+        failure mode this whole mechanism could plausibly introduce. With the
+        forked writer that guarantee is stronger rather than weaker: a child that
+        fails or hangs is rewritten here before this returns, so the shards exist
+        by the time anyone can act on them.
         """
         pending, self._pending_save = self._pending_save, None
         path = None
         if pending is not None:
-            thread, path = pending
-            thread.join()
+            if pending[0] == "fork":
+                _, pid, err_fd, writes, path = pending
+                self._reap_forked_write(pid, err_fd, writes, path)
+            else:
+                _, thread, path = pending
+                thread.join()
         error, self._pending_error = self._pending_error, None
         if error is not None:
             raise RuntimeError(

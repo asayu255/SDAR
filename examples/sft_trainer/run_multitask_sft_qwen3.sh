@@ -141,9 +141,20 @@ set -x
 # ~760 s beside training. The driver's flush then blocks ~290 s, but the
 # pipeline has already dispatched the next step, so that wait costs almost no
 # GPU time -- the whole 4-step window works out to ~186 s of excess per save,
-# 2.25% of the run at save_freq=25. Halve save_freq to halve it; removing it
-# means writing from outside the process (a forked writer), since sync save is
-# worse (198 s x 12 = 2.6%) and the contention follows the GIL, not the disk.
+# 2.25% of the run at save_freq=25. Sync save is worse (198 s x 12 = 2.6%), and
+# halving save_freq only halves it, so the write now happens in a FORKED CHILD
+# (CKPT_FORK_WRITER=1, the default): a separate interpreter has a separate GIL,
+# and copy-on-write means the staged shards are read rather than copied or
+# transferred. Expected to leave only the 3.5-22 s of staging on the save step.
+#
+# CKPT_FORK_WRITER=0 restores the thread exactly and is the A/B: with it on, the
+# step after each save should come back to the ~297 s median instead of
+# 420-519 s. CKPT_FORK_TIMEOUT_S=900 bounds the one real hazard -- forking a
+# process that carries CUDA, NCCL-watchdog and vLLM threads can produce a child
+# deadlocked on a lock no surviving thread will release. A child that fails or
+# hangs is killed, its shards are written by the parent before the flush
+# returns, and the fork path is disabled for the rest of the run, so that costs
+# at most one timeout rather than one per save.
 #
 # The same bytes land in the same files; what moves is when. The one visible
 # consequence is that latest_checkpointed_iteration.txt is published a step late,

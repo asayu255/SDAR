@@ -42,6 +42,21 @@ except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
 
 
+@pytest.fixture(autouse=True)
+def _use_the_writer_thread(monkeypatch):
+    """These tests cover the fallback writer, which is a thread.
+
+    The default writer is a forked child (it does not hold the GIL, so it does
+    not stall the next step's kernel launches). Its own contracts differ enough
+    to need their own file -- a failed child is rewritten by the parent rather
+    than raised, and a threading.Event cannot observe another process -- so they
+    live in tests/utils/test_fork_checkpoint_writer.py. What is checked here is
+    that CKPT_FORK_WRITER=0 still behaves exactly as it always did, which is the
+    A/B those measurements depend on.
+    """
+    monkeypatch.setattr(ckpt_mod, "_FORK_WRITER", False)
+
+
 class _Manager:
     """A checkpoint manager with the real async machinery and no FSDP.
 
@@ -54,6 +69,7 @@ class _Manager:
         self.async_save = True
         self._pending_save = None
         self._pending_error = None
+        self._fork_broken = False
 
     start = FSDPCheckpointManager._start_async_write
     wait = FSDPCheckpointManager.wait_for_pending_save
