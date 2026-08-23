@@ -33,6 +33,11 @@ from verl.utils.fsdp_utils import fsdp_version, get_fsdp_state_ctx
 
 from .checkpoint_manager import BaseCheckpointManager
 
+try:
+    from torch.distributed._shard.sharded_tensor import ShardedTensor as _ShardedTensor
+except Exception:  # pragma: no cover - torch without the sharded-tensor API
+    _ShardedTensor = None
+
 
 # A background *thread* writing the checkpoint shares the GIL with the training
 # loop, and torch.save holds it for as long as it is pickling. Measured on run
@@ -60,6 +65,50 @@ def _write_shards(writes):
     """Pickle each ``(state_dict, path)`` to disk. No device or collective work."""
     for state_dict, path in writes:
         torch.save(state_dict, path)
+
+
+def _finish_offload_to_cpu(obj, moved, name):
+    """Return ``obj`` with every tensor on CPU, recording what had to move.
+
+    ``offload_to_cpu`` on the sharded state-dict configs moves the sharded
+    parameters, but not everything the state dict carries: buffers and other
+    plain tensors can come back still on the device. The writer thread hid that
+    -- ``torch.save`` calls ``storage.cpu()`` itself, a quiet D2H inside the
+    "async" write, device work the design said the writer must never do. The
+    forked child could not hide it: a CUDA context does not survive fork, so its
+    first CUDA call was its last ("CUDA error: initialization error", measured
+    on run nbq51imk, all three ranks, first save). Staging finishes the offload
+    here, on the thread where CUDA works, so the writer -- thread or child --
+    receives tensors it can pickle without touching the device.
+
+    ``moved`` collects ``(name, device, bytes)`` per straggler, so the log can
+    say exactly which tensors offload_to_cpu missed rather than that some did.
+    ShardedTensor is checked before Tensor because it subclasses it, and its
+    local shards are moved in place -- the state dict owns them, nothing else
+    holds these copies.
+    """
+    if _ShardedTensor is not None and isinstance(obj, _ShardedTensor):
+        for shard in obj.local_shards():
+            if shard.tensor.device.type != "cpu":
+                moved.append((f"{name}<shard>", str(shard.tensor.device),
+                              shard.tensor.numel() * shard.tensor.element_size()))
+                shard.tensor = shard.tensor.detach().cpu()
+        return obj
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type == "cpu":
+            return obj
+        moved.append((name, str(obj.device), obj.numel() * obj.element_size()))
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {key: _finish_offload_to_cpu(value, moved, f"{name}.{key}") for key, value in obj.items()}
+    if isinstance(obj, torch.Size):
+        return obj
+    if isinstance(obj, tuple):
+        items = [_finish_offload_to_cpu(value, moved, f"{name}[{i}]") for i, value in enumerate(obj)]
+        return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
+    if isinstance(obj, list):
+        return [_finish_offload_to_cpu(value, moved, f"{name}[{i}]") for i, value in enumerate(obj)]
+    return obj
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -495,6 +544,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     (extra_state_dict, extra_path),
                 ]
                 if self.async_save:
+                    moved = []
+                    writes = [
+                        (_finish_offload_to_cpu(state, moved, kind), target)
+                        for (state, target), kind in zip(writes, ("model", "optim", "extra"))
+                    ]
+                    if moved:
+                        sample = ", ".join(entry[0] for entry in moved[:4])
+                        if len(moved) > 4:
+                            sample += ", ..."
+                        print(
+                            f"[ckpt-write] rank {self.rank}: moved {len(moved)} tensors "
+                            f"({sum(entry[2] for entry in moved) / 1e6:.0f} MB) that "
+                            f"offload_to_cpu left on the device ({sample})",
+                            flush=True,
+                        )
                     self._start_async_write(writes, local_path)
                 else:
                     _write_shards(writes)

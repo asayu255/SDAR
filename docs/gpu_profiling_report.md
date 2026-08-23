@@ -1465,3 +1465,26 @@ stall watch は thread 側の機構も特定した: save ごとに **~75 s と ~
 何をしようと ~1 step になる）だった。現在は writer 自身の時計を報告する
 （fork の子は receipt に載せて返し、この receipt が無い限り exit 0 でも
 失敗扱いで親が書き直す）。
+
+#### 死因判明: offload_to_cpu が残した GPU tensor に torch.save が触った
+
+3 rank とも同一の traceback:
+
+```
+torch.save(state_dict, path)
+  -> _save -> storage = storage.cpu()
+RuntimeError: CUDA error: initialization error
+```
+
+`offload_to_cpu=True` は sharded パラメータを CPU に落とすが、state dict が
+運ぶ全 tensor を落とすわけではない（buffer などの素の tensor が GPU のまま
+戻ってくる）。thread writer は親の CUDA コンテキストを共有するので
+`torch.save` が黙って D2H して動いていた —— つまり **「writer はデバイスに
+触らない」という設計主張は最初から破られていた**。fork の子は CUDA context
+を継承できないので、最初の 1 個で死んだ。
+
+修正: staging（親スレッド、CUDA が使える場所）で state dict を走査して
+残りを CPU へ移してから writer に渡す。動かした tensor は
+`[ckpt-write] rank N: moved K tensors (M MB) ... (model.buffers....)` と
+名前つきで印字されるので、次のプローブで「offload が何を取りこぼすか」も
+記録として残る。子はもうデバイスに触る理由が構造的に無い。

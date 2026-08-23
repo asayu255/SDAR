@@ -226,7 +226,12 @@ set -x
 #     "fork writer"  + normal step times = the fix working.
 #     "thread writer" = the fork died at the first save and disabled itself;
 #     the reason was printed at that save ("could not fork ..." or "forked
-#     checkpoint writer failed (<child traceback>)"). Under the thread expect
+#     checkpoint writer failed (<child traceback>)"). The one instance measured
+#     (run nbq51imk) was torch.save calling storage.cpu() on a tensor
+#     offload_to_cpu had left on the device -- a CUDA call, which a forked
+#     child cannot make. Staging now finishes the offload first and prints
+#     "[ckpt-write] rank N: moved K tensors ..." naming the stragglers, so
+#     that death is gone by construction. Under the thread expect
 #     two host-blocked stalls per save (~75 s model + ~122 s optim: torch.save
 #     holds the GIL for effectively the whole per-file serialization), which
 #     the [stall] lines show as 75 s / 122 s micro-batches.

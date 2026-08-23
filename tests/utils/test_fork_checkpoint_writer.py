@@ -327,3 +327,84 @@ def test_a_clean_exit_without_the_receipt_is_a_failure(tmp_path, monkeypatch):
             "the parent must rewrite when the receipt is missing"
         )
     assert m._fork_broken is True
+
+
+class TestFinishOffload:
+    """The staging pass that made the fork survivable.
+
+    On run nbq51imk the forked child died on its first save, all three ranks:
+    torch.save hit a storage still on the device and its storage.cpu() was a
+    CUDA call in a process whose inherited context cannot serve one. The walk
+    has to find every tensor wherever the state dict nests it -- and it must not
+    churn what is already right, because the model shard is gigabytes of CPU
+    tensors that a copy would double.
+
+    The CUDA branch itself cannot run here (no device in CI); it is exercised by
+    the probe run, whose log names every straggler this walk moved.
+    """
+
+    def test_cpu_tensors_pass_through_untouched(self):
+        t = torch.arange(6, dtype=torch.float32)
+        moved = []
+
+        out = mod._finish_offload_to_cpu({"w": t}, moved, "model")
+
+        assert moved == []
+        assert out["w"] is t, "an already-CPU tensor must not be copied"
+
+    def test_structure_survives_the_walk(self):
+        import collections
+
+        Pair = collections.namedtuple("Pair", "a b")
+        t = torch.zeros(2)
+        state = {
+            "nest": {"list": [t, (t, {"deep": t})]},
+            "named": Pair(t, [t]),
+            "size": torch.Size([3, 4]),
+            "scalar": 7,
+            "text": "adam",
+            "none": None,
+        }
+        moved = []
+
+        out = mod._finish_offload_to_cpu(state, moved, "optim")
+
+        assert moved == []
+        assert out["nest"]["list"][1][1]["deep"] is t
+        assert isinstance(out["named"], Pair) and out["named"].a is t
+        assert out["size"] == torch.Size([3, 4])
+        assert out["scalar"] == 7 and out["text"] == "adam" and out["none"] is None
+
+    def test_a_straggler_is_recorded_with_its_name(self, monkeypatch):
+        """The log must say WHICH tensor offload_to_cpu missed, not that one was.
+
+        No CUDA here, so the device check is what gets faked: a subclass that
+        claims to be elsewhere. The walk must move it, name its path, and count
+        its bytes.
+        """
+
+        class _ClaimsToBeElsewhere(torch.Tensor):
+            @property
+            def device(self):
+                class _Device:
+                    type = "cuda"
+
+                    def __str__(self):
+                        return "cuda:0"
+
+                return _Device()
+
+            def detach(self):
+                return torch.tensor([1.0, 2.0])
+
+        straggler = _ClaimsToBeElsewhere()
+        moved = []
+
+        out = mod._finish_offload_to_cpu({"buffers": {"rope": straggler}}, moved, "model")
+
+        assert len(moved) == 1
+        name, device, _ = moved[0]
+        assert name == "model.buffers.rope"
+        assert device == "cuda:0"
+        assert isinstance(out["buffers"]["rope"], torch.Tensor)
+        assert out["buffers"]["rope"].device.type == "cpu"
