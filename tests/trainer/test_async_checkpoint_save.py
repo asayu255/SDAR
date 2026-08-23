@@ -70,9 +70,16 @@ class _Manager:
         self._pending_save = None
         self._pending_error = None
         self._fork_broken = False
+        self._thread_write_seconds = None
+        self.last_write_seconds = None
+        self.last_writer_kind = None
+        # The overlapped copy is the fork route's concern; this stub covers the
+        # writer thread, so it starts with nothing in flight on the side stream.
+        self._pending_copy = None
 
     start = FSDPCheckpointManager._start_async_write
     wait = FSDPCheckpointManager.wait_for_pending_save
+    _drain_pending_copy = FSDPCheckpointManager._drain_pending_copy
 
 
 @pytest.fixture

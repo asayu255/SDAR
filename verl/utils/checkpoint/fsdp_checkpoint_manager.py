@@ -56,6 +56,10 @@ _FORK_WRITER = os.environ.get("CKPT_FORK_WRITER", "1").lower() not in ("0", "fal
 # after the fork (~300 s), by which point a healthy write (~178 s solo) is long
 # done, so this fires only for a child that is stuck rather than slow.
 _FORK_TIMEOUT_S = float(os.environ.get("CKPT_FORK_TIMEOUT_S", "900"))
+# Overlap the save's device-to-host copy with the next step instead of paying
+# it on the training thread. CKPT_SNAPSHOT=0 keeps the blocking copy, which is
+# the A/B and the fallback.
+_SNAPSHOT_OFFLOAD = os.environ.get("CKPT_SNAPSHOT", "1").lower() not in ("0", "false", "no", "")
 
 
 def fork_writer_enabled() -> bool:
@@ -68,7 +72,7 @@ def _write_shards(writes):
         torch.save(state_dict, path)
 
 
-def _finish_offload_to_cpu(obj, moved, name, mirror=None):
+def _finish_offload_to_cpu(obj, moved, name, offload=None):
     """Return ``obj`` with every tensor on CPU, recording what had to move.
 
     ``offload_to_cpu`` on the sharded state-dict configs moves the sharded
@@ -93,23 +97,86 @@ def _finish_offload_to_cpu(obj, moved, name, mirror=None):
             if shard.tensor.device.type != "cpu":
                 moved.append((f"{name}<shard{index}>", str(shard.tensor.device),
                               shard.tensor.numel() * shard.tensor.element_size()))
-                shard.tensor = _into_mirror(shard.tensor, f"{name}<shard{index}>", mirror)
+                shard.tensor = _route(shard.tensor, f"{name}<shard{index}>", offload)
         return obj
     if isinstance(obj, torch.Tensor):
         if obj.device.type == "cpu":
             return obj
         moved.append((name, str(obj.device), obj.numel() * obj.element_size()))
-        return _into_mirror(obj, name, mirror)
+        return _route(obj, name, offload)
     if isinstance(obj, dict):
-        return {key: _finish_offload_to_cpu(value, moved, f"{name}.{key}", mirror) for key, value in obj.items()}
+        return {key: _finish_offload_to_cpu(value, moved, f"{name}.{key}", offload) for key, value in obj.items()}
     if isinstance(obj, torch.Size):
         return obj
     if isinstance(obj, tuple):
-        items = [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", mirror) for i, value in enumerate(obj)]
+        items = [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", offload) for i, value in enumerate(obj)]
         return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
     if isinstance(obj, list):
-        return [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", mirror) for i, value in enumerate(obj)]
+        return [_finish_offload_to_cpu(value, moved, f"{name}[{i}]", offload) for i, value in enumerate(obj)]
     return obj
+
+
+class _Offload:
+    """Where a save's device tensors go, and by which route.
+
+    Two routes. The blocking one copies device -> pinned host on the training
+    thread: correct, simple, and worth ~0.3-0.6 s of dead device time per save
+    because a D2H moves no SM work and NVML reads the card as idle for its
+    duration.
+
+    The overlapped one splits that in half. A device -> device copy into a
+    persistent snapshot buffer runs on the main stream (7 GB of traffic at
+    ~1.5 TB/s, tens of milliseconds, and it IS SM work so the card stays busy),
+    and the snapshot -> pinned host copy is then issued on a side stream, where
+    it overlaps the next step's compute and costs the training thread nothing.
+    The snapshot exists precisely because the side stream cannot read the live
+    tensors: the next step overwrites them, and stream ordering does not
+    protect a reader on another stream.
+    """
+
+    def __init__(self, mirror, snapshot=None):
+        self.mirror = mirror        # name -> pinned host tensor, reused across saves
+        self.snapshot = snapshot    # name -> device tensor, or None to copy inline
+        self.pairs = []             # (device snapshot, host mirror) for the side stream
+
+    def stage(self, tensor, name):
+        host = _slot(self.mirror, name, tensor, pin=True)
+        if self.snapshot is None:
+            host.copy_(tensor)
+            return host
+        device_slot = _slot(self.snapshot, name, tensor, device=tensor.device)
+        device_slot.copy_(tensor)   # main stream, ordered against the next step
+        self.pairs.append((device_slot, host))
+        return host
+
+
+def _slot(store, name, like, pin=False, device="cpu"):
+    """A reusable buffer shaped like ``like``, kept across saves.
+
+    A fresh allocation is paid for in page faults as the copy touches each new
+    page, and a fresh *pinned* allocation additionally page-locks memory every
+    time. A slot whose shape or dtype changed is replaced rather than truncated
+    into: optimizer state is fixed once allocated, but a silently short copy
+    would corrupt the checkpoint, which is worse than an allocation. Pinning is
+    a finite resource, so failing to pin degrades to pageable rather than
+    taking the save down.
+    """
+    slot = store.get(name)
+    if slot is not None and slot.shape == like.shape and slot.dtype == like.dtype:
+        return slot
+    try:
+        slot = torch.empty(like.shape, dtype=like.dtype, device=device, pin_memory=pin)
+    except (RuntimeError, MemoryError):
+        slot = torch.empty(like.shape, dtype=like.dtype, device=device)
+    store[name] = slot
+    return slot
+
+
+def _route(tensor, name, offload):
+    """Send one straggler to CPU by whichever route this save is using."""
+    if offload is None:
+        return tensor.detach().cpu()
+    return offload.stage(tensor, name)
 
 
 def _into_mirror(tensor, name, mirror):
@@ -130,15 +197,7 @@ def _into_mirror(tensor, name, mirror):
     """
     if mirror is None:
         return tensor.detach().cpu()
-    slot = mirror.get(name)
-    if slot is None or slot.shape != tensor.shape or slot.dtype != tensor.dtype:
-        try:
-            slot = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-        except (RuntimeError, MemoryError):
-            slot = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
-        mirror[name] = slot
-    slot.copy_(tensor)
-    return slot
+    return _Offload(mirror).stage(tensor, name)
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -218,6 +277,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # writer (thread or forked child) is finished with these pages before
         # anything overwrites them.
         self._offload_mirror = {}
+        # Persistent device buffers for the overlapped route, plus the stream
+        # and the copy still in flight on it. Allocated on the first save that
+        # needs them; an allocation failure pins _snapshot_ok False and every
+        # later save takes the blocking route, which is correct and only slower.
+        self._snapshot_buffers = {}
+        self._snapshot_ok = _SNAPSHOT_OFFLOAD
+        self._copy_stream = None
+        self._pending_copy = None   # (event, writes, path, started) awaiting its D2H
         # GenerationConfig.from_pretrained goes to the HF hub, and the old code
         # paid that network round trip on EVERY save. The config cannot change
         # mid-run; fetch it once.
@@ -391,6 +458,71 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         _write_shards(writes)
         return None
 
+    def _issue_overlapped_d2h(self, pairs):
+        """Copy snapshot -> pinned host on a side stream. Returns the event, or None.
+
+        The side stream waits for the main stream so it cannot start before the
+        device-to-device snapshot it reads has landed; the main stream does NOT
+        wait for it, which is the entire point -- the next step's kernels are
+        issued immediately and the copy rides alongside them.
+        """
+        try:
+            if self._copy_stream is None:
+                self._copy_stream = torch.cuda.Stream()
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._copy_stream):
+                for device_slot, host in pairs:
+                    host.copy_(device_slot, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self._copy_stream)
+            return event
+        except Exception as exc:      # noqa: BLE001 - degrade, never fail a save
+            warnings.warn(
+                f"[rank-{self.rank}]: could not overlap the checkpoint copy ({exc!r}); "
+                "falling back to the blocking one",
+                stacklevel=2,
+            )
+            self._snapshot_ok = False
+            return None
+
+    def start_write_if_copy_done(self) -> bool:
+        """Fork the writer if the overlapped copy has landed. Never blocks.
+
+        Called from the training loop once the step is under way -- by then the
+        copy issued at the previous save has had a whole forward to finish in,
+        so this normally forks without waiting and the write gets a full step to
+        run in, exactly as it did when the copy was synchronous. Returns whether
+        it started one, so a caller can log it.
+        """
+        pending = self._pending_copy
+        if pending is None:
+            return False
+        event, writes, path, started = pending
+        if not event.query():
+            return False
+        self._pending_copy = None
+        print(
+            f"[ckpt-write] rank {self.rank}: overlapped copy landed "
+            f"{time.monotonic() - started:.1f} s after staging; starting the write",
+            flush=True,
+        )
+        self._start_async_write(writes, path)
+        return True
+
+    def _drain_pending_copy(self):
+        """Block until the overlapped copy lands, then start its write.
+
+        The backstop for start_write_if_copy_done: anything that needs the
+        shards -- the next save, the flush that publishes the tracker -- must
+        find a write in flight rather than a copy nobody picked up.
+        """
+        if self._pending_copy is None:
+            return
+        event, writes, path, _ = self._pending_copy
+        self._pending_copy = None
+        event.synchronize()
+        self._start_async_write(writes, path)
+
     def _remove_paths_in_background(self, paths):
         """Fire-and-forget ``rm -rf`` for rotated-out checkpoint directories.
 
@@ -423,6 +555,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         fails or hangs is rewritten here before this returns, so the shards exist
         by the time anyone can act on them.
         """
+        self._drain_pending_copy()
         pending, self._pending_save = self._pending_save, None
         path = None
         if pending is not None:
@@ -623,10 +756,33 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 if self.async_save:
                     moved = []
                     walk_started = time.perf_counter()
-                    writes = [
-                        (_finish_offload_to_cpu(state, moved, kind, self._offload_mirror), target)
-                        for (state, target), kind in zip(writes, ("model", "optim", "extra"))
-                    ]
+                    offload = _Offload(
+                        self._offload_mirror,
+                        self._snapshot_buffers if (self._snapshot_ok and is_cuda_available) else None,
+                    )
+                    try:
+                        writes = [
+                            (_finish_offload_to_cpu(state, moved, kind, offload), target)
+                            for (state, target), kind in zip(writes, ("model", "optim", "extra"))
+                        ]
+                    except torch.cuda.OutOfMemoryError:
+                        # The snapshot is ~7 GB of device memory. If it does not
+                        # fit, the blocking route still saves the checkpoint --
+                        # give up the overlap for the rest of the run rather than
+                        # the run itself, and drop what was allocated so far.
+                        warnings.warn(
+                            f"[rank-{self.rank}]: no room for the checkpoint snapshot; "
+                            "copying on the training thread from now on",
+                            stacklevel=2,
+                        )
+                        self._snapshot_ok = False
+                        self._snapshot_buffers.clear()
+                        moved = []
+                        offload = _Offload(self._offload_mirror)
+                        writes = [
+                            (_finish_offload_to_cpu(state, moved, kind, offload), target)
+                            for (state, target), kind in zip(writes, ("model", "optim", "extra"))
+                        ]
                     walk_done = time.perf_counter()
                     if moved:
                         sample = ", ".join(entry[0] for entry in moved[:4])
@@ -638,7 +794,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                             f"offload_to_cpu left on the device ({sample})",
                             flush=True,
                         )
-                    self._start_async_write(writes, local_path)
+                    event = self._issue_overlapped_d2h(offload.pairs) if offload.pairs else None
+                    if event is None:
+                        if offload.pairs:
+                            # The issue failed after the snapshot was taken; the
+                            # mirrors hold nothing yet, so copy them here.
+                            for device_slot, host in offload.pairs:
+                                host.copy_(device_slot)
+                        self._start_async_write(writes, local_path)
+                    else:
+                        self._pending_copy = (event, writes, local_path, time.monotonic())
                 else:
                     _write_shards(writes)
 
@@ -680,7 +845,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 f"{time.perf_counter() - stage_started:.1f} s on this thread "
                 f"(model build {model_built - stage_started:.1f}, "
                 f"optim build {optim_built - model_built:.1f}, "
-                f"offload walk {walk_done - walk_started:.1f}, "
+                f"offload {walk_done - walk_started:.2f} "
+                f"[{'snapshot, overlapped' if self._pending_copy else 'blocking copy'}], "
                 f"extras+barrier {time.perf_counter() - walk_done:.1f})",
                 flush=True,
             )

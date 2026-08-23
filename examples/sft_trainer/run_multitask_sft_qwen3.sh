@@ -228,6 +228,17 @@ set -x
 #     did, because the flush only runs at the step boundary -- the first probe
 #     printed that number under the write's label and read 500 s writes that
 #     were really ~200 s.
+#     CKPT_SNAPSHOT=1 (the default) additionally moves the device-to-host copy
+#     off this thread: the save takes a device-to-device snapshot (~7 GB at
+#     ~1.5 TB/s, tens of ms, and SM-busy so the card is not idle for it) and
+#     issues the D2H on a side stream, where it overlaps the next step. The
+#     writer is forked by the training loop once that copy lands, right after
+#     the batch's H2D. The save line then reads "offload 0.02 [snapshot,
+#     overlapped]" instead of "[blocking copy]", and a following
+#     "overlapped copy landed N s after staging" names when the write began.
+#     CKPT_SNAPSHOT=0 restores the blocking copy; so does a device OOM on the
+#     snapshot buffers, which warns and degrades for the rest of the run.
+#
 #     "fork writer"  + normal step times = the fix working.
 #     "thread writer" = the fork died at the first save and disabled itself;
 #     the reason was printed at that save ("could not fork ..." or "forked

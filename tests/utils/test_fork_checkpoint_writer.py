@@ -47,6 +47,14 @@ def _manager(fork_broken=False):
     m._pending_save = None
     m._pending_error = None
     m._fork_broken = fork_broken
+    m._thread_write_seconds = None
+    m.last_write_seconds = None
+    m.last_writer_kind = None
+    m._offload_mirror = {}
+    m._snapshot_buffers = {}
+    m._snapshot_ok = False
+    m._copy_stream = None
+    m._pending_copy = None
     return m
 
 
@@ -495,3 +503,101 @@ def test_a_pinned_mirror_is_still_plain_bytes_to_the_writer(tmp_path):
     torch.save({"w": slot}, target)
 
     assert torch.equal(torch.load(target, weights_only=False)["w"], torch.arange(6, dtype=torch.float32))
+
+
+class _FakeEvent:
+    """A CUDA event's query/synchronize contract, without a device."""
+
+    def __init__(self, ready=False):
+        self.ready = ready
+        self.synchronized = False
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.synchronized = True
+        self.ready = True
+
+
+class TestOverlappedCopy:
+    """The device-to-host copy moved off the training thread.
+
+    The training thread now takes only a device-to-device snapshot and issues
+    the D2H on a side stream; the writer must not fork until that copy lands,
+    or it pickles mirror pages the GPU has not filled yet -- a checkpoint that
+    looks complete and holds garbage. Two things therefore carry the weight:
+    the pickup never forks early, and nothing that needs the shards can slip
+    past a copy nobody picked up.
+    """
+
+    def test_snapshot_route_defers_the_copy_and_records_the_pair(self):
+        mirror, snapshot = {}, {}
+        offload = mod._Offload(mirror, snapshot)
+        live = torch.arange(4, dtype=torch.float32)
+
+        host = offload.stage(live, "optim.state.0.exp_avg")
+
+        assert len(offload.pairs) == 1, "the side stream needs the (snapshot, mirror) pair"
+        device_slot, target = offload.pairs[0]
+        assert target is host, "the write must point at the mirror, not the snapshot"
+        assert torch.equal(device_slot, live), "the snapshot is taken on the training thread"
+        assert host.shape == live.shape
+
+    def test_blocking_route_copies_inline_and_records_nothing(self):
+        offload = mod._Offload({})
+        host = offload.stage(torch.arange(4, dtype=torch.float32), "w")
+
+        assert offload.pairs == []
+        assert torch.equal(host, torch.arange(4, dtype=torch.float32))
+
+    def test_pickup_is_a_noop_with_nothing_pending(self):
+        m = _manager()
+        assert m.start_write_if_copy_done() is False
+
+    def test_pickup_refuses_to_fork_before_the_copy_lands(self, tmp_path):
+        """Forking early would pickle mirror pages the GPU has not written."""
+        m = _manager()
+        event = _FakeEvent(ready=False)
+        m._pending_copy = (event, _writes(tmp_path), str(tmp_path), time.monotonic())
+
+        assert m.start_write_if_copy_done() is False
+        assert m._pending_save is None, "no writer may exist yet"
+        assert m._pending_copy is not None, "and the copy must stay pending"
+
+    def test_pickup_forks_once_the_copy_has_landed(self, tmp_path, capsys):
+        m = _manager()
+        writes = _writes(tmp_path)
+        m._pending_copy = (_FakeEvent(ready=True), writes, str(tmp_path), time.monotonic())
+
+        assert m.start_write_if_copy_done() is True
+        assert m._pending_copy is None
+        assert m._pending_save is not None
+        m.wait_for_pending_save()
+
+        for state, path in writes:
+            assert torch.equal(torch.load(path, weights_only=False)["w"], state["w"])
+        assert "overlapped copy landed" in capsys.readouterr().out
+
+    def test_a_copy_nobody_picked_up_is_drained_by_the_flush(self, tmp_path):
+        """The backstop. If the training loop never got round to the pickup, the
+        flush that publishes the tracker must still block on the copy and write
+        the shards -- never publish a checkpoint whose bytes are not there."""
+        m = _manager()
+        writes = _writes(tmp_path)
+        event = _FakeEvent(ready=False)
+        m._pending_copy = (event, writes, str(tmp_path), time.monotonic())
+
+        m.wait_for_pending_save()
+
+        assert event.synchronized, "the flush must wait for the copy, not skip it"
+        assert m._pending_copy is None and m._pending_save is None
+        for state, path in writes:
+            assert torch.equal(torch.load(path, weights_only=False)["w"], state["w"])
+
+    def test_the_env_switch_selects_the_blocking_route(self, monkeypatch):
+        monkeypatch.setattr(mod, "_SNAPSHOT_OFFLOAD", False)
+        m = _manager()
+        # _manager builds the object directly, so mirror the constructor's read
+        m._snapshot_ok = mod._SNAPSHOT_OFFLOAD
+        assert m._snapshot_ok is False

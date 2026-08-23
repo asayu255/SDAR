@@ -764,6 +764,15 @@ class ActorRolloutRefWorker(Worker):
             data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
+        # Pick up the previous save's overlapped copy, if it has landed. The
+        # copy was issued on a side stream at the end of the last save and has
+        # had the batch's H2D to finish in, so this normally forks the writer
+        # without waiting -- and the write then gets a whole step to run in,
+        # exactly as it did when the copy was synchronous. Never blocks: if the
+        # copy is somehow still going, the next flush drains it.
+        manager = getattr(self, "checkpoint_manager", None)
+        if manager is not None:
+            manager.start_write_if_copy_done()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
