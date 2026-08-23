@@ -440,3 +440,20 @@ def test_the_walk_threads_the_mirror_through_nesting():
     assert moved == []
     assert out1["state"]["0"]["exp_avg"] is state["state"]["0"]["exp_avg"]
     assert mirror == {}
+
+
+def test_background_removal_deletes_and_never_blocks(tmp_path):
+    """Rotation deletes ~20 GB on the save's critical path; the background rm
+    must actually delete, and a spawn failure must degrade to the synchronous
+    remove rather than leak the disk."""
+    m = _manager()
+    victim = tmp_path / "global_step_1" / "actor"
+    victim.mkdir(parents=True)
+    (victim / "model.pt").write_bytes(b"x" * 1024)
+
+    m._remove_paths_in_background([str(tmp_path / "global_step_1")])
+
+    deadline = time.monotonic() + 10
+    while (tmp_path / "global_step_1").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not (tmp_path / "global_step_1").exists(), "the background rm never landed"

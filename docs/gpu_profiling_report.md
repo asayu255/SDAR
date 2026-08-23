@@ -1518,3 +1518,29 @@ step 2 で一瞬見えた「プロセス外 writer なら汚染ゼロ」が全 s
 残るコストは staging だけ: 初回 20.4 s（state dict 初構築）、以後 ~7 s/save。
 save_freq=25 の本番換算で **~0.03%**（修正前 2.25%）。checkpoint の項は
 これで閉じる。
+
+#### プローブ 3（run 46o9xef3）: 内訳判明、ついでに大きな副産物
+
+```
+[ckpt-write] rank 0: staged in 5.3 s (model build 3.2, optim build 0.0, offload walk 1.9)
+[ckpt-write] rank 0: fork writer finished actor: write 192.5 s, start-to-flush 302.5 s
+```
+
+staging ~5 s の内訳: **model build 3.0〜3.5 s**（ほぼ全部が FSDP 自身の
+per-tensor pageable D2H）、optim build **0.0 s**（生 tensor をそのまま包む
+だけ —— aliasing 仮説の傍証）、walk 1.7〜1.9 s（ミラー再利用が効いている。
+初回 3.0 → 以後 1.7）。save_checkpoint 全体（6.3〜10.4 s）との差は
+rotation の同期 rm（~20 GB）、rank0 の `GenerationConfig.from_pretrained`
+（**毎 save HF hub へのネットワーク往復**）、barrier。
+
+**副産物が大きい**: `SKIP_ROLLOUT_BUILD=1` + expandable_segments で
+`memory_reserved` **66 → 23.7 GB**、`alloc_retries` **0**、`cuda_mallocs`
+ほぼ 0、worker ヒープ 1.09M → 653k オブジェクト。mfu は 0.342 で不変。
+allocator クラスの停止は機構ごと消えた。
+
+次の削り（実装済み）: model も offload_to_cpu を切って walk のミラー経由に
+（-2.5 s 見込み）、rotation を fire-and-forget の `rm -rf` 子プロセスに、
+GenerationConfig をキャッシュ（ネットワーク往復は初回のみ）、そして
+save 全体を 1 行で計測する `save cost ... (model build / optim build /
+offload walk / extras+barrier)` に統合。期待値: save の device-idle
+**~5 s → ~2〜3 s**（本番 freq 25 で ~0.01%）。

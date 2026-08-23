@@ -14,6 +14,7 @@
 
 import os
 import signal
+import subprocess
 import threading
 import time
 import traceback
@@ -208,6 +209,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # writer (thread or forked child) is finished with these pages before
         # anything overwrites them.
         self._offload_mirror = {}
+        # GenerationConfig.from_pretrained goes to the HF hub, and the old code
+        # paid that network round trip on EVERY save. The config cannot change
+        # mid-run; fetch it once.
+        self._generation_config = None
 
     def _start_async_write(self, writes, local_path: str):
         """Hand the staged shards to a forked child (or a thread) and return.
@@ -377,6 +382,24 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         _write_shards(writes)
         return None
 
+    def _remove_paths_in_background(self, paths):
+        """Fire-and-forget ``rm -rf`` for rotated-out checkpoint directories.
+
+        Correctness does not depend on when the delete lands (see the call
+        site); what it must never do is block the save or take the run down. A
+        Popen that fails to spawn degrades to the synchronous remove rather
+        than leaking the disk.
+        """
+        for path in paths:
+            try:
+                subprocess.Popen(
+                    ["rm", "-rf", "--", str(path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                self.remove_previous_save_local_path([path])
+
     def wait_for_pending_save(self):
         """Block until the background write finishes; re-raise what it caught.
 
@@ -536,17 +559,31 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # record the previous global step
         self.previous_global_step = global_step
 
-        # remove previous local_path
+        # Rotation deletes ~17-20 GB of an old checkpoint, and a synchronous
+        # unlink walk of that much sits on the save's critical path with the
+        # device idle behind it. Hand it to rm -rf in a fire-and-forget child:
+        # the directory being removed is at least two saves old, fully written
+        # (wait_for_pending_save above), and the tracker can never name it, so
+        # nothing observes whether the delete happens now or seconds later.
         if max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
             keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
+            self._remove_paths_in_background(self.previous_saved_paths[:keep_start])
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
         local_path = self.local_mkdir(local_path)
         torch.distributed.barrier()
 
-        # every rank will save its own model and optim shard
-        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        # every rank will save its own model and optim shard.
+        #
+        # Under async_save the model's offload_to_cpu is OFF, deliberately: the
+        # measured breakdown (run 46o9xef3) was model build 3.0-3.5 s -- almost
+        # all of it FSDP's own per-tensor pageable D2H -- against 1.7-1.9 s for
+        # the walk moving 4.6 GB through the reused mirror. Letting state_dict
+        # return device tensors and the walk below carry them into the mirror
+        # does the same copy through recycled pages. The sync path keeps the
+        # stock offload: it has no walk and no mirror.
+        offload_model = is_cuda_available and not self.async_save
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=offload_model)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -593,20 +630,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                             flush=True,
                         )
                     self._start_async_write(writes, local_path)
-                    # The staging is the whole GPU-idle window a save costs now
-                    # (the write itself left the process), so where its seconds
-                    # go decides what to shrink next: "build" is FSDP
-                    # assembling the state dicts -- collectives, must stay on
-                    # this thread -- and "offload" is the D2H walk above, which
-                    # the mirror is meant to keep at copy speed.
-                    print(
-                        f"[ckpt-write] rank {self.rank}: staged in "
-                        f"{time.perf_counter() - stage_started:.1f} s "
-                        f"(model build {model_built - stage_started:.1f}, "
-                        f"optim build {optim_built - model_built:.1f}, "
-                        f"offload walk {walk_done - walk_started:.1f})",
-                        flush=True,
-                    )
                 else:
                     _write_shards(writes)
 
@@ -620,7 +643,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
                 # Some model's name_or_path is empty if not initialized from pretrained,
                 # in this cases, we don't save generation config.
-                generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                if self._generation_config is None:
+                    self._generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                generation_config = self._generation_config
                 generation_config.save_pretrained(local_path)
             else:
                 generation_config = None
@@ -633,6 +658,23 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # are there. Nothing below reads them, and the hf_model branch works off a
         # fresh full state dict rather than the files.
         torch.distributed.barrier()
+
+        if self.async_save:
+            # The whole device-idle window this save cost, phase by phase. The
+            # builds are FSDP assembling the state dicts (collectives, pinned
+            # to this thread); the walk is the snapshot copy into the reused
+            # mirror; extras is the rank-0 config/tokenizer writes plus the
+            # barrier absorbing the slowest rank. What dominates here decides
+            # what to shrink next.
+            print(
+                f"[ckpt-write] rank {self.rank}: save cost "
+                f"{time.perf_counter() - stage_started:.1f} s on this thread "
+                f"(model build {model_built - stage_started:.1f}, "
+                f"optim build {optim_built - model_built:.1f}, "
+                f"offload walk {walk_done - walk_started:.1f}, "
+                f"extras+barrier {time.perf_counter() - walk_done:.1f})",
+                flush=True,
+            )
 
         if "hf_model" in self.checkpoint_contents:
             hf_local_path = os.path.join(local_path, "huggingface")
