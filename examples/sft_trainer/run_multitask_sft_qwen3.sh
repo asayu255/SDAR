@@ -182,9 +182,19 @@ set -x
 # out whether a writer change worked. This probe answers it in about half an
 # hour, and writes nowhere near the real checkpoints:
 #
-#   ++trainer.default_local_dir=$HOME/checkpoints/sft_ckpt_probe \
-#   ++trainer.save_freq=1 \
-#   ++trainer.max_actor_ckpt_to_keep=2
+#   EXPECTED_CONFIG_WAIVE=trainer.save_freq \
+#   bash examples/sft_trainer/run_multitask_sft_qwen3.sh <the usual overrides> \
+#     ++trainer.default_local_dir=$HOME/checkpoints/sft_ckpt_probe \
+#     ++trainer.save_freq=1 \
+#     ++trainer.max_actor_ckpt_to_keep=2
+#
+# The waiver is required: save_freq is pinned in the expectations file, because
+# at total_training_steps=300 it is what makes the twelve checkpoints
+# eval_checkpoints.sh expects. Naming it in the invocation moves the knob for
+# this run and prints a WAIVED line at startup; editing the expectations file
+# instead would change what the production run means, and is the edit that gets
+# forgotten. default_local_dir and max_actor_ckpt_to_keep are not pinned and
+# need no waiver.
 #
 # save_freq=1 because the question is only "does a write beside training slow
 # it down", and at 1 EVERY step runs beside a write: the loop flushes the

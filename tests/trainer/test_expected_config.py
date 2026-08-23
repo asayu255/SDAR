@@ -23,9 +23,12 @@ method branches regardless of which expectations files each carries.
 Run:  python tests/trainer/test_expected_config.py
 """
 
+import contextlib
 import glob
+import io
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -35,6 +38,7 @@ from verl.utils.expected_config import (
     check_expected_config,
     enforce_expected_config,
     load_expectations,
+    waived_keys,
 )
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -133,9 +137,141 @@ def test_committed_expectations_files_self_consistent():
         print(f"PASS: {rel} self-consistent ({len(expectations)} keys), drift detected on {drift_key}")
 
 
+def _waive(keys):
+    """Set EXPECTED_CONFIG_WAIVE for one call; restore whatever was there.
+
+    Plain os.environ rather than monkeypatch so these run under the __main__
+    runner below as well as under pytest, which is the convention this file
+    already follows.
+    """
+    previous = os.environ.get("EXPECTED_CONFIG_WAIVE")
+    if keys is None:
+        os.environ.pop("EXPECTED_CONFIG_WAIVE", None)
+    else:
+        os.environ["EXPECTED_CONFIG_WAIVE"] = keys
+    return previous
+
+
+def _restore(previous):
+    if previous is None:
+        os.environ.pop("EXPECTED_CONFIG_WAIVE", None)
+    else:
+        os.environ["EXPECTED_CONFIG_WAIVE"] = previous
+
+
+def _waiver_fixture(tmp_dir, **over):
+    """A two-key expectations file and a config that matches it unless told not to."""
+    path = os.path.join(tmp_dir, "expect.yaml")
+    with open(path, "w") as handle:
+        handle.write('"trainer.save_freq": 25\n"trainer.total_training_steps": 300\n')
+    trainer = {"save_freq": 25, "total_training_steps": 300}
+    trainer.update(over)
+    return OmegaConf.create({"trainer": trainer}), path
+
+
+def test_waived_key_no_longer_fails():
+    """A probe may move a pinned knob when it names it.
+
+    The lock exists so a comparison run cannot be silently invalidated, and
+    editing the expectations file to unblock a probe is the failure it is meant
+    to prevent -- that edit is the production run's intent, and it is the kind
+    somebody forgets to revert. Naming the key in the invocation keeps the
+    exception in one shell line and in the log the run gets judged from.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        config, expect_file = _waiver_fixture(tmp, save_freq=1)
+        previous = _waive("trainer.save_freq")
+        try:
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                checked = enforce_expected_config(config, expect_file)
+        finally:
+            _restore(previous)
+
+    out = captured.getvalue()
+    assert "WAIVED trainer.save_freq" in out, out
+    assert "running with 1" in out and "says 25" in out, out
+    assert checked == 1, "the waived key must not count as one still being checked"
+    print("PASS: a named waiver is honoured and printed")
+
+
+def test_waiver_does_not_disarm_other_keys():
+    """Otherwise a probe escape becomes a blanket off switch."""
+    with tempfile.TemporaryDirectory() as tmp:
+        config, expect_file = _waiver_fixture(tmp, save_freq=1, total_training_steps=10)
+        previous = _waive("trainer.save_freq")
+        try:
+            try:
+                enforce_expected_config(config, expect_file)
+            except AssertionError as exc:
+                assert "total_training_steps" in str(exc), str(exc)
+                assert "save_freq" not in str(exc), str(exc)
+            else:
+                raise AssertionError("a drifted key survived alongside a waiver")
+        finally:
+            _restore(previous)
+    print("PASS: waiving one key still enforces the rest")
+
+
+def test_waiver_for_an_unpinned_key_is_an_error():
+    """A waiver that protects nothing is a typo, and belongs to the same family
+    as the typo'd ``+key=`` override this module already catches."""
+    with tempfile.TemporaryDirectory() as tmp:
+        config, expect_file = _waiver_fixture(tmp, save_freq=1)
+        previous = _waive("trainer.save_freq,trainer.tpyo")
+        try:
+            try:
+                enforce_expected_config(config, expect_file)
+            except AssertionError as exc:
+                assert "tpyo" in str(exc), str(exc)
+            else:
+                raise AssertionError("a waiver naming an unpinned key was accepted")
+        finally:
+            _restore(previous)
+    print("PASS: a waiver naming an unpinned key is rejected")
+
+
+def test_no_waiver_is_unchanged_behaviour():
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = _waive(None)
+        try:
+            drifted, expect_file = _waiver_fixture(tmp, save_freq=1)
+            try:
+                enforce_expected_config(drifted, expect_file)
+            except AssertionError as exc:
+                assert "save_freq" in str(exc), str(exc)
+            else:
+                raise AssertionError("drift passed with no waiver set")
+
+            clean, _ = _waiver_fixture(tmp)
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                assert enforce_expected_config(clean, expect_file) == 2
+            assert "waived" not in captured.getvalue()
+        finally:
+            _restore(previous)
+    print("PASS: with no waiver set the validator behaves exactly as before")
+
+
+def test_waivers_accept_commas_or_spaces():
+    for raw in ("a.b c.d", "a.b,c.d", " a.b , c.d "):
+        previous = _waive(raw)
+        try:
+            assert waived_keys() == ["a.b", "c.d"], raw
+        finally:
+            _restore(previous)
+    print("PASS: waiver lists accept commas or spaces")
+
+
 if __name__ == "__main__":
     test_matching_config_passes()
     test_single_mismatch_fails_and_lists_key()
     test_missing_key_fails()
     test_committed_expectations_files_self_consistent()
+    test_waived_key_no_longer_fails()
+    test_waiver_does_not_disarm_other_keys()
+    test_waiver_for_an_unpinned_key_is_an_error()
+    test_no_waiver_is_unchanged_behaviour()
+    test_waivers_accept_commas_or_spaces()
     print("\nALL EXPECTED-CONFIG TESTS PASSED")
+

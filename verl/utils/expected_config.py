@@ -34,8 +34,29 @@ Because validation runs on the composed config, it also catches mistakes this
 file's author cannot see locally: Hydra overrides shadowed by entry-point
 injection, typo'd ``+key=`` overrides that never take effect, and stray CLI
 overrides appended via ``$@``.
+
+Waiving a key for a probe run
+-----------------------------
+A measurement run sometimes has to move a pinned knob on purpose -- e.g.
+``trainer.save_freq=1`` to make the checkpoint path fire every step instead of
+once every two hours. Editing the expectations file for that is the worst
+available option: it is the intent of the *production* run, and an edit made to
+unblock a probe is an edit somebody forgets to revert, which is precisely the
+silent invalidation this module exists to prevent.
+
+So name the key instead::
+
+    EXPECTED_CONFIG_WAIVE=trainer.save_freq bash examples/.../run.sh ++trainer.save_freq=1
+
+Each waived key is printed on its own line at startup with the value it was
+supposed to have, so a waiver is loud in the log a run gets judged from, and it
+lives in one shell invocation rather than in version control. A waiver naming a
+key the expectations file does not pin is itself an error -- a typo'd waiver
+that quietly protects nothing belongs to the same family of mistakes as a
+typo'd ``+key=`` override.
 """
 
+import os
 from typing import Any, Dict, List, Tuple
 
 from omegaconf import OmegaConf
@@ -94,6 +115,12 @@ def load_expectations(expect_file: str) -> Dict[str, Any]:
     return flat
 
 
+def waived_keys() -> List[str]:
+    """Dotted keys the operator has explicitly excused, from EXPECTED_CONFIG_WAIVE."""
+    raw = os.environ.get("EXPECTED_CONFIG_WAIVE", "")
+    return [key.strip() for key in raw.replace(",", " ").split() if key.strip()]
+
+
 def check_expected_config(config, expect_file: str) -> List[Tuple[str, Any, Any]]:
     """Return a list of (dotted_key, got, expected) mismatches (empty = OK)."""
     expectations = load_expectations(expect_file)
@@ -113,6 +140,26 @@ def enforce_expected_config(config, expect_file: str, tag: str = "expected-confi
     the number of validated keys on success.
     """
     mismatches = check_expected_config(config, expect_file)
+
+    waived = waived_keys()
+    if waived:
+        pinned = load_expectations(expect_file)
+        unknown = [key for key in waived if key not in pinned]
+        assert not unknown, (
+            f"[{tag}] EXPECTED_CONFIG_WAIVE names {unknown}, which "
+            f"{expect_file} does not pin. A waiver that protects nothing is a "
+            "typo, and silently ignoring it would defeat the point of naming keys."
+        )
+        for key in waived:
+            got = OmegaConf.select(config, key, default=_MISSING)
+            got_repr = "<missing>" if got is _MISSING else repr(got)
+            print(
+                f"[{tag}] WAIVED {key}: running with {got_repr}, "
+                f"expectations file says {pinned[key]!r}",
+                flush=True,
+            )
+        mismatches = [m for m in mismatches if m[0] not in set(waived)]
+
     if mismatches:
         lines = [
             f"[{tag}] effective config does not match {expect_file} "
@@ -127,5 +174,7 @@ def enforce_expected_config(config, expect_file: str, tag: str = "expected-confi
         )
         raise AssertionError("\n".join(lines))
     n_keys = len(load_expectations(expect_file))
-    print(f"[{tag}] OK — {n_keys} expected keys match the effective config ({expect_file})")
-    return n_keys
+    checked = n_keys - len(waived)
+    suffix = f", {len(waived)} waived" if waived else ""
+    print(f"[{tag}] OK — {checked} expected keys match the effective config ({expect_file}){suffix}")
+    return checked
