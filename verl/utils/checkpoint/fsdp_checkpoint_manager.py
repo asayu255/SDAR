@@ -128,6 +128,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # the timeout once per save for the rest of a 300-step run would be far
         # worse than the contention this is trying to remove.
         self._fork_broken = False
+        self.last_write_seconds = None   # duration of the most recent write
+        self.last_writer_kind = None     # "fork" or "thread", for the same line
 
     def _start_async_write(self, writes, local_path: str):
         """Hand the staged shards to a forked child (or a thread) and return.
@@ -158,7 +160,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         thread = threading.Thread(
             target=_run, name=f"ckpt-write-rank{self.rank}", daemon=True
         )
-        self._pending_save = ("thread", thread, local_path)
+        self._pending_save = ("thread", thread, local_path, time.monotonic())
         thread.start()
 
     def _start_forked_write(self, writes, local_path: str) -> bool:
@@ -208,7 +210,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             os._exit(status)
 
         os.close(write_fd)                              # parent
-        self._pending_save = ("fork", pid, read_fd, writes, local_path)
+        self._pending_save = ("fork", pid, read_fd, writes, local_path, time.monotonic())
         return True
 
     def _reap_forked_write(self, pid, err_fd, writes, path):
@@ -287,12 +289,29 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         pending, self._pending_save = self._pending_save, None
         path = None
         if pending is not None:
+            started = pending[-1]
             if pending[0] == "fork":
-                _, pid, err_fd, writes, path = pending
+                _, pid, err_fd, writes, path, _ = pending
                 self._reap_forked_write(pid, err_fd, writes, path)
             else:
-                _, thread, path = pending
+                _, thread, path, _ = pending
                 thread.join()
+            # The one number that says whether the writer is contending with the
+            # training loop. Solo it is ~178 s; sharing the GIL with the next
+            # step stretched it to ~760 s (both sides slow each other down), so
+            # this reads as a verdict without waiting for a wandb query.
+            self.last_write_seconds = time.monotonic() - started
+            # Names what actually wrote the shards. A fork whose child died was
+            # rewritten here, and calling that "fork" would hide the one event
+            # worth noticing in a log.
+            self.last_writer_kind = pending[0]
+            if pending[0] == "fork" and self._fork_broken:
+                self.last_writer_kind = "fork-failed-rewritten-by-parent"
+            print(
+                f"[ckpt-write] rank {self.rank}: {self.last_writer_kind} writer finished "
+                f"{os.path.basename(str(path))} in {self.last_write_seconds:.1f} s",
+                flush=True,
+            )
         error, self._pending_error = self._pending_error, None
         if error is not None:
             raise RuntimeError(

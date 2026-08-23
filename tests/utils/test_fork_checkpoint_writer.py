@@ -235,3 +235,34 @@ def test_the_child_leaves_without_running_atexit_handlers(tmp_path):
     source = inspect.getsource(mod.FSDPCheckpointManager._start_forked_write)
     assert "os._exit(" in source
     assert "sys.exit(" not in source
+
+
+def test_the_write_duration_and_writer_are_reported(tmp_path, capsys):
+    """The line that makes the fix judgeable without a wandb query.
+
+    A writer sharing the GIL with the training loop stretches from ~178 s solo
+    to ~760 s, so the duration alone separates the two outcomes -- but only if
+    it says which writer produced it.
+    """
+    m = _manager()
+    m._start_async_write(_writes(tmp_path), str(tmp_path))
+    m.wait_for_pending_save()
+
+    assert m.last_writer_kind == "fork"
+    assert m.last_write_seconds is not None and m.last_write_seconds >= 0
+    assert "[ckpt-write]" in capsys.readouterr().out
+
+
+def test_a_repaired_write_is_not_reported_as_a_fork(tmp_path, monkeypatch):
+    """Calling the parent's rescue "fork" would hide the one event worth seeing."""
+    m = _manager()
+    parent = os.getpid()
+    real = mod._write_shards
+    monkeypatch.setattr(mod, "_write_shards",
+                        lambda w: real(w) if os.getpid() == parent else (_ for _ in ()).throw(RuntimeError("boom")))
+
+    m._start_async_write(_writes(tmp_path), str(tmp_path))
+    with pytest.warns(UserWarning):
+        m.wait_for_pending_save()
+
+    assert m.last_writer_kind == "fork-failed-rewritten-by-parent"

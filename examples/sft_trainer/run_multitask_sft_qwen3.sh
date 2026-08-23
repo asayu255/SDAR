@@ -177,6 +177,34 @@ set -x
 # is not optional: there are two samplers, one per process, and each writes its
 # own pid-suffixed file.
 #
+# TO JUDGE THE CHECKPOINT WRITER QUICKLY, save early, often, and elsewhere.
+# save_freq=25 puts the first save two hours in, which is a long wait to find
+# out whether a writer change worked. This probe answers it in about half an
+# hour, and writes nowhere near the real checkpoints:
+#
+#   ++trainer.default_local_dir=$HOME/checkpoints/sft_ckpt_probe \
+#   ++trainer.save_freq=5 \
+#   ++trainer.max_actor_ckpt_to_keep=2
+#
+# max_actor_ckpt_to_keep is not optional at this frequency: a checkpoint is
+# ~17-21 GB, and save_freq=5 over 300 steps would be sixty of them (~1.2 TB).
+# The rotation happens after the pending write is joined, so it never deletes a
+# directory that is still being written.
+#
+# save_freq=5 rather than 2 so that steps 7-9 are ordinary steps and give the
+# baseline the comparison needs; at 2 every step is either a save or the step
+# after one. Read the verdict from two lines:
+#
+#   [ckpt-write] rank 0: fork writer finished global_step_5 in 176.3 s
+#     ~178 s   the writer has the disk to itself -- no contention
+#     ~760 s   it is fighting the training loop for the GIL
+#     "fork-failed-rewritten-by-parent" means the child died and the parent
+#     rewrote the shards; the fork path is then off for the rest of the run.
+#
+#   [step-gpu] rank 0 step 6: ... in-micro 290 s ...
+#     compare against steps 7-9. Equal is the fix working; 420-519 s against a
+#     ~297 s median is the contention still there.
+#
 # DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. It is the
 # obvious answer to the allocator reserving more than the model needs, and vLLM
 # refuses to start under it:
