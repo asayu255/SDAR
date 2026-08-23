@@ -638,3 +638,30 @@ ambient 0.58% / discrete 0.32%（うち solo 0.13%）で、
 
 なおこのパッケージが対象にしたのはスパイク（0.13%）である。より大きい
 **ambient 0.58% は `actor.bwd` に住んでいて、手つかず**のまま残っている。
+
+---
+
+## 10. 「完全に無くす」ための残り台帳
+
+checkpoint（2.25% → 0.03%、9 節の fork writer で解決済み）を除き、
+GPU が遊ぶ既知の源をすべて列挙する。
+
+| 源 | 大きさ | 状態 |
+| --- | --- | --- |
+| solo excursion（0.6〜0.8 s、gen-2 GC 候補） | 0.13% | **対策済み・未検証**: freeze / re-freeze / boundary collect は既定オン。消えたかどうかは NVML トレースでしか見えず、まだ測っていない |
+| allocator セグメント成長（62 回 cudaMalloc 型、起動時 1 回） | 一過性 ~0.6 s ×数回 | **今回解決**: `SKIP_ROLLOUT_BUILD=1`（この arm の既定）で vLLM を建てず、`expandable_segments:True` を解禁。cudaMalloc の同期停止と alloc_retries が機構ごと消える |
+| save staging | ~7 s/save = 0.03% @freq25 | 受容（state dict 構築は重みを読む同期点なので原理的に残る） |
+| before-step | 0.24〜0.71 s/step ≈ 0.1% | driver 境界。pipeline 済みの残余 |
+| ambient | 0.58%（`actor.bwd`） | **未着手。残る最大の項** |
+| unaccounted | 0.05〜0.12% | stall watch の測定残余 |
+
+検証は本番 run に相乗りさせる: `GPU_PROFILER=1 GPU_PROFILER_INTERVAL=0.2
+GPU_PROFILER_TRACE=/tmp/trace.csv` は NVML を 0.2 秒ごとに読むだけで
+（SYNC_PHASES を付けない限り）訓練に介入しないので、本番にそのまま付けて、
+終わってから `gpu_stall_scan.py` で solo excursion の有無を読む。
+消えていれば 0.13% は closed、残っていれば `ACTOR_GC_MANUAL=1` へ、
+それでも残れば gen-2 GC 棄却で戻ってくる。
+
+これを全部足すと、既知源をすべて潰し切った理論値は
+**~99.7〜99.8%**（ambient 未解決分が残る）。100.00% は
+NVML の定義上も到達しない（境界の H2D・reduce の隙間はゼロにならない）。

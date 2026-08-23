@@ -245,12 +245,15 @@ set -x
 #     compare against steps 7-9. Equal is the fix working; 420-519 s against a
 #     ~297 s median is the contention still there.
 #
-# DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. It is the
-# obvious answer to the allocator reserving more than the model needs, and vLLM
-# refuses to start under it:
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is ON by default here, and
+# only because SKIP_ROLLOUT_BUILD=1 (also the default) keeps vLLM out of the
+# process -- vLLM's CuMemAllocator refuses to start under it:
 #
 #   AssertionError: Expandable segments are not compatible with memory pool.
 #   (vllm/device_allocator/cumem.py, pytorch/pytorch#147851)
+#
+# The two travel together; never set expandable_segments by hand on a run that
+# builds vLLM.
 #
 # vLLM v1 allocates through its own CuMemAllocator so sleep()/wake_up() can
 # unmap physical pages, and that allocator asserts expandable segments are off.
@@ -474,6 +477,19 @@ fi
 # preserving (see the header), so this changes throughput and nothing else.
 # ROLLOUT_KEEP_VLLM_AWAKE=0 / OFFPOLICY_BATCH_PREFETCH=0 still turns either off.
 export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
+# This arm never generates (test_freq=-1; validation is a separate process), so
+# the vLLM rollout is a passenger that costs startup time and -- the expensive
+# part -- forbids expandable_segments via its CuMemAllocator assert. Skip the
+# build, and with vLLM out of the process run under expandable_segments: the
+# allocator then grows its pool by mapping pages instead of device-synchronizing
+# cudaMalloc calls, which removes the segment-growth stalls (62 mallocs in one
+# step on run bgwezy3k) and the alloc_retries outright. SKIP_ROLLOUT_BUILD=0
+# restores the rollout build AND stops exporting the allocator setting -- the
+# two must travel together, vLLM refuses to start under expandable segments.
+export SKIP_ROLLOUT_BUILD=${SKIP_ROLLOUT_BUILD:-1}
+if [ "${SKIP_ROLLOUT_BUILD}" != "0" ]; then
+  export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+fi
 export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
 export OFFPOLICY_ACTOR_PIPELINE=${OFFPOLICY_ACTOR_PIPELINE:-1}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'

@@ -63,6 +63,16 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 
+def skip_rollout_build() -> bool:
+    """SKIP_ROLLOUT_BUILD=1: do not construct the rollout engine at init.
+
+    Read at call time rather than import time so tests can flip it. Only for
+    runs that never generate; generate_sequences raises with the same words if
+    that promise is broken.
+    """
+    return os.environ.get("SKIP_ROLLOUT_BUILD", "0").lower() not in ("0", "false", "no", "")
+
+
 
 from peft import LoraConfig, TaskType, get_peft_model
 from codetiming import Timer
@@ -615,7 +625,25 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
-        if self._is_rollout:
+        if self._is_rollout and skip_rollout_build():
+            # The off-policy arms never call generate_sequences (test_freq=-1,
+            # val_before_train=False; validation is a separate process), so the
+            # engine would be a passenger -- and an expensive one in a way that
+            # is easy to miss: vLLM's CuMemAllocator asserts that expandable
+            # segments are OFF, so merely BUILDING it forbids
+            # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, the allocator
+            # mode that removes cudaMalloc segment-growth stalls (the 62-malloc
+            # event on run bgwezy3k, rank1 step 2) and alloc_retries outright.
+            # Skipping the build is what unlocks it. generate_sequences fails
+            # loudly if anything calls it after all.
+            self.rollout, self.rollout_sharding_manager = None, None
+            print(
+                f"[rollout-skip] rank {self.rank}: SKIP_ROLLOUT_BUILD=1 -- not "
+                f"building the {self.config.rollout.name} rollout; this run "
+                "cannot generate, and expandable_segments is now permitted",
+                flush=True,
+            )
+        elif self._is_rollout:
             # Priced, because this arm may not be buying anything. The
             # off-policy loops train from pre-made trajectories and validate out
             # of band (trainer.test_freq=-1), so generate_sequences is never
@@ -800,6 +828,13 @@ class ActorRolloutRefWorker(Worker):
         prompts = prompts.to(get_torch_device().current_device())
 
         assert self._is_rollout
+        if self.rollout is None:
+            raise RuntimeError(
+                "generate_sequences called but the rollout was never built "
+                "(SKIP_ROLLOUT_BUILD=1). This flag is only for runs that never "
+                "generate -- test_freq=-1 and val_before_train=False; unset it "
+                "for any run that validates in-loop."
+            )
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
@@ -857,6 +892,12 @@ class ActorRolloutRefWorker(Worker):
         is in use. Paired with end_rollout_session() in a finally block.
         """
         assert self._is_rollout
+        # Before the import, deliberately: with SKIP_ROLLOUT_BUILD there is no
+        # manager at all, and pulling in the vLLM machinery just to conclude
+        # "not a vLLM manager" would make this hook the one place a skipped
+        # build still pays for -- or crashes on -- vLLM.
+        if self.rollout_sharding_manager is None:
+            return
         from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
         if not isinstance(self.rollout_sharding_manager, FSDPVLLMShardingManager):
