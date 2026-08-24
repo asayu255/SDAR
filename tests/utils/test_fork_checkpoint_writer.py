@@ -623,3 +623,66 @@ def test_a_tensor_subclass_never_reaches_the_plain_buffer():
     assert _Exotic.moved, "the subclass must do its own move"
     assert offload.pairs == [], "and must not be queued onto the side stream"
     assert type(out) is torch.Tensor
+
+
+class TestDTensorOffload:
+    """The model's shards: unwrapped, snapshotted, and swapped back in place.
+
+    Two facts from the GPU (scripts/check_dtensor_offload.py) shape this. The
+    plain-buffer route cannot take a DTensor at all -- plain.copy_(dtensor)
+    raises. And DTensor.from_local, the obvious way to rebuild the wrapper
+    around a CPU shard, normalizes the local tensor to the mesh's device type
+    and hands back a CUDA shard: it round-trips perfectly in a process that has
+    CUDA and kills the forked writer, which does not. So the walk works on the
+    local shard and assigns it back.
+
+    A stand-in stands for DTensor here because a real one needs a process
+    group; what is under test is the walk's handling, not torch's.
+    """
+
+    class _FakeDTensor:
+        def __init__(self, local):
+            self._local_tensor = local
+
+        def to_local(self):
+            return self._local_tensor
+
+    def _walk(self, monkeypatch, obj, offload):
+        monkeypatch.setattr(mod, "_DTensor", self._FakeDTensor)
+        moved = []
+        out = mod._finish_offload_to_cpu(obj, moved, "model", offload)
+        return out, moved
+
+    def test_the_local_shard_is_snapshotted_and_swapped_in_place(self, monkeypatch):
+        class _OnDevice(torch.Tensor):
+            @property
+            def device(self):
+                class _D:
+                    type = "cuda"
+
+                    def __str__(self):
+                        return "cuda:0"
+                return _D()
+
+            def detach(self):
+                return torch.tensor([1.0, 2.0])
+
+        wrapper = self._FakeDTensor(_OnDevice())
+        offload = mod._Offload({}, {})
+
+        out, moved = self._walk(monkeypatch, {"weight": wrapper}, offload)
+
+        assert out["weight"] is wrapper, "the DTensor object itself must survive the walk"
+        assert wrapper.to_local().device.type == "cpu", "its shard must end up on CPU"
+        assert [name for name, _, _ in moved] == ["model.weight<local>"]
+
+    def test_a_shard_already_on_cpu_is_left_alone(self, monkeypatch):
+        local = torch.arange(4, dtype=torch.float32)
+        wrapper = self._FakeDTensor(local)
+        offload = mod._Offload({}, {})
+
+        out, moved = self._walk(monkeypatch, {"weight": wrapper}, offload)
+
+        assert out["weight"] is wrapper
+        assert wrapper.to_local() is local, "no copy for a shard that is already where it belongs"
+        assert moved == [] and offload.pairs == []

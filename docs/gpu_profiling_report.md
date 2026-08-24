@@ -1544,3 +1544,28 @@ GenerationConfig をキャッシュ（ネットワーク往復は初回のみ）
 save 全体を 1 行で計測する `save cost ... (model build / optim build /
 offload walk / extras+barrier)` に統合。期待値: save の device-idle
 **~5 s → ~2〜3 s**（本番 freq 25 で ~0.01%）。
+
+#### 最後の 3.2 s: model の DTensor も overlap 経路に載せた
+
+probe（`scripts/check_dtensor_offload.py`、GPU 実行）が 2 つの事実を出した:
+
+```
+3a from_local(cpu shard) keeps it on CPU: FAIL (local on cuda:0)
+3c in-place _local_tensor swap keeps it on CPU: PASS (local now on cpu)
+3d round-trip after the swap, still CPU: PASS (local on cpu)
+```
+
+**`DTensor.from_local` は使えない。** local tensor を mesh の device type に
+正規化するので、pinned CPU shard を渡しても CUDA shard が返る —— CUDA のある
+プロセスでは `torch.save` が通ってしまい、**CUDA を持たない fork の子で
+`storage.cpu()` に落ちる**（nbq51imk の死因の再現）。最初の probe が
+「例外が出ない」だけを PASS とし device を印字しただけで検証しなかったため、
+一度 `ALL PASS` と誤報している。各ステップが device を assert するよう直した。
+
+使えるのは **`_local_tensor` の in-place 差し替え**で、これは walk の
+ShardedTensor 分岐が既にやっている手口と同じ。walk がこの state dict エントリ
+を所有している（FSDP がこの save のために作り、他の誰も参照を持たない）ので
+安全。
+
+これで model 側も `offload_to_cpu=False` に戻し、snapshot → side stream の
+経路に載る。save cost の見込みは **3.58 s → ~0.3 s**（extras+barrier のみ）。

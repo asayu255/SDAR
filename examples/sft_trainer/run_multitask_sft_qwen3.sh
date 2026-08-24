@@ -229,7 +229,11 @@ set -x
 #     printed that number under the write's label and read 500 s writes that
 #     were really ~200 s.
 #     CKPT_SNAPSHOT=1 (the default) additionally moves the device-to-host copy
-#     off this thread: the save takes a device-to-device snapshot (~7 GB at
+#     off this thread -- both the optimizer's plain tensors and the model's
+#     DTensor shards, the latter unwrapped to their local shard, snapshotted,
+#     and swapped back in place (NOT via DTensor.from_local, which normalizes
+#     the shard back to the mesh's device and would kill the forked writer;
+#     scripts/check_dtensor_offload.py is what established that on the device): the save takes a device-to-device snapshot (~7 GB at
 #     ~1.5 TB/s, tens of ms, and SM-busy so the card is not idle for it) and
 #     issues the D2H on a side stream, where it overlaps the next step. The
 #     writer is forked by the training loop once that copy lands, right after

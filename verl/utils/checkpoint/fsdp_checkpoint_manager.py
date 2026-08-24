@@ -39,6 +39,11 @@ try:
 except Exception:  # pragma: no cover - torch without the sharded-tensor API
     _ShardedTensor = None
 
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:  # pragma: no cover - torch without the DTensor API
+    _DTensor = None
+
 
 # A background *thread* writing the checkpoint shares the GIL with the training
 # loop, and torch.save holds it for as long as it is pickling. Measured on run
@@ -98,6 +103,20 @@ def _finish_offload_to_cpu(obj, moved, name, offload=None):
                 moved.append((f"{name}<shard{index}>", str(shard.tensor.device),
                               shard.tensor.numel() * shard.tensor.element_size()))
                 shard.tensor = _route(shard.tensor, f"{name}<shard{index}>", offload)
+        return obj
+    if _DTensor is not None and isinstance(obj, _DTensor):
+        local = obj.to_local()
+        if local.device.type != "cpu":
+            moved.append((f"{name}<local>", str(local.device),
+                          local.numel() * local.element_size()))
+            # In place, and NOT via DTensor.from_local: from_local normalizes
+            # the local tensor to the mesh's device type, so it hands back a
+            # CUDA shard that round-trips fine here and kills the forked writer,
+            # which has no CUDA context (measured, scripts/check_dtensor_offload.py).
+            # Assigning the shard keeps it on CPU and survives save/load. Safe
+            # because the walk owns this state-dict entry -- FSDP built it for
+            # this save and nothing else holds a reference.
+            obj._local_tensor = _route(local, f"{name}<local>", offload)
         return obj
     if isinstance(obj, torch.Tensor):
         if obj.device.type == "cpu":
@@ -723,16 +742,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         # every rank will save its own model and optim shard.
         #
-        # The model keeps offload_to_cpu ON. Turning it off to route the model
-        # through the walk below looked like a 3 s win and was a crash: FSDP1's
-        # sharded model state dict is DTensors, and a plain reusable buffer
-        # cannot receive one -- "aten.copy_.default: got mixed torch.Tensor and
-        # DTensor" (run ke23u52t, all three ranks, first save). Only the
-        # optimizer stragglers reach the walk, and those are plain tensors.
-        # Overlapping the model's D2H needs a DTensor-aware snapshot that
-        # rebuilds the wrapper around a CPU local shard, which is a change to
-        # make against a GPU, not blind.
-        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        # Under async_save the model's offload_to_cpu is OFF so its D2H can be
+        # overlapped like the optimizer's: FSDP does that copy synchronously on
+        # this thread, and it was the whole remaining save cost (model build
+        # 3.2-3.8 s of a 3.58 s save, run ovb0yobz). The walk now unwraps a
+        # DTensor to its local shard, snapshots that, and swaps the shard in
+        # place -- checked on the device rather than assumed, after an earlier
+        # blind attempt crashed every rank (ke23u52t) and a from_local version
+        # silently moved the shard back to CUDA.
+        offload_model = is_cuda_available and not (self.async_save and _DTensor is not None)
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=offload_model)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
