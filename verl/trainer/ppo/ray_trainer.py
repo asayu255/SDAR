@@ -66,7 +66,6 @@ from verl.utils.seqlen_balancing import (
     log_minibatch_unbalance,
     log_seqlen_unbalance,
 )
-from verl.utils.task_interleave import interleave_enabled, interleaved_order
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -855,23 +854,6 @@ class RayPPOTrainer:
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
-
-            # The evaluation set is stored grouped by task, and the generation
-            # batch reaches the workers as contiguous per-rank chunks -- so each
-            # rank gets one task, they generate for wildly different lengths, and
-            # as the short tasks finish the surviving task's rows collapse onto a
-            # single rank while the others are handed nothing. Round-robin fixes
-            # the layout without touching the sample set; see task_interleave for
-            # why within-task order (and therefore alfworld's seeded games) is
-            # preserved, and for the accuracy class of the change.
-            if interleave_enabled():
-                task_names = get_task_names(test_batch)
-                if task_names is not None:
-                    order = interleaved_order(task_names)
-                    if order != list(range(len(order))):
-                        test_batch = test_batch[order]
-                        print(f"[val-interleave] {len(order)} rows round-robined across "
-                              f"{len(set(str(t) for t in task_names))} tasks", flush=True)
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":

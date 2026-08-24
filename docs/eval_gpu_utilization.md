@@ -75,52 +75,51 @@ worker の `/proc/*/environ` を grep するのは自然な確認だが、**別�
 
 ---
 
-## 3. 43〜50% —— env.step が生成と直列
+## 3. env.step の比率 —— 最初の見積もりは 1 batch からの外挿だった
 
-`vanilla_multi_turn_loop`(`agent_system/multi_turn_rollout/rollout_loop.py`)の
-1 turn は完全直列である:
+`vanilla_multi_turn_loop` の 1 turn が完全直列であることは変わらない:
 
 ```
 preprocess → generate(GPU) → decode → envs.step(CPU/IPC/HTTP)
 ```
 
-GPU が働くのは generate だけ。`envs.step` の間、**vLLM は 28.5 GB 常駐した
-まま カーネルが 1 本も走らない**。既存の overlap 機構(`_env_step_executor`
-による logprob prefetch)は `is_train` 必須なので、**評価では死んでいる**。
+`envs.step` の間、vLLM は 28.5 GB 常駐したままカーネルが 1 本も走らない。
+既存の overlap 機構(`_env_step_executor` による logprob prefetch)は
+`is_train` 必須なので評価では死んでいる。
 
-これが最大の項で、**学習並みに持っていくには必ずこれを潰す必要がある**。
-そして評価の天井はここで決まる: wall の 46% しか GPU の仕事が存在しない以上、
-env を生成の裏に入れない限り util は 46% を超えない。
+**ただしその大きさを 42〜50% としたのは誤りだった。** turn timing を入れて
+測った実測(alfworld batch):
 
-### なぜまだ実装していないか
+```
+TOTAL             11.2    201.0      1.4     17.0    230.6
+SHARE  gen(GPU-busy)=87.1%  cpu-glue(preproc+decode+envstep, GPU-idle)=12.9%
+```
 
-隠すには batch を cohort に割り、片方が env.step 中に他方を生成する必要が
-ある。alfworld の seeded game cycle を保つには**単一の envs オブジェクトを
-保ったまま部分集合を step する**しかなく、それは:
+**envstep は 17.0 / 230.6 = 7.4%。** そして gen が wall の 87.1% を占める
+一方で、NVML は同じ run の GPU busy を 46.6% と読む —— つまり
+**`generate_sequences` の中で GPU が半分空いている**。
 
-* `SimpleMemory.store/fetch` を index 対応にする(全 manager 共有)
-* 各 manager の `step` が持つ positional state
-  (`self.pre_text_obs`、`self.memory`、`prev_admissible_commands`)を index 対応にする
-* 各 leaf の `envs.step` を部分ディスパッチにする
-  (alfworld は env ごとに Ray actor なので leaf は容易)
-* rollout loop を cohort パイプラインに書き換える
+**この表は 413 batch のうちの batch 0 だけ**、つまり run の 0.24% である。
+4 節の通り 411/413 は search batch で、その `envs.step` は retriever への
+HTTP 呼び出しであり、alfworld の表には原理的に写らない。1 節の
+「engine 常駐 + util 0 が 42.9%」はほぼ全部そちらのはずだが、**まだ
+測っていない**。
 
-を全部要求する。**評価の正確性クリティカルパスへの侵襲的変更**であり、
-しかも「env 時間が turn のどこにどう分布しているか」を測る前に設計すると、
-この調査で 3 回やった失敗(測らずに原因を言う)の 4 回目になる。
+判断に必要なものは走行中のログに既にある。turn timing は batch ごとに出るので:
 
-`ROLLOUT_TURN_TIMING=1` を `eval_checkpoints.sh` の既定にした。次の eval が
-turn ごとの `preproc / gen / decode / envstep / genGPU%` を出す。決めるのは:
+```bash
+grep -rhE "TOTAL +[0-9]|SHARE  gen" /tmp/ray/session_latest/logs/*.out | head -30
+```
 
-* 末尾が alfworld 単独なら cohort は **alfworld の中**を割る必要がある
-* task 混在が続くなら cohort は **task** でよく、`_task_indices` が既にあるので
-  はるかに安全
+先頭 2 本が alfworld と webshop、以降が search。search の `SHARE` 行が
+出た時点で、標的が **generate の中**なのか **retriever 待ち**なのかが決まる。
+前者なら vLLM 側の話(`enable_chunked_prefill=False`、
+`max_num_batched_tokens=8192`、毎 turn 全履歴を再 prefill)で env とは無関係、
+後者なら `search_url` の fan-out(`envs.py:54` が複数 client に対応済み)が
+最も安い。**cohort 分割はどちらでもない** —— search は 4 turn しかないので
+overlap の余地自体が小さい。
 
-**この 2 つは実装も risk も別物である。**
-
----
-
-## 4. 生成中の rank 不均衡 —— これは直した
+## 4. 生成中の rank 不均衡 —— 帰属を間違えた(撤回)
 
 2 秒トレースの生成中サンプル:
 
@@ -130,26 +129,30 @@ turn ごとの `preproc / gen / decode / envstep / genGPU%` を出す。決め�
 0, 87   1, 25   2, 88
 ```
 
-生成 batch は**連続チャンクで rank に配られ**、評価セットは**task ごとに
-固めて**保存されている。つまり rank 0 = alfworld、rank 1 = search、
-rank 2 = webshop。3 task は生成長も終了 turn も違う。しかも search が数 turn で
-終わると、**生き残った task の行が 1 枚に集中し、他の 2 枚には何も渡らない**。
+これを「batch が task ごとに固まっていて、rank ごとに 1 task が当たるため」と
+読み、round-robin する `VAL_TASK_INTERLEAVE` を入れた。**前提が偽だった。**
 
-`TaskBalancedSampler` の `TASK_BALANCE_INTERLEAVE` は *sampler* なので効かない
-—— 検証 dataloader は sampler を取らず、データセット順に読む。
+`examples/data_preprocess/prepare_sdar_multitask.py` の `_build_split` は
+test セットをこう組む:
 
-`verl/utils/task_interleave.py` を足した。round-robin で並べ替えるだけで、
-**task 内の相対順序は保つ**。これが seeding 不変条件そのもので、alfworld は
-TextWorld の seeded game cycle を**位置で**引くため、task 内で行を動かすと
-別の episode を採点することになる —— per-checkpoint プロセス設計が防いで
-いる当のものである。
+| batch | 中身 | max_steps |
+| ---: | --- | ---: |
+| 0 | alfworld 126 行 | 50 |
+| 1 | webshop 126 行 | 15 |
+| 2〜412 | search(test parquet 全行 ≈ 51,713) | 4 |
 
-`VAL_TASK_INTERLEAVE=1` で有効。**既定は OFF**: rank が変われば温度>0 で
-サンプルされる token が変わる。batch 構成変更と同じ精度クラスだが、ここは
-**採点経路**であり、pull しただけで報告する数字が変わってはいけない。
-sweep 単位で on か off を決めること。
+**batch は task ごとに単一**である。しかも `_validation_task_name`
+(`ray_trainer.py:810`)は**混在 batch で ValueError を投げる** ——
+`val_kwargs_by_task` が batch 単位で解決されるので、混ぜてはいけない。
+search が最後に置かれているのも、その端数 batch が次の task と混ざらない
+ようにするためである(同ファイルのコメント)。
 
----
+したがって round-robin は恒等写像を返す no-op で、仮に効けば例外だった。
+**revert 済み。** 観測された偏りは task 混在ではなく、**単一 task 内の
+生成長のばらつき**である —— 早く終わった rank が、他 rank の最長系列を待つ。
+
+**教訓としてここに残す**: `87/0/0` という署名から機構を推定して実装し、
+データ生成側を読んでいなかった。この arm で 4 回目の同じ失敗である。
 
 ## 5. 実装していないもの —— episode 単位の async loop
 
@@ -173,11 +176,13 @@ worker group の駆動方法ごと変わる。
 
 | 項目 | 大きさ | 状態 |
 | --- | --- | --- |
-| env.step 直列 | **43〜50%** | **未着手。最大項。** 次の eval の turn timing が cohort の粒度を決める |
-| vLLM 毎 turn 寝起き | 10.8〜13% | 観測可能にした。原因は次の run が確定させる |
-| 生成中の rank 不均衡 | 生成 37〜47% のうち不明分 | `VAL_TASK_INTERLEAVE=1` で解消。既定 OFF |
-| env 自体の遅延 | 未測定 | search は `search_url` の fan-out に対応済み。turn timing が最遅 task を出す |
+| vLLM 毎 turn 寝起き | 10.4〜13% | **解消**。`closed after 50 generate calls on one wake` で確認 |
+| `generate_sequences` の中の空き | alfworld batch で gen が wall の 87.1%、同 run の GPU busy が 46.6% | **未特定**。`GPU_PROFILER=1` が turn timing の `genGPU%` 列を埋める |
+| search batch の retriever 待ち | **未測定**。411/413 の batch がこれ | 走行中のログの `SHARE` 行が出す |
+| env.step(alfworld batch 実測) | 7.4% | 当初 42〜50% としたのは 1 batch からの外挿の誤り |
+| 生成中の rank 不均衡 | — | 帰属を誤り、修正を revert(4 節) |
 
-**この 4 つを全部潰した場合の上限は、env を完全に隠せたとして ~90%。**
-学習の 99.9% には届かない —— 評価は生成と環境の往復であり、環境が CPU に
-いる限り、隠せるのは重ねられるぶんだけである。
+**評価の天井は「wall のうち GPU に仕事がある割合」で決まる。** alfworld batch
+ではそれが 87.1% あり、うち半分が gen の中で空いている。search batch では
+まだ分かっていない。**どちらを直すかを決める数字は、いま走っている run が
+書き出している。**
