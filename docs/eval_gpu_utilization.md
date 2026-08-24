@@ -284,23 +284,53 @@ search が最後に置かれているのも、その端数 batch が次の task 
 **教訓としてここに残す**: `87/0/0` という署名から機構を推定して実装し、
 データ生成側を読んでいなかった。この arm で 4 回目の同じ失敗である。
 
-## 5. 実装していないもの —— episode 単位の async loop
+## 5. batch を 2 本並走させる —— 残った 16.5% への手
 
-GPU が「どれかの episode が生成中なら常に busy」になる唯一の形。
-`agent_system/multi_turn_rollout/async_rollout_core.py` に、同期 loop と
-同一軌跡を collect することを CPU で証明する制御フロー核が既にあり
-(`tests/ray_cpu/test_async_rollout_equivalence.py` が 6 件で固めている)、
-docstring は「次に `async_rollout_loop.py` を足す」と書いている。
+3 節のあと、search batch 1 本は **generate 11.87 s に対し preproc 1.20 s +
+envstep 1.17 s**。この 2.37 s は「環境の答えを受けてから次の生成まで」に
+挟まっていて、**先読みできない** —— 次の turn のプロンプトは今の turn への
+環境の答えそのものだからである。
 
-その統合ファイルは**存在しない**。そして繋ぐ相手の `vLLMAsyncRollout`
-(`vllm_rollout_spmd.py:410`)は verl の **agent-loop / async server 経路**用の
-SPMD ラッパであって、この rollout loop に差せる AsyncLLM ではない。
-worker group の駆動方法ごと変わる。
+1 本の batch の中では埋められない。**別の batch なら埋められる。** batch は
+互いに独立なので、片方が環境を待つ間にもう片方が生成できる。worker group は
+Ray actor で自分の呼び出しを直列化するので、**2 本の generate は勝手に順番待ち
+になり、重なるのは「一方の環境待ち」と「他方の生成」だけ** —— つまり狙った隙間
+そのものである。
 
-**3 節の cohort より大きい変更で、3 節の測定結果が前提になる。**
-順序としては後である。
+### 採点を変えないための 3 条件
 
----
+`verl/utils/val_pipeline.py`。
+
+1. **順序。** 結果は投入順に retire し、集計は呼び出しスレッドで行う。
+   集計先は平坦なリストで、あとから `data_source` や `task_name` と**位置で**
+   突き合わせるので、順序が崩れれば全行が別の行のメタデータで採点される
+   —— しかも例外は出ない
+2. **隔離。** slot は env manager と TrajectoryCollector を**専有**する。
+   どちらも rollout ごとの状態(観測履歴、env ごとの step カウンタ)を持つので、
+   2 本が同じ manager に入れば履歴が混ざる
+3. **適格性。** extra slot は**2 個目の manager を作っても同じ episode を採点
+   できる task に限る**(`PIPELINEABLE_VAL_TASKS`)。alfworld は入っていない
+   —— `AlfworldEnvs` は worker i を `seed + i // group_n` で seed するので、
+   どの game を引くかが**その manager 内の位置**の関数になる。2 つに分ければ
+   全行が別の game を引き、これも例外は出ない。search は各行が自分の
+   question と ground_truth を reset で受け取り、`_rng` は作られて一度も
+   使われないので、2 つの manager は交換可能である
+
+**`VAL_PIPELINE_DEPTH=1`(既定)では thread に投げすらしない** —— 呼び出しは
+inline で、従来の逐次ループと同一である。
+
+### 見込み
+
+generate が 2.97 s/turn、preproc + env が 0.59 s/turn なので、pipeline は
+generate 律速になる。batch 14.33 s → ~12.5 s、評価全体 **1.73 h → ~1.52 h、
+util 83% → ~94%**。**未実測。**
+
+### 使っていないもの
+
+`agent_system/multi_turn_rollout/async_rollout_core.py` の軌跡単位スケジューラは
+使っていない。あれが要るのは「1 本の batch の中で軌跡ごとに非同期化する」場合で、
+それには vLLM の AsyncLLM 経路と env の部分 step が要る。**batch を 2 本並べる
+だけで同じ隙間が埋まり、env にも rollout loop にも触らずに済む。**
 
 ## 6. 現状の台帳
 
@@ -316,13 +346,16 @@ worker group の駆動方法ごと変わる。
 
 ### ここから先
 
-| | wall | util | 要るもの |
+| | wall | util | 状態 |
 | --- | ---: | ---: | --- |
-| いま | 1.73 h | 83.0% | — |
-| retriever をさらに詰める | ~1.68 h | ~85% | `load_docs` / JSON の最適化。残り 8.1% の 2/3 |
-| batch をまたぐ async pipeline | ~1.44 h | ~99% | `async_rollout_loop.py`(5 節) |
+| いま | 1.73 h | 83.0% | 実測 |
+| **`VAL_PIPELINE_DEPTH=2`** | **~1.52 h** | **~94%** | **実装済み・未実測**(5 節) |
+| retriever の GPU 専有 | −0.04 h | +2 pt | 未着手。`CUDA_VISIBLE_DEVICES` で 1 枚ずつ。ただし 8001 は第三者(`100.86.45.34`)が使っており調整が要る |
 
-**理論上限は 99.9% で、隠せないのは pipeline の fill と drain だけである。**
-ただし preproc と retrieval を隠すには、待っている間に別の軌跡を生成する形
-—— cohort ないし episode 単位の async ループ —— が要る。残り 16 pt に対して
-採点経路の再設計なので、投資判断は別である。
+retriever の内訳は実測済みで、**`load_docs` は 250 ms → 2.8 ms(total の 1.2%)**
+で解決、残りは `encode`(61%)と `faiss`。`encode` がクエリ数に比例しない
+(3 本 134 ms、21 本 27 ms、50 本 253 ms)ことから、計算ではなく **8000 と 8001 が
+同じ 2 枚の GPU を取り合っている待ち**である。
+
+**理論上限は 99.9% で、隠せないのは pipeline の fill と drain だけ。**
+depth 2 の残り 6 pt はその fill/drain と、generate 律速からのわずかなずれである。

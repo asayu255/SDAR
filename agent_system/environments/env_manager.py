@@ -982,6 +982,58 @@ class LazyEnvManager:
         return getattr(self.materialize(), name)
 
 
+# Tasks a second validation manager may be built for. A second manager scores the
+# same episodes only when a row's episode comes entirely from that row -- search
+# passes each env its own question and ground_truth at reset, and its `_rng` is
+# constructed and never used, so two managers are interchangeable.
+#
+# alfworld is not on this list and must not be: AlfworldEnvs seeds worker i with
+# `seed + i // group_n`, so which game a row plays is a function of its position
+# *within its manager*. Split across two and every row plays a different game --
+# which is the one thing the per-checkpoint-process design exists to prevent, and
+# it would not raise.
+#
+# webshop is left off for the same reason until someone checks it: its envs are
+# Ray actors handed goals at construction, and "probably fine" is not the standard
+# for a scoring path.
+PIPELINEABLE_VAL_TASKS = ("search",)
+
+
+def build_val_env_manager(config, tasks: List[str]):
+    """A second validation env manager, restricted to `tasks`.
+
+    Same arguments as the one make_envs builds, so the environments are the ones
+    that batch would have seen anyway -- only fewer tasks, because a manager for
+    tasks it will never be handed costs 126 Ray actors each.
+
+    Lazy, like the primary: a run that never routes a batch here never builds it.
+    """
+    for task in tasks:
+        if task not in PIPELINEABLE_VAL_TASKS:
+            raise ValueError(
+                f"{task!r} cannot have a second validation manager (see PIPELINEABLE_VAL_TASKS); "
+                f"allowed: {list(PIPELINEABLE_VAL_TASKS)}"
+            )
+    all_tasks = _get_multitask_tasks(config)
+    unknown = [task for task in tasks if task not in all_tasks]
+    if unknown:
+        raise ValueError(f"tasks not configured for this run: {unknown} (configured: {all_tasks})")
+
+    def _build():
+        return _build_multitask_manager(
+            config=config,
+            tasks=list(tasks),
+            task_max_steps=_get_multitask_task_max_steps(config, all_tasks),
+            per_task_batch_size=_get_multitask_per_task_batch_size(config, all_tasks, is_train=False),
+            group_n=1,
+            is_train=False,
+            seed=config.env.seed + 1000,
+            resources_per_worker=OmegaConf.to_container(config.env.resources_per_worker, resolve=True),
+        )
+
+    return LazyEnvManager(_build)
+
+
 def make_envs(config):
     """
     Create enviroments 

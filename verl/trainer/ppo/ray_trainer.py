@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type
+from typing import Dict, NamedTuple, Optional, Type
 
 import numpy as np
 import ray
@@ -70,6 +70,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from agent_system.multi_turn_rollout.rollout_loop import rollout_session
+from verl.utils.val_pipeline import Slot, run_pipelined
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
@@ -441,6 +442,20 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 # BALANCE_MINIBATCH=1 and compare perf/mfu/actor, which is data-independent.
 _BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
     "1", "true", "yes", "on")
+
+
+class _PreparedValidationBatch(NamedTuple):
+    """What one validation batch needs before it can be rolled out.
+
+    ``batch`` is None for the reward-model-only case the sequential loop returned
+    ``{}`` on; ``task`` is what the pipeline routes by, and is resolved here
+    because _validation_kwargs_for_batch has to see the batch anyway.
+    """
+
+    batch: object
+    input_texts: object
+    task: object
+    gen_batch: object
 
 
 class RayPPOTrainer:
@@ -837,6 +852,108 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
+    def _validation_slots(self):
+        """One slot per validation batch that may be in flight at once.
+
+        A slot owns an environment manager and a trajectory collector outright,
+        because both hold per-rollout state -- observation history, per-env step
+        counters, the pending-reset handle. Sharing either between two concurrent
+        rollouts would interleave one batch's history into the other's.
+
+        Depth 1 (the default) is a single slot on the manager this trainer was
+        built with, which is exactly the sequential loop. Above that, the extra
+        slots are restricted to the tasks a second manager can serve without
+        changing which episodes are scored -- see PIPELINEABLE_VAL_TASKS.
+        Cached, so the extra managers are built at most once per process.
+        """
+        if getattr(self, "_val_slots", None) is not None:
+            return self._val_slots
+
+        depth = int(os.environ.get("VAL_PIPELINE_DEPTH", "1"))
+        slots = [Slot("primary", self.val_envs, self.traj_collector, tasks=None)]
+        if depth > 1:
+            from agent_system.environments.env_manager import PIPELINEABLE_VAL_TASKS, build_val_env_manager
+            from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+            tasks = list(PIPELINEABLE_VAL_TASKS)
+            for index in range(1, depth):
+                slots.append(
+                    Slot(
+                        f"extra-{index}",
+                        build_val_env_manager(self.config, tasks),
+                        TrajectoryCollector(config=self.config, tokenizer=self.tokenizer, processor=self.processor),
+                        tasks=tasks,
+                    )
+                )
+            print(
+                f"[val-pipeline] depth {depth}: {len(slots)} slots, the extra ones restricted to {tasks}. "
+                "Batches retire in order; only the rollouts overlap.",
+                flush=True,
+            )
+        self._val_slots = slots
+        return slots
+
+    def _prepare_validation_batch(self, test_data):
+        """Everything before the rollout: repeat, decode the prompts, split off
+        the generation batch, resolve the task's sampling kwargs.
+
+        Runs on the calling thread and in order -- it touches the tokeniser and
+        the trainer's own config, and it is where the batch's task is decided,
+        which the pipeline needs before it can pick a slot.
+        """
+        test_batch = DataProto.from_single_dict(test_data)
+        test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+
+        # we only do validation on rule-based rm
+        if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            return _PreparedValidationBatch(None, None, None, None)
+
+        # Store original inputs
+        input_ids = test_batch.batch["input_ids"]
+        # TODO: Can we keep special tokens except for padding tokens?
+        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+        for optional in ("multi_modal_data", "raw_prompt", "tools_kwargs", "env_kwargs", "task_name"):
+            if optional in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append(optional)
+        test_gen_batch = test_batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+
+        test_gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "validate": True,
+        }
+        test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
+        print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+        return _PreparedValidationBatch(
+            test_batch, input_texts, self._validation_task_name(test_gen_batch), test_gen_batch
+        )
+
+    def _rollout_validation_batch(self, prepared, slot):
+        """The agent-environment loop for one batch, on its own slot.
+
+        This is the part that runs concurrently when the pipeline is deeper than
+        one, and the only part that does: everything it touches -- the gen batch,
+        the slot's envs, the slot's collector -- belongs to this batch alone. The
+        worker group is shared, but it is a Ray actor and serialises its own
+        calls, which is what makes one batch's environment overlap another's
+        generation rather than contend with it.
+        """
+        if prepared.batch is None:
+            return None
+        return slot.collector.multi_turn_loop(
+            gen_batch=prepared.gen_batch,
+            actor_rollout_wg=self.actor_rollout_wg,
+            envs=slot.envs,
+            is_train=False,
+        )
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -863,64 +980,22 @@ class RayPPOTrainer:
         # clock on NVML -- and the search rollouts are 24 s each, far too short to
         # amortise it. The worker counts scopes, so the inner 413 become no-ops.
         with rollout_session(self.actor_rollout_wg):
-            for test_data in self.val_dataloader:
-                test_batch = DataProto.from_single_dict(test_data)
-
-                # repeat test batch
-                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
-
-                # we only do validation on rule-based rm
-                if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            slots = self._validation_slots()
+            for prepared, test_output_gen_batch in run_pipelined(
+                self.val_dataloader,
+                prepare=self._prepare_validation_batch,
+                task_of=lambda prepared: prepared.task,
+                launch=self._rollout_validation_batch,
+                slots=slots,
+            ):
+                if prepared.batch is None:
+                    # reward_model.enable with a model-style rm: the sequential
+                    # loop returned {} on the first such batch, and so does this.
                     return {}
+                test_batch = prepared.batch
+                sample_inputs.extend(prepared.input_texts)
 
-                # Store original inputs
-                input_ids = test_batch.batch["input_ids"]
-                # TODO: Can we keep special tokens except for padding tokens?
-                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                sample_inputs.extend(input_texts)
-
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-                if "multi_modal_data" in test_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in test_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in test_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "env_kwargs" in test_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("env_kwargs")
-                if "task_name" in test_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("task_name")
-                test_gen_batch = test_batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )
-
-                test_gen_batch.meta_info = {
-                    "eos_token_id": self.tokenizer.eos_token_id,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "recompute_log_prob": False,
-                    "validate": True,
-                }
-                test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
-                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
-                # # pad to be divisible by dp_size
-                # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-                # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-
-                # # unpad
-                # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
-                ################ agent-environment loop ###############
-                test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                        gen_batch=test_gen_batch,
-                                                        actor_rollout_wg=self.actor_rollout_wg,
-                                                        envs=self.val_envs,
-                                                        is_train=False,
-                                                        )
-                print('validation generation end')
-                del test_batch
+                print("validation generation end")
                 test_batch = test_output_gen_batch
                 # Store generated outputs
                 output_ids = test_output_gen_batch.batch["responses"]

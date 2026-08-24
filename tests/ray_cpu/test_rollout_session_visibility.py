@@ -352,13 +352,26 @@ def test_rollout_session_is_a_no_op_when_the_flag_is_off(monkeypatch):
 
 
 def test_validate_wraps_its_whole_loop_in_one_session():
-    """The hoist is the point. If the `with` ever moves inside the for, the 413
-    inner scopes become 413 wake/sleep cycles again -- silently."""
+    """The hoist is the point. If the `with` ever moves inside the per-batch
+    loop, the 413 inner scopes become 413 wake/sleep cycles again -- silently."""
     import inspect
 
     from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
     src = inspect.getsource(RayPPOTrainer._validate)
     with_at = src.index("with rollout_session(self.actor_rollout_wg):")
-    for_at = src.index("for test_data in self.val_dataloader:")
-    assert with_at < for_at, "the session must open outside the batch loop"
+    loop_at = src.index("run_pipelined(")
+    assert with_at < loop_at, "the session must open outside the batch loop"
+
+
+def test_validate_drives_its_batches_through_the_pipeline():
+    """The loop is a generator consumer now. If it ever goes back to iterating
+    val_dataloader directly, the pipeline is bypassed and VAL_PIPELINE_DEPTH
+    silently does nothing."""
+    import inspect
+
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    src = inspect.getsource(RayPPOTrainer._validate)
+    assert "run_pipelined(" in src
+    assert "for test_data in self.val_dataloader:" not in src

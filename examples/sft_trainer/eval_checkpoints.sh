@@ -135,6 +135,24 @@ export ROLLOUT_KEEP_VLLM_AWAKE=1
 # is not already known.
 export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 
+# VAL_PIPELINE_DEPTH=2 keeps a second validation batch in flight, so one batch's
+# environment and tokenising overlap the other's generation. After the retriever
+# was batched a search batch is 11.87 s of generation against 1.20 s of
+# tokenising and 1.17 s of environment -- 16.5% the GPU spends waiting for work
+# that cannot be brought forward, because the next turn's prompt is the
+# environment's answer to this one. Another batch is the only thing that can
+# fill it.
+#
+# Scored rows are unchanged: batches retire in submission order, the accumulation
+# stays on the main thread, and the extra slots only serve tasks whose episodes
+# come entirely from their own row (search). alfworld keeps a single manager --
+# its games are indexed by position within the manager, so a second one would
+# score a different set.
+#
+# Left at 1 by default: it is the scoring path, and depth 2 builds a second set
+# of search environments. Turn it on for a whole sweep or not at all.
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-1}"
+
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
 # and the rest append; the id is per invocation, so re-running this script never
