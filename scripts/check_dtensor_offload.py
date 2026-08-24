@@ -24,13 +24,15 @@ to guess at them cost a crashed run, so this asks the GPU instead of guessing:
 
   1. torch.empty_like(dt) gives a DTensor sharing the placement -- the snapshot.
   2. snapshot.copy_(live) works DTensor-to-DTensor on the main stream.
-  3. a DTensor with a CPU local shard can be rebuilt on a CUDA mesh, and
-     torch.save/torch.load round-trips it identically to what FSDP produces.
+  3. a DTensor with a CPU local shard can be rebuilt on a CUDA mesh, the shard
+     STAYS on CPU, and torch.save/torch.load round-trips it that way.
 
-(3) is the doubtful one, and it is the one that decides the design: FSDP's own
-offload_to_cpu produces exactly such an object, so it is representable -- what
-is unknown is whether DTensor.from_local will build it without a collective or
-a device check.
+(3) is the doubtful one and it decides the design. FSDP's own offload_to_cpu
+produces exactly such an object, so it is representable. What is unknown is
+whether it can be built here -- and "no exception" is not the test: from_local
+normalizes the local tensor to the mesh's device type, so it can hand back a
+CUDA shard that round-trips perfectly in a process that has CUDA and kills the
+forked writer, which does not. Every step asserts the device it claims.
 
 Run on the GPU box, one process, no training:
 
@@ -92,18 +94,30 @@ def main() -> int:
         host = torch.empty(local.shape, dtype=local.dtype, device="cpu", pin_memory=True)
         host.copy_(local)                       # this is the copy that would move to the side stream
         rebuilt = DTensor.from_local(host, mesh, snapshot.placements, run_check=False)
-        print(f"[rank {rank}] 3a from_local(cpu shard) on a cuda mesh: PASS "
-              f"(local on {rebuilt.to_local().device})")
+        # The device is the whole point, so it is asserted rather than printed.
+        # from_local normalizes the local tensor to the mesh's device type, which
+        # silently undoes the offload: the object builds, the round-trip passes
+        # in a process that has CUDA, and the forked writer -- which does not --
+        # dies on storage.cpu() exactly as it did on run nbq51imk.
+        stayed = rebuilt.to_local().device.type == "cpu"
+        print(f"[rank {rank}] 3a from_local(cpu shard) keeps it on CPU: "
+              f"{'PASS' if stayed else 'FAIL'} (local on {rebuilt.to_local().device})")
+        if not stayed:
+            print(f"[rank {rank}]    from_local moved it back to the device; "
+                  "trying the in-place fallback instead...")
+            return _try_in_place(rank, live, snapshot)
 
         path = f"/tmp/dtensor_probe_rank{rank}.pt"
         torch.save({"w": rebuilt}, path)
         loaded = torch.load(path, weights_only=False)["w"]
-        matches = torch.equal(loaded.to_local().cpu(), live.to_local().cpu())
-        print(f"[rank {rank}] 3b torch.save/load round-trip: {'PASS' if matches else 'FAIL (values differ)'} "
-              f"({type(loaded).__name__})")
+        matches = (torch.equal(loaded.to_local().cpu(), live.to_local().cpu())
+                   and loaded.to_local().device.type == "cpu")
+        print(f"[rank {rank}] 3b torch.save/load round-trip, still CPU: "
+              f"{'PASS' if matches else 'FAIL'} "
+              f"({type(loaded).__name__}, local on {loaded.to_local().device})")
         os.remove(path)
         if not matches:
-            return 1
+            return _try_in_place(rank, live, snapshot)
     except Exception as exc:
         print(f"[rank {rank}] 3 from_local / round-trip: FAIL {exc!r}")
         print(f"[rank {rank}]    trying the in-place fallback instead...")
@@ -128,16 +142,20 @@ def _try_in_place(rank, live, snapshot):
         host = torch.empty(local.shape, dtype=local.dtype, device="cpu", pin_memory=True)
         host.copy_(local)
         snapshot._local_tensor = host
-        print(f"[rank {rank}] 3c in-place _local_tensor swap: PASS "
-              f"(local now on {snapshot.to_local().device})")
+        stayed = snapshot.to_local().device.type == "cpu"
+        print(f"[rank {rank}] 3c in-place _local_tensor swap keeps it on CPU: "
+              f"{'PASS' if stayed else 'FAIL'} (local now on {snapshot.to_local().device})")
+        if not stayed:
+            return 1
 
         path = f"/tmp/dtensor_probe_inplace_rank{rank}.pt"
         torch.save({"w": snapshot}, path)
         loaded = torch.load(path, weights_only=False)["w"]
-        matches = torch.equal(loaded.to_local().cpu(), live.to_local().cpu())
+        matches = (torch.equal(loaded.to_local().cpu(), live.to_local().cpu())
+                   and loaded.to_local().device.type == "cpu")
         os.remove(path)
-        print(f"[rank {rank}] 3d round-trip after the swap: "
-              f"{'PASS' if matches else 'FAIL (values differ)'}")
+        print(f"[rank {rank}] 3d round-trip after the swap, still CPU: "
+              f"{'PASS' if matches else 'FAIL'} (local on {loaded.to_local().device})")
         if matches:
             print(f"[rank {rank}] FALLBACK PASS -- overlap the model via the in-place swap")
             return 0
