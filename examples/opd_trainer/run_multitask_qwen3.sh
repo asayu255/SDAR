@@ -386,7 +386,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.model.use_fused_kernels=False \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \
