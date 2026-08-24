@@ -858,11 +858,28 @@ class ActorRolloutRefWorker(Worker):
         # weights are frozen during a rollout, so a single sync at session start
         # produces the identical weights for every turn -> generation is unchanged.
         # Only the per-turn data sharding (preprocess/postprocess) still runs.
+        self._rollout_generate_calls = getattr(self, "_rollout_generate_calls", 0) + 1
         if getattr(self, "_rollout_session_active", False):
+            self._rollout_session_generates = getattr(self, "_rollout_session_generates", 0) + 1
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
             output = self.rollout_sharding_manager.postprocess_data(output)
         else:
+            # Said once, because it is the difference between one wake per rollout
+            # and one per turn -- 21 GB of vLLM state unmapped and remapped every
+            # time, which on the eval arm measured 13% of wall clock. Silent until
+            # now: the sharding manager's own enter/exit log is DEBUG on a logger
+            # pinned to WARN, so neither state printed anything and the two were
+            # indistinguishable from outside.
+            if self.rank == 0 and not getattr(self, "_rollout_no_session_warned", False):
+                self._rollout_no_session_warned = True
+                print(
+                    "[rollout-session] rank 0: generating WITHOUT a session -- every turn "
+                    "will wake and sleep vLLM and re-sync the frozen weights. Set "
+                    "ROLLOUT_KEEP_VLLM_AWAKE=1 in the process that runs the rollout loop "
+                    "(the driver, not just the workers).",
+                    flush=True,
+                )
             with self.rollout_sharding_manager:
                 log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
@@ -906,15 +923,38 @@ class ActorRolloutRefWorker(Worker):
         # "not a vLLM manager" would make this hook the one place a skipped
         # build still pays for -- or crashes on -- vLLM.
         if self.rollout_sharding_manager is None:
+            self._say_session("no rollout sharding manager (SKIP_ROLLOUT_BUILD)")
             return
         from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
         if not isinstance(self.rollout_sharding_manager, FSDPVLLMShardingManager):
+            self._say_session(f"manager is {type(self.rollout_sharding_manager).__name__}, not vLLM's")
             return
         if getattr(self, "_rollout_session_active", False):
             return
         self.rollout_sharding_manager.__enter__()
         self._rollout_session_active = True
+        self._rollout_session_generates = 0
+        self._say_session("opened -- vLLM stays awake for this rollout")
+
+    def _say_session(self, message: str):
+        """One line per distinct session outcome, from rank 0.
+
+        Every early return above is a silent downgrade to per-turn wake/sleep, and
+        each has a different cause and a different fix. Printing the reason is what
+        makes the two states tellable apart at all -- the manager's own enter/exit
+        logging is DEBUG under a WARN logger, so it never reaches a log file.
+        Deduplicated because these run once per rollout, not once per run.
+        """
+        if self.rank != 0:
+            return
+        seen = getattr(self, "_rollout_session_said", None)
+        if seen is None:
+            seen = self._rollout_session_said = set()
+        if message in seen:
+            return
+        seen.add(message)
+        print(f"[rollout-session] rank 0: {message}", flush=True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def end_rollout_session(self):
@@ -925,6 +965,16 @@ class ActorRolloutRefWorker(Worker):
             return
         self._rollout_session_active = False
         self.rollout_sharding_manager.__exit__(None, None, None)
+        # The count is the whole point: one session covering N turns is the
+        # working state, and N wake/sleep cycles is the broken one. A session that
+        # served 1 generate is a session that bought nothing.
+        served = getattr(self, "_rollout_session_generates", 0)
+        if self.rank == 0:
+            print(
+                f"[rollout-session] rank 0: closed after {served} generate call"
+                f"{'' if served == 1 else 's'} on one wake",
+                flush=True,
+            )
 
 
 

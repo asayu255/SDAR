@@ -120,6 +120,34 @@ def _now():
     return time.perf_counter()
 
 
+_SAID_ROLLOUT_ENV = False
+
+
+def _say_rollout_env():
+    """Print, once, the flags as THIS process resolved them.
+
+    The flags are read at import time in whichever process runs the rollout loop
+    -- the trainer Ray actor, not the launcher and not the rollout workers. On the
+    eval arm that distinction cost 13% of wall clock and took a 2-second
+    nvidia-smi trace to notice, because a driver that never calls
+    begin_rollout_session() and one whose workers refuse to open a session look
+    identical from outside: vLLM wakes and sleeps every turn either way. Reading
+    the value off the process that actually branches on it is the only reading
+    that answers the question.
+    """
+    global _SAID_ROLLOUT_ENV
+    if _SAID_ROLLOUT_ENV:
+        return
+    _SAID_ROLLOUT_ENV = True
+    print(
+        f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
+        f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
+        f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
+        f"; ROLLOUT_TURN_TIMING={'on' if _ROLLOUT_TURN_TIMING else 'off'}",
+        flush=True,
+    )
+
+
 def _fmt_per_gpu(vals):
     if not vals:
         return "-"
@@ -978,6 +1006,7 @@ class TrajectoryCollector:
         # Open one vLLM session for the whole rollout (opt-in). end_rollout_session
         # runs in finally so the engine is always returned to its slept/offloaded
         # state before the post-rollout (gather/teacher/train) phases.
+        _say_rollout_env()
         if _ROLLOUT_KEEP_VLLM_AWAKE:
             actor_rollout_wg.begin_rollout_session()
         try:

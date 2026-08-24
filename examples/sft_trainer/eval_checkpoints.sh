@@ -118,6 +118,23 @@ if [ "${SKIP_ROLLOUT_BUILD:-0}" != "0" ]; then
 fi
 export SKIP_ROLLOUT_BUILD=0
 
+# Same reasoning, opposite default. The training arm never generates, so
+# per-turn vLLM wake/sleep costs it nothing and the flag is a plain opt-in.
+# Evaluation generates on every turn, and a 2-second nvidia-smi trace of the
+# 2026-08-24 eval showed the engine unmapping and remapping 21 GB every ~34 s --
+# 13% of wall clock -- because the session never opened. Forced on here, and the
+# run prints which state it is actually in ([rollout-session] lines) so the next
+# one cannot be silently wrong again.
+export ROLLOUT_KEEP_VLLM_AWAKE=1
+
+# Per-turn preproc / gen / decode / envstep breakdown plus the GPU util measured
+# during generation. It is a print at the end of each rollout, so it costs
+# nothing, and it is the only instrument that says how much of an eval is spent
+# waiting on the environment rather than generating. On by default here for the
+# same reason the training arm leaves it off: this is the arm where the answer
+# is not already known.
+export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
+
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
 # and the rest append; the id is per invocation, so re-running this script never
