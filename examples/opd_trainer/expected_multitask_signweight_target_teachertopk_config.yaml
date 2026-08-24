@@ -1,6 +1,6 @@
 # Expected effective config for the pure-OPD multitask run WITH cross-teacher
 # sign weighting in target mode, on a TEACHER-indexed top-k support and with a
-# one-sided (raise-only) weight table.
+# stronger symmetric weight table (1 +- 0.5 instead of 1 +- 0.25).
 #
 # Differs from expected_multitask_signweight_target_config.yaml in exactly four
 # scientific values -- student_indexed_topk, agree_weight, agree_neg_weight, and
@@ -212,14 +212,15 @@
 # the loss type, not beside the performance knobs.
 "algorithm.opd.sign_weight.mode": target
 "algorithm.opd.sign_weight.agree_weight": 1.5
-# 1.0 = agreement to LOWER is recorded but not acted on, so this table only ever
-# raises. That is a deliberate one-sided design, not agree_weight's mirror, and
-# it has a consequence worth stating next to the value: agree_neg no longer pulls
-# the renormaliser back, so Z = 1 + 0.5 * sum_{agree_pos} p is unanchored and
-# larger. The mechanism therefore partly cancels itself where agreement mass is
-# high, and the systematic sharpening sign_weight/inv_z measures grows with it
-# (predicted ~0.976 against 0.991 measured on the 1.25/0.75 arm).
-"algorithm.opd.sign_weight.agree_neg_weight": 1.0
+# agree_weight's mirror, and pinned as such: the table is 1 +- delta with
+# delta = 0.5, where the 1.25/0.75 arm had delta = 0.25. Symmetry is load-bearing
+# rather than tidy. The renormaliser is Z = 1 + delta*(A - B) over the position's
+# agree_pos and agree_neg teacher mass, so it grows with the DIFFERENCE and
+# agree_neg anchors it. Setting this to 1.0 gives Z = 1 + delta*A instead, and at
+# the agreement mass measured on the 1.25/0.75 arm that lands the effective boost
+# BELOW the arm it was meant to strengthen. A future edit that "simplifies" this
+# to 1.0 is not a simplification; it changes what the arm tests.
+"algorithm.opd.sign_weight.agree_neg_weight": 0.5
 # 1.0 = conflict is not acted on. Recorded rather than omitted: "this arm did
 # nothing about conflict" is a claim about the experiment, and target mode
 # refuses any other value.
@@ -239,6 +240,6 @@
 "actor_rollout_ref.actor.sign_weight.enable": true
 "actor_rollout_ref.actor.sign_weight.mode": target
 "actor_rollout_ref.actor.sign_weight.agree_weight": 1.5
-"actor_rollout_ref.actor.sign_weight.agree_neg_weight": 1.0
+"actor_rollout_ref.actor.sign_weight.agree_neg_weight": 0.5
 "actor_rollout_ref.actor.sign_weight.disagree_weight": 1.0
 "actor_rollout_ref.actor.sign_weight.deadzone": 0.1

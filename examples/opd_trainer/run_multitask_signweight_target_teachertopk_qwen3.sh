@@ -6,16 +6,17 @@ set -x
 # ---------------------------------------------------------------------------
 # CROSS-TEACHER SIGN WEIGHTING -- TARGET MODE.
 #
-# TEACHER-INDEXED variant of the target arm, with a stronger, one-sided table.
+# TEACHER-INDEXED variant of the target arm, with a stronger symmetric table.
 #
 # Three things differ from run_multitask_signweight_target_qwen3.sh, and all
 # three are science, not tuning:
 #
 #   actor.student_indexed_topk=False   the support is the TEACHER's top-20
 #   sign_weight.agree_weight=1.5       was 1.25
-#   sign_weight.agree_neg_weight=1.0   was 0.75 -- agreement to LOWER is no
-#                                      longer acted on, so the table only ever
-#                                      raises
+#   sign_weight.agree_neg_weight=0.5   was 0.75
+#
+# The last two are ONE change, not two: the table stays 1 +- delta and delta
+# goes 0.25 -> 0.5. Keeping it symmetric is not cosmetic -- see below.
 #
 # WHAT THIS ARM CAN AND CANNOT BE COMPARED WITH. student_indexed_topk decides
 # which 20 tokens the coarse-grained KL is exact on, so it changes the
@@ -35,22 +36,41 @@ set -x
 # constraint that the off-task teachers can only speak about tokens the on-task
 # teacher ranked.
 #
-# EXPECTED EFFECT OF agree_neg_weight=1.0, WRITTEN DOWN BEFORE THE RUN. The
-# renormaliser is Z = 1 + 0.5 * sum_{agree_pos} p, with nothing pulling it back
-# down, so the weight partly cancels itself: at the measured agreement mass
-# concentrated on ~9% of positions (A ~ 0.72 there) Z ~ 1.36 and the effective
-# boost is 1.5/1.36 = +10%, against +11% for the 1.25/0.75 table. On a UNIFORM
-# mass distribution the same change is +45% against +24%. Which of those is
-# right depends on a concentration this run's logs only bound to ~a decimal
-# place, so the arm may well move the target LESS than the arm it strengthens.
-# The offline probe in docs/multitask_signweight_150step_handover.md (section
-# 11, item 5) settles it in an hour and should be run first.
-#   Z also stops being anchored: with the old table agree_pos and agree_neg
-# partly cancelled in Z (measured inv_z 0.991); here they cannot, and inv_z is
-# predicted near 0.976. That is the systematic sharpening that
-# sign_weight/target_entropy_delta exists to catch, ~2.4x larger than the run
-# that licensed reading a sign-shuffle control as a test of sign content.
-# Check target_entropy_delta before using a shuffle control with this arm.
+# WHY THE TABLE STAYS SYMMETRIC. With w = (1+d, 1-d) the renormaliser is
+# Z = 1 + d*(A - B), where A and B are the position's agree_pos and agree_neg
+# teacher mass. It grows with the DIFFERENCE, not with A, so agree_neg anchors
+# it and the weight does not cancel itself. A one-sided table (agree_neg = 1.0)
+# gives Z = 1 + d*A instead, and at the agreement mass this run measured --
+# concentrated on roughly a tenth of positions, A ~ 0.72 there -- Z reaches 1.36
+# and the effective boost 1.5/1.36 = +10% comes out BELOW the +11% of the
+# 1.25/0.75 table it was meant to strengthen. Symmetry is what makes "raise the
+# multiplier" actually raise the intervention.
+#
+# EXPECTED EFFECT, WRITTEN DOWN BEFORE THE RUN. Against the 1.25/0.75 arm, at
+# firing positions: Z 1.12 -> 1.25, TV 0.081 -> 0.147 (1.80x), the agree_pos
+# boost +11.3% -> +20.3%, the agree_neg cut -33% -> -60%. The multiplier is
+# 1.8x at the estimated concentration, 1.9x at f=0.20 and 2.0x uniform, so
+# unlike the one-sided table this prediction does not depend on a concentration
+# the logs only bound to about a decimal place.
+#
+# WHAT TO WATCH, AND WHY 150 STEPS. sign_weight/target_kl_ratio is
+# KL(p_i || p~) / KL(p_s || p~): both distances to the SAME point, so it says
+# how the rewrite compares with what the student still has to learn. Scaling the
+# measured step-150 values by d gives alfworld 0.354 -> 1.42, webshop 0.223 ->
+# 0.92, search 0.035 -> 0.13. Above 1 the rewrite has moved the target further
+# from the teacher than the student is from the target: the arm is no longer a
+# reweighted distillation but a different objective, and the ratio KEEPS RISING
+# as the student converges. Alfworld is predicted past that line by step 150.
+# That is the reason to stop at 150 and read the ratio before going on, and it
+# has to be stated in any writeup of this arm.
+#   inv_z is predicted near 0.982 against 0.991 measured, so the systematic
+# sharpening sign_weight/target_entropy_delta exists to catch grows only about
+# twofold and stays small. That is not the binding constraint here; the ratio is.
+#
+# All the predictions above are transferred from the STUDENT-indexed run,
+# because that is the only place these masses have been measured. This arm takes
+# its support from the teacher, so the state masses may differ and the numbers
+# should be read as the expectation being tested, not as a forecast.
 #
 # Identical to run_multitask_qwen3.sh except for algorithm.opd.sign_weight.*,
 # actor.student_indexed_topk, and the run's own identity -- same teachers, same
@@ -540,7 +560,7 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.sign_weight.enable=True \
     +algorithm.opd.sign_weight.mode=target \
     +algorithm.opd.sign_weight.agree_weight=1.5 \
-    +algorithm.opd.sign_weight.agree_neg_weight=1.0 \
+    +algorithm.opd.sign_weight.agree_neg_weight=0.5 \
     +algorithm.opd.sign_weight.disagree_weight=1.0 \
     +algorithm.opd.sign_weight.deadzone=0.1 \
     +algorithm.opd.sign_weight.base_path=Qwen/Qwen3-1.7B \

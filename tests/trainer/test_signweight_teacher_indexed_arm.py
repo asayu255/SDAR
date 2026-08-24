@@ -115,15 +115,18 @@ def test_the_forcing_does_not_reach_an_arm_without_the_weighting():
     )
 
 
-def test_the_weighting_reaches_the_actor_with_the_one_sided_table():
+def test_the_weighting_reaches_the_actor_with_the_symmetric_table():
     cfg = _injected(TEACHER_ARM)
     sign = cfg.actor_rollout_ref.actor.sign_weight
     assert sign.enable is True
     assert sign.mode == "target"
+    # The table is 1 +- delta with delta = 0.5, against 1 +- 0.25 on the arm this
+    # strengthens. Asserted as a pair because the symmetry is load-bearing: with
+    # agree_neg at 1.0 the renormaliser Z = 1 + delta*A is unanchored and the
+    # effective boost lands BELOW the weaker arm.
     assert float(sign.agree_weight) == 1.5
-    # 1.0, not a mirror of agree_weight: agreement to lower is recorded and not
-    # acted on. A future edit that "restores symmetry" changes the arm.
-    assert float(sign.agree_neg_weight) == 1.0
+    assert float(sign.agree_neg_weight) == 0.5
+    assert float(sign.agree_weight) - 1.0 == 1.0 - float(sign.agree_neg_weight)
     assert float(sign.disagree_weight) == 1.0
 
 
