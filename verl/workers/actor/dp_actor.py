@@ -1013,9 +1013,13 @@ class DataParallelPPOActor(BasePPOActor):
         sign_cfg = self.config.get("sign_weight", None)
         sign_enabled = bool(sign_cfg and sign_cfg.get("enable", False)) and "sign_cache_ids" in data.batch.keys()
         if sign_enabled:
-            assert student_indexed_topk, (
-                "sign weighting is built on the student's top-k; it has nothing to "
-                "read without student_indexed_topk"
+            # Either support works -- the student's top-k, resolved above, or the
+            # teacher's own, already selected into select_keys by the branch above.
+            # What the weights cannot be built from is the single-token estimator,
+            # which produces no candidate set for the four models to share.
+            assert teacher_topk_kl, (
+                "sign weighting needs a top-k support for the four models to share; "
+                "set algorithm.opd.kl_loss_type=topk_kl"
             )
             select_keys += ["sign_cache_ids", "sign_off_tasks"]
         sign_mode = str(sign_cfg.get("mode", "target")) if sign_enabled else None

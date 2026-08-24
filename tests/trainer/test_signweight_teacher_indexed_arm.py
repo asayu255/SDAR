@@ -180,3 +180,93 @@ def test_the_arm_does_not_share_a_checkpoint_directory():
         assert mine.trainer.default_local_dir != theirs.trainer.default_local_dir
         assert mine.trainer.experiment_name != theirs.trainer.experiment_name
         assert mine.trainer.val_instance_log_dir != theirs.trainer.val_instance_log_dir
+
+
+# --------------------------------------------------------------------------- #
+# The execution gates. The config tests above pass on a build that aborts at
+# trainer init, which is exactly what happened: four separate gates asked
+# "is the student choosing the support?" when the question was "does anything
+# need the hidden-state cache?", and the config never sees any of them.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_arm_gets_past_the_trainer_precondition_check():
+    """This is the assert that used to abort the run before step 1.
+
+    Called rather than reproduced: a copy of the condition in the test would
+    keep passing while the real one drifted.
+    """
+    from verl.trainer.ppo.opd_ray_trainer import check_sign_weight_prerequisites
+
+    check_sign_weight_prerequisites(
+        mode="target",
+        teacher_topk_kl=True,
+        base_policy_path="Qwen/Qwen3-1.7B",
+        n_teachers=3,
+    )
+
+
+def test_the_precondition_still_refuses_what_it_should():
+    from verl.trainer.ppo.opd_ray_trainer import check_sign_weight_prerequisites
+
+    ok = dict(mode="target", teacher_topk_kl=True, base_policy_path="Qwen/Qwen3-1.7B", n_teachers=3)
+    for bad in (
+        {"teacher_topk_kl": False},   # no support for the four models to share
+        {"base_policy_path": None},   # no reference for the shifts
+        {"n_teachers": 1},            # no off-task teacher to agree with
+        {"mode": "targett"},
+    ):
+        with pytest.raises(AssertionError):
+            check_sign_weight_prerequisites(**{**ok, **bad})
+
+
+HIDDEN_CACHE_SITES = (
+    "register_teacher_lm_head",      # the output projections the lookup reads
+    "clear_teacher_hidden_cache",    # or entries accumulate until the card dies
+    "check_teacher_hidden_cache",    # the witness over those entries
+)
+
+
+def test_every_hidden_cache_site_is_gated_on_the_cache_not_on_the_support():
+    """The bug class, pinned at the source.
+
+    Each of these three is needed whenever ANYTHING reads models back out of the
+    hidden-state cache -- and sign weighting does, whichever model picked the
+    ids. Gating them on student_indexed_topk instead cost, in order: no
+    projections registered, a cache that grew without bound, and no witness.
+    """
+    src = open(os.path.join(REPO, "verl", "trainer", "ppo", "opd_ray_trainer.py")).read()
+    lines = src.split("\n")
+    for site in HIDDEN_CACHE_SITES:
+        calls = [i for i, ln in enumerate(lines) if f".{site}(" in ln]
+        assert calls, f"{site} is not called at all -- did it move?"
+        for i in calls:
+            guard = "\n".join(lines[max(0, i - 25) : i])
+            assert "need_hidden_cache" in guard, (
+                f"{site} at line {i + 1} is not guarded by need_hidden_cache; "
+                "a support-indexing flag is the wrong question for a cache site"
+            )
+
+
+def test_the_driver_caches_the_other_three_models_on_a_teacher_indexed_arm():
+    """compute_sign_weight_cache does not care who chose the support -- it caches
+    base on every row and each teacher on the rows it is off-task for. Pinned
+    here with student_indexed_topk=False, the setting that used to make the
+    actor throw the result away."""
+    from tests.trainer.test_sign_weight_routing import _FakeRefWG, _make_batch, _make_trainer
+
+    tasks = ["webshop", "alfworld", "search", "alfworld"]
+    teachers = {t: _FakeRefWG(t) for t in ("alfworld", "search", "webshop")}
+    base = _FakeRefWG("base")
+    trainer = _make_trainer(teachers, base)
+    trainer.student_indexed_topk = False
+    trainer.need_hidden_cache = True
+    batch = _make_batch(tasks)
+    trainer.compute_sign_weight_cache(batch)
+
+    assert sorted(base.rows) == sorted(range(len(tasks))), "base must speak for every row"
+    for name, wg in teachers.items():
+        expected = sorted(i for i, t in enumerate(tasks) if t != name)
+        assert sorted(wg.rows) == expected, f"{name} scored the wrong rows"
+    ids = batch.batch["sign_cache_ids"]
+    assert int(ids.min()) >= 0, "a row was left without one of its four models"

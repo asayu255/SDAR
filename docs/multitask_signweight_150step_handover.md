@@ -1050,7 +1050,7 @@ Alfworld サブタスク別はステップごとにバッチへの出現が変�
 | 13 | `actor/teacher_kl_loss`(position アーム) | 位置重みが掛かった後の値。target アームと直接比較しない |
 | 14 | `target_kl` / `inv_z` / `target_entropy_delta` / `target_tv` | 小数第3位で量子化。平均は使えるが軌道は使えない(§4.3) |
 | 15 | Alfworld サブタスク別 | N が 100–148 と揃わない。アーム比較に使えない |
-| 16 | `sign_weight/*` が丸ごと出ない | **かつては `student_indexed_topk=False` で機構が黙って無効化された。**ドライバは `sign_weight_forward`(1step の1/4)を払い続け、アクターは `fwd_teacher_topk_logprobs is not None` で全部スキップしていた。現在は `dp_actor.py` が assert で落ち、`main_opd` が `ref.student_indexed_topk` を強制する |
+| 16 | `student_indexed_topk` と符号重み | **支持集合を誰が選ぶか**と**hidden state キャッシュが要るか**は別の問いだが、コードは長らく前者で後者を判定していた。teacher-indexed の重み付きアームは (a) trainer init の assert で停止、(b) アクターの assert で停止、(c) 教師/base の lm_head が未登録、(d) ステップ間でキャッシュが消えず OOM、(e) アクターが重み構築を黙ってスキップ、の5通りに壊れていた。現在は `need_hidden_cache = student_indexed_topk or sign_weight_enabled` に統一され、`tests/trainer/test_signweight_teacher_indexed_arm.py` がソースレベルで固定している |
 
 ---
 

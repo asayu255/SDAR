@@ -125,6 +125,36 @@ def compute_opd_data_metrics_by_task(batch: DataProto) -> dict:
     )
 
 
+def check_sign_weight_prerequisites(*, mode, teacher_topk_kl, base_policy_path, n_teachers):
+    """What an arm needs before the weighting can run at all.
+
+    Module-level so a test can ask "would this arm start?" by calling the same
+    thing the trainer does, instead of a copy that drifts. It is also the record
+    of what is NOT a prerequisite: the support may be the student's top-k or the
+    teacher's own, and for a long time this refused the second one -- which is
+    how a teacher-indexed weighted arm came to abort at trainer init.
+
+    Raises AssertionError with the setting to change.
+    """
+    assert mode in ("position", "target"), (
+        f"algorithm.opd.sign_weight.mode must be 'position' or 'target', got {mode!r}"
+    )
+    # The signal is the sign of log pi_m - log pi_0 on a support shared by all
+    # four models. EITHER top-k is such a support. What the mechanism cannot work
+    # from is the single-token estimator, which produces no support at all.
+    assert teacher_topk_kl, (
+        "sign weighting requires algorithm.opd.kl_loss_type=topk_kl: the "
+        "single-token estimator gives no support for the four models to share"
+    )
+    assert base_policy_path, (
+        "sign weighting requires algorithm.opd.sign_weight.base_path "
+        "(the pre-RL policy the teachers' shifts are measured against)"
+    )
+    assert n_teachers >= 2, (
+        "sign weighting needs at least one off-task teacher besides the on-task one"
+    )
+
+
 class OPDRayTrainer(RayPPOTrainer):
     """Multitask on-policy distillation trainer with per-task teacher routing."""
 
@@ -161,29 +191,24 @@ class OPDRayTrainer(RayPPOTrainer):
         # arm had before.
         sw_cfg = dict(opd_cfg.get("sign_weight", {}) or {})
         self.sign_weight_enabled = bool(sw_cfg.get("enable", False))
+        # Who needs the hidden-state cache, which is NOT the same question as who
+        # picks the top-k support. student_indexed_topk needs it because the
+        # on-task teacher is scored at ids that do not exist until the actor's
+        # forward; sign weighting needs it because base and the off-task teachers
+        # are, whichever model chose those ids. Gating the cache on the first
+        # alone left a teacher-indexed weighted arm with no output projections
+        # registered, no cache cleared between steps, and no witness -- while the
+        # driver still ran the three extra forwards that fill it.
+        self.need_hidden_cache = self.student_indexed_topk or self.sign_weight_enabled
         self.sign_weight_mode = str(sw_cfg.get("mode", "target"))
         self.base_policy_path = sw_cfg.get("base_path", None)
         self.base_wg = None
         if self.sign_weight_enabled:
-            assert self.sign_weight_mode in ("position", "target"), (
-                f"algorithm.opd.sign_weight.mode must be 'position' or 'target', got {self.sign_weight_mode!r}"
-            )
-            # The signal is the sign of log pi_m - log pi_0 on a support shared by
-            # all four models, and the shared support is the student's top-k. The
-            # single-token estimator produces no support at all, and the
-            # teacher-indexed variant resolves nothing in the actor, where the
-            # student's ids are: both would need a second, separate mechanism.
-            assert self.teacher_topk_kl and self.student_indexed_topk, (
-                "sign weighting requires algorithm.opd.kl_loss_type=topk_kl with "
-                "actor_rollout_ref.actor.student_indexed_topk=True (the student's "
-                "top-k is the support every model is scored on)"
-            )
-            assert self.base_policy_path, (
-                "sign weighting requires algorithm.opd.sign_weight.base_path "
-                "(the pre-RL policy the teachers' shifts are measured against)"
-            )
-            assert len(self.teacher_paths) >= 2, (
-                "sign weighting needs at least one off-task teacher besides the on-task one"
+            check_sign_weight_prerequisites(
+                mode=self.sign_weight_mode,
+                teacher_topk_kl=self.teacher_topk_kl,
+                base_policy_path=self.base_policy_path,
+                n_teachers=len(self.teacher_paths),
             )
 
     # ------------------------------------------------------------------ #
@@ -275,10 +300,12 @@ class OPDRayTrainer(RayPPOTrainer):
             wg = all_wg[key]
             wg.init_model()
             self.teacher_wg[task] = wg
-            if self.student_indexed_topk and not bool(self.config.trainer.get("val_only", False)):
-                # The actor resolves this teacher at ids the student picks, which
-                # needs its output projection at update time -- by which point the
-                # ref path has resharded it. One unsharded copy per teacher, taken
+            if self.need_hidden_cache and not bool(self.config.trainer.get("val_only", False)):
+                # The actor resolves this teacher at ids nobody has picked yet --
+                # the student's top-k, or the on-task teacher's own on a
+                # teacher-indexed weighted arm, where this teacher is off-task for
+                # two thirds of the rows. Either way it needs its output projection
+                # at update time -- by which point the ref path has resharded it. One unsharded copy per teacher, taken
                 # once here, labelled with the task the cache will file it under.
                 # Not in a val_only run: nothing scores a teacher there, and this
                 # is 1.9 GB a rank held for the life of the process, next to a vLLM
@@ -293,7 +320,7 @@ class OPDRayTrainer(RayPPOTrainer):
         if self.sign_weight_enabled:
             self.base_wg = all_wg["base_policy"]
             self.base_wg.init_model()
-            if self.student_indexed_topk and not bool(self.config.trainer.get("val_only", False)):
+            if self.need_hidden_cache and not bool(self.config.trainer.get("val_only", False)):
                 # Filed under a label that is deliberately not a task name: the
                 # cache picks an output projection by this string, and the routing
                 # picks a teacher by task name. A collision would silently score
@@ -791,7 +818,7 @@ class OPDRayTrainer(RayPPOTrainer):
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
-                    if self.student_indexed_topk:
+                    if self.need_hidden_cache:
                         # Drop last step's hidden states before the teachers start
                         # filling the cache again. Ids are monotone across the run,
                         # so a leftover entry could never be mistaken for a live one
@@ -906,7 +933,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         with _timer("sign_weight_forward", timing_raw):
                             self.compute_sign_weight_cache(batch)
 
-                    if self.student_indexed_topk or self.sign_weight_enabled:
+                    if self.need_hidden_cache:
                         # After the misses are scored, not before: the cache is only
                         # complete now. Also when only the sign weights use the
                         # cache: a teacher-indexed weighted arm puts base and the

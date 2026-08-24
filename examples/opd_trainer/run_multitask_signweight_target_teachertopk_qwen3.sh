@@ -53,10 +53,15 @@ set -x
 # Check target_entropy_delta before using a shuffle control with this arm.
 #
 # Identical to run_multitask_qwen3.sh except for algorithm.opd.sign_weight.*,
-# actor.student_indexed_topk, and
-# the run's own identity, so the two differ in the weighting of the teacher KL
-# and in nothing else -- same teachers, same data, same batch sizes, same eval
-# protocol. That is what makes the plain arm the control for this one.
+# actor.student_indexed_topk, and the run's own identity -- same teachers, same
+# data, same batch sizes, same eval protocol.
+#
+# THAT IS TWO DIFFERENCES, NOT ONE, so run_multitask_qwen3.sh is NOT the control
+# for this arm: it takes its support from the student, and the support decides
+# which 20 tokens the KL is exact on. The control this arm needs is a pure-OPD
+# run with student_indexed_topk=False and sign_weight.enable=False and nothing
+# else changed. It does not exist yet. Until it does, read this arm's
+# sign_weight/* diagnostics, not its success rates.
 #
 # What the weighting does (verl/trainer/ppo/sign_weights.py): each teacher is a
 # single-task RL fine-tune of one base policy, so sign(log pi_m - log pi_0) says
@@ -85,9 +90,10 @@ set -x
 #
 # Cost: three extra frozen forwards per step (the base over all rows, each
 # teacher over the 2/3 of rows that are not its own task), and the hidden-state
-# cache holds four models per row instead of one. enable=False reproduces the
-# plain arm exactly: no base worker is built, no extra forward runs, and nothing
-# is written into the batch.
+# cache holds four models per row instead of one. enable=False turns all of that
+# off -- no base worker is built, no extra forward runs, nothing is written into
+# the batch -- which is exactly how the control for this arm would be made:
+# take this script, set sign_weight.enable=False, change nothing else.
 #
 # CHECKPOINT DIRECTORY. Arm-specific, and it has to be: the path is
 # default_local_dir/global_step_N and trainer.resume_mode defaults to "auto", so
