@@ -1,4 +1,5 @@
 import json
+import time
 import warnings
 from typing import List, Optional, Union
 import argparse
@@ -28,8 +29,25 @@ def read_jsonl(file_path):
 
 
 def load_docs(corpus, doc_idxs):
-    results = [corpus[int(idx)] for idx in doc_idxs]
-    return results
+    """Fetch the documents at these row numbers, in this order.
+
+    One gather, not one lookup per row. ``corpus`` is an Arrow-backed
+    datasets.Dataset, and ``corpus[i]`` walks its whole indexing machinery and
+    builds a fresh Python dict every time -- so a turn that retrieves top-3 for
+    44 queries paid 132 of those. Measured end to end, a batched retrieval took
+    292 ms per turn against ~20-40 ms of encoder and FAISS: nearly all of the
+    rest was this loop. ``corpus[list]`` is a single take over the table.
+
+    The return shape is unchanged: one dict per requested row, in the order
+    asked for, duplicates included (different queries do retrieve the same
+    passage).
+    """
+    idxs = [int(idx) for idx in doc_idxs]
+    if not idxs:
+        return []
+    columns = corpus[idxs]
+    names = list(columns.keys())
+    return [{name: columns[name][position] for name in names} for position in range(len(idxs))]
 
 
 def load_model(model_path: str, use_fp16: bool = False):
@@ -234,20 +252,38 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
+        spent = {"encode": 0.0, "faiss": 0.0, "load": 0.0}
         for start_idx in range(0, len(query_list), self.batch_size):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
+            mark = time.perf_counter()
             batch_emb = self.encoder.encode(query_batch)
+            spent["encode"] += time.perf_counter() - mark
+
+            mark = time.perf_counter()
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            spent["faiss"] += time.perf_counter() - mark
 
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
-            # load_docs is not vectorized, but is a python list approach
             flat_idxs = sum(batch_idxs, [])
+            mark = time.perf_counter()
             batch_results = load_docs(self.corpus, flat_idxs)
+            spent["load"] += time.perf_counter() - mark
             # chunk them back
             batch_results = [batch_results[i * num : (i + 1) * num] for i in range(len(batch_idxs))]
             results.extend(batch_results)
             scores.extend(batch_scores)
+        # Where the time went, per request -- which with a batched client is once
+        # per rollout turn. The encoder and the FAISS scan are bounded by what the
+        # hardware can do; the document lookup is not, and attributing between
+        # them by argument is how a quarter of a second per turn stayed invisible.
+        print(
+            f"[retrieve] {len(query_list):4d} queries  topk {num}  "
+            f"encode {1000 * spent['encode']:6.1f} ms  "
+            f"faiss {1000 * spent['faiss']:6.1f} ms  "
+            f"load_docs {1000 * spent['load']:6.1f} ms",
+            flush=True,
+        )
         if return_score:
             return results, scores
         else:
@@ -336,6 +372,7 @@ def retrieve_endpoint(request: QueryRequest):
         request.topk = config.retrieval_topk  # fallback to default
 
     queries = [request.query] if isinstance(request.query, str) else list(request.query)
+    started = time.perf_counter()
 
     # batch_search even for one query. DenseRetriever._batch_search encodes the
     # whole list in one forward pass and hands FAISS one (n, dim) matrix, which
@@ -348,6 +385,8 @@ def retrieve_endpoint(request: QueryRequest):
         results = retriever.batch_search(queries, num=request.topk, return_score=False)
         scores = None
 
+    served = time.perf_counter()
+
     # One entry per query, in the order they were sent -- which for a single
     # string is the one-element list the old response already was.
     resp = []
@@ -359,6 +398,13 @@ def retrieve_endpoint(request: QueryRequest):
             )
         else:
             resp.append(documents)
+    # The two _batch_search cannot see: its own total as the endpoint measures it,
+    # and the reshaping into the response.
+    print(
+        f"[retrieve]              search {1000 * (served - started):6.1f} ms  "
+        f"format {1000 * (time.perf_counter() - served):5.1f} ms",
+        flush=True,
+    )
     return {"result": resp}
 
 
