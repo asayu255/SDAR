@@ -349,9 +349,12 @@ WALL   slot=extra-1  batch#37  span=14.3s  wall-since-first-batch=402.1s  sum-of
 決着する。判定は 2 通り:
 
 ```bash
-grep '^WALL' eval.log | tail -1                       # serial/wall が 1.00 か、1.2 前後か
-grep '^WALL' eval.log | sed -n '100p;300p'            # search 区間の 2 点
+grep 'WALL   slot=' eval.log | tail -1                # serial/wall が 1.00 か、1.2 前後か
+grep 'WALL   slot=' eval.log | sed -n '100p;300p'     # search 区間の 2 点
 ```
+
+**行頭アンカー(`^WALL`)は使えない。** rollout loop は Ray actor の中で走るので、
+stdout の各行に `(SFTMultiTaskTaskRunner pid=…) ` が前置される。
 
 後者のほうが読みとして強い。`serial/wall` は validation の先頭から累積するので、
 primary slot だけで走る alfworld と webshop の 2 batch が前半を押し下げる。
@@ -361,6 +364,10 @@ primary slot だけで走る alfworld と webshop の 2 batch が前半を押し
 下限が 11.87 s/batch。`serial/wall` に直すと **1.15〜1.21x** が効いている姿で、
 **2.00x は出ない**(2 本の generate は worker group 上で直列化されるため、
 重なるのは環境待ちの分だけ)。
+
+depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出す**
+(depth 1 でも)。出ないことが「depth 1」と「pipeline の無いビルド」の両方を
+意味してしまうのは、2 節で session を 13% 見落とした構図そのものだからである。
 
 `reset_batch_wall()` を `_validate()` の先頭で呼ぶので、学習中に評価を挟む場合も
 評価ごとに 0 から数え直す。

@@ -885,11 +885,14 @@ class RayPPOTrainer:
                         tasks=tasks,
                     )
                 )
-            print(
-                f"[val-pipeline] depth {depth}: {len(slots)} slots, the extra ones restricted to {tasks}. "
-                "Batches retire in order; only the rollouts overlap.",
-                flush=True,
-            )
+            detail = f"the extra ones restricted to {tasks}. Batches retire in order; only the rollouts overlap."
+        else:
+            detail = "the sequential loop, run inline with no threads. Set VAL_PIPELINE_DEPTH=2 to overlap."
+        # Printed at every depth, including 1. Silence would mean both "depth is
+        # 1" and "this build has no pipeline at all", which is the same pair of
+        # indistinguishable states that cost this arm 13% of the evaluation once
+        # already.
+        print(f"[val-pipeline] VAL_PIPELINE_DEPTH={depth}: {len(slots)} slot(s), {detail}", flush=True)
         self._val_slots = slots
         return slots
 

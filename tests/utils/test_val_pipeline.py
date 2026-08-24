@@ -232,6 +232,29 @@ def test_depth_one_is_the_default(monkeypatch):
     assert len(_trainer(1)._validation_slots()) == 1
 
 
+def test_the_resolved_depth_is_announced_even_at_one(monkeypatch, capsys):
+    """Silence would mean both "depth is 1" and "this build has no pipeline",
+    which is the pair of indistinguishable states that hid the vLLM session bug.
+    """
+    monkeypatch.delenv("VAL_PIPELINE_DEPTH", raising=False)
+    _trainer(1)._validation_slots()
+    out = capsys.readouterr().out
+    assert "[val-pipeline] VAL_PIPELINE_DEPTH=1: 1 slot(s)" in out
+    assert "VAL_PIPELINE_DEPTH=2" in out  # and says how to turn it on
+
+
+def test_the_announcement_names_the_depth_that_was_asked_for(monkeypatch, capsys):
+    monkeypatch.setenv("VAL_PIPELINE_DEPTH", "2")
+    import agent_system.environments.env_manager as env_manager
+    import agent_system.multi_turn_rollout.rollout_loop as rollout_loop
+
+    monkeypatch.setattr(env_manager, "build_val_env_manager", lambda config, tasks: "envs")
+    monkeypatch.setattr(rollout_loop, "TrajectoryCollector", lambda **kw: "collector")
+
+    _trainer(2)._validation_slots()
+    assert "[val-pipeline] VAL_PIPELINE_DEPTH=2: 2 slot(s)" in capsys.readouterr().out
+
+
 def test_the_extra_slots_are_restricted(monkeypatch):
     """alfworld must never reach a second manager: its games are indexed by
     position within the manager it belongs to."""
