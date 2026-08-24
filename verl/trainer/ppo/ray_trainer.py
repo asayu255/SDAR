@@ -69,6 +69,7 @@ from verl.utils.seqlen_balancing import (
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+from agent_system.multi_turn_rollout.rollout_loop import rollout_session
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
@@ -849,95 +850,108 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        # One vLLM session for the WHOLE validation, not one per batch.
+        # Entering the sharding manager re-gathers the FSDP state dict, re-syncs
+        # the model weights and wakes the engine; leaving it sleeps the engine and
+        # unmaps its 21 GB. Nothing here trains, so the weights are frozen across
+        # every batch and one sync produces the identical weights for all of them
+        # -- the generated tokens are unchanged.
+        #
+        # multi_turn_loop opens its own session per rollout, which on this arm is
+        # 413 rollouts (alfworld, webshop, then one per 126 rows of search). Paying
+        # the unmap and remap between each measured 10.4% of the evaluation's wall
+        # clock on NVML -- and the search rollouts are 24 s each, far too short to
+        # amortise it. The worker counts scopes, so the inner 413 become no-ops.
+        with rollout_session(self.actor_rollout_wg):
+            for test_data in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(test_data)
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+                # repeat test batch
+                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+                # we only do validation on rule-based rm
+                if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                    return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+                # Store original inputs
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                sample_inputs.extend(input_texts)
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "env_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("env_kwargs")
-            if "task_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("task_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+                if "multi_modal_data" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "tools_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "env_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("env_kwargs")
+                if "task_name" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("task_name")
+                test_gen_batch = test_batch.pop(
+                    batch_keys=batch_keys_to_pop,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                )
 
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "validate": True,
-            }
-            test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "validate": True,
+                }
+                test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # # pad to be divisible by dp_size
+                # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
 
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                # # unpad
+                # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
-            ################ agent-environment loop ###############
-            test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                    gen_batch=test_gen_batch,
-                                                    actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
-                                                    is_train=False,
-                                                    )
-            print('validation generation end')
-            del test_batch
-            test_batch = test_output_gen_batch
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                ################ agent-environment loop ###############
+                test_output_gen_batch = self.traj_collector.multi_turn_loop(
+                                                        gen_batch=test_gen_batch,
+                                                        actor_rollout_wg=self.actor_rollout_wg,
+                                                        envs=self.val_envs,
+                                                        is_train=False,
+                                                        )
+                print('validation generation end')
+                del test_batch
+                test_batch = test_output_gen_batch
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                sample_outputs.extend(output_texts)
 
-            # test_batch = test_batch.union(test_output_gen_batch)
+                # test_batch = test_batch.union(test_output_gen_batch)
 
-            # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                # evaluate using reward_function
+                result = self.val_reward_fn(test_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_scores.extend(scores)
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-            batch_task_names = get_task_names(test_batch)
-            if batch_task_names is None:
-                batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
-            task_name_lst.append(batch_task_names)
-            tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
-            traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
-            # success rate
-            for k in test_batch.non_tensor_batch.keys():
-                if 'success_rate' in k:
-                    if k not in success_rate_dict:
-                        success_rate_dict[k] = []
-                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
-                    # all success_rate should be the same
-                    for i in range(1, len(test_batch.non_tensor_batch[k])):
-                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+                reward_tensor_lst.append(reward_tensor)
+                data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                batch_task_names = get_task_names(test_batch)
+                if batch_task_names is None:
+                    batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
+                task_name_lst.append(batch_task_names)
+                tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
+                traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                # success rate
+                for k in test_batch.non_tensor_batch.keys():
+                    if 'success_rate' in k:
+                        if k not in success_rate_dict:
+                            success_rate_dict[k] = []
+                        success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
+                        # all success_rate should be the same
+                        for i in range(1, len(test_batch.non_tensor_batch[k])):
+                            assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 

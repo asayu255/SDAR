@@ -930,12 +930,20 @@ class ActorRolloutRefWorker(Worker):
         if not isinstance(self.rollout_sharding_manager, FSDPVLLMShardingManager):
             self._say_session(f"manager is {type(self.rollout_sharding_manager).__name__}, not vLLM's")
             return
-        if getattr(self, "_rollout_session_active", False):
+        # Nesting, by depth rather than by a bool. The rollout loop opens a
+        # session per multi_turn_loop; _validate opens one around the whole
+        # validation, which is 413 of those on this arm. With a bool the inner
+        # scope's end_rollout_session would close the outer one on the first
+        # batch and every batch after it would wake and sleep vLLM again -- the
+        # hoist would silently do nothing. Only the outermost scope enters and
+        # exits; the inner ones just count.
+        self._rollout_session_depth = getattr(self, "_rollout_session_depth", 0) + 1
+        if self._rollout_session_depth > 1:
             return
         self.rollout_sharding_manager.__enter__()
         self._rollout_session_active = True
         self._rollout_session_generates = 0
-        self._say_session("opened -- vLLM stays awake for this rollout")
+        self._say_session("opened -- vLLM stays awake until the outermost scope closes")
 
     def _say_session(self, message: str):
         """One line per distinct session outcome, from rank 0.
@@ -963,16 +971,29 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def end_rollout_session(self):
-        """Close the sharding manager opened by begin_rollout_session(), restoring
-        exactly the post-generation state of the non-session path (sleep/offload
-        vLLM, restore RNG + train mode, empty cache)."""
+        """Close the session opened by begin_rollout_session(), restoring exactly
+        the post-generation state of the non-session path (sleep/offload vLLM,
+        restore RNG + train mode, empty cache).
+
+        Reference-counted: only the call that balances the OUTERMOST
+        begin_rollout_session actually exits the manager."""
+        depth = getattr(self, "_rollout_session_depth", 0)
+        if depth <= 0:
+            # begin_rollout_session declined (no manager, or not vLLM's), or this
+            # is an unpaired call. Either way there is nothing open to close.
+            return
+        self._rollout_session_depth = depth - 1
+        if self._rollout_session_depth > 0:
+            # An outer scope still holds it. Sleeping vLLM here is exactly the
+            # bug the depth counter exists to prevent.
+            return
         if not getattr(self, "_rollout_session_active", False):
             return
         self._rollout_session_active = False
         self.rollout_sharding_manager.__exit__(None, None, None)
-        # The count is the whole point: one session covering N turns is the
-        # working state, and N wake/sleep cycles is the broken one. A session that
-        # served 1 generate is a session that bought nothing.
+        # The count is the whole point: one session covering N generate calls is
+        # the working state, and N wake/sleep cycles is the broken one. A session
+        # that served 1 generate is a session that bought nothing.
         served = getattr(self, "_rollout_session_generates", 0)
         if getattr(self, "_rank", None) == 0:
             print(

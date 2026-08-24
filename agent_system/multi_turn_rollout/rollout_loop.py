@@ -15,6 +15,7 @@
 
 import os
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -220,6 +221,36 @@ def _print_turn_timing(records):
             f"(lower=better; TASK_BALANCE_INTERLEAVE shrinks this on mixed turns)"
         )
     print("\n".join(lines), flush=True)
+
+
+@contextmanager
+def rollout_session(actor_rollout_wg):
+    """Hold vLLM awake for everything inside this block.
+
+    Without a session, generate_sequences re-enters the sharding manager on every
+    call: it re-gathers the FSDP state dict, re-syncs the full model weights, and
+    wakes then sleeps the engine. The weights are frozen for as long as nobody
+    trains, so one sync at the top of the block produces the identical weights
+    for every call inside it -- the generated tokens are unchanged.
+
+    Nest it as widely as the frozen weights allow. multi_turn_loop opens one per
+    rollout, and _validate opens one around the whole validation; on the SFT arm
+    that is 413 rollouts, and paying a 21 GB unmap and remap between each of them
+    measured 10.4% of the evaluation's wall clock. The worker counts scopes, so
+    the inner ones are free.
+
+    A no-op when ROLLOUT_KEEP_VLLM_AWAKE is off, and on any rollout that is not
+    vLLM's -- the worker decides that, not this.
+    """
+    _say_rollout_env()
+    if not _ROLLOUT_KEEP_VLLM_AWAKE:
+        yield
+        return
+    actor_rollout_wg.begin_rollout_session()
+    try:
+        yield
+    finally:
+        actor_rollout_wg.end_rollout_session()
 
 
 class TrajectoryCollector:
@@ -1003,13 +1034,12 @@ class TrajectoryCollector:
         self._prefetched_log_probs = {}
 
         # Initial observations from the environment
-        # Open one vLLM session for the whole rollout (opt-in). end_rollout_session
-        # runs in finally so the engine is always returned to its slept/offloaded
-        # state before the post-rollout (gather/teacher/train) phases.
-        _say_rollout_env()
-        if _ROLLOUT_KEEP_VLLM_AWAKE:
-            actor_rollout_wg.begin_rollout_session()
-        try:
+        # One vLLM session for this whole rollout, nested inside whatever wider
+        # session the caller holds (_validate holds one around all 413 of them).
+        # The contextmanager closes in a finally, so the engine is returned to its
+        # slept/offloaded state before the post-rollout (gather/teacher/train)
+        # phases -- unless an outer scope is still holding it, which is the point.
+        with rollout_session(actor_rollout_wg):
             if self.config.algorithm.filter_groups.enable and is_train:
                 # Dynamic Sampling (for DAPO and Dynamic GiGPO)
                 total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
@@ -1026,9 +1056,6 @@ class TrajectoryCollector:
                     actor_rollout_wg=actor_rollout_wg,
                     envs=envs,
                 )
-        finally:
-            if _ROLLOUT_KEEP_VLLM_AWAKE:
-                actor_rollout_wg.end_rollout_session()
         assert len(total_batch_list) == len(total_episode_rewards)
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)

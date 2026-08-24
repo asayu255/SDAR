@@ -70,22 +70,39 @@ worker の `/proc/*/environ` を grep するのは自然な確認だが、**別�
   1 回しか賄っていない session は何も買っていない
 * `eval_checkpoints.sh` が `ROLLOUT_KEEP_VLLM_AWAKE=1` を強制
 
-### 結果
+### 結果 —— turn 内では解消、batch 間には残っていた
 
 次の eval のログ:
 
 ```
 [rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE='1' -> session mode ON
-[rollout-session] rank 0: opened -- vLLM stays awake for this rollout
+[rollout-session] rank 0: opened -- vLLM stays awake until the outermost scope closes
 [rollout-session] rank 0: closed after 50 generate calls on one wake
 ```
 
-**50 turn を 1 回の wake で賄っている。** 34 秒周期の unmap/remap は消えた。
-`eval_checkpoints.sh` が `${ROLLOUT_KEEP_VLLM_AWAKE:-1}` ではなく **1 を強制**
-するようになったのが効いた —— run スクリプト側の既定値は、呼び出したシェルに
-0 が残っていれば負ける。同じ形の罠を `SKIP_ROLLOUT_BUILD` でも踏んでいる。
+**50 turn を 1 回の wake で賄っている** —— turn ごとの寝起きは消えた。
 
----
+**しかし batch ごとには残っていた。** session は `multi_turn_loop` 単位で開閉し
+(`rollout_loop.py`)、`_validate` は `val_dataloader` を回すので **413 回**開閉
+していた。旧 run で NVML が測った低メモリ状態 **wall の 10.4%** と、2 秒トレースの
+**周期 34 秒 ≒ search batch 1 本の長さ**は、どちらもこの per-batch churn である。
+alfworld batch(230 秒)なら償却できるが、search batch は 24 秒しかない。
+
+### hoist —— 413 回を 1 回に
+
+評価中は重みが一度も変わらないので、session は `_validate` 全体を 1 回で包める。
+入れたもの:
+
+* `rollout_session(actor_rollout_wg)` —— 両方の呼び出し側が共有する contextmanager
+  (`rollout_loop.py`)。`finally` で必ず閉じるので、途中で例外が出ても vLLM は
+  眠って戻る
+* `_validate` が **batch ループの外側**でそれを開く
+* worker 側の session を **深さで数える**ようにした(`fsdp_workers.py`)。
+  bool のままだと**内側の 413 回目の close が外側の session を閉じてしまい**、
+  hoist が黙って無効になる —— 最初の batch 以降は元通り毎 batch 寝起きし、
+  しかもログは「1 回開いた」と言い続ける
+
+**期待効果: wall の 10.4%。** 3 節の (a) と合わせて 88.2% → 98.5%(見積もり)。
 
 ## 3. 42.6% —— retriever 待ち。二つの計測器が同じ数字に着地した
 
@@ -206,12 +223,32 @@ worker group の駆動方法ごと変わる。
 
 | 項目 | 大きさ | 状態 |
 | --- | --- | --- |
-| **search の retriever 待ち** | **42.6%** | **未着手。最大項。** NVML(42.9%)と turn timing(42.6%)が一致。打ち手は 3 節 (a) レプリカ増(コード変更ゼロ)/ (b) search だけの cohort overlap(2.85 h → 1.93 h) |
-| generate | 51.8% | GPU が実際に働いている区間。alfworld batch では wall の 87.1% を占める |
-| preproc(CPU tokenize) | 5.2% | overlap 可能だが小さい |
-| vLLM 毎 turn 寝起き | 10.4〜13% → **0** | **解消**。`closed after 50 generate calls on one wake` |
-| 生成中の rank 不均衡 | — | 帰属を誤り、修正を revert(4 節) |
+| **search の retriever 待ち** | **42.6%** | **未着手。最大項。** 打ち手は 3 節 —— 実測 80 ms/クエリが 126 並行で 7.5 秒(93 倍)、実効並列度 1.35、16.8 クエリ/秒。retriever は事実上シングルスレッドで、**別マシン**(100.86.45.30、wasabi は .24)なので worker を増やしても eval と競合しない |
+| batch ごとの vLLM wake/sleep | 10.4% | **解消**(2 節の hoist、413 回 → 1 回) |
+| turn ごとの vLLM wake/sleep | — | **解消**(2 節の session) |
+| preproc(CPU tokenize) | 5.2% | overlap しない限り露出する |
+| generate | 51.8% | GPU が実際に働いている区間 |
 
-**評価の天井**: envs.step を完全に隠せたとして wall は 1.93 h、GPU busy は
-generate の区間だけなので **~90%** が上限。学習の 99.9% には届かない ——
-評価は CPU にいる環境との往復であり、隠せるのは重ねられるぶんだけである。
+### 到達点(モデル、未実測)
+
+| | wall | GPU util |
+| --- | ---: | ---: |
+| 現状 | 2.85 h | 51.8% |
+| retriever を並列化 | 1.67 h | 88.2% |
+| + session hoist(**実装済み**) | 1.50 h | 98.5% |
+| batch をまたぐ async pipeline | 1.48 h | 99.9% |
+
+**評価の理論上限は 99.9% である。** 「環境との往復だから 90% が限界」と一度書いたが、
+それは誤りだった —— 短くできないもの(retriever の 80 ms、decode、preproc)と
+**隠せないもの**は別で、裏で generate が回っていれば全部隠れる。本当に隠せないのは
+**pipeline の fill と drain だけ**で、それも batch 境界をまたげば run 全体で 1 回に
+なる(いまは 413 回払っている)。
+
+ただしその道には条件がある: **retriever が generate に追いつくこと。**
+評価全体の retrieval は 73,123 クエリで、generate の総時間 5,316 秒に収めるには
+**13.8 クエリ/秒**が要る。実測 16.8 なので追いつくが、稼働率 82% は薄い。
+retriever を直せばここに余裕が生まれ、pipeline が安定する。
+
+**実務上は上の 2 つ(retriever + hoist)で 98.5%。** 3 つ目が買うのは残り 1.4 pt で、
+`async_rollout_loop.py` の新規実装(vLLM AsyncLLM 経路、env の部分 step、
+`_validate` が batch 境界をまたいで結果を集める形への再設計)が要る。
