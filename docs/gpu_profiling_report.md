@@ -1240,6 +1240,15 @@ python3 scripts/gpu_stall_scan.py /tmp/trace.*.csv
 
 ### 9.12 rank は揃っている。mini-batch は揃っていない
 
+> **実測で否定された（2026-08-24）。** 下のシミュレーションが出した
+> straggler wait 10.1% に対し、実 run のメトリクスは 4 run・447 step で
+> `global_seqlen/minibatch_wait_frac` = **0.00036**（0.036%）、
+> `_dealt` も同値で伸びしろ 0、`minibatch_spread_mean` は 3137 ではなく
+> **12 トークン**だった。節の趣旨（rank の合流は mini-batch ごと、metric を
+> 足したこと）は有効だが、**大きさの見積もりは 260 倍外れている**。
+> 経緯と実測表は [spike_investigation.md 11.5](spike_investigation.md)。
+
+
 `global_seqlen/balanced_min` と `balanced_max` は実 run で **1 トークンしか
 違わない**。これを「rank 間は揃っている」と読んでいたが、その読み方が
 間違っていた。
@@ -1292,6 +1301,18 @@ the same, rows length-sorted: 0.0%
 **本当の数字は次の run が metric で出す。プロファイラは要らない。**
 
 ### 9.13 スパイクではなかった —— 損失の 16.5% は NCCL の中で待っている
+
+> **この 16.5% は step 1 の数字であって、定常状態ではない（2026-08-24）。**
+> トレースは step 1 の micro 40〜59 の 20 本から取っており、同じ step の
+> `minibatch_wait_frac` が 0.125 だったので整合すると書いた。だが定常状態の
+> 同メトリクスは 447 step で 0.00036 —— **347 倍小さい**。トークン偏りが
+> straggler を作るという因果（20 本中 17 本）はトレースの実測として有効で、
+> 誤っているのは**その偏りが定常状態でも続くという前提**の方である。
+> [spike_investigation.md 11.5](spike_investigation.md)。
+>
+> なお本節末尾の「NCCL の床が 28%」と `CUDA_DEVICE_MAX_CONNECTIONS` は
+> 別件として生きている。後者は 11.7 で FSDP 向けに解除した。
+
 
 > スパイク（＝使用率が落ちる現象）そのものの調査経過は
 > **[docs/spike_investigation.md](spike_investigation.md)** に分離した。

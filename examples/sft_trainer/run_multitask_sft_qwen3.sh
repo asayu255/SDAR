@@ -93,6 +93,15 @@ set -x
 #     order, same worker — the actor cannot start k+1 before k returns. It does
 #     NOT run ahead across a step that saves or validates, since a checkpoint
 #     taken with a call already queued would hold a later step's weights.
+#   CUDA_DEVICE_MAX_CONNECTIONS=8 — undoes the =1 that verl pins on every Ray
+#     worker for Megatron's sake. One hardware queue is how Megatron orders its
+#     tensor-parallel overlap; FSDP needs the opposite, since forward_prefetch
+#     puts the next layer's all-gather on a separate stream precisely so it
+#     overlaps. Exported below because get_ppo_ray_runtime_env() drops keys the
+#     launcher already set. Read the effect off timing_s/update_actor_worker and
+#     perf/mfu/actor, not off GPU utilisation: a spinning NCCL kernel counts as
+#     busy in NVML (docs/gpu_profiling_report.md 9.13), so what this can remove
+#     was never in the utilisation number to begin with.
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on; they speed up the validation rollouts)
 #   NOTE: leave ROLLOUT_PREFETCH_LOGPROB and ENV_RESET_PREFETCH off here —
@@ -507,6 +516,30 @@ if [ "${SKIP_ROLLOUT_BUILD}" != "0" ]; then
 fi
 export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
 export OFFPOLICY_ACTOR_PIPELINE=${OFFPOLICY_ACTOR_PIPELINE:-1}
+
+# verl pins CUDA_DEVICE_MAX_CONNECTIONS=1 for every Ray worker
+# (verl/trainer/constants_ppo.py). That is a Megatron requirement -- its
+# tensor-parallel overlap needs the communication kernels issued on the same
+# hardware queue as the compute they hide behind, in program order. One queue is
+# how Megatron gets that ordering.
+#
+# This arm is FSDP, and FSDP wants the opposite: forward_prefetch issues the next
+# layer's all-gather on a SEPARATE stream so it overlaps the current layer's
+# compute. Collapsing the streams onto one connection serialises exactly the pair
+# that was supposed to overlap, so the all-gather stops being free and starts
+# being added time. Nothing here goes through Megatron.
+#
+# get_ppo_ray_runtime_env() drops any key already present in the launcher's
+# environment, so exporting it here is what overrides it -- the workers inherit
+# this value instead of the pinned 1.
+#
+# This changes no arithmetic: it is a scheduling hint to the driver, not a
+# numeric or a parallelism setting. It is also invisible to the NVML utilisation
+# number, because a spinning NCCL kernel reads as busy (docs 9.13) -- read the
+# result off timing_s/update_actor_worker and perf/mfu/actor instead, both of
+# which sit inside +-1% over a hundred steps and so resolve a 1% move in ten.
+# Set it back to 1 to reproduce the old behaviour.
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8}
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
