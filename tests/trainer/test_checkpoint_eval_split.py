@@ -198,3 +198,54 @@ def test_the_eval_driver_runs_the_training_script_rather_than_repeating_it():
     assert any("run_multitask_sft_qwen3.sh" in line for line in lines)
     # The one scientific knob a copy would be tempted to restate.
     assert not any("val_kwargs_by_task" in line for line in lines)
+
+
+def test_the_eval_driver_builds_the_rollout():
+    """The one thing the split does NOT share with the training run.
+
+    The run script defaults SKIP_ROLLOUT_BUILD=1 -- the training arm never
+    generates, and not building vLLM is what lets it run under
+    expandable_segments. Evaluation is the opposite case: generating is the whole
+    job. Inherited from the training default it would load the model, build FSDP
+    and the envs, and only then raise from generate_sequences, minutes in and
+    after the checkpoint is already resident.
+    """
+    lines = _command_lines(EVAL_SCRIPT)
+
+    assert any(re.fullmatch(r"export SKIP_ROLLOUT_BUILD=0", line.strip()) for line in lines), (
+        "eval_checkpoints.sh must force the rollout build on"
+    )
+
+
+def test_the_eval_driver_does_not_let_the_environment_win():
+    """``export SKIP_ROLLOUT_BUILD=${SKIP_ROLLOUT_BUILD:-0}`` would honour a 1
+    left over in the shell that last launched a training run, and fail late for
+    a reason the caller cannot see. There is no valid eval without a rollout, so
+    it is not a knob."""
+    lines = _command_lines(EVAL_SCRIPT)
+    assignments = [line.strip() for line in lines if "SKIP_ROLLOUT_BUILD=" in line and line.strip().startswith("export")]
+
+    assert assignments == ["export SKIP_ROLLOUT_BUILD=0"]
+
+
+def test_the_run_script_still_defaults_it_on():
+    """The two halves are only in tension while the training default is 1. If it
+    ever flips, the override above becomes noise rather than a fix -- and the
+    comment explaining it becomes wrong."""
+    lines = _command_lines(RUN_SCRIPT)
+
+    assert any("export SKIP_ROLLOUT_BUILD=${SKIP_ROLLOUT_BUILD:-1}" in line for line in lines)
+
+
+def test_turning_the_rollout_back_on_also_drops_expandable_segments():
+    """They travel together: vLLM's CuMemAllocator asserts expandable segments
+    are off, so a rollout built under that allocator mode aborts at startup. The
+    run script guards the export on the flag; if that guard is ever removed, the
+    eval process would set both and die in vLLM's assert."""
+    text = RUN_SCRIPT.read_text()
+
+    guard = re.search(
+        r'if \[ "\$\{SKIP_ROLLOUT_BUILD\}" != "0" \]; then\s*\n\s*export PYTORCH_CUDA_ALLOC_CONF=',
+        text,
+    )
+    assert guard, "PYTORCH_CUDA_ALLOC_CONF must stay guarded on SKIP_ROLLOUT_BUILD"

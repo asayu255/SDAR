@@ -52,6 +52,15 @@
 #
 # The teacher pool does not have to exist for this. algorithm.sft.data_dir is
 # still checked as the identity of the arm, but a val_only process never reads it.
+#
+# THE ROLLOUT HAS TO BE BUILT HERE. The run script defaults SKIP_ROLLOUT_BUILD=1
+# because the training arm never generates, and skipping the vLLM build is what
+# lets it run under expandable_segments. This process is the opposite case:
+# generating IS the work. Left at the default it would load the model, build FSDP
+# and the envs, and only then raise from generate_sequences -- minutes in, after
+# the checkpoint is already on the GPUs. So force it off here, which also stops
+# the run script exporting the allocator setting (the two travel together --
+# vLLM's CuMemAllocator asserts expandable segments are off).
 set -euo pipefail
 
 SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,6 +108,15 @@ for STEP in $STEPS; do
     [ -d "$CKPT_DIR/global_step_$STEP/actor" ] || {
         echo "no actor checkpoint at $CKPT_DIR/global_step_$STEP/actor" >&2; exit 1; }
 done
+
+# Not ${SKIP_ROLLOUT_BUILD:-0}: an inherited 1 from the shell that last launched
+# a training run would be honoured and this would fail late for a reason the
+# caller has no way to see. There is no such thing as a valid eval without a
+# rollout, so this one is not a knob.
+if [ "${SKIP_ROLLOUT_BUILD:-0}" != "0" ]; then
+    echo "[eval] SKIP_ROLLOUT_BUILD=$SKIP_ROLLOUT_BUILD in the environment; overriding to 0 -- evaluation generates."
+fi
+export SKIP_ROLLOUT_BUILD=0
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
