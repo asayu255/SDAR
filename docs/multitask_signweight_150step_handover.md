@@ -26,12 +26,21 @@ off-task 教師2本・base)で読み、off-task 2本が全会一致でかつ自�
    独立に検算して合った(§9)。
 2. **しかし触れている教師確率質量は 8.6% しかない。**教師のRLは分布の頭ではなく裾を動かして
    おり、質量の 64.7% は自タスク教師が base から動かしていないトークンに載っている(§3.2)。
-3. **介入の絶対量は小さい。**target アームの目標書き換えは全変動距離で 0.72%、KL で 0.001 nats。
-4. **ただし相対量は上がり続けている。**生徒は150stepで教師にほぼ収束し(teacher_kl が
-   0.571 → 0.005 nats)、書き換えが残り距離に占める割合は 0.3% → 25.2%(Alfworld 35.4%)に
-   なった。**アームが分かれるとしたら150step以降**という予測がここから出る(§10.3)。
+3. **介入は「均一に小さい」のではなく「1割の位置に集中して大きい」。**位置平均の全変動距離は
+   0.72% だが、合意質量は約9%の位置に集中しており、**発火位置での書き換えは TV 8% 規模**である
+   (§4.2)。書き換えの中身は「頭のトークンから約1%を削り、3教師が揃って持ち上げた中位候補に
+   配る」で、`agree_pos` が得る質量の46%は重み 1.0 の頭から出ている(§4.1)。
+4. **相対量は上がり続け、飽和しない。**生徒は150stepで目標にほぼ収束し
+   ($\mathrm{KL}(p_s\Vert\tilde p)$ が 0.571 → 0.005 nats)、`target_kl_ratio` は
+   0.003 → 0.252(Alfworld 0.354)。分子は凍結モデルだけの関数で一定、分母は損失なので、
+   この比は**1 で飽和せず発散する**。**アームが分かれるとしたら150step以降**という予測が
+   ここから出る(§10.3)。
 5. **2アームは、学習中ロールアウトを含む全共通指標でほぼ一致している**(成功率 0.533 vs 0.534)。
    これは「差が無い」という結論ではない。**正式な検証がまだ走っていない**だけである。
+
+**指標の定義は §12 にコードの行番号付きでまとめてある。**引用する前にそこを見ること —
+名前から素直に読める意味と実装が食い違うものが複数ある(特に `teacher_kl` の第2引数、
+`abs_delta_mean` の母集団、`episode/*_success_rate` の取り方)。
 
 ---
 
@@ -91,7 +100,7 @@ LR warmup(総stepの10%)が変わり step 15–30 の軌道が対照とずれる
 **この走行を生んだ実装は本文書と同じブランチ `claude/pure-opd-signweight-student-topk`
 にある**(本文書追加時点の HEAD: `aff49d1`)。機構の設計・重み表・指標の定義は
 `docs/multitask_signweight_pure_opd.md` にあり、本文書はその指標の実測値を引き受ける、
-という分担である。参照先はすべて同一ツリーにあるので、本文書のコード参照(§12.2)は
+という分担である。参照先はすべて同一ツリーにあるので、本文書のコード参照(§13.2)は
 チェックアウトしたまま辿れる。
 
 なお原稿・解析側の `claude/current-implementation-review-f99pr1` には
@@ -146,8 +155,26 @@ LR warmup(総stepの10%)が変わり step 15–30 の軌道が対照とずれる
 |---|---:|---:|---:|---:|
 | `mass_frac_agree_pos + mass_frac_agree_neg` | **0.086** | 0.091 | 0.091 | 0.068 |
 
-**教師質量の 8.6% にしか重みが掛かっていない。**§4 の介入量が小さいのはこれが理由であり、
-実装の不備ではない。
+**教師質量の 8.6% にしか重みが掛かっていない。**§4 の介入量が平均として小さいのはこれが
+理由であり、実装の不備ではない。
+
+`frac` と `mass_frac` から「その状態の候補1個あたりの平均 $p_i$」が復元できる
+($\bar p = \text{mass\_frac}\times\text{coverage}/(\text{frac}\times 20)$)。
+これが1位置あたりの絵を一番はっきり見せる:
+
+| 状態 | 候補/位置 | 平均 $p_i$ | 全候補平均比 |
+|---|---:|---:|---:|
+| `neutral_on_task_silent` | **0.85** | **0.755** | **15.2x** |
+| `neutral_off_task_silent` | 1.08 | 0.101 | 2.0x |
+| `conflict_on_pos` | 1.19 | 0.028 | 0.6x |
+| `agree_neg` | 0.92 | 0.022 | 0.4x |
+| `agree_pos` | 3.87 | 0.017 | 0.3x |
+| `neutral_off_task_split` | 10.51 | 0.011 | 0.2x |
+| `conflict_on_neg` | 1.58 | 0.002 | 0.1x |
+
+**1位置あたり、教師が $p\approx0.75$ を置いているトークンがほぼちょうど1個あり、それが
+base から 0.1 nats 以内。**次が $p\approx0.10$ で1個。残り約18個が合計 $\approx0.14$ を
+分け合う。「教師のRLは頭を動かしていない」とはこの構造のことである。
 
 その他の読みどころ:
 
@@ -237,11 +264,20 @@ alfworld 50 / webshop 15 / search 4 ターンだからで、データ組成で�
 * **`teacher_kl` が 0.571 → 0.005 nats に崩落している。**生徒は150stepで教師にほぼ収束した。
   `pg_loss_coef=0` かつ `kl_loss_coef=1.0` の純蒸留なので当然ではあるが、**残り伸びしろが
   ほとんど無い状態に入っている**という事実は次の実験設計に直結する。
-* **`target_kl_ratio` が 0.003 → 0.252 に上がった。**分子(書き換え量)はほぼ一定で
-  分母(生徒の残り距離)が100倍縮んだ結果である。step150 時点で
-  **Alfworld は残り距離の 35.4%、WebShop は 22.3% を書き換えが占める。**
-  Search だけ 3.5% と低いのは、search 教師との残り距離 `teacher_kl` が 0.025 と
-  他タスク(0.004–0.006)の4〜6倍あり、分母が縮んでいないため。
+* **【重要】`teacher_kl` の第2引数は $p_i$ ではなく $\tilde p$ である。**
+  `dp_actor.py:1277` が `fwd_teacher_topk_logprobs` を書き換え後の値で上書きし、
+  `:1407` の `topk_kl_per_token` がそれを使う。つまり
+  $\text{teacher\_kl}=\mathrm{KL}(p_s\Vert\tilde p)$ =
+  **生徒から「実際の訓練目標」までの距離**。詳細は §12.3。
+* **`target_kl_ratio` が 0.003 → 0.252 に上がった。**分子と分母は**同じ点 $\tilde p$ までの
+  距離**であり、分子は凍結モデルだけの関数で一定、分母は損失そのもので 0 に向かう。
+  比が上がるのは単に $\text{target\_kl}/\text{loss}$ だからで、**1 では飽和せず、生徒が
+  $\tilde p$ に収束すれば発散する。**step150 時点で Alfworld 35.4%、WebShop 22.3%。
+  Search だけ 3.5% と低いのは `teacher_kl` が 0.025 と他タスク(0.004–0.006)の4〜6倍あり、
+  分母が縮んでいないため。
+  局所的に $\mathrm{KL}\approx\frac12\chi^2$ なので
+  $\text{ratio}\approx[d(p_i,\tilde p)/d(p_s,\tilde p)]^2$、
+  $\sqrt{0.252}\approx0.50$ = **生徒の残距離は教師と目標のズレの約2倍**。
 * **`inv_z` = 0.9912 < 1**、すなわち $Z > 1$。`docs/multitask_signweight_pure_opd.md` §5 が
   予告した**系統的シャープ化(tail の縮み)は実測された。**大きさは 0.9%。
 * **`target_entropy_delta` は符号が一定でない**: 全体 +0.0017、Alfworld +0.0032(エントロピー
@@ -254,7 +290,51 @@ alfworld 50 / webshop 15 / search 4 ターンだからで、データ組成で�
   ただし符号がタスク間で反転しているので、シャッフル対照を組む際は**タスク別に**
   この量を見ること(全体平均は Alfworld の + と WebShop の − が打ち消し合っている)。
 
-### 4.1 【要注意】この4指標はログの精度で潰れている
+### 4.1 書き換えは質量をどこからどこへ動かしているか
+
+生徒の固定点は $p_i$ ではなく $\tilde p=wp_i/Z$。平均質量から状態別の流れを出すと
+(全体、1位置あたり絶対確率、$Z=1.0111$):
+
+| 状態 | $w/Z$ | 相対変化 | 絶対 $\Delta p$ |
+|---|---:|---:|---:|
+| `agree_pos`(~3.9個) | 1.2365 | **+23.6%** | **+0.0153** |
+| `agree_neg`(~0.9個) | 0.7419 | −25.8% | −0.0053 |
+| **head(`neutral_on_task_silent`, $p\approx0.755$)** | 0.9892 | −1.10% | **−0.0071** |
+| その他 top-20 + tail | 0.9892 | −1.10% | −0.0030 |
+
+**頭のトークンから約1%を削り、3教師が独立に base から持ち上げた中位候補に配っている。**
+`agree_pos` が受け取る質量の **46%(Search では 67%)が head から出ている** —
+head は重み 1.0 の「意見なし」状態なのに、再正規化の税が確率に比例するため
+質量の 64% を持つ head が最大の供給源になる。狙った操作ではなく副作用である。
+
+これが `target_entropy_delta` の符号を説明する。Alfworld が +0.0032(エントロピー**増加**)
+なのは、$p\approx0.79$ の頭から $p\approx0.017$ の4個へ質量が移るから。tail は $1/Z$ で
+縮んでいる(`inv_z`<1)のに全体エントロピーが上がるのは矛盾ではなく、
+**頭の平坦化が tail の収縮より効いている**ということ。
+
+### 4.2 【重要】介入は「均一に小さい」のではなく「1割の位置に集中して大きい」
+
+上の平均質量から計算すると TV=0.0153 になるが、実測の位置平均 TV は 0.0072 と半分である。
+「合意質量が位置の一部に集中している」2点モデルで `target_tv` / `inv_z` / `target_kl` を
+同時に当てにいくと:
+
+| | 集中率 $f$ | 発火位置での `agree_pos` 質量 | 発火位置での TV |
+|---|---:|---:|---:|
+| 全体 | **9%** | 教師質量の 75% | **0.081** |
+| Alfworld | 9% | 76% | 0.079 |
+| Search | 9% | 89% | 0.042 |
+| WebShop | 7% | 70% | 0.095 |
+
+TV と `inv_z` は 5–10% 以内で合うが `target_kl` は 1.7 倍ずれる(下記の量子化と、2点分布という
+粗いモデルの両方が効く)。**$f$ は「約1割」という桁の主張として読むこと。**
+
+機構的には筋が通る。大半の位置は頭が $p\approx0.75$ を占める確定的な位置で教師は沈黙して
+おり、機構が発火するのは**分布が平坦で複数候補が生きている位置 = 意思決定点**である。
+
+**したがって「介入は小さい」は平均の話でしかない。**約9割の位置では何もせず、
+残り1割で TV 8% 規模の書き換えをしている。
+
+### 4.3 【要注意】この4指標はログの精度で潰れている
 
 元ログが小数第3位までなので、`target_kl` は **0.001 と 0.002 の2値しか取っていない**
 (150step中ほぼ全部が 0.001)。`target_entropy_delta` も Search/WebShop では
@@ -330,16 +410,29 @@ alfworld 50 / webshop 15 / search 4 ターンだからで、データ組成で�
 * **`abs_delta_mean` は Alfworld 7.24 / Search 1.93 / WebShop 5.33 nats。**
   Search 教師は他の 1/3〜1/4 しか base から動いていない。lock のコメントにある
   「search の KL 係数は 0.001、他は 0.01 の10倍差」と整合する。
-* **デッドゾーン ε = 0.1 nats は、実測された移動量に対して2桁小さい。**
-  結果 `deadzone_frac` は 4.2–7.2% しか沈黙にしていない。
-  ε は「教師が一度も動かしていない候補のドリフトノイズが確信ある ±1 になる」のを防ぐために
-  導入されたが、**教師は nats 単位で動いており、想定していたノイズ領域はほとんど存在しない。**
-  lock のコメント「Set without a prior measurement, so `deadzone_frac` is what says afterwards
-  whether it was right」への答えがこれである。
-* ただし **ε を上げるべきとは限らない。**`deadzone_frac` ≒ `frac_neutral_on_task_silent`
-  (4.2% vs 3.9%)であり、沈黙している候補は §3.2 の通り**質量の 64.7% を持つ頭**である。
-  ε を上げれば頭がさらに沈黙して機構が触れる質量が減るだけかもしれない。
-  **判断の前に $|\delta|$ の分布(平均ではなく分位点)を測ること。**
+* **ただし `abs_delta_mean` は top-20 全候補の等重み平均であり、大半を占める低確率候補が
+  支配する。**裾では $10^{-6}\to10^{-3}$ が 6.9 nats になるが確率質量はほぼ動かない。
+  **この平均が大きいことは「教師が分布を大きく変えた」を意味しない。**
+* **ε = 0.1 nats は、意図とは逆の場所に効いている。**
+  * 裾(候補の大半、$p<0.03$): $|\delta|$ が nats 単位なので**εを楽に超える**
+    → ノイズ抑制の役目をほぼ果たしていない
+  * 頭($p\approx0.755$、0.85個/位置): **εの内側に落ちる**
+    → 質量 64.7% を沈黙させているのは ε そのもの
+  実際 `deadzone_frac` ≒ `frac_neutral_on_task_silent`(4.2% vs 3.9%)で、
+  **沈黙させている候補 = 質量を持つ頭**である。
+* **絶対 log 空間の閾値は高確率トークンに対して構造的に非対称である。**
+  $p_0$ のトークンが上げられる最大幅は $-\log p_0$ なので:
+
+  $$p_0 > e^{-\epsilon} = 0.905 \;\Longrightarrow\; \text{どう動かしても正方向には永久に沈黙}$$
+
+  $p_0=0.75$ でも上げ幅の上限は 0.288 nats で、ε がその 1/3 を食う(下げ方向は無制限)。
+  データにも痕跡があり、全体で `agree_neg` の平均 $p$ (0.022) が `agree_pos` (0.017) より
+  高く、Alfworld ではさらに顕著(0.028 vs 0.017)。
+  **高確率側では「上げの合意」より「下げの合意」が拾われやすい**という予測と整合する。
+* したがって **ε を単純に上げるのは筋が悪い。**頭がさらに沈黙して機構が触れる質量が減る。
+  触るなら**確率空間の相対量**($|p_m-p_0|/p_0$、あるいは $p_0$ に応じてスケールする
+  $\epsilon(p_0)$)への変更を先に検討し、判断の前に per-teacher の $|\delta|$ の
+  **分位点**(平均ではなく)を測ること。
 
 ---
 
@@ -513,10 +606,13 @@ $Z - 1 = 0.25(\sum_{\text{agree\_pos}} p - \sum_{\text{agree\_neg}} p)$ から�
 $Z$ の位置平均から来ているため(Jensen の不等式)。
 
 $\mathbb{E}[1/Z] - 1/\mathbb{E}[Z] \approx \mathrm{Var}(Z)$ から逆算すると
-$\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$。
-**位置ごとの書き換え量は平均(0.011)の約4〜5倍のばらつきを持つ**ということであり、
-「全体で TV 0.72%」は個々の位置が一様に 0.7% 動いているという意味ではない。
-(この逆算は3桁丸めの上での2次近似なので、桁の主張として読むこと。)
+$\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$ —
+**位置ごとの書き換え量は平均(0.011)の4〜5倍のばらつきを持つ。**
+
+§4.2 の集中モデル($f\approx0.09$、発火位置で $Z\approx1.13$)はこれと独立に
+$\mathrm{std}(Z)=\sqrt{f(Z_c-1)^2}\approx0.035$ を与え、同じ桁に落ちる。
+**2つの独立な経路が「書き換えは1割の位置に集中している」を指している。**
+(どちらも3桁丸めの上での近似なので、桁の主張として読むこと。)
 
 ### 9.3 診断と損失が同じ量を見ているか
 
@@ -561,7 +657,7 @@ $\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$�
 2. **機構が効いたか。**対照アーム(符号重み無し純OPD)がこの CSV に無い。
 3. **`episode/*` の差。**学習中ロールアウトであり、温度も検証プロトコルと違う。
    そもそも2アームの差は step間標準偏差の数十分の一で、**判別限界以下**である。
-4. **step単位の細かい軌道**(§4.1 の量子化)。
+4. **step単位の細かい軌道**(§4.3 の量子化)。
 
 ### 10.3 次に効くとしたらどこか(予測)
 
@@ -572,8 +668,18 @@ $\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$�
 
 したがって **150→300 の区間こそが、target の固定点移動が目的関数を支配する区間である。**
 150step で2アームが一致しているのは想定と矛盾しない。
-逆に、**300step で差が出なければ、この機構は 8.6% の質量に対する ±25% の重みでは
-足りないという結論**になる(その場合の選択肢は §11 の作業5)。
+
+ただし「レバーが足りない」という結論に飛ばないこと。§4.2 の通り、**発火する1割の位置では
+すでに TV 8% の書き換えが起きている。**300step で差が出ない場合に疑うべきは順に:
+
+1. **発火位置の数**(9%)が足りない — 全会一致ゲートが到達可能質量の 24% しか通していない
+2. **書き換えの向き**が効いていない — 頭から中位候補への再配分が学習信号として無意味
+3. **恒久的な固定点変位そのものが後半に害**(OPD+GRPO 実験の 300step で利得が消え WebShop が
+   反転した先例 — `docs/multitask_sign_weighting_results_150.md`、
+   ブランチ `claude/current-implementation-review-f99pr1`)
+
+`agree_weight` の単純増強(1.25→1.5)は 1 に対する処方だが、発火位置では $Z$ が既に 1.13 で
+$w/Z$ が 1 に近づくため**効きが鈍る**。選択肢は §11 の作業6。
 
 ### 10.4 「target > position」の判定に必要なもの
 
@@ -613,23 +719,333 @@ $\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$�
    区間も z も後から計算できなかった)なので、jsonl が出ているか先に確認すること。
 4. **150→300 を走らせる。**`train_position_300` / `train_target_300` と対応する val フェーズ。
    §10.3 の通り、差が出るとすればこの区間である。
-5. **機構のパラメータを見直すかどうかの判断材料を取る。**300step で差が出なかった場合の候補:
-   * `agree_weight` を 1.25 より強くする(質量 8.6% × ±25% では小さすぎる可能性)
-   * デッドゾーン ε の再設定 — **ただし §6.1 の通り、先に $|\delta|$ の分位点を測ること。**
-     平均 7.24 nats に対し ε=0.1 は2桁小さいが、沈黙している候補は質量の頭である。
+5. **オフラインプローブを走らせる(訓練不要)。**step-150 checkpoint(25step 刻みで全部ある)と
+   4凍結モデルで固定バッチを1回流すだけで、以降の判断材料がすべて取れる:
+   * `neutral_on_task_silent`(質量 64.7%)の **off-task 内訳**(全会一致/割れ/沈黙)
+     → 頭に手を入れる案のレバー量
+   * split / off_silent 質量のうち「**信頼投票者が発話かつ一致**」の質量
+     → 全会一致ゲートを緩めた場合の効果量
+   * per-teacher の $|\delta|$ の**分位点**(平均ではなく) → ε 再設定の判断(§6.1)
+   * **質量加重の** `agree_rate` → 0.761 が高質量トークン上でも成り立つかの確認(§12.5-3)
+   * 位置ごとの $Z$ の分布 → §4.2 の集中率 $f$ の直接測定(現状は3指標からの推定)
+6. **機構のパラメータを見直すかどうかの判断材料を取る。**300step で差が出なかった場合の候補:
+   * **全会一致ゲートを信頼投票者だけに絞る** — 実測の一致率行列(§6)は
+     Alfworld↔WebShop が 0.68–0.76、Search はどちらとも 0.35–0.49 で、
+     **「全タスクの合意」という設計が実測された転移構造と噛み合っていない。**
+     Alfworld 状態で全会一致が通すのは、両 off-task が発話した候補の 26.7%
+     (独立近似 0.761×0.392≈0.298 とほぼ一致)で、**Search の拒否権が WebShop の
+     確認した候補の約6割を落としている。**発火位置の数を増やす方向なので飽和しない
+   * `agree_weight` を 1.25 より強くする — **ただし §4.2 の通り発火位置では $Z\approx1.13$ で
+     $w/Z$ が 1 に近づくため効きが鈍る。**まずプローブで発火位置の $Z$ を測ること
+   * デッドゾーン ε — **§6.1 の通り、絶対 log 空間の閾値は高確率トークンの「上げ」を
+     構造的に差別している。**単純に上げるのではなく確率空間の相対量への変更を検討し、
+     判断の前に $|\delta|$ の分位点を測ること
    * `disagree_weight` — 現状 1.0(対立は不作為)。target モードは 1.0 以外を拒否する実装なので、
-     変えるなら重み表の設計から。
-6. **`target_*` 系4指標のログ精度を上げる**(§4.1)。現状3桁で 0.001/0.002 の2値しか
-   取れていない。
-7. **原稿側ブランチとの関係を決める。**解析・原稿の
+     変えるなら重み表の設計から。`docs/multitask_two_channel_proposal.md`
+     (ブランチ `claude/current-implementation-review-f99pr1`)の系統と統合すべき
+   * **恒久変位のアニーリング** — `agree_weight` を 150→300 で 1.0 に戻し、降下中の誘導だけ
+     残して終着点の変位を消す。§10.3 の疑い3(先例で 300step に利得が消えた)への直接の対処
+7. **`target_*` 系4指標のログ精度を上げる**(§4.3)。現状3桁で 0.001/0.002 の2値しか
+   取れておらず、§4.2 の集中率 $f$ が推定に留まっている主因でもある。
+8. **原稿側ブランチとの関係を決める。**解析・原稿の
    `claude/current-implementation-review-f99pr1` には実装の一部しか無い(§2.4)。
    あちらで解析を続けるなら、実装を取り込むか、参照先を明示して分離を維持するかを決めること。
 
 ---
 
-## 12. 付録
+## 12. 指標定義 — コード上の計算式
 
-### 12.1 生データ
+**この節は「説明の誤りを防ぐ」ためにある。**各指標について、何を分子・分母に取っているかを
+コードの行と対応させる。行番号は本文書追加時点(`aff49d1`)のもの。
+
+### 12.0 全 `sign_weight/*` に共通する前提
+
+すべての `sign_weight/*` は**アクターの forward の中**、生徒の top-k が確定した直後に
+計算される(`dp_actor.py:1252-1286`, `:1427-1433`)。
+
+| 前提 | 内容 |
+|---|---|
+| 支持集合 $S$ | **生徒**の上位 $k=20$ トークン(`student_indexed_topk=true`)。教師の top-20 ではない |
+| 確率の定義 | 4モデルとも**フルボキャブラリ log-softmax を $S$ で gather した値**。$S$ 内で再正規化しない。よって $\sum_{v\in S}p(v) \le 1$、残りが tail |
+| $p_i$ | 添字 $i$ = **その行の自タスク教師**。`mass_*` 系の重みはすべてこの $p_i$ |
+| $p_0$ | base = `Qwen/Qwen3-1.7B`。キャッシュ上のラベルは `__sign_base__` |
+| マスク | `response_mask`。プロンプトとパディングは全指標から除外 |
+| 有効単位 | 「位置」= (行, 応答トークン位置) の組。`n_tokens` がその数 |
+| ランク間の合成 | `reduce_metrics`(`verl/utils/metric/utils.py:23-29`)が**キー名に `max`/`min` を含むかで np.max/np.min/np.mean を選ぶ**。`sign_weight/*` はすべて mean、すなわち**各ランクのプール比の平均**。ランク間でトークン数が揃っていれば真のプール比と一致する(`sign_weights.py:620-627` の docstring) |
+
+### 12.1 状態分布 — `frac_*` / `mass_frac_*`
+
+状態は候補ごとに7つの排他値(`sign_weights.py:110-116`)。判定は `candidate_weights`
+(`sign_weights.py:147-254`)。
+
+$$\delta_m(v) = \log p_m(v) - \log p_0(v), \qquad
+\mathrm{sgn}_\epsilon(\delta)=\begin{cases}+1&\delta>\epsilon\\-1&\delta<-\epsilon\\0&|\delta|\le\epsilon\end{cases}$$
+
+| 状態 | 条件 | target の重み |
+|---|---|---:|
+| `agree_pos` | 自タスク $+1$、off-task が**全会一致**で $+1$ | 1.25 |
+| `agree_neg` | 自タスク $-1$、off-task 全会一致で $-1$ | 0.75 |
+| `conflict_on_pos` | 自タスク $+1$、off-task 全会一致で $-1$ | 1.0 |
+| `conflict_on_neg` | 自タスク $-1$、off-task 全会一致で $+1$ | 1.0 |
+| `neutral_on_task_silent` | **自タスクが $0$**(off-task の内容は問わない) | 1.0 |
+| `neutral_off_task_split` | 自タスク非0、off-task 全員が非0だが符号が割れた | 1.0 |
+| `neutral_off_task_silent` | 自タスク非0、off-task の**少なくとも1本**が $0$ | 1.0 |
+
+全会一致は `off_sum.abs() == n_off`(`sign_weights.py:213-217`)、すなわち
+**off-task 全員が非0かつ同符号のときだけ** consensus を定義する。
+
+集計は `update_candidates`(`sign_weights.py:429-509`)、出力は `metrics()`
+(`sign_weights.py:637-640`):
+
+$$\text{frac\_}s = \frac{\#\{\text{状態}s\text{の候補}\}}{\sum_{s'}\#\{s'\}}, \qquad
+\text{mass\_frac\_}s = \frac{\sum_{\text{状態}s\text{の候補}}p_i(v)}{\sum_{v\in S}p_i(v)}$$
+
+- `frac_*` の分母は**7状態の候補数の総和**(`total_cand`)。状態は排他かつ網羅なので
+  $= 20 \times$ `n_tokens`。実測でも `n_candidates` / `n_tokens` $= 20.000$ で確認できる
+- `mass_frac_*` の分母は `mass_tot` $=\sum_{\text{位置}}\sum_{v\in S}p_i(v)$。**tail は入らない**
+- したがって両方とも**縦に合計 1.000** になる(実測でも 1.000)
+
+**この2つは必ず対で読むこと。**候補数と質量では絵が正反対になる状態がある。
+状態ごとの「候補1個あたりの平均 $p_i$」は $\text{mass\_frac}\times\text{coverage}/(\text{frac}\times 20)$
+で復元でき、§3.2 の表がそれである。
+
+### 12.2 支持集合の規模 — `n_tokens` / `n_candidates` / `teacher_coverage`
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `n_tokens` | `response_mask` が立った (行, 位置) の数 | `sign_weights.py:455` |
+| `n_candidates` | 上記 × 20 (= `frac_*` の分母) | `sign_weights.py:642` |
+| `teacher_coverage` | $\dfrac{1}{n_{\text{tok}}}\sum_{\text{位置}}\sum_{v\in S}p_i(v)$ | `sign_weights.py:649` |
+
+`teacher_coverage` は**位置あたりの、生徒 top-20 が覆う自タスク教師の質量**。
+$1 - $ これが tail の割合。**target モードのレバーの天井**であり、`mass_frac_*` は
+この中の構成比なので、coverage 無しでは過大に読める。実測 0.993。
+
+### 12.3 target モードの分布変更量
+
+`update_target`(`sign_weights.py:537-609`)。$w$ は `candidate_weights` の出力、
+$\tilde p(v)=w(v)p_i(v)/Z$、$Z=\sum_{v\in S}w(v)p_i(v)+\tau$、$\tau=1-\sum_{v\in S}p_i(v)$。
+
+| 指標 | 式 | コード | 備考 |
+|---|---|---|---|
+| `target_kl` | $\mathrm{KL}(p_i\Vert\tilde p)=\log Z-\sum_v p_i(v)\log w(v)$ | `:580` | $k{+}1$ カテゴリ上。閉形式で計算 |
+| `inv_z` | $1/Z=\tilde\tau/\tau$ | `:581` | tail の割合が掛けられる係数 |
+| `target_entropy_delta` | $H(\tilde p)-H(p_i)$、$k{+}1$ カテゴリ | `:583-589` | **正 = 書き換え後の方がエントロピーが高い** |
+| `target_tv` | $\frac12\big(\sum_v\lvert\tilde p-p_i\rvert+\lvert\tilde\tau-\tau\rvert\big)$ | `:590` | $[0,1]$、ステップ間比較可 |
+| `teacher_kl` | 下記 | `:595`, `dp_actor.py:1432` | **要注意、次項** |
+
+#### 【重要】`teacher_kl` の第2引数は $p_i$ ではなく $\tilde p$
+
+`dp_actor.py` の実行順がこうなっている:
+
+```
+:1276  sign_target_inputs = (fwd_teacher_topk_logprobs, candidate_weight)   # 元の p_i を退避
+:1277  fwd_teacher_topk_logprobs = reweight_teacher_logprobs(...)           # p_i を p̃ で上書き
+:1407  teacher_kld = topk_kl_per_token(student_topk_logprob=..., 
+                                       teacher_topk_logprob=fwd_teacher_topk_logprobs)
+:1432  sign_stats.update_target(..., teacher_kl=teacher_kld)
+```
+
+したがって `sign_weight/teacher_kl` も `actor/teacher_kl_loss` も
+
+$$\text{teacher\_kl} = \mathrm{KL}(p_s \Vert \tilde p)$$
+
+**生徒から「書き換え後の目標」までの距離**である。$p_i$ までの距離ではない。
+これは正しい(生徒が実際に最小化しているのは $\tilde p$ への距離である)が、
+名前からは読み取れないので**論文・スライドに書くときは必ず $\tilde p$ と明記すること。**
+
+#### `target_kl_ratio`
+
+$$\text{target\_kl\_ratio}=\frac{\sum_{\text{位置}}\mathrm{KL}(p_i\Vert\tilde p)}{\sum_{\text{位置}}\mathrm{KL}(p_s\Vert\tilde p)}$$
+
+`sign_weights.py:679-683`。**報告値の比ではなく、和の比**として計算される(分母が共通なので
+平均の比と一致する)。位置ごとの比の平均**ではない**。
+
+**分子と分母は同じ点 $\tilde p$ までの距離**である。したがって:
+
+- 分子は凍結モデル($w$)と $p_i$ だけの関数で、**生徒の収束具合に依存しない**(実測 0.001 で一定)
+- 分母は損失そのもので、訓練が 0 に押し下げる
+- よって比は**訓練が進むほど単調に上がり、生徒が $\tilde p$ に収束すれば発散する**。1 で飽和しない
+- 局所的に $\mathrm{KL}\approx\frac12\chi^2$ なので
+  $\text{ratio}\approx\big[d(p_i,\tilde p)/d(p_s,\tilde p)\big]^2$。
+  $\sqrt{0.252}\approx0.50$ = 「生徒の残距離は、教師と目標のズレの約2倍」
+
+### 12.4 position モードの重み — `w_mean_pre_norm`
+
+`position_weights`(`sign_weights.py:257-283`)は候補の重みを1位置1スカラーに畳む。
+**単純平均ではなく教師質量による加重平均**で、tail は重み 1.0 で参加する:
+
+$$\bar w(\text{位置})=\sum_{v\in S}w(v)p_i(v)+\tau\;(=Z)$$
+
+`update_position`(`:511-535`)が**正規化前**の値を積み、`metrics()`(`:656`)が位置平均を出す。
+
+$$\text{w\_mean\_pre\_norm}=\frac{1}{n_{\text{tok}}}\sum_{\text{位置}}\bar w$$
+
+質量加重なので、恒等式
+
+$$\text{w\_mean\_pre\_norm}=1+0.25\big(\text{mass\_frac}_{\text{agree\_pos}}+\text{mass\_frac}_{\text{agree\_neg}}\big)\times\text{teacher\_coverage}$$
+
+が厳密に成り立つ(position モードは両 agree が 1.25)。§9.1 の検算がこれ。
+
+損失に入るのは正規化**後**の値(`normalize_per_task`, `:286`)で、**前回呼び出しの per-task 平均**で
+割る。step1 は正規化されずに走る。
+
+### 12.5 教師系の診断 — `agree_rate` / `abs_delta_mean` / `deadzone_frac`
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `agree_rate/<off>__on__<on>` | 行のタスクが `<on>`、off-task 平面が `<off>` の候補のうち、**両者ともデッドゾーン外**だったものを分母に、符号が一致した割合 | `:499-509`, `:658-662` |
+| `abs_delta_mean/<task>` | $\frac{1}{N}\sum\lvert\log p_{\text{task}}(v)-\log p_0(v)\rvert$ [nats] | `:464-492`, `:668` |
+| `deadzone_frac/<task>` | 同じ母集団で $\lvert\delta\rvert\le\epsilon$ だった候補の割合 | `:469-492`, `:669` |
+
+読むときの注意:
+
+1. **`agree_rate` は条件付き率。**分母は `(on != 0) & (so != 0) & mask`、すなわち
+   **両教師が意見を持った候補だけ**。沈黙は分母から抜ける
+2. **`<on>` は行のタスク**(どのタスクの状態上で測ったか)。`webshop__on__alfworld` =
+   「Alfworld の状態で WebShop 教師が Alfworld 教師と一致した割合」。**行列は非対称**
+3. **候補数ベースで、質量加重ではない。**高確率トークン上でも同じ一致率かは別問題
+4. **`abs_delta_mean` は top-20 全候補の等重み平均**で、大半を占める低確率候補が支配する。
+   裾では $10^{-6}\to10^{-3}$ が 6.9 nats になるが確率質量はほぼ動かないので、
+   **この平均が大きいことは「教師が分布を大きく変えた」を意味しない**
+5. 各教師は**自タスク行での役割と off-task 行での役割を合算**して集計される
+
+### 12.6 デッドゾーン $\epsilon$ の構造的な性質
+
+`_deadzoned_sign`(`sign_weights.py:129-145`)。$\epsilon=0.1$ nats ≈ 確率が 10.5% 変わる幅。
+
+導入の意図は「教師が触っていない候補のドリフトノイズが確信ある $\pm1$ になり、
+独立な2教師が半分の確率で偽の一致をする」ことの防止。
+
+**ただし絶対 log 空間の閾値なので、高確率トークンに対して構造的に非対称である:**
+
+$$\text{$p_0$ のトークンが上げられる最大幅} = -\log p_0 \quad\Longrightarrow\quad
+p_0 > e^{-\epsilon} = 0.905 \text{ なら正方向には永久に沈黙}$$
+
+$p_0=0.75$ でも上げ幅の上限は 0.288 nats で、$\epsilon$ がその 1/3 を占める。下げ方向は無制限。
+$\epsilon$ を上げるか、確率空間の相対量に変えるかを検討する際は、この非対称性を勘定に入れること。
+
+### 12.7 損失系 — `actor/*`
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `actor/teacher_kl_loss` | `agg_loss(teacher_kld, response_mask, loss_agg_mode)`。**per-task 正規化前**で、正規化しない run と比較可能に保たれている | `dp_actor.py:1434`, `:1461` |
+| `actor/teacher_kl_loss_weighted` | `(row_kl * task_loss_weight).sum() * task_dp_world_size * gradient_accumulation`。**実際に `policy_loss` に足される項** | `dp_actor.py:1448-1454` |
+| `actor/teacher_kl_loss/<task>` | 同じ `teacher_kld` をタスクの行だけで集約 | `dp_actor.py:1551-1554` |
+| `actor/teacher_kl_coef` | `teacher_kl_loss_coef` をそのまま記録(定数 1.0) | `dp_actor.py:1462` |
+| `actor/pg_loss` 他 | `pg_loss_coef == 0` のとき `_ZERO_PG_METRICS` の定数 0 が入る。**「PG項が0だった」の機械的確認**であって計算結果ではない | `dp_actor.py:71`, `:1567` |
+| `actor/lr` | `actor_lr_scheduler.get_last_lr()[0]`。実値 1e-6 だがログが小数第3位なので 0.000 と出る | `fsdp_workers.py:724` |
+
+`teacher_kld` 自体は `topk_kl_per_token`(`core_algos.py:677`)= 生徒側の reverse KL
+$\mathrm{KL}(p_s\Vert\cdot)$ を $k{+}1$ カテゴリ(top-20 + tail)で密に計算したもの。
+第2引数は §12.3 の通り target モードでは $\tilde p$。
+
+position モードでは `teacher_kld = teacher_kld * sign_position_weight`(`dp_actor.py:1425`)
+と per-token に掛かるので、**`actor/teacher_kl_loss` は position アームでは重み込みの値**になる。
+2アームの `actor/teacher_kl_loss` を直接比べるときはこの非対称に注意。
+
+### 12.8 タスク正規化 — `task_loss/*`
+
+`attach_task_loss_weights`(`task_loss_weights.py:48-135`)。
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `task_loss/rows/<task>` | そのタスクの実行(非パディング)行数 | `:133` |
+| `task_loss/token_share/<task>` | そのタスクの応答トークン数 / 実行行の応答トークン総数。**素の token-mean が与えたはずの重み**を記録したもので、正規化後の実効重みではない | `:132` |
+| `task_loss/padding_rows` | `len(batch) - n_real`。`adjust_batch` の割り切り用パディング | `:135` |
+
+`normalize_loss_by_task=true` のとき per-row 重みは $\dfrac{\text{num\_mini\_batches}}{|\text{tasks}|\times\text{task\_tokens}}$
+で、**損失側では各タスクが 1/3 ずつ**になる。`token_share` はその補正**前**の偏りを可視化する監視値。
+
+### 12.9 キャッシュ — `teacher_cache/*` / `teacher_prefetch/*`
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `teacher_cache/rows` | 全ランクの保持行数の**総和** | `opd_ray_trainer.py:926` |
+| `teacher_cache/gb` | 全ランクのバイト数の総和 / $10^9$(GiB ではなく GB) | `:927` |
+| `teacher_cache/witness_max_err` | 全ランクの `check_witness` 戻り値の**最大** | `:928-929`, `fsdp_workers.py:1093` |
+| `teacher_prefetch/rows` / `hit_rate` | 先読みで既に採点済みだった行数と、その バッチ比 | `:529-530` |
+
+**`witness_max_err` の許容は固定値ではない。**`check_witness`
+(`teacher_cache.py:570`)は各位置ごとに
+
+$$\text{tol} = \text{atol} + \text{ulps}\cdot\varepsilon(\text{bf16})\cdot\lvert\text{logit}\rvert
+\qquad(\text{atol}=10^{-3},\ \text{ulps}=8)$$
+
+を作り、$\text{err}/\text{tol}$ の最大が 1 を超えたときだけ `RuntimeError` を投げる。
+$\lvert\text{logit}\rvert\approx32$ では bf16 の量子が約 0.25 nats なので、
+**返り値 0.25 は保存精度そのものであって異常ではない。**返り値は「最大絶対偏差」で、
+判定に使う比ではない。150step 完走した事実が「一度も許容を超えていない」ことを意味する。
+
+### 12.10 ロールアウト・環境 — `episode/*` / `opd/score/*`
+
+`compute_opd_data_metrics`(`opd_ray_trainer.py:65`)。**いずれも損失には入らない監視値。**
+
+| 指標 | 定義 | コード | 注意 |
+|---|---|---|---|
+| `episode/<...>_success_rate` | `float(v[0])` — non-tensor 列の**先頭要素**をそのまま取る | `:98-100` | **バッチ平均ではない。**環境側が全行に書き込んだ値を1つ読んでいる |
+| `episode/reward/mean` | `traj_uid` で重複除去した軌跡の報酬平均 | `:102` | 軌跡単位 |
+| `episode/response_tokens/*` | **1軌跡が生成した総トークン数** | `:104-108` | `response_length/*` は**1ターン**単位なので別物 |
+| `opd/score/{mean,max,min}` | `token_level_scores.sum(-1)` の統計 | `:92-95` | 行単位(軌跡重複除去なし) |
+
+**`episode/*` は学習中ロールアウト(`temperature=1.0`)の値であり、検証結果ではない**(§2.3)。
+Alfworld サブタスク別はステップごとにバッチへの出現が変わるため N が揃わない(§13.1 の表)。
+
+### 12.11 長さ・バッチ — `response_length/*` / `prompt_length/*` / `global_seqlen/*`
+
+`opd_ray_trainer.py:80-87`。
+
+| 指標 | 定義 | 注意 |
+|---|---|---|
+| `response_length/mean` | **1ターンあたり**の応答トークン数 | 軌跡単位は `episode/response_tokens/mean` |
+| `response_length/clip_ratio` | `mean(response_length == max_response_length)` | 512 に張り付いた割合 |
+| `prompt_length/clip_ratio` | 同様に `max_prompt_length` に張り付いた割合 | |
+| `global_seqlen/{max,min}` | ランクごとのトークン数の最大・最小 | **`reduce_metrics` がキー名で np.max/np.min を選ぶ**(`utils/metric/utils.py:26-28`) |
+| `global_seqlen/balanced_{max,min}` | `_balance_batch` 後の値 | 両者が一致していればバランサが機能 |
+
+### 12.12 時間・資源 — `timing_s/*` / `perf/*`
+
+| 指標 | 定義 | コード |
+|---|---|---|
+| `timing_s/sign_weight_forward` | `compute_sign_weight_cache` を囲む `_timer` = base 全行 + 各 off-task 教師の該当行の凍結 forward | `opd_ray_trainer.py:906` |
+| `timing_s/teacher_forward` | 自タスク教師のパス。キャッシュ再利用のため小さい | `opd_ray_trainer.py:887` |
+| `timing_s/update_actor` | ドライバ側のブロッキング `ray.get` — **バッチのシリアライズと転送を含む** | `fsdp_workers.py:704-715` の注記 |
+| `timing_s/update_actor_worker` | ワーカ内の純計算時間。上との差が転送 | `fsdp_workers.py:715` |
+| `perf/mfu/actor` | `estimated_flops * ppo_epochs / promised_flops / world_size` | `fsdp_workers.py:718` |
+| `perf/max_memory_{allocated,reserved}_gb` | `torch.cuda.max_memory_*() / 1024**3`(GiB)。キー名に `max` を含むので**ランク間は np.max** | `fsdp_workers.py:719-720` |
+| `perf/cpu_memory_used_gb` | `psutil.virtual_memory().used / 1024**3` | `fsdp_workers.py:721` |
+
+**`perf/max_memory_*` から空きメモリを推定しないこと。**vLLM のアロケータプールが torch 側から
+数えられるため、カード容量(94.97 GiB)より大きな値が出る。intent lock の
+`enable_gradient_checkpointing` の項に同じ注記がある。
+
+### 12.13 落とし穴の一覧
+
+引用前に確認すべき点だけを集めたもの。
+
+| # | 指標 | 落とし穴 |
+|---|---|---|
+| 1 | `sign_weight/teacher_kl`, `actor/teacher_kl_loss` | 第2引数は $\tilde p$。$p_i$ ではない(§12.3) |
+| 2 | `target_kl_ratio` | 1 で飽和せず**発散する**。「残り距離の何割」は分母が $\tilde p$ 基準 |
+| 3 | `frac_*` vs `mass_frac_*` | 別の絵を出す。Search の `conflict_on_neg` は候補数 36.5% / 質量 0.2% |
+| 4 | `abs_delta_mean` | 低確率候補が支配する等重み平均。分布の変化量ではない(§12.5-4) |
+| 5 | `agree_rate` | 両教師が非沈黙の候補だけを分母にした**条件付き率**。非対称行列 |
+| 6 | `witness_max_err` | 0.25 は bf16 の保存精度。**止めない**(§12.9) |
+| 7 | `perf/max_memory_*` | カード容量を超える値が出る。空き容量の推定に使わない |
+| 8 | `episode/*_success_rate` | `v[0]` の1要素読み。バッチ平均ではない |
+| 9 | `episode/*` 全般 | 学習中ロールアウト。検証結果ではない。対照アームもこのログに無い |
+| 10 | `response_length/*` | ターン単位。軌跡単位は `episode/response_tokens/*` |
+| 11 | `actor/lr` = 0.000 | 小数第3位表示による(実値 1e-6)。バグではない |
+| 12 | `actor/pg_loss` 等 = 0.000 | 計算結果ではなく `pg_loss_coef=0` のときの定数 |
+| 13 | `actor/teacher_kl_loss`(position アーム) | 位置重みが掛かった後の値。target アームと直接比較しない |
+| 14 | `target_kl` / `inv_z` / `target_entropy_delta` / `target_tv` | 小数第3位で量子化。平均は使えるが軌道は使えない(§4.3) |
+| 15 | Alfworld サブタスク別 | N が 100–148 と揃わない。アーム比較に使えない |
+
+---
+
+## 13. 付録
+
+### 13.1 生データ
 
 `docs/multitask_signweight_150step_all_metrics.csv`(本文書と同じディレクトリ)。
 1行 = 1 (arm, metric)。列:
@@ -660,9 +1076,9 @@ $\mathrm{Var}(Z) \approx 0.0022$、すなわち $\mathrm{std}(Z) \approx 0.047$�
 Alfworld サブタスクは step ごとにバッチへの出現が違うため。`save_checkpoint` は 25step ごと。
 
 **元ログは小数第3位までの表示である。**したがって `population_std = 0.000` は
-「完全に一定」を保証しない。§4.1 の指標群は特に注意。
+「完全に一定」を保証しない。§4.3 の指標群は特に注意。
 
-### 12.2 コード参照
+### 13.2 コード参照
 
 | 対象 | 場所 |
 |---|---|
@@ -679,7 +1095,7 @@ Alfworld サブタスクは step ごとにバッチへの出現が違うため�
 
 いずれも本文書と同じブランチ `claude/pure-opd-signweight-student-topk` にある。
 
-### 12.3 指標の総数
+### 13.3 指標の総数
 
 | | Target | Position | 共通 |
 |---|---:|---:|---:|
