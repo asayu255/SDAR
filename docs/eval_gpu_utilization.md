@@ -325,6 +325,46 @@ generate が 2.97 s/turn、preproc + env が 0.59 s/turn なので、pipeline �
 generate 律速になる。batch 14.33 s → ~12.5 s、評価全体 **1.73 h → ~1.52 h、
 util 83% → ~94%**。**未実測。**
 
+### 効いたかどうかの判定 —— turn table では答えが出ない
+
+pipeline は **1 本の batch のコストを変えない**。変えるのは「2 本目がいつ走るか」
+だけなので、turn timing の `SHARE gen(GPU-busy)` は depth 1 でも depth 2 でも
+同じ値を出す。実際 depth 2 の 1 batch 目(alfworld)は
+`SHARE gen(GPU-busy)=87.1%` で、逐次実行と一致した。**ここを見て「効いていない」
+と読むのは、この arm が 4 節でやったのと同じ種類の帰属ミスである。**
+
+そこで、batch ごとの表の末尾に **WALL 行**を出すようにした
+(`ROLLOUT_TURN_TIMING=1` のとき)。
+
+```
+WALL   slot=extra-1  batch#37  span=14.3s  wall-since-first-batch=402.1s  sum-of-spans=520.8s  serial/wall=1.29x
+```
+
+* `span` —— その batch 自身が使った秒数。pipeline では**変わらない**
+* `sum-of-spans` —— 各 batch の span の総和。逐次実行なら wall と一致する
+* `wall-since-first-batch` —— 最初の batch の開始から、この batch の終了まで
+* `serial/wall` —— **1.00 なら 1 本ずつ、1 を超えた分だけ重なっている**
+
+同時性でしか離れない 2 数なので、これは NVML も wandb も要らずにログだけで
+決着する。判定は 2 通り:
+
+```bash
+grep '^WALL' eval.log | tail -1                       # serial/wall が 1.00 か、1.2 前後か
+grep '^WALL' eval.log | sed -n '100p;300p'            # search 区間の 2 点
+```
+
+後者のほうが読みとして強い。`serial/wall` は validation の先頭から累積するので、
+primary slot だけで走る alfworld と webshop の 2 batch が前半を押し下げる。
+**2 点の `wall-since-first-batch` の差 ÷ batch 数の差**が、その区間の
+「1 batch あたり何秒」である。逐次実行での実測値は **15.1 s/batch**
+(1.73 h ÷ 413)で、depth 2 の見込みは **~12.5 s/batch**、generate 律速の
+下限が 11.87 s/batch。`serial/wall` に直すと **1.15〜1.21x** が効いている姿で、
+**2.00x は出ない**(2 本の generate は worker group 上で直列化されるため、
+重なるのは環境待ちの分だけ)。
+
+`reset_batch_wall()` を `_validate()` の先頭で呼ぶので、学習中に評価を挟む場合も
+評価ごとに 0 から数え直す。
+
 ### 使っていないもの
 
 `agent_system/multi_turn_rollout/async_rollout_core.py` の軌跡単位スケジューラは
@@ -349,7 +389,7 @@ util 83% → ~94%**。**未実測。**
 | | wall | util | 状態 |
 | --- | ---: | ---: | --- |
 | いま | 1.73 h | 83.0% | 実測 |
-| **`VAL_PIPELINE_DEPTH=2`** | **~1.52 h** | **~94%** | **実装済み・未実測**(5 節) |
+| **`VAL_PIPELINE_DEPTH=2`** | **~1.52 h** | **~94%** | **実装済み・未実測**(5 節)。判定は WALL 行の `serial/wall` |
 | retriever の GPU 専有 | −0.04 h | +2 pt | 未着手。`CUDA_VISIBLE_DEVICES` で 1 枚ずつ。ただし 8001 は第三者(`100.86.45.34`)が使っており調整が要る |
 
 retriever の内訳は実測済みで、**`load_docs` は 250 ms → 2.8 ms(total の 1.2%)**

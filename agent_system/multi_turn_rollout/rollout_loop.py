@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import threading
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -149,13 +150,71 @@ def _say_rollout_env():
     )
 
 
+_SLOT_LABEL = threading.local()
+
+
+@contextmanager
+def slot_label(name):
+    """Tag this thread's rollout with the pipeline slot that launched it.
+
+    Thread-local rather than an attribute on the collector: the label belongs to
+    the run, not to the object, and every stub a test hands the pipeline would
+    otherwise have to accept being written to.
+    """
+    previous = getattr(_SLOT_LABEL, "name", None)
+    _SLOT_LABEL.name = name
+    try:
+        yield
+    finally:
+        _SLOT_LABEL.name = previous
+
+
+def _current_slot():
+    return getattr(_SLOT_LABEL, "name", None) or "-"
+
+
+# Wall-clock accounting across batches, so the log says on its own whether two
+# batches actually overlapped. The per-batch turn table cannot: pipelining does
+# not change what one batch costs, only when the second one runs. Two numbers
+# settle it -- the sum of the batches' own spans, and the wall clock from the
+# first batch's start to this one's end. Serial running keeps them equal; every
+# second of overlap pushes the sum above the wall.
+_WALL_LOCK = threading.Lock()
+_WALL_STATE = {"batches": 0, "first_start": None, "serial": 0.0}
+
+
+def reset_batch_wall():
+    """Start a fresh accounting period (called at the top of each validation)."""
+    with _WALL_LOCK:
+        _WALL_STATE.update(batches=0, first_start=None, serial=0.0)
+
+
+def _record_batch_wall(start, end, slot):
+    """Fold one batch into the running totals and return the line to print."""
+    with _WALL_LOCK:
+        if _WALL_STATE["first_start"] is None:
+            _WALL_STATE["first_start"] = start
+        index = _WALL_STATE["batches"]
+        _WALL_STATE["batches"] += 1
+        span = end - start
+        _WALL_STATE["serial"] += span
+        serial = _WALL_STATE["serial"]
+        wall = end - _WALL_STATE["first_start"]
+    ratio = serial / wall if wall > 0 else float("nan")
+    return (
+        f"WALL   slot={slot}  batch#{index}  span={span:.1f}s  "
+        f"wall-since-first-batch={wall:.1f}s  sum-of-spans={serial:.1f}s  "
+        f"serial/wall={ratio:.2f}x  (1.00 = one batch at a time; above 1 = overlapped)"
+    )
+
+
 def _fmt_per_gpu(vals):
     if not vals:
         return "-"
     return "/".join(f"{v:.0f}" if v is not None else "-" for v in vals)
 
 
-def _print_turn_timing(records):
+def _print_turn_timing(records, span=None, slot="-"):
     """Pretty-print the per-turn breakdown collected during one rollout.
 
     The perGPU% column shows per-GPU SM util during the turn's generation; the
@@ -220,6 +279,8 @@ def _print_turn_timing(records):
             f"DP-IMBALANCE  mean |maxGPU-minGPU| during gen = {mean_spread:.1f} pp "
             f"(lower=better; TASK_BALANCE_INTERLEAVE shrinks this on mixed turns)"
         )
+    if span is not None:
+        lines.append(_record_batch_wall(span[0], span[1], slot))
     print("\n".join(lines), flush=True)
 
 
@@ -763,6 +824,7 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
         _turn_records = [] if _ROLLOUT_TURN_TIMING else None
+        _batch_started = _now()
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -919,7 +981,7 @@ class TrajectoryCollector:
                 break
 
         if _turn_records is not None:
-            _print_turn_timing(_turn_records)
+            _print_turn_timing(_turn_records, span=(_batch_started, _now()), slot=_current_slot())
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,

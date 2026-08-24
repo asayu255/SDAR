@@ -69,7 +69,7 @@ from verl.utils.seqlen_balancing import (
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-from agent_system.multi_turn_rollout.rollout_loop import rollout_session
+from agent_system.multi_turn_rollout.rollout_loop import reset_batch_wall, rollout_session, slot_label
 from verl.utils.val_pipeline import Slot, run_pipelined
 from gigpo import core_gigpo
 
@@ -947,12 +947,15 @@ class RayPPOTrainer:
         """
         if prepared.batch is None:
             return None
-        return slot.collector.multi_turn_loop(
-            gen_batch=prepared.gen_batch,
-            actor_rollout_wg=self.actor_rollout_wg,
-            envs=slot.envs,
-            is_train=False,
-        )
+        # the label rides on the thread, so the batch's WALL line says which slot
+        # ran it -- with the pipeline deeper than one, two tables interleave.
+        with slot_label(slot.name):
+            return slot.collector.multi_turn_loop(
+                gen_batch=prepared.gen_batch,
+                actor_rollout_wg=self.actor_rollout_wg,
+                envs=slot.envs,
+                is_train=False,
+            )
 
     def _validate(self):
         reward_tensor_lst = []
@@ -979,6 +982,7 @@ class RayPPOTrainer:
         # the unmap and remap between each measured 10.4% of the evaluation's wall
         # clock on NVML -- and the search rollouts are 24 s each, far too short to
         # amortise it. The worker counts scopes, so the inner 413 become no-ops.
+        reset_batch_wall()
         with rollout_session(self.actor_rollout_wg):
             slots = self._validation_slots()
             for prepared, test_output_gen_batch in run_pipelined(

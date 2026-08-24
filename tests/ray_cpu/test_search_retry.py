@@ -151,10 +151,14 @@ def test_backoff_is_capped(_no_sleeping):
     """Linear growth would reach hour-long sleeps under an unbounded retry."""
     session = _Session([requests.exceptions.Timeout("t")] * 200 + [_Response()])
     _call(session, max_retries=None)
-    assert _no_sleeping, "expected the retry loop to sleep"
-    assert max(_no_sleeping) <= mod.MAX_RETRY_DELAY
-    assert _no_sleeping[0] == mod.INITIAL_RETRY_DELAY  # still backs off from 1s
-    assert _no_sleeping[-1] == mod.MAX_RETRY_DELAY     # and saturates
+    # The coalescer holds a query for its batching window before sending, and
+    # that sleep is not backoff -- it lands first and would otherwise read as a
+    # 10 ms initial delay.
+    backoff = [s for s in _no_sleeping if s != mod._BATCH_WINDOW_S]
+    assert backoff, "expected the retry loop to sleep"
+    assert max(backoff) <= mod.MAX_RETRY_DELAY
+    assert backoff[0] == mod.INITIAL_RETRY_DELAY  # still backs off from 1s
+    assert backoff[-1] == mod.MAX_RETRY_DELAY     # and saturates
 
 
 def test_timeout_is_passed_through_including_none():
