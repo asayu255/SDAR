@@ -106,12 +106,47 @@ def main() -> int:
             return 1
     except Exception as exc:
         print(f"[rank {rank}] 3 from_local / round-trip: FAIL {exc!r}")
-        print("    -> the model's D2H cannot be overlapped this way; "
-              "FSDP's offload_to_cpu stays, and the ~3.2 s per save with it.")
-        return 1
+        print(f"[rank {rank}]    trying the in-place fallback instead...")
+        return _try_in_place(rank, live, snapshot)
 
     print(f"[rank {rank}] ALL PASS -- the model's offload can be overlapped like the optimizer's")
     return 0
+
+
+def _try_in_place(rank, live, snapshot):
+    """Fallback: swap the DTensor's local shard for a pinned host one, in place.
+
+    The real walk's ShardedTensor branch already mutates ``shard.tensor`` this
+    way, so if from_local refuses to build the object, assigning
+    ``_local_tensor`` may still produce it -- and that is enough here, because
+    the walk owns these state-dict entries and nothing else holds a reference.
+    A private attribute, hence the probe: it either works on this torch build,
+    or the model's offload stays with FSDP and the ~3.2 s stays with it.
+    """
+    try:
+        local = snapshot.to_local()
+        host = torch.empty(local.shape, dtype=local.dtype, device="cpu", pin_memory=True)
+        host.copy_(local)
+        snapshot._local_tensor = host
+        print(f"[rank {rank}] 3c in-place _local_tensor swap: PASS "
+              f"(local now on {snapshot.to_local().device})")
+
+        path = f"/tmp/dtensor_probe_inplace_rank{rank}.pt"
+        torch.save({"w": snapshot}, path)
+        loaded = torch.load(path, weights_only=False)["w"]
+        matches = torch.equal(loaded.to_local().cpu(), live.to_local().cpu())
+        os.remove(path)
+        print(f"[rank {rank}] 3d round-trip after the swap: "
+              f"{'PASS' if matches else 'FAIL (values differ)'}")
+        if matches:
+            print(f"[rank {rank}] FALLBACK PASS -- overlap the model via the in-place swap")
+            return 0
+    except Exception as exc:
+        print(f"[rank {rank}] 3c in-place swap: FAIL {exc!r}")
+
+    print(f"[rank {rank}]    -> the model's D2H cannot be overlapped; FSDP's "
+          "offload_to_cpu stays, and the ~3.2 s per save with it.")
+    return 1
 
 
 if __name__ == "__main__":
