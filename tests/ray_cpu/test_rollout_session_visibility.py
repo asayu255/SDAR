@@ -53,12 +53,26 @@ def _fresh_say(monkeypatch):
 
 
 class _Worker:
-    """The attributes the session hooks touch, bound to the real methods."""
+    """The attributes the session hooks touch, bound to the real methods.
+
+    ``_rank``, not ``rank``: on the real worker ``rank`` is a property over
+    ``self._rank``, and reading it before distributed init raises. A print must
+    never be able to break the thing it is observing, so the hooks read the
+    underlying attribute defensively -- and this stub has to match, or it would
+    pass while the real object raised.
+    """
 
     def __init__(self, rank=0):
-        self.rank = rank
+        self._rank = rank
 
     _say_session = fsdp_workers.ActorRolloutRefWorker._say_session
+
+
+def test_a_worker_without_a_rank_yet_stays_silent_instead_of_raising():
+    """begin_rollout_session used to touch nothing. Adding a print to it must
+    not turn it into a call that can fail."""
+    worker = _Worker.__new__(_Worker)  # no _rank at all
+    worker._say_session("opened -- vLLM stays awake for this rollout")
 
 
 def test_the_driver_reports_the_value_it_resolved(capsys, monkeypatch):

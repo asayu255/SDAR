@@ -871,7 +871,7 @@ class ActorRolloutRefWorker(Worker):
             # now: the sharding manager's own enter/exit log is DEBUG on a logger
             # pinned to WARN, so neither state printed anything and the two were
             # indistinguishable from outside.
-            if self.rank == 0 and not getattr(self, "_rollout_no_session_warned", False):
+            if getattr(self, "_rank", None) == 0 and not getattr(self, "_rollout_no_session_warned", False):
                 self._rollout_no_session_warned = True
                 print(
                     "[rollout-session] rank 0: generating WITHOUT a session -- every turn "
@@ -946,7 +946,12 @@ class ActorRolloutRefWorker(Worker):
         logging is DEBUG under a WARN logger, so it never reaches a log file.
         Deduplicated because these run once per rollout, not once per run.
         """
-        if self.rank != 0:
+        # Defensively, because this is a print: `rank` is a property over
+        # `self._rank`, which is set by the worker's distributed init. A hook
+        # that used to be a silent no-op must not start raising AttributeError
+        # on a worker that has not reached that point -- observing something is
+        # not a licence to break it.
+        if getattr(self, "_rank", None) != 0:
             return
         seen = getattr(self, "_rollout_session_said", None)
         if seen is None:
@@ -969,7 +974,7 @@ class ActorRolloutRefWorker(Worker):
         # working state, and N wake/sleep cycles is the broken one. A session that
         # served 1 generate is a session that bought nothing.
         served = getattr(self, "_rollout_session_generates", 0)
-        if self.rank == 0:
+        if getattr(self, "_rank", None) == 0:
             print(
                 f"[rollout-session] rank 0: closed after {served} generate call"
                 f"{'' if served == 1 else 's'} on one wake",

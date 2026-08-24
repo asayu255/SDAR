@@ -135,6 +135,21 @@ export ROLLOUT_KEEP_VLLM_AWAKE=1
 # is not already known.
 export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 
+# VAL_TASK_INTERLEAVE=1 round-robins the validation batch by task before it is
+# split across ranks. The evaluation set is stored task by task and the split is
+# contiguous, so today rank 0 gets alfworld, rank 1 search, rank 2 webshop --
+# nvidia-smi reads 87/0/0 and 100/31/53 during generation, and once the short
+# tasks finish the surviving rows sit on one rank while the others idle.
+#
+# Left OFF by default on purpose. It changes which rank samples a given row, so
+# at temperature above zero the tokens differ -- the same accuracy class as any
+# batch-composition change, but this is the scoring path, and a checkpoint
+# should not report a different number because someone pulled. Turn it on for a
+# whole sweep or not at all; scores are comparable within a setting, not across.
+# Episodes are unaffected either way: the layout preserves each task's own row
+# order, which is what alfworld's seeded game cycle indexes by.
+export VAL_TASK_INTERLEAVE="${VAL_TASK_INTERLEAVE:-0}"
+
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
 # and the rest append; the id is per invocation, so re-running this script never
