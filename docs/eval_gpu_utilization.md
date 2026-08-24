@@ -27,7 +27,7 @@ wandb のシステムストリーム(15 秒の点サンプル、warm-up 後 618 
 
 ---
 
-## 2. 13% —— vLLM が毎 turn 寝起きしている
+## 2. 13% —— vLLM が毎 turn 寝起きしていた(解消済み)
 
 2 秒トレースのメモリが 34 秒周期でこう動く:
 
@@ -70,54 +70,84 @@ worker の `/proc/*/environ` を grep するのは自然な確認だが、**別�
   1 回しか賄っていない session は何も買っていない
 * `eval_checkpoints.sh` が `ROLLOUT_KEEP_VLLM_AWAKE=1` を強制
 
-**原因そのものはまだ特定できていない。** 次の eval が
-`[rollout-session]` の 2 行で確定させる。
+### 結果
+
+次の eval のログ:
+
+```
+[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE='1' -> session mode ON
+[rollout-session] rank 0: opened -- vLLM stays awake for this rollout
+[rollout-session] rank 0: closed after 50 generate calls on one wake
+```
+
+**50 turn を 1 回の wake で賄っている。** 34 秒周期の unmap/remap は消えた。
+`eval_checkpoints.sh` が `${ROLLOUT_KEEP_VLLM_AWAKE:-1}` ではなく **1 を強制**
+するようになったのが効いた —— run スクリプト側の既定値は、呼び出したシェルに
+0 が残っていれば負ける。同じ形の罠を `SKIP_ROLLOUT_BUILD` でも踏んでいる。
 
 ---
 
-## 3. env.step の比率 —— 最初の見積もりは 1 batch からの外挿だった
+## 3. 42.6% —— retriever 待ち。二つの計測器が同じ数字に着地した
 
-`vanilla_multi_turn_loop` の 1 turn が完全直列であることは変わらない:
-
-```
-preprocess → generate(GPU) → decode → envs.step(CPU/IPC/HTTP)
-```
-
-`envs.step` の間、vLLM は 28.5 GB 常駐したままカーネルが 1 本も走らない。
-既存の overlap 機構(`_env_step_executor` による logprob prefetch)は
-`is_train` 必須なので評価では死んでいる。
-
-**ただしその大きさを 42〜50% としたのは誤りだった。** turn timing を入れて
-測った実測(alfworld batch):
+turn timing を batch ごとに読むと、**評価は 2 種類の batch でできている**:
 
 ```
-TOTAL             11.2    201.0      1.4     17.0    230.6
-SHARE  gen(GPU-busy)=87.1%  cpu-glue(preproc+decode+envstep, GPU-idle)=12.9%
+batch 0  alfworld  TOTAL  pre 11.2  gen 201.0  dec 1.4  env  17.0  total 230.6   gen 87.1%
+batch 1  webshop   TOTAL  pre  5.4  gen  78.5  dec 0.4  env   3.5  total  87.8   gen 89.4%
+batch 2+ search    TOTAL  pre  1.3  gen  12.2  dec 0.1  env  10.6  total  24.2   gen 48-56%
 ```
 
-**envstep は 17.0 / 230.6 = 7.4%。** そして gen が wall の 87.1% を占める
-一方で、NVML は同じ run の GPU busy を 46.6% と読む —— つまり
-**`generate_sequences` の中で GPU が半分空いている**。
+search batch が **411 本**(413 − alfworld − webshop)ある。重み付けすると:
 
-**この表は 413 batch のうちの batch 0 だけ**、つまり run の 0.24% である。
-4 節の通り 411/413 は search batch で、その `envs.step` は retriever への
-HTTP 呼び出しであり、alfworld の表には原理的に写らない。1 節の
-「engine 常駐 + util 0 が 42.9%」はほぼ全部そちらのはずだが、**まだ
-測っていない**。
+| | 秒 | 割合 |
+| --- | ---: | ---: |
+| generate | 5,316 | 51.8% |
+| **envs.step** | **4,377** | **42.6%** |
+| preproc | 535 | 5.2% |
+| decode | 43 | 0.4% |
+| 合計 | 10,268 s = 2.85 h | |
 
-判断に必要なものは走行中のログに既にある。turn timing は batch ごとに出るので:
+**envs.step の 99.5% は search batch にある。**
 
-```bash
-grep -rhE "TOTAL +[0-9]|SHARE  gen" /tmp/ray/session_latest/logs/*.out | head -30
-```
+そして 1 節の NVML —— 前 run の 694 窓で「engine 常駐・カーネル 0 本」が
+**42.9%** —— と、turn timing の **42.6%** が一致する。**独立な二つの計測器が
+同じ量を測っていた。**
 
-先頭 2 本が alfworld と webshop、以降が search。search の `SHARE` 行が
-出た時点で、標的が **generate の中**なのか **retriever 待ち**なのかが決まる。
-前者なら vLLM 側の話(`enable_chunked_prefill=False`、
-`max_num_batched_tokens=8192`、毎 turn 全履歴を再 prefill)で env とは無関係、
-後者なら `search_url` の fan-out(`envs.py:54` が複数 client に対応済み)が
-最も安い。**cohort 分割はどちらでもない** —— search は 4 turn しかないので
-overlap の余地自体が小さい。
+### 経緯としての訂正
+
+この 42〜50% を最初に NVML から出し、そのあと alfworld batch 1 本の
+turn timing(envstep 7.4%)を見て「外挿の誤りだった」と撤回した。
+**撤回の方が誤りだった。** alfworld batch は run の 2.2% で、そこでの
+envstep は本当に 7.4% だが、残り 97.8% を占める search batch では 44% である。
+1 本から一般化して外し、次は別の 1 本から一般化して戻し過ぎた。
+**batch ごとに形が違う workload では、加重するまで何も言えない。**
+
+### 中身 —— retriever への HTTP
+
+search の `envs.step` は `http://100.86.45.30:8001/retrieve` への呼び出しである。
+1 batch 4 turn なので **1 turn あたり 2.65 秒**、同じ turn の generate が
+3.06 秒。既に 126 リクエストは並行で飛んでいる
+(`envs.py:68` の `ThreadPoolExecutor(max_workers=min(batch_size, 256))`)ので、
+2.65 秒は**126 並行下での retriever の応答時間**であって直列化ではない。
+
+### 打ち手は 2 つ。片方はコード変更ゼロ
+
+**(a) retriever を増やす。** `env_config.search.search_url` は **リストを受け、
+env を round-robin で振り分ける**(`envs.py:54-66`)。レプリカを 2〜3 本立てて
+リストで渡すだけで、126 並行の負荷が分散する。**コード変更なし。**
+2.65 秒がサーバ飽和由来なら、ここがいちばん安い。
+
+**(b) cohort overlap。** search は `gen 3.06 / envstep 2.65` と**ほぼ釣り合って
+いる**ので、overlap の理想形に最も近い。2 cohort に割って
+`gen(A) ‖ step(B)` を組むと 1 batch 24.2 → 16.2 秒(**−33%**)、
+評価全体で **2.85 h → 1.93 h**。
+
+(b) には依然として subset step が要る(`SimpleMemory` と manager の positional
+state を index 対応にする)。ただし search の leaf は `self.envs` が独立な
+`SearchEnv` のリストで executor から index 指定で叩かれているだけなので、
+**alfworld より素直である**。そして 42.6% の 99.5% が search にある以上、
+**手を入れる先は search だけでよい** —— 当初「全 manager を index 対応に」と
+見積もったのは、ここでも加重する前の話だった。
 
 ## 4. 生成中の rank 不均衡 —— 帰属を間違えた(撤回)
 
@@ -176,13 +206,12 @@ worker group の駆動方法ごと変わる。
 
 | 項目 | 大きさ | 状態 |
 | --- | --- | --- |
-| vLLM 毎 turn 寝起き | 10.4〜13% | **解消**。`closed after 50 generate calls on one wake` で確認 |
-| `generate_sequences` の中の空き | alfworld batch で gen が wall の 87.1%、同 run の GPU busy が 46.6% | **未特定**。`GPU_PROFILER=1` が turn timing の `genGPU%` 列を埋める |
-| search batch の retriever 待ち | **未測定**。411/413 の batch がこれ | 走行中のログの `SHARE` 行が出す |
-| env.step(alfworld batch 実測) | 7.4% | 当初 42〜50% としたのは 1 batch からの外挿の誤り |
+| **search の retriever 待ち** | **42.6%** | **未着手。最大項。** NVML(42.9%)と turn timing(42.6%)が一致。打ち手は 3 節 (a) レプリカ増(コード変更ゼロ)/ (b) search だけの cohort overlap(2.85 h → 1.93 h) |
+| generate | 51.8% | GPU が実際に働いている区間。alfworld batch では wall の 87.1% を占める |
+| preproc(CPU tokenize) | 5.2% | overlap 可能だが小さい |
+| vLLM 毎 turn 寝起き | 10.4〜13% → **0** | **解消**。`closed after 50 generate calls on one wake` |
 | 生成中の rank 不均衡 | — | 帰属を誤り、修正を revert(4 節) |
 
-**評価の天井は「wall のうち GPU に仕事がある割合」で決まる。** alfworld batch
-ではそれが 87.1% あり、うち半分が gen の中で空いている。search batch では
-まだ分かっていない。**どちらを直すかを決める数字は、いま走っている run が
-書き出している。**
+**評価の天井**: envs.step を完全に隠せたとして wall は 1.93 h、GPU busy は
+generate の区間だけなので **~90%** が上限。学習の 99.9% には届かない ——
+評価は CPU にいる環境との往復であり、隠せるのは重ねられるぶんだけである。
