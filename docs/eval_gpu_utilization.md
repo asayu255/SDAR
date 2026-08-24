@@ -249,6 +249,27 @@ SHARE  gen(GPU-busy)=83.1%  cpu-glue=16.9%
 retriever 側にはまだ 2〜3 倍ありそうだが(292 ms 対 理論下限 ~100 ms、差は
 `load_docs` と JSON)、8.1% の 2/3 なので 5 pt 程度である。
 
+### サーバ側のバージョンずれ —— 実際に踏んだ
+
+2026-08-25 の eval で envstep が **1.17 s → 10.8 s** に戻った。原因は
+retriever のバージョンずれで、`8000` は新コード、eval が向いていた
+**`8001` は旧コードのまま**だった。リストのクエリが 422 で弾かれ、
+クライアントが単発送信に落ちていた:
+
+```
+batched search of 38 queries failed (... 422 Client Error: Unprocessable Entity
+for url: http://100.86.45.30:8001/retrieve); retrying singly
+```
+
+**この状態は turn table の `TOTAL` にしか出ない。** util も wall も「なんとなく
+遅い」としか言わないので、`envstep` を見るまで retriever を疑えなかった。
+
+無効化はプロセス内で永続だったため、retriever を直しても**走っている run は
+単発のまま**という二段目の罠があった。`SEARCH_BATCH_RETRY_S`(既定 300 s)で
+**定期的に再試行する**ようにした —— コストは 1 周期あたり 1 回の失敗リクエスト
+だけ(クエリはどのみち単発で送られる)で、retriever を再起動すれば run を
+落とさずに戻る。`0` で従来どおり永続。
+
 ## 4. 生成中の rank 不均衡 —— 帰属を間違えた(撤回)
 
 2 秒トレースの生成中サンプル:

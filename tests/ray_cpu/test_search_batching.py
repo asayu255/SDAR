@@ -244,3 +244,64 @@ def test_a_result_count_that_does_not_match_is_an_error_not_a_mix_up():
     for response, error in out:
         assert response is None
         assert "3 queries" in error
+
+
+def test_a_url_that_rejects_lists_stops_being_batched():
+    server = _Server(accepts_lists=False)
+    _concurrent(server, ["a", "b", "c"])
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is False
+
+    # and the next round goes singly, without probing the server again
+    server.requests.clear()
+    _concurrent(server, ["d", "e"])
+    assert all(isinstance(request, str) for request in server.requests)
+
+
+def test_the_disable_lifts_after_the_cooldown(monkeypatch):
+    """The usual reason a URL starts accepting lists is that the retriever was
+    restarted. Nothing else would ever tell us, and an evaluation runs for hours
+    -- so the flag has to expire rather than be permanent."""
+    clock = [1000.0]
+    monkeypatch.setattr(search_tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(search_tool, "_BATCH_RETRY_S", 300.0)
+
+    server = _Server(accepts_lists=False)
+    _concurrent(server, ["a", "b", "c"])
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is False
+
+    clock[0] += 299.0
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is False
+    clock[0] += 2.0
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is True
+
+
+def test_a_restarted_retriever_is_picked_up_without_restarting_the_run(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(search_tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(search_tool, "_BATCH_RETRY_S", 300.0)
+
+    server = _Server(accepts_lists=False)
+    _concurrent(server, ["a", "b", "c"])
+
+    server.accepts_lists = True  # the retriever was restarted with the new code
+    clock[0] += 301.0
+    server.requests.clear()
+    results = _concurrent(server, ["d", "e", "f"])
+
+    assert any(isinstance(request, list) for request in server.requests), server.requests
+    assert [response["result"][0][0]["document"]["contents"] for response, _ in results] == [
+        "doc for d",
+        "doc for e",
+        "doc for f",
+    ]
+
+
+def test_the_cooldown_can_be_turned_off(monkeypatch):
+    """A retriever that will never be restarted should not be probed forever."""
+    clock = [1000.0]
+    monkeypatch.setattr(search_tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(search_tool, "_BATCH_RETRY_S", 0.0)
+
+    _concurrent(_Server(accepts_lists=False), ["a", "b", "c"])
+    clock[0] += 100000.0
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is False

@@ -40,6 +40,12 @@ RETRY_PROGRESS_EVERY = 60.0
 _BATCH_ENABLED = os.environ.get("SEARCH_BATCH_REQUESTS", "1").strip().lower() not in ("0", "false", "no", "")
 # Long enough to catch a fan-out, short enough to be noise against an 80 ms query.
 _BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "10")) / 1000.0
+# How long a URL stays un-batched after it rejects a list. A retriever restarted
+# with a server that does take lists is the usual reason the answer changes, and
+# nothing else would ever tell us: the flag is set once and an evaluation runs
+# for hours. Re-probing costs one rejected request per period -- the queries are
+# sent singly either way. 0 makes the disable permanent.
+_BATCH_RETRY_S = float(os.environ.get("SEARCH_BATCH_RETRY_S", "300"))
 
 
 def _search_api_request(
@@ -249,9 +255,19 @@ class _Coalescer:
         # rather than by parsing an error string: a batch that fails and then
         # succeeds one query at a time is a server that does not take lists.
         self._batchable: Dict[str, bool] = {}
+        self._retry_at: Dict[str, float] = {}
 
     def enabled_for(self, url: str) -> bool:
-        return _BATCH_ENABLED and self._batchable.get(url, True)
+        if not _BATCH_ENABLED:
+            return False
+        with self._lock:
+            if self._batchable.get(url, True):
+                return True
+            if _BATCH_RETRY_S <= 0 or time.monotonic() < self._retry_at.get(url, 0.0):
+                return False
+            self._batchable[url] = True
+        logger.warning(f"{url}: re-probing batched search after {_BATCH_RETRY_S:.0f}s un-batched")
+        return True
 
     def call(self, url: str, query: str, send, **key_parts):
         # Checked here as well as in call_search_api: once a URL has told us it
@@ -292,11 +308,14 @@ class _Coalescer:
                 logger.warning(f"batched search of {len(queries)} queries failed ({error}); retrying singly")
                 singles = [send(item.query) for item in batch]
                 if all(single_error is None for _, single_error in singles):
-                    self._batchable[url] = False
+                    with self._lock:
+                        self._batchable[url] = False
+                        self._retry_at[url] = time.monotonic() + _BATCH_RETRY_S
                     logger.warning(
                         f"{url} rejected a batched request but served the queries individually; "
                         "batching disabled for it. Restart the retriever with a server that "
-                        "accepts a list of queries to get it back."
+                        "accepts a list of queries -- this URL is re-probed every "
+                        f"{_BATCH_RETRY_S:.0f}s, so a restart is picked up without restarting the run."
                     )
                 for item, (single_response, single_error) in zip(batch, singles):
                     item.response, item.error = single_response, single_error
