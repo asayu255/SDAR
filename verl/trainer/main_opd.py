@@ -47,6 +47,24 @@ def inject_opd_config(config) -> None:
         sign_cfg = opd_cfg.get("sign_weight", None)
         if sign_cfg is not None:
             config.actor_rollout_ref.actor.sign_weight = sign_cfg
+        if sign_cfg is not None and bool(sign_cfg.get("enable", False)):
+            # The frozen models the weights read (base, and each row's off-task
+            # teachers) are scored at ids nobody knows until the training forward
+            # picks a support, so they have to keep their hidden states and
+            # normaliser -- which is exactly what ref.student_indexed_topk buys.
+            #
+            # Forced rather than left to the ppo_trainer.yaml interpolation
+            # ${actor_rollout_ref.actor.student_indexed_topk}, because that ties it
+            # to the ACTOR's support choice, and the two are independent: a
+            # teacher-indexed arm takes its support from the teacher and still
+            # needs base and the off-task teachers resolvable at those ids. With
+            # the interpolation, actor.student_indexed_topk=False turned the
+            # caching off and the weights had nothing to read.
+            config.actor_rollout_ref.ref.student_indexed_topk = True
+            assert config.actor_rollout_ref.ref.get("response_only_logits", False), (
+                "sign weighting needs ref.response_only_logits=True: the row map the "
+                "hidden-state cache is packed against comes from there"
+            )
         config.actor_rollout_ref.actor.pg_loss_coef = 0          # no GRPO policy gradient
         config.actor_rollout_ref.actor.entropy_coeff = 0         # no entropy bonus
         config.actor_rollout_ref.actor.use_kl_loss = False       # no reference-KL term

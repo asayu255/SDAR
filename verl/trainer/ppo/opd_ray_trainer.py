@@ -906,9 +906,12 @@ class OPDRayTrainer(RayPPOTrainer):
                         with _timer("sign_weight_forward", timing_raw):
                             self.compute_sign_weight_cache(batch)
 
-                    if self.student_indexed_topk:
+                    if self.student_indexed_topk or self.sign_weight_enabled:
                         # After the misses are scored, not before: the cache is only
-                        # complete now. The witness confirms every entry still
+                        # complete now. Also when only the sign weights use the
+                        # cache: a teacher-indexed weighted arm puts base and the
+                        # off-task teachers in it without the on-task teacher going
+                        # through it, and those entries need the same witness. The witness confirms every entry still
                         # reproduces the log-probs its teacher returned, i.e. that
                         # none has drifted onto another row. One call -- the cache is
                         # per process, so asking all three teachers would check the

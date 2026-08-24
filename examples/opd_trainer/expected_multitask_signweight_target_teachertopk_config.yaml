@@ -1,0 +1,244 @@
+# Expected effective config for the pure-OPD multitask run WITH cross-teacher
+# sign weighting in target mode, on a TEACHER-indexed top-k support and with a
+# one-sided (raise-only) weight table.
+#
+# Differs from expected_multitask_signweight_target_config.yaml in exactly four
+# scientific values -- student_indexed_topk, agree_weight, agree_neg_weight, and
+# the run identity. A diff between the two locks is the full statement of what
+# this arm changes.
+#
+# This file is the machine-readable INTENT of the experiment. main_opd
+# validates the composed Hydra config against every key below AFTER its own
+# config injection (verl/utils/expected_config.py) and aborts on any mismatch,
+# so a wrong default / typo'd override / shadowed injection fails in seconds
+# instead of producing a mislabeled multi-hour run.
+#
+# Rules:
+#   - Keys are dotted paths into the composed config; values are the expected
+#     effective values.
+#   - Only SCIENTIFIC knobs live here (they define what the experiment *is*).
+#     Performance knobs (micro batch sizes, offload, prefix caching,
+#     max_model_len, gpu_memory_utilization, ...) are intentionally NOT listed
+#     so machine tuning never requires touching this file. $HOME-derived data
+#     paths are also not pinned (machine-dependent).
+#   - To change a setting intentionally: edit the run script AND this file in
+#     the same commit. A run-script-only edit will (by design) refuse to start.
+
+# ---- distillation loss (the knob that caused the original low_var_kl mishap) --
+"algorithm.opd.kl_loss_type": topk_kl
+"algorithm.opd.kl_loss_coef": 1.0
+"algorithm.opd.topk": 20
+# Per-task normalisation of the teacher-KL loss. The plain token-mean weights a
+# task by its share of response tokens, measured at 69/27/4% for
+# alfworld/webshop/search on this mixture purely because of the 50/15/4-turn
+# episode caps; the per-row weights in attach_task_loss_weights make it 1/3 each.
+# Data composition, batch sizes and step count are untouched, so this arm still
+# differs from the SFT and offline-KD arms in nothing but the loss -- which is
+# exactly why it is pinned: the three arms must agree on it or the comparison
+# confounds the objective with the task weighting.
+"algorithm.opd.normalize_loss_by_task": true
+# effective values after main_opd's injection into the actor config
+"actor_rollout_ref.actor.use_teacher_kl_loss": true
+"actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
+"actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
+"actor_rollout_ref.actor.teacher_kl_topk": 20
+"actor_rollout_ref.actor.normalize_loss_by_task": true
+
+# ---- pure-distillation invariants (no other signal enters the loss) -----------
+"algorithm.adv_estimator": grpo
+"algorithm.use_kl_in_reward": false
+"actor_rollout_ref.actor.pg_loss_coef": 0
+"actor_rollout_ref.actor.use_kl_loss": false
+"actor_rollout_ref.actor.entropy_coeff": 0
+"actor_rollout_ref.actor.use_sdl_loss": false
+"actor_rollout_ref.actor.use_sdar_loss": false
+"actor_rollout_ref.actor.use_invalid_action_penalty": true
+"actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
+"actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
+  alfworld: 0.1
+  search: 0.01
+  webshop: 0.1
+
+# ---- teachers -------------------------------------------------------------------
+"algorithm.opd.teacher_paths.alfworld": "$HOME/checkpoints/teachers/alfworld_step300"
+"algorithm.opd.teacher_paths.search": "$HOME/checkpoints/teachers/search_step300"
+"algorithm.opd.teacher_paths.webshop": "$HOME/checkpoints/teachers/webshop_step300"
+
+# ---- model / optimization -------------------------------------------------------
+"actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
+"actor_rollout_ref.actor.optim.lr": 1.0e-6
+"actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
+"actor_rollout_ref.actor.ppo_mini_batch_size": 60
+# Throughput knobs that nonetheless sit on the GRADIENT path, so they are pinned
+# here even though the rule above exempts performance settings. ZeRO-2 is
+# arithmetic-neutral; no_sync_grad_accum reduces once per mini-batch instead of
+# once per micro-batch, which reorders the partial sums (same expectation,
+# different last bits). Neither may change silently between runs.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+"actor_rollout_ref.actor.no_sync_grad_accum": true
+# response_only_logits is pinned for the same reason. Restricting lm_head to the
+# response rows computes exactly the values the full projection did -- lm_head is
+# per-position, so selecting before or after it is the same arithmetic -- but the
+# GEMM changes shape, which moves the last bits like a micro-batch change does.
+# It also sits on both the student's gradient and the teacher's targets, so the
+# two must not diverge between compared runs.
+"actor_rollout_ref.actor.response_only_logits": true
+"actor_rollout_ref.ref.response_only_logits": true
+# student_indexed_topk is pinned because it is not a performance knob at all: it
+# decides which 20 tokens the coarse-grained KL is exact on. Reverse KL weights
+# by the student's mass and the term it drops is tail_s * KL(p_s|A-bar || p_t|A-bar),
+# so a support taken from the student covers the student's mass and a support
+# taken from the teacher does not. Both are lower bounds on the same full KL, so
+# the two settings are different (valid) objectives -- comparing arms across them
+# compares nothing.
+#
+# THIS ARM TAKES THE TEACHER'S SUPPORT ON PURPOSE, accepting the looser bound to
+# buy something the student-indexed arms cannot have: with the support chosen by
+# a frozen model, the sign weights are a fixed function of the four frozen models
+# instead of a feedback loop through the student's own drift. It also puts back
+# the constraint that the off-task teachers can only speak about tokens the
+# on-task teacher ranked.
+#
+# The consequence for comparison is absolute: this arm's success rates cannot be
+# put next to the control / position / target arms. Its control would have to be
+# a teacher-indexed pure-OPD run, which does not exist yet.
+#
+# ref.student_indexed_topk does NOT follow this value. main_opd forces it True
+# whenever sign_weight.enable is set, because the base policy and the off-task
+# teachers must stay resolvable at whatever support is chosen -- and that is
+# independent of who chose it. With the ppo_trainer.yaml interpolation in place
+# this arm cached no hidden states and the weighting silently did nothing.
+"actor_rollout_ref.actor.student_indexed_topk": false
+"actor_rollout_ref.ref.student_indexed_topk": true
+# enable_gradient_checkpointing sits on the gradient path even though it looks
+# like a pure memory knob: a recomputed forward and a stored one differ in their
+# last bits under autocast, the same class as no_sync_grad_accum. It is pinned
+# ON. Turning it off is worth ~a third of actor.bwd, but it was measured: with it
+# off, step 1 OOMed in its first micro-batch on a 94.97 GiB card, so the ~13 GB of
+# activations it would keep does not exist. (Do not re-derive that headroom from
+# perf/max_memory_*: both of those high-water marks have printed values larger
+# than the card, because vLLM's allocator pool is counted by torch while its
+# pages are mapped and unmapped underneath. See the run script.)
+"actor_rollout_ref.model.enable_gradient_checkpointing": true
+# rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that has
+# nothing to do with log probs: this arm never runs compute_log_prob, so the
+# value's only effect is adjust_batch's divisor, lcm(rollout*2, rollout*2,
+# actor*2). At 16 that is 160 and step 1 threw away 116 rows to reach it; at 10
+# it is 20. Which rows get dropped is data, so it belongs here.
+"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
+# NOT pinned, and deliberately so:
+#   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
+#     bit-identical, covered by the exemption above.
+#   rollout.return_rollout_log_probs -- decides whether a column nothing in this
+#     arm reads is built. The sampled tokens are identical either way.
+#   rollout.disable_log_stats -- logging volume only.
+#   ROLLOUT_PREFETCH_TEACHER_{CHUNK,CHUNK_MAX,ADAPTIVE} -- these only decide how
+#     many already-final rows one prefetch call scores, so like the chunk size
+#     they cannot change a value.
+# Speculative decoding WOULD belong here (it sits on the sampling path, so it
+# must not differ silently between compared runs) but it cannot run on this stack
+# at all -- see the run script for why -- so there is nothing to pin.
+
+# ---- data -----------------------------------------------------------------------
+"data.train_batch_size": 45
+"data.val_batch_size": 126
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.enable": true
+"data.task_balance.per_task_batch_size": 15
+"data.task_balance.num_batches": 300
+"data.task_balance.tasks": [alfworld, search, webshop]
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment ------------------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 1
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.tasks": [alfworld, search, webshop]
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+"env.multitask.val_per_task_batch_size": 126
+# On an exhausted retry budget the client does NOT fail the run: the error text is
+# substituted for the retrieved document and becomes the <information> block the
+# model sees, with nothing in the metrics to say so. That makes the retry policy a
+# property of the DATA, which is why it is pinned here rather than left with the
+# performance knobs. max_retries: null retries a timeout / refused connection / 5xx
+# until the retriever answers, so no turn can be trained on an error string; 4xx and
+# malformed JSON still fail at once, since waiting cannot turn those into a document.
+#
+# timeout is generous but finite on purpose. null would also wait, but a connection
+# that dies without being closed (a retriever restart) then blocks forever with
+# nothing to detect it -- and the rollout's turn barrier waits on the slowest env, so
+# one dead socket stalls every trajectory in the step. A finite timeout turns that
+# into one more retry against the restarted server.
+"env.search.timeout": 600
+"env.search.max_retries": null
+
+# ---- rollout sampling / validation protocol ----------------------------------------
+"actor_rollout_ref.rollout.temperature": 1.0
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
+
+# ---- run identity ------------------------------------------------------------------
+"trainer.total_training_steps": 300
+"trainer.project_name": verl_agent_opd_signweight_multitask
+# experiment_name is pinned as part of the run identity: renaming (or reusing a
+# name for a different config) requires touching this file next to the knobs.
+"trainer.experiment_name": opd_multitask_signweight_target_teachertopk_qwen3_1.7b
+
+# ---- cross-teacher sign agreement --------------------------------------------
+# The mechanism this arm exists to test, so every knob of it is pinned.
+"algorithm.opd.sign_weight.enable": true
+# position and target are different operations on different objects -- one scales
+# a KL term, the other a probability -- so the mode belongs in the lock next to
+# the loss type, not beside the performance knobs.
+"algorithm.opd.sign_weight.mode": target
+"algorithm.opd.sign_weight.agree_weight": 1.5
+# 1.0 = agreement to LOWER is recorded but not acted on, so this table only ever
+# raises. That is a deliberate one-sided design, not agree_weight's mirror, and
+# it has a consequence worth stating next to the value: agree_neg no longer pulls
+# the renormaliser back, so Z = 1 + 0.5 * sum_{agree_pos} p is unanchored and
+# larger. The mechanism therefore partly cancels itself where agreement mass is
+# high, and the systematic sharpening sign_weight/inv_z measures grows with it
+# (predicted ~0.976 against 0.991 measured on the 1.25/0.75 arm).
+"algorithm.opd.sign_weight.agree_neg_weight": 1.0
+# 1.0 = conflict is not acted on. Recorded rather than omitted: "this arm did
+# nothing about conflict" is a claim about the experiment, and target mode
+# refuses any other value.
+"algorithm.opd.sign_weight.disagree_weight": 1.0
+# nats. |log pi_m - log pi_0| below this counts as "task m's RL never touched
+# this token"; without it the drift noise on untouched candidates becomes
+# confident signs and two teachers agree on coin flips. Set without a prior
+# measurement, so sign_weight/deadzone_frac/<teacher> is what says afterwards
+# whether it was right.
+"algorithm.opd.sign_weight.deadzone": 0.1
+# The pre-RL policy the shifts are measured against. Must be the checkpoint all
+# three teachers were fine-tuned FROM: the mechanism reads their difference from
+# it, so a different base makes the signs mean something else.
+"algorithm.opd.sign_weight.base_path": Qwen/Qwen3-1.7B
+# effective values after main_opd copies them onto the actor, which is where the
+# weights are actually built -- the driver only caches the models they read.
+"actor_rollout_ref.actor.sign_weight.enable": true
+"actor_rollout_ref.actor.sign_weight.mode": target
+"actor_rollout_ref.actor.sign_weight.agree_weight": 1.5
+"actor_rollout_ref.actor.sign_weight.agree_neg_weight": 1.0
+"actor_rollout_ref.actor.sign_weight.disagree_weight": 1.0
+"actor_rollout_ref.actor.sign_weight.deadzone": 0.1

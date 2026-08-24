@@ -1223,14 +1223,36 @@ class DataParallelPPOActor(BasePPOActor):
                                 input_ids=data["input_ids"],
                                 attention_mask=data["attention_mask"],
                             )
+                        sign_support_ids = student_topk_ids
+                        sign_on_task_logprobs = fwd_teacher_topk_logprobs
                     else:
                         student_topk_logprobs = student_topk_out
                         fwd_teacher_topk_logprobs = None
+                        # Teacher-indexed: the support and the on-task teacher's
+                        # values at it are both already on the batch, so the sign
+                        # weights need no lookup to build -- only the other three
+                        # models do. The support is then a function of the frozen
+                        # teacher alone and does not drift as the student moves,
+                        # which is the whole reason to run this variant.
+                        sign_support_ids = data.get("teacher_topk_ids", None) if teacher_topk_kl else None
+                        sign_on_task_logprobs = (
+                            data.get("teacher_topk_logprobs", None) if teacher_topk_kl else None
+                        )
 
                     # ---- cross-teacher sign agreement --------------------- #
                     sign_position_weight = None
                     sign_target_inputs = None
-                    if sign_enabled and fwd_teacher_topk_logprobs is not None:
+                    if sign_enabled:
+                        # Refuse rather than skip. This block used to be guarded on
+                        # fwd_teacher_topk_logprobs, which is None whenever
+                        # student_indexed_topk is off -- so a teacher-indexed arm
+                        # with sign_weight.enable=true ran the driver's three extra
+                        # frozen forwards (a quarter of the step) and then silently
+                        # trained plain OPD, with no sign_weight/* metrics to say so.
+                        assert sign_on_task_logprobs is not None and sign_support_ids is not None, (
+                            "sign weighting needs a top-k support and the on-task teacher's "
+                            "log-probs at it; got neither. It requires teacher_kl_loss_type=topk_kl."
+                        )
                         with _actor_phase("actor.sign_weight"):
                             sign_ids = data["sign_cache_ids"]
                             # Same exchange the on-task teacher went through, once
@@ -1241,7 +1263,7 @@ class DataParallelPPOActor(BasePPOActor):
                             planes = [
                                 self._teacher_logprobs_at(
                                     cache_ids=sign_ids[:, c],
-                                    ids=student_topk_ids,
+                                    ids=sign_support_ids,
                                     input_ids=data["input_ids"],
                                     attention_mask=data["attention_mask"],
                                 )
@@ -1250,7 +1272,7 @@ class DataParallelPPOActor(BasePPOActor):
                             base_logprob = planes[0]
                             off_logprobs = torch.stack(planes[1:], dim=-1)
                             candidate_weight, sign_state = candidate_weights(
-                                fwd_teacher_topk_logprobs,
+                                sign_on_task_logprobs,
                                 off_logprobs,
                                 base_logprob,
                                 mode=sign_mode,
@@ -1261,7 +1283,7 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             sign_stats.update_candidates(
                                 state=sign_state,
-                                on_task_logprob=fwd_teacher_topk_logprobs,
+                                on_task_logprob=sign_on_task_logprobs,
                                 off_task_logprobs=off_logprobs,
                                 base_logprob=base_logprob,
                                 response_mask=response_mask,
@@ -1273,12 +1295,17 @@ class DataParallelPPOActor(BasePPOActor):
                                 # Keep the original: the diagnostics below measure
                                 # how far the rewrite moved the target, which is a
                                 # statement about the pair.
-                                sign_target_inputs = (fwd_teacher_topk_logprobs, candidate_weight)
+                                sign_target_inputs = (sign_on_task_logprobs, candidate_weight)
+                                # Assigned to fwd_teacher_topk_logprobs (not to the
+                                # teacher-indexed column it may have come from)
+                                # because that is the variable the loss reads below,
+                                # and it takes precedence over data[...] there. One
+                                # path for both supports.
                                 fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
-                                    fwd_teacher_topk_logprobs, candidate_weight
+                                    sign_on_task_logprobs, candidate_weight
                                 )
                             else:
-                                pos_w = position_weights(candidate_weight, fwd_teacher_topk_logprobs)
+                                pos_w = position_weights(candidate_weight, sign_on_task_logprobs)
                                 sign_stats.update_position(
                                     position_weight=pos_w,
                                     response_mask=response_mask,
@@ -1567,9 +1594,11 @@ class DataParallelPPOActor(BasePPOActor):
                         data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
 
-                if student_indexed_topk:
+                if student_indexed_topk or sign_enabled:
                     # Every row the exchange was asked about must have been
-                    # answered by exactly one rank. Checked here rather than in the
+                    # answered by exactly one rank. Also when only the sign
+                    # weights used it: a teacher-indexed arm reads base and the
+                    # off-task teachers out of the same cache. Checked here rather than in the
                     # exchange itself: reading the tally synchronises, and this is
                     # the last point before the weights move, so a row that went
                     # unresolved still cannot reach them.
