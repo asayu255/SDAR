@@ -39,6 +39,14 @@ set -uo pipefail
 #   bash examples/opd_trainer/run_signweight_sequence.sh train_position_150
 #   bash examples/opd_trainer/run_signweight_sequence.sh val_control
 #
+# The teacher-indexed arm (run_multitask_signweight_target_teachertopk_qwen3.sh)
+# has phases here but is deliberately NOT in the default list: its support comes
+# from the teacher, which is a different objective, so it does not belong in a
+# sequence whose point is that its arms are comparable. Train and evaluate it to
+# 150 with:
+#   bash examples/opd_trainer/run_signweight_sequence.sh \
+#       train_target_teachertopk_150 val_target_teachertopk_150
+#
 # Overridable from the environment:
 #   SEARCH_URL   the retriever (default below)
 #   LOG_DIR      where the per-phase logs go
@@ -200,6 +208,11 @@ phase_val_target_150()     { val_arm target "$MID_STEPS"; }
 # The control's instance rows: its original run predates val_instance_log_dir,
 # and without them the treatment rows have nothing to pair against.
 phase_val_control()        { val_arm control "$MID_STEPS" && val_arm control "$TOTAL_STEPS"; }
+# The teacher-indexed arm. NOT part of the default sequence and not comparable
+# with the three arms that are: it takes its top-k support from the teacher, so
+# it optimises a different lower bound on the same KL. Run it by name.
+phase_train_target_teachertopk_150() { train_arm target_teachertopk "$MID_STEPS"; }
+phase_val_target_teachertopk_150()   { val_arm target_teachertopk "$MID_STEPS"; }
 phase_train_position_300() { train_arm position "$TOTAL_STEPS"; }
 phase_val_position_300()   { val_arm position "$TOTAL_STEPS"; }
 phase_train_target_300()   { train_arm target "$TOTAL_STEPS"; }
@@ -224,6 +237,7 @@ for phase in "${PHASES[@]}"; do
         echo "FATAL: unknown phase '$phase'." >&2
         echo "       known: train_position_150 val_position_150 train_target_150 val_target_150" >&2
         echo "              val_control train_position_300 val_position_300 train_target_300 val_target_300" >&2
+        echo "              train_target_teachertopk_150 val_target_teachertopk_150 (not in the default run)" >&2
         exit 2
     fi
     # Before EVERY phase, the first included: a cluster left over from an
@@ -242,6 +256,6 @@ banner "SEQUENCE COMPLETE"
 echo "wandb project: verl_agent_opd_signweight_multitask"
 echo
 echo "Per-instance validation rows, for the PAIRED comparison:"
-for mode in position target control; do
+for mode in position target control target_teachertopk; do
     echo "  $mode: \$HOME/val_instances/$(exp_of "$mode")/val_step{$MID_STEPS,$TOTAL_STEPS}.jsonl"
 done
