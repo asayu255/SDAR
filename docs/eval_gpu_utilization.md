@@ -147,24 +147,70 @@ search の `envs.step` は `http://100.86.45.30:8001/retrieve` への呼び出�
 (`envs.py:68` の `ThreadPoolExecutor(max_workers=min(batch_size, 256))`)ので、
 2.65 秒は**126 並行下での retriever の応答時間**であって直列化ではない。
 
-### 打ち手は 2 つ。片方はコード変更ゼロ
+### 打ち手 —— サーバ側は塞がっていて、バッチだけが残った
 
-**(a) retriever を増やす。** `env_config.search.search_url` は **リストを受け、
-env を round-robin で振り分ける**(`envs.py:54-66`)。レプリカを 2〜3 本立てて
-リストで渡すだけで、126 並行の負荷が分散する。**コード変更なし。**
-2.65 秒がサーバ飽和由来なら、ここがいちばん安い。
+`100.86.45.30` を見て、当初の想定が 2 つ潰れた。
 
-**(b) cohort overlap。** search は `gen 3.06 / envstep 2.65` と**ほぼ釣り合って
-いる**ので、overlap の理想形に最も近い。2 cohort に割って
-`gen(A) ‖ step(B)` を組むと 1 batch 24.2 → 16.2 秒(**−33%**)、
-評価全体で **2.85 h → 1.93 h**。
+```
+retrieval_server.py --index_path .../e5_Flat.index --retriever_model e5-base-v2 --faiss_gpu --port 8000
+retrieval_server.py --index_path .../e5_Flat.index --retriever_model e5-base-v2 --faiss_gpu --port 8001
+GPU0: 36599/49140 MiB   GPU1: 34509/49140 MiB   (両プロセスが両 GPU に分割して載っている)
+112 cores / 754 GB
+```
 
-(b) には依然として subset step が要る(`SimpleMemory` と manager の positional
-state を index 対応にする)。ただし search の leaf は `self.envs` が独立な
-`SearchEnv` のリストで executor から index 指定で叩かれているだけなので、
-**alfworld より素直である**。そして 42.6% の 99.5% が search にある以上、
-**手を入れる先は search だけでよい** —— 当初「全 manager を index 対応に」と
-見積もったのは、ここでも加重する前の話だった。
+* **worker 数を増やす → 該当しない。** `--faiss_gpu` なので仕事は GPU にある。
+  112 コアは無関係。
+* **レプリカを増やす → 塞がっている。** 8000 と 8001 は**同じ 2 枚**を共有していて、
+  空きは 12.5 / 14.6 GB。index 1 部が約 35 GB なので 3 台目は入らない。
+
+そして 80 ms の正体が分かった。**`e5_Flat` は全探索**である。wiki-18 は約 2,100 万
+パッセージ、768 次元 fp16 で **約 32 GB**。1 クエリごとにこれを全部読む:
+
+```
+32 GB ÷ A6000 の帯域 768 GB/s ≒ 42 ms(2 枚分割で ~21 ms)+ エンコード → 実測 80 ms
+```
+
+**93 倍の膨張はここから出る。1 クエリで既に帯域を使い切るので、126 並行は
+並列化されず順番待ちになる。** サーバを増やしても帯域は増えない。
+
+#### バッチだけが桁で効く
+
+Flat index では、126 クエリを 1 回の `index.search()` に渡せば **32 GB を 1 回しか
+読まない**:
+
+| | 読む量 | 時間 |
+| --- | --- | ---: |
+| 126 クエリを個別に | 32 GB × 126 | 10.1 s |
+| 126 クエリを 1 バッチで | 32 GB × 1 + 演算 | ~0.1 s |
+
+そして **サーバには既にその実装がある** —— `DenseRetriever._batch_search` は
+`encoder.encode(query_batch)` と `index.search(batch_emb)` を 1 回ずつ呼び、
+`retrieval_batch_size=512` で刻む。HTTP から届いていなかっただけで、
+`retrieval_batch_size` のコメントは「単一クエリしか対応していないので未使用」と
+書かれていた。
+
+#### 入れたもの
+
+**サーバ**(`examples/search/retriever/retrieval_server.py`): `QueryRequest.query` を
+`Union[str, List[str]]` に。文字列の挙動もレスポンスの形も変えていないので、
+**古いクライアントはそのまま動く** —— 再起動を誰かと調整する必要がない。
+
+**クライアント**(`.../skyrl_gym/tools/search.py`): `call_search_api` の内側に
+**コアレッサ**を置いた。rollout は全 env の action を ThreadPoolExecutor から
+同時に投げるので、呼び出しは数ミリ秒以内に揃う。最初の呼び出しが 10 ms 待って、
+溜まったぶんを 1 リクエストで送る。
+
+**env の意味論には一切触れていない。** 各呼び出し元は
+`{"result": [documents]}` という**単一クエリと同じ形**を受け取るので、
+下流はバッチ化されたことを知りようがない —— 同じクエリ、同じ順序、同じ文書。
+
+* クエリ 1 本のときは**素の文字列**で送る(未対応サーバを突かない)
+* バッチが失敗したら**1 本ずつ再送**し、それで通れば「リストを受けないサーバ」と
+  学習して以後バッチをやめる。エラー文字列を解釈するのではなく、**試して判る**
+* 本当に retriever が落ちているときは、単発でも失敗するのでエラーが呼び出し元まで
+  届く(ここを握り潰すと、エラー文字列が `<information>` として学習データに入る)
+
+`SEARCH_BATCH_REQUESTS=0` で無効化、`SEARCH_BATCH_WINDOW_MS` で窓幅。
 
 ## 4. 生成中の rank 不均衡 —— 帰属を間違えた(撤回)
 
