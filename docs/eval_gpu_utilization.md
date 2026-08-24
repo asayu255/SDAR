@@ -212,6 +212,43 @@ Flat index では、126 クエリを 1 回の `index.search()` に渡せば **32
 
 `SEARCH_BATCH_REQUESTS=0` で無効化、`SEARCH_BATCH_WINDOW_MS` で窓幅。
 
+### 実測 —— 9 倍
+
+バッチ対応の retriever(port 8000)に向けた run。search batch 3 本の平均:
+
+| | before | after | |
+| --- | ---: | ---: | ---: |
+| **envstep** | **10.60 s** | **1.17 s** | **0.11x** |
+| env / turn | 2.65 s | 0.29 s | |
+| gen | 12.25 s | 11.87 s | 変わらず |
+| preproc | 1.26 s | 1.20 s | 変わらず |
+| batch 合計 | 24.21 s | **14.33 s** | 0.59x |
+
+```
+SHARE  gen(GPU-busy)=80.1%  cpu-glue=19.9%
+SHARE  gen(GPU-busy)=84.8%  cpu-glue=15.2%
+SHARE  gen(GPU-busy)=83.1%  cpu-glue=16.9%
+```
+
+**評価全体(turn 時間)2.85 h → 1.73 h、GPU util 51.8% → 83.0%。**
+モデルの見積もりは 1.70 h / 87.0% だったので、ほぼ当たった —— 外れたぶんは
+1 turn の retrieval が想定 100 ms に対し実測 292 ms だったこと(`load_docs` が
+132 パッセージを HF dataset から引く分と JSON 化)。
+
+### 残ったもの
+
+| search batch 1 本 | 秒 | 割合 |
+| --- | ---: | ---: |
+| generate(GPU busy) | 11.87 | 82.8% |
+| **preproc(CPU tokenize)** | 1.20 | **8.4%** |
+| **envstep(retriever)** | 1.17 | **8.1%** |
+| decode | 0.10 | 0.7% |
+
+**preproc と retriever が同じ大きさになった。** どちらも generate の裏に
+隠す以外に消しようがなく、それは cohort / async pipeline の話になる(5 節)。
+retriever 側にはまだ 2〜3 倍ありそうだが(292 ms 対 理論下限 ~100 ms、差は
+`load_docs` と JSON)、8.1% の 2/3 なので 5 pt 程度である。
+
 ## 4. 生成中の rank 不均衡 —— 帰属を間違えた(撤回)
 
 2 秒トレースの生成中サンプル:
@@ -267,34 +304,25 @@ worker group の駆動方法ごと変わる。
 
 ## 6. 現状の台帳
 
-| 項目 | 大きさ | 状態 |
-| --- | --- | --- |
-| **search の retriever 待ち** | **42.6%** | **未着手。最大項。** 打ち手は 3 節 —— 実測 80 ms/クエリが 126 並行で 7.5 秒(93 倍)、実効並列度 1.35、16.8 クエリ/秒。retriever は事実上シングルスレッドで、**別マシン**(100.86.45.30、wasabi は .24)なので worker を増やしても eval と競合しない |
-| batch ごとの vLLM wake/sleep | 10.4% | **解消**(2 節の hoist、413 回 → 1 回) |
-| turn ごとの vLLM wake/sleep | — | **解消**(2 節の session) |
-| preproc(CPU tokenize) | 5.2% | overlap しない限り露出する |
-| generate | 51.8% | GPU が実際に働いている区間 |
+| 項目 | before | after | 状態 |
+| --- | ---: | ---: | --- |
+| turn ごとの vLLM wake/sleep | — | 0 | **解消**(2 節、session) |
+| batch ごとの vLLM wake/sleep | 10.4% | 0 | **解消**(2 節、hoist) |
+| **search の retriever 待ち** | **42.6%** | **8.1%** | **解消**(3 節、バッチ化。10.60 → 1.17 s/batch) |
+| preproc(CPU tokenize) | 5.2% | 8.4% | 残(割合は分母が縮んで上がった) |
+| generate | 51.8% | 82.8% | GPU が働いている区間 |
 
-### 到達点(モデル、未実測)
+**評価の turn 時間 2.85 h → 1.73 h、GPU util 51.8% → 83.0%(実測)。**
 
-| | wall | GPU util |
-| --- | ---: | ---: |
-| 現状 | 2.85 h | 51.8% |
-| retriever を並列化 | 1.67 h | 88.2% |
-| + session hoist(**実装済み**) | 1.50 h | 98.5% |
-| batch をまたぐ async pipeline | 1.48 h | 99.9% |
+### ここから先
 
-**評価の理論上限は 99.9% である。** 「環境との往復だから 90% が限界」と一度書いたが、
-それは誤りだった —— 短くできないもの(retriever の 80 ms、decode、preproc)と
-**隠せないもの**は別で、裏で generate が回っていれば全部隠れる。本当に隠せないのは
-**pipeline の fill と drain だけ**で、それも batch 境界をまたげば run 全体で 1 回に
-なる(いまは 413 回払っている)。
+| | wall | util | 要るもの |
+| --- | ---: | ---: | --- |
+| いま | 1.73 h | 83.0% | — |
+| retriever をさらに詰める | ~1.68 h | ~85% | `load_docs` / JSON の最適化。残り 8.1% の 2/3 |
+| batch をまたぐ async pipeline | ~1.44 h | ~99% | `async_rollout_loop.py`(5 節) |
 
-ただしその道には条件がある: **retriever が generate に追いつくこと。**
-評価全体の retrieval は 73,123 クエリで、generate の総時間 5,316 秒に収めるには
-**13.8 クエリ/秒**が要る。実測 16.8 なので追いつくが、稼働率 82% は薄い。
-retriever を直せばここに余裕が生まれ、pipeline が安定する。
-
-**実務上は上の 2 つ(retriever + hoist)で 98.5%。** 3 つ目が買うのは残り 1.4 pt で、
-`async_rollout_loop.py` の新規実装(vLLM AsyncLLM 経路、env の部分 step、
-`_validate` が batch 境界をまたいで結果を集める形への再設計)が要る。
+**理論上限は 99.9% で、隠せないのは pipeline の fill と drain だけである。**
+ただし preproc と retrieval を隠すには、待っている間に別の軌跡を生成する形
+—— cohort ないし episode 単位の async ループ —— が要る。残り 16 pt に対して
+採点経路の再設計なので、投資判断は別である。
