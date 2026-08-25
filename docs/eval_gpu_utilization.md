@@ -630,3 +630,62 @@ GPU あたり 42 系列という、CPU 律速に落ちる典型的な条件で�
 
 **util を上げるのではなく throughput を上げる**のが 2 つ目の要点である。帯域律速の
 decode では幅を増やしても util はほぼ動かないが、同じ時間で処理する行数が増える。
+
+## 9. FlashInfer —— util は上がり、遅くなった
+
+`pip install flashinfer-python` で、起動時の
+`FlashInfer is not available. Falling back to the PyTorch-native implementation`
+は消えた。同じ checkpoint、同じ retriever、**同じ batch 番号**での比較:
+
+| | genGPU% | batch#171 までの wall |
+| --- | ---: | ---: |
+| なし | 72〜80 | **2552.6 s** |
+| あり | **86〜90** | **2661.6 s(+4.3%)** |
+
+**GPU 占有率は 10 pt 上がり、スループットは 4.3% 落ちた。** 8 節で
+「サンプラの fallback が泡の原因では」と読んだのは外れである。
+
+これで **`genGPU%` を目的関数にしてはならない**ことが二度実証された(一度目は
+5 節の `slots-busy`)。NVML が測るのは「kernel が走っているか」であって
+「有用な仕事が進んでいるか」ではない。**判定は常に同じ batch 番号での累積 wall で
+行うこと。**
+
+なお この run は `VLLM_LOGGING_LEVEL=INFO` も同時に変えている(KV cache の値を
+読むため)。4.3% がどちらの寄与かは切り分けていないが、**どちらも利得が無い以上
+両方戻すのが結論**なので切り分けていない。
+
+### 比較の作法 —— 単発の `s/batch last20` では足りない
+
+同一 run の中で `s/batch last20` は **11.8〜16.3** まで振れる(search の batch ごとに
+質問も応答長も違う)。20 batch の窓でも run 間比較には足りない。
+**同じ batch 番号での累積 `wall=` だけが振れない** —— dataloader の順序は
+決定的なので、`batch#171` はどの run でも同じ 126 行だからである。
+
+```bash
+grep 'batch#171 ' run_a.log run_b.log
+```
+
+完走を待つ必要もない。
+
+## 10. 残っている最後の 1 手 —— KV cache が足りていない
+
+```
+GPU KV cache size: 159,600 tokens
+Maximum concurrency for 4,608 tokens per request: 34.64x
+```
+
+**GPU あたり 42 系列(126 ÷ 3)を流しているのに、上限が 34.64 系列である。**
+満長の系列が揃うと vLLM は preemption と再計算を起こす。8 節で見た decode の泡は
+これかもしれない。
+
+`gpu_memory_utilization` を 0.6 → 0.85 にすれば KV cache はおよそ 1.7 倍
+(同時 ~57 系列)。**`val_only` は optimizer state を使わないので余地はあるはず**である。
+`expected_multitask_sft_config.yaml` はこのキーを固定していないので、上書きは通る。
+
+```bash
+bash examples/sft_trainer/eval_checkpoints.sh \
+  -- actor_rollout_ref.rollout.gpu_memory_utilization=0.85
+grep 'batch#171 ' 新しいログ 古いログ    # 2552.6 s と比べる
+```
+
+**未測定。**
