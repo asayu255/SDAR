@@ -279,3 +279,35 @@ def test_merging_is_off_unless_asked_for():
     import agent_system.multi_turn_rollout.rollout_loop as rollout_loop
 
     assert rollout_loop._ROLLOUT_MERGE_GENERATES is False
+
+
+def test_the_merger_says_how_often_it_merged():
+    """A run where nothing merged and a run where merging bought nothing look
+    identical from the outside otherwise."""
+    lines = []
+
+    def concat(batches):
+        return [row for batch in batches for row in batch]
+
+    def split(output, sizes):
+        parts, start = [], 0
+        for size in sizes:
+            parts.append(output[start : start + size])
+            start += size
+        return parts
+
+    merger = GenerateMerger(concat=concat, split=split, report_every=2, printer=lines.append)
+    merger.call("k", ["a"], 1, _issue)
+    merger.call("k", ["b"], 1, _issue)
+
+    assert lines
+    assert "2 generate calls, 0 of them merged (0.0%)" in lines[-1]
+    assert "carrying 0 extra rows" in lines[-1]
+
+
+def test_the_report_can_be_turned_off():
+    lines = []
+    merger = GenerateMerger(concat=list, split=lambda o, s: [o], report_every=0, printer=lines.append)
+    for _ in range(10):
+        merger.call("k", ["a"], 1, _issue)
+    assert lines == []

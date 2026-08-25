@@ -50,9 +50,17 @@ class _Waiter:
 class GenerateMerger:
     """Coalesce concurrent calls sharing a key into one call, without waiting."""
 
-    def __init__(self, concat: Callable[[List[Any]], Any], split: Callable[[Any, List[int]], List[Any]]):
+    def __init__(
+        self,
+        concat: Callable[[List[Any]], Any],
+        split: Callable[[Any, List[int]], List[Any]],
+        report_every: int = 200,
+        printer: Callable[[str], None] = print,
+    ):
         self._concat = concat
         self._split = split
+        self._report_every = report_every
+        self._print = printer
         self._cv = threading.Condition()
         self._pending: Dict[Any, List[_Waiter]] = {}
         self._issuing: set = set()
@@ -98,7 +106,26 @@ class GenerateMerger:
                 for member in group:
                     member.done = True
                 self._cv.notify_all()
+            self._maybe_report()
         return self._deliver(waiter)
+
+    def _maybe_report(self):
+        """Say how often merging actually happened.
+
+        Without this, a run where nothing ever merged and a run where merging
+        bought nothing produce the same numbers -- the pair of indistinguishable
+        states this arm has now spent three separate fixes on.
+        """
+        if self._report_every <= 0 or self.calls % self._report_every:
+            return
+        self._print(self.line())
+
+    def line(self) -> str:
+        share = 100.0 * self.merges / self.calls if self.calls else 0.0
+        return (
+            f"[rollout-merge] {self.calls} generate calls, {self.merges} of them merged "
+            f"({share:.1f}%), carrying {self.rows_merged} extra rows"
+        )
 
     def _claim(self, key, waiter):
         """Take every waiter queued under ``key`` if nobody else is issuing."""

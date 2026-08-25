@@ -938,5 +938,44 @@ pipeline には別の batch があるが、**わざと位相をずらして走�
 **既定 OFF。** 行も sampling も同一とはいえ、採点経路で仮定によって有効化するもの
 ではない。`ROLLOUT_MERGE_GENERATES=1` で入り、起動時に状態を必ず出す。
 
-**①〜④すべて未測定。判定は `ms/row` と `genGPU%` の両方で行うこと** ——
+### ③ の実測 —— 0.6 s は vllm.generate の中で確定
+
+```
+[rollout-phases] rank 0, mean over 200 calls (s):
+  build_inputs 0.000  engine 3.888  assemble 0.004  total 3.893
+```
+
+**engine の周りの Python は 4 ミリ秒である。** 出力の組み立て(応答ごとの
+Python ループ + pad + concat)が固定費の正体ではないかという読みは外れた。
+
+これで消去は完了した。sharding manager 0.00、device 転送 0.00、detokenize 0.00、
+CPU 戻し 0.00、Ray 往復 ≒ 0、入力構築 0.000、出力組み立て 0.004。
+**固定費 0.6 s は `vllm.generate()` の内側にある**、これ以上は verl 側からは
+割れない。次に進むなら vLLM 内部のプロファイルである。
+
+### ①+④ の実測 —— 効果なし
+
+同じ batch 番号での累積 wall(#36):
+
+| | wall | 由来 |
+| --- | ---: | --- |
+| 252 行のみ | ~1,004 s | #31 の 903.5 と #45 の 1,184.7 から内挿 |
+| **+ chunked prefill + merge** | **1,018.4 s** | **+1.4%** |
+
+`ms/row last20` は 74 で、252 行のみの run の 72〜78 の帯の中。
+gen 加重の util は **86.0% → 84.8%** とわずかに低下。**どちらも利得なし。**
+
+**そして ①(chunked prefill)と ④(merge)を同じ run で変えてしまった。**
+このドキュメントで 2 度目の同じ失敗である。合算がゼロなので分離せずに両方
+落とすが、片方が効いて片方が損をしていた可能性は排除できていない。
+
+### ④ が本当に合流したのかは分からなかった
+
+`GenerateMerger` は合流回数を数えていたのに、**それを出していなかった。**
+「一度も合流しなかった」と「合流したが利得がなかった」が外から同じに見える
+—— この arm が既に 3 回直した構図そのものを、自分で作っていた。
+`[rollout-merge] N generate calls, M of them merged (X%), carrying R extra rows`
+を 200 呼び出しごとに出すようにした。**次に ④ を試すときは、まずこの行を見ること。**
+
+**② は未測定。判定は `ms/row` と `genGPU%` の両方で行うこと** ——
 FlashInfer は util +10 pt で速度 −4.3% だった。
