@@ -403,14 +403,17 @@ span が 2 倍になった slot が 2 本あれば、**何も得ていなくて�
 空き」と読んだ 5 節冒頭の前提が誤っていた。あの 17% は、少なくとも
 「別の batch を並べる」という手では埋まらない。
 
-**未解決:** NVML 平均 79.9% に対し同区間の gen share が 50.7% だった食い違い
-(3 節の劣化中の測定)は、glue 中も GPU が動いていることを示す。wasabi の GPU を
-eval 以外のプロセスが使っていないかは**未確認**であり、確認されるまでこの arm の
-util の数字はすべて汚染の可能性を抱えている:
+**理由は未解明のままである。** 二つの仮説はどちらも潰れた。
 
-```bash
-nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
-```
+* *GPU を他プロセスと共有している* —— 否。`nvidia-smi --query-compute-apps` は
+  eval 自身の vLLM worker 3 つ(29074 MiB × 3、1 GPU に 1 つ)だけを返した
+* *NVML 79.9% に対し gen share 50.7% という食い違いがある* —— そもそも
+  食い違いではなかった。**前者は pid 1779012、後者は pid 2495876 の測定で、
+  別の run である。** 条件の違う 2 つを並べて矛盾と呼んでいた
+
+残る候補は「vLLM の呼び出しあたり固定費」(batch を 2 本にすれば
+`generate_sequences` の回数も 2 倍になり、DataProto の往復とスケジューリングが
+2 倍かかる)だが、プロファイルを取っていないので**推測である**。
 
 **`VAL_PIPELINE_DEPTH` は既定の 1 のままにする。** depth 1 では thread に投げすら
 せず inline で走るので、コードが残っていても実行時のコストはない。
