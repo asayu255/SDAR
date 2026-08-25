@@ -54,9 +54,6 @@ class EpisodeRewardManager:
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
 
             # ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
@@ -83,8 +80,12 @@ class EpisodeRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine and np.random.random() < 0.1:
                 already_print_data_sources[data_source] += 1
-                print(f"[{data_source}][prompt]", prompt_str)
-                print(f"[{data_source}][response]", response_str)
+                # Decoded HERE and not above: the sample being printed is one in
+                # a few hundred, and decoding every row's prompt and response to
+                # throw both away is 504 detokenisations a validation batch on
+                # the thread the pipeline waits for.
+                print(f"[{data_source}][prompt]", self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False))
+                print(f"[{data_source}][response]", self.tokenizer.decode(valid_response_ids, skip_special_tokens=False))
                 print(f"[{data_source}][score]", score)
 
         if return_dict:

@@ -1145,3 +1145,37 @@ Calling thread: dataload 210.4s (worst single wait 31.2s), prepare 5.0s,
 
 **未測定。** `worst single wait` が数十秒なら loader で確定、1 秒未満なら
 loader ではなく、次は「3 slot が同時に envstep に入る同期」を疑うことになる。
+
+## 19. 採点が 1 batch につき 504 回 detokenize して 503 回捨てていた
+
+`agent_system/reward_manager/episode.py` が、**行ごとに prompt と response を
+decode してから**、印字するかどうかを判定していた:
+
+```python
+prompt_str = self.tokenizer.decode(valid_prompt_ids, ...)     # 252 行すべて
+response_str = self.tokenizer.decode(valid_response_ids, ...) # 252 行すべて
+...
+if already_print[...] < num_examine and np.random.random() < 0.1:   # 1 batch に 1 回
+    print(f"[{data_source}][prompt]", prompt_str)
+```
+
+**採点自体は文字列を一切使わない** —— `episode_rewards` と `episode_lengths` を
+読むだけである。文字列は印字のためだけに存在していた。252 行の batch なら
+**504 回 decode して 503 回捨てる**、しかも **pipeline が batch 間に待つ
+呼び出しスレッド上**で。
+
+判定の中に移した。
+
+これは 15〜45 秒の停止の説明にはならない(`scoring` は 25 batch で 17.5 s、
+1 batch あたり 0.7 s)。**純粋な無駄で、直しても数%である。**
+
+### 同時に確認できたこと
+
+```
+[rollout-phases] 300 calls: build_inputs 0.000  engine 4.374  assemble 0.005  total 4.379
+[gen-phases]     300 calls: to_device 0.002  preprocess 0.002  generate 4.381
+                            postprocess 0.001  to_cpu 0.001  total 4.388
+```
+
+**verl が engine の周りでしていることの合計は 14 ミリ秒。** 300 呼び出しの平均で、
+8 節の 200 呼び出しと同じ結論である。
