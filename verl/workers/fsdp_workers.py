@@ -858,7 +858,6 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def _record_gen_phases(self, marks):
         """Accumulate one call's phase times; print the mean every N calls."""
         totals = getattr(self, "_gen_phase_totals", None)
@@ -881,6 +880,7 @@ class ActorRolloutRefWorker(Worker):
             flush=True,
         )
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         marks = {} if _GEN_PHASE_TIMING else None
         _t = time.perf_counter()
