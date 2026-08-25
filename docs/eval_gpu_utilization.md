@@ -434,28 +434,42 @@ depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出�
 
 ## 6. 現状の台帳
 
+最終測定は 2026-08-25、retriever 健全(8000)、`VAL_PIPELINE_DEPTH=1`。
+search batch 1 本の内訳:
+
+| | 秒 | 割合 | 状態 |
+| --- | ---: | ---: | --- |
+| **generate(GPU busy)** | 12.8〜13.8 | **85.4%** | 働いている区間 |
+| preproc(CPU tokenize) | 1.15 | 7.4% | 残 |
+| envstep(retriever) | 1.00 | 6.4% | 残 |
+| decode | 0.10 | 0.6% | 残 |
+| **合計** | **15.5** | | 完了間隔は 14.2 s/batch |
+
 | 項目 | before | after | 状態 |
 | --- | ---: | ---: | --- |
 | turn ごとの vLLM wake/sleep | — | 0 | **解消**(2 節、session) |
 | batch ごとの vLLM wake/sleep | 10.4% | 0 | **解消**(2 節、hoist) |
-| **search の retriever 待ち** | **42.6%** | **8.1%** | **解消**(3 節、バッチ化。10.60 → 1.17 s/batch) |
-| preproc(CPU tokenize) | 5.2% | 8.4% | 残(割合は分母が縮んで上がった) |
-| generate | 51.8% | 82.8% | GPU が働いている区間 |
+| **search の retriever 待ち** | **42.6%** | **6.4%** | **解消**(3 節、バッチ化。10.60 → 1.00 s/batch) |
+| retriever のバージョンずれ | 10.8 s | 1.0 s | **解消**(3 節、8000 へ張り替え + `SEARCH_BATCH_RETRY_S`) |
+| preproc(CPU tokenize) | 5.2% | 7.4% | 残。**envstep を抜いて glue の最大項になった** |
+| generate | 51.8% | **85.4%** | GPU が働いている区間 |
 
-**評価の turn 時間 2.85 h → 1.73 h、GPU util 51.8% → 83.0%(実測)。**
+**評価の turn 時間 2.85 h → 1.63 h、GPU 稼働 51.8% → 85.4%(実測)。**
 
 ### ここから先
 
-| | wall | util | 状態 |
-| --- | ---: | ---: | --- |
-| いま | 1.73 h | 83.0% | 実測 |
-| `VAL_PIPELINE_DEPTH=2` | 変化なし | 変化なし | **実測、効果ゼロ**(5 節)。同条件で depth 1 も depth 2 も 14.2 s/batch |
-| retriever の GPU 専有 | −0.04 h | +2 pt | 未着手。`CUDA_VISIBLE_DEVICES` で 1 枚ずつ。ただし 8001 は第三者(`100.86.45.34`)が使っており調整が要る |
+残っているのは glue の **2.25 s/batch(14.6%)** だけで、内訳は
+preproc 1.15 + envstep 1.00 + decode 0.10。
 
-retriever の内訳は実測済みで、**`load_docs` は 250 ms → 2.8 ms(total の 1.2%)**
-で解決、残りは `encode`(61%)と `faiss`。`encode` がクエリ数に比例しない
-(3 本 134 ms、21 本 27 ms、50 本 253 ms)ことから、計算ではなく **8000 と 8001 が
-同じ 2 枚の GPU を取り合っている待ち**である。
+| | 見込み | 状態 |
+| --- | ---: | --- |
+| `VAL_PIPELINE_DEPTH=2` | — | **実測、効果ゼロ**(5 節)。同条件で depth 1 も depth 2 も 14.2 s/batch |
+| preproc の増分トークナイズ | −7% | **未着手・要検討。** 毎 turn 全履歴を tokenize し直しているのを、生成された応答と観測の**差分だけ**を tokenize して token id を連結する形に変える。BPE の結合が turn 境界をまたぐ危険があるので、等価性の検証が要る |
+| envstep(retriever 1.00 s) | −6% | 打ち手なし。3 節でバッチ化済みで、残りは encode + faiss の実時間 |
 
-**理論上限は 99.9% で、隠せないのは pipeline の fill と drain だけ。**
-depth 2 の残り 6 pt はその fill/drain と、generate 律速からのわずかなずれである。
+**なぜ depth 2 が効かないのかは未解明である。** glue は 2.25 s しかないが、
+それを別 batch の generate で埋められない理由は分かっていない。GIL(generate
+呼び出しの driver 側処理と preproc がどちらも Python 側で GIL を持つ)が候補だが、
+プロファイルを取っていないので推測にとどまる。**5 節の「別 batch を並べる」という
+手そのものが実測で否定されているので、この理由を解明しても得るものは
+2.25 s の一部でしかない。**
