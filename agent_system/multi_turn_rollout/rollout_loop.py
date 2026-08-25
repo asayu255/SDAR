@@ -284,6 +284,33 @@ def _print_turn_timing(records):
     print("\n".join(lines), flush=True)
 
 
+# Reuse of the prompt tokenisation for raw_prompt_ids.
+#
+# In the text-only path preprocess_single_sample tokenises the SAME string
+# twice: once through tokenize_and_postprocess_data (which calls the tokenizer
+# with add_special_tokens=False and pads), and once through tokenizer.encode
+# with add_special_tokens=False to build raw_prompt_ids. The non-pad tokens of
+# the first ARE the second, for the truncation modes this arm uses -- both
+# sides cut "left" the same way, "right" the same way, and "error" raises
+# before this point. That second pass runs once per ROW per TURN: on the
+# multitask batch, 360 rows against alfworld's 50-turn cap.
+#
+# The equality is load-bearing for scoring (raw_prompt_ids is what vLLM
+# generates from), so it is not assumed: the first _RAW_IDS_VERIFY calls run
+# both paths and compare, and any mismatch disables the reuse for the process
+# and says so. "middle" truncation and multimodal prompts always take the old
+# path -- middle is not a mode postprocess_data implements, and multimodal
+# raw_prompt is a different string.
+_RAW_IDS_REUSE = os.environ.get("ROLLOUT_RAW_IDS_REUSE", "1").strip().lower() not in ("0", "false", "no")
+_RAW_IDS_VERIFY = 8
+_RAW_IDS_STATE = {"enabled": _RAW_IDS_REUSE, "verified": 0}
+
+
+def _prompt_ids_from_tensors(input_ids_row, attention_mask_row):
+    """The prompt's token ids, as the already-run tokenisation produced them."""
+    return input_ids_row[attention_mask_row.bool()].tolist()
+
+
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
@@ -332,6 +359,49 @@ class TrajectoryCollector:
             item: self.preprocess_single_sample(item=item, gen_batch=gen_batch, obs=obs)
             for item in items
         }
+
+    def _raw_prompt_ids(self, tokenizer, raw_prompt, input_ids_row, attention_mask_row, is_multi_modal):
+        """raw_prompt_ids for one row, reusing the tokenisation already done.
+
+        See the _RAW_IDS_REUSE comment above for why the reuse is sound and how
+        it is verified. The fallback is the original double-encode, kept intact
+        for multimodal rows, "middle" truncation, and any process where the
+        self-check ever failed.
+        """
+        truncation = self.config.data.truncation
+        eligible = _RAW_IDS_STATE["enabled"] and not is_multi_modal and truncation in ("left", "right", "error")
+        if eligible:
+            extracted = _prompt_ids_from_tensors(input_ids_row, attention_mask_row)
+            if _RAW_IDS_STATE["verified"] >= _RAW_IDS_VERIFY:
+                return extracted
+            encoded = self._encode_raw_prompt(tokenizer, raw_prompt)
+            if encoded == extracted:
+                _RAW_IDS_STATE["verified"] += 1
+                return extracted
+            _RAW_IDS_STATE["enabled"] = False
+            print(
+                "[raw-ids] reused prompt tokens differ from a fresh encode "
+                f"({len(extracted)} vs {len(encoded)} ids); reuse disabled for this process, "
+                "falling back to double tokenisation.",
+                flush=True,
+            )
+            return encoded
+        return self._encode_raw_prompt(tokenizer, raw_prompt)
+
+    def _encode_raw_prompt(self, tokenizer, raw_prompt):
+        raw_prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+            if self.config.data.truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+            elif self.config.data.truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+            elif self.config.data.truncation == "middle":
+                left_half = self.config.data.max_prompt_length // 2
+                right_half = self.config.data.max_prompt_length - left_half
+                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+            elif self.config.data.truncation == "error":
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+        return raw_prompt_ids
 
     def preprocess_single_sample(
         self,
@@ -452,18 +522,9 @@ class TrajectoryCollector:
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
-            if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
-            elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
-            elif self.config.data.truncation == "middle":
-                left_half = self.config.data.max_prompt_length // 2
-                right_half = self.config.data.max_prompt_length - left_half
-                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-            elif self.config.data.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+        raw_prompt_ids = self._raw_prompt_ids(
+            tokenizer, raw_prompt, input_ids[0], attention_mask[0], is_multi_modal
+        )
 
         # Build final output dict
         row_dict.update({
