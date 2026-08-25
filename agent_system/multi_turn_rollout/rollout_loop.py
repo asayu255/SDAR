@@ -142,6 +142,12 @@ def _say_rollout_env():
         return
     _SAID_ROLLOUT_ENV = True
     print(
+        f"[rollout-merge] driver: ROLLOUT_MERGE_GENERATES="
+        f"{os.environ.get('ROLLOUT_MERGE_GENERATES', '<unset>')!r} -> queued generate calls "
+        f"{'ARE merged into one' if _ROLLOUT_MERGE_GENERATES else 'run one after another'}",
+        flush=True,
+    )
+    print(
         f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
         f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
         f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
@@ -249,6 +255,58 @@ def _record_batch_wall(start, end, slot, rows=None):
         f"wall={wall:.1f}s  slots-busy={occupancy:.2f}x"
     )
     return "\n".join(lines)
+
+
+# Merge generate calls that are already queued behind one another.
+#
+# A search batch's last turns decode for a handful of trajectories spread over
+# three ranks, and the ranks do not finish together: twelve active trajectories
+# measured 61/89/56 per-GPU, the call returning only once the rank holding the
+# longest responses is done. The empty seats can only be filled from another
+# batch, and the pipeline has one -- but runs it out of phase on purpose, which
+# is where its 16.5% came from. So nothing waits: a call merges only what is
+# ALREADY queued behind it, which the worker group would have serialised anyway.
+#
+# Off by default. It changes how rows are grouped inside a generate call, and
+# although the rows and their sampling parameters are identical either way, the
+# scoring path is not somewhere to enable a thing by assumption.
+_ROLLOUT_MERGE_GENERATES = os.environ.get("ROLLOUT_MERGE_GENERATES", "0").strip().lower() in ("1", "true", "yes", "on")
+_GENERATE_MERGER = None
+
+
+def _merge_key(batch):
+    """Calls sharing this may be merged; calls that do not, may never be.
+
+    Everything that makes two calls differ apart from their rows: the sampling
+    parameters, and the tensor widths a concatenation would have to agree on.
+    """
+    widths = tuple(sorted((name, tuple(tensor.shape[1:])) for name, tensor in batch.batch.items()))
+    return (repr(sorted((str(k), repr(v)) for k, v in (batch.meta_info or {}).items())), widths)
+
+
+def _split_by_rows(output, sizes):
+    start, parts = 0, []
+    for size in sizes:
+        parts.append(output.slice(start, start + size))
+        start += size
+    return parts
+
+
+def _generate_sequences(actor_rollout_wg, batch_input_padded):
+    """One generate call, merged with whatever is queued when merging is on."""
+    if not _ROLLOUT_MERGE_GENERATES:
+        return actor_rollout_wg.generate_sequences(batch_input_padded)
+    global _GENERATE_MERGER
+    if _GENERATE_MERGER is None:
+        from verl.utils.generate_merge import GenerateMerger
+
+        _GENERATE_MERGER = GenerateMerger(concat=DataProto.concat, split=_split_by_rows)
+    return _GENERATE_MERGER.call(
+        _merge_key(batch_input_padded),
+        batch_input_padded,
+        len(batch_input_padded),
+        actor_rollout_wg.generate_sequences,
+    )
 
 
 def _token_counts(batch_input_padded, batch_output_padded):
@@ -958,7 +1016,7 @@ class TrajectoryCollector:
             # pad to be divisible by dp_size
             batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
             _gw0 = gpu_profiler.now()
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+            batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
             _gw1 = gpu_profiler.now()
             if _turn_records is not None:
                 _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)

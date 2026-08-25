@@ -868,3 +868,75 @@ batch 間の隙間は相対的に薄まり、depth 2 が埋めるものが減る
 
 **採点は動いていない**(alfworld と webshop は 126 行のまま、search は同じ行を
 同じ順序で、まとめ方だけ変えている)。
+
+## 15. util を上げる 4 手
+
+13〜14 節の 252 行 batch で、generate 中の空きは **4.06 s / 28.8 s = 14%**。
+
+| turn | gen | util | 空き | 正体 |
+| ---: | ---: | ---: | ---: | --- |
+| 0 | 1.98 | 69% | 0.61 s | 呼び出し固定費 |
+| 1 | 15.67 | 91% | 1.41 s | 固定費 + prefill のステップ境界 |
+| 2 | 6.81 | 90% | 0.68 s | 固定費 |
+| 3 | 4.38 | 69% | 1.36 s | 固定費 + **GPU 間の応答長不均衡** |
+
+126 行では turn 0 が 44%、空き 0.51 s。**呼び出しが 2 倍長くなっても空きは
+0.5〜0.6 s のまま**で、固定費の読みがここでも一致した。**固定費 0.6 s × 4 turn が
+空きの約 6 割**である。
+
+### ① chunked prefill と token 予算(設定のみ、未測定)
+
+turn 1 は 186,764 トークンを投げており、GPU あたり 62,255。
+`max_num_batched_tokens=8192` の予算では **prefill が 8 ステップに分割され**、
+境界ごとにホスト処理が挟まる。`enable_chunked_prefill=True` は prefill と decode を
+同じステップに混ぜるので、この隙間を埋める設定である。
+
+```bash
+-- actor_rollout_ref.rollout.enable_chunked_prefill=True \
+   actor_rollout_ref.rollout.max_num_batched_tokens=32768
+```
+
+`enable_chunked_prefill=False` は誰かが明示的に選んだ値で、vLLM の版によっては
+prefix caching と併用できない。起動時に落ちたらそれが理由である。
+
+### ② 378 行(設定のみ、未測定)
+
+turn 0 の 44% → 69% は固定費が薄まった結果なので、もう一段ある。ただし KV cache が
+turn 1 で 156,500 / 159,600 と上限すれすれで、**preemption が起きれば逆効果**。
+
+### ③ engine 境界での分割(実装済み、未測定)
+
+固定費 0.6 s は `generate_sequences` の内側までは絞れたが、その先が
+**「vllm.generate の中」なのか「その周りの Python」なのか**は分けていなかった。
+verl の rollout wrapper が入力リストの構築・engine 呼び出し・出力の組み立てを
+別々に計測する。出力の組み立ては応答ごとの Python ループと pad + concat で、
+252 行 × 最大 512 トークンに対して自明に安いとは言えない。
+
+```
+[rollout-phases] rank 0, mean over 50 calls (s): build_inputs 0.031  engine 3.402  assemble 0.118  total 3.551
+```
+
+計測は `verl/utils/phase_timing.py` に切り出した。worker 側と重複しており、
+**どちらのコピーもテストできなかった**(片方は vllm、片方は worker が要る)。
+
+### ④ 順番待ちの generate を合流させる(実装済み・既定 OFF、未測定)
+
+turn 3 の `perGPU% 61/89/56` —— 12 本を 3 rank に割れば本数は 4/4/4 で揃うが、
+**揃っていないのは応答長**である。呼び出しは 3 rank 全部が終わるまで返らないので、
+短い方の rank は待つ。空いた席は**別の batch からしか埋められない**。
+
+pipeline には別の batch があるが、**わざと位相をずらして走らせている**(その
+ずらしが 16.5% を生んだ)。だから**待たない**:`verl/utils/generate_merge.py` は
+**既に順番待ちしている呼び出しだけ**を合流させる。worker group は Ray actor で
+呼び出しを直列化するので、飛び込んできた 2 本目はどのみち待つ —— 合流させても
+何も失わず、1 本目の空き rank にその行が乗る。
+
+合流してよいのは「行以外が同一の呼び出し」だけなので、**sampling パラメータと
+テンソル幅**を鍵にする。search の greedy と alfworld の temperature 0.4 は
+決して同じ呼び出しに入らない。
+
+**既定 OFF。** 行も sampling も同一とはいえ、採点経路で仮定によって有効化するもの
+ではない。`ROLLOUT_MERGE_GENERATES=1` で入り、起動時に状態を必ず出す。
+
+**①〜④すべて未測定。判定は `ms/row` と `genGPU%` の両方で行うこと** ——
+FlashInfer は util +10 pt で速度 −4.3% だった。
