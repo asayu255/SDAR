@@ -145,7 +145,9 @@ def _say_rollout_env():
         f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
         f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
         f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
-        f"; ROLLOUT_TURN_TIMING={'on' if _ROLLOUT_TURN_TIMING else 'off'}",
+        f"; ROLLOUT_TURN_TIMING={'on' if _ROLLOUT_TURN_TIMING else 'off'}"
+        f"; GPU_PROFILER={os.environ.get('GPU_PROFILER', '<unset>')!r} -> the turn table's "
+        f"genGPU%/perGPU% columns will be {'filled' if gpu_profiler.enabled() else 'EMPTY (-)'}",
         flush=True,
     )
 
@@ -849,6 +851,11 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
         _turn_records = [] if _ROLLOUT_TURN_TIMING else None
+        if _turn_records is not None:
+            # Feeds the genGPU% column. Nothing on the validation path would
+            # otherwise start the sampler -- push_phase is its only other caller
+            # and that lives in the trainer's fit loop.
+            gpu_profiler.ensure_started()
         _batch_started = _now()
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):

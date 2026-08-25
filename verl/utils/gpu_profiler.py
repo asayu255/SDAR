@@ -618,6 +618,24 @@ def pop_phase(name):
         _sampler.pop(name)
 
 
+def ensure_started():
+    """Start the sampler now, for a caller that only reads util windows.
+
+    ``push_phase`` is the only other thing that starts it, and the validation
+    path never calls it -- so on an evaluation the sampler never existed and
+    ``mean_util_between`` returned None for every window. The turn table printed
+    its genGPU% and perGPU% columns as "-" on every evaluation ever run,
+    GPU_PROFILER=1 included, which reads as "the GPU was not measured" when it
+    actually means "nothing ever asked it to be".
+
+    Returns whether a sampler is running. Cheap to call repeatedly: a pointer
+    check once the sampler exists, and it does not retry a failed backend.
+    """
+    if not enabled():
+        return False
+    return _ensure_sampler() is not None
+
+
 def mean_util_between(t0, t1):
     if not enabled() or _sampler is None:
         return None

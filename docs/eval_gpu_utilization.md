@@ -508,10 +508,22 @@ decode の wall は「何本流すか」ではなく「何ステップ回すか�
 
 ### 先にやること —— `genGPU%` を埋める
 
-turn table には `genGPU%` と `perGPU%` の列が最初からあるが、
-`verl/utils/gpu_profiler.py` の NVML サンプラが `GPU_PROFILER=1` でなければ
-no-op なので、**ずっと `-` を出していた**。列があって中身が無い状態は、2 節の
-session と同じ「無言の穴」である。`eval_checkpoints.sh` の既定を 1 にした。
+turn table には `genGPU%` と `perGPU%` の列が最初からあるが、**評価では一度も
+埋まったことがなかった。** 理由は二段階ある。
+
+1. NVML サンプラは `GPU_PROFILER=1` でなければ no-op —— `eval_checkpoints.sh` の
+   既定を 1 にした
+2. **それだけでは足りなかった。** サンプラを生成するのは `push_phase()` だけで、
+   それを呼ぶのは trainer の fit ループである。**評価パスは一度も呼ばない**ので、
+   `GPU_PROFILER=1` を立てても `_sampler` は None のまま、`mean_util_between` は
+   全ての窓に None を返し、列は `-` を出し続けた
+
+列があって中身が無い状態は 2 節の session と同じ「無言の穴」で、しかも今回は
+**フラグを立てた側から見て正しく設定できているように見える**ぶん質が悪い。
+`gpu_profiler.ensure_started()` を公開し、turn timing が有効な rollout の先頭で
+呼ぶようにした。あわせて `[rollout-session]` の行が
+`GPU_PROFILER=... -> genGPU%/perGPU% columns will be filled / EMPTY (-)` を
+名指しで出すので、次からは起動時に分かる。
 
 これで尻尾の turn の SM 使用率が直接読める。**満員の turn が 95%、尻尾が 20% なら
 上の読みは確定**で、打ち手の見込みも計算できる。両方とも高いなら
