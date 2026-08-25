@@ -291,6 +291,8 @@ def rollout_session(actor_rollout_wg):
         yield
     finally:
         actor_rollout_wg.end_rollout_session()
+
+
 # Reuse of the prompt tokenisation for raw_prompt_ids.
 #
 # In the text-only path preprocess_single_sample tokenises the SAME string

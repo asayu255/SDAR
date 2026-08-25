@@ -48,6 +48,8 @@
 | C env reset prefetch | `ENV_RESET_PREFETCH=1`（script が export） | 2 | ビット同一 |
 | **検索リクエストのバッチ化** | `SEARCH_BATCH_REQUESTS`（**既定 on**、export 不要） | 7 | 同一クエリ・同一順序・同一文書 |
 | **raw_prompt_ids の二重 tokenize 停止** | `ROLLOUT_RAW_IDS_REUSE`（**既定 on**、export 不要） | 7 | 最初の8回で新旧一致を自己検証 |
+| **セッションの hoist（検証全体で1回）** | `ROLLOUT_KEEP_VLLM_AWAKE=1`（① と同じノブ） | 7 | 重みは検証中不変 |
+| **val テーブル用 decode の停止** | 自動（`trainer.log_val_generations=0` のとき） | 7 | 読まれない文字列を作らない |
 | `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
 | rollout log-prob を作らない | `rollout.return_rollout_log_probs=False` | 5 | 生成トークン不変 |
 | session 中の `empty_cache` 抑止 | コード（常時、session 中のみ） | 5 | ビット同一 |
@@ -78,6 +80,21 @@ text-only 経路で**同じ文字列を2回 tokenize** していた ―― 1回�
 両方を走らせて突き合わせる**。1 度でも食い違えばそのプロセスは恒久的に旧経路へ戻り、その旨を
 印字する。multimodal と `truncation=middle` は常に旧経路（前者は raw_prompt が別の文字列、
 後者は `postprocess_data` が実装していないモード）。
+
+**セッションの hoist は ① の適用範囲を広げたもの。**① は `multi_turn_loop` 単位で開閉するので、
+`_validate` が `val_dataloader` を回すと**バッチごとに** vLLM が寝起きする。移植元の計測では
+21 GB の unmap/remap が **評価 wall の 10.4%** で、search バッチは 24 秒しかないので償却できない。
+`_validate` がバッチループの外側で 1 回開くようにした。
+
+**ワーカ側のセッションは深さで数える。**bool のままだと**内側の close が外側のセッションを
+閉じてしまい**、最初のバッチ以降は元通り毎バッチ寝起きしながら、ログは「1 回開いた」と言い続ける。
+`end_rollout_session` は 1 回の wake が何回の generate を賄ったかを印字するので、
+**1 しか賄っていないセッションは何も買っていない**とその場で分かる。
+
+**val テーブル用の decode は `log_val_generations=0` なら丸ごと不要。**この repo は 0 なのに、
+全行の prompt と response を decode してから捨てていた。`_decode_for_val_table` が
+0 のとき空リストを返す。あわせて `[val-hash]` 行（応答トークン id の sha1）を出すようにした ――
+「生成に触れていない」と主張する変更は、スコアではなく**トークンが同じ**ことを示す必要がある。
 
 **5 期の 2 件は「読まれない結果を作るのをやめた」もの。** `rollout_log_probs` の消費者は
 `RayPPOTrainer.fit` の drift 検査（`rollout_probs_diff`）だけで、比較対象の `old_log_prob`
