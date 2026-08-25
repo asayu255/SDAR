@@ -125,7 +125,7 @@ def run_pipelined(
     # samples at exactly zero on all three cards; a union of the launch
     # intervals is what says whether that is this.
     spans = []  # (start, end) per launch, appended from the worker threads
-    clock = {"prepare": 0.0, "consumer": 0.0, "retire_wait": 0.0}
+    clock = {"prepare": 0.0, "consumer": 0.0, "retire_wait": 0.0, "dataload": 0.0, "dataload_max": 0.0}
 
     def timed_launch(prepared, slot):
         started = time.perf_counter()
@@ -160,7 +160,8 @@ def run_pipelined(
         print(
             f"[val-pipeline] {tag}: {len(spans)} batches over {span:.1f}s: at least one slot "
             f"running {covered:.1f}s ({100 * covered / span:.1f}%), NOTHING running {idle:.1f}s "
-            f"({100 * idle / span:.1f}%). Calling thread: prepare {clock['prepare']:.1f}s, "
+            f"({100 * idle / span:.1f}%). Calling thread: dataload {clock['dataload']:.1f}s "
+            f"(worst single wait {clock['dataload_max']:.1f}s), prepare {clock['prepare']:.1f}s, "
             f"scoring {clock['consumer']:.1f}s, waiting on a slot {clock['retire_wait']:.1f}s.",
             flush=True,
         )
@@ -169,8 +170,22 @@ def run_pipelined(
         if _REPORT_EVERY > 0 and len(spans) and len(spans) % _REPORT_EVERY == 0:
             report(final=False)
 
+    # next(items) is the loader, and it was the one thing on the calling thread
+    # that nothing timed: with num_workers>0 torch hands batches back in strict
+    # worker order, so one slow worker stalls the loop every num_workers
+    # batches -- the shape of the periodic stalls NVML shows.
+    iterator = iter(items)
     try:
-        for item in items:
+        while True:
+            _t = time.perf_counter()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+            waited = time.perf_counter() - _t
+            clock["dataload"] += waited
+            clock["dataload_max"] = max(clock["dataload_max"], waited)
+
             _t = time.perf_counter()
             prepared = prepare(item)
             clock["prepare"] += time.perf_counter() - _t

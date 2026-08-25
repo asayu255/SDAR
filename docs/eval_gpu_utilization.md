@@ -1100,3 +1100,48 @@ wandb の system stream(15 秒点サンプル、108 点、26.8 分)を数え直�
 終わったまま次が投入されない**という、いま疑っている状態の直接の証拠になる。
 
 **未測定。** 次の run でこの 1 行を読むこと。
+
+## 18. 止まっているのは pipeline の外ではなく、slot の中でもなかった
+
+同じ run(`sft-multitask-eval-20260825-211138`)を両方の計器で測った:
+
+| 計器 | 値 |
+| --- | ---: |
+| wandb system stream(起動後) | 平均 **77.8%**、**exact-0 が 11.9%** |
+| `run_pipelined` の被覆(和集合) | **何も走っていない 0.4%** |
+
+**slot は走っているのに GPU が止まっている。** 被覆率は「slot が走っている」しか
+見ないので、3 slot が同時に GPU の外(envstep / preproc)にいる状態を
+「走っている」と数えてしまう。
+
+数字で言うと、batch 1 本は preproc 3.9 + gen 44.4 + envstep 3.8 ≈ 52.4 s、
+**GPU の外は 15.3%**。3 slot が独立なら「全部同時に外」は 0.153³ = **0.36%**。
+観測は **11.9%、33 倍**である。偶然の重なりではない。
+
+### retriever ではなかった
+
+0 の塊が 8〜10 batch ごとに 15〜45 秒であることから、3 slot が共有する唯一の
+外部資源 —— retriever —— を疑った。**外れ。** 46 batch の envstep は
+**平均 3.8 s、最大 8.6 s**(17.5 は alfworld batch)で、15〜40 s の詰まりは 1 本も無い。
+
+### 計測外だったもの —— loader
+
+```python
+for item in items:          # ← next(dataloader) はここ。計測外だった
+    prepared = prepare(item)   # ← ここから測っていた
+```
+
+`num_workers=8` で、torch は worker から**厳密なラウンドロビン順**に batch を返す。
+**8 batch ごとに一番遅い worker を待つ**構造で、観測された「8〜10 batch ごと」と
+一致する。1 batch は 252 行の tokenize(最大 4096 トークン)である。
+
+`dataload` と **その最悪値**を計測に追加した(平均だけでは周期的な 30 秒の
+待ちが 46 本に薄まって見えなくなる)。
+
+```
+Calling thread: dataload 210.4s (worst single wait 31.2s), prepare 5.0s,
+  scoring 17.5s, waiting on a slot 746.8s.
+```
+
+**未測定。** `worst single wait` が数十秒なら loader で確定、1 秒未満なら
+loader ではなく、次は「3 slot が同時に envstep に入る同期」を疑うことになる。

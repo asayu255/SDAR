@@ -451,3 +451,52 @@ def test_the_periodic_report_can_be_turned_off(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "after " not in out
     assert "final:" in out
+
+
+def test_the_loader_wait_is_timed_and_its_worst_case_named(capsys):
+    """next(items) was the one thing on the calling thread nothing measured, and
+    with num_workers>0 torch returns batches in strict worker order -- one slow
+    worker stalls the loop every num_workers batches."""
+    import time as _time
+
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    def slow_loader():
+        for i in range(4):
+            _time.sleep(0.08 if i == 2 else 0.01)  # one worker is slow
+            yield i
+
+    slots = [Slot("a", None, None), Slot("b", None, None)]
+    for _ in run_pipelined(
+        slow_loader(), prepare=lambda x: x, task_of=lambda p: "s", launch=lambda p, s: p, slots=slots
+    ):
+        pass
+
+    out = capsys.readouterr().out
+    assert "dataload" in out
+    worst = float(out.split("worst single wait ")[1].split("s)")[0])
+    assert worst >= 0.07  # the slow one, not the average
+
+
+def test_the_loader_is_not_charged_to_prepare(capsys):
+    """Charging the loader's wait to prepare would name the wrong culprit."""
+    import time as _time
+
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    def loader():
+        for i in range(3):
+            _time.sleep(0.05)
+            yield i
+
+    slots = [Slot("a", None, None), Slot("b", None, None)]
+    for _ in run_pipelined(
+        loader(), prepare=lambda x: x, task_of=lambda p: "s", launch=lambda p, s: p, slots=slots
+    ):
+        pass
+
+    out = capsys.readouterr().out
+    dataload = float(out.split("dataload ")[1].split("s ")[0])
+    prepare = float(out.split("prepare ")[1].split("s,")[0])
+    assert dataload >= 0.14
+    assert prepare < 0.05
