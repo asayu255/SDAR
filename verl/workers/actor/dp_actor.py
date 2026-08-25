@@ -42,7 +42,7 @@ from verl.trainer.ppo.sign_weights import (
 )
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils import gpu_profiler
+from verl.utils import actor_capture, gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
@@ -105,18 +105,23 @@ def _actor_phase(name: str):
 
     A no-op unless GPU_PROFILER=1: push_phase/pop_phase return immediately.
     """
-    if not _PROFILE_STAGES:
-        yield
-        return
-    if _SYNC_PHASES:
-        get_torch_device().synchronize()
-    gpu_profiler.push_phase(name)
-    try:
-        yield
-    finally:
+    # The NVTX range is separate from the sampler and is pushed on EVERY rank:
+    # the question a kernel trace answers is which rank the other two are
+    # waiting for, and a timeline labelled on rank 0 alone cannot answer it.
+    # Both are no-ops unless their own env var is set.
+    with actor_capture.phase(name):
+        if not _PROFILE_STAGES:
+            yield
+            return
         if _SYNC_PHASES:
             get_torch_device().synchronize()
-        gpu_profiler.pop_phase(name)
+        gpu_profiler.push_phase(name)
+        try:
+            yield
+        finally:
+            if _SYNC_PHASES:
+                get_torch_device().synchronize()
+            gpu_profiler.pop_phase(name)
 
 
 _VARLEN_KWARGS = os.environ.get("ACTOR_PASS_CU_SEQLENS", "1").strip().lower() in (
@@ -1031,6 +1036,13 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        # The stall watch measures the gap before each micro-batch, and the one
+        # that spans two update_policy calls is a different animal from the ones
+        # inside a step: it holds the return to the driver, its logging, and the
+        # next batch's dispatch and H2D. Told where the boundary is, it compares
+        # like with like instead of flagging that gap every step.
+        actor_capture.new_step()
+
         # A call that died between entering and leaving no_sync would leave the
         # flag off, and every later step would then silently skip its gradient
         # reduce. Cheap to make each call start from a known state.
@@ -1215,7 +1227,10 @@ class DataParallelPPOActor(BasePPOActor):
                 # That is why this pairs with sharding_strategy=shard_grad_op.
                 n_micro = len(micro_batches)
                 accum_ctx = None
-                for micro_idx, data in enumerate(micro_batches):
+                # enumerate(), plus the capture window and one named range per
+                # micro-batch. Wrapping the iterator leaves the body untouched;
+                # a no-op unless ACTOR_NSYS_MICRO or ACTOR_TORCH_MICRO is set.
+                for micro_idx, data in actor_capture.iter_micro_batches(micro_batches):
                     if self.no_sync_grad_accum:
                         if micro_idx == 0 and n_micro > 1:
                             accum_ctx = _grad_sync_context(self.actor_module, True)
@@ -1683,7 +1698,13 @@ class DataParallelPPOActor(BasePPOActor):
                     assert_rows_were_owned_once()
 
                 with _actor_phase("actor.optim"):
-                    grad_norm = self._optimizer_step()
+                    # Named separately because it runs in the window between two
+                    # micro-batches, which the stall watch would otherwise report
+                    # as idle -- a reduce-scatter plus an Adam update over 570M
+                    # parameters is real kernels, and calling that idle puts a
+                    # noise floor under the stalls being looked for.
+                    with actor_capture.span("optim"):
+                        grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()

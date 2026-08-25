@@ -11,6 +11,8 @@ import hydra
 import ray
 from omegaconf import OmegaConf, open_dict
 
+from verl.utils import actor_capture
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -83,8 +85,23 @@ def run_opd(config) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs)
+        if actor_capture.nsys_enabled():
+            # The ranks are Ray actors, not children of this launcher, so
+            # wrapping the launch command in `nsys profile` reaches nothing that
+            # touches a GPU. Ray's _nsight plugin wraps each worker process
+            # instead; the capture ranges dp_actor opens are what keep the report
+            # to a handful of micro-batches. Reports land in the Ray session's
+            # logs/nsight directory, one per process.
+            #
+            # nsys_enabled(), not enabled(): the torch backend writes its own
+            # trace from inside the rank and wants no plugin, so turning it on
+            # must not drag every worker under Nsight as well.
+            ray_init_kwargs["runtime_env"]["_nsight"] = actor_capture.nsight_runtime_env()
+            print(f"[nsys] workers will run under Nsight: "
+                  f"{ray_init_kwargs['runtime_env']['_nsight']}", flush=True)
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     runner = OPDTaskRunner.remote()
     ray.get(runner.run.remote(config))
