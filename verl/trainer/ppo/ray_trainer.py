@@ -61,7 +61,12 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
 )
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    deal_by_length,
+    get_seqlen_balanced_partitions,
+    log_minibatch_unbalance,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -428,6 +433,18 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     if name not in timing_raw:
         timing_raw[name] = 0
     timing_raw[name] += timer.last
+
+
+# Deal each rank's rows length-first into its mini-batches so mini-batch k holds
+# the same token count on every rank. OFF by default, and deliberately: it
+# changes which rows share a mini-batch, and with ~70 optimizer steps per
+# training step the trajectory is not bit-identical -- turning it on would make
+# a new arm non-comparable with the ones already run. The measurement in
+# _balance_batch runs either way, so the size of the prize is visible before
+# anyone spends it. Turn on with BALANCE_MINIBATCH=1 and compare
+# perf/mfu/actor, which is data-independent.
+_BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 class RayPPOTrainer:
@@ -1324,11 +1341,49 @@ class RayPPOTrainer:
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst, k_partitions=world_size, equal_size=True)
+        minibatch_rows = self._minibatch_rows_per_rank(world_size)
+        ordered = global_partition_lst
+        if _BALANCE_MINIBATCH and minibatch_rows:
+            # Balancing the rank totals leaves mini-batch k unrelated across
+            # ranks, and the ranks meet at the gradient reduce that ends every
+            # one of them. deal_by_length gives each rank the same length-ordered
+            # deal, so the columns match by construction.
+            ordered = [deal_by_length(global_seqlen_lst, p, minibatch_rows)
+                       for p in global_partition_lst]
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        global_idx = torch.tensor([j for partition in ordered for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        # The whole-batch balance above is exact to about a token, and says
+        # nothing about where the ranks actually meet: at the gradient reduce and
+        # optimizer step that end every mini-batch, of which there are
+        # train_rows / ppo_mini_batch_size per step. Each is a contiguous slice
+        # of the rank's rows, and the partitioner's length ordering is discarded
+        # by _check_and_sort_partitions, so slice k can hold very different token
+        # counts on different ranks while the totals still match. That difference
+        # is a wait on every rank but the slowest, and it is invisible to
+        # utilization.gpu, which counts a spinning collective as busy. Measured
+        # rather than inferred, because it is free to do so.
+        if minibatch_rows:
+            # Measured on what was actually dispatched, so with BALANCE_MINIBATCH
+            # on the wait it reports is the one the run really paid.
+            metrics.update(log_minibatch_unbalance(
+                seqlen_list=global_seqlen_lst, partitions=ordered,
+                minibatch_rows=minibatch_rows, prefix=logging_prefix))
+
+    def _minibatch_rows_per_rank(self, world_size: int) -> int:
+        """Rows in one rank's mini-batch, or 0 if this arm has no actor to ask.
+
+        ppo_mini_batch_size is a global row count in the driver's config and is
+        divided by world_size inside the worker (fsdp_workers), so the division
+        has to be repeated here rather than read off.
+        """
+        try:
+            mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        except Exception:  # noqa: BLE001 - a metric must never break a step
+            return 0
+        return int(mini) // world_size if mini else 0
 
     def fit(self):
         """
