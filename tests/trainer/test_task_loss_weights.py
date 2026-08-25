@@ -29,6 +29,21 @@ except Exception as e:  # pragma: no cover - environment without full deps
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+# The per-row weights are stored in a float32 tensor (attach_task_loss_weights),
+# so a weight of the form num_mini_batches / (n_tasks * task_tokens) arrives with
+# about 2e-8 of relative error -- a sixth of float32's epsilon, and sixteen times
+# what these assertions used to demand. The replay below then carries that error
+# through a float64 loss, which is why the numbers miss by 1e-8 and not by
+# nothing. Holding the test to the storage precision rather than to exact
+# arithmetic: what is being checked is that each task gets an equal SHARE, and a
+# share that is right to seven figures is right.
+#
+# Do not tighten this without widening the weights. float64 weights would promote
+# the loss on the multiply, which changes the objective's arithmetic to buy a
+# precision no gradient can tell apart.
+_WEIGHT_PRECISION = 1e-6
+
+
 def _make_batch(task_names, row_tokens, resp_len=None):
     """A batch whose row ``i`` has ``row_tokens[i]`` unmasked response tokens."""
     bs = len(task_names)
@@ -81,16 +96,6 @@ def _replay_actor(batch, per_token_loss, *, mini_batch_size, dp_world_size, micr
             rank_losses.append(total)
         step_losses.append(sum(rank_losses) / dp_world_size)  # FSDP averages the ranks
     return sum(step_losses) / len(step_losses)
-
-
-# ``attach_task_loss_weights`` stores the weights as a float32 column (one scalar
-# per row, travelling into the actor alongside the batch), so a weight like
-# 2 / (3 * 256) carries about 3e-8 of relative quantisation error and no replay of
-# the actor can be exact to more than that. The structural mistakes these tests
-# exist to catch -- a missing dp_world_size, the wrong mini-batch count, dividing
-# by the per-mini-batch token total instead of the step's -- are all integer-factor
-# sized, so 1e-6 catches every one of them with 30x the headroom float32 needs.
-_REL = 1e-6
 
 
 def _token_mean(per_token_loss, mask, rows):
@@ -184,7 +189,7 @@ def test_step_loss_is_the_equal_share_token_mean():
         _token_mean(per_token_loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
         for task in ("alfworld", "webshop", "search")
     )
-    assert got == pytest.approx(expected, rel=_REL)
+    assert got == pytest.approx(expected, rel=_WEIGHT_PRECISION)
 
 
 def test_step_loss_magnitude_matches_the_unweighted_token_mean():
@@ -205,7 +210,7 @@ def test_step_loss_magnitude_matches_the_unweighted_token_mean():
     got = _replay_actor(
         batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
     )
-    assert got == pytest.approx(0.5, rel=_REL)
+    assert got == pytest.approx(0.5, rel=_WEIGHT_PRECISION)
 
 
 def test_step_loss_is_invariant_to_micro_batch_grouping():
@@ -221,7 +226,7 @@ def test_step_loss_is_invariant_to_micro_batch_grouping():
 
     a = _replay_actor(batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=3)
     b = _replay_actor(batch, per_token_loss, mini_batch_size=12, dp_world_size=2, micro_batch_size=6)
-    assert a == pytest.approx(b, rel=_REL)
+    assert a == pytest.approx(b, rel=_WEIGHT_PRECISION)
 
 
 def test_short_final_mini_batch_keeps_the_equal_share():
@@ -250,7 +255,7 @@ def test_short_final_mini_batch_keeps_the_equal_share():
         _token_mean(per_token_loss, mask, [i for i, t in enumerate(tasks) if t == task]) / 3
         for task in ("alfworld", "webshop", "search")
     )
-    assert got == pytest.approx(expected, rel=_REL)
+    assert got == pytest.approx(expected, rel=_WEIGHT_PRECISION)
 
 
 def test_short_final_mini_batch_keeps_the_magnitude():
@@ -264,4 +269,4 @@ def test_short_final_mini_batch_keeps_the_magnitude():
     got = _replay_actor(
         batch, mask.double() * 0.5, mini_batch_size=12, dp_world_size=2, micro_batch_size=3
     )
-    assert got == pytest.approx(0.5, rel=_REL)
+    assert got == pytest.approx(0.5, rel=_WEIGHT_PRECISION)
