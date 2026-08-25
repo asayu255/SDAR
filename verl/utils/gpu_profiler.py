@@ -753,6 +753,13 @@ _PHASE_ORDER = [
     # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
     # execution order so the interior of a step reads top to bottom.
     "actor.fwd",
+    # Only present on the sign-weighted arms, and only inside update_actor: the
+    # on-task teacher resolved at the support (student-indexed arms only), then
+    # the three frozen models the weights read. Listed because unlisted phases
+    # fall to a sorted tail after the ordered ones, which puts the mechanism's
+    # own cost -- about a quarter of the step -- below the stage that follows it.
+    "actor.teacher_lookup",
+    "actor.sign_weight",
     "actor.bwd",
     "actor.task_metrics",
     "actor.optim",

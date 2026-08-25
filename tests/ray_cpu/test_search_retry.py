@@ -64,6 +64,20 @@ class _Session:
 
 
 @pytest.fixture(autouse=True)
+def _un_batched(monkeypatch):
+    """One request at a time, which is what every test in this file is about.
+
+    call_search_api now coalesces concurrent queries, and a leader holds its
+    window open with a time.sleep before the request goes out. That sleep is not
+    a retry backoff, but it lands in _no_sleeping ahead of one -- which is how
+    test_backoff_is_capped came to read the 10ms window as the first attempt's
+    1s. Batching has its own file (tests/ray_cpu/test_search_batching.py); here
+    the wrapper degenerates to a direct send and the retry loop is what is left.
+    """
+    monkeypatch.setattr(mod, "_BATCH_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_sleeping(monkeypatch):
     """Backoff is asserted on separately; every other test runs at full speed."""
     slept = []
