@@ -916,6 +916,31 @@ class RayPPOTrainer:
         """
         return hashlib.sha1(responses.cpu().numpy().tobytes()).hexdigest()[:12]
 
+    @staticmethod
+    def _decode_for_val_table(tokenizer, ids_rows, limit):
+        """Decode rows for the logged sample table, or nothing when it is off.
+
+        The table is capped at ``trainer.log_val_generations`` samples and this
+        repo runs it at 0 -- yet every validation row's prompt AND response were
+        decoded on the calling thread to feed it. The reward manager had the same
+        bug on the same thread (fixed there by gating on ``num_examine``).
+        """
+        if not limit:
+            return []
+        return [tokenizer.decode(ids, skip_special_tokens=True) for ids in ids_rows]
+
+    @staticmethod
+    def _response_digest(responses):
+        """A short fingerprint of a batch's generated token ids.
+
+        Any change that claims to leave generation alone -- a session hoist, a
+        reused tokenisation, a merged generate call -- has to be shown to produce
+        the same TOKENS, not only the same scores. Batches are consumed in
+        dataloader order, so equal digests at the same batch index mean equal
+        generations, row for row.
+        """
+        return hashlib.sha1(responses.cpu().numpy().tobytes()).hexdigest()[:12]
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
