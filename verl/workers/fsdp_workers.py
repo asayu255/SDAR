@@ -38,6 +38,7 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.phase_timing import PhaseTimer, mark as _mark
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
@@ -166,17 +167,7 @@ def get_sharding_strategy(device_mesh, fsdp_config=None):
 # guessed at. What the driver measures MINUS what this prints is the Ray round
 # trip, which is the one leg neither side can time alone.
 _GEN_PHASE_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
-_GEN_PHASE_EVERY = int(os.environ.get("ROLLOUT_GEN_PHASE_EVERY", "50"))
 _GEN_PHASES = ("to_device", "preprocess", "generate", "postprocess", "to_cpu")
-
-
-def _mark(marks, name, start):
-    """Record the span since ``start`` under ``name``; return the new start."""
-    if marks is None:
-        return start
-    now = time.perf_counter()
-    marks[name] = now - start
-    return now
 
 
 class ActorRolloutRefWorker(Worker):
@@ -860,25 +851,16 @@ class ActorRolloutRefWorker(Worker):
 
     def _record_gen_phases(self, marks):
         """Accumulate one call's phase times; print the mean every N calls."""
-        totals = getattr(self, "_gen_phase_totals", None)
-        if totals is None:
-            totals = self._gen_phase_totals = dict.fromkeys(_GEN_PHASES, 0.0)
-            self._gen_phase_calls = 0
-        for name in _GEN_PHASES:
-            totals[name] += marks.get(name, 0.0)
-        self._gen_phase_calls += 1
-        if _GEN_PHASE_EVERY <= 0 or self._gen_phase_calls % _GEN_PHASE_EVERY:
-            return
-        if getattr(self, "_rank", None) not in (0, None):
-            return
-        n = self._gen_phase_calls
-        parts = "  ".join(f"{name} {totals[name] / n:.2f}" for name in _GEN_PHASES)
-        print(
-            f"[gen-phases] rank 0, mean over {n} calls (s): {parts}  "
-            f"worker-total {sum(totals.values()) / n:.2f}  "
-            "(driver's gen column minus this = the Ray round trip)",
-            flush=True,
-        )
+        timer = getattr(self, "_gen_phase_timer", None)
+        if timer is None:
+            timer = self._gen_phase_timer = PhaseTimer(
+                "gen-phases",
+                _GEN_PHASES,
+                every=int(os.environ.get("ROLLOUT_GEN_PHASE_EVERY", "50")),
+                note="(driver's gen column minus this = the Ray round trip)",
+                rank=lambda: getattr(self, "_rank", None),
+            )
+        timer.record(marks)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):

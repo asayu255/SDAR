@@ -54,7 +54,7 @@ def _call(worker, generate=1.0, **rest):
 
 
 def test_nothing_is_printed_before_the_period_is_up(monkeypatch, capsys):
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 50)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "50")
     worker = _Worker()
     for _ in range(49):
         _call(worker)
@@ -62,19 +62,19 @@ def test_nothing_is_printed_before_the_period_is_up(monkeypatch, capsys):
 
 
 def test_the_mean_is_printed_on_the_period(monkeypatch, capsys):
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 10)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "10")
     worker = _Worker()
     for _ in range(10):
         _call(worker, generate=2.0)
     out = capsys.readouterr().out
     assert "[gen-phases] rank 0, mean over 10 calls" in out
     assert "generate 2.00" in out
-    assert "worker-total 2.18" in out
+    assert "total 2.18" in out
 
 
 def test_the_mean_is_over_every_call_not_the_last_period(monkeypatch, capsys):
     """A counter that reset each period would report noise as the mean."""
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 10)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "10")
     worker = _Worker()
     for _ in range(10):
         _call(worker, generate=1.0)
@@ -87,17 +87,17 @@ def test_the_mean_is_over_every_call_not_the_last_period(monkeypatch, capsys):
 
 
 def test_only_rank_zero_prints(monkeypatch, capsys):
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 5)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "5")
     worker = _Worker(rank=2)
     for _ in range(5):
         _call(worker)
     assert capsys.readouterr().out == ""
     # but it still accumulated, so the rank is a print filter and not a gate
-    assert worker._gen_phase_calls == 5
+    assert worker._gen_phase_timer.calls == 5
 
 
 def test_a_zero_period_turns_the_print_off(monkeypatch, capsys):
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 0)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "0")
     worker = _Worker()
     for _ in range(100):
         _call(worker)
@@ -107,7 +107,7 @@ def test_a_zero_period_turns_the_print_off(monkeypatch, capsys):
 def test_a_missing_phase_counts_as_zero(monkeypatch, capsys):
     """The no-session branch and the session branch record the same names, but a
     partial call must not raise inside the thing being measured."""
-    monkeypatch.setattr(fsdp_workers, "_GEN_PHASE_EVERY", 1)
+    monkeypatch.setenv("ROLLOUT_GEN_PHASE_EVERY", "1")
     worker = _Worker()
     worker._record_gen_phases({"generate": 1.5})
     out = capsys.readouterr().out
