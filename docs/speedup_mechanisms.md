@@ -46,9 +46,25 @@
 | E2 active-only decode | 既定 on | 2 | ビット同一 |
 | E3 compact per-turn record | 既定 on | 2 | ビット同一 |
 | C env reset prefetch | `ENV_RESET_PREFETCH=1`（script が export） | 2 | ビット同一 |
+| **検索リクエストのバッチ化** | `SEARCH_BATCH_REQUESTS`（**既定 on**、export 不要） | 7 | 同一クエリ・同一順序・同一文書 |
 | `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
 | rollout log-prob を作らない | `rollout.return_rollout_log_probs=False` | 5 | 生成トークン不変 |
 | session 中の `empty_cache` 抑止 | コード（常時、session 中のみ） | 5 | ビット同一 |
+
+**検索リクエストのバッチ化は `claude/gpu-utilization-optimization-j1piv8` からの移植。**
+`e5_Flat` は全探索なので1クエリで約 32 GB の埋め込みを全部読む。126 並行だと 32 GB を 126 回
+読むことになり、無負荷 80 ms のクエリが 7.5 秒に膨らむ ―― 両サーバプロセスが同じ 2 枚を共有
+しているので、レプリカを増やしても帯域は増えない。クライアント側に 10 ms 窓のコアレッサを置き、
+溜まったクエリを 1 リクエストで送る。各呼び出し元は `{"result": [documents]}` という**単一
+クエリと同じ形**を受け取るので、env の意味論には触れていない。移植元の実測で search batch の
+`envs.step` が 10.60s → 1.17s、評価全体 2.85h → 1.73h、GPU 利用率 51.8% → 83.0%。
+
+**サーバ側の再起動が要る。**`examples/search/retriever/retrieval_server.py` の
+`QueryRequest.query` が `Union[str, List[str]]` になっている必要がある。**古いクライアントは
+そのまま動く**ので再起動のタイミングは調整不要だが、**再起動するまで効果は出ない** ――
+クライアントはリストを 1 回送って拒否され、単発にフォールバックしてその URL のバッチ化を
+300 秒止める（`SEARCH_BATCH_RETRY_S`）。従来動作 + 5 分に 1 回の無駄リクエストである。
+`SEARCH_BATCH_REQUESTS=0` で完全に無効化できる。
 
 **5 期の 2 件は「読まれない結果を作るのをやめた」もの。** `rollout_log_probs` の消費者は
 `RayPPOTrainer.fit` の drift 検査（`rollout_probs_diff`）だけで、比較対象の `old_log_prob`
@@ -626,6 +642,7 @@ export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
 export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 # 既定 on: ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD
 #          ROLLOUT_PREFETCH_TEACHER_ADAPTIVE（chunk を glue に追従。128 が下限 / 512 が上限）
+#          SEARCH_BATCH_REQUESTS（窓 SEARCH_BATCH_WINDOW_MS=10、拒否時の再探索 SEARCH_BATCH_RETRY_S=300）
 # 立てない: ROLLOUT_PREFETCH_LOGPROB（消費側が無い）、GPU_PROFILER_SYNC_PHASES（遅くなる）
 # 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1 GPU_PROFILER_ROLLUP_EVERY=1
 bash examples/opd_trainer/run_multitask_qwen3.sh env.search.search_url=http://<host>:8000/retrieve
