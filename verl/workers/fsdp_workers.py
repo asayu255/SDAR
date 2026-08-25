@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import time
 import warnings
 from typing import Union
 
@@ -150,6 +151,32 @@ def get_sharding_strategy(device_mesh, fsdp_config=None):
             f"{device_mesh.ndim}-D mesh; choose one of {sorted(alternatives)}"
         )
     return alternatives[requested]
+
+
+# Per-call breakdown of generate_sequences, printed from rank 0 every N calls.
+#
+# The driver measures this call as one number and the GPU sampler says the GPU is
+# idle for a fixed ~0.65 s of it, whatever the call contains -- a per-call cost,
+# not one that scales with the data. That number is the largest single item left
+# in the evaluation (a search batch pays it once per turn), and the driver cannot
+# see inside it: the Ray round trip, the sharding manager's data reshaping, the
+# engine call and the detokenisation are one opaque span from out there.
+#
+# Summed here and printed as a mean, so the cost is attributed rather than
+# guessed at. What the driver measures MINUS what this prints is the Ray round
+# trip, which is the one leg neither side can time alone.
+_GEN_PHASE_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
+_GEN_PHASE_EVERY = int(os.environ.get("ROLLOUT_GEN_PHASE_EVERY", "50"))
+_GEN_PHASES = ("to_device", "preprocess", "generate", "postprocess", "to_cpu")
+
+
+def _mark(marks, name, start):
+    """Record the span since ``start`` under ``name``; return the new start."""
+    if marks is None:
+        return start
+    now = time.perf_counter()
+    marks[name] = now - start
+    return now
 
 
 class ActorRolloutRefWorker(Worker):
@@ -832,9 +859,35 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def _record_gen_phases(self, marks):
+        """Accumulate one call's phase times; print the mean every N calls."""
+        totals = getattr(self, "_gen_phase_totals", None)
+        if totals is None:
+            totals = self._gen_phase_totals = dict.fromkeys(_GEN_PHASES, 0.0)
+            self._gen_phase_calls = 0
+        for name in _GEN_PHASES:
+            totals[name] += marks.get(name, 0.0)
+        self._gen_phase_calls += 1
+        if _GEN_PHASE_EVERY <= 0 or self._gen_phase_calls % _GEN_PHASE_EVERY:
+            return
+        if getattr(self, "_rank", None) not in (0, None):
+            return
+        n = self._gen_phase_calls
+        parts = "  ".join(f"{name} {totals[name] / n:.2f}" for name in _GEN_PHASES)
+        print(
+            f"[gen-phases] rank 0, mean over {n} calls (s): {parts}  "
+            f"worker-total {sum(totals.values()) / n:.2f}  "
+            "(driver's gen column minus this = the Ray round trip)",
+            flush=True,
+        )
+
     def generate_sequences(self, prompts: DataProto):
+        marks = {} if _GEN_PHASE_TIMING else None
+        _t = time.perf_counter()
         # Support all hardwares
         prompts = prompts.to(get_torch_device().current_device())
+        if marks is not None:
+            marks["to_device"] = time.perf_counter() - _t
 
         assert self._is_rollout
         if self.rollout is None:
@@ -861,9 +914,13 @@ class ActorRolloutRefWorker(Worker):
         self._rollout_generate_calls = getattr(self, "_rollout_generate_calls", 0) + 1
         if getattr(self, "_rollout_session_active", False):
             self._rollout_session_generates = getattr(self, "_rollout_session_generates", 0) + 1
+            _t = time.perf_counter()
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            _t = _mark(marks, "preprocess", _t)
             output = self.rollout.generate_sequences(prompts=prompts)
+            _t = _mark(marks, "generate", _t)
             output = self.rollout_sharding_manager.postprocess_data(output)
+            _mark(marks, "postprocess", _t)
         else:
             # Said once, because it is the difference between one wake per rollout
             # and one per turn -- 21 GB of vLLM state unmapped and remapped every
@@ -883,14 +940,22 @@ class ActorRolloutRefWorker(Worker):
             with self.rollout_sharding_manager:
                 log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
+                _t = time.perf_counter()
                 prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                _t = _mark(marks, "preprocess", _t)
                 output = self.rollout.generate_sequences(prompts=prompts)
+                _t = _mark(marks, "generate", _t)
 
                 log_gpu_memory_usage("After rollout generation", logger=logger)
 
                 output = self.rollout_sharding_manager.postprocess_data(output)
+                _mark(marks, "postprocess", _t)
 
+        _t = time.perf_counter()
         output = output.to("cpu")
+        if marks is not None:
+            marks["to_cpu"] = time.perf_counter() - _t
+            self._record_gen_phases(marks)
 
         # clear kv cache -- but NOT inside a rollout session. This call releases
         # cached blocks back to the driver and forces a device synchronize, and it

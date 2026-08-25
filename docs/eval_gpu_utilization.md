@@ -539,3 +539,57 @@ turn table には `genGPU%` と `perGPU%` の列が最初からあるが、**評
 | `data.val_batch_size` だけ上げる | 同上 | **不可。** env manager が同じ値で size されるので alfworld の worker 数が変わり、`seed + i // group_n` で引く game が変わって**採点が変わる** |
 
 **まだどれも着手していない。`genGPU%` の実測が先である。**
+
+## 8. `genGPU%` の実測 —— 尻尾ではなく、呼び出し固定費だった
+
+サンプラを起動して初めて読めた値(2026-08-25、depth 2、10 turn の batch):
+
+| turn | active | gen (s) | genGPU% | perGPU% | **GPU が空いた秒** |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 0 | 126 | 2.08 | 72 | 72/72/71 | 0.58 |
+| 1 | 126 | 3.43 | 79 | 79/79/79 | 0.72 |
+| 2 | 126 | 3.25 | 80 | 80/79/80 | 0.65 |
+| 5 | 110 | 4.02 | 69 | 60/79/68 | 1.25 |
+| 9 | 89 | 2.85 | 77 | 77/77/78 | 0.66 |
+
+**7 節の読みは外れた。** 満員(active=126)でも SM は 72〜80% しかなく、
+**active が減っても util はほとんど下がらない**(126 で 79%、89 で 77%)。
+尻尾の席が空いているという話ではなかった。
+
+`perGPU%` は 3 枚とも揃っているので **DP の偏りでもない**(この分岐は閉じた)。
+
+代わりに出たのは **呼び出し 1 回あたり約 0.65 s の固定した GPU 空き**である。
+turn の長さにも active 数にも比例していない。データ量に比例する転送コストなら、
+長い履歴を送る後半 turn ほど util が下がるはずだが、**逆に上がっている**。
+
+`_gw0.._gw1` は `actor_rollout_wg.generate_sequences()` 全体を囲っているので、
+この 0.65 s には driver→Ray→worker の往復、sharding manager の per-call
+前後処理、vLLM 入口、出力の detokenize が入っている。**turn ごとに 1 回払う** ——
+search batch(4 turn)で 2.6 s、10 turn の batch で 6.5 s。
+
+設定ミスではない。`enforce_eager=False`(CUDA graph 有効)、
+`enable_prefix_caching` 既定 True、`perGPU%` 均等。
+
+### 中身を割る —— worker 側の per-call 計測
+
+driver からは 1 つの不透明な span なので、worker 側で
+`to_device / preprocess / generate / postprocess / to_cpu` を積算し、
+rank 0 が N 回ごとに平均を出すようにした(`ROLLOUT_TURN_TIMING=1` で有効、
+`ROLLOUT_GEN_PHASE_EVERY` で周期、既定 50)。
+
+```
+[gen-phases] rank 0, mean over 50 calls (s): to_device 0.02  preprocess 0.31  generate 2.55  postprocess 0.09  to_cpu 0.12  worker-total 3.09  (driver's gen column minus this = the Ray round trip)
+```
+
+**driver の `gen` 列からこの `worker-total` を引いた差が Ray の往復**で、
+これは片側だけでは絶対に測れない唯一の脚である。0.65 s がどの脚にあるかで
+打ち手が変わる:
+
+| 大きい脚 | 意味 | 打ち手 |
+| --- | --- | --- |
+| Ray の往復(差分) | turn ごとに全履歴を padded tensor で送り直している | `raw_prompt_ids` だけ送る。attention_mask と position_ids は vLLM に不要 |
+| `preprocess` / `postprocess` | sharding manager の per-call データ整形 | 整形自体を削るか、GPU 上で行う |
+| `to_cpu` | 出力の転送 | 非同期化 |
+| `generate` の中 | vLLM 自身の per-step CPU | vLLM 側の設定・版 |
+
+**未測定。次の run で `[gen-phases]` を読むこと。**
