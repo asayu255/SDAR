@@ -34,6 +34,8 @@
 | **search の val batch 252 行** | ms/row **94.8 → 78.0** | OFF(§6) |
 | **`VAL_PIPELINE_DEPTH=3` + generate 合流** | ms/row **74 → 57** | OFF(§6) |
 | 採点時の無駄な detokenize 削除 | 数%(504 回 → 1 回/batch) | ON |
+| **ログ用テーブルの全行 decode 停止** | `log_val_generations=0` なのに全 52k 行の prompt+response を decode していた | ON |
+| **raw_prompt の二重 tokenize 停止** | 同一文字列を 2 回 encode(turn ごと 252 回)。最初の 8 呼び出しで新旧一致を自己検証し、不一致なら永久フォールバック | ON |
 
 ### 効いた理由が直感と違うもの
 
@@ -259,8 +261,10 @@ bash examples/sft_trainer/eval_checkpoints.sh \
    —— この値が alfworld の episode を決めるからである。効果が確認できたら
    マッピング形に書き換えて、決定をファイルに残すこと。
 2. **採点の突き合わせが未了。** 合流は呼び出しごとの batch 形状を変えるので、
-   greedy でも reduction 順序が変われば token が稀に変わりうる。
-   **合流あり / なしで `val/search/test_score` を wandb で照合すること。**
+   greedy でも reduction 順序が変われば token が稀に変わりうる。判定は 2 段:
+   `val/search/test_score` の一致(wandb)と、**`[val-hash]` 行の一致**
+   (batch ごとの応答 token 列の sha1。同じ batch 番号で digest が揃えば
+   token 単位で同一)。score より強い後者を先に見るのがよい。
 
 ---
 

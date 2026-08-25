@@ -18,6 +18,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import uuid
@@ -857,6 +858,33 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
+    @staticmethod
+    def _decode_for_val_table(tokenizer, ids_rows, limit):
+        """Decode rows for the logged sample table, or nothing when it is off.
+
+        The table is capped at ``trainer.log_val_generations`` samples and this
+        arm runs it at 0 -- yet every validation row's prompt AND response were
+        decoded on the calling thread to feed it: 104,000 detokenisations per
+        evaluation for a table that was never logged. The reward manager had the
+        same bug on the same thread.
+        """
+        if not limit:
+            return []
+        return [tokenizer.decode(ids, skip_special_tokens=True) for ids in ids_rows]
+
+    @staticmethod
+    def _response_digest(responses):
+        """A short fingerprint of a batch's generated token ids.
+
+        The merge of queued generate calls regroups rows inside a call, and
+        greedy decoding is only reduction-order deterministic -- so its adoption
+        gate is that scores AND tokens match an unmerged run. Scores are in
+        wandb; this line is the token half. Batches retire in submission order
+        and hold the same rows in any config with the same batching, so equal
+        digests at the same batch index mean equal generations, row for row.
+        """
+        return hashlib.sha1(responses.cpu().numpy().tobytes()).hexdigest()[:12]
+
     def _validation_batch_sampler(self):
         """Group validation rows by task, at each task's own batch size.
 
@@ -956,7 +984,7 @@ class RayPPOTrainer:
         # Store original inputs
         input_ids = test_batch.batch["input_ids"]
         # TODO: Can we keep special tokens except for padding tokens?
-        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+        input_texts = self._decode_for_val_table(self.tokenizer, input_ids, self.config.trainer.log_val_generations)
 
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
@@ -1028,6 +1056,7 @@ class RayPPOTrainer:
         # clock on NVML -- and the search rollouts are 24 s each, far too short to
         # amortise it. The worker counts scopes, so the inner 413 become no-ops.
         reset_batch_wall()
+        val_batch_index = 0
         with rollout_session(self.actor_rollout_wg):
             slots = self._validation_slots()
             for prepared, test_output_gen_batch in run_pipelined(
@@ -1048,8 +1077,13 @@ class RayPPOTrainer:
                 test_batch = test_output_gen_batch
                 # Store generated outputs
                 output_ids = test_output_gen_batch.batch["responses"]
-                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-                sample_outputs.extend(output_texts)
+                print(
+                    f"[val-hash] batch#{val_batch_index} rows={output_ids.shape[0]} "
+                    f"responses sha1 {self._response_digest(output_ids)}",
+                    flush=True,
+                )
+                val_batch_index += 1
+                sample_outputs.extend(self._decode_for_val_table(self.tokenizer, output_ids, self.config.trainer.log_val_generations))
 
                 # test_batch = test_batch.union(test_output_gen_batch)
 

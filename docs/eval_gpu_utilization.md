@@ -1139,16 +1139,28 @@ for item in items:          # ← next(dataloader) はここ。計測外だっ�
 **8 batch ごとに一番遅い worker を待つ**構造で、観測された「8〜10 batch ごと」と
 一致する。1 batch は 252 行の tokenize(最大 4096 トークン)である。
 
-`dataload` と **その最悪値**を計測に追加した(平均だけでは周期的な 30 秒の
-待ちが 46 本に薄まって見えなくなる)。
+`dataload` と **その最悪値**を計測に追加した(平均だけでは周期的な待ちが
+薄まって見えなくなる)。
+
+### 実測 —— loader も外れ
 
 ```
-Calling thread: dataload 210.4s (worst single wait 31.2s), prepare 5.0s,
-  scoring 17.5s, waiting on a slot 746.8s.
+Calling thread: dataload 1.7s (worst single wait 0.4s), prepare 5.8s,
+  scoring 19.2s, waiting on a slot 734.7s.
 ```
 
-**未測定。** `worst single wait` が数十秒なら loader で確定、1 秒未満なら
-loader ではなく、次は「3 slot が同時に envstep に入る同期」を疑うことになる。
+**dataload は 25 batch で 1.7 秒、最悪 0.4 秒。** loader 仮説は死んだ。
+(この節の草稿には説明用に 31.2s という架空の例が書いてあり、それが
+実測値として引用される事故が起きた。**例示の数字を実測と同じ形式で書いては
+ならない。**)
+
+呼び出しスレッドの合計は 26.7s / 760.3s = **3.5%**。残る説明は一つ:
+**GPU の外の処理が slot 間で取り合いになり、揃って遅くなる**。実測で
+preproc は depth 2 → 3 で 2.7 → 3.9 s、envstep は 2.0 → 3.0 s(1.5 倍)。
+独立なら伸びない。取り合って一緒に遅くなるから位相が揃い、3 slot 同時に
+GPU の外にいる時間(wall の 10.6%)ができる。preproc は Python の tokenize
+なので GIL、envstep は 3 倍のクエリを受ける retriever(どちらも推測、
+プロファイル未取得)。まとめは `eval_performance_summary.md` §4。
 
 ## 19. 採点が 1 batch につき 504 回 detokenize して 503 回捨てていた
 
