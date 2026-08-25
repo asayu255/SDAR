@@ -84,6 +84,34 @@ _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").st
 # overhead is removed (and vLLM's prefix cache can persist across turns). Opt-in;
 # OFF reproduces the current per-turn behavior exactly.
 _ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
+_SAID_ROLLOUT_ENV = False
+
+
+def _say_rollout_env():
+    """Print, once, the flags as THIS process resolved them.
+
+    They are read at import time in whichever process runs the rollout loop --
+    the trainer Ray actor, not the launcher and not the rollout workers. On the
+    eval arm that distinction cost 10.4% of wall clock and took an nvidia-smi
+    trace to notice, because a driver that never calls begin_rollout_session()
+    and one whose workers refuse to open a session look identical from outside:
+    vLLM wakes and sleeps every turn either way. Reading the value off the
+    process that actually branches on it is the only reading that answers the
+    question.
+    """
+    global _SAID_ROLLOUT_ENV
+    if _SAID_ROLLOUT_ENV:
+        return
+    _SAID_ROLLOUT_ENV = True
+    print(
+        f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
+        f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
+        f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
+        f"; ROLLOUT_TURN_TIMING={'on' if _ROLLOUT_TURN_TIMING else 'off'}"
+        f"; GPU_PROFILER={os.environ.get('GPU_PROFILER', '<unset>')!r} -> the turn table's "
+        f"genGPU%/perGPU% columns will be {'filled' if gpu_profiler.enabled() else 'EMPTY (-)'}",
+        flush=True,
+    )
 
 # Decode only the rows that were actually generated this turn. Finished rows'
 # scattered filler is all pad tokens, which batch_decode(skip_special_tokens=True)
@@ -305,6 +333,7 @@ def rollout_session(actor_rollout_wg):
     A no-op when ROLLOUT_KEEP_VLLM_AWAKE is off, and on any rollout that is not
     vLLM's -- the worker decides that, not this.
     """
+    _say_rollout_env()
     if not _ROLLOUT_KEEP_VLLM_AWAKE:
         yield
         return
