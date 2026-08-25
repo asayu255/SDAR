@@ -1177,13 +1177,55 @@ class DataParallelPPOActor(BasePPOActor):
         # reduce_metrics would have.
         deferred_metrics = {}
 
-        def _defer(name, value):
-            deferred_metrics.setdefault(name, []).append(value.detach())
+        def _defer(name, value, weight=None):
+            deferred_metrics.setdefault(name, []).append(
+                (value.detach(), None if weight is None else weight.detach())
+            )
+
+        def _defer_task(name, loss_mat, mask):
+            """A task's token-mean for this micro-batch, deferred with its presence.
+
+            Written out rather than calling agg_loss so an absent task yields 0
+            instead of 0/0: the read at the end divides the sum of the values by
+            the number of micro-batches the task appeared in, which is the same
+            average the per-task metric has always reported -- it just no longer
+            needs the device to tell the host which micro-batches those were.
+
+            The formula is token-mean, which is why sync_free_task_metrics below
+            also requires loss_agg_mode to be token-mean. Under seq-mean-* this
+            would be a different quantity reported under the same name, and
+            nothing would say so.
+            """
+            den = mask.sum()
+            value = (loss_mat * mask).sum() / den.clamp(min=1)
+            _defer(name, value, weight=(den > 0).to(value.dtype))
 
         # Pooled across every micro-batch of this call and rendered once at the
         # end. Ratios cannot be emitted per micro-batch: the reducer would average
         # them, and a micro-batch with fewer valid tokens would weigh as much as a
         # full one.
+        # Whether the per-task metric loop can run over ALL tasks, including the
+        # ones with no rows in this micro-batch, and so skip the device read that
+        # would say which those are -- torch.unique(...).tolist(), one host sync
+        # per micro-batch. It can exactly when every metric the loop computes is
+        # deferred: the branches below that call .item() inside the loop would
+        # turn an absent task into a NaN, and would be paying a sync each anyway.
+        # That is the pure-OPD shape, which inject_opd_config forces and the
+        # intent locks pin -- teacher-KL only, no policy gradient, entropy,
+        # reference KL or SD terms.
+        #
+        # loss_agg_mode is in the condition because _defer_task hard-codes the
+        # token-mean formula; the aggregation is not a term that can be switched
+        # off, so it has to be checked rather than assumed.
+        sync_free_task_metrics = (
+            pg_loss_coef == 0
+            and self.config.entropy_coeff == 0
+            and not self.config.use_kl_loss
+            and not self.config.get("use_sdl_loss", False)
+            and not self.config.get("use_sdar_loss", False)
+            and self.config.loss_agg_mode == "token-mean"
+        )
+
         sign_stats = SignWeightStats(task_names=task_id_names) if sign_enabled else None
 
         for epoch in range(self.config.ppo_epochs):
@@ -1605,7 +1647,9 @@ class DataParallelPPOActor(BasePPOActor):
                         # separately anyway: this phase is where the backward's
                         # queued reduce-scatter tail drains.
                         with _actor_phase("actor.task_metrics"), torch.no_grad():
-                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                            for task, rows in iter_task_row_masks(
+                                task_ids, task_id_names, include_absent=sync_free_task_metrics
+                            ):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
 
@@ -1667,10 +1711,20 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    _defer(
-                                        f"actor/teacher_kl_loss/{task}",
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
-                                    )
+                                    if sync_free_task_metrics:
+                                        # rows may select nothing here; _defer_task
+                                        # carries the presence so an absent task
+                                        # contributes 0 rather than NaN.
+                                        _defer_task(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            teacher_kld[rows],
+                                            task_response_mask,
+                                        )
+                                    else:
+                                        _defer(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        )
 
                                 append_to_dict(metrics, task_metrics)
 
@@ -1714,9 +1768,17 @@ class DataParallelPPOActor(BasePPOActor):
             if sign_mode == "position":
                 self._refresh_sign_position_means(sign_stats, task_id_names)
         # The one read for everything deferred above. torch.stack forces a single
-        # host sync here instead of one per micro-batch.
-        for name, values in deferred_metrics.items():
-            metrics[name] = torch.stack(values).mean().item()
+        # host sync here instead of one per micro-batch. Entries carrying a
+        # presence weight are summed and divided by how many micro-batches
+        # actually held the task, which is the mean the unweighted path took over
+        # exactly those.
+        for name, entries in deferred_metrics.items():
+            values = torch.stack([value for value, _ in entries])
+            if entries[0][1] is None:
+                metrics[name] = values.mean().item()
+            else:
+                present = torch.stack([weight for _, weight in entries])
+                metrics[name] = (values.sum() / present.sum().clamp(min=1)).item()
         if _PROFILE_STAGES:
             # One table per update_policy call. The driver's boundary phase
             # ("step") never pops in this process, so the report is asked for

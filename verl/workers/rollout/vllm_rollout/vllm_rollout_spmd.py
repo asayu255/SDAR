@@ -28,6 +28,7 @@ When working with Megatron:
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Dict, List, Union
@@ -41,6 +42,7 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 
 from verl import DataProto
+from verl.utils.phase_timing import PhaseTimer
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
@@ -89,6 +91,31 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+
+# Where a generate_sequences call's seconds go, split at the engine boundary.
+#
+# Measured from outside, the call leaves the GPU idle for a fixed span whatever
+# it carries -- and the worker's own legs (device transfer, the sharding
+# manager's reshaping, detokenisation, the trip back) all time near zero. That
+# puts the cost inside this function, but "inside vllm.generate" and "inside the
+# Python around it" are different problems with different fixes, and from the
+# worker they are one number.
+#
+# So: the input list build, the engine call, and the output assembly are timed
+# separately. The assembly in particular is a Python loop over every response
+# followed by a pad-and-concatenate, which for a few hundred rows of up to 512
+# tokens is not obviously cheap.
+#
+# Same flag as the worker-side breakdown, so one env var turns on both halves of
+# the same question.
+_ROLLOUT_PHASE_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
+_ROLLOUT_PHASES = PhaseTimer(
+    "rollout-phases",
+    ("build_inputs", "engine", "assemble"),
+    every=int(os.environ.get("ROLLOUT_GEN_PHASE_EVERY", "50")),
+    note="(engine = vllm; the other two are the Python around it)",
+)
 
 
 class vLLMRollout(BaseRollout):
@@ -266,6 +293,9 @@ class vLLMRollout(BaseRollout):
         ):
             self.inference_engine.init_cache_engine()
 
+        _phase_t = time.perf_counter() if _ROLLOUT_PHASE_TIMING else None
+        _phase_marks = {} if _ROLLOUT_PHASE_TIMING else None
+
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -325,6 +355,10 @@ class vLLMRollout(BaseRollout):
                 lora_int_id=lora_int_ids[0]
                 lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
 
+        if _phase_marks is not None:
+            _phase_marks["build_inputs"] = time.perf_counter() - _phase_t
+            _phase_t = time.perf_counter()
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
@@ -333,6 +367,10 @@ class vLLMRollout(BaseRollout):
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
+
+            if _phase_marks is not None:
+                _phase_marks["engine"] = time.perf_counter() - _phase_t
+                _phase_t = time.perf_counter()
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -403,6 +441,10 @@ class vLLMRollout(BaseRollout):
             and self.config.free_cache_engine
         ):
             self.inference_engine.free_cache_engine()
+
+        if _phase_marks is not None:
+            _phase_marks["assemble"] = time.perf_counter() - _phase_t
+            _ROLLOUT_PHASES.record(_phase_marks)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
