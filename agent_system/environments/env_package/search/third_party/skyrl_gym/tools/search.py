@@ -38,24 +38,8 @@ RETRY_PROGRESS_EVERY = 60.0
 # the first one for a short window and sending whatever accumulated as a single
 # request turns those 126 reads into one, without the environments knowing.
 _BATCH_ENABLED = os.environ.get("SEARCH_BATCH_REQUESTS", "1").strip().lower() not in ("0", "false", "no", "")
-# 100 ms, and NOT the 10 ms this used to be. "Within a few milliseconds of each
-# other" is what the fan-out intends, not what it achieves: 252 threads are
-# started at once (search/envs.py: max_workers = min(batch_size, 256)) but reach
-# this call under the GIL, one at a time, over roughly 300 ms. A 10 ms window
-# therefore opened and closed about thirty times per turn and sent about eight
-# queries each, and those thirty requests then fought over the retriever's single
-# GPU encoder -- the same 3-query request measured 42 ms and 432 ms depending on
-# what else was in flight.
-#
-# Measured, one turn of a 252-row search batch:
-#
-#     window 10 ms  -> envstep 28.32 s,  gen share 37-46%
-#     window 100 ms -> envstep  0.34 s,  gen share 90-94%
-#
-# The window is paid once per turn per pipeline slot and only when there is a
-# query to hold, so 100 ms buys an 80x reduction for 0.4 s across a batch. Going
-# further has little left to win: what remains is 0.34 s.
-_BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "100")) / 1000.0
+# Long enough to catch a fan-out, short enough to be noise against an 80 ms query.
+_BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "10")) / 1000.0
 # How long a URL stays un-batched after it rejects a list. A retriever restarted
 # with a server that does take lists is the usual reason the answer changes, and
 # nothing else would ever tell us: the flag is set once and an evaluation runs
@@ -98,46 +82,6 @@ class _RetryableServerError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.attempts = attempts
-# CONNECT is bounded separately from READ, because they fail for different
-# reasons and only one of them is worth waiting out.
-#
-# `timeout=600` is a scalar, and requests applies a scalar to both phases. So a
-# route that has gone away -- [Errno 113] No route to host, which is what a
-# WireGuard/Tailscale hiccup looks like from here -- hangs in connect() while
-# the kernel retries ARP, and the caller sits there. Measured in one 45-minute
-# evaluation: "search recovered after 2 attempts (41s)", "(33s)", "(40s)" --
-# one attempt, one backoff, and about forty seconds inside a single connect.
-#
-# Those forty seconds are not one row's. The coalescing window's followers wait
-# on the leader with no bound (deliberately -- see _Coalescer.call), so one
-# stalled connect holds every row in the window, and with three pipeline slots
-# on one retriever it holds all three. In the system stream it looks like the
-# whole node died: GPU 0%, its memory controller 0%, host CPU flat, no disk, no
-# extra network. That accounted for most of what was left of the GPU deficit.
-#
-# A healthy retriever accepts in well under a second on a LAN or a tailnet, so
-# 5 s is generous for connect and turns a dropped route into one fast retry
-# instead of a forty-second stall. READ stays as configured: a batch of 250
-# queries legitimately takes seconds, and giving up on it would put an error
-# string into the trajectory where a document belongs.
-_CONNECT_TIMEOUT_S = float(os.environ.get("SEARCH_CONNECT_TIMEOUT_S", "5"))
-
-# How long a socket may hold UNACKNOWLEDGED data before the kernel errors it.
-# This is the bound the connect timeout above cannot give: a request that got a
-# connection and then lost its peer is past connect, and Linux would otherwise
-# follow tcp_retries2 (~15 min) or, as measured here, whatever the tunnel outage
-# happened to be (~40 s). See _socket_health_options for the evidence.
-# 0 leaves the kernel default.
-_USER_TIMEOUT_S = float(os.environ.get("SEARCH_TCP_USER_TIMEOUT_S", "10"))
-
-
-def _split_timeout(timeout):
-    """(connect, read) for requests, bounding connect however read is set."""
-    if _CONNECT_TIMEOUT_S <= 0:
-        return timeout
-    if timeout is None:
-        return (_CONNECT_TIMEOUT_S, None)
-    return (min(_CONNECT_TIMEOUT_S, timeout), timeout)
 
 
 def _search_api_request(
@@ -243,7 +187,7 @@ def _search_api_request(
                 retrieval_service_url,
                 headers=headers,
                 json=payload,
-                timeout=_split_timeout(timeout),
+                timeout=timeout,
             )
 
             # Check for Gateway Timeout (504) and other server errors for retrying
@@ -589,105 +533,26 @@ def call_search_api(
     )
 
 
-def _urllib3_default_socket_options():
-    """What urllib3 would have put on the socket if we passed nothing.
-
-    Read from urllib3 rather than hardcoded so a version that adds an option
-    keeps it. The fallback is the value urllib3 has shipped for years, which is
-    the one that matters: TCP_NODELAY off would be a regression, not a default.
-    """
-    try:
-        from urllib3.connection import HTTPConnection
-
-        defaults = HTTPConnection.default_socket_options
-        if defaults:
-            return list(defaults)
-    except Exception as e:  # pragma: no cover - urllib3 internals moved
-        logger.warning(f"could not read urllib3's default socket options ({e}); assuming TCP_NODELAY")
-    import socket
-
-    return [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
-
-
-def _socket_health_options(idle_s: int = 30, interval_s: int = 10, probes: int = 3):
-    """The socket options that decide how fast a dead retriever peer is noticed.
-
-    Two different failures need two different knobs, and only one of them was
-    set here before.
-
-    KEEPALIVE covers an *idle* socket whose peer went away: no data outstanding,
-    nothing to retransmit, so without probes the kernel never learns and the
-    next request rides a corpse. 30 s idle + 3 probes 10 s apart.
-
-    TCP_USER_TIMEOUT covers a socket with data *outstanding* -- the request went
-    out and no acknowledgement came back. Keepalive does not apply (the socket
-    is not idle) and Linux instead follows tcp_retries2, roughly 15 minutes.
-    That is the failure this evaluation actually hits.
-
-    MEASURED, run sft-multitask-eval-20260826-201115: 19 samples of 15 s in
-    which all three GPUs sat at 0% while host CPU, disk, network and thread
-    count were indistinguishable from a busy sample and GPU power fell from
-    282 W to 99 W -- the whole node waiting on an answer that was not coming.
-    The search log dates them: "recovered after 2 attempts (41s)".
-
-    TWO attempts is what identifies the failure. A route that is down for 40 s
-    fails instantly (EHOSTUNREACH is not a wait), so covering 40 s would take
-    about nine attempts with this backoff. Two attempts means the FIRST one
-    spent the whole 40 s inside one wedged socket and the second, on a fresh
-    connection, succeeded at once. Bounding that socket is therefore worth
-    roughly three quarters of the 6.3 points of idle it costs.
-
-    Best-effort: these are platform-specific and urllib3's socket_options kwarg
-    is not public API, so a platform or version that lacks them keeps the OS
-    default rather than failing the run. The retry loop stays correct either
-    way -- it just takes longer to get its turn.
-    """
-    import socket
-
-    # urllib3's socket_options kwarg REPLACES its defaults, it does not extend
-    # them, and its default is TCP_NODELAY. Building this list from scratch
-    # therefore turns Nagle back on for the one session that sends nothing but
-    # small JSON POSTs -- against a server that delays its ACKs, that is tens of
-    # milliseconds added to every retrieval, on the hottest path in the run.
-    # Start from whatever urllib3 would have used and add to it.
-    options = list(_urllib3_default_socket_options())
-
-    def add(level, opt, value):
-        if opt is None:
-            return
-        if any(lvl == level and name == opt for lvl, name, _ in options):
-            return  # already carried over from urllib3's defaults
-        options.append((level, opt, value))
-
-    add(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    for name, value in (("TCP_KEEPIDLE", idle_s), ("TCP_KEEPINTVL", interval_s), ("TCP_KEEPCNT", probes)):
-        add(socket.IPPROTO_TCP, getattr(socket, name, None), value)
-    # Milliseconds, and Linux-only. 0 leaves the kernel default (tcp_retries2).
-    if _USER_TIMEOUT_S > 0:
-        add(socket.IPPROTO_TCP, getattr(socket, "TCP_USER_TIMEOUT", None), int(_USER_TIMEOUT_S * 1000))
-    return options
-
-
 def _enable_tcp_keepalive(adapter, idle_s: int = 30, interval_s: int = 10, probes: int = 3) -> None:
-    """Install :func:`_socket_health_options` on an adapter's future sockets."""
-    options = _socket_health_options(idle_s, interval_s, probes)
+    """Ask urllib3's pools to set SO_KEEPALIVE (and the Linux tuning) on new sockets.
+
+    Best-effort: the socket options are platform-specific and urllib3's kwargs
+    are not part of its public API, so a version that does not accept them
+    leaves the default behaviour rather than failing the run. The retry loop is
+    still correct without keepalive -- it just takes the OS default to notice a
+    dead peer.
+    """
+    import socket
+
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    for name, value in (("TCP_KEEPIDLE", idle_s), ("TCP_KEEPINTVL", interval_s), ("TCP_KEEPCNT", probes)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            options.append((socket.IPPROTO_TCP, opt, value))
     try:
         adapter.poolmanager.connection_pool_kw["socket_options"] = options
     except Exception as e:  # pragma: no cover - urllib3 internals moved
-        logger.warning(f"could not set socket health options on the search session: {e}")
-        return
-    # Said out loud because silence used to mean either "installed" or "the
-    # logger was never configured", and the difference is 40 s of GPU idle.
-    import socket
-
-    bounds = []
-    if any(o == getattr(socket, "TCP_USER_TIMEOUT", None) for _l, o, _v in options):
-        bounds.append(f"wedged socket {_USER_TIMEOUT_S:.0f}s")
-    else:
-        bounds.append("wedged socket UNBOUNDED (no TCP_USER_TIMEOUT on this platform)")
-    if _CONNECT_TIMEOUT_S > 0:
-        bounds.append(f"connect {_CONNECT_TIMEOUT_S:.0f}s")
-    logger.info(f"search socket bounds: {', '.join(bounds)} ({len(options)} socket options installed)")
+        logger.warning(f"could not enable TCP keepalive on the search session: {e}")
 
 
 def _passages2string(retrieval_result):
@@ -716,13 +581,11 @@ class SearchToolGroup(ToolGroup):
                     max_retries=0,  # We handle retries ourselves
                     pool_block=False,  # Don't block if pool is full
                 )
-                # Socket health. A request waiting on a retriever that has
-                # gone away sees nothing at the socket layer -- no FIN, no RST.
-                # Keepalive reaps an idle corpse before the next request rides
-                # it; TCP_USER_TIMEOUT bounds one that already has a request
-                # outstanding, which is the case that was costing this run 6.3
-                # points of GPU idle. Both turn a silent wait into a connection
-                # error, which the retry loop then handles on a fresh socket.
+                # TCP keepalive. A request waiting on a retriever that has gone
+                # away sees nothing at the socket layer -- no FIN, no RST -- and
+                # with a long or absent read timeout it waits for the OS default,
+                # which is hours. Keepalive probes turn that into a connection
+                # error within ~a minute, which the retry loop then handles.
                 _enable_tcp_keepalive(adapter)
                 session.mount("http://", adapter)
                 session.mount("https://", adapter)
