@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import time
 import warnings
 from typing import Union
 
@@ -40,6 +41,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
+from verl.utils.phase_timing import PhaseTimer, mark as _mark
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -158,6 +160,23 @@ def _fsdp_param_dtype(module, default):
             break
         seen = nxt
     return default
+
+
+# Per-call breakdown of generate_sequences, printed from rank 0 every N calls.
+#
+# The driver measures this call as one number and cannot see inside it: the Ray
+# round trip, the sharding manager's data reshaping, the engine call and the
+# detokenisation are one opaque span from out there. A search batch pays that
+# span once per turn, tens of thousands of times in an evaluation.
+#
+# Summed here and printed as a mean, so the cost is attributed rather than
+# guessed at. What the driver measures MINUS what this prints is the Ray round
+# trip, which is the one leg neither side can time alone.
+#
+# Off by default: it is a diagnostic, and a run that is not being profiled
+# should not carry even the dict.
+_GEN_PHASE_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() in ("1", "true", "yes", "on")
+_GEN_PHASES = ("to_device", "preprocess", "generate", "postprocess", "to_cpu")
 
 
 class ActorRolloutRefWorker(Worker):
@@ -772,10 +791,32 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    def _record_gen_phases(self, marks):
+        """Accumulate one call's phase times; print the mean every N calls.
+
+        Per call is unprintable -- a generate happens once per turn, tens of
+        thousands of times in an evaluation -- and a mean over a period says the
+        same thing without burying the log.
+        """
+        timer = getattr(self, "_gen_phase_timer", None)
+        if timer is None:
+            timer = self._gen_phase_timer = PhaseTimer(
+                "gen-phases",
+                _GEN_PHASES,
+                every=int(os.environ.get("ROLLOUT_GEN_PHASE_EVERY", "50")),
+                note="(driver's gen column minus this = the Ray round trip)",
+                rank=lambda: getattr(self, "_rank", None),
+            )
+        timer.record(marks)
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        marks = {} if _GEN_PHASE_TIMING else None
+        _t = time.perf_counter()
         # Support all hardwares
         prompts = prompts.to(get_torch_device().current_device())
+        if marks is not None:
+            marks["to_device"] = time.perf_counter() - _t
 
         assert self._is_rollout
 
@@ -797,21 +838,49 @@ class ActorRolloutRefWorker(Worker):
             # served. A session that served 1 bought nothing, and that is the
             # symptom of a hoist that silently did not take.
             self._rollout_session_generates = getattr(self, "_rollout_session_generates", 0) + 1
+            _t = time.perf_counter()
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            _t = _mark(marks, "preprocess", _t)
             output = self.rollout.generate_sequences(prompts=prompts)
+            _t = _mark(marks, "generate", _t)
             output = self.rollout_sharding_manager.postprocess_data(output)
+            _mark(marks, "postprocess", _t)
         else:
+            # Said once, because it is the difference between one wake per rollout
+            # and one per turn -- 21 GB of vLLM state unmapped and remapped every
+            # time. _say_session covers a session that opened and closed; this
+            # covers the case it cannot see, where begin_rollout_session was never
+            # called at all, and the two states are otherwise indistinguishable
+            # from outside (the sharding manager's own enter/exit log is DEBUG on
+            # a logger pinned to WARN).
+            if getattr(self, "_rank", None) == 0 and not getattr(self, "_rollout_no_session_warned", False):
+                self._rollout_no_session_warned = True
+                print(
+                    "[rollout-session] rank 0: generating WITHOUT a session -- every turn "
+                    "will wake and sleep vLLM and re-sync the frozen weights. Set "
+                    "ROLLOUT_KEEP_VLLM_AWAKE=1 in the process that runs the rollout loop "
+                    "(the driver, not just the workers).",
+                    flush=True,
+                )
             with self.rollout_sharding_manager:
                 log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
+                _t = time.perf_counter()
                 prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                _t = _mark(marks, "preprocess", _t)
                 output = self.rollout.generate_sequences(prompts=prompts)
+                _t = _mark(marks, "generate", _t)
 
                 log_gpu_memory_usage("After rollout generation", logger=logger)
 
                 output = self.rollout_sharding_manager.postprocess_data(output)
+                _mark(marks, "postprocess", _t)
 
+        _t = time.perf_counter()
         output = output.to("cpu")
+        if marks is not None:
+            marks["to_cpu"] = time.perf_counter() - _t
+            self._record_gen_phases(marks)
 
         # clear kv cache -- but NOT inside a rollout session. This call releases
         # cached blocks back to the driver and forces a device synchronize, and it
