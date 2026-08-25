@@ -136,12 +136,18 @@ export ROLLOUT_KEEP_VLLM_AWAKE=1
 export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 
 # VAL_PIPELINE_DEPTH=2 keeps a second validation batch in flight, so one batch's
-# environment and tokenising overlap the other's generation. After the retriever
-# was batched a search batch is 11.87 s of generation against 1.20 s of
-# tokenising and 1.17 s of environment -- 16.5% the GPU spends waiting for work
-# that cannot be brought forward, because the next turn's prompt is the
-# environment's answer to this one. Another batch is the only thing that can
-# fill it.
+# environment, tokenising and scoring overlap the other's generation.
+#
+# MEASURED, same checkpoint and same retriever, on the WALL lines' s/batch:
+# 17.0 s per batch at depth 1 against 14.2 at depth 2, a 16.5% shortening of the
+# evaluation. Most of what it recovers is not in the turn table at all: a search
+# batch's own span is 14.1 s, so 2.9 s of every 17.0 is spent between batches,
+# on the main thread, decoding 126 prompts for the next batch and 126 responses
+# from the last one. The GPU has nothing to do for any of it.
+#
+# Read s/batch and not the occupancy ratio, and never compare a span against an
+# s/batch: doing that is what produced a wrong "no effect" reading of this
+# change once already.
 #
 # Scored rows are unchanged: batches retire in submission order, the accumulation
 # stays on the main thread, and the extra slots only serve tasks whose episodes
@@ -149,9 +155,9 @@ export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 # its games are indexed by position within the manager, so a second one would
 # score a different set.
 #
-# Left at 1 by default: it is the scoring path, and depth 2 builds a second set
-# of search environments. Turn it on for a whole sweep or not at all.
-export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-1}"
+# The cost is a second set of search environments. Set it to 1 on a box that
+# cannot spare them.
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-2}"
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it

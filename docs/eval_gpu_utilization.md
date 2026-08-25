@@ -385,44 +385,43 @@ span が 2 倍になった slot が 2 本あれば、**何も得ていなくて�
 実際 depth 2 の完走 run は **1.82x** を出しながら、s/batch は 1.5% しか動かなかった。
 占有率としては正しく、速度向上としては無意味である。
 
-#### depth 2 の実測 —— 効果はゼロだった
+#### depth 2 の実測 —— 16.5% 短縮した
 
-同条件(retriever は 8000、envstep 0.7〜1.1 s)で depth 1 と depth 2 を測った。
+同一 checkpoint、同一 retriever(8000、envstep 1.0 s)、同じ推定器
+(`WALL` 行の `s/batch last20`、n=20)で:
 
-| | s/batch | span | slots-busy | 出典 |
-| --- | ---: | ---: | ---: | --- |
-| depth 1 | 14.2 **(n=1)** | 13.8 s | 0.99x | 完了間隔 574.0 − 559.8 |
-| depth 2 | **14.2** | 27〜38 s | 1.82x | `s/batch last20`(n=20)、413 batch 完走 |
+| | s/batch | span | slots-busy |
+| --- | ---: | ---: | ---: |
+| depth 1 | **17.0** | 14.1 s | 0.98x |
+| **depth 2** | **14.2** | 27〜38 s | 1.82x |
 
-**この比較はまだ決着していない。** depth 1 の 14.2 は完了間隔 1 個から取った値で、
-**同じ run の turn table は `TOTAL 15.0` と `16.1` を出している** —— 直列実行では
-完了間隔は span 以上になるはずなので、13.8 s の軽い batch が 2 本続いたところを
-測ってしまった疑いが濃い。同じ推定器(`s/batch last20`)で depth 1 を取り直すこと。
-15.5 前後なら depth 2 は 8% 効いており、14.2 なら効果ゼロである。
+**17.0 → 14.2、16.5% 短縮。** 見込み(15.1 → 12.5)とほぼ同じ比率である。
 
-以下はこの数字が確定するまで暫定である。
+回収した中身は **turn table には出ない**。depth 1 の span は 14.1 s なので、
+**17.0 s のうち 2.9 s は batch と batch の間**にある —— 次の batch の 126 本の
+プロンプトを decode し、前の batch の 126 本の応答を decode し、reward を計算する
+main thread の時間で、その間 GPU には何もない。turn table は batch の**中**しか
+測らないので、この 2.9 s はどの行にも現れない。depth 2 が埋めたのは主にここである。
 
-意味するところは明確で、`slots-busy=1.82x` が示すとおり **2 slot は確かに埋まって
-いた**。埋まっていて throughput が変わらないのは、**両者が奪い合う資源が既に
-飽和していた**ということである。したがって turn table の
-`cpu-glue(preproc+decode+envstep, GPU-idle)=17.2%` を「2 本目の batch で埋められる
-空き」と読んだ 5 節冒頭の前提が誤っていた。あの 17% は、少なくとも
-「別の batch を並べる」という手では埋まらない。
+##### 一度これを「効果ゼロ」と誤判定した
 
-**理由は未解明のままである。** 二つの仮説はどちらも潰れた。
+depth 1 の s/batch を**完了間隔 1 個(14.2 s)**から取り、depth 2 の
+`s/batch last20`(14.2 s)と並べて「同一、効果ゼロ」と結論した。誤りは二重だった。
 
-* *GPU を他プロセスと共有している* —— 否。`nvidia-smi --query-compute-apps` は
-  eval 自身の vLLM worker 3 つ(29074 MiB × 3、1 GPU に 1 つ)だけを返した
-* *NVML 79.9% に対し gen share 50.7% という食い違いがある* —— そもそも
-  食い違いではなかった。**前者は pid 1779012、後者は pid 2495876 の測定で、
-  別の run である。** 条件の違う 2 つを並べて矛盾と呼んでいた
+1. n=1 だった。たまたま軽い batch が 2 本続いた区間を引いていた
+2. **span と s/batch を突き合わせた。** span は batch の中身、s/batch は batch の
+   間隔で、両者の差(2.9 s)こそが pipeline の埋める対象である。同じ推定器で
+   両方を取れば 17.0 対 14.2 とはっきり離れる
 
-残る候補は「vLLM の呼び出しあたり固定費」(batch を 2 本にすれば
-`generate_sequences` の回数も 2 倍になり、DataProto の往復とスケジューリングが
-2 倍かかる)だが、プロファイルを取っていないので**推測である**。
+**比較は必ず `s/batch last20` 同士で行うこと。** `slots-busy` は占有率、`span` は
+batch の中身であって、どちらも run 間の比較に使ってはならない。
 
-**`VAL_PIPELINE_DEPTH` は既定の 1 のままにする。** depth 1 では thread に投げすら
-せず inline で走るので、コードが残っていても実行時のコストはない。
+#### 残っているもの —— 0.9 s/batch
+
+depth 2 の 14.2 s/batch に対し、generate 自身は 12.8〜13.8 s。**差は約 0.9 s、
+6%** である。これが「GPU の裏に完全に隠す」で取れる残り全部であり、それには
+trajectory 単位の連続バッチ(vLLM AsyncLLM + env の部分 step)が要る。
+rollout loop と env manager の両方を書き換えて 6% なので、**割に合わない。**
 
 depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出す**
 (depth 1 でも)。出ないことが「depth 1」と「pipeline の無いビルド」の両方を
@@ -443,13 +442,15 @@ depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出�
 最終測定は 2026-08-25、retriever 健全(8000)、`VAL_PIPELINE_DEPTH=1`。
 search batch 1 本の内訳:
 
-| | 秒 | 割合 | 状態 |
-| --- | ---: | ---: | --- |
-| **generate(GPU busy)** | 12.8〜13.8 | **85.4%** | 働いている区間 |
-| preproc(CPU tokenize) | 1.15 | 7.4% | 残 |
-| envstep(retriever) | 1.00 | 6.4% | 残 |
-| decode | 0.10 | 0.6% | 残 |
-| **合計** | **15.5** | | 完了間隔は 14.2 s/batch |
+| | 秒 | 状態 |
+| --- | ---: | --- |
+| **generate(GPU busy)** | 12.8〜13.8 | 働いている区間 |
+| preproc(CPU tokenize) | 1.15 | batch 内。depth 2 が隠す |
+| envstep(retriever) | 1.00 | batch 内。depth 2 が隠す |
+| decode | 0.10 | batch 内 |
+| batch 間(126 本の decode ×2 + reward) | **2.9** | **turn table に出ない。** depth 2 が隠す |
+| **depth 1 の合計** | **17.0** | |
+| **depth 2 の実測** | **14.2** | 残る GPU 待ちは約 0.9 s |
 
 | 項目 | before | after | 状態 |
 | --- | ---: | ---: | --- |
@@ -460,22 +461,23 @@ search batch 1 本の内訳:
 | preproc(CPU tokenize) | 5.2% | 7.4% | 残。**envstep を抜いて glue の最大項になった** |
 | generate | 51.8% | **85.4%** | GPU が働いている区間 |
 
-**評価の turn 時間 2.85 h → 1.63 h、GPU 稼働 51.8% → 85.4%(実測)。**
+**評価の turn 時間 2.85 h → 1.71 h(413 batch 完走の実測)、s/batch は
+depth 1 の 17.0 に対し depth 2 で 14.2。generate 律速の下限 12.8〜13.8 に対し
+残る GPU 待ちは 0.9 s/batch。**
 
 ### ここから先
 
-残っているのは glue の **2.25 s/batch(14.6%)** だけで、内訳は
-preproc 1.15 + envstep 1.00 + decode 0.10。
+残っているのは **0.9 s/batch(6%)** だけである。generate 自身が 12.8〜13.8 s で、
+これが下限。
 
 | | 見込み | 状態 |
 | --- | ---: | --- |
-| `VAL_PIPELINE_DEPTH=2` | 0〜8% | **未決着**(5 節)。depth 2 は 14.2 s/batch(n=20)、depth 1 は同じ推定器で取り直しが要る |
-| preproc の増分トークナイズ | −7% | **未着手・要検討。** 毎 turn 全履歴を tokenize し直しているのを、生成された応答と観測の**差分だけ**を tokenize して token id を連結する形に変える。BPE の結合が turn 境界をまたぐ危険があるので、等価性の検証が要る |
-| envstep(retriever 1.00 s) | −6% | 打ち手なし。3 節でバッチ化済みで、残りは encode + faiss の実時間 |
+| **`VAL_PIPELINE_DEPTH=2`** | **−16.5%** | **実測・既定 ON**(5 節)。17.0 → 14.2 s/batch。`eval_checkpoints.sh` の既定を 2 にした |
+| trajectory 単位の連続バッチ | −6% | **割に合わない。** vLLM AsyncLLM + env の部分 step が要り、rollout loop と env manager の両方を書き換えることになる |
+| `VAL_PIPELINE_DEPTH=3` | 不明 | 未測定。埋める対象が 0.9 s しか残っていないので、slot を増やす余地はほぼない |
 
-**なぜ depth 2 が効かないのかは未解明である。** glue は 2.25 s しかないが、
-それを別 batch の generate で埋められない理由は分かっていない。GIL(generate
-呼び出しの driver 側処理と preproc がどちらも Python 側で GIL を持つ)が候補だが、
-プロファイルを取っていないので推測にとどまる。**5 節の「別 batch を並べる」という
-手そのものが実測で否定されているので、この理由を解明しても得るものは
-2.25 s の一部でしかない。**
+**GPU を完全に埋めきる形は trajectory 単位の連続バッチだが、残りが 6% なので
+着手していない。** batch 単位で足並みが揃う限り「全員が同時に env を待つ瞬間」は
+必ず生まれ、それを消すには 126 本を独立にスケジュールするしかない。depth 2 は
+その谷を「もう 1 つの塊」で埋める手で、谷の大半(2.9 + α のうち約 2.8 s)を
+実際に埋めた。
