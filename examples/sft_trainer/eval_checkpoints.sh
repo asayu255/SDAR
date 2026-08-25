@@ -135,6 +135,16 @@ export ROLLOUT_KEEP_VLLM_AWAKE=1
 # is not already known.
 export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 
+# The turn table's genGPU% and perGPU% columns are filled by the NVML sampler in
+# verl/utils/gpu_profiler.py, which is a no-op unless GPU_PROFILER=1. Without it
+# the columns still print, as "-" -- a header with nothing under it, which is the
+# same kind of silent hole as a session that never opened. They are the only
+# instrument that says whether the GPU is FED during generation, as opposed to
+# merely busy: a search batch's last turns run 11 and 27 trajectories in a slot
+# sized for 126, and NVML calls that 100% either way. Sampling is one NVML read
+# every 0.3 s on a background thread.
+export GPU_PROFILER="${GPU_PROFILER:-1}"
+
 # VAL_PIPELINE_DEPTH=2 keeps a second validation batch in flight, so one batch's
 # environment, tokenising and scoring overlap the other's generation.
 #
