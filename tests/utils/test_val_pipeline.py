@@ -357,3 +357,58 @@ def test_a_single_task_run_keeps_the_plain_loader():
     trainer = _sampler_trainer({"search": 252}, _ROWS)
     trainer.config = OmegaConf.create({"env": {"env_name": "search"}, "data": {"val_batch_size": 126}})
     assert trainer._validation_batch_sampler() is None
+
+
+def test_coverage_is_the_union_not_the_sum():
+    """Two slots running the same seconds cover those seconds once. Summing
+    would report more time covered than the run took."""
+    from verl.utils.val_pipeline import _coverage
+
+    covered, span = _coverage([(0.0, 10.0), (0.0, 10.0)])
+    assert (covered, span) == (10.0, 10.0)
+
+
+def test_coverage_counts_the_hole_between_two_runs():
+    from verl.utils.val_pipeline import _coverage
+
+    covered, span = _coverage([(0.0, 10.0), (15.0, 20.0)])
+    assert covered == 15.0 and span == 20.0  # 5 s with nothing running
+
+
+def test_coverage_merges_overlapping_and_touching_spans():
+    from verl.utils.val_pipeline import _coverage
+
+    assert _coverage([(0.0, 5.0), (3.0, 8.0), (8.0, 9.0)]) == (9.0, 9.0)
+
+
+def test_coverage_of_nothing_is_nothing():
+    from verl.utils.val_pipeline import _coverage
+
+    assert _coverage([]) == (0.0, 0.0)
+
+
+def test_the_pipeline_reports_where_its_wall_went(capsys):
+    """The number that matters is the stretch with every slot finished and
+    nothing resubmitted -- neither the per-batch table nor slots-busy sees it."""
+    import time as _time
+
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    slots = [Slot("a", None, None), Slot("b", None, None)]
+
+    def launch(prepared, slot):
+        _time.sleep(0.05)
+        return prepared
+
+    consumed = []
+    for prepared, result in run_pipelined(
+        range(4), prepare=lambda x: x, task_of=lambda p: "search", launch=launch, slots=slots
+    ):
+        _time.sleep(0.02)  # the caller scoring a batch
+        consumed.append(result)
+
+    assert consumed == [0, 1, 2, 3]
+    out = capsys.readouterr().out
+    assert "[val-pipeline] 4 batches over" in out
+    assert "NOTHING running" in out
+    assert "scoring" in out

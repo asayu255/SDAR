@@ -39,8 +39,25 @@ would score different games and it does not get one. Search has no such state
 matter.
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, List, Optional
+
+
+def _coverage(intervals):
+    """Total wall covered by at least one interval, and the span they lie in."""
+    if not intervals:
+        return 0.0, 0.0
+    ordered = sorted(intervals)
+    covered, cur_start, cur_end = 0.0, ordered[0][0], ordered[0][1]
+    for start, end in ordered[1:]:
+        if start > cur_end:
+            covered += cur_end - cur_start
+            cur_start, cur_end = start, end
+        else:
+            cur_end = max(cur_end, end)
+    covered += cur_end - cur_start
+    return covered, ordered[-1][1] - ordered[0][0]
 
 
 class Slot:
@@ -94,18 +111,44 @@ def run_pipelined(
     inflight = []  # [(prepared, future, slot)] oldest first -- also the retirement order
     free = list(slots)
 
+    # Where the wall clock goes. The per-batch tables measure inside a rollout
+    # and the occupancy ratio averages the slots, so neither can see the state
+    # that matters here: EVERY slot finished and none resubmitted, because the
+    # calling thread is between them. NVML reported 23% of an evaluation's
+    # samples at exactly zero on all three cards; a union of the launch
+    # intervals is what says whether that is this.
+    spans = []  # (start, end) per launch, appended from the worker threads
+    clock = {"prepare": 0.0, "consumer": 0.0, "retire_wait": 0.0}
+
+    def timed_launch(prepared, slot):
+        started = time.perf_counter()
+        try:
+            return launch(prepared, slot)
+        finally:
+            spans.append((started, time.perf_counter()))
+
     def retire():
         """Finish the oldest batch, hand it back, and free its slot."""
         prepared, future, slot = inflight.pop(0)
+        waited = time.perf_counter()
         try:
             result = future.result()
         finally:
+            clock["retire_wait"] += time.perf_counter() - waited
             free.append(slot)
         return prepared, result
 
+    def handed_back():
+        """Yield one retired batch and charge the caller's time to the caller."""
+        payload = retire()
+        resumed = time.perf_counter()
+        return payload, resumed
+
     try:
         for item in items:
+            _t = time.perf_counter()
             prepared = prepare(item)
+            clock["prepare"] += time.perf_counter() - _t
             task = task_of(prepared)
             # Retire until a slot this batch can use is free. A batch whose task
             # only one slot serves waits for that slot specifically, which is why
@@ -116,12 +159,26 @@ def run_pipelined(
                     break
                 if not inflight:
                     raise RuntimeError(f"no slot can run task {task!r}: {slots}")
-                yield retire()
+                payload, resumed = handed_back()
+                yield payload
+                clock["consumer"] += time.perf_counter() - resumed
             free.remove(slot)
-            inflight.append((prepared, executor.submit(launch, prepared, slot), slot))
+            inflight.append((prepared, executor.submit(timed_launch, prepared, slot), slot))
         while inflight:
-            yield retire()
+            payload, resumed = handed_back()
+            yield payload
+            clock["consumer"] += time.perf_counter() - resumed
     finally:
+        covered, span = _coverage(spans)
+        if span > 0:
+            idle = span - covered
+            print(
+                f"[val-pipeline] {len(spans)} batches over {span:.1f}s: at least one slot running "
+                f"{covered:.1f}s ({100 * covered / span:.1f}%), NOTHING running {idle:.1f}s "
+                f"({100 * idle / span:.1f}%). Calling thread: prepare {clock['prepare']:.1f}s, "
+                f"scoring {clock['consumer']:.1f}s, waiting on a slot {clock['retire_wait']:.1f}s.",
+                flush=True,
+            )
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.
         for _, future, _ in inflight:
