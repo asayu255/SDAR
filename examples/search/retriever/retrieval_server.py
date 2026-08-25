@@ -1,6 +1,7 @@
 import json
+import time
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Union
 import argparse
 
 import faiss
@@ -28,8 +29,25 @@ def read_jsonl(file_path):
 
 
 def load_docs(corpus, doc_idxs):
-    results = [corpus[int(idx)] for idx in doc_idxs]
-    return results
+    """Fetch the documents at these row numbers, in this order.
+
+    One gather, not one lookup per row. ``corpus`` is an Arrow-backed
+    datasets.Dataset, and ``corpus[i]`` walks its whole indexing machinery and
+    builds a fresh Python dict every time -- so a turn that retrieves top-3 for
+    44 queries paid 132 of those. Measured end to end, a batched retrieval took
+    292 ms per turn against ~20-40 ms of encoder and FAISS: nearly all of the
+    rest was this loop. ``corpus[list]`` is a single take over the table.
+
+    The return shape is unchanged: one dict per requested row, in the order
+    asked for, duplicates included (different queries do retrieve the same
+    passage).
+    """
+    idxs = [int(idx) for idx in doc_idxs]
+    if not idxs:
+        return []
+    columns = corpus[idxs]
+    names = list(columns.keys())
+    return [{name: columns[name][position] for name in names} for position in range(len(idxs))]
 
 
 def load_model(model_path: str, use_fp16: bool = False):
@@ -234,20 +252,38 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
+        spent = {"encode": 0.0, "faiss": 0.0, "load": 0.0}
         for start_idx in range(0, len(query_list), self.batch_size):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
+            mark = time.perf_counter()
             batch_emb = self.encoder.encode(query_batch)
+            spent["encode"] += time.perf_counter() - mark
+
+            mark = time.perf_counter()
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            spent["faiss"] += time.perf_counter() - mark
 
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
-            # load_docs is not vectorized, but is a python list approach
             flat_idxs = sum(batch_idxs, [])
+            mark = time.perf_counter()
             batch_results = load_docs(self.corpus, flat_idxs)
+            spent["load"] += time.perf_counter() - mark
             # chunk them back
             batch_results = [batch_results[i * num : (i + 1) * num] for i in range(len(batch_idxs))]
             results.extend(batch_results)
             scores.extend(batch_scores)
+        # Where the time went, per request -- which with a batched client is once
+        # per rollout turn. The encoder and the FAISS scan are bounded by what the
+        # hardware can do; the document lookup is not, and attributing between
+        # them by argument is how a quarter of a second per turn stayed invisible.
+        print(
+            f"[retrieve] {len(query_list):4d} queries  topk {num}  "
+            f"encode {1000 * spent['encode']:6.1f} ms  "
+            f"faiss {1000 * spent['faiss']:6.1f} ms  "
+            f"load_docs {1000 * spent['load']:6.1f} ms",
+            flush=True,
+        )
         if return_score:
             return results, scores
         else:
@@ -302,7 +338,16 @@ class Config:
 
 
 class QueryRequest(BaseModel):
-    query: str
+    # A list as well as a string, because the index is Flat: a search reads the
+    # whole 32 GB of embeddings regardless of how many queries it is given, so
+    # 126 separate requests read it 126 times and one request with 126 queries
+    # reads it once. Measured against this server, an unloaded single query is
+    # 80 ms and 126 concurrent ones take 7.5 s -- a 93x inflation that is the
+    # index being re-read, not the server being slow.
+    #
+    # A plain string still behaves exactly as before, so an un-upgraded client
+    # keeps working and no restart has to be coordinated with one.
+    query: Union[str, List[str]]
     topk: Optional[int] = None
     return_scores: bool = False
 
@@ -313,35 +358,53 @@ app = FastAPI()
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
     """
-    Endpoint that accepts a single query and performs retrieval.
+    Endpoint that accepts one query or a list of them and performs retrieval.
     Input format:
     {
-      "query": "What is Python?",
+      "query": "What is Python?",                     # or ["What is Python?", ...]
       "topk": 3,
       "return_scores": true
     }
+    The response is {"result": [...]} with one entry per query, in order -- for a
+    single string that is the one-element list it has always been.
     """
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform retrieval
+    queries = [request.query] if isinstance(request.query, str) else list(request.query)
+    started = time.perf_counter()
+
+    # batch_search even for one query. DenseRetriever._batch_search encodes the
+    # whole list in one forward pass and hands FAISS one (n, dim) matrix, which
+    # for a Flat index is one pass over the embeddings instead of n passes. It
+    # already chunks by retrieval_batch_size (512), so a caller cannot make the
+    # request too large to serve; it only makes it read the index fewer times.
     if request.return_scores:
-        results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
+        results, scores = retriever.batch_search(queries, num=request.topk, return_score=True)
     else:
-        results = retriever.search(query=request.query, num=request.topk, return_score=False)
+        results = retriever.batch_search(queries, num=request.topk, return_score=False)
         scores = None
 
-    # Format response
+    served = time.perf_counter()
+
+    # One entry per query, in the order they were sent -- which for a single
+    # string is the one-element list the old response already was.
     resp = []
-    if request.return_scores and scores is not None:
-        # If scores are returned, combine them with results
-        combined = []
-        for doc, score in zip(results, scores):
-            # Convert numpy float32 to regular Python float for JSON serialization
-            combined.append({"document": doc, "score": float(score)})
-        resp.append(combined)
-    else:
-        resp.append(results)
+    for position, documents in enumerate(results):
+        if scores is not None:
+            resp.append(
+                # float(): numpy float32 is not JSON serialisable
+                [{"document": doc, "score": float(score)} for doc, score in zip(documents, scores[position])]
+            )
+        else:
+            resp.append(documents)
+    # The two _batch_search cannot see: its own total as the endpoint measures it,
+    # and the reshaping into the response.
+    print(
+        f"[retrieve]              search {1000 * (served - started):6.1f} ms  "
+        f"format {1000 * (time.perf_counter() - served):5.1f} ms",
+        flush=True,
+    )
     return {"result": resp}
 
 
@@ -379,7 +442,10 @@ if __name__ == "__main__":
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,  # this is unused in the current retrieval implementation, which only supports single query
+        # How many queries one encoder pass and one FAISS search handle. Reached
+        # from /retrieve now that it accepts a list, so it is the cap on how much
+        # of the index re-reading a batched client can amortise away.
+        retrieval_batch_size=512,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.

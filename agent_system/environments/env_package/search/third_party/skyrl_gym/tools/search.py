@@ -1,10 +1,11 @@
 import json
 import logging
+import os
 import requests
 import uuid
 import time
 import threading
-from typing import Tuple, Optional, Any, Dict
+from typing import Tuple, Optional, Any, Dict, List, Union
 from urllib.parse import urlparse
 
 from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.core import tool, ToolGroup
@@ -25,10 +26,31 @@ MAX_RETRY_DELAY = 30
 # in the log to say why.
 RETRY_PROGRESS_EVERY = 60.0
 
+# Coalescing. The index this talks to is Flat, so one search reads the whole 32 GB
+# of embeddings no matter how many queries it is given: 126 separate requests read
+# it 126 times. Measured against the retriever in use, one unloaded query is 80 ms
+# and 126 concurrent ones take 7.5 s -- a 93x inflation that is entirely the index
+# being re-read, and that no number of server processes or replicas can remove
+# because they share the same GPUs and the same bandwidth.
+#
+# The rollout hands every environment its action at once (a ThreadPoolExecutor over
+# all of them), so the calls arrive within a few milliseconds of each other. Holding
+# the first one for a short window and sending whatever accumulated as a single
+# request turns those 126 reads into one, without the environments knowing.
+_BATCH_ENABLED = os.environ.get("SEARCH_BATCH_REQUESTS", "1").strip().lower() not in ("0", "false", "no", "")
+# Long enough to catch a fan-out, short enough to be noise against an 80 ms query.
+_BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "10")) / 1000.0
+# How long a URL stays un-batched after it rejects a list. A retriever restarted
+# with a server that does take lists is the usual reason the answer changes, and
+# nothing else would ever tell us: the flag is set once and an evaluation runs
+# for hours. Re-probing costs one rejected request per period -- the queries are
+# sent singly either way. 0 makes the disable permanent.
+_BATCH_RETRY_S = float(os.environ.get("SEARCH_BATCH_RETRY_S", "300"))
 
-def call_search_api(
+
+def _search_api_request(
     retrieval_service_url: str,
-    query: str,
+    query: Union[str, List[str]],
     topk: int = 3,
     return_scores: bool = True,
     timeout: Optional[int] = DEFAULT_TIMEOUT,
@@ -195,6 +217,179 @@ def call_search_api(
         session.close()
 
     return None, last_error
+
+
+
+class _QuerySlot:
+    """One caller's place in a coalesced request."""
+
+    __slots__ = ("query", "done", "response", "error")
+
+    def __init__(self, query: str):
+        self.query = query
+        self.done = threading.Event()
+        self.response = None
+        self.error = None
+
+
+class _Coalescer:
+    """Turn concurrent single-query calls into one request per short window.
+
+    The first caller of a window becomes its leader: it waits out the window, takes
+    everything that accumulated, sends it as one request and hands each caller its
+    own slice. Every other caller just waits for its slot. A caller that arrives
+    after the leader has taken the batch starts the next window.
+
+    Each caller still receives exactly the ``{"result": [documents]}`` shape a
+    single-query call returns, so nothing downstream can tell the difference --
+    same queries, same order, same server, same documents.
+
+    Batching is per (url, topk, return_scores, timeout, retries): a window only
+    ever holds requests that would have been identical apart from the query.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._windows: Dict[Any, list] = {}
+        # Set false for a URL whose server rejects a list. Learned by trying,
+        # rather than by parsing an error string: a batch that fails and then
+        # succeeds one query at a time is a server that does not take lists.
+        self._batchable: Dict[str, bool] = {}
+        self._retry_at: Dict[str, float] = {}
+
+    def enabled_for(self, url: str) -> bool:
+        if not _BATCH_ENABLED:
+            return False
+        with self._lock:
+            if self._batchable.get(url, True):
+                return True
+            if _BATCH_RETRY_S <= 0 or time.monotonic() < self._retry_at.get(url, 0.0):
+                return False
+            self._batchable[url] = True
+        logger.warning(f"{url}: re-probing batched search after {_BATCH_RETRY_S:.0f}s un-batched")
+        return True
+
+    def call(self, url: str, query: str, send, **key_parts):
+        # Checked here as well as in call_search_api: once a URL has told us it
+        # does not take lists, no caller should be able to make it say so again.
+        if not self.enabled_for(url):
+            return send(query)
+        slot = _QuerySlot(query)
+        key = (url,) + tuple(sorted(key_parts.items()))
+        with self._lock:
+            window = self._windows.setdefault(key, [])
+            window.append(slot)
+            leader = len(window) == 1
+        if not leader:
+            # No timeout: the leader fills every slot in a finally, including
+            # when its request raises. A bound here would race a slow retriever
+            # and hand the environment an error it did not have.
+            slot.done.wait()
+            return slot.response, slot.error
+
+        time.sleep(_BATCH_WINDOW_S)
+        with self._lock:
+            batch = self._windows.pop(key, [])
+        self._flush(url, batch, send)
+        return slot.response, slot.error
+
+    def _flush(self, url, batch, send):
+        try:
+            queries = [item.query for item in batch]
+            # One query goes as a bare string: identical to the un-batched call,
+            # so a lone environment never probes a server for list support it may
+            # not have.
+            response, error = send(queries[0] if len(queries) == 1 else queries)
+            if len(queries) > 1 and error:
+                # Either the server does not accept a list or the retriever is
+                # unwell. Re-send one at a time: if that works, it was the former
+                # and this URL stops batching; if it fails too, the caller gets
+                # the error it would have got anyway.
+                logger.warning(f"batched search of {len(queries)} queries failed ({error}); retrying singly")
+                singles = [send(item.query) for item in batch]
+                if all(single_error is None for _, single_error in singles):
+                    with self._lock:
+                        self._batchable[url] = False
+                        self._retry_at[url] = time.monotonic() + _BATCH_RETRY_S
+                    logger.warning(
+                        f"{url} rejected a batched request but served the queries individually; "
+                        "batching disabled for it. Restart the retriever with a server that "
+                        "accepts a list of queries -- this URL is re-probed every "
+                        f"{_BATCH_RETRY_S:.0f}s, so a restart is picked up without restarting the run."
+                    )
+                for item, (single_response, single_error) in zip(batch, singles):
+                    item.response, item.error = single_response, single_error
+                return
+            self._distribute(batch, response, error)
+        except BaseException as exc:  # noqa: BLE001 - a leader that dies must not hang its followers
+            for item in batch:
+                if item.error is None and item.response is None:
+                    item.error = f"coalesced search failed: {exc}"
+            raise
+        finally:
+            for item in batch:
+                item.done.set()
+
+    @staticmethod
+    def _distribute(batch, response, error):
+        if error is not None or not response:
+            for item in batch:
+                item.error = error or "search returned no response"
+            return
+        results = response.get("result")
+        if not isinstance(results, list) or len(results) != len(batch):
+            got = len(results) if isinstance(results, list) else "no"
+            for item in batch:
+                item.error = f"retriever returned {got} results for {len(batch)} queries"
+            return
+        for item, documents in zip(batch, results):
+            # The single-query shape, so callers cannot tell they were batched.
+            item.response = {"result": [documents]}
+
+
+_COALESCER = _Coalescer()
+
+
+def call_search_api(
+    retrieval_service_url: str,
+    query: str,
+    topk: int = 3,
+    return_scores: bool = True,
+    timeout: Optional[int] = DEFAULT_TIMEOUT,
+    log_requests: bool = True,
+    session: Optional[requests.Session] = None,
+    max_retries: Optional[int] = MAX_RETRIES,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Retrieve for one query, coalescing it with whatever else is in flight.
+
+    Same arguments, same return, same documents as issuing the request alone --
+    see _Coalescer for why the requests are worth merging and what keeps the
+    result indistinguishable. SEARCH_BATCH_REQUESTS=0 sends them one at a time.
+    """
+
+    def send(payload_query):
+        return _search_api_request(
+            retrieval_service_url=retrieval_service_url,
+            query=payload_query,
+            topk=topk,
+            return_scores=return_scores,
+            timeout=timeout,
+            log_requests=log_requests,
+            session=session,
+            max_retries=max_retries,
+        )
+
+    if not _COALESCER.enabled_for(retrieval_service_url):
+        return send(query)
+    return _COALESCER.call(
+        retrieval_service_url,
+        query,
+        send,
+        topk=topk,
+        return_scores=return_scores,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
 
 
 def _enable_tcp_keepalive(adapter, idle_s: int = 30, interval_s: int = 10, probes: int = 3) -> None:
