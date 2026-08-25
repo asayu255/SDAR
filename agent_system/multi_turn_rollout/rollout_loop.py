@@ -148,6 +148,13 @@ def _say_rollout_env():
         flush=True,
     )
     print(
+        f"[rollout-pump] driver: ROLLOUT_ASYNC_GENERATE="
+        f"{os.environ.get('ROLLOUT_ASYNC_GENERATE', '<unset>')!r} -> generate calls "
+        f"{'go through one continuously stepped engine per rank' if _ROLLOUT_ASYNC_GENERATE else 'each block on their own batch'}"
+        f"{'; this supersedes merging' if _ROLLOUT_ASYNC_GENERATE and _ROLLOUT_MERGE_GENERATES else ''}",
+        flush=True,
+    )
+    print(
         f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
         f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
         f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
@@ -292,8 +299,131 @@ def _split_by_rows(output, sizes):
     return parts
 
 
+# Drive the engine as a pool instead of one blocking call per batch.
+#
+# Merging above only catches calls that happen to be queued together -- measured,
+# 21.5% of them. This is the same idea without the "happen to": every slot's rows
+# go into one engine that is stepped continuously, so they are resident together
+# whether or not their calls lined up. A slot still waits for its own rows and
+# still steps its own environments in lockstep, so nothing about which
+# trajectories are collected changes.
+#
+# Off by default, and for the same reason merging is: it changes which requests
+# share a decode step, which moves floating-point reduction order, so results are
+# neither bit-identical to the blocking path nor reproducible run to run.
+_ROLLOUT_ASYNC_GENERATE = os.environ.get("ROLLOUT_ASYNC_GENERATE", "0").strip().lower() in ("1", "true", "yes", "on")
+_PUMP_STATE = {"client": None, "off": not _ROLLOUT_ASYNC_GENERATE, "lock": threading.Lock()}
+_SESSION_DEPTH = {"depth": 0, "lock": threading.Lock()}
+
+# meta_info keys the rank needs to derive the same sampling params the blocking
+# path would have used. Nothing else crosses: the rest of meta_info carries
+# tokenizer ids and other values that have no business keying a params cache.
+_PUMP_META_KEYS = ("do_sample", "validate", "temperature")
+
+
+def _pump_pins_one_sample(meta_info) -> bool:
+    """Whether this call asks the engine for exactly one sequence per prompt.
+
+    Both branches that override sampling -- greedy and validation -- set n=1, and
+    a request out of the pool returns one sequence. A training call that leaves
+    the configured n alone may want several, and quietly keeping the first would
+    be a scoring change, so the whole call goes back to the blocking path.
+    """
+    meta_info = meta_info or {}
+    return (not meta_info.get("do_sample", True)) or bool(meta_info.get("validate", False))
+
+
+def _pump_client(actor_rollout_wg):
+    """The one client this process talks to the ranks through, or None.
+
+    A rank that cannot be pumped says why, once, and the path stays off for the
+    rest of the process -- retrying every call would print the same refusal a
+    few thousand times and pay a round trip for each.
+    """
+    state = _PUMP_STATE
+    with state["lock"]:
+        if state["off"]:
+            return None
+        if state["client"] is not None:
+            return state["client"]
+        from verl.workers.rollout.pump_client import PumpClient, PumpUnavailable
+
+        client = PumpClient(actor_rollout_wg)
+        try:
+            client.handshake()
+        except PumpUnavailable as refusal:
+            state["off"] = True
+            print(f"[rollout-pump] staying on the blocking path: {refusal}", flush=True)
+            return None
+        except Exception as exc:  # noqa: BLE001 - a broken handshake is not worth a dead run
+            state["off"] = True
+            print(f"[rollout-pump] handshake failed, staying on the blocking path: {type(exc).__name__}: {exc}", flush=True)
+            return None
+        client.start()
+        state["client"] = client
+        print(f"[rollout-pump] driving {actor_rollout_wg.world_size} ranks as a pool; {client.handshake_info}", flush=True)
+        return client
+
+
+def close_pump_client():
+    """Put the pool down. Safe to call when it was never started."""
+    with _PUMP_STATE["lock"]:
+        client, _PUMP_STATE["client"] = _PUMP_STATE["client"], None
+    if client is not None:
+        print(client.line(), flush=True)
+        client.close()
+
+
+def _generate_via_pump(client, batch_input_padded):
+    """Generate this call's rows through the pool and assemble them here.
+
+    The tensors are built by the same function the worker builds them with, from
+    the prompt tensors this call already holds -- the only thing that came back
+    over the wire is token ids.
+    """
+    from verl.workers.rollout.generation_output import assemble_generation_output
+
+    meta_info = batch_input_padded.meta_info or {}
+    carried = {k: meta_info[k] for k in _PUMP_META_KEYS if k in meta_info}
+    prompts = batch_input_padded.non_tensor_batch["raw_prompt_ids"]
+    futures = [client.submit(_as_id_list(prompt), carried) for prompt in prompts]
+    responses = [future.result() for future in futures]
+
+    non_tensor_batch = {k: v for k, v in batch_input_padded.non_tensor_batch.items() if k != "raw_prompt_ids"}
+    info = client.handshake_info
+    return assemble_generation_output(
+        idx=batch_input_padded.batch["input_ids"],
+        attention_mask=batch_input_padded.batch["attention_mask"],
+        position_ids=batch_input_padded.batch["position_ids"],
+        response_token_ids=responses,
+        non_tensor_batch=non_tensor_batch,
+        eos_token_id=info["eos_token_id"],
+        pad_token_id=info["pad_token_id"],
+        response_length=info["response_length"],
+    )
+
+
+def _as_id_list(prompt_token_ids):
+    return prompt_token_ids.tolist() if hasattr(prompt_token_ids, "tolist") else list(prompt_token_ids)
+
+
+def _pump_can_serve(batch_input_padded) -> bool:
+    """Whether this particular call is one the pool can serve identically."""
+    if "multi_modal_data" in batch_input_padded.non_tensor_batch:
+        return False
+    if "raw_prompt_ids" not in batch_input_padded.non_tensor_batch:
+        # generate_sequences rebuilds these from the padded input_ids when they
+        # are missing; rather than keep a second copy of that, let it.
+        return False
+    return _pump_pins_one_sample(batch_input_padded.meta_info)
+
+
 def _generate_sequences(actor_rollout_wg, batch_input_padded):
     """One generate call, merged with whatever is queued when merging is on."""
+    if _ROLLOUT_ASYNC_GENERATE and _pump_can_serve(batch_input_padded):
+        client = _pump_client(actor_rollout_wg)
+        if client is not None:
+            return _generate_via_pump(client, batch_input_padded)
     if not _ROLLOUT_MERGE_GENERATES:
         return actor_rollout_wg.generate_sequences(batch_input_padded)
     global _GENERATE_MERGER
@@ -450,10 +580,24 @@ def rollout_session(actor_rollout_wg):
     if not _ROLLOUT_KEEP_VLLM_AWAKE:
         yield
         return
+    with _SESSION_DEPTH["lock"]:
+        _SESSION_DEPTH["depth"] += 1
     actor_rollout_wg.begin_rollout_session()
     try:
         yield
     finally:
+        # The pool lives exactly as long as the outermost session does. Held
+        # past it, its thread would be stepping an engine the sharding manager
+        # has put to sleep and whose weights the next training step replaces.
+        # Counted rather than flagged because the slots of the validation
+        # pipeline each open one of these, concurrently, inside _validate's.
+        # Closed before the session ends, not after, so the ranks are still
+        # awake when they are told to drop anything they are holding.
+        with _SESSION_DEPTH["lock"]:
+            _SESSION_DEPTH["depth"] -= 1
+            outermost = _SESSION_DEPTH["depth"] == 0
+        if outermost:
+            close_pump_client()
         actor_rollout_wg.end_rollout_session()
 
 

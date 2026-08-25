@@ -49,6 +49,7 @@ CALLED_ON_THE_WORKER_GROUP = (
     "generate_sequences",
     "init_model",
     "load_checkpoint",
+    "rollout_pump_step",
     "save_checkpoint",
     "update_actor",
     "update_actor_async",

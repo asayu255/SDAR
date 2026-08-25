@@ -221,6 +221,7 @@ chunked prefill と合流、depth 3 と合流。前者は合算がゼロだっ�
 | `[gen-phases]` | `fsdp_workers.py` | worker 内の 5 脚 | engine の内側 |
 | `[rollout-phases]` | `vllm_rollout_spmd.py` | engine 境界の 3 脚 | engine の内側 |
 | `[rollout-merge]` | `generate_merge.py` | 合流率と相乗り行数 | — |
+| `[rollout-pump]` | `pump_client.py` | 投入・完了・round 数・rank ごとの in-flight | engine の内側 |
 | `[val-pipeline]` 被覆 | `val_pipeline.py` | **どの slot も走っていない**時間、呼び出しスレッドの内訳 | slot が走っていて GPU が空いている状態 |
 | wandb system stream | wandb | **機械の util(唯一の真値)** | 15 秒点サンプル。原因は言わない |
 
@@ -236,6 +237,10 @@ ROLLOUT_GEN_PHASE_EVERY=50  [gen-phases] / [rollout-phases] の周期
 VAL_PIPELINE_REPORT_EVERY=25 [val-pipeline] の周期(0 で最後だけ)
 ROLLOUT_MERGE_GENERATES=1   generate の合流(既定 OFF)
 VAL_PIPELINE_DEPTH=3        slot 数(合流には 3 以上が要る)
+ROLLOUT_ASYNC_GENERATE=1    engine をプールとして回す(既定 OFF、合流の上位互換)
+ROLLOUT_PUMP_ROUND_S=0.02   1 round の待ち。長いほど RPC は減り、完了通知は遅れる
+ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だけ)
+ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限。既定でよい)
 ```
 
 ---
@@ -282,12 +287,114 @@ bash examples/sft_trainer/eval_checkpoints.sh \
 
 ---
 
+## 7.5 async(engine をプールとして回す)
+
+`ROLLOUT_ASYNC_GENERATE=1`。**合流の上位互換**であって、別の打ち手ではない。
+
+### 何をしているか
+
+`LLM.generate(prompts)` は「252 行を全部 add して、最後の 1 行が終わるまで
+step して、まとめて返す」1 本の同期呼び出しである。中の batching は
+もともと continuous なのに、**呼び出しが同期**なので、別の batch の行は
+途中から入れない。だから毎回の呼び出しの尻で、数本の長い軌跡だけが
+ほぼ空の GPU を占有して decode する(12 軌跡で per-GPU 61/89/56 を実測)。
+
+async はその engine を、**1 本のスレッドが `step()` を回し続けるプール**に
+する。pipeline の各 slot は自分の行を投げて自分の答えを待つだけになるので、
+slot A の行と slot B の行が**常に**同じ decode step に同居する。合流が
+「たまたま queue が重なった 21.5%」で拾っていたものを、100% にする。
+
+| | 合流 | async |
+| --- | --- | --- |
+| 同居する条件 | 呼び出しが偶然重なったとき | 常に |
+| 実測の発火率 | 21.5% | ― |
+| 効果(実測/見込み) | −19〜24% (ms/row 75→57) | 未測定 |
+
+### 実装(4 つの部品)
+
+| ファイル | 役割 |
+| --- | --- |
+| `verl/workers/rollout/token_pump.py` | 1 スレッドが engine を占有し `add_request`/`step` を回す。**他スレッドは queue 経由**でしか触らない |
+| `verl/workers/rollout/generation_output.py` | token id → DataProto の組み立て。**blocking 経路と共通**。2 本あれば必ずずれる場所なので 1 本にした |
+| `vllm_rollout_spmd.py: pump_step` | rank 側の 1 round。投入と回収を**同じ呼び出しで**行う(Ray actor はメソッドを 1 本ずつしか実行しないので、分けると回収が投入の後ろに並ぶ) |
+| `verl/workers/rollout/pump_client.py` | driver 側。全 slot が 1 つの client を共有し、**1 スレッドだけ**が round を回す。rank 割り当ては least-in-flight |
+
+### 成り立つ前提と、断る条件
+
+**`tensor_model_parallel_size=1`** が効いている。各 rank が丸ごとモデルを
+持つので、どの rank がどの request を捌いてもよく、driver が負荷で選べる。
+TP>1 なら TP group の全 rank が同じ request を同じ順で add しないと次の
+collective で固まるので、この設計は成立しない —— worker 側で断る。
+
+断る条件(いずれも **blocking 経路に静かに落ちる**、近似で処理しない):
+
+| 条件 | 理由 |
+| --- | --- |
+| `tensor_model_parallel_size > 1` | 上記 |
+| LoRA | adapter は呼び出し単位で選ばれる |
+| `return_rollout_log_probs=True` | pump が返すのは token id だけ |
+| multimodal な行がある | prompt が token id だけではない |
+| `n > 1` になりうる呼び出し | request 1 本 = 1 系列。黙って 1 本目を採るのは採点の変更 |
+| `raw_prompt_ids` が無い | blocking 側はそこで input_ids から作り直す。その処理をもう 1 本持たない |
+| rollout session が開いていない | pump は round の合間も engine を step する。session 外では sharding manager が寝かせた engine を叩くことになる |
+
+session を閉じるより**先に** pump を閉じる。pool の寿命は最も外側の
+session と同じで、重みが変わる境界をまたがない。
+
+### 再現性 —— merge と同じ判断である
+
+async は merge より**徹底的に**非決定的である。merge は「呼び出しが重なったか」
+で決まるが、async は request の到着タイミングで decode step の中身が決まる。
+**設定を固定しても走行ごとに変わる。**
+
+したがって §7 の宿題 2 と同じ 1 つの判断になる:
+
+* 判定を「`[val-hash]` 一致」に置くなら、async も merge も入らない。
+  ついでに val batch 126→252 のような**採用済み**の変更も同じ理由で落ちる
+  (batch の形が変われば reduction 順序が変わる、が機構だから)。
+* 判定を「score が動かない」に置くなら両方入る。そのとき必要な数字は
+  **同一設定を 2 回走らせた `val/*/test_score` の差**(評価器のノイズ下限)で、
+  以後の比較はすべてこれを超えていなければ意味がない。
+
+**測っていないものは既定にしない。** `ROLLOUT_ASYNC_GENERATE` は OFF。
+
+### 試すコマンド
+
+合流と**入れ替え**る(重ねない)。比較対象は §7 の設定、指標は `WALL ... ms/row`:
+
+```bash
+ray stop --force
+ROLLOUT_ASYNC_GENERATE=1 VAL_PIPELINE_DEPTH=3 ROLLOUT_PUMP_REPORT_EVERY=200 \
+EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
+bash examples/sft_trainer/eval_checkpoints.sh \
+  -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
+     env.search.search_url='http://<retriever>:8000/retrieve'
+```
+
+起動直後に出るべき 2 行:
+
+```
+[rollout-pump] driver: ROLLOUT_ASYNC_GENERATE='1' -> generate calls go through one continuously stepped engine per rank
+[rollout-pump] driving 3 ranks as a pool; {'pad_token_id': ..., 'response_length': ..., 'eos_token_id': ...}
+```
+
+**2 行目が出ず `staying on the blocking path: ...` が出たら、その理由が答え**で、
+測っているのは blocking 経路である(§7.5「断る条件」の表)。合流のときに
+「一度も合流していない」と「合流したが効果ゼロ」を取り違えたのと同じ穴なので、
+ここは必ず確認すること。
+
+`ROLLOUT_PUMP_ROUND_S` は RPC 回数と完了通知の遅れのトレードオフ。既定 0.02 で
+30 秒の batch あたり 1500 round。`[rollout-pump]` の `rounds` が多すぎるようなら
+0.05 まで上げてよい(尻の遅れは 1 turn あたり最大 1 round ぶん)。
+
+---
+
 ## 8. 残っている打ち手
 
 | | 見込み | コスト |
 | --- | ---: | --- |
 | **preproc の増分トークナイズ** | util +6 pt、wall −8% | 毎 turn 履歴を丸ごと tokenize し直しているのを、token id を持ち回って差分だけにする。**BPE の結合が turn 境界をまたぐと採点が変わる**ので、全 turn で「全履歴 tokenize」と「差分連結」が token 単位で一致することを実軌跡で確認するテストが先 |
-| **worker 内 continuous batching** | util +11 pt、wall −10% | blocking な `generate()` をやめ、`add_request()` + `step()` のポンプを回す。`async_rollout_core.py` にスケジューラと等価性テストは既にある(未接続)。preproc の worker 側移植が精度クリティカル。数日 |
+| **trajectory ごとの env step** | util +6 pt(§4a の残り) | いまの async は generate だけを非同期にした。slot の中の turn は依然 lock-step で、全行が生成し終わるまで env に進めない。ここを崩すには env manager が部分集合を step できる必要があり、retriever のバッチ化(envstep 10.60→1.00 s/batch)と両立させるため「窓で束ねる」形が要る |
 | `VAL_PIPELINE_DEPTH=4` | 不明 | 合流率が上がる可能性。ただし CPU 競合(§4a)が先に律速する見込み |
 | retriever の GPU 専有 | +2 pt | `CUDA_VISIBLE_DEVICES` で 1 枚ずつ。第三者(`100.86.45.34`)との調整が要る |
 

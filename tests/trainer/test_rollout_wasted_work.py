@@ -37,8 +37,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 RUN_SCRIPT = REPO / "examples" / "sft_trainer" / "run_multitask_sft_qwen3.sh"
 
-# Files that PRODUCE the column rather than read it.
-_PRODUCERS = ("vllm_rollout_spmd.py", "vllm_rollout.py", "sglang_rollout.py")
+# Files that PRODUCE the column rather than read it. generation_output.py is on
+# the list because the assembly that writes the column moved out of
+# vllm_rollout_spmd.py into it, so both the blocking and the pumped rollout paths
+# build the batch through one function; it never reads the column off a batch.
+_PRODUCERS = (
+    "vllm_rollout_spmd.py",
+    "vllm_rollout.py",
+    "sglang_rollout.py",
+    "generation_output.py",
+)
 
 
 def _reader_lines():

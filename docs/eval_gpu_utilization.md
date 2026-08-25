@@ -1195,3 +1195,49 @@ if already_print[...] < num_examine and np.random.random() < 0.1:   # 1 batch �
 
 **verl が engine の周りでしていることの合計は 14 ミリ秒。** 300 呼び出しの平均で、
 8 節の 200 呼び出しと同じ結論である。
+
+---
+
+## 20. async —— engine をプールとして回す(実装、未計測)
+
+`ROLLOUT_ASYNC_GENERATE=1`。**詳細は
+[`eval_performance_summary.md` §7.5](eval_performance_summary.md) に書いた。**
+ここには経緯だけ残す。
+
+きっかけは 19 節までの分解のうち **(b) generate 呼び出しの中で GPU が空いている
+11.6%** である。12 軌跡が 3 rank に散って per-GPU 61/89/56 という測定がその姿で、
+座席は空いているのに、それを埋められる行は**別の batch にある**。
+
+合流(`ROLLOUT_MERGE_GENERATES`)はこれを「呼び出しが偶然重なったとき」だけ
+埋める仕掛けで、実測の発火率は 21.5%、効果は ms/row 75→57(−24%)だった。
+async はその「偶然」を外す —— engine を 1 スレッドが回し続けるプールにして、
+どの slot の行も常に同居させる。
+
+**上位互換なので、両方を同時に入れる意味はない。** `ROLLOUT_ASYNC_GENERATE=1`
+のときは合流は経路に入らない(起動時の `[rollout-pump]` 行がそう言う)。
+
+### 詰まった点、と外し方
+
+* **SPMD で per-request の投入ができるのか。** `distributed_executor_backend=
+  "external_launcher"` かつ `tensor_model_parallel_size=1` なので、各 rank が
+  丸ごとモデルを持つ独立した engine である。rank 間に collective が無いから、
+  driver がどの rank に何を投げるか自由に決められる。**TP>1 ならこの設計は
+  成立しない**ので worker 側で断る。
+* **Ray actor はメソッドを 1 本ずつしか実行しない。** 投入と回収を別の呼び出しに
+  分けると、回収が投入の後ろに並んで自分の待っているものを塞ぐ。だから
+  `rollout_pump_step` は **1 呼び出しで投入と回収の両方**をする。
+* **組み立てが 2 本になる危険。** token id → DataProto の算術(response の
+  padding、position_ids の続き、eos での mask 打ち切り)は worker と driver の
+  両方が要る。2 本持てば必ずずれ、しかも**ずれても例外は出ない** —— position_id
+  が 1 ずれた batch で学習/採点が進むだけである。`generation_output.py` に
+  1 本だけ置いて両方から呼ぶ形にした。
+
+### 状態
+
+**既定 OFF、効果は未計測。** merge と同じ理由で、`[val-hash]` は一致しない
+(むしろ merge より徹底的に一致しない —— request の到着タイミングで decode step
+の中身が決まるので、設定を固定しても走行ごとに変わる)。
+
+採否の判定は §7.5 に書いたとおり **score でしか決められない**。そのために要る
+数字は「同一設定 2 回の `val/*/test_score` の差」で、これは merge の判定と
+**同じ 1 つの数字**である。
