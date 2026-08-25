@@ -592,4 +592,41 @@ rank 0 が N 回ごとに平均を出すようにした(`ROLLOUT_TURN_TIMING=1` 
 | `to_cpu` | 出力の転送 | 非同期化 |
 | `generate` の中 | vLLM 自身の per-step CPU | vLLM 側の設定・版 |
 
-**未測定。次の run で `[gen-phases]` を読むこと。**
+### 実測 —— 0.65 s は vLLM の内側だった
+
+```
+[gen-phases] rank 0, mean over 150 calls (s): to_device 0.00  preprocess 0.00
+  generate 3.23  postprocess 0.00  to_cpu 0.00  worker-total 3.24
+```
+
+**4 つの脚が同時に消えた。** sharding manager の per-call 整形も、device への
+転送も、detokenize も、CPU への戻しも **0.00 s**。さらに worker-total 3.24〜3.52 は
+driver 側の `gen` 列(3.25〜3.43)とほぼ一致するので、**Ray の往復も実質ゼロ**である。
+
+上の表に挙げた打ち手のうち「`raw_prompt_ids` だけ送る」「整形を削る」「to_cpu を
+非同期化」は**すべて的外れだった**。padded tensor を毎 turn 送り直しているのは
+事実だが、それは 1 秒も食っていない。
+
+空いている 20% は **`vllm.generate()` の内側**、decode ステップの隙間にある。
+起動ログが候補を名指ししている:
+
+```
+WARNING [topk_topp_sampler.py:69] FlashInfer is not available.
+Falling back to the PyTorch-native implementation of top-p & top-k sampling.
+```
+
+Qwen3-1.7B の decode 1 ステップの GPU 仕事は重み 3.4 GB の読み出しで、A6000 の
+帯域からおよそ 4〜5 ms。そこにステップごとの CPU 処理(vLLM のスケジューラ +
+PyTorch-native サンプラ)が乗れば 20% の泡は説明がつく。**小さいモデル ×
+GPU あたり 42 系列という、CPU 律速に落ちる典型的な条件である。**
+
+### 打ち手
+
+| | 見込み | コスト |
+| --- | --- | --- |
+| **FlashInfer を入れる** | ログが名指ししている fallback が消える。ステップごとの CPU が減る | `pip install flashinfer-python`。**コード変更なし** |
+| **GPU あたりの系列数を増やす** | decode は帯域律速で幅に対して**劣線形**(11 系列 3.19 s 対 126 系列 5.47 s = 11.5 倍の仕事が 1.7 倍の時間)。3 倍幅にすれば throughput が 1.5〜2 倍 | task ごとの val batch size(search だけ)。ただし **KV cache の余裕を先に確認**すること —— `gpu_memory_utilization=0.6`、`max_model_len=4608`、Qwen3-1.7B は 1 token 約 0.115 MB なので、満長なら 1 系列 530 MB、GPU あたり 47 系列で頭打ちになる |
+| `enable_chunked_prefill=True` | prefill と decode を同じステップに混ぜられる | 現在明示的に False。理由の確認が要る |
+
+**util を上げるのではなく throughput を上げる**のが 2 つ目の要点である。帯域律速の
+decode では幅を増やしても util はほぼ動かないが、同じ時間で処理する行数が増える。
