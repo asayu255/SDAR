@@ -20,6 +20,7 @@ Single Process Actor
 import itertools
 import time
 import logging
+import functools
 import os
 from contextlib import contextmanager
 from typing import Tuple
@@ -116,6 +117,29 @@ def _actor_phase(name: str):
         if _SYNC_PHASES:
             get_torch_device().synchronize()
         gpu_profiler.pop_phase(name)
+
+
+_VARLEN_KWARGS = os.environ.get("ACTOR_PASS_CU_SEQLENS", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_attention_takes_varlen_kwargs() -> bool:
+    """Does this transformers accept cu_seqlens at the flash-attention entry?
+
+    Checked once, by signature, because the alternative is a silent wrong
+    answer: an older ``_flash_attention_forward`` swallows unknown keywords into
+    **kwargs and passes them to flash-attn, which does not know them either.
+    """
+    try:
+        import inspect
+
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except Exception:  # noqa: BLE001 - any import shape means "do not risk it"
+        return False
+    params = inspect.signature(_flash_attention_forward).parameters
+    return all(name in params for name in
+               ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"))
 
 
 def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: int):
@@ -386,6 +410,44 @@ class DataParallelPPOActor(BasePPOActor):
             fingerprints = row_fingerprint(input_ids, attention_mask)
         return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints)
 
+    def _varlen_kwargs(self, cu_seqlens, max_seqlen_in_batch) -> dict:
+        """The packed-sequence boundaries, handed over instead of re-derived.
+
+        With ``use_remove_padding`` the model is given ``position_ids`` and HF's
+        flash-attention path works the boundaries out itself: whether the
+        sequences are packed at all, and how long the longest is. Both decisions
+        are made on the device and read on the host -- flash-attn needs Python
+        ints -- so each is a device-to-host sync, ONCE PER LAYER PER FORWARD.
+        Twenty-eight layers, doubled because gradient checkpointing recomputes
+        the forward inside the backward.
+
+        ``unpad_input`` has already computed both, once, for the whole
+        micro-batch. Passing them makes _flash_attention_forward skip the
+        position_ids path entirely, and the values are the same ones it would
+        have derived -- both come from the same attention_mask.
+
+        Off in two cases:
+
+        * Ulysses SP > 1. The sequence is split across ranks after this point,
+          so boundaries computed on the unsplit batch describe a different
+          tensor than the attention sees. verl's monkey_patch all-gathers
+          position_ids for exactly that reason; handing it stale cu_seqlens
+          would be wrong rather than merely slower.
+        * A transformers whose entry point does not name the kwargs. It would
+          take them into **kwargs and pass them to flash-attn, which does not
+          know them either -- so the check is by signature, not by version.
+        """
+        if cu_seqlens is None or not _VARLEN_KWARGS or self.use_ulysses_sp:
+            return {}
+        if not _flash_attention_takes_varlen_kwargs():
+            return {}
+        return {
+            "cu_seq_lens_q": cu_seqlens,
+            "cu_seq_lens_k": cu_seqlens,
+            "max_length_q": max_seqlen_in_batch,
+            "max_length_k": max_seqlen_in_batch,
+        }
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None,
         need_log_prob=True, return_lse=False,
@@ -433,7 +495,15 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                # cu_seqlens and max_seqlen are kept, not discarded: handing them
+                # to the attention entry saves a device-to-host sync per layer per
+                # forward (see _varlen_kwargs). Older flash_attn returns fewer
+                # values, so the unpack is by length rather than by position.
+                unpadded = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad, indices = unpadded[0], unpadded[1]  # input_ids_rmpad (total_nnz, ...)
+                cu_seqlens, max_seqlen_in_batch = (
+                    (unpadded[2], unpadded[3]) if len(unpadded) >= 4 else (None, None)
+                )
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -483,6 +553,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if resp_only:
                     sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
                     extra_args["logits_to_keep"] = sel
+
+                extra_args.update(self._varlen_kwargs(cu_seqlens, max_seqlen_in_batch))
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
