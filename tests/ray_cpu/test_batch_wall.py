@@ -287,3 +287,79 @@ def test_occupancy_of_two_slots_says_nothing_about_speedup():
 
     assert busy(pipelined) == pytest.approx(2.0, abs=0.01)
     assert per_batch(pipelined, "last20") == pytest.approx(solo_rate, abs=1.0)
+
+
+class _Tensor:
+    def __init__(self, total):
+        self._total = total
+
+    def sum(self):
+        return self._total
+
+
+class _Batch:
+    def __init__(self, total):
+        self.batch = {"attention_mask": _Tensor(total)}
+
+
+def test_token_counts_split_prompt_from_generated():
+    prompt, generated = rollout_loop._token_counts(_Batch(48_300), _Batch(49_120))
+    assert (prompt, generated) == (48_300, 820)
+
+
+def test_token_counts_never_go_negative():
+    """The output mask should cover the prompt, but a truncating rollout could
+    hand back less; a negative token count would be worse than a zero."""
+    assert rollout_loop._token_counts(_Batch(100), _Batch(80)) == (100, 0)
+
+
+def test_token_counts_are_absent_rather_than_wrong():
+    class _NoMask:
+        batch = {}
+
+    assert rollout_loop._token_counts(_NoMask(), _NoMask()) == (None, None)
+    assert rollout_loop._token_counts(None, None) == (None, None)
+
+
+def test_the_table_carries_the_token_columns(capsys):
+    records = [
+        {
+            "turn": 0,
+            "active": 126,
+            "preproc": 0.2,
+            "gen": 1.0,
+            "decode": 0.0,
+            "envstep": 0.4,
+            "gen_util": 72.0,
+            "gen_util_per_gpu": [72.0, 72.0, 71.0],
+            "prompt_tok": 48_300,
+            "gen_tok": 820,
+        },
+        {
+            "turn": 1,
+            "active": 126,
+            "preproc": 0.2,
+            "gen": 5.4,
+            "decode": 0.0,
+            "envstep": 0.3,
+            "gen_util": 79.0,
+            "gen_util_per_gpu": [79.0, 79.0, 79.0],
+            "prompt_tok": 61_000,
+            "gen_tok": 43_000,
+        },
+    ]
+    rollout_loop._print_turn_timing(records)
+    out = capsys.readouterr().out
+
+    assert "promptTok" in out and "genTok" in out
+    assert "48,300" in out and "43,000" in out
+    assert "TOKENS prompt=109,300" in out
+    assert "generated=43,820" in out
+    assert "UPPER bound" in out  # prefix-cache hits are not recomputed
+
+
+def test_a_table_without_token_counts_is_unchanged(capsys):
+    rollout_loop._print_turn_timing(_records(2))
+    out = capsys.readouterr().out
+    assert "TOKENS" not in out
+    assert "SHARE" in out

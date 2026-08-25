@@ -235,6 +235,29 @@ def _record_batch_wall(start, end, slot):
     return "\n".join(lines)
 
 
+def _token_counts(batch_input_padded, batch_output_padded):
+    """Prompt and generated token counts for one generate call, or (None, None).
+
+    The split between them is what decides whether a turn is prefill work or
+    decode work, and no other instrument here can see it: the driver times the
+    call as one span, NVML says only whether a kernel was resident, and vLLM's
+    own stats logger emits nothing on this path even with disable_log_stats
+    false and its logging at INFO (verified: the KV-cache lines print, the
+    throughput lines do not).
+
+    Both counts come from attention_mask sums, which are exactly the tokens the
+    engine was handed -- padding rows from pad_dataproto_to_divisor included,
+    since the engine processes those too. The generated count is the output's
+    total minus the prompt's, which needs no assumption about pad ids.
+    """
+    try:
+        prompt = int(batch_input_padded.batch["attention_mask"].sum())
+        total = int(batch_output_padded.batch["attention_mask"].sum())
+    except (AttributeError, KeyError, TypeError):
+        return None, None
+    return prompt, max(0, total - prompt)
+
+
 def _fmt_per_gpu(vals):
     if not vals:
         return "-"
@@ -254,9 +277,11 @@ def _print_turn_timing(records, span=None, slot="-"):
     header = (
         f"{'turn':>4}{'active':>8}{'preproc':>9}{'gen':>9}{'decode':>9}"
         f"{'envstep':>9}{'total':>9}{'genGPU%':>9}{'  perGPU%':>12}"
+        f"{'promptTok':>12}{'genTok':>10}"
     )
     lines = ["[rollout-turn-timing] per-turn breakdown (seconds); GPU busy only during 'gen'", header, "-" * len(header)]
     tot = {k: 0.0 for k in ("preproc", "gen", "decode", "envstep", "total")}
+    toks = {"prompt_tok": 0, "gen_tok": 0}
     full_util, shrunk_util = [], []
     dp_spreads = []  # per-turn max-min across GPUs during gen (DP imbalance)
     first_active = records[0]["active"]
@@ -269,9 +294,15 @@ def _print_turn_timing(records, span=None, slot="-"):
         gu_s = f"{gu:.0f}" if gu is not None else "-"
         pg = r.get("gen_util_per_gpu")
         pg_s = _fmt_per_gpu(pg)
+        pt, gt = r.get("prompt_tok"), r.get("gen_tok")
+        for key, value in (("prompt_tok", pt), ("gen_tok", gt)):
+            if value is not None:
+                toks[key] += value
         lines.append(
             f"{r['turn']:>4}{r['active']:>8}{r['preproc']:>9.2f}{r['gen']:>9.2f}"
             f"{r['decode']:>9.2f}{r['envstep']:>9.2f}{total:>9.2f}{gu_s:>9}{pg_s:>12}"
+            f"{(f'{pt:,}' if pt is not None else '-'):>12}"
+            f"{(f'{gt:,}' if gt is not None else '-'):>10}"
         )
         if gu is not None:
             (full_util if r["active"] >= first_active else shrunk_util).append(gu)
@@ -283,7 +314,18 @@ def _print_turn_timing(records, span=None, slot="-"):
     lines.append(
         f"{'TOTAL':>4}{'':>8}{tot['preproc']:>9.1f}{tot['gen']:>9.1f}"
         f"{tot['decode']:>9.1f}{tot['envstep']:>9.1f}{tot['total']:>9.1f}"
+        f"{'':>9}{'':>12}{toks['prompt_tok']:>12,}{toks['gen_tok']:>10,}"
     )
+    if toks["prompt_tok"] or toks["gen_tok"]:
+        # promptTok is what was HANDED to the engine, not what it recomputed:
+        # with prefix caching on, a turn's shared prefix is served from cache.
+        # So the prompt figure is an UPPER bound on prefill work, and the ratio
+        # below is the most prefill-heavy reading the data allows. If generated
+        # tokens dominate even here, the turn is decode-bound for certain.
+        lines.append(
+            f"TOKENS prompt={toks['prompt_tok']:,} (submitted; prefix-cache hits are not recomputed, "
+            f"so this is an UPPER bound on prefill work)  generated={toks['gen_tok']:,} (decode steps)"
+        )
     cpu_glue = tot["preproc"] + tot["decode"] + tot["envstep"]
     if tot["total"] > 0:
         lines.append(
@@ -902,6 +944,8 @@ class TrajectoryCollector:
             _gw0 = gpu_profiler.now()
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             _gw1 = gpu_profiler.now()
+            if _turn_records is not None:
+                _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)
             # # unpad
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
             _m_gen = _now()  # end of GPU generation window
@@ -954,6 +998,8 @@ class TrajectoryCollector:
                     "envstep": _m_env - _m_decode,
                     "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
                     "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
+                    "prompt_tok": _prompt_tok,
+                    "gen_tok": _gen_tok,
                 })
 
 
