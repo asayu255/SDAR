@@ -385,27 +385,35 @@ span が 2 倍になった slot が 2 本あれば、**何も得ていなくて�
 実際 depth 2 の完走 run は **1.82x** を出しながら、s/batch は 1.5% しか動かなかった。
 占有率としては正しく、速度向上としては無意味である。
 
-#### depth 2 の実測 —— 効果は測れなかった
+#### depth 2 の実測 —— 効果はゼロだった
 
-413 batch 完走、rollout **6145 s = 1.71 h**。
+同条件(retriever は 8000、envstep 0.7〜1.1 s)で depth 1 と depth 2 を測った。
 
-| | s/batch | 出典 |
-| --- | ---: | --- |
-| depth 1 | 15.1 | 1.73 h ÷ 413(3 節時点) |
-| **depth 2** | **14.9** | 6145 s ÷ 413 |
+| | s/batch | span | slots-busy | 出典 |
+| --- | ---: | ---: | ---: | --- |
+| depth 1 | **14.2** | 13.8 s | 0.99x | 完了間隔 574.0 − 559.8 |
+| depth 2 | **14.2** | 27〜38 s | 1.82x | `s/batch last20`、413 batch 完走 |
 
-**差 1.5%。しかもこの run は retriever も preproc も 3 節時点より速い**
-(envstep 0.7〜1.1 対 1.17、preproc 0.9 対 1.20)ので、depth 2 自身の寄与は
-これ以下である。**見込みの 15.1 → 12.5 は出なかった。**
+**同一である。** 見込みの 15.1 → 12.5 s/batch は出ず、**1 秒も縮まなかった。**
 
-見込みが外れた理由は未確定。有力なのは「generate が 126 系列で既に GPU を
-飽和させており、turn table の `cpu-glue 17.2%` は**そのぶんまるごと空いている
-わけではない**」という線である。NVML 平均 79.9% に対し同じ区間の gen share が
-50.7% だったこと(3 節の劣化中の測定)も、glue 中に GPU が完全には空いていない
-ことを示唆する。
+意味するところは明確で、`slots-busy=1.82x` が示すとおり **2 slot は確かに埋まって
+いた**。埋まっていて throughput が変わらないのは、**両者が奪い合う資源が既に
+飽和していた**ということである。したがって turn table の
+`cpu-glue(preproc+decode+envstep, GPU-idle)=17.2%` を「2 本目の batch で埋められる
+空き」と読んだ 5 節冒頭の前提が誤っていた。あの 17% は、少なくとも
+「別の batch を並べる」という手では埋まらない。
 
-**次に要るのは同条件の depth 1 run である。** search batch 50 本(約 12 分)で
-`s/batch last20` は収束するので、完走させる必要はない。
+**未解決:** NVML 平均 79.9% に対し同区間の gen share が 50.7% だった食い違い
+(3 節の劣化中の測定)は、glue 中も GPU が動いていることを示す。wasabi の GPU を
+eval 以外のプロセスが使っていないかは**未確認**であり、確認されるまでこの arm の
+util の数字はすべて汚染の可能性を抱えている:
+
+```bash
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+**`VAL_PIPELINE_DEPTH` は既定の 1 のままにする。** depth 1 では thread に投げすら
+せず inline で走るので、コードが残っていても実行時のコストはない。
 
 depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出す**
 (depth 1 でも)。出ないことが「depth 1」と「pipeline の無いビルド」の両方を
@@ -438,7 +446,7 @@ depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出�
 | | wall | util | 状態 |
 | --- | ---: | ---: | --- |
 | いま | 1.73 h | 83.0% | 実測 |
-| `VAL_PIPELINE_DEPTH=2` | 1.71 h | — | **実測、効果なし**(5 節)。s/batch 15.1 → 14.9 で、retriever が速くなった分を差し引くとそれ以下 |
+| `VAL_PIPELINE_DEPTH=2` | 変化なし | 変化なし | **実測、効果ゼロ**(5 節)。同条件で depth 1 も depth 2 も 14.2 s/batch |
 | retriever の GPU 専有 | −0.04 h | +2 pt | 未着手。`CUDA_VISIBLE_DEVICES` で 1 枚ずつ。ただし 8001 は第三者(`100.86.45.34`)が使っており調整が要る |
 
 retriever の内訳は実測済みで、**`load_docs` は 250 ms → 2.8 ms(total の 1.2%)**
