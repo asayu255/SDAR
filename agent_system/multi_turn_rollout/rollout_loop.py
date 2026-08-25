@@ -1093,6 +1093,12 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
         _turn_records = [] if _ROLLOUT_TURN_TIMING else None
+        if _turn_records is not None:
+            # Feeds the genGPU% column. Nothing on the validation path would
+            # otherwise start the sampler -- push_phase is its only other caller
+            # and that lives in the trainer's fit loop, so every evaluation ever
+            # run printed those columns as "-".
+            gpu_profiler.ensure_started()
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)

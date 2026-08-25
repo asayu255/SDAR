@@ -44,6 +44,7 @@ from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metric
 from verl.utils.metric.stall_counters import per_rank_stall_counter_metrics
 from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.phase_timing import PhaseTimer, mark as _mark
+from verl.workers.actor.dp_actor import _actor_phase
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -762,8 +763,17 @@ class ActorRolloutRefWorker(Worker):
             )
         collect_at_step_boundary()
 
-        # Support all hardwares
-        data = data.to(get_torch_device().current_device())
+        # Support all hardwares.
+        #
+        # Tagged because this is the near side of the step boundary that survived
+        # pipelining. A Ray actor runs its calls one at a time, so the worker
+        # cannot start moving step k+1's batch onto the device until k has
+        # returned -- whatever that costs is unhideable from the driver side, and
+        # until it is measured it is indistinguishable from the Ray
+        # deserialisation that precedes it (which lands outside this phase, as
+        # (idle/other), because it happens before the method body).
+        with _actor_phase("actor.h2d"):
+            data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:

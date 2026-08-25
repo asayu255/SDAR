@@ -74,20 +74,35 @@ def test_sync_phases_synchronizes_on_both_edges():
     assert device.synchronize.call_count == 2
 
 
+def _phases_used():
+    """Every actor.* phase actually opened anywhere in the worker.
+
+    Read from the files rather than inspect.getsource: update_policy is wrapped
+    by GPUMemoryLogger, which does not use functools.wraps, so getsource returns
+    the decorator's inner function and finds nothing.
+
+    Both files, because _actor_phase is defined in dp_actor but not only used
+    there: actor.h2d wraps the batch's move onto the device, which happens in
+    fsdp_workers before update_policy is called at all.
+    """
+    import os
+
+    paths = [mod.__file__.replace(".pyc", ".py")]
+    paths.append(os.path.join(os.path.dirname(paths[0]), "..", "..", "workers", "fsdp_workers.py"))
+    used = set()
+    for path in paths:
+        for line in open(path).read().splitlines():
+            if '_actor_phase("' in line and not line.strip().startswith("def "):
+                used.add(line.split('_actor_phase("')[1].split('"')[0])
+    return used
+
+
 def test_the_instrumented_stages_are_the_ones_the_report_orders():
     """A stage the report does not know about lands in the alphabetical tail,
-    which silently breaks the top-to-bottom reading of a step's interior.
-
-    Read from the file rather than inspect.getsource: update_policy is wrapped by
-    GPUMemoryLogger, which does not use functools.wraps, so getsource returns the
-    decorator's inner function and finds nothing.
-    """
+    which silently breaks the top-to-bottom reading of a step's interior."""
     from verl.utils import gpu_profiler
 
-    source = open(mod.__file__.replace(".pyc", ".py")).read()
-    used = {line.split('_actor_phase("')[1].split('"')[0]
-            for line in source.splitlines()
-            if '_actor_phase("' in line and not line.strip().startswith("def ")}
+    used = _phases_used()
     assert used, "update_policy is not instrumented"
     assert used <= set(gpu_profiler._PHASE_ORDER), used - set(gpu_profiler._PHASE_ORDER)
     # Every stage the report orders should actually be produced, or the ordering
