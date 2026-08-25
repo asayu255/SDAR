@@ -682,10 +682,51 @@ Maximum concurrency for 4,608 tokens per request: 34.64x
 (同時 ~57 系列)。**`val_only` は optimizer state を使わないので余地はあるはず**である。
 `expected_multitask_sft_config.yaml` はこのキーを固定していないので、上書きは通る。
 
-```bash
-bash examples/sft_trainer/eval_checkpoints.sh \
-  -- actor_rollout_ref.rollout.gpu_memory_utilization=0.85
-grep 'batch#171 ' 新しいログ 古いログ    # 2552.6 s と比べる
-```
+### 実測 —— 変わらなかった
 
-**未測定。**
+`gpu_memory_utilization=0.85` で走らせ、**確率的な alfworld / webshop を挟まない
+search 区間だけ**を切り出して比較した(`wall@40 − wall@5` = search batch 35 本):
+
+| | search 35 本 |
+| --- | ---: |
+| 0.6 | **418.1 s** |
+| 0.85 | **420.6 s(+0.6%)** |
+
+**誤差である。** batch#40 の `span=22.3s` と `s/batch last20=12.3s` は両 run で
+完全に一致した —— search は `do_sample=False` で決定的なので、同じ batch は同じ
+時間で終わる。**KV cache を 1.7 倍にしても preemption の損失は測れなかった。**
+34.64x という上限は、実際の系列長が 4,608 に遠く及ばないため効いていない。
+
+設定は 0.6 のまま。
+
+## 11. 締め
+
+| 打ち手 | 結果 |
+| --- | --- |
+| turn ごとの vLLM wake/sleep を止める(session) | **採用** |
+| batch ごとの wake/sleep を止める(hoist) | **採用**(10.4%) |
+| retriever のバッチ化 | **採用**(envstep 10.60 → 1.00 s) |
+| retriever のバージョンずれ + 自動再試行 | **採用** |
+| `VAL_PIPELINE_DEPTH=2` | **採用**(17.0 → 14.2 s/batch) |
+| FlashInfer | **不採用**(+4.3%) |
+| `gpu_memory_utilization=0.85` | **不採用**(±0%) |
+| task ごとの val batch size | 未着手(8 節の前提が崩れたため見送り) |
+| trajectory 単位の連続バッチ | 未着手(残り 6% に対して rollout 中核の書き換え) |
+
+**評価の wall 2.85 h → 1.71 h。**
+
+残る非効率は `vllm.generate()` の内側の約 20% で、**設定では動かないことが
+2 つの実測で確認された**(FlashInfer、KV cache)。ここから先はモデル側
+(量子化、投機デコード)か、rollout の作り替えになる。
+
+### この節で三度踏んだ穴
+
+1. **占有率を目的関数にした。** `slots-busy=1.82x`(速度は同じ)、
+   `genGPU%` 77 → 88(速度は 4.3% 低下)。NVML は kernel が載っているかしか見ない
+2. **単発の値で run 間比較をした。** n=1 の完了間隔、20 batch の窓 —— どちらも
+   同一 run 内で 11.8〜16.3 まで振れる
+3. **span と s/batch を突き合わせた。** batch の中身と batch の間隔は別物で、
+   その差(2.9 s)こそが pipeline の埋める対象だった
+
+**正しい判定は一つだけ:同じ batch 番号での累積 `wall=` の差分を、決定的な
+task の区間で取る。**
