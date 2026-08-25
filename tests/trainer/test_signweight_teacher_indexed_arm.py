@@ -38,6 +38,12 @@ CONTROL = "examples/opd_trainer/run_multitask_qwen3.sh"
 # difference between two runs that will be discussed side by side.
 INTENDED = {
     "actor_rollout_ref.actor.student_indexed_topk",
+    # Follows the actor by interpolation in ppo_trainer.yaml, so it differs here
+    # too -- at COMPOSE time it is still False on this arm. main_opd then forces
+    # it True, which is what test_the_frozen_models_still_keep_their_hidden_states
+    # pins. Both facts belong in the suite: the interpolation is live, and the
+    # injection overrides it.
+    "actor_rollout_ref.ref.student_indexed_topk",
     "algorithm.opd.sign_weight.agree_weight",
     "algorithm.opd.sign_weight.agree_neg_weight",
 }
