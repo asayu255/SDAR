@@ -40,6 +40,8 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
+from verl.utils.metric.stall_counters import per_rank_stall_counter_metrics
 from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.phase_timing import PhaseTimer, mark as _mark
 from verl.utils.fsdp_utils import (
@@ -670,7 +672,26 @@ class ActorRolloutRefWorker(Worker):
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            # Priced, because nothing else here reports it. The engine is built
+            # on every rank, sleeps itself at construction, and still holds a
+            # CUDA context, whatever survives sleep(level=1), and the allocator
+            # high-water mark its profiling run left behind. That is device
+            # memory the actor could be spending on a larger micro batch, and
+            # neither counter next door sees it: allocated only counts this
+            # process's live tensors and reserved is a counter that outlives its
+            # pages (vLLM's CuMemAllocator unmaps out of band). mem_get_info is
+            # the driver's own free/total, which is what nvidia-smi shows.
+            before = device_footprint_gb(get_torch_device())
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            after = device_footprint_gb(get_torch_device())
+            print(
+                f"[rollout-footprint] rank {self.rank}: building the "
+                f"{self.config.rollout.name} rollout took the device from "
+                f"{before:.2f} to {after:.2f} GiB in use ({after - before:+.2f} GiB, "
+                f"gpu_memory_utilization={self.config.rollout.gpu_memory_utilization}, "
+                f"enforce_eager={self.config.rollout.enforce_eager})",
+                flush=True,
+            )
 
         if self._is_ref:
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
@@ -768,8 +789,24 @@ class ActorRolloutRefWorker(Worker):
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            # Every rank's, not just this one's. The two lines this replaces read
+            # max_memory_* on the local card and shipped it in meta_info, and
+            # DataProto.concat keeps meta_info from the FIRST worker only -- so
+            # perf/max_memory_reserved_gb reached wandb as rank 0's number under
+            # a name that reads like a reduction. The ranks are meant to match
+            # (shard_grad_op replicates parameters, _balance_batch equalises rows
+            # and tokens), which makes a spread a finding, and it was invisible.
+            # Same two key names, so the history stays continuous; they are now
+            # actually the cross-rank maxima they claimed to be.
+            metrics.update(per_rank_memory_metrics(get_torch_device()))
+            # Which of {cudaMalloc segment growth, gen-2 GC, dynamo recompile}
+            # fired on this rank this step. Each is a candidate mechanism for a
+            # sub-second in-micro-batch stall and each increments a counter the
+            # process already keeps, so a dip on a step where exactly one moved
+            # is an attribution. Note the interaction with host_gc: freezing does
+            # not stop collections, it empties what they walk, so stall/gc_gen2
+            # rising is not evidence the freeze failed.
+            metrics.update(per_rank_stall_counter_metrics(get_torch_device()))
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
