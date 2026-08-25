@@ -260,11 +260,25 @@ bash examples/sft_trainer/eval_checkpoints.sh \
    `expected_multitask_sft_config.yaml` で固定されていて、それは正しい
    —— この値が alfworld の episode を決めるからである。効果が確認できたら
    マッピング形に書き換えて、決定をファイルに残すこと。
-2. **採点の突き合わせが未了。** 合流は呼び出しごとの batch 形状を変えるので、
-   greedy でも reduction 順序が変われば token が稀に変わりうる。判定は 2 段:
-   `val/search/test_score` の一致(wandb)と、**`[val-hash]` 行の一致**
-   (batch ごとの応答 token 列の sha1。同じ batch 番号で digest が揃えば
-   token 単位で同一)。score より強い後者を先に見るのがよい。
+2. **合流は生成を変える(実測)。既定に昇格させてはいけない。**
+   同一 checkpoint・同一 retriever・同一 batching で、合流あり/なしの
+   `[val-hash]` を search 30 batch ぶん比べた結果:
+
+   | | |
+   | --- | ---: |
+   | 一致しなかった batch | **28 / 30** |
+   | 1 batch あたりの行数差 | 591 対 587 など、**数行(~0.7%)** |
+
+   `rows=` は「軌跡 × 有効 turn」の総数なので、**行数が違う = 一部の軌跡が
+   違う turn 数で終わった** —— token が変わり、検索するか答えるかの分岐が
+   変わったということである。greedy でも batch 形状が reduction 順序を変える、
+   という機構どおりの結果。
+
+   **したがって採否は score でしか決められない。** 判定は
+   `val/search/test_score` を合流あり/なしで完走比較すること。
+   **その前に対照が要る:合流なしを 2 回走らせて `[val-hash]` が一致するか。**
+   一致すれば非決定性は合流由来と確定し、しなければ depth 3 自体が
+   非決定的ということになって話が変わる。
 
 ---
 
