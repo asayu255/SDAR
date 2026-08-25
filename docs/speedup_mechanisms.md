@@ -47,6 +47,7 @@
 | E3 compact per-turn record | 既定 on | 2 | ビット同一 |
 | C env reset prefetch | `ENV_RESET_PREFETCH=1`（script が export） | 2 | ビット同一 |
 | **検索リクエストのバッチ化** | `SEARCH_BATCH_REQUESTS`（**既定 on**、export 不要） | 7 | 同一クエリ・同一順序・同一文書 |
+| **raw_prompt_ids の二重 tokenize 停止** | `ROLLOUT_RAW_IDS_REUSE`（**既定 on**、export 不要） | 7 | 最初の8回で新旧一致を自己検証 |
 | `max_model_len=4608` | script 内 | 1 | KV 予算を必要ちょうどに絞る |
 | rollout log-prob を作らない | `rollout.return_rollout_log_probs=False` | 5 | 生成トークン不変 |
 | session 中の `empty_cache` 抑止 | コード（常時、session 中のみ） | 5 | ビット同一 |
@@ -65,6 +66,18 @@
 クライアントはリストを 1 回送って拒否され、単発にフォールバックしてその URL のバッチ化を
 300 秒止める（`SEARCH_BATCH_RETRY_S`）。従来動作 + 5 分に 1 回の無駄リクエストである。
 `SEARCH_BATCH_REQUESTS=0` で完全に無効化できる。
+
+**raw_prompt_ids の二重 tokenize も同ブランチからの移植。**`preprocess_single_sample` は
+text-only 経路で**同じ文字列を2回 tokenize** していた ―― 1回目は
+`tokenize_and_postprocess_data`（padding 付き）、2回目は `raw_prompt_ids` 用の
+`tokenizer.encode`。1回目の非 pad トークンが 2 回目そのものになる（`left`/`right`/`error`
+のどれも同じ切り方をする）。**行ごと・ターンごと**に走るので、360 行 × alfworld の 50 ターン上限
+という規模になる。
+
+`raw_prompt_ids` は vLLM が生成に使う値なので等価性は仮定せず、**プロセスの最初の 8 回だけ
+両方を走らせて突き合わせる**。1 度でも食い違えばそのプロセスは恒久的に旧経路へ戻り、その旨を
+印字する。multimodal と `truncation=middle` は常に旧経路（前者は raw_prompt が別の文字列、
+後者は `postprocess_data` が実装していないモード）。
 
 **5 期の 2 件は「読まれない結果を作るのをやめた」もの。** `rollout_log_probs` の消費者は
 `RayPPOTrainer.fit` の drift 検査（`rollout_probs_diff`）だけで、比較対象の `old_log_prob`
@@ -643,6 +656,7 @@ export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 # 既定 on: ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY / ROLLOUT_COMPACT_RECORD
 #          ROLLOUT_PREFETCH_TEACHER_ADAPTIVE（chunk を glue に追従。128 が下限 / 512 が上限）
 #          SEARCH_BATCH_REQUESTS（窓 SEARCH_BATCH_WINDOW_MS=10、拒否時の再探索 SEARCH_BATCH_RETRY_S=300）
+#          ROLLOUT_RAW_IDS_REUSE（prompt の二重 tokenize 停止。最初の8回で自己検証）
 # 立てない: ROLLOUT_PREFETCH_LOGPROB（消費側が無い）、GPU_PROFILER_SYNC_PHASES（遅くなる）
 # 計測（任意）: GPU_PROFILER=1 ROLLOUT_TURN_TIMING=1 GPU_PROFILER_ROLLUP_EVERY=1
 bash examples/opd_trainer/run_multitask_qwen3.sh env.search.search_url=http://<host>:8000/retrieve
