@@ -1023,4 +1023,33 @@ turn 0 の util は 126 行で 44%、252 行で 79%、ここで 89% —— 呼�
 VAL_PIPELINE_DEPTH=3 ...（ROLLOUT_MERGE_GENERATES なし）
 ```
 
-ms/row が 57 のままなら合流は落とす。66〜70 なら合流が効いている。**未測定。**
+### 切り分けの実測 —— 23% は全部 merge、depth 3 単独はゼロ
+
+| | ms/row | batch#25 の累積 wall |
+| --- | ---: | ---: |
+| 252 行・depth 2 | 74 | 794.0 s |
+| **252 行・depth 3(merge なし)** | **75** | **788.7 s** |
+| 252 行・depth 3 + merge | **57** | — |
+
+**depth 3 単独は depth 2 と区別がつかない。** slot を増やしても generate 呼び出しは
+worker group 上で直列のままなので、当然である。**depth 3 は throughput のレバーでは
+なく、merger に相手を供給するためだけの前提条件**である。
+
+したがって **load-bearing な部品は merger** であり、それは
+**採点経路で呼び出し内の行の組み方を変える方**である。「リスクの小さい depth 3 だけ
+残す」という逃げ道は無い。
+
+### 採点の確認が要る
+
+merge は greedy であっても、呼び出しごとの batch 形状を変える。reduction の順序が
+変われば token が稀に変わりうる —— 126 → 252 の幅変更で既に踏んだのと同じ種類の
+変化である。**merge あり / なしの run で `val/search/test_score` を wandb で
+突き合わせること。** 一致すれば以後は気にしなくてよく、ずれるならその幅を
+記録した上で採用可否を決める。
+
+### depth 4 は試す価値がある
+
+merge 率は depth 3 で 24.5%。**depth を上げれば待ち行列が長くなり、合流率は
+上がるはず**である。ただし driver 側の CPU(preproc 4.6 s、envstep 3.1 s)が
+depth 4 で律速に回る可能性がある。**判定は同じく ms/row と、`[rollout-merge]` の
+合流率の両方で。**
