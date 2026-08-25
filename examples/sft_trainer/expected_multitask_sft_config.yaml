@@ -140,6 +140,18 @@
 "env.multitask.history_length.alfworld": 2
 "env.multitask.history_length.search": 4
 "env.multitask.history_length.webshop": 2
+# Accepts one number, as here, or a mapping naming the tasks that differ:
+#
+#   "env.multitask.val_per_task_batch_size": {alfworld: 126, search: 252, webshop: 126}
+#
+# alfworld and webshop must stay at 126 whatever else changes -- an environment
+# manager is built at this size and alfworld seeds worker i from the game cycle by
+# position within it, so a different size scores a different set of games. search
+# is indifferent: every row carries its own question and ground truth, and the
+# rows and their order are the same either way. Raising it is a throughput change
+# (its later turns decode for a handful of trajectories in a slot sized for all of
+# them), and raising it means editing this line too -- which is the point of the
+# line: the decision gets recorded rather than passed on a command line.
 "env.multitask.val_per_task_batch_size": 126
 
 # The retriever policy decides what enters the validation trajectories, so it is

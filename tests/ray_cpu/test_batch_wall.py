@@ -363,3 +363,47 @@ def test_a_table_without_token_counts_is_unchanged(capsys):
     out = capsys.readouterr().out
     assert "TOKENS" not in out
     assert "SHARE" in out
+
+
+def test_rows_make_two_differently_batched_runs_comparable():
+    """Widening search turns 413 batches into 208, so batch #171 stops being the
+    same rows and s/batch stops being comparable. Rows processed does not move.
+    """
+    t = 0.0
+    for _ in range(21):  # 126-row batches at 14.2 s
+        narrow = rollout_loop._record_batch_wall(t, t + 14.2, "primary", rows=126)
+        t += 14.2
+
+    rollout_loop.reset_batch_wall()
+    t = 0.0
+    for _ in range(21):  # 252-row batches at 22.0 s -- fewer batches, more rows
+        wide = rollout_loop._record_batch_wall(t, t + 22.0, "primary", rows=252)
+        t += 22.0
+
+    assert per_batch(narrow, "last20") == pytest.approx(14.2, abs=0.1)
+    assert per_batch(wide, "last20") == pytest.approx(22.0, abs=0.1)
+    # s/batch says the wide run is slower; per row it is the faster one
+    assert ms_per_row(narrow, "last20") == pytest.approx(113, abs=1)
+    assert ms_per_row(wide, "last20") == pytest.approx(87, abs=1)
+
+
+def ms_per_row(line, scope="all"):
+    segment = re.search(r"ms/row (\S+ \S+)", line).group(1)
+    return float(re.search(rf"{scope}=([0-9.]+)", segment).group(1))
+
+
+def test_rows_are_reported_per_batch_and_cumulatively():
+    first = rollout_loop._record_batch_wall(0.0, 10.0, "primary", rows=126)
+    assert "rows=126" in first
+    assert ms_per_row(first) == pytest.approx(10.0 / 126 * 1000, abs=1)
+
+    second = rollout_loop._record_batch_wall(10.0, 20.0, "primary", rows=252)
+    assert "rows=252" in second
+    assert ms_per_row(second) == pytest.approx(20.0 / 378 * 1000, abs=1)
+
+
+def test_a_batch_without_a_row_count_still_reports_the_rest():
+    line = rollout_loop._record_batch_wall(0.0, 10.0, "primary")
+    assert "rows=-" in line
+    assert "ms/row" not in line
+    assert per_batch(line) == 10.0

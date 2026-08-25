@@ -193,17 +193,24 @@ def _current_slot():
 # carries a prefix the comparison does not want.
 _WALL_LOCK = threading.Lock()
 _WALL_WINDOW = 20
-_WALL_STATE = {"batches": 0, "first_start": None, "serial": 0.0, "recent": []}
+_WALL_STATE = {"batches": 0, "first_start": None, "serial": 0.0, "recent": [], "rows": 0}
 
 
 def reset_batch_wall():
     """Start a fresh accounting period (called at the top of each validation)."""
     with _WALL_LOCK:
-        _WALL_STATE.update(batches=0, first_start=None, serial=0.0, recent=[])
+        _WALL_STATE.update(batches=0, first_start=None, serial=0.0, recent=[], rows=0)
 
 
-def _record_batch_wall(start, end, slot):
-    """Fold one batch into the running totals and return the line(s) to print."""
+def _record_batch_wall(start, end, slot, rows=None):
+    """Fold one batch into the running totals and return the line(s) to print.
+
+    ``rows`` makes the run comparable to one that batches differently. Seconds
+    per batch only compares runs whose batches hold the same number of rows, and
+    the batch NUMBER stops being a fixed point too -- widening search's batches
+    turns 413 of them into 208, so batch #171 is no longer the same rows. Rows
+    processed is the invariant either way.
+    """
     with _WALL_LOCK:
         if _WALL_STATE["first_start"] is None:
             _WALL_STATE["first_start"] = start
@@ -213,12 +220,17 @@ def _record_batch_wall(start, end, slot):
         _WALL_STATE["serial"] += span
         serial = _WALL_STATE["serial"]
         wall = end - _WALL_STATE["first_start"]
+        if rows:
+            _WALL_STATE["rows"] += int(rows)
+        rows_total = _WALL_STATE["rows"]
         recent = _WALL_STATE["recent"]
-        recent.append(end)
+        recent.append((end, rows_total))
         # one more than the window: the rate over N completions needs the end
         # time of the batch before them, not just the N end times themselves.
         del recent[: -(_WALL_WINDOW + 1)]
-        window = (recent[-1] - recent[0]) / (len(recent) - 1) if len(recent) > 1 else float("nan")
+        window = (recent[-1][0] - recent[0][0]) / (len(recent) - 1) if len(recent) > 1 else float("nan")
+        window_rows = recent[-1][1] - recent[0][1]
+        window_per_row = (recent[-1][0] - recent[0][0]) / window_rows * 1000 if window_rows else float("nan")
     occupancy = serial / wall if wall > 0 else float("nan")
     lines = []
     if index == 0:
@@ -227,9 +239,13 @@ def _record_batch_wall(start, end, slot):
             "OCCUPANCY, not speedup -- a pipelined batch's span inflates while it waits on "
             "another batch's generate, so two slots read 2.00x whether or not anything was gained."
         )
+    per_row = ""
+    if rows_total:
+        all_per_row = wall / rows_total * 1000
+        per_row = f"  ms/row last{_WALL_WINDOW}={window_per_row:.0f} all={all_per_row:.0f}"
     lines.append(
-        f"WALL   slot={slot}  batch#{index}  span={span:.1f}s  "
-        f"s/batch last{_WALL_WINDOW}={window:.1f}s all={wall / (index + 1):.1f}s  "
+        f"WALL   slot={slot}  batch#{index}  rows={rows or '-'}  span={span:.1f}s  "
+        f"s/batch last{_WALL_WINDOW}={window:.1f}s all={wall / (index + 1):.1f}s{per_row}  "
         f"wall={wall:.1f}s  slots-busy={occupancy:.2f}x"
     )
     return "\n".join(lines)
@@ -264,7 +280,7 @@ def _fmt_per_gpu(vals):
     return "/".join(f"{v:.0f}" if v is not None else "-" for v in vals)
 
 
-def _print_turn_timing(records, span=None, slot="-"):
+def _print_turn_timing(records, span=None, slot="-", rows=None):
     """Pretty-print the per-turn breakdown collected during one rollout.
 
     The perGPU% column shows per-GPU SM util during the turn's generation; the
@@ -349,7 +365,7 @@ def _print_turn_timing(records, span=None, slot="-"):
             f"(lower=better; TASK_BALANCE_INTERLEAVE shrinks this on mixed turns)"
         )
     if span is not None:
-        lines.append(_record_batch_wall(span[0], span[1], slot))
+        lines.append(_record_batch_wall(span[0], span[1], slot, rows=rows))
     print("\n".join(lines), flush=True)
 
 
@@ -1059,7 +1075,9 @@ class TrajectoryCollector:
                 break
 
         if _turn_records is not None:
-            _print_turn_timing(_turn_records, span=(_batch_started, _now()), slot=_current_slot())
+            _print_turn_timing(
+                _turn_records, span=(_batch_started, _now()), slot=_current_slot(), rows=batch_size
+            )
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,

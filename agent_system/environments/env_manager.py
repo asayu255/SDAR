@@ -872,6 +872,42 @@ def _get_multitask_per_task_batch_size(config, tasks: List[str], is_train: bool)
     return int(per_task_batch_size)
 
 
+def _get_multitask_val_batch_sizes(config, tasks: List[str]):
+    """``(sizes, default)`` for validation: how many rows each task's batch holds.
+
+    ``val_per_task_batch_size`` may be one number, as it always was, or a mapping
+    naming the tasks that differ -- the same shape ``max_steps`` and
+    ``history_length`` already take. Anything unnamed keeps ``data.val_batch_size``,
+    so adding an entry for one task cannot silently resize another.
+
+    A task's size is not free of its scoring. alfworld draws its episodes from a
+    seeded game cycle indexed by position within its environment manager, and the
+    manager is built at this size: change it and the run plays different games.
+    search does not care -- every row carries its own question and ground truth --
+    which is the task the size is worth changing for.
+    """
+    multitask_cfg = config.env.get("multitask", {})
+    configured = _plain_container(multitask_cfg.get("val_per_task_batch_size", None))
+    if isinstance(configured, dict):
+        unknown = [task for task in configured if task not in tasks]
+        if unknown:
+            raise ValueError(f"val_per_task_batch_size names tasks not in this run: {unknown} (configured: {tasks})")
+        sizes = {task: int(size) for task, size in configured.items()}
+        for task, size in sizes.items():
+            if size <= 0:
+                raise ValueError(f"val_per_task_batch_size[{task!r}] must be positive, got {size}")
+        default = int(config.data.val_batch_size)
+        return {task: sizes.get(task, default) for task in tasks}, default
+    uniform = _get_multitask_per_task_batch_size(config, tasks, is_train=False)
+    return {task: uniform for task in tasks}, uniform
+
+
+def _size_for(per_task_batch_size, task: str) -> int:
+    if isinstance(per_task_batch_size, dict):
+        return int(per_task_batch_size[task])
+    return int(per_task_batch_size)
+
+
 def _get_multitask_task_history_length(config, task: str):
     multitask_cfg = config.env.get("multitask", {})
     configured = _plain_container(multitask_cfg.get("history_length", {}))
@@ -889,10 +925,12 @@ def _copy_config_for_task(config, env_name: str, max_steps: int, task: str = Non
     return task_config
 
 
-def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str, int], per_task_batch_size: int, group_n: int, is_train: bool, seed: int, resources_per_worker: Dict):
+def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str, int], per_task_batch_size, group_n: int, is_train: bool, seed: int, resources_per_worker: Dict):
+    """``per_task_batch_size`` is one number for every task, or a mapping."""
     managers = {}
 
     for task in tasks:
+        env_num = _size_for(per_task_batch_size, task)
         if task == "alfworld":
             from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
 
@@ -902,7 +940,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             _envs = build_alfworld_envs(
                 alf_config_path,
                 seed,
-                per_task_batch_size,
+                env_num,
                 group_n,
                 resources_per_worker=resources_per_worker,
                 is_train=is_train,
@@ -915,7 +953,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             task_config = _copy_config_for_task(config, "search", task_max_steps[task], task=task)
             _envs = build_search_envs(
                 seed=seed,
-                env_num=per_task_batch_size,
+                env_num=env_num,
                 group_n=group_n,
                 is_train=is_train,
                 env_config=task_config.env,
@@ -940,7 +978,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             task_config = _copy_config_for_task(config, "Webshop", task_max_steps[task], task=task)
             _envs = build_webshop_envs(
                 seed=seed,
-                env_num=per_task_batch_size,
+                env_num=env_num,
                 group_n=group_n,
                 is_train=is_train,
                 env_kwargs=env_kwargs,
@@ -999,6 +1037,19 @@ class LazyEnvManager:
 PIPELINEABLE_VAL_TASKS = ("search",)
 
 
+def get_val_batch_sizes(config):
+    """``(sizes, default)`` for validation batching, or ``None`` for a non-multitask run.
+
+    The trainer's loader needs the same numbers the environment managers are
+    built with -- a batch of 252 rows handed to a manager holding 126
+    environments would index past the end -- so both read them from here.
+    """
+    if config.env.env_name.lower() != "multitask":
+        return None
+    tasks = _get_multitask_tasks(config)
+    return _get_multitask_val_batch_sizes(config, tasks)
+
+
 def build_val_env_manager(config, tasks: List[str]):
     """A second validation env manager, restricted to `tasks`.
 
@@ -1024,7 +1075,7 @@ def build_val_env_manager(config, tasks: List[str]):
             config=config,
             tasks=list(tasks),
             task_max_steps=_get_multitask_task_max_steps(config, all_tasks),
-            per_task_batch_size=_get_multitask_per_task_batch_size(config, all_tasks, is_train=False),
+            per_task_batch_size=_get_multitask_val_batch_sizes(config, all_tasks)[0],
             group_n=1,
             is_train=False,
             seed=config.env.seed + 1000,
@@ -1048,7 +1099,7 @@ def make_envs(config):
         tasks = _get_multitask_tasks(config)
         task_max_steps = _get_multitask_task_max_steps(config, tasks)
         train_per_task_batch_size = _get_multitask_per_task_batch_size(config, tasks, is_train=True)
-        val_per_task_batch_size = _get_multitask_per_task_batch_size(config, tasks, is_train=False)
+        val_batch_sizes = _get_multitask_val_batch_sizes(config, tasks)[0]
         if train_per_task_batch_size * len(tasks) != int(config.data.train_batch_size):
             raise ValueError(
                 "multitask train batch mismatch: "
@@ -1059,13 +1110,21 @@ def make_envs(config):
         #     test parquet yields one single-task batch per task (each task is evaluated
         #     in its own rollout pass)
         #   - mixed batch: val_batch_size == val_per_task_batch_size * len(tasks)
+        #
+        # Neither is checked once the sizes differ by task: the batches then come
+        # from TaskBatchSampler, which groups by task by construction rather than
+        # by the sizes lining up, and val_batch_size is only the default for the
+        # tasks the config does not name.
         val_batch_size = int(config.data.val_batch_size)
-        if val_batch_size not in (val_per_task_batch_size, val_per_task_batch_size * len(tasks)):
-            raise ValueError(
-                "multitask val batch mismatch: val_batch_size must be "
-                f"{val_per_task_batch_size} (per-task validation batches) or "
-                f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
-            )
+        uniform = set(val_batch_sizes.values())
+        if len(uniform) == 1:
+            val_per_task_batch_size = uniform.pop()
+            if val_batch_size not in (val_per_task_batch_size, val_per_task_batch_size * len(tasks)):
+                raise ValueError(
+                    "multitask val batch mismatch: val_batch_size must be "
+                    f"{val_per_task_batch_size} (per-task validation batches) or "
+                    f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
+                )
 
         def _build_train_envs():
             managers = _build_multitask_manager(
@@ -1089,7 +1148,7 @@ def make_envs(config):
                 config=config,
                 tasks=tasks,
                 task_max_steps=task_max_steps,
-                per_task_batch_size=val_per_task_batch_size,
+                per_task_batch_size=val_batch_sizes,
                 group_n=1,
                 is_train=False,
                 seed=config.env.seed + 1000,
@@ -1098,7 +1157,7 @@ def make_envs(config):
             if "webshop" in tasks:
                 import time
 
-                time.sleep(val_per_task_batch_size * 0.1)
+                time.sleep(val_batch_sizes["webshop"] * 0.1)
             return managers
 
         return LazyEnvManager(_build_train_envs), LazyEnvManager(_build_val_envs)

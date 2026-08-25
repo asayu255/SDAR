@@ -288,3 +288,72 @@ def test_a_second_manager_is_refused_for_an_unsafe_task():
 
     with pytest.raises(ValueError, match="cannot have a second validation manager"):
         build_val_env_manager(config=None, tasks=["alfworld"])
+
+
+def _sampler_trainer(val_per_task_batch_size, task_names, val_batch_size=126):
+    """RayPPOTrainer's validation batch sampler, bound to the fields it reads."""
+    from omegaconf import OmegaConf
+
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    class _Frame:
+        column_names = ["task_name"]
+
+        def __getitem__(self, key):
+            return {"task_name": task_names}[key]
+
+    class _T:
+        _validation_batch_sampler = RayPPOTrainer._validation_batch_sampler
+
+        def __init__(self):
+            self.config = OmegaConf.create(
+                {
+                    "env": {
+                        "env_name": "multitask",
+                        "multitask": {
+                            "tasks": ["alfworld", "search", "webshop"],
+                            "val_per_task_batch_size": val_per_task_batch_size,
+                        },
+                    },
+                    "data": {"val_batch_size": val_batch_size},
+                }
+            )
+            self.val_dataset = type("_D", (), {"dataframe": _Frame()})()
+
+    return _T()
+
+
+_ROWS = ["alfworld"] * 126 + ["webshop"] * 126 + ["search"] * 500
+
+
+def test_uniform_sizes_keep_the_plain_loader():
+    """No sampler means the loader keeps batch_size/shuffle/drop_last, which is
+    the path every other arm is on."""
+    assert _sampler_trainer(126, _ROWS)._validation_batch_sampler() is None
+
+
+def test_a_per_task_size_builds_a_sampler():
+    sampler = _sampler_trainer({"search": 252}, _ROWS)._validation_batch_sampler()
+    assert sampler is not None
+    assert [len(b) for b in sampler] == [126, 126, 252, 248]
+
+
+def test_a_mapping_that_changes_nothing_still_keeps_the_plain_loader():
+    assert _sampler_trainer({"search": 126}, _ROWS)._validation_batch_sampler() is None
+
+
+def test_rows_without_a_task_column_are_a_loud_failure():
+    """Grouping by task is the whole point; guessing would produce mixed batches
+    and get_task_names raises on those, hundreds of batches in."""
+    trainer = _sampler_trainer({"search": 252}, _ROWS)
+    trainer.val_dataset = type("_D", (), {"dataframe": type("_F", (), {"column_names": ["prompt"]})()})()
+    with pytest.raises(ValueError, match="no task_name column"):
+        trainer._validation_batch_sampler()
+
+
+def test_a_single_task_run_keeps_the_plain_loader():
+    from omegaconf import OmegaConf
+
+    trainer = _sampler_trainer({"search": 252}, _ROWS)
+    trainer.config = OmegaConf.create({"env": {"env_name": "search"}, "data": {"val_batch_size": 126}})
+    assert trainer._validation_batch_sampler() is None

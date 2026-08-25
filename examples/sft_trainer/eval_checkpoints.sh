@@ -169,6 +169,34 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # cannot spare them.
 export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-2}"
 
+# WIDER SEARCH BATCHES -- not on by default, because it needs the pinned config
+# edited in the same change.
+#
+# A search batch's later turns decode for a handful of trajectories in a slot
+# sized for 126: measured, the last two turns take 46% of a batch's generation
+# time to carry 14% of its work, and a decode step costs the same whether it
+# carries ten sequences or a hundred. So those turns are nearly free to widen.
+#
+# To run it, set BOTH (they are checked against each other):
+#
+#   expected_multitask_sft_config.yaml:
+#     "env.multitask.val_per_task_batch_size": {alfworld: 126, search: 252, webshop: 126}
+#
+#   this script, appended to the trainer arguments:
+#     env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}'
+#
+# alfworld and webshop stay at 126: their environment managers are built at this
+# size and alfworld's games are indexed by position within its manager. search's
+# rows and their order do not change, only how they are grouped, so its score
+# does not move.
+#
+# 252 fits the KV cache (159,600 tokens per GPU): the heaviest turn is 64 active
+# at ~1,330 prompt tokens plus 512 of response, about 118,000. 378 would sit at
+# 156,500, which is too close to the edge.
+#
+# Compare runs on ms/row from the WALL lines, NOT on s/batch or batch number --
+# widening turns 413 batches into 208, so neither is the same quantity twice.
+
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
 # and the rest append; the id is per invocation, so re-running this script never

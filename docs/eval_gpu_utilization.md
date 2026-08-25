@@ -771,3 +771,82 @@ turn table に `promptTok` と `genTok` の 2 列を足した。どちらも
 それは確定である。**
 
 **未測定。次の run で `TOKENS` の行を読むこと。**
+
+## 13. 実測 —— 尻尾は decode 律速だった
+
+`promptTok` / `genTok` を入れて、search batch 1 本の turn 別内訳:
+
+| turn | active | gen | genGPU% | promptTok/行 | genTok/行 | **新規 prefill/行** |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 126 | 0.91 | **44%** | 167 | 20 | 167 |
+| 1 | 126 | 10.29 | 90% | 730 | 208 | ~563 |
+| 2 | 32 | 5.53 | 90% | 1,330 | 198 | ~600 |
+| 3 | 10 | 3.99 | 81% | 2,214 | 239 | ~884 |
+
+search は履歴窓が滑らない(`history_length=4` = `max_steps=4`)ので、turn N の
+プロンプトは turn N−1 の接頭辞を含む。**実 prefill は promptTok の差分**である。
+
+まず、8 節以降で置いていた「プロンプト 1,500 トークン」は**外れていた**
+(turn 0 で 167、9 倍違う)。
+
+読めること:
+
+1. **turn 0 の 44% は呼び出し固定費。** 0.91 s のうち 0.51 s が空き —— 実測の
+   0.6 s とほぼ一致する。呼び出しが短いほど固定費の比率が上がる、という予測どおり
+2. **turn 1〜3 は 81〜90%。** 呼び出しが長ければ固定費は薄まる
+3. **尻尾は decode 律速で確定。** turn 3 は新規 prefill が 8,840 トークンしか
+   ないのに 3.99 秒。prefill でこの時間は説明できない。**240〜500 回の decode
+   ステップを、126 席のうち 10 席だけ埋めて回している**
+4. **尻尾は generate 時間の 46%(9.52 / 20.7 s)を使い、仕事は 14%(42 / 294)**
+
+7 節でこの可能性を「util が active に反応しないから」と棄却したのは誤りだった。
+反応しないのは帯域律速だからで、**席が空いていないことの証明にはならない。**
+
+## 14. task ごとの validation batch size
+
+尻尾の席を埋める最小の手は、**search の batch を広げること**である。decode の
+1 ステップは席の数にほぼ依存しないので、252 行にすれば同じステップ数で倍の行を
+処理する。
+
+### 実装
+
+* `env.multitask.val_per_task_batch_size` が **数値 1 つ、または task ごとの
+  マッピング**を取る(`max_steps` と `history_length` に前例がある)。
+  名前のない task は `data.val_batch_size` のまま
+* `verl/utils/val_batching.py` の **`TaskBatchSampler`** —— 行を task で
+  グループ化し、その task の size で刻む。**全 task が同じ size なら sampler を
+  作らず、従来の loader のまま**(他の arm は無影響)
+* 環境 manager は task ごとに違う worker 数で建つ
+* `WALL` 行に **`rows=` と `ms/row`** を追加
+
+### なぜ sampler が要るのか
+
+**いま single-task batch になっているのは規則ではなく偶然である。** loader は
+`batch_size=126` で機械的に切っているだけで、alfworld と webshop がちょうど
+126 行だから揃っている。**`val_batch_size` を 252 にすると最初の batch が
+alfworld 126 + webshop 126 の混合になり、`get_task_names` が例外を投げる。**
+sampler は task 境界で切ることでこれを規則にする。
+
+### 採点は動かない
+
+| task | 変わるもの | 採点 |
+| --- | --- | --- |
+| alfworld | 何も(manager 126、seed、game cycle そのまま) | **不変** |
+| webshop | 何も | **不変** |
+| search | まとめ方だけ(同じ行、同じ順序) | **不変** |
+
+### 有効化には pinned config の編集が要る
+
+`expected_multitask_sft_config.yaml` が
+`"env.multitask.val_per_task_batch_size": 126` を固定している。これは正しい
+——この値が alfworld の episode を決めるからである。**弱めない。** 有効にするには
+そちらもマッピング形に書き換える。決定がコマンドラインではなくファイルに残る、
+というのがこの pin の目的である。
+
+### 比較の作法(更新)
+
+widening は **413 batch を 208 batch に変える**ので、
+**`s/batch` も batch 番号も同じ量ではなくなる。** 比較は `ms/row` で行う。
+現行は **118 ms/行**(6145 s ÷ 51,965 行)。
+
+**未測定。**

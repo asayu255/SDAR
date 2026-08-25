@@ -691,14 +691,19 @@ class RayPPOTrainer:
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
+        val_loader_kwargs = dict(
             dataset=self.val_dataset,
-            batch_size=val_batch_size,
             num_workers=self.config.data.get("dataloader_num_workers", 8),
-            shuffle=False,
-            drop_last=False,
             collate_fn=collate_fn,
         )
+        batch_sampler = self._validation_batch_sampler()
+        if batch_sampler is None:
+            val_loader_kwargs.update(batch_size=val_batch_size, shuffle=False, drop_last=False)
+        else:
+            # batch_size/shuffle/drop_last are not accepted alongside a
+            # batch_sampler: it decides all three.
+            val_loader_kwargs.update(batch_sampler=batch_sampler)
+        self.val_dataloader = StatefulDataLoader(**val_loader_kwargs)
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
@@ -851,6 +856,43 @@ class RayPPOTrainer:
         if "temperature" in task_kwargs:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
+
+    def _validation_batch_sampler(self):
+        """Group validation rows by task, at each task's own batch size.
+
+        Returns None when every task takes the same size -- then the plain
+        loader already produces exactly these batches, and the old path is kept
+        so that runs which change nothing behave identically.
+
+        A batch holding two tasks is not a slow path, it is an exception:
+        get_task_names refuses a mixed validation batch. Today's single-task
+        batches come from alfworld and webshop happening to hold exactly
+        val_batch_size rows, which stops being true the moment one task's size
+        moves. This sampler makes it a rule instead of an alignment.
+        """
+        from agent_system.environments.env_manager import get_val_batch_sizes
+        from verl.utils.val_batching import TaskBatchSampler, task_names_of
+
+        resolved = get_val_batch_sizes(self.config)
+        if resolved is None:
+            return None
+        sizes, default = resolved
+        if len(set(sizes.values())) <= 1:
+            return None
+
+        task_names = task_names_of(self.val_dataset)
+        if task_names is None:
+            raise ValueError(
+                "val_per_task_batch_size names different sizes per task, but the validation "
+                "rows carry no task_name column to group them by"
+            )
+        sampler = TaskBatchSampler(task_names, sizes, default)
+        print(
+            f"[val-batching] per-task validation batch sizes {sizes} (default {default}): "
+            f"{len(sampler)} batches, each holding one task.",
+            flush=True,
+        )
+        return sampler
 
     def _validation_slots(self):
         """One slot per validation batch that may be in flight at once.
