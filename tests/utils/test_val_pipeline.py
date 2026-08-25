@@ -409,6 +409,45 @@ def test_the_pipeline_reports_where_its_wall_went(capsys):
 
     assert consumed == [0, 1, 2, 3]
     out = capsys.readouterr().out
-    assert "[val-pipeline] 4 batches over" in out
+    assert "[val-pipeline] final: 4 batches over" in out
     assert "NOTHING running" in out
     assert "scoring" in out
+
+
+def test_the_pipeline_reports_before_the_run_finishes(capsys, monkeypatch):
+    """A summary only at the end costs the whole validation to read once."""
+    import time as _time
+
+    import verl.utils.val_pipeline as vp
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    monkeypatch.setattr(vp, "_REPORT_EVERY", 2)
+    slots = [Slot("a", None, None), Slot("b", None, None)]
+
+    seen_early = []
+    for _, _ in run_pipelined(
+        range(5),
+        prepare=lambda x: x,
+        task_of=lambda p: "search",
+        launch=lambda prepared, slot: (_time.sleep(0.01), prepared)[1],
+        slots=slots,
+    ):
+        seen_early.append(capsys.readouterr().out)
+
+    assert any("after 2" in chunk for chunk in seen_early)
+    assert any("after 4" in chunk for chunk in seen_early)
+
+
+def test_the_periodic_report_can_be_turned_off(capsys, monkeypatch):
+    import verl.utils.val_pipeline as vp
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    monkeypatch.setattr(vp, "_REPORT_EVERY", 0)
+    slots = [Slot("a", None, None), Slot("b", None, None)]
+    for _ in run_pipelined(
+        range(4), prepare=lambda x: x, task_of=lambda p: "s", launch=lambda p, s: p, slots=slots
+    ):
+        pass
+    out = capsys.readouterr().out
+    assert "after " not in out
+    assert "final:" in out

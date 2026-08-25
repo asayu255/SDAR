@@ -39,9 +39,16 @@ would score different games and it does not get one. Search has no such state
 matter.
 """
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, List, Optional
+
+
+# How often the coverage summary is printed, in retired batches. A summary only
+# at the end needs the whole validation to finish -- fifty minutes to answer a
+# question a tenth of that would settle.
+_REPORT_EVERY = int(os.environ.get("VAL_PIPELINE_REPORT_EVERY", "25"))
 
 
 def _coverage(intervals):
@@ -144,6 +151,24 @@ def run_pipelined(
         resumed = time.perf_counter()
         return payload, resumed
 
+    def report(final):
+        covered, span = _coverage(spans)
+        if span <= 0:
+            return
+        idle = span - covered
+        tag = "final" if final else f"after {len(spans)}"
+        print(
+            f"[val-pipeline] {tag}: {len(spans)} batches over {span:.1f}s: at least one slot "
+            f"running {covered:.1f}s ({100 * covered / span:.1f}%), NOTHING running {idle:.1f}s "
+            f"({100 * idle / span:.1f}%). Calling thread: prepare {clock['prepare']:.1f}s, "
+            f"scoring {clock['consumer']:.1f}s, waiting on a slot {clock['retire_wait']:.1f}s.",
+            flush=True,
+        )
+
+    def maybe_report():
+        if _REPORT_EVERY > 0 and len(spans) and len(spans) % _REPORT_EVERY == 0:
+            report(final=False)
+
     try:
         for item in items:
             _t = time.perf_counter()
@@ -162,23 +187,16 @@ def run_pipelined(
                 payload, resumed = handed_back()
                 yield payload
                 clock["consumer"] += time.perf_counter() - resumed
+                maybe_report()
             free.remove(slot)
             inflight.append((prepared, executor.submit(timed_launch, prepared, slot), slot))
         while inflight:
             payload, resumed = handed_back()
             yield payload
             clock["consumer"] += time.perf_counter() - resumed
+            maybe_report()
     finally:
-        covered, span = _coverage(spans)
-        if span > 0:
-            idle = span - covered
-            print(
-                f"[val-pipeline] {len(spans)} batches over {span:.1f}s: at least one slot running "
-                f"{covered:.1f}s ({100 * covered / span:.1f}%), NOTHING running {idle:.1f}s "
-                f"({100 * idle / span:.1f}%). Calling thread: prepare {clock['prepare']:.1f}s, "
-                f"scoring {clock['consumer']:.1f}s, waiting on a slot {clock['retire_wait']:.1f}s.",
-                flush=True,
-            )
+        report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.
         for _, future, _ in inflight:
