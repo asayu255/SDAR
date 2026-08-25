@@ -11,18 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whether the log can say, by itself, that two batches overlapped.
+"""Seconds of wall per batch, which is what a pipeline is judged on.
 
-The per-batch turn table cannot answer that. Pipelining does not change what a
+The per-batch turn table cannot answer it: pipelining does not change what a
 batch costs -- ``SHARE gen(GPU-busy)`` reads the same at depth 1 and depth 2 --
-it changes only when the second batch runs. So the evidence has to be a pair of
-numbers that only concurrency can separate: the sum of the batches' own spans,
-and the wall clock from the first batch's start to this one's end. Serial
-running holds them equal; every overlapped second pushes the sum above the wall.
+so the evidence has to be wall clock across batches.
 
-These tests pin the arithmetic and the reset, because the ratio is the number
-the pipeline's worth is judged on and a silently accumulating counter would read
-as a speedup that never happened.
+The occupancy ratio reported alongside it is NOT a speedup, and these tests pin
+that distinction because it was read as one. Under pipelining a batch's own span
+inflates: the generate call it sits in is queued behind another batch's. Two
+slots each reporting a doubled span read 2.00x with nothing gained -- measured
+1.82x on a run whose s/batch moved by 1.5%.
 """
 
 import os
@@ -44,29 +43,34 @@ def fresh():
     rollout_loop.reset_batch_wall()
 
 
-def ratio(line):
-    return float(re.search(r"serial/wall=([0-9.]+)x", line).group(1))
+def busy(line):
+    return float(re.search(r"slots-busy=([0-9.]+)x", line).group(1))
 
 
 def field(line, name):
     return float(re.search(rf"{name}=([0-9.]+)s", line).group(1))
 
 
+def per_batch(line, scope="all"):
+    return float(re.search(rf"{scope}=([0-9.]+)s", line).group(1))
+
+
 def test_one_batch_is_exactly_serial():
     line = rollout_loop._record_batch_wall(100.0, 110.0, "primary")
     assert "batch#0" in line
     assert field(line, "span") == 10.0
-    assert field(line, "wall-since-first-batch") == 10.0
-    assert ratio(line) == 1.0
+    assert field(line, "wall") == 10.0
+    assert per_batch(line) == 10.0
+    assert busy(line) == 1.0
 
 
 def test_back_to_back_batches_stay_at_one():
     rollout_loop._record_batch_wall(0.0, 10.0, "primary")
     line = rollout_loop._record_batch_wall(10.0, 20.0, "primary")
     assert "batch#1" in line
-    assert field(line, "sum-of-spans") == 20.0
-    assert field(line, "wall-since-first-batch") == 20.0
-    assert ratio(line) == 1.0
+    assert field(line, "wall") == 20.0
+    assert per_batch(line) == 10.0
+    assert busy(line) == 1.0
 
 
 def test_a_gap_between_batches_drops_below_one():
@@ -74,15 +78,17 @@ def test_a_gap_between_batches_drops_below_one():
     # preparation on the calling thread: wall grows, the spans do not.
     rollout_loop._record_batch_wall(0.0, 10.0, "primary")
     line = rollout_loop._record_batch_wall(15.0, 25.0, "primary")
-    assert ratio(line) == pytest.approx(0.8)
+    assert busy(line) == pytest.approx(0.8)
+    assert per_batch(line) == pytest.approx(12.5)
 
 
 def test_fully_overlapped_batches_read_two():
     rollout_loop._record_batch_wall(0.0, 10.0, "primary")
     line = rollout_loop._record_batch_wall(0.0, 10.0, "extra-1")
-    assert field(line, "sum-of-spans") == 20.0
-    assert field(line, "wall-since-first-batch") == 10.0
-    assert ratio(line) == 2.0
+    assert field(line, "wall") == 10.0
+    assert busy(line) == 2.0
+    # and the figure that actually matters halved, which the ratio does not say
+    assert per_batch(line) == 5.0
 
 
 def test_half_overlapped_batches_read_between():
@@ -90,13 +96,14 @@ def test_half_overlapped_batches_read_between():
     # while the first is still stepping its environment.
     rollout_loop._record_batch_wall(0.0, 10.0, "primary")
     line = rollout_loop._record_batch_wall(5.0, 15.0, "extra-1")
-    assert ratio(line) == pytest.approx(20.0 / 15.0, abs=0.005)
+    assert busy(line) == pytest.approx(20.0 / 15.0, abs=0.005)
+    assert per_batch(line) == pytest.approx(7.5)
 
 
 def test_wall_is_measured_from_the_first_batch_not_this_one():
     rollout_loop._record_batch_wall(100.0, 110.0, "primary")
     line = rollout_loop._record_batch_wall(110.0, 130.0, "primary")
-    assert field(line, "wall-since-first-batch") == 30.0
+    assert field(line, "wall") == 30.0
 
 
 def test_slot_name_is_carried_through():
@@ -109,8 +116,8 @@ def test_reset_starts_a_new_accounting_period():
     rollout_loop.reset_batch_wall()
     line = rollout_loop._record_batch_wall(1000.0, 1010.0, "primary")
     assert "batch#0" in line
-    assert field(line, "sum-of-spans") == 10.0
-    assert field(line, "wall-since-first-batch") == 10.0
+    assert field(line, "wall") == 10.0
+    assert per_batch(line) == 10.0
 
 
 def test_batches_are_numbered_in_completion_order():
@@ -120,7 +127,7 @@ def test_batches_are_numbered_in_completion_order():
 
 def test_zero_length_period_does_not_divide_by_zero():
     line = rollout_loop._record_batch_wall(5.0, 5.0, "primary")
-    assert "serial/wall=nan" in line
+    assert "slots-busy=nan" in line
 
 
 def test_concurrent_records_do_not_lose_a_batch():
@@ -141,7 +148,6 @@ def test_concurrent_records_do_not_lose_a_batch():
     for t in threads:
         t.join()
     assert sorted(int(re.search(r"batch#(\d+)", line).group(1)) for line in lines) == list(range(8))
-    assert max(field(line, "sum-of-spans") for line in lines) == 8.0
 
 
 def _records(n):
@@ -220,3 +226,64 @@ def test_an_unlabelled_rollout_still_prints(capsys):
     """Training rollouts do not go through the pipeline and have no slot."""
     rollout_loop._print_turn_timing(_records(2), span=(0.0, 5.0), slot=rollout_loop._current_slot())
     assert "WALL   slot=-  batch#0" in capsys.readouterr().out
+
+
+def test_the_legend_is_printed_once_at_the_start():
+    first = rollout_loop._record_batch_wall(0.0, 1.0, "primary")
+    second = rollout_loop._record_batch_wall(1.0, 2.0, "primary")
+    assert "legend" in first and "OCCUPANCY, not speedup" in first
+    assert "legend" not in second
+
+
+def test_the_window_has_no_rate_until_there_are_two_batches():
+    assert "last20=nans" in rollout_loop._record_batch_wall(0.0, 10.0, "primary")
+
+
+def test_the_trailing_window_drops_the_expensive_prefix():
+    """alfworld and webshop are the first two batches and cost multiples of a
+    search batch, so a cumulative figure over 413 would carry them forever."""
+    rollout_loop._record_batch_wall(0.0, 231.0, "primary")  # alfworld
+    line = None
+    t = 231.0
+    for _ in range(25):  # search batches, 14s each
+        line = rollout_loop._record_batch_wall(t, t + 14.0, "primary")
+        t += 14.0
+
+    assert per_batch(line, "last20") == pytest.approx(14.0)
+    assert per_batch(line) > 20.0  # the cumulative figure still carries alfworld
+
+
+def test_the_window_tracks_a_change_in_rate():
+    t = 0.0
+    for _ in range(20):
+        rollout_loop._record_batch_wall(t, t + 24.0, "primary")
+        t += 24.0
+    slow = rollout_loop._record_batch_wall(t, t + 24.0, "primary")
+    t += 24.0
+    for _ in range(20):  # the retriever is fixed; batches get faster
+        fast = rollout_loop._record_batch_wall(t, t + 14.0, "primary")
+        t += 14.0
+
+    assert per_batch(slow, "last20") == pytest.approx(24.0)
+    assert per_batch(fast, "last20") == pytest.approx(14.0)
+
+
+def test_occupancy_of_two_slots_says_nothing_about_speedup():
+    """The reading that has to be impossible: 2.00x with no gain at all.
+
+    Two slots whose spans doubled because each is queued behind the other run
+    exactly as fast as one slot at the original span, and the occupancy ratio
+    reads 2.00x for both.
+    """
+    solo = [rollout_loop._record_batch_wall(float(i) * 14, float(i) * 14 + 14, "primary") for i in range(6)][-1]
+    solo_rate = per_batch(solo, "last20")
+
+    rollout_loop.reset_batch_wall()
+    t = 0.0
+    for _ in range(10):  # two slots, each batch taking twice as long
+        rollout_loop._record_batch_wall(t, t + 28.0, "primary")
+        pipelined = rollout_loop._record_batch_wall(t, t + 28.0, "extra-1")
+        t += 28.0
+
+    assert busy(pipelined) == pytest.approx(2.0, abs=0.01)
+    assert per_batch(pipelined, "last20") == pytest.approx(solo_rate, abs=1.0)

@@ -358,33 +358,54 @@ pipeline は **1 本の batch のコストを変えない**。変えるのは「
 (`ROLLOUT_TURN_TIMING=1` のとき)。
 
 ```
-WALL   slot=extra-1  batch#37  span=14.3s  wall-since-first-batch=402.1s  sum-of-spans=520.8s  serial/wall=1.29x
+WALL   slot=extra-1  batch#412  span=11.9s  s/batch last20=14.2s all=14.9s  wall=6145.0s  slots-busy=1.82x
 ```
 
-* `span` —— その batch 自身が使った秒数。pipeline では**変わらない**
-* `sum-of-spans` —— 各 batch の span の総和。逐次実行なら wall と一致する
-* `wall-since-first-batch` —— 最初の batch の開始から、この batch の終了まで
-* `serial/wall` —— **1.00 なら 1 本ずつ、1 を超えた分だけ重なっている**
-
-同時性でしか離れない 2 数なので、これは NVML も wandb も要らずにログだけで
-決着する。判定は 2 通り:
+* **`s/batch` —— run 間で比べる数字はこれだけである。** `last20` は直近 20 本の
+  完了間隔、`all` は先頭からの累積
+* `span` —— その batch 自身の秒数。**pipeline 下では膨らむ**(後述)
+* `slots-busy` —— **占有率であって速度向上ではない**
 
 ```bash
-grep 'WALL   slot=' eval.log | tail -1                # serial/wall が 1.00 か、1.2 前後か
-grep 'WALL   slot=' eval.log | sed -n '100p;300p'     # search 区間の 2 点
+grep 'WALL   slot=' eval.log | tail -1
 ```
 
 **行頭アンカー(`^WALL`)は使えない。** rollout loop は Ray actor の中で走るので、
 stdout の各行に `(SFTMultiTaskTaskRunner pid=…) ` が前置される。
 
-後者のほうが読みとして強い。`serial/wall` は validation の先頭から累積するので、
-primary slot だけで走る alfworld と webshop の 2 batch が前半を押し下げる。
-**2 点の `wall-since-first-batch` の差 ÷ batch 数の差**が、その区間の
-「1 batch あたり何秒」である。逐次実行での実測値は **15.1 s/batch**
-(1.73 h ÷ 413)で、depth 2 の見込みは **~12.5 s/batch**、generate 律速の
-下限が 11.87 s/batch。`serial/wall` に直すと **1.15〜1.21x** が効いている姿で、
-**2.00x は出ない**(2 本の generate は worker group 上で直列化されるため、
-重なるのは環境待ちの分だけ)。
+#### `slots-busy` を speedup と読んではいけない —— 最初にそう設計して間違えた
+
+当初この行は `serial/wall` という名前で、「逐次なら sum-of-spans、実際は wall、
+だから比が速度向上」と説明していた。**前提が誤っている。** pipeline 下では
+batch 自身の span が膨らむ —— その batch が座っている generate 呼び出しが、
+他方の batch の generate の後ろに並ぶからである。実測の `TOTAL` でも gen が
+**28.4 s と 10.3 s** に割れており、前者は待ち時間を含んだ値である。
+
+span が 2 倍になった slot が 2 本あれば、**何も得ていなくても比は 2.00x を指す。**
+実際 depth 2 の完走 run は **1.82x** を出しながら、s/batch は 1.5% しか動かなかった。
+占有率としては正しく、速度向上としては無意味である。
+
+#### depth 2 の実測 —— 効果は測れなかった
+
+413 batch 完走、rollout **6145 s = 1.71 h**。
+
+| | s/batch | 出典 |
+| --- | ---: | --- |
+| depth 1 | 15.1 | 1.73 h ÷ 413(3 節時点) |
+| **depth 2** | **14.9** | 6145 s ÷ 413 |
+
+**差 1.5%。しかもこの run は retriever も preproc も 3 節時点より速い**
+(envstep 0.7〜1.1 対 1.17、preproc 0.9 対 1.20)ので、depth 2 自身の寄与は
+これ以下である。**見込みの 15.1 → 12.5 は出なかった。**
+
+見込みが外れた理由は未確定。有力なのは「generate が 126 系列で既に GPU を
+飽和させており、turn table の `cpu-glue 17.2%` は**そのぶんまるごと空いている
+わけではない**」という線である。NVML 平均 79.9% に対し同じ区間の gen share が
+50.7% だったこと(3 節の劣化中の測定)も、glue 中に GPU が完全には空いていない
+ことを示唆する。
+
+**次に要るのは同条件の depth 1 run である。** search batch 50 本(約 12 分)で
+`s/batch last20` は収束するので、完走させる必要はない。
 
 depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出す**
 (depth 1 でも)。出ないことが「depth 1」と「pipeline の無いビルド」の両方を
@@ -417,7 +438,7 @@ depth は毎回 `[val-pipeline] VAL_PIPELINE_DEPTH=N: ...` として**必ず出�
 | | wall | util | 状態 |
 | --- | ---: | ---: | --- |
 | いま | 1.73 h | 83.0% | 実測 |
-| **`VAL_PIPELINE_DEPTH=2`** | **~1.52 h** | **~94%** | **実装済み・未実測**(5 節)。判定は WALL 行の `serial/wall` |
+| `VAL_PIPELINE_DEPTH=2` | 1.71 h | — | **実測、効果なし**(5 節)。s/batch 15.1 → 14.9 で、retriever が速くなった分を差し引くとそれ以下 |
 | retriever の GPU 専有 | −0.04 h | +2 pt | 未着手。`CUDA_VISIBLE_DEVICES` で 1 枚ずつ。ただし 8001 は第三者(`100.86.45.34`)が使っており調整が要る |
 
 retriever の内訳は実測済みで、**`load_docs` は 250 ms → 2.8 ms(total の 1.2%)**

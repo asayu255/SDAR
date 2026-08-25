@@ -173,24 +173,35 @@ def _current_slot():
     return getattr(_SLOT_LABEL, "name", None) or "-"
 
 
-# Wall-clock accounting across batches, so the log says on its own whether two
-# batches actually overlapped. The per-batch turn table cannot: pipelining does
-# not change what one batch costs, only when the second one runs. Two numbers
-# settle it -- the sum of the batches' own spans, and the wall clock from the
-# first batch's start to this one's end. Serial running keeps them equal; every
-# second of overlap pushes the sum above the wall.
+# Wall-clock accounting across batches. The per-batch turn table cannot say what
+# pipelining did, because what a batch costs is not what changes.
+#
+# The figure that carries between runs is SECONDS OF WALL PER BATCH. Everything
+# else here is diagnosis, and one number in particular is a trap: the occupancy
+# ratio -- the sum of the batches' spans over the wall clock -- is NOT a speedup.
+# Under pipelining a batch's own span INFLATES, because the generate call it sits
+# in is queued behind another batch's. Two slots each reporting a doubled span
+# put the ratio at 2.00x with nothing whatsoever gained. It says how many slots
+# were occupied, and that is all it says. Measured 1.82x on a run that moved
+# s/batch by 1.5%.
+#
+# s/batch is reported over a trailing window as well as from the start, because
+# the run is not homogeneous: alfworld and webshop are the first two batches and
+# cost multiples of a search batch, so a figure cumulative over 413 batches
+# carries a prefix the comparison does not want.
 _WALL_LOCK = threading.Lock()
-_WALL_STATE = {"batches": 0, "first_start": None, "serial": 0.0}
+_WALL_WINDOW = 20
+_WALL_STATE = {"batches": 0, "first_start": None, "serial": 0.0, "recent": []}
 
 
 def reset_batch_wall():
     """Start a fresh accounting period (called at the top of each validation)."""
     with _WALL_LOCK:
-        _WALL_STATE.update(batches=0, first_start=None, serial=0.0)
+        _WALL_STATE.update(batches=0, first_start=None, serial=0.0, recent=[])
 
 
 def _record_batch_wall(start, end, slot):
-    """Fold one batch into the running totals and return the line to print."""
+    """Fold one batch into the running totals and return the line(s) to print."""
     with _WALL_LOCK:
         if _WALL_STATE["first_start"] is None:
             _WALL_STATE["first_start"] = start
@@ -200,12 +211,26 @@ def _record_batch_wall(start, end, slot):
         _WALL_STATE["serial"] += span
         serial = _WALL_STATE["serial"]
         wall = end - _WALL_STATE["first_start"]
-    ratio = serial / wall if wall > 0 else float("nan")
-    return (
+        recent = _WALL_STATE["recent"]
+        recent.append(end)
+        # one more than the window: the rate over N completions needs the end
+        # time of the batch before them, not just the N end times themselves.
+        del recent[: -(_WALL_WINDOW + 1)]
+        window = (recent[-1] - recent[0]) / (len(recent) - 1) if len(recent) > 1 else float("nan")
+    occupancy = serial / wall if wall > 0 else float("nan")
+    lines = []
+    if index == 0:
+        lines.append(
+            "WALL   legend: s/batch is the figure to compare between runs. slots-busy is "
+            "OCCUPANCY, not speedup -- a pipelined batch's span inflates while it waits on "
+            "another batch's generate, so two slots read 2.00x whether or not anything was gained."
+        )
+    lines.append(
         f"WALL   slot={slot}  batch#{index}  span={span:.1f}s  "
-        f"wall-since-first-batch={wall:.1f}s  sum-of-spans={serial:.1f}s  "
-        f"serial/wall={ratio:.2f}x  (1.00 = one batch at a time; above 1 = overlapped)"
+        f"s/batch last{_WALL_WINDOW}={window:.1f}s all={wall / (index + 1):.1f}s  "
+        f"wall={wall:.1f}s  slots-busy={occupancy:.2f}x"
     )
+    return "\n".join(lines)
 
 
 def _fmt_per_gpu(vals):
