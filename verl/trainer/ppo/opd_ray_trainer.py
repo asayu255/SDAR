@@ -727,6 +727,43 @@ class OPDRayTrainer(RayPPOTrainer):
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
     # No old_log_prob / ref / values / advantage / reward-in-loss.
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Hooks the OPD+GRPO arm overrides. They exist so the two arms share one
+    # fit(): everything the loop does around them -- the hidden-state cache,
+    # the sign-weight pass, env-reset prefetch, stop_after_steps -- is the part
+    # that must stay identical between the arms, and a second copy of it is
+    # exactly how "the arms differ only in the objective" stops being true.
+    # ------------------------------------------------------------------ #
+    progress_desc = "OPD Training"
+
+    def _reward_and_advantage(self, batch: DataProto, metrics: dict, timing_raw: dict):
+        """Turn the env reward into whatever this arm feeds the loss.
+
+        Pure OPD computes it for MONITORING ONLY: it is never turned into
+        advantages and never enters the loss, so a reward-manager failure must
+        not take the run down with it.
+
+        Returns ``(batch, reward_extra_infos_dict)`` -- the batch is returned
+        rather than mutated because the GRPO override rebinds it (``union`` and
+        ``compute_advantage`` both return new objects).
+        """
+        reward_extra_infos_dict = {}
+        with _timer("reward", timing_raw):
+            try:
+                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                batch.batch["token_level_scores"] = reward_tensor
+                if reward_extra_infos_dict:
+                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+            except Exception as e:  # monitoring must never break training
+                print(f"[OPD] reward computation skipped: {e}")
+        return batch, reward_extra_infos_dict
+
+    def _data_metrics(self, batch: DataProto) -> dict:
+        """Batch statistics for the step. Advantage-free on this arm."""
+        metrics = compute_opd_data_metrics(batch=batch)
+        metrics.update(compute_opd_data_metrics_by_task(batch=batch))
+        return metrics
+
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -776,7 +813,7 @@ class OPDRayTrainer(RayPPOTrainer):
                 "discard the tail since the last save"
             )
 
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="OPD Training")
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc=self.progress_desc)
         self.global_steps += 1
         last_val_metrics = None
 
@@ -898,17 +935,12 @@ class OPDRayTrainer(RayPPOTrainer):
 
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    # Reward is computed for monitoring only (task success); it is never
-                    # turned into advantages and never enters the loss.
-                    reward_extra_infos_dict = {}
-                    with _timer("reward", timing_raw):
-                        try:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                            batch.batch["token_level_scores"] = reward_tensor
-                            if reward_extra_infos_dict:
-                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                        except Exception as e:  # monitoring must never break training
-                            print(f"[OPD] reward computation skipped: {e}")
+                    # On pure OPD this scores the batch for monitoring only. The
+                    # OPD+GRPO arm overrides it to also compute old_log_prob and
+                    # the group-relative advantages the policy gradient needs.
+                    batch, reward_extra_infos_dict = self._reward_and_advantage(
+                        batch, metrics, timing_raw
+                    )
 
                     # ---- Per-task teacher forward pass (the only training signal) ----
                     with _timer("teacher_forward", timing_raw):
@@ -1000,8 +1032,7 @@ class OPDRayTrainer(RayPPOTrainer):
                     "training/global_step": self.global_steps,
                     "training/epoch": epoch,
                 })
-                metrics.update(compute_opd_data_metrics(batch=batch))
-                metrics.update(compute_opd_data_metrics_by_task(batch=batch))
+                metrics.update(self._data_metrics(batch=batch))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
