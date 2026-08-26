@@ -34,8 +34,14 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, agg_loss_by_task_weights, agg_loss_with_sample_weights, compute_policy_loss, compute_policy_loss_gspo, compute_policy_loss_per_token, kl_penalty, topk_kl_per_token
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.trainer.ppo.sign_weights import (
+    REWRITE_TERMS,
+    OffTaskLadderStats,
+    ScopeTermStats,
+    SignPairCounts,
     SignWeightStats,
     TokenStateCounts,
+    rewrite_decomposition_terms,
+    rewrite_ratio_metrics,
     candidate_weights,
     normalize_per_task,
     position_weights,
@@ -1174,7 +1180,13 @@ class DataParallelPPOActor(BasePPOActor):
         # the student is about to pick. Absent -> the weighting never runs, which
         # is what makes enable=false identical to the plain arm.
         sign_cfg = self.config.get("sign_weight", None)
-        sign_enabled = bool(sign_cfg and sign_cfg.get("enable", False)) and "sign_cache_ids" in data.batch.keys()
+        # Split deliberately. sign_enabled is config AND batch content, because a
+        # batch without the cached planes cannot build weights. The accumulators
+        # below run COLLECTIVES, so they must be constructed and reduced on the
+        # config alone: a rank whose batch happened to lack the key would
+        # otherwise skip an all_reduce and hang every other rank.
+        sign_cfg_on = bool(sign_cfg and sign_cfg.get("enable", False))
+        sign_enabled = sign_cfg_on and "sign_cache_ids" in data.batch.keys()
         if sign_enabled:
             # Either support works -- the student's top-k, resolved above, or the
             # teacher's own, already selected into select_keys by the branch above.
@@ -1282,6 +1294,30 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
         sign_stats = SignWeightStats(task_names=task_id_names) if sign_enabled else None
+        # ---- transfer measurement (opt-in, target mode) --------------------
+        # Answers what nothing else here does: whether the STUDENT ended up
+        # carrying anything from the teachers it is not trained on. Every other
+        # number in this file describes the teachers' agreement or the size of
+        # the rewrite. Gated on the CONFIG only -- see sign_cfg_on above.
+        sign_dev = next(self.actor_module.parameters()).device
+        n_task = len(task_id_names or [])
+        target_mode = sign_cfg_on and str((sign_cfg or {}).get("mode", "target")) == "target"
+        transfer_on = target_mode and bool(
+            ((sign_cfg or {}).get("transfer_stats", None) or {}).get("enable", False)
+        )
+        pair_on = sign_cfg_on and bool(
+            ((sign_cfg or {}).get("pair_stats", None) or {}).get("enable", False)
+        )
+        rewrite_stats = ScopeTermStats(names=REWRITE_TERMS, n_tasks=n_task, device=sign_dev) if transfer_on else None
+        ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
+        pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
+        student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
+        # The observer arm: measure everything, change nothing. NOT the same as
+        # setting all three weights to 1.0 -- reweight_teacher_logprobs still
+        # subtracts a log z that differs from 0 by float error, and its tail
+        # clamp can bind at teacher_coverage 1.000, so over 150 steps that is a
+        # different trajectory and would not be a control.
+        sign_measure_only = bool((sign_cfg or {}).get("measure_only", False)) if sign_cfg_on else False
         # Which vocabulary tokens the weighting acts on. Off unless asked for:
         # it costs a dense (scopes x states x V) accumulator and one 34 MB
         # device-to-host read per call, which is nothing next to the step but is
@@ -1451,6 +1487,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # ---- cross-teacher sign agreement --------------------- #
                     sign_position_weight = None
                     sign_target_inputs = None
+                    sign_base_logprob = None
                     if sign_enabled:
                         # Refuse rather than skip. This block used to be guarded on
                         # fwd_teacher_topk_logprobs, which is None whenever
@@ -1480,6 +1517,10 @@ class DataParallelPPOActor(BasePPOActor):
                             ]
                             base_logprob = planes[0]
                             off_logprobs = torch.stack(planes[1:], dim=-1)
+                            # The rewrite decomposition runs further down, past the
+                            # end of this block, and needs the base to measure the
+                            # teacher's own travel against.
+                            sign_base_logprob = base_logprob
                             candidate_weight, sign_state = candidate_weights(
                                 sign_on_task_logprobs,
                                 off_logprobs,
@@ -1500,6 +1541,36 @@ class DataParallelPPOActor(BasePPOActor):
                                 task_ids=task_ids,
                                 off_plane_tasks=data.get("sign_off_tasks", None),
                             )
+                            if pair_stats is not None:
+                                # The (on-task, off-task) sign contingency table
+                                # per ordered pair, from which the pair
+                                # association, the gate's leave-one-out and the
+                                # blind-spot census are all read.
+                                pair_stats.update(
+                                    on_task_logprob=sign_on_task_logprobs,
+                                    off_task_logprobs=off_logprobs,
+                                    base_logprob=base_logprob,
+                                    student_logprob=student_topk_logprobs,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                    deadzone=sign_deadzone,
+                                    student_deadzone=student_resid_deadzone,
+                                )
+                            if ladder_stats is not None:
+                                # How far the student travelled toward the
+                                # teachers it is NOT trained on, against where
+                                # the base started and where its own teacher
+                                # sits. The headline transfer measurement.
+                                ladder_stats.update(
+                                    student_logprob=student_topk_logprobs,
+                                    on_task_logprob=sign_on_task_logprobs,
+                                    base_logprob=base_logprob,
+                                    off_task_logprobs=off_logprobs,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                )
                             if token_stats is not None:
                                 # The same candidates the stats above summarise,
                                 # kept under their vocabulary ids.
@@ -1519,14 +1590,15 @@ class DataParallelPPOActor(BasePPOActor):
                                 # how far the rewrite moved the target, which is a
                                 # statement about the pair.
                                 sign_target_inputs = (sign_on_task_logprobs, candidate_weight)
-                                # Assigned to fwd_teacher_topk_logprobs (not to the
-                                # teacher-indexed column it may have come from)
-                                # because that is the variable the loss reads below,
-                                # and it takes precedence over data[...] there. One
-                                # path for both supports.
-                                fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
-                                    sign_on_task_logprobs, candidate_weight
-                                )
+                                if not sign_measure_only:
+                                    # Assigned to fwd_teacher_topk_logprobs (not to
+                                    # the teacher-indexed column it may have come
+                                    # from) because that is the variable the loss
+                                    # reads below, and it takes precedence over
+                                    # data[...] there. One path for both supports.
+                                    fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
+                                        sign_on_task_logprobs, candidate_weight
+                                    )
                             else:
                                 pos_w = position_weights(candidate_weight, sign_on_task_logprobs)
                                 sign_stats.update_position(
@@ -1542,14 +1614,15 @@ class DataParallelPPOActor(BasePPOActor):
                                 # the micro-batch's own is exactly the wrong
                                 # fallback, so the first step runs unnormalised --
                                 # sign_weight/*/w_mean_pre_norm records by how much.
-                                sign_position_weight = (
-                                    normalize_per_task(
-                                        pos_w, response_mask, task_ids,
-                                        means=self._sign_position_means,
+                                if not sign_measure_only:
+                                    sign_position_weight = (
+                                        normalize_per_task(
+                                            pos_w, response_mask, task_ids,
+                                            means=self._sign_position_means,
+                                        )
+                                        if self._sign_position_means is not None
+                                        else pos_w
                                     )
-                                    if self._sign_position_means is not None
-                                    else pos_w
-                                )
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -1724,6 +1797,30 @@ class DataParallelPPOActor(BasePPOActor):
                                 task_ids=task_ids,
                                 teacher_kl=teacher_kld,
                             )
+                            if rewrite_stats is not None and sign_base_logprob is not None:
+                                # The same rewrite, measured at the STUDENT's own
+                                # distribution instead of the teacher's. target_kl
+                                # says how far the target moved; these say whether
+                                # that displacement reached the student, and what
+                                # it cost the loss at the states actually visited.
+                                #
+                                # teacher_kld is passed as it stands, so under
+                                # measure_only it is the KL to the UNREWRITTEN
+                                # teacher and cf_clamp_resid picks up the whole
+                                # rewrite instead of the clamp -- which is the
+                                # correct reading for an arm whose loss the rewrite
+                                # never entered.
+                                rewrite_stats.update(
+                                    rewrite_decomposition_terms(
+                                        student_logprob=student_topk_logprobs,
+                                        on_task_logprob=sign_target_inputs[0],
+                                        base_logprob=sign_base_logprob,
+                                        candidate_weight=sign_target_inputs[1],
+                                        teacher_kl=teacher_kld,
+                                    ),
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
                         if task_loss_weight is None:
@@ -1905,6 +2002,24 @@ class DataParallelPPOActor(BasePPOActor):
         # first. The ranked rows go on the actor for the worker to decode -- this
         # process has no tokenizer -- while the shape metrics are scalars and
         # ride back with everything else.
+        # Reduced before rendering, for the same reason the token table is: these
+        # are ratios over sparse per-(dst, src) cells, and a mean of per-rank
+        # ratios is not the pooled ratio. Unconditional on batch content -- the
+        # collective must not depend on it.
+        if rewrite_stats is not None:
+            rewrite_stats.all_reduce()
+            metrics.update(rewrite_stats.metrics(task_names=task_id_names))
+            metrics.update(rewrite_ratio_metrics(rewrite_stats.sums(task_names=task_id_names)))
+        if ladder_stats is not None:
+            ladder_stats.all_reduce()
+            metrics.update(ladder_stats.metrics(task_names=task_id_names))
+        if pair_stats is not None:
+            pair_stats.all_reduce()
+            metrics.update(pair_stats.metrics(task_names=task_id_names))
+        if sign_measure_only:
+            # So a reader of the logs can tell an observer arm from a live one
+            # without going back to the launch command.
+            metrics["sign_weight/measure_only"] = 1.0
         self.last_token_report = None
         if token_stats is not None:
             token_stats.all_reduce()

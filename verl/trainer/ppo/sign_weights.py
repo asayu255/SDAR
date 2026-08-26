@@ -76,6 +76,7 @@ the intended direction and keeps the loss a proper divergence (non-negative,
 zero only at the target), which the term-wise product is not.
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -935,3 +936,712 @@ class TokenStateCounts:
                     "dw": float(dw[scope, tok]),
                 })
         return rows
+
+
+class ScopeTermStats:
+    """Sync-free device accumulator for per-POSITION scalars, keyed by scope.
+
+    The counterpart of :class:`TokenStateCounts` for ``(bs, resp)`` quantities.
+    It exists because :meth:`SignWeightStats._add` is ``float(value)`` -- one
+    device-to-host read per term per scope per micro-batch, and ``update_target``
+    already pays about twenty-eight of them. Nothing new joins that debt: every
+    term here lands in one ``index_add_`` and is read once per ``update_policy``.
+
+    Layout is ``(1 + n_tasks, n_terms + 1)``. Scope 0 is the pooled batch, scope
+    ``1 + t`` is task ``t``, and the trailing column is the valid-position count
+    every ratio divides by -- shared rather than per term, since they all run
+    over the same mask.
+
+    float64 throughout. These cells receive millions of atomic adds each and CUDA
+    ``index_add_`` does not promise an order, so float32 would make the last bits
+    of every reported ratio depend on the scheduler.
+
+    The all_reduce is over WORLD. Under ``ulysses_sequence_parallel_size > 1`` a
+    position is held by several ranks, so counts come out multiplied by that
+    factor -- benign for every ratio here, since the factor cancels, and wrong
+    for any absolute sum. Said here so nobody "fixes" it into a mean.
+    """
+
+    def __init__(self, *, names, n_tasks: int, device):
+        self.names = list(names)
+        self.n_scopes = 1 + int(n_tasks)
+        self.buf = torch.zeros(
+            (self.n_scopes, len(self.names) + 1), dtype=torch.float64, device=device
+        )
+        self._cpu_cache = None
+
+    def update(self, terms: dict, response_mask: torch.Tensor, task_ids=None) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            terms: ``{name: (bs, resp) tensor}``; every name given at
+                construction must be present.
+            response_mask: (bs, resp).
+            task_ids: (bs,) or None. Rows with a negative id reach the pooled
+                scope only -- adjust_batch's padding and any untagged row are
+                real positions, but filing them under a task would invent one.
+        """
+        self._cpu_cache = None
+        m = response_mask.to(torch.float64)
+        cols = [terms[name].detach().to(torch.float64) * m for name in self.names]
+        cols.append(m)
+        # (bs, n_terms + 1): each row's contribution, already masked.
+        vals = torch.stack(cols, dim=-1).sum(dim=1)
+        self.buf[0] += vals.sum(0)
+        if task_ids is None:
+            return
+        t = task_ids.reshape(-1).to(torch.long)
+        known = (t >= 0).to(torch.float64).unsqueeze(-1)
+        self.buf.index_add_(0, t.clamp(min=0) + 1, vals * known)
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu")
+        return self._cpu_cache
+
+    def sums(self, task_names=None) -> dict:
+        """``{scope_name_or_None: {term: total}}`` plus ``"n"``, the denominator.
+
+        Handed to callers that need to build a ratio ACROSS terms (``a / b``)
+        rather than a mean; taking two separately-rendered means and dividing
+        them is the same number only when both ran over the same positions, and
+        several of the ratios below deliberately do not.
+        """
+        buf = self._cpu()
+        out = {}
+        for scope in range(self.n_scopes):
+            n = float(buf[scope, -1])
+            if n <= 0:
+                continue
+            name = None if scope == 0 else (
+                task_names[scope - 1] if task_names and scope - 1 < len(task_names) else f"task{scope - 1}"
+            )
+            out[name] = {t: float(buf[scope, i]) for i, t in enumerate(self.names)}
+            out[name]["n"] = n
+        return out
+
+    def metrics(self, task_names=None, prefix: str = "sign_weight") -> dict:
+        """Every term as a mean over the valid positions it was accumulated on."""
+        out = {}
+        for scope_name, totals in self.sums(task_names).items():
+            head = prefix if scope_name is None else f"{prefix}/{scope_name}"
+            n = totals["n"]
+            for term in self.names:
+                out[f"{head}/{term}"] = totals[term] / n
+        return out
+
+
+def _dist_parts(logprob: torch.Tensor, eps: float = 1e-8):
+    """``(p, tail)`` for a full-vocab log-softmax gathered at a top-k support.
+
+    Hoisted out of the KL below because the ladder scores five distributions
+    against each other and ``topk_kl_per_token`` would recompute both
+    exponentials and both tails on every pairing -- about thirty passes over
+    ``(bs, resp, k)`` where sixteen do.
+    """
+    p = logprob.detach().to(torch.float32).exp()
+    tail = (1.0 - p.sum(dim=-1)).clamp(min=eps, max=1.0)
+    return p, tail
+
+
+def _topk_kl_from_parts(lp_a, p_a, tail_a, lp_b, tail_b) -> torch.Tensor:
+    """``KL(a || b)`` over the k+1 categories, from parts computed once.
+
+    Numerically identical to ``core_algos.topk_kl_per_token(a, b)``; it is
+    written out here only so the shared exponentials can be reused.
+    """
+    return (p_a * (lp_a.detach().to(torch.float32) - lp_b.detach().to(torch.float32))).sum(-1) + tail_a * (
+        tail_a.log() - tail_b.log()
+    )
+
+
+class OffTaskLadderStats:
+    """How far the student travelled toward the teachers it is NOT trained on.
+
+    This is the measurement the mechanism was built for and that nothing in the
+    arm currently makes. Every other number describes the TEACHERS' agreement
+    structure or the SIZE of the rewrite; none says whether the student ended up
+    carrying anything from the off-task teachers.
+
+    Three rungs, all against the same off-task teacher ``pi_src`` on the same
+    support, at the same positions:
+
+        kl_base = KL(pi_0        || pi_src)   where the student started
+        kl_on   = KL(pi_dst      || pi_src)   where on-task distillation alone lands
+        kl_stu  = KL(pi_student  || pi_src)   where the student actually is
+
+    and the reading is the ratio
+
+        off_travel = (kl_stu - kl_base) / (kl_on - kl_base)
+
+    which is 0 at initialisation by construction (the student IS the base: the
+    lock pins model.path == sign_weight.base_path == Qwen/Qwen3-1.7B) and 1 when
+    the student has moved exactly as far toward pi_src as its own teacher sits.
+
+    Why the ratio and not the difference. The three teachers were RL-trained with
+    different KL coefficients -- search at 0.001 against 0.01 for the other two,
+    which shows up as abs_delta_mean 7.29 / 5.42 / 1.98 nats -- so any absolute
+    distance ranks teachers by how far they drifted, and a raw KL to a far-drifted
+    teacher is large for reasons that have nothing to do with the student.
+
+    What the ratio buys is exact ANCHORS, not scale invariance. Both endpoints are
+    distances to the same pi_src over the same positions and support, so 0 and 1
+    mean the same two things whatever pi_src is and however far it drifted. Between
+    the anchors the mapping is not scale-free -- KL is not linear, so rescaling
+    pi_src does move an intermediate value -- and the number must be read as "where
+    between not-moved and teacher-matched", never as a quantity comparable in
+    magnitude across pairs.
+
+    What it cannot say on its own: ``kl_stu < kl_on`` is passed for free by a
+    student that has simply not converged, and the report puts search's
+    distillation at 0.023 nats residual. Read off_travel against
+    ``on_travel = 1 - teacher_kl_now / teacher_kl_step0``, never alone.
+
+    Keyed by the ORDERED pair (dst = the row's own task, src = the off-task
+    teacher), because "what alfworld picked up from search" and "what search
+    picked up from alfworld" are different quantities and the existing pairwise
+    agreement matrix is already asymmetric (0.49 vs 0.38 on the shipped run).
+    """
+
+    TERMS = ("kl_base", "kl_on", "kl_stu", "cov_off")
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = int(n_tasks)
+        self.buf = torch.zeros(
+            (self.n_tasks * self.n_tasks, len(self.TERMS) + 1), dtype=torch.float64, device=device
+        )
+        self._cpu_cache = None
+
+    def update(
+        self,
+        *,
+        student_logprob: torch.Tensor,
+        on_task_logprob: torch.Tensor,
+        base_logprob: torch.Tensor,
+        off_task_logprobs: torch.Tensor,
+        response_mask: torch.Tensor,
+        task_ids: torch.Tensor,
+        off_plane_tasks: torch.Tensor,
+    ) -> None:
+        """Fold one micro-batch in.
+
+        ``student_logprob`` must be detached by the caller's convention; it is
+        detached again here because letting a graph reach a diagnostic buffer
+        would hold the whole micro-batch's activations alive.
+        """
+        self._cpu_cache = None
+        m = response_mask.to(torch.float64)
+        T = self.n_tasks
+
+        lp_s, lp_on, lp_0 = student_logprob, on_task_logprob, base_logprob
+        p_s, tail_s = _dist_parts(lp_s)
+        p_on, tail_on = _dist_parts(lp_on)
+        p_0, tail_0 = _dist_parts(lp_0)
+
+        dst = task_ids.reshape(-1).to(torch.long)
+        for c in range(off_task_logprobs.size(-1)):
+            lp_off = off_task_logprobs[..., c]
+            _p_off, tail_off = _dist_parts(lp_off)
+            terms = [
+                _topk_kl_from_parts(lp_0, p_0, tail_0, lp_off, tail_off),
+                _topk_kl_from_parts(lp_on, p_on, tail_on, lp_off, tail_off),
+                _topk_kl_from_parts(lp_s, p_s, tail_s, lp_off, tail_off),
+                1.0 - tail_off,  # how much of pi_src the support covers
+            ]
+            vals = torch.stack([t.to(torch.float64) * m for t in terms] + [m], dim=-1).sum(dim=1)
+            src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
+            # sign_off_tasks is legitimately -1 when the driver could not name the
+            # plane's task, and task_ids is -1 on padding. Clamp the INDEX, fold
+            # the validity into the VALUE -- selecting rows out would need their
+            # count on the host.
+            ok = ((dst >= 0) & (src >= 0)).to(torch.float64).unsqueeze(-1)
+            flat = dst.clamp(min=0) * T + src.clamp(min=0)
+            self.buf.index_add_(0, flat, vals * ok)
+
+    def all_reduce(self) -> None:
+        """Summed across ranks before any ratio is taken.
+
+        Required, not optional: these cells are sparse per (dst, src) and a mean
+        of per-rank ratios is not the pooled ratio when the ranks hold different
+        numbers of positions for a pair.
+        """
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(self.n_tasks, self.n_tasks, len(self.TERMS) + 1)
+        return self._cpu_cache
+
+    def metrics(self, task_names=None, prefix: str = "transfer", min_positions: float = 1.0) -> dict:
+        """The three rungs, the travel ratio, and the coverage that bounds them."""
+        buf = self._cpu()
+        out = {}
+
+        def _name(i):
+            if task_names and i < len(task_names):
+                return task_names[i]
+            return f"task{i}"
+
+        for dst in range(self.n_tasks):
+            for src in range(self.n_tasks):
+                if dst == src:
+                    continue  # the on-task teacher is not an off-task plane
+                n = float(buf[dst, src, -1])
+                if n < min_positions:
+                    continue
+                pair = f"{_name(dst)}__vs__{_name(src)}"
+                vals = {t: float(buf[dst, src, i]) / n for i, t in enumerate(self.TERMS)}
+                for rung in ("base", "on", "stu"):
+                    out[f"{prefix}/kl_to_off/{rung}/{pair}"] = vals[f"kl_{rung}"]
+                out[f"{prefix}/support_coverage/off/{pair}"] = vals["cov_off"]
+                out[f"{prefix}/kl_to_off/n_positions/{pair}"] = n
+                span = vals["kl_on"] - vals["kl_base"]
+                # A span at or below noise makes the ratio meaningless rather than
+                # large: the denominator is "how far on-task distillation moves the
+                # model toward this teacher", and where that is zero the question
+                # "how far along that has the student come" has no answer.
+                if abs(span) > 1e-6:
+                    out[f"{prefix}/off_travel/{pair}"] = (vals["kl_stu"] - vals["kl_base"]) / span
+                out[f"{prefix}/off_span/{pair}"] = span
+        return out
+
+
+# Terms produced by :func:`rewrite_decomposition_terms`, in the order a
+# ScopeTermStats should be constructed with.
+REWRITE_TERMS = (
+    "cf_cost",
+    "control_teacher_kl",
+    "rewrite_align",
+    "rewrite_span",
+    "rewrite_fisher",
+    "log_z",
+    "log_z_sq",
+    "cf_clamp_resid",
+    "student_tail_mass",
+)
+
+
+def rewrite_decomposition_terms(
+    *,
+    student_logprob: torch.Tensor,
+    on_task_logprob: torch.Tensor,
+    base_logprob: torch.Tensor,
+    candidate_weight: torch.Tensor,
+    teacher_kl: torch.Tensor,
+    eps: float = 1e-8,
+) -> dict:
+    """What the rewrite cost the student, decomposed exactly.
+
+    ``target_kl`` says how far the rewrite moved the TARGET. It cannot say
+    whether that displacement reached the student, because it is a statement
+    about ``p`` and ``p~`` only. These terms are the same rewrite measured at the
+    student's own distribution, at the states the student actually visited.
+
+    The central quantity is
+
+        cf_cost = log Z - sum_S p_s log w  ==  KL(p_s||p~) - KL(p_s||p)
+
+    and the identity is exact, not an approximation: substituting
+    ``log p~(v) = log p(v) + log w(v) - log Z`` into ``KL(p_s||p~)`` leaves
+    ``KL(p_s||p) - sum_S p_s log w + log Z``, because ``p_s`` sums to one over the
+    k+1 categories. So cf_cost is signed -- POSITIVE means the rewrite moved the
+    target away from where the student already was (it made the loss harder),
+    NEGATIVE that it moved toward it. Neither sign licenses a story about which
+    tokens were "confirmed" or "corrected"; it is a decomposition, not a test.
+
+    ``rewrite_align = target_kl - cf_cost = sum_S (p_s - p) log w`` is how far
+    along the rewrite direction the student already sits, relative to the plain
+    teacher. ``rewrite_span = sum_S (p - p_0) log w`` is the same projection for
+    the teacher's own travel from the base, which is what makes their ratio
+    (``rewrite_progress``, formed at render) a dimensionless number: -1 when the
+    student sits at the base, 0 when it has matched the teacher's travel along
+    log w, positive on overshoot.
+
+    ``rewrite_fisher = Var_{p_s}(log w)`` is the squared Fisher norm of the extra
+    gradient this arm adds. It is exactly zero when nothing fires, and -- unlike
+    every distance here -- it is invariant to the teachers' KL coefficients,
+    which differ by 3.7x in measured drift.
+
+    ``control_teacher_kl`` is computed DIRECTLY against the unrewritten teacher
+    rather than derived as ``teacher_kl - cf_cost``: only the direct form shares
+    the loss's own 1e-8 tail clamp, and the difference between the two is
+    precisely what ``cf_clamp_resid`` reports. That residual is the identity
+    ``teacher_kl == control_teacher_kl + cf_cost`` measured rather than assumed;
+    read it before trusting cf_cost on a task whose teacher_coverage is 1.000,
+    where the clamp binds.
+
+    Args:
+        student_logprob: (bs, resp, k) the student at the support. Detached here.
+        on_task_logprob: (bs, resp, k) the unrewritten on-task teacher.
+        base_logprob: (bs, resp, k) the shared base policy.
+        candidate_weight: (bs, resp, k) the weight the rewrite applied.
+        teacher_kl: (bs, resp) the loss's own per-token KL to the REWRITTEN
+            teacher, i.e. what update_target already receives.
+
+    Returns:
+        ``{name: (bs, resp) tensor}`` for every name in :data:`REWRITE_TERMS`.
+    """
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+
+    lp_s = student_logprob.detach().to(torch.float32)
+    p = on_task_logprob.detach().to(torch.float32).exp()
+    p_s = lp_s.exp()
+    p_0 = base_logprob.detach().to(torch.float32).exp()
+    w = candidate_weight.detach().to(torch.float32)
+
+    tail = (1.0 - p.sum(dim=-1)).clamp(min=eps, max=1.0)
+    z = ((p * w).sum(dim=-1) + tail).clamp(min=eps)
+    log_z = z.log()
+    log_w = w.clamp(min=eps).log()
+
+    a_s = (p_s * log_w).sum(dim=-1)
+    cf_cost = log_z - a_s
+    target_kl = log_z - (p * log_w).sum(dim=-1)
+    control_kl = topk_kl_per_token(lp_s, on_task_logprob.detach())
+
+    return {
+        "cf_cost": cf_cost,
+        "control_teacher_kl": control_kl,
+        "rewrite_align": target_kl - cf_cost,
+        "rewrite_span": ((p - p_0) * log_w).sum(dim=-1),
+        "rewrite_fisher": (p_s * log_w.square()).sum(dim=-1) - a_s.square(),
+        "log_z": log_z,
+        "log_z_sq": log_z.square(),
+        "cf_clamp_resid": teacher_kl.detach().to(torch.float32) - control_kl - cf_cost,
+        # Not bounded by teacher_coverage, which is the ON-TASK TEACHER's mass on
+        # the support. The student's own leftover is a different number and the
+        # one that says how much of its distribution these terms never saw.
+        "student_tail_mass": (1.0 - p_s.sum(dim=-1)).clamp(min=0.0, max=1.0),
+    }
+
+
+def rewrite_ratio_metrics(sums: dict, prefix: str = "sign_weight") -> dict:
+    """Ratios that must be formed from SUMS, not from means of ratios.
+
+    ``rewrite_progress`` and ``cf_cost_ratio`` are quotients of two totals over
+    the same positions. Averaging a per-position quotient instead would weight
+    every position equally regardless of how much of the rewrite it carried, and
+    would divide by zero at the many positions where nothing fired.
+
+    Args:
+        sums: the mapping :meth:`ScopeTermStats.sums` returns.
+    """
+    out = {}
+    for scope_name, tot in sums.items():
+        head = prefix if scope_name is None else f"{prefix}/{scope_name}"
+        span = tot.get("rewrite_span", 0.0)
+        if abs(span) > 1e-12:
+            out[f"{head}/rewrite_progress"] = tot["rewrite_align"] / span
+        # Unlike target_kl_ratio this one can be negative: cf_cost is signed.
+        tkl = tot.get("control_teacher_kl", 0.0)
+        if abs(tkl) > 1e-12:
+            out[f"{head}/cf_cost_ratio"] = tot["cf_cost"] / tkl
+        n = tot["n"]
+        mean_lz = tot["log_z"] / n
+        out[f"{head}/log_z_mean"] = mean_lz
+        # E[Z] and E[1/Z] are different functionals of the same distribution and
+        # the arm has only ever reported the second. The variance is what says
+        # how far apart they are allowed to be.
+        out[f"{head}/log_z_var"] = max(tot["log_z_sq"] / n - mean_lz * mean_lz, 0.0)
+    return out
+
+
+class SignPairCounts:
+    """The (on-task, off-task) sign contingency table, per ordered task pair.
+
+    One accumulator, five readings. It exists because the questions "is what
+    transfers common knowledge", "whose knowledge is it", and "what does the gate
+    throw away" are all questions about the same joint distribution of signs, and
+    building three accumulators for it would let them disagree.
+
+    Cell axes, in index order:
+
+    ``dst``  the task of the ROW -- whose states these are, i.e. who would receive.
+    ``src``  the task of the off-task PLANE -- whose teacher is being consulted.
+    ``i``    ``sign(delta_on) + 1`` for the row's own teacher: 0 lower, 1 silent, 2 raise.
+    ``j``    ``sign(delta_src) + 1`` for that off-task teacher.
+    ``l``    ``sign(student - on_task_teacher) + 1``: which side of its own target
+             the student sits on at this candidate. The residual, not the shift
+             from base -- the student is TRAINED toward the on-task teacher, so
+             its shift from base is dominated by that and says little.
+    ``o``    do the OTHER off-task planes all carry the same sign as the on-task
+             teacher. Only meaningful when ``i != 1``; it is what makes the
+             leave-one-out reading possible (would the gate still pass without
+             ``src``).
+    ``h``    headroom: is a ``+deadzone`` raise arithmetically possible at all,
+             i.e. ``-base_logprob > deadzone``. Without this axis a large
+             "the off-task teacher had an opinion the on-task one did not" mass
+             cannot be told from the log-space ceiling: at ``p_0 > 0.905`` no
+             teacher CAN raise a token by 0.1 nats, so its silence there is
+             arithmetic, not ignorance.
+
+    Three arrays over those cells: candidate counts, on-task teacher probability
+    mass, and the SQUARE of that mass. The third is not decoration -- the mass
+    weight here is extremely heavy-tailed (the shipped run puts 64% of teacher
+    mass on 4.2% of candidates), so ``(sum p)^2 / sum p^2`` is the effective
+    sample size, and without it a mass-weighted rate has no error bar and cannot
+    be told from step noise.
+
+    float64, because millions of atomic adds concentrate into a few hundred cells
+    and CUDA's ``index_add_`` does not promise an order.
+
+    All-reduced before rendering: these cells are sparse per pair and a mean of
+    per-rank ratios is not the pooled ratio. Note that this makes ``agree_count``
+    here a GLOBAL number while the shipped ``sign_weight/agree_rate`` is rank-0
+    local -- they agree only at world_size 1, and both are reported so the
+    difference is visible rather than assumed away.
+    """
+
+    N_I = N_J = N_L = 3
+    N_O = N_H = 2
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = T = int(n_tasks)
+        self.n_cells = T * T * self.N_I * self.N_J * self.N_L * self.N_O * self.N_H
+        self.count = torch.zeros(self.n_cells, dtype=torch.float64, device=device)
+        self.mass = torch.zeros(self.n_cells, dtype=torch.float64, device=device)
+        self.mass_sq = torch.zeros(self.n_cells, dtype=torch.float64, device=device)
+        # Population totals per receiving task, accumulated ONCE per micro-batch.
+        # Inside the per-plane loop every candidate's mass would be added once per
+        # plane, so the denominator would read half its true value at n_off == 2 --
+        # and it is the number that says which population a rate is a rate OF.
+        self.totals = torch.zeros((T, 2), dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(
+        self,
+        *,
+        on_task_logprob: torch.Tensor,
+        off_task_logprobs: torch.Tensor,
+        base_logprob: torch.Tensor,
+        student_logprob: torch.Tensor,
+        response_mask: torch.Tensor,
+        task_ids: torch.Tensor,
+        off_plane_tasks: torch.Tensor,
+        deadzone: float,
+        student_deadzone: float = 0.0,
+    ) -> None:
+        """Fold one micro-batch in.
+
+        The signs are recomputed here rather than returned from
+        :func:`candidate_weights`. That function is on the loss path and its
+        arity is depended on at eight call sites; two subtractions and two
+        comparisons are the cheaper trade, and ``SignWeightStats.update_candidates``
+        already recomputes exactly the same tensors.
+        """
+        self._cpu_cache = None
+        T = self.n_tasks
+        valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(on_task_logprob)
+
+        p_on = on_task_logprob.detach().to(torch.float32).exp()
+        sign_on = _deadzoned_sign(on_task_logprob.detach() - base_logprob.detach(), deadzone)
+        sign_off = _deadzoned_sign(
+            off_task_logprobs.detach() - base_logprob.detach().unsqueeze(-1), deadzone
+        )
+        sign_res = _deadzoned_sign(
+            student_logprob.detach().to(on_task_logprob.dtype) - on_task_logprob.detach(),
+            student_deadzone,
+        )
+        # Can any model raise this token past the deadzone at all? log p <= 0, so
+        # a +deadzone raise needs -log p_0 > deadzone.
+        headroom = (-base_logprob.detach() > deadzone).long()
+
+        dst = task_ids.reshape(-1).to(torch.long)
+        n_off = off_task_logprobs.size(-1)
+        # How many planes carry the on-task sign, for the leave-one-out axis.
+        same_as_on = (sign_off == sign_on.unsqueeze(-1))
+        n_same = same_as_on.sum(dim=-1)
+
+        i = (sign_on + 1).long()
+        l = (sign_res + 1).long()
+        dst_b = dst.view(-1, 1, 1)
+
+        for c in range(n_off):
+            j = (sign_off[..., c] + 1).long()
+            others = ((n_same - same_as_on[..., c].long()) == (n_off - 1)).long()
+            src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
+            # -1 is legitimate on both (an unnamed plane, a padding row). Clamp the
+            # INDEX and fold validity into the VALUE; selecting rows out first
+            # would need their count on the host.
+            ok = valid & (dst_b >= 0) & (src.view(-1, 1, 1) >= 0)
+            flat = (
+                ((((((dst.clamp(min=0).view(-1, 1, 1) * T + src.clamp(min=0).view(-1, 1, 1))
+                     * self.N_I + i) * self.N_J + j) * self.N_L + l) * self.N_O + others)
+                 * self.N_H + headroom)
+            ).reshape(-1)
+            okf = ok.to(torch.float64).reshape(-1)
+            m = (p_on.to(torch.float64) * ok).reshape(-1)
+            self.count.index_add_(0, flat, okf)
+            self.mass.index_add_(0, flat, m)
+            self.mass_sq.index_add_(0, flat, m * m)
+
+        # Once per micro-batch, outside the plane loop.
+        ok_row = valid & (dst_b >= 0)
+        tot = torch.stack(
+            [ok_row.to(torch.float64).sum(dim=(1, 2)), (p_on.to(torch.float64) * ok_row).sum(dim=(1, 2))],
+            dim=-1,
+        )
+        self.totals.index_add_(0, dst.clamp(min=0), tot * (dst >= 0).to(torch.float64).unsqueeze(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        for t in (self.count, self.mass, self.mass_sq, self.totals):
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            T = self.n_tasks
+            shape = (T, T, self.N_I, self.N_J, self.N_L, self.N_O, self.N_H)
+            self._cpu_cache = (
+                self.count.detach().to("cpu").view(shape),
+                self.mass.detach().to("cpu").view(shape),
+                self.mass_sq.detach().to("cpu").view(shape),
+                self.totals.detach().to("cpu"),
+            )
+        return self._cpu_cache
+
+    # -- readings ---------------------------------------------------------- #
+
+    def _pair_name(self, i, task_names):
+        if task_names and i < len(task_names):
+            return task_names[i]
+        return f"task{i}"
+
+    def metrics(self, task_names=None, prefix: str = "sign_weight", min_count: float = 1000.0) -> dict:
+        """Every reading this table supports, rendered host-side.
+
+        Three families, all over the ordered pair ``src -> dst`` ("what src's
+        teacher says at dst's states"):
+
+        ``pair/``       how associated the two teachers' opinions are.
+        ``gate/``       what the unanimity rule does with that association.
+        ``blindspot/``  what src says where dst's own teacher says nothing.
+
+        Cells with too few candidates are omitted rather than reported noisy: a
+        rate over a handful of candidates goes through ``reduce_metrics`` looking
+        exactly like a rate over millions.
+        """
+        count, mass, mass_sq, totals = self._cpu()
+        out = {}
+        T = self.n_tasks
+        LOW, SIL, HIGH = 0, 1, 2  # i / j values: lower, silent, raise
+
+        for dst in range(T):
+            for src in range(T):
+                if dst == src:
+                    continue
+                c = count[dst, src]
+                if float(c.sum()) < min_count:
+                    continue
+                m = mass[dst, src]
+                msq = mass_sq[dst, src]
+                pair = f"{self._pair_name(src, task_names)}__on__{self._pair_name(dst, task_names)}"
+
+                # ---- pair association ----------------------------------- #
+                # The 2x2 over non-silent signs. n[a][b] = both spoke, on-task
+                # said a, off-task said b.
+                n = {(a, b): float(c[a, b].sum()) for a in (LOW, HIGH) for b in (LOW, HIGH)}
+                n_tot = sum(n.values())
+                if n_tot > 0:
+                    agree = n[(HIGH, HIGH)] + n[(LOW, LOW)]
+                    out[f"{prefix}/pair/agree_count/{pair}"] = agree / n_tot
+                    # Haldane-corrected log odds ratio. THE headline of this
+                    # family: unlike an agreement rate it is invariant to each
+                    # teacher's own propensity to raise rather than lower, which
+                    # is exactly what an agreement rate confounds with
+                    # association. The teachers differ 3.7x in measured drift, so
+                    # that confound is not hypothetical here.
+                    lor = math.log(
+                        ((n[(HIGH, HIGH)] + 0.5) * (n[(LOW, LOW)] + 0.5))
+                        / ((n[(HIGH, LOW)] + 0.5) * (n[(LOW, HIGH)] + 0.5))
+                    )
+                    out[f"{prefix}/pair/lor/{pair}"] = lor
+                    # The marginals the odds ratio divides out, reported so a
+                    # near-zero lor can be told from a degenerate table.
+                    out[f"{prefix}/pair/sign_bias_on/{pair}"] = (n[(HIGH, HIGH)] + n[(HIGH, LOW)]) / n_tot
+                    out[f"{prefix}/pair/sign_bias_off/{pair}"] = (n[(HIGH, HIGH)] + n[(LOW, HIGH)]) / n_tot
+
+                # Mass-weighted agreement, and the population it is a rate of.
+                # Never quote one without the other: the count-weighted matrix
+                # can describe a tail population the objective barely touches.
+                m_both = {(a, b): float(m[a, b].sum()) for a in (LOW, HIGH) for b in (LOW, HIGH)}
+                m_tot = sum(m_both.values())
+                if m_tot > 0:
+                    out[f"{prefix}/pair/agree_mass/{pair}"] = (
+                        m_both[(HIGH, HIGH)] + m_both[(LOW, LOW)]
+                    ) / m_tot
+                    dst_mass = float(totals[dst, 1])
+                    if dst_mass > 0:
+                        out[f"{prefix}/pair/agree_pop_mass/{pair}"] = m_tot / dst_mass
+                    sq = float(msq[[LOW, HIGH]][:, [LOW, HIGH]].sum())
+                    if sq > 0:
+                        # (sum p)^2 / sum p^2 -- how many equally-weighted
+                        # candidates this mass-weighted rate is really worth.
+                        out[f"{prefix}/pair/agree_ess/{pair}"] = (m_tot * m_tot) / sq
+
+                # ---- the gate's leave-one-out ---------------------------- #
+                # Restricted to i != silent, since the gate never fires there.
+                # o == 1 means every OTHER off-task plane already agrees with the
+                # on-task teacher, so src alone decides whether the gate passes.
+                for label, sel in (
+                    ("concur", [(HIGH, HIGH), (LOW, LOW)]),
+                    ("veto_silent", [(HIGH, SIL), (LOW, SIL)]),
+                    ("veto_dissent", [(HIGH, LOW), (LOW, HIGH)]),
+                ):
+                    mm = sum(float(m[a, b, :, 1].sum()) for a, b in sel)
+                    cc = sum(float(c[a, b, :, 1].sum()) for a, b in sel)
+                    out[f"{prefix}/gate/{label}_mass/{pair}"] = mm
+                    out[f"{prefix}/gate/{label}_count/{pair}"] = cc
+                gate_pop = float(m[[LOW, HIGH], :, :, 1].sum())
+                out[f"{prefix}/gate/pop_mass/{pair}"] = gate_pop
+                if gate_pop > 0:
+                    for label, sel in (
+                        ("concur", [(HIGH, HIGH), (LOW, LOW)]),
+                        ("veto_silent", [(HIGH, SIL), (LOW, SIL)]),
+                        ("veto_dissent", [(HIGH, LOW), (LOW, HIGH)]),
+                    ):
+                        mm = sum(float(m[a, b, :, 1].sum()) for a, b in sel)
+                        out[f"{prefix}/gate/{label}_frac/{pair}"] = mm / gate_pop
+
+                # ---- the blind spot -------------------------------------- #
+                # i == SIL: the row's own teacher had no opinion. Whatever src
+                # says here is knowledge the distillation target cannot carry,
+                # because the target is the on-task teacher and it did not move.
+                # This is where "specialist" knowledge would have to live.
+                for label, jj in (("pos", HIGH), ("neg", LOW)):
+                    total_m = float(m[SIL, jj].sum())
+                    out[f"{prefix}/blindspot/off_opinion_mass_{label}/{pair}"] = total_m
+                    # Split by headroom. Silence at h == 0 is arithmetic, not
+                    # ignorance: no model can raise a token whose base
+                    # probability already exceeds exp(-deadzone).
+                    if total_m > 0:
+                        out[f"{prefix}/blindspot/off_opinion_h1_frac_{label}/{pair}"] = (
+                            float(m[SIL, jj, :, :, 1].sum()) / total_m
+                        )
+                dst_mass = float(totals[dst, 1])
+                if dst_mass > 0:
+                    out[f"{prefix}/blindspot/silent_pop_mass/{pair}"] = float(m[SIL].sum()) / dst_mass
+
+                # ---- does the student take the off-task side? ------------ #
+                # Among candidates where the on-task teacher was SILENT and src
+                # had an opinion: does the student sit on src's side of its own
+                # target? The on-task teacher said nothing, so a lean here cannot
+                # be attributed to the distillation target -- which is the whole
+                # reason this cell is the one worth reading.
+                for label, jj in (("pos", HIGH), ("neg", LOW)):
+                    lead = float(c[SIL, jj, jj].sum())   # student residual sign == src's sign
+                    opp = float(c[SIL, jj, 2 - jj].sum())
+                    if lead + opp >= min_count:
+                        out[f"{prefix}/blindspot/student_follows_{label}/{pair}"] = lead / (lead + opp)
+        return out
