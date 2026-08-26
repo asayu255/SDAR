@@ -72,6 +72,39 @@ def sampling_kwargs_for(meta_info: Dict[str, Any], val_kwargs: Any) -> Dict[str,
     return {}
 
 
+def seed_for_prompt(prompt_token_ids: Any, row: int = 0) -> int:
+    """A sampling seed that depends on the prompt and the row, and nothing else.
+
+    Under the pump, which requests share a decode step is decided by arrival
+    timing, so a generator shared across whatever happens to be resident draws
+    differently for the same prompt from one run to the next. Keying the seed to
+    the prompt removes that source of drift: the same prompt draws the same way
+    whenever it arrives.
+
+    THE ROW IS NOT OPTIONAL DECORATION. Validation with ``val_kwargs.n > 1``
+    repeats each row n times in the DataProto itself
+    (``RayPPOTrainer._validate``: ``test_batch.repeat(...)``), not through
+    SamplingParams.n -- so the n copies of one row reach the engine as n
+    requests with BYTE-IDENTICAL prompts. Seeded on the prompt alone they would
+    all draw the same tokens, take the same action, see the same observation and
+    build the same next prompt: n samples collapsed into n copies of one, with
+    nothing raised and the sample variance moving in the direction that looks
+    like a win. Mixing the row in keeps the copies distinct while keeping every
+    one of them stable across runs.
+
+    This does not make the pumped path reproducible -- the logits still move
+    with batch composition, which is the same reason merging changed
+    generation. It removes a second source of drift stacked on top of that one.
+
+    Lives here rather than beside the engine so the driver and the CPU tests can
+    reach it without vllm, and so there is one definition of it rather than two.
+    """
+    import zlib
+
+    ids = np.asarray(list(prompt_token_ids), dtype=np.int64)
+    return zlib.crc32(ids.tobytes() + int(row).to_bytes(8, "little", signed=True)) & 0x7FFFFFFF
+
+
 def assemble_generation_output(
     *,
     idx: torch.Tensor,

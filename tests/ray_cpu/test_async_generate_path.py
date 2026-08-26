@@ -242,3 +242,62 @@ def test_the_flag_off_never_touches_the_pool():
     wg = StubWorkerGroup()
     rollout_loop._generate_sequences(wg, _batch(ROWS, dict(VALIDATING)))
     assert wg.blocking_calls == 1 and wg.pump_rounds == 0
+
+
+# --------------------------------------------------------------------------- #
+# ROLLOUT_ASYNC_REQUIRE: a measurement must not quietly measure the other path
+# --------------------------------------------------------------------------- #
+def _strict(monkeypatch, on=True):
+    monkeypatch.setattr(rollout_loop, "_ROLLOUT_ASYNC_REQUIRE", on)
+    monkeypatch.setattr(rollout_loop, "_ROLLOUT_ASYNC_GENERATE", True)
+    rollout_loop._PUMP_STATE["client"] = None
+    rollout_loop._PUMP_STATE["off"] = False
+
+
+class _RefusingWG:
+    world_size = 3
+
+    def rollout_pump_step(self, payloads):
+        return [{"refused": "rollout log-probs are requested", "in_session": True}] * self.world_size
+
+    def generate_sequences(self, data):
+        raise AssertionError("the blocking path must not be reached under REQUIRE")
+
+
+def test_a_refusing_rank_is_an_error_when_async_is_required(monkeypatch):
+    """Without this, a stock PPO config (return_rollout_log_probs=True) prints one
+    line, latches off, and reports the blocking path's wall clock as the pump's."""
+    _strict(monkeypatch)
+    try:
+        with pytest.raises(RuntimeError, match="ROLLOUT_ASYNC_REQUIRE=1 and the pool refused"):
+            rollout_loop._pump_client(_RefusingWG())
+    finally:
+        rollout_loop._PUMP_STATE["off"] = True
+
+
+def test_a_refusing_rank_only_falls_back_when_async_is_not_required(monkeypatch):
+    _strict(monkeypatch, on=False)
+    try:
+        assert rollout_loop._pump_client(_RefusingWG()) is None
+    finally:
+        rollout_loop._PUMP_STATE["off"] = True
+
+
+def test_a_call_the_pool_cannot_serve_is_an_error_when_async_is_required(monkeypatch):
+    """A multimodal or n>1 call would otherwise slip onto the blocking path unremarked."""
+    _strict(monkeypatch)
+    batch = _batch(ROWS[:2], {"do_sample": True})   # neither greedy nor validation -> n is not pinned
+    try:
+        with pytest.raises(RuntimeError, match="cannot go through the pool.*does not pin n=1"):
+            rollout_loop._generate_sequences(_RefusingWG(), batch)
+    finally:
+        rollout_loop._PUMP_STATE["off"] = True
+
+
+def test_the_reason_names_which_thing_stopped_it():
+    batch = _batch(ROWS[:2], {"do_sample": False},
+                   {"multi_modal_data": np.array([{} for _ in range(2)], dtype=object)})
+    assert "multi_modal_data" in rollout_loop._why_the_pump_cannot_serve(batch)
+
+    batch = _batch(ROWS[:2], {"do_sample": False})
+    assert rollout_loop._why_the_pump_cannot_serve(batch) is None

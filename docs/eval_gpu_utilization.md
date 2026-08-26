@@ -1303,3 +1303,53 @@ lock-step の turn ループがそれを禁じていた(§7.6)。task ごとに 
 3. 3 に async を足す —— per-task が立てる 3 本の generate を pump が並列に流す
 
 1 を飛ばすと、また「どれが効いたか分からない」に戻る。
+
+---
+
+## 22. 外部レビュー —— 構造は合っていたが、落ちる経路が3本あった
+
+async(§20)に外部レビューを受け、指摘をコードに当てた。**5件中3件が本物**で、
+検証の過程で**レビューに無い4件目**と、**私が入れた修正自身のバグ**が出た。
+
+### 本物だったもの
+
+| | |
+| --- | --- |
+| **abort が例外経路で走らない** | `_fail_all` が `_pending` を空にしてから `_abort_outstanding` が読む。engine 例外のあと request が居座り、KV block を握ったまま次の rollout に持ち越す。**abort が要る唯一の場面で abort だけが起きない** |
+| **submit と生存確認が別ロック** | 確認と挿入の間に pump が死ぬと `_fail_all` 済みの `_pending` に future が入り、誰も解決しない。待ち手は永久に待つ |
+| **返らない request で永久停止** | `_pending` が空にならない → round も idle にならない → client は回り続け caller は止まったまま。timeout も watchdog も無かった |
+
+### レビューに無かったもの —— request id の使い回し
+
+id は `{name}-{n}`、`_next_id` は client ごとに 0 から。rank 側の `_pump_done` は
+client より長生きする。**前 session の完了が次 session の別 request を、別の
+token で解決しうる。** 例外は出ない。client ごとの epoch を id に混ぜ、stop 時に
+queue を drain するようにした。
+
+### 私の修正自身のバグ —— n サンプル検証の潰れ
+
+レビューの「per-request seed が無い」に応えて prompt の token id から seed を
+作った。ところが `val_kwargs.n>1` の検証は **DataProto 側で行を複製する**
+(`test_batch.repeat(...)`)ので、n 個のプロンプトはバイト単位で同一 —— 同じ
+seed、同じ draw、同じ action、同じ観測、同じ次プロンプト。**n 個の標本が 1 個の
+n 複製に潰れる。** しかも標本分散が下がるので「安定した」ように見える。
+
+seed に行番号を混ぜて直した。**「速くする変更」ではなく「正しさを守る変更」を
+入れて壊した**ので、これは記録に残す価値がある。
+
+### 前提が違っていたもの
+
+* **「least-in-flight が prefix cache の sticky を壊す」** ——
+  `dispatch_dp_compute_data_proto` は `chunk(world_size)` で**圧縮済み active 行**を
+  等分する。軌跡が 1 本終わるたび以降の行の rank がずれるので、**blocking 経路も
+  sticky ではない。** pump が壊したのではなく最初から無い。sticky routing は
+  新規の打ち手であって回帰修正ではない。
+* **「per-trajectory ではない」** —— そのとおり。§7.6 の per-task advance で
+  task 単位までは進めたが、行単位ではない。
+
+### 測定に足したもの
+
+`ROLLOUT_ASYNC_REQUIRE=1`。pool に載らない呼び出しで落ちる。§17 と同じ罠
+——「効かなかった」と「走らなかった」を取り違える —— を構造的に塞ぐ。
+`ROLLOUT_ASYNC_GENERATE` を忘れた REQUIRE 単独は import 時に落とす(それ自体が
+同じ穴になるので)。pool を一度も使わずに終わった run は、終了時にそう言う。

@@ -28,6 +28,7 @@ from verl.workers.rollout.generation_output import (
     assemble_generation_output,
     repeat_interleave,
     sampling_kwargs_for,
+    seed_for_prompt,
 )
 
 PAD = 0
@@ -209,3 +210,92 @@ def test_validate_takes_the_val_kwargs_and_lets_meta_info_override_temperature()
 def test_plain_training_call_overrides_nothing():
     # Empty, not a dict of defaults: the caller's own **kwargs have to survive.
     assert sampling_kwargs_for({}, _ValKwargs) == {}
+
+
+# --------------------------------------------------------------------------- #
+# seed_for_prompt
+# --------------------------------------------------------------------------- #
+def test_the_same_prompt_and_row_always_seed_the_same():
+    """That stability is the whole point: the draw stops depending on arrival order."""
+    assert seed_for_prompt([5, 6, 7], 3) == seed_for_prompt([5, 6, 7], 3)
+
+
+def test_identical_prompts_on_different_rows_seed_differently():
+    """Validation with val_kwargs.n > 1 repeats a row in the DataProto itself.
+
+    The n copies arrive as n requests with byte-identical prompts. Seeded on the
+    prompt alone they would draw identically, take the same action, see the same
+    observation -- n samples collapsed into n copies of one, and the sample
+    variance would shrink, which reads as a stability win rather than a bug.
+    """
+    seeds = {seed_for_prompt([5, 6, 7], row) for row in range(4)}
+    assert len(seeds) == 4
+
+
+def test_different_prompts_on_the_same_row_seed_differently():
+    assert seed_for_prompt([5, 6, 7], 1) != seed_for_prompt([5, 6, 8], 1)
+
+
+def test_a_prompt_is_not_confused_with_a_row_number():
+    """The row is appended as fixed-width bytes, not concatenated into the ids."""
+    assert seed_for_prompt([1, 2], 3) != seed_for_prompt([1, 2, 3], 0)
+
+
+def test_the_seed_is_in_range_for_vllm():
+    for ids, row in (([0], 0), ([2 ** 20, 7], 251), ([1] * 4096, 9)):
+        seed = seed_for_prompt(ids, row)
+        assert isinstance(seed, int) and 0 <= seed <= 0x7FFFFFFF
+
+
+def test_numpy_and_list_prompts_seed_the_same():
+    assert seed_for_prompt(np.array([4, 5, 6]), 2) == seed_for_prompt([4, 5, 6], 2)
+
+
+# --------------------------------------------------------------------------- #
+# what the driver has to forward
+# --------------------------------------------------------------------------- #
+class _RecordingMeta(dict):
+    """A meta_info that remembers which keys were asked for."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read = set()
+
+    def get(self, key, default=None):
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.read.add(key)
+        return super().__getitem__(key)
+
+
+class _SeedValKwargs:
+    top_k = 20
+    top_p = 0.8
+    temperature = 0.7
+
+
+def test_the_driver_forwards_every_meta_key_the_sampling_choice_reads():
+    """Guard against a fourth key being added here and silently not crossing.
+
+    _PUMP_META_KEYS is what the driver puts on the wire. If sampling_kwargs_for
+    grows a key that is not in it, the rank would derive different sampling
+    params from the blocking path -- and nothing would say so.
+    """
+    from agent_system.multi_turn_rollout.rollout_loop import _PUMP_META_KEYS
+
+    read = set()
+    for meta in (
+        {"do_sample": False},
+        {"do_sample": True, "validate": True, "temperature": 0.5},
+        {"do_sample": True, "validate": False},
+    ):
+        recorder = _RecordingMeta(meta)
+        sampling_kwargs_for(recorder, _SeedValKwargs())
+        read |= recorder.read
+
+    assert read <= set(_PUMP_META_KEYS), (
+        f"sampling_kwargs_for reads {sorted(read - set(_PUMP_META_KEYS))}, "
+        f"which the driver does not forward"
+    )

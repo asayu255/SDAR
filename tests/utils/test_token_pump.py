@@ -228,3 +228,79 @@ def test_stopping_aborts_what_the_engine_still_holds():
     pump.stop(timeout=5)
 
     assert aborted and len(aborted[0]) == 1
+
+
+def test_a_dead_engine_still_gets_told_to_drop_what_it_holds():
+    """The abort matters MOST on the exception path, and used to happen least.
+
+    _fail_all empties _pending on its way past, so an _abort_outstanding that
+    reads only _pending aborted exactly nothing after an engine exception --
+    leaving the requests resident, holding KV blocks for the rest of the
+    process, which on this arm is the next rollout.
+    """
+    engine = _Engine(length=10_000, fail_after=2, step_seconds=0.002)
+    aborted = []
+    engine.abort_request = aborted.append
+
+    pump = TokenPump(engine, idle_wait_s=0.001).start()
+    future = pump.submit([1, 2, 3], "p")
+    with pytest.raises(RuntimeError, match="engine died"):
+        future.result(5)
+    for _ in range(500):
+        if aborted:
+            break
+        time.sleep(0.01)
+
+    assert aborted, "the engine was never told to drop the request it still holds"
+    assert list(aborted[0]) == [next(iter(engine.running))]
+
+
+def test_a_request_that_races_the_engines_death_is_refused_not_orphaned():
+    """The liveness checks have to be under the same lock as the insertion.
+
+    Outside it they decide nothing: the pump can die between the check and the
+    insert, _fail_all has already emptied _pending, and the future goes into a
+    dictionary nobody reads again. Its waiter waits forever.
+    """
+    engine = _Engine(length=10_000, fail_after=1, step_seconds=0.002)
+    engine.abort_request = lambda ids: None
+    pump = TokenPump(engine, idle_wait_s=0.001).start()
+    pump.submit([1], "p")
+    for _ in range(500):
+        if pump._failure is not None:
+            break
+        time.sleep(0.01)
+    assert pump._failure is not None, "the pump was supposed to have died by now"
+
+    with pytest.raises(PumpClosed, match="token pump died"):
+        pump.submit([9], "p").result(2)
+
+
+def test_the_insert_and_the_liveness_check_share_one_lock():
+    """Directly: hold the lock, kill the pump, and let submit take the lock after.
+
+    A submit that checked before taking the lock would sail past a pump that
+    died while it waited.
+    """
+    engine = _Engine(length=10_000, step_seconds=0.002)
+    engine.abort_request = lambda ids: None
+    pump = TokenPump(engine, idle_wait_s=0.001).start()
+
+    outcome = {}
+
+    def submitter():
+        try:
+            outcome["future"] = pump.submit([7], "p")
+        except PumpClosed as exc:
+            outcome["raised"] = exc
+
+    pump._lock.acquire()
+    thread = threading.Thread(target=submitter)
+    thread.start()
+    time.sleep(0.05)          # the submitter is now blocked on the lock
+    pump._failure = RuntimeError("engine died while you waited")
+    pump._lock.release()
+    thread.join(5)
+
+    assert "raised" in outcome, "submit was let through by a check it made too early"
+    pump.stop(timeout=5)

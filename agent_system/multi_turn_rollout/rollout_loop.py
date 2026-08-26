@@ -30,7 +30,7 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
+from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 # Opt-in per-turn rollout timing. When off (default) the loop is unchanged and
@@ -318,6 +318,26 @@ def _split_by_rows(output, sizes):
 # share a decode step, which moves floating-point reduction order, so results are
 # neither bit-identical to the blocking path nor reproducible run to run.
 _ROLLOUT_ASYNC_GENERATE = os.environ.get("ROLLOUT_ASYNC_GENERATE", "0").strip().lower() in ("1", "true", "yes", "on")
+# For measurement runs: refuse to fall back. Without it a config the pool cannot
+# serve (rollout log-probs on, LoRA, tp>1, a multimodal or n>1 call) silently
+# hands the batch to the blocking path, and the run reports a number for a
+# mechanism it never used. This is the same trap merging fell into, where
+# "never merged once" was read as "merging did not help".
+_ROLLOUT_ASYNC_REQUIRE = os.environ.get("ROLLOUT_ASYNC_REQUIRE", "0").strip().lower() in ("1", "true", "yes", "on")
+if _ROLLOUT_ASYNC_REQUIRE and not _ROLLOUT_ASYNC_GENERATE:
+    # Otherwise the flag whose whole job is to stop a silent blocking-path
+    # measurement would itself produce one: nothing enables the pool, nothing
+    # refuses, and the run reports the blocking path's number under a strict
+    # heading. Fail at import, where it is one line to fix.
+    raise RuntimeError(
+        "ROLLOUT_ASYNC_REQUIRE=1 needs ROLLOUT_ASYNC_GENERATE=1; on its own it "
+        "would let the run quietly measure the blocking path, which is the one "
+        "thing it exists to prevent"
+    )
+# A driver-side bound on one request, as a second line after the client's own
+# watchdog: if the round thread dies in a way that leaves a waiter behind, this
+# is what turns a hung rollout into a failed one.
+_PUMP_RESULT_TIMEOUT_S = float(os.environ.get("ROLLOUT_PUMP_RESULT_TIMEOUT_S", "1800"))
 _PUMP_STATE = {"client": None, "off": not _ROLLOUT_ASYNC_GENERATE, "lock": threading.Lock()}
 _SESSION_DEPTH = {"depth": 0, "lock": threading.Lock()}
 
@@ -359,10 +379,18 @@ def _pump_client(actor_rollout_wg):
             client.handshake()
         except PumpUnavailable as refusal:
             state["off"] = True
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError(
+                    f"ROLLOUT_ASYNC_REQUIRE=1 and the pool refused: {refusal}"
+                ) from refusal
             print(f"[rollout-pump] staying on the blocking path: {refusal}", flush=True)
             return None
         except Exception as exc:  # noqa: BLE001 - a broken handshake is not worth a dead run
             state["off"] = True
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError(
+                    f"ROLLOUT_ASYNC_REQUIRE=1 and the handshake failed: {type(exc).__name__}: {exc}"
+                ) from exc
             print(f"[rollout-pump] handshake failed, staying on the blocking path: {type(exc).__name__}: {exc}", flush=True)
             return None
         client.start()
@@ -375,9 +403,17 @@ def close_pump_client():
     """Put the pool down. Safe to call when it was never started."""
     with _PUMP_STATE["lock"]:
         client, _PUMP_STATE["client"] = _PUMP_STATE["client"], None
+        never_started = client is None and _ROLLOUT_ASYNC_GENERATE
     if client is not None:
         print(client.line(), flush=True)
         client.close()
+    elif never_started:
+        # Say it out loud. A run asked for the pool and used the blocking path
+        # end to end; without this line the only evidence is one refusal printed
+        # hours earlier, and the number gets written down as the pool's.
+        print("[rollout-pump] the pool was never used; every generate took the "
+              "blocking path (ROLLOUT_ASYNC_REQUIRE=1 would have made this an error)",
+              flush=True)
 
 
 def _generate_via_pump(client, batch_input_padded):
@@ -392,8 +428,16 @@ def _generate_via_pump(client, batch_input_padded):
     meta_info = batch_input_padded.meta_info or {}
     carried = {k: meta_info[k] for k in _PUMP_META_KEYS if k in meta_info}
     prompts = batch_input_padded.non_tensor_batch["raw_prompt_ids"]
-    futures = [client.submit(_as_id_list(prompt), carried) for prompt in prompts]
-    responses = [future.result() for future in futures]
+    # The row ordinal travels with the prompt because the rank seeds sampling
+    # from both. Validation with val_kwargs.n > 1 repeats a row n times in the
+    # DataProto, so n of these prompts are byte-identical; without the ordinal
+    # they would all draw the same sample. See seed_for_prompt.
+    futures = [
+        client.submit(_as_id_list(prompt), dict(carried, row=row))
+        for row, prompt in enumerate(prompts)
+    ]
+    timeout = _PUMP_RESULT_TIMEOUT_S if _PUMP_RESULT_TIMEOUT_S > 0 else None
+    responses = [future.result(timeout=timeout) for future in futures]
 
     non_tensor_batch = {k: v for k, v in batch_input_padded.non_tensor_batch.items() if k != "raw_prompt_ids"}
     info = client.handshake_info
@@ -413,23 +457,38 @@ def _as_id_list(prompt_token_ids):
     return prompt_token_ids.tolist() if hasattr(prompt_token_ids, "tolist") else list(prompt_token_ids)
 
 
-def _pump_can_serve(batch_input_padded) -> bool:
-    """Whether this particular call is one the pool can serve identically."""
+def _why_the_pump_cannot_serve(batch_input_padded) -> Optional[str]:
+    """Why this particular call is not one the pool can serve identically."""
     if "multi_modal_data" in batch_input_padded.non_tensor_batch:
-        return False
+        return "the call carries multi_modal_data"
     if "raw_prompt_ids" not in batch_input_padded.non_tensor_batch:
         # generate_sequences rebuilds these from the padded input_ids when they
         # are missing; rather than keep a second copy of that, let it.
-        return False
-    return _pump_pins_one_sample(batch_input_padded.meta_info)
+        return "the call has no raw_prompt_ids"
+    if not _pump_pins_one_sample(batch_input_padded.meta_info):
+        return "the call does not pin n=1 (neither do_sample=False nor validate=True)"
+    return None
+
+
+def _pump_can_serve(batch_input_padded) -> bool:
+    return _why_the_pump_cannot_serve(batch_input_padded) is None
 
 
 def _generate_sequences(actor_rollout_wg, batch_input_padded):
     """One generate call, merged with whatever is queued when merging is on."""
-    if _ROLLOUT_ASYNC_GENERATE and _pump_can_serve(batch_input_padded):
-        client = _pump_client(actor_rollout_wg)
-        if client is not None:
-            return _generate_via_pump(client, batch_input_padded)
+    if _ROLLOUT_ASYNC_GENERATE:
+        servable = _pump_can_serve(batch_input_padded)
+        if servable:
+            client = _pump_client(actor_rollout_wg)
+            if client is not None:
+                return _generate_via_pump(client, batch_input_padded)
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError("ROLLOUT_ASYNC_REQUIRE=1 but the pool is unavailable")
+        elif _ROLLOUT_ASYNC_REQUIRE:
+            raise RuntimeError(
+                "ROLLOUT_ASYNC_REQUIRE=1 but this call cannot go through the pool: "
+                f"{_why_the_pump_cannot_serve(batch_input_padded)}"
+            )
     if not _ROLLOUT_MERGE_GENERATES:
         return actor_rollout_wg.generate_sequences(batch_input_padded)
     global _GENERATE_MERGER

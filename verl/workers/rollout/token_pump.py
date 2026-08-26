@@ -102,13 +102,20 @@ class TokenPump:
     # -- submission --------------------------------------------------------
 
     def submit(self, prompt_token_ids: Sequence[int], sampling_params: Any, request_id: Optional[str] = None) -> Future:
-        """Queue one generation. The future carries the response token ids."""
-        if self._stopping.is_set():
-            raise PumpClosed("token pump is stopping; no new requests")
-        if self._failure is not None:
-            raise PumpClosed(f"token pump died: {self._failure}")
+        """Queue one generation. The future carries the response token ids.
+
+        The liveness checks are inside the lock with the insertion, because
+        outside it they decide nothing: the pump can die between the check and
+        the insert, and _fail_all would then have already emptied _pending. The
+        future would go into the dictionary nobody looks at again -- and its
+        waiter, whose whole job is to wait, would wait forever.
+        """
         future: Future = Future()
         with self._lock:
+            if self._stopping.is_set():
+                raise PumpClosed("token pump is stopping; no new requests")
+            if self._failure is not None:
+                raise PumpClosed(f"token pump died: {self._failure}")
             if request_id is None:
                 request_id = f"{self._name}-{self._next_id}"
                 self._next_id += 1
@@ -125,6 +132,11 @@ class TokenPump:
     # -- the pump ----------------------------------------------------------
 
     def _run(self) -> None:
+        # Ids that _fail_all took out of _pending. They still have to reach
+        # abort_request: _fail_all empties _pending, and an _abort_outstanding
+        # that reads an empty _pending aborts nothing, leaving the requests
+        # resident in the engine holding KV blocks for the rest of the process.
+        cleared: List[str] = []
         try:
             # Checked at the TOP, not only when the engine drains: a request that
             # never finishes would otherwise keep the pump stepping forever and
@@ -144,19 +156,25 @@ class TokenPump:
                     if getattr(output, "finished", False):
                         self._resolve(output)
         except BaseException as exc:  # noqa: BLE001 - the pump owns every waiter
-            self._failure = exc
-            self._fail_all(exc)
+            with self._lock:
+                self._failure = exc
+            cleared = self._fail_all(exc)
         finally:
-            self._abort_outstanding()
+            self._abort_outstanding(cleared)
 
-    def _abort_outstanding(self) -> None:
+    def _abort_outstanding(self, cleared: Sequence[str] = ()) -> None:
         """Tell the engine to drop what nobody will collect.
 
         Left resident, those requests would keep consuming KV cache blocks for
         the rest of the process -- which on this arm is the next rollout.
+
+        ``cleared`` is for ids that were already taken out of ``_pending`` by
+        _fail_all on the way here. Reading only ``_pending`` would abort exactly
+        nothing on the path where aborting matters most.
         """
         with self._lock:
             request_ids = list(self._pending)
+        request_ids.extend(rid for rid in cleared if rid not in request_ids)
         if not request_ids:
             return
         try:
@@ -193,12 +211,14 @@ class TokenPump:
             return
         future.set_result(list(completions[0].token_ids))
 
-    def _fail_all(self, exc: BaseException) -> None:
+    def _fail_all(self, exc: BaseException) -> List[str]:
+        """Fail every outstanding future, and return the ids that were holding them."""
         with self._lock:
             pending, self._pending = self._pending, {}
         for future in pending.values():
             if not future.done():
                 future.set_exception(exc)
+        return list(pending)
 
     def line(self) -> str:
         return (

@@ -38,6 +38,8 @@ whole path otherwise.
 
 import os
 import threading
+import time
+import uuid
 from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +51,15 @@ _PUMP_REPORT_EVERY = int(os.environ.get("ROLLOUT_PUMP_REPORT_EVERY", "0"))
 # recomputing, holding requests on the driver is cheaper than holding them in
 # half-finished KV blocks.
 _PUMP_MAX_IN_FLIGHT = int(os.environ.get("ROLLOUT_PUMP_MAX_IN_FLIGHT", "0"))
+# A request that a rank neither finishes nor fails would otherwise be waited on
+# forever: _pending keeps it, so no round is ever idle, and the driver's
+# future.result() has nothing to wake it. Long enough that a genuinely slow
+# generation is never killed by it -- this is a stuck-detector, not a deadline.
+_PUMP_REQUEST_TIMEOUT_S = float(os.environ.get("ROLLOUT_PUMP_REQUEST_TIMEOUT_S", "900"))
+
+
+def _now() -> float:
+    return time.monotonic()
 
 
 class PumpUnavailable(RuntimeError):
@@ -69,6 +80,7 @@ class PumpClient:
         max_in_flight: int = _PUMP_MAX_IN_FLIGHT,
         name: str = "pump",
         printer=print,
+        request_timeout_s: float = _PUMP_REQUEST_TIMEOUT_S,
     ):
         self._wg = worker_group
         self._world_size = int(worker_group.world_size)
@@ -76,21 +88,30 @@ class PumpClient:
         self._max_in_flight = max_in_flight
         self._name = name
         self._print = printer
+        self._request_timeout_s = request_timeout_s
 
         self._lock = threading.Lock()
         self._inbox: List[Tuple[str, List[int], Dict[str, Any]]] = []
         self._pending: Dict[str, Future] = {}
+        self._deadlines: Dict[str, float] = {}
         self._in_flight = [0] * self._world_size
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._failure: Optional[BaseException] = None
         self._next_id = 0
+        # Request ids have to be unique for the LIFE OF THE WORKER, not of this
+        # client. A rank's TokenPump and its done-queue outlive one client, and a
+        # second client numbering from 0 again would hand out ids the previous
+        # one already used -- letting a leftover completion resolve a different
+        # request with the wrong tokens, silently.
+        self._epoch = uuid.uuid4().hex[:8]
 
         self.rounds = 0
         self.submitted = 0
         self.finished = 0
         self.peak_in_flight = 0
+        self.timed_out = 0
         self.handshake_info: Dict[str, Any] = {}
 
     # -- lifecycle ---------------------------------------------------------
@@ -157,16 +178,22 @@ class PumpClient:
         those from it exactly as the blocking path does, so there is no second
         reading of the config to disagree with the first.
         """
-        if self._failure is not None:
-            raise PumpFailed(f"pump client is dead: {self._failure}")
-        if self._stopping.is_set():
-            raise PumpFailed("pump client is closing; no new requests")
         future: Future = Future()
         carried = {str(k): _plain(v) for k, v in meta_info.items()}
         with self._lock:
-            request_id = f"{self._name}-{self._next_id}"
+            # Checked inside the lock, with the insertion. Outside it they decide
+            # nothing: the round thread can die between the check and the insert,
+            # and _fail_all would then have already emptied _pending. This future
+            # would land in the dictionary nobody reads again, and its waiter --
+            # whose whole job is to wait -- would wait forever.
+            if self._failure is not None:
+                raise PumpFailed(f"pump client is dead: {self._failure}")
+            if self._stopping.is_set():
+                raise PumpFailed("pump client is closing; no new requests")
+            request_id = f"{self._name}-{self._epoch}-{self._next_id}"
             self._next_id += 1
             self._pending[request_id] = future
+            self._deadlines[request_id] = _now() + self._request_timeout_s
             self._inbox.append((request_id, list(prompt_token_ids), carried))
             self.submitted += 1
         self._wake.set()
@@ -192,7 +219,8 @@ class PumpClient:
                     continue
                 self._round(outgoing)
         except BaseException as exc:  # noqa: BLE001 - this thread owns every waiter
-            self._failure = exc
+            with self._lock:
+                self._failure = exc
             self._fail_all(PumpFailed(f"pump round failed: {type(exc).__name__}: {exc}"))
 
     def _round(self, outgoing: List[Tuple[str, List[int], Dict[str, Any]]]) -> None:
@@ -224,13 +252,31 @@ class PumpClient:
                 self._in_flight[rank] = int(reply.get("in_flight", 0))
                 for request_id, token_ids in reply.get("finished", ()):
                     future = self._pending.pop(request_id, None)
+                    self._deadlines.pop(request_id, None)
                     if future is not None:
                         self.finished += 1
                         resolved.append((future, token_ids, None))
                 for request_id, message in reply.get("failed", ()):
                     future = self._pending.pop(request_id, None)
+                    self._deadlines.pop(request_id, None)
                     if future is not None:
                         resolved.append((future, None, message))
+            # Anything a rank has neither finished nor failed for longer than the
+            # timeout is stuck, and a stuck request is a trajectory that never
+            # ends. Fail it here, where the reason can be named, rather than
+            # leaving the driver blocked in future.result() with nothing to read.
+            if self._request_timeout_s > 0:
+                cutoff = _now()
+                for request_id, deadline in list(self._deadlines.items()):
+                    if deadline > cutoff:
+                        continue
+                    self._deadlines.pop(request_id, None)
+                    future = self._pending.pop(request_id, None)
+                    if future is not None:
+                        self.timed_out += 1
+                        resolved.append((future, None,
+                                         f"request {request_id} was neither finished nor failed by any "
+                                         f"rank within {self._request_timeout_s:.0f}s"))
             self.peak_in_flight = max(self.peak_in_flight, len(self._pending))
 
         for future, token_ids, message in resolved:
@@ -247,6 +293,7 @@ class PumpClient:
     def _fail_all(self, exc: BaseException) -> None:
         with self._lock:
             pending, self._pending = self._pending, {}
+            self._deadlines = {}
             self._inbox = []
         for future in pending.values():
             if not future.done():
@@ -255,6 +302,7 @@ class PumpClient:
     def line(self) -> str:
         return (
             f"[{self._name}] {self.submitted} requests, {self.finished} finished, "
+            f"{self.timed_out} timed out, "
             f"{self.rounds} rounds, peak {self.peak_in_flight} in flight, "
             f"per-rank in flight {self._in_flight}"
             + (f", capped at {self._max_in_flight}" if self._max_in_flight else "")

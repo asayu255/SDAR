@@ -244,6 +244,10 @@ ROLLOUT_PUMP_ROUND_S=0.02   1 round の待ち。長いほど RPC は減り、完
 ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だけ)
 ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限。既定でよい)
 ROLLOUT_PER_TASK_ADVANCE=1 task ごとに turn を進める(既定 OFF、§7.6)
+ROLLOUT_ASYNC_REQUIRE=1    pool に載らない呼び出しを fallback させず落とす(測定時は必須)
+ROLLOUT_PUMP_REQUEST_TIMEOUT_S=900  どの rank も finished/failed に載せなかった request を諦める
+ROLLOUT_PUMP_RESULT_TIMEOUT_S=1800  driver 側の保険。0 で無効
+ROLLOUT_PUMP_SEED=1        request ごとに (prompt, row) から seed を作る(既定 ON)
 ```
 
 ---
@@ -390,6 +394,32 @@ bash examples/sft_trainer/eval_checkpoints.sh \
 30 秒の batch あたり 1500 round。`[rollout-pump]` の `rounds` が多すぎるようなら
 0.05 まで上げてよい(尻の遅れは 1 turn あたり最大 1 round ぶん)。
 
+
+### 外部レビューで出た欠陥と、その修正
+
+構造の話ではなく、**動く／動かないの話**が5件出た。うち3件は本物で、2件は前提が
+違っていた。修正済みで、いずれも回帰テストが元のコードで落ちることを確認してある。
+
+| | 何が起きるか | |
+| --- | --- | --- |
+| **abort が exception 経路で一度も走らない** | `_fail_all` が `_pending` を空にしてから `_abort_outstanding` が読むので、engine 例外のあと request が**engine に居座り KV block を握ったまま**次の rollout に持ち越される。まさに abort が存在する理由の場面で、abort だけが起きない | 直した |
+| **submit と生存確認が別ロック** | 確認と挿入の間に pump が死ぬと、`_fail_all` が済んだ後の `_pending` に future が入る。誰も解決せず、**待ち手は永久に待つ** | 直した(確認を挿入と同じロックの中へ) |
+| **どの rank も返さない request で永久停止** | `_pending` が空にならないので round も idle にならず、client は回り続け caller は止まったまま。timeout も watchdog も無かった | 直した(request ごとの deadline + driver 側 timeout) |
+| **request id の使い回し** | レビュー外。id は `{name}-{n}` で `_next_id` は client ごとに 0 から。rank 側の done-queue は client より長生きするので、**前 session の完了が次 session の別 request を間違った token で解決しうる**。例外は出ない | 直した(client ごとの epoch + stop 時に queue を drain) |
+| **n サンプル検証の潰れ** | 私が入れた seed のバグ。`val_kwargs.n>1` は DataProto 側で行を複製するので n 個のプロンプトが**バイト単位で同一** → 同じ seed → 同じ軌跡。n 個の標本が 1 個の n 複製になり、**分散が下がるので改善に見える** | 直した(seed に行番号を混ぜる) |
+
+前提が違っていたもの:
+
+* **「silent fallback で blocking を測ってしまう」** —— 起きうる。`ROLLOUT_ASYNC_REQUIRE=1`
+  を足した。ただし `ROLLOUT_ASYNC_GENERATE` を忘れた REQUIRE 単独が同じ穴になるので、
+  その組み合わせは import 時に落とす。
+* **「least-in-flight が prefix cache の sticky を壊す」** —— **blocking 経路が
+  そもそも sticky ではない。** `dispatch_dp_compute_data_proto` は
+  `chunk(world_size)` で**圧縮済み active 行**を等分するので、軌跡が 1 本終わる
+  たびに以降の行の rank がずれる。pump が壊したのではなく、最初から無い。
+  sticky routing は**新しい最適化**であって回帰修正ではない(§8)。
+* **「per-trajectory ではない」** —— そのとおり。§7.6 参照。task 単位まで。
+
 ---
 
 ## 7.6 per-task advance(task ごとに turn を進める)
@@ -446,7 +476,7 @@ merge と同じ理由で変わる。各 task が自分の行だけで generate �
 
 ```bash
 ray stop --force
-ROLLOUT_PER_TASK_ADVANCE=1 ROLLOUT_ASYNC_GENERATE=1 \
+ROLLOUT_PER_TASK_ADVANCE=1 ROLLOUT_ASYNC_GENERATE=1 ROLLOUT_ASYNC_REQUIRE=1 \
 EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
 bash examples/sft_trainer/eval_checkpoints.sh 100 \
   -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
@@ -469,6 +499,7 @@ batch ごとに 1 本のままで、3 枚の表が 3 本の WALL を出すこと
 | --- | ---: | --- |
 | **preproc の増分トークナイズ** | util +6 pt、wall −8% | 毎 turn 履歴を丸ごと tokenize し直しているのを、token id を持ち回って差分だけにする。**BPE の結合が turn 境界をまたぐと採点が変わる**ので、全 turn で「全履歴 tokenize」と「差分連結」が token 単位で一致することを実軌跡で確認するテストが先 |
 | **trajectory ごとの env step** | util +6 pt(§4a の残り) | **task 単位までは実装した(§7.6、既定 OFF、未測定)。** 残るのは行単位で、そこは env package の de-vectorize が要る。retriever のバッチ化(envstep 10.60→1.00 s/batch)と両立させるため「窓で束ねる」形が必要になるのも行単位から |
+| **sticky routing** | 不明 | 同じ軌跡を毎 turn 同じ rank に送れば prefix cache が効く。**blocking 経路も sticky ではない**ので回帰修正ではなく新規の打ち手。軌跡の識別子が generate 呼び出しまで来ていないので、そこの配線が要る |
 | `VAL_PIPELINE_DEPTH=4` | 不明 | 合流率が上がる可能性。ただし CPU 競合(§4a)が先に律速する見込み |
 | retriever の GPU 専有 | +2 pt | `CUDA_VISIBLE_DEVICES` で 1 枚ずつ。第三者(`100.86.45.34`)との調整が要る |
 

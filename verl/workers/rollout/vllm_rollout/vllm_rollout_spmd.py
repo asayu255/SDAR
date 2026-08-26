@@ -31,8 +31,8 @@ import os
 import queue
 import time
 from contextlib import contextmanager
-from copy import deepcopy
-from typing import Any, Dict, List, Optional, Union
+from copy import copy, deepcopy
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -46,8 +46,13 @@ from verl.utils.phase_timing import PhaseTimer
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.generation_output import assemble_generation_output, sampling_kwargs_for
+from verl.workers.rollout.generation_output import assemble_generation_output, sampling_kwargs_for, seed_for_prompt
 from verl.workers.rollout.token_pump import TokenPump
+
+# Seeding each pumped request from its own prompt. Default on: it can only make
+# the pumped path LESS run-to-run variable, and the pumped path is opt-in
+# already. ROLLOUT_PUMP_SEED=0 restores vllm's shared generator.
+_PUMP_SEED = os.environ.get("ROLLOUT_PUMP_SEED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 from vllm.config import CompilationConfig, LoRAConfig
 from vllm.lora.request import LoRARequest
@@ -455,6 +460,33 @@ class vLLMRollout(BaseRollout):
             self._pump_sampling_cache[key] = cached
         return cached
 
+    def _pump_seeded(self, params: SamplingParams, prompt_token_ids: Sequence[int], row: int = 0) -> SamplingParams:
+        """Pin this request's sampling to its prompt, not to its arrival order.
+
+        Without a seed, vllm draws from one generator shared by whatever is
+        resident, so the same prompt sampled in a different decode step draws
+        differently -- and under the pump, which requests share a step is decided
+        by arrival timing. Seeding from the prompt's own token ids and the row
+        makes that one source of run-to-run drift go away. The row is required,
+        not decorative -- see seed_for_prompt, where n-sample validation sends
+        byte-identical prompts that a prompt-only seed would collapse.
+
+        It does NOT make the pumped path reproducible. The logits still move with
+        batch composition (the same reason merging changed generation), and this
+        cannot touch that. It removes a second, avoidable source on top of it.
+
+        Greedy needs no generator, so it is left alone -- as is n > 1, which the
+        pump refuses anyway and which a shared seed would collapse into n copies
+        of one sample.
+        """
+        if not _PUMP_SEED or params.n != 1:
+            return params
+        if not getattr(params, "temperature", 0):
+            return params
+        seeded = copy(params)
+        seeded.seed = seed_for_prompt(prompt_token_ids, row)
+        return seeded
+
     def _pump_refuse(self) -> Optional[str]:
         """Why this rollout cannot be pumped, or None if it can.
 
@@ -500,7 +532,18 @@ class vLLMRollout(BaseRollout):
             pump, self._pump = self._pump, None
             if pump is not None:
                 pump.stop()
-            return {"finished": [], "failed": [], "in_flight": 0, "stopped": True}
+            # Drain what stopping just produced. Left in the queue, a completion
+            # from this session would be handed to whoever asks next -- and the
+            # next session's driver starts a fresh client, so nothing about the
+            # id it is keyed by makes that impossible on its own.
+            dropped = 0
+            while True:
+                try:
+                    self._pump_done.get_nowait()
+                except queue.Empty:
+                    break
+                dropped += 1
+            return {"finished": [], "failed": [], "in_flight": 0, "stopped": True, "dropped": dropped}
 
         if self._pump is None:
             self._pump = TokenPump(self.inference_engine.llm_engine, name=f"token-pump-{self._pump_name}").start()
@@ -519,7 +562,10 @@ class vLLMRollout(BaseRollout):
                 # of n would be a scoring change nobody asked for.
                 failed.append((request_id, f"pumped path cannot serve n={params.n}; it returns one sequence per request"))
                 continue
-            future = self._pump.submit(prompt_token_ids, params, request_id=request_id)
+            row = int(dict(meta_info).get("row", 0))
+            future = self._pump.submit(prompt_token_ids,
+                                       self._pump_seeded(params, prompt_token_ids, row),
+                                       request_id=request_id)
             future.add_done_callback(lambda f, rid=request_id: self._pump_done.put((rid, f)))
 
         timeout_s = float(payload.get("timeout_s", 0.02))

@@ -20,6 +20,7 @@ raising, a request coming back failed, the client closing underneath a waiter --
 has to end with the future *done*, not abandoned.
 """
 
+import concurrent.futures
 import threading
 import time
 
@@ -265,7 +266,7 @@ def test_a_cap_holds_requests_on_the_driver_rather_than_in_the_engine():
         # spread over the ranks, but a later round must never carry a request
         # that was submitted before one an earlier round carried.
         per_round = [
-            [int(rid.split("-")[1]) for rank in round_ for (rid, _p, _m) in rank]
+            [int(rid.rsplit("-", 1)[1]) for rank in round_ for (rid, _p, _m) in rank]
             for round_ in wg.payload_log
         ]
         sent_rounds = [ids for ids in per_round if ids]
@@ -295,3 +296,90 @@ def test_meta_info_is_carried_through_to_the_rank_that_serves_the_request():
         client.close()
     submitted = [s for round_ in wg.payload_log for rank in round_ for s in rank]
     assert submitted and submitted[0][2] == {"validate": True, "temperature": 0.7}
+
+
+# --------------------------------------------------------------------------- #
+# Not hanging
+# --------------------------------------------------------------------------- #
+class BlackHoleWG(FakeWorkerGroup):
+    """Ranks that accept a request and then never mention it again.
+
+    vLLM aborting a request, or a reply lost on the way back, looks exactly like
+    this from the driver -- and _pending staying non-empty means the round loop
+    never goes idle, so the client spins happily while the caller blocks.
+    """
+
+    def rollout_pump_step(self, payloads):
+        if payloads[0].get("handshake") or payloads[0].get("stop"):
+            return super().rollout_pump_step(payloads)
+        with self.lock:
+            self.rounds += 1
+            for rank, payload in enumerate(payloads):
+                for request_id, _p, _m in payload["submit"]:
+                    self.resident[rank][request_id] = None
+            return [{"finished": [], "failed": [], "in_flight": len(self.resident[r])}
+                    for r in range(self.world_size)]
+
+
+def test_a_request_no_rank_ever_answers_fails_instead_of_hanging():
+    client = _client(BlackHoleWG(), request_timeout_s=0.2)
+    client.handshake()
+    client.start()
+    try:
+        future = client.submit([1, 2, 3], {})
+        with pytest.raises(PumpFailed, match="neither finished nor failed"):
+            future.result(timeout=5)
+        assert client.timed_out == 1
+    finally:
+        client.close(timeout=2)
+
+
+def test_the_watchdog_can_be_turned_off():
+    client = _client(BlackHoleWG(), request_timeout_s=0)
+    client.handshake()
+    client.start()
+    try:
+        future = client.submit([1, 2, 3], {})
+        with pytest.raises(concurrent.futures.TimeoutError):
+            future.result(timeout=0.4)
+    finally:
+        client.close(timeout=2)
+
+
+def test_a_slow_request_is_not_killed_by_the_watchdog():
+    """It is a stuck-detector, not a deadline; a long generation must survive it."""
+    client = _client(FakeWorkerGroup(latency_rounds=40), request_timeout_s=30)
+    client.handshake()
+    client.start()
+    try:
+        assert client.submit([7], {}).result(timeout=10) is not None
+        assert client.timed_out == 0
+    finally:
+        client.close(timeout=2)
+
+
+# --------------------------------------------------------------------------- #
+# Request ids
+# --------------------------------------------------------------------------- #
+def test_two_clients_never_hand_out_the_same_request_id():
+    """A rank's pump and its done-queue outlive one client.
+
+    Numbering from 0 again would reissue ids the previous client already used,
+    and a leftover completion would then resolve a different request with the
+    wrong tokens -- with nothing raised anywhere.
+    """
+    wg = FakeWorkerGroup(latency_rounds=NEVER)
+    first, second = _client(wg), _client(wg)
+    first.submit([1], {})
+    second.submit([1], {})
+    ids = [rid for c in (first, second) for rid in c._pending]
+    assert len(set(ids)) == 2, f"two clients issued the same id: {ids}"
+
+
+def test_one_client_still_numbers_its_own_requests_in_order():
+    wg = FakeWorkerGroup(latency_rounds=NEVER)
+    client = _client(wg)
+    for _ in range(3):
+        client.submit([1], {})
+    tails = [int(rid.rsplit("-", 1)[1]) for rid in client._pending]
+    assert sorted(tails) == [0, 1, 2]
