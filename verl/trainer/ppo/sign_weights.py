@@ -1268,8 +1268,15 @@ def rewrite_decomposition_terms(
 
     ``rewrite_fisher = Var_{p_s}(log w)`` is the squared Fisher norm of the extra
     gradient this arm adds. It is exactly zero when nothing fires, and -- unlike
-    every distance here -- it is invariant to the teachers' KL coefficients,
+    every distance here -- it carries none of the teachers' KL coefficients,
     which differ by 3.7x in measured drift.
+
+    The variance is over the k+1 categories, with the TAIL counted as a category
+    at ``log w = 0``: the rewrite does not touch the tail, so ``Z`` does not undo
+    a uniform weight and a weight that is constant across the support still tilts
+    the support against the tail. Read it as "how much structure the rewrite has
+    within this position", not as "how large the rewrite is" -- those come apart
+    exactly here, and ``cf_cost`` is the one that answers the second.
 
     ``control_teacher_kl`` is computed DIRECTLY against the unrewritten teacher
     rather than derived as ``teacher_kl - cf_cost``: only the direct form shares

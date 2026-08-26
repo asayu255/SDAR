@@ -194,19 +194,34 @@ def test_the_anchors_hold_however_far_the_off_task_teacher_drifted():
     assert raw[1] > 3 * raw[0]
 
 
-def test_the_ladder_ignores_padding_and_unnamed_planes():
-    base, on = _logprob(2, 2, 5, seed=15), _logprob(2, 2, 5, seed=16)
-    off = torch.stack([_logprob(2, 2, 5, seed=17)], dim=-1)
-    L = OffTaskLadderStats(n_tasks=3, device="cpu")
-    L.update(
-        student_logprob=on, on_task_logprob=on, base_logprob=base, off_task_logprobs=off,
-        response_mask=torch.tensor([[1.0, 1.0], [0.0, 0.0]]),
-        task_ids=torch.tensor([0, -1]),          # row 1 has no task
-        off_plane_tasks=torch.tensor([[1], [-1]]),  # ...and no named plane
-    )
-    m = L.metrics(task_names=TASKS)
+def test_the_ladder_drops_a_row_with_no_task_even_when_it_is_not_padding():
+    """The response mask and the task/plane validity are SEPARATE reasons to
+    drop a row, and only the mask is folded into the values by the caller. A row
+    that is fully unmasked but carries task -1 (or an unnamed plane) must still
+    contribute nothing -- otherwise it lands in whatever cell the index clamp
+    happens to point at, which is task 0's.
+    """
+    base, on = _logprob(3, 2, 5, seed=15), _logprob(3, 2, 5, seed=16)
+    off = torch.stack([_logprob(3, 2, 5, seed=17)], dim=-1)
+
+    def _run(tasks, planes):
+        L = OffTaskLadderStats(n_tasks=3, device="cpu")
+        L.update(
+            student_logprob=on, on_task_logprob=on, base_logprob=base, off_task_logprobs=off,
+            response_mask=torch.ones(3, 2),  # nothing is padding here
+            task_ids=tasks, off_plane_tasks=planes,
+        )
+        return L.metrics(task_names=TASKS)
+
+    # rows 1 and 2 are fully valid positions with an invalid task / plane
+    m = _run(torch.tensor([0, -1, 0]), torch.tensor([[1], [1], [-1]]))
     assert m["transfer/kl_to_off/n_positions/alfworld__vs__search"] == pytest.approx(2.0)
     assert len([k for k in m if "/n_positions/" in k]) == 1
+
+    # and all three valid gives three times the positions, so the drop above was
+    # the validity test and not an empty batch
+    m_all = _run(torch.tensor([0, 0, 0]), torch.tensor([[1], [1], [1]]))
+    assert m_all["transfer/kl_to_off/n_positions/alfworld__vs__search"] == pytest.approx(6.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +254,25 @@ def test_cf_cost_is_exactly_the_extra_kl_the_rewrite_costs_the_student():
     t = _decomp(student, on, base, w)
     direct = topk_kl_per_token(student, reweight_teacher_logprobs(on, w)) - topk_kl_per_token(student, on)
     torch.testing.assert_close(t["cf_cost"], direct, atol=2e-6, rtol=0)
+
+
+def test_the_control_kl_is_computed_directly_not_backed_out_of_the_identity():
+    """It would be arithmetically tempting to set ``control_kl = teacher_kl -
+    cf_cost``, and it would be self-defeating: cf_clamp_resid would then be
+    identically zero by construction and could no longer report the tail clamp it
+    exists to report. Only the direct form also shares the loss's own 1e-8 clamp.
+
+    Asserted bit-for-bit, with a LIVE weight -- the derived form agrees to about
+    1e-7, which is exactly why a loose tolerance here would not catch it.
+    """
+    student, on, base = _logprob(3, 4, 8, seed=60), _logprob(3, 4, 8, seed=61), _logprob(3, 4, 8, seed=62)
+    off = torch.stack([_logprob(3, 4, 8, seed=63), _logprob(3, 4, 8, seed=64)], dim=-1)
+    w = _weights(on, off, base)
+    assert float((w - 1.0).abs().max()) > 0, "the weight must actually act for this to test anything"
+    t = _decomp(student, on, base, w)
+    torch.testing.assert_close(
+        t["control_teacher_kl"], topk_kl_per_token(student, on), atol=0.0, rtol=0.0
+    )
 
 
 def test_the_clamp_residual_is_the_identity_measured_not_assumed():
@@ -285,6 +319,24 @@ def test_rewrite_fisher_is_a_variance_and_survives_a_rescaled_teacher():
     # depends on w and p_s only: the base cancels out of it entirely
     t2 = _decomp(student, on, _logprob(3, 4, 8, seed=99), _weights(on, off, base))
     torch.testing.assert_close(t["rewrite_fisher"], t2["rewrite_fisher"])
+
+    # A VARIANCE, not a second moment -- isolated on a support that carries all
+    # the mass, so the tail is not a second category to have variance against.
+    # There a uniform weight is genuinely structureless and Var is 0, while
+    # E[(log w)^2] would report (log 1.5)^2 and call a no-op an intervention.
+    full = torch.log_softmax(torch.randn(3, 4, 8), dim=-1)  # sums to 1 on the support
+    flat_w = torch.full((3, 4, 8), 1.5)
+    t3 = _decomp(full, full, full, flat_w)
+    assert float(t3["rewrite_fisher"].abs().max()) < 1e-5
+
+    # ...and with a tail present the SAME uniform weight has non-zero fisher,
+    # because the tail is a category the rewrite does not touch. That is not a
+    # bug in the metric, it is what "structure within this position" means when
+    # the support is partial -- and it is why cf_cost, which measures the size of
+    # the displacement instead, is reported beside it.
+    t4 = _decomp(student, on, base, flat_w)
+    assert float(t4["rewrite_fisher"].abs().max()) > 1e-3
+    assert float(t4["cf_cost"].abs().max()) > 1e-3
 
 
 def test_the_log_z_moments_are_a_different_functional_from_inv_z():
