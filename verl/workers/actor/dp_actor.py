@@ -1302,13 +1302,23 @@ class DataParallelPPOActor(BasePPOActor):
         sign_dev = next(self.actor_module.parameters()).device
         n_task = len(task_id_names or [])
         target_mode = sign_cfg_on and str((sign_cfg or {}).get("mode", "target")) == "target"
-        transfer_on = target_mode and bool(
+        transfer_on = sign_cfg_on and bool(
             ((sign_cfg or {}).get("transfer_stats", None) or {}).get("enable", False)
         )
+        rewrite_on = transfer_on and target_mode
         pair_on = sign_cfg_on and bool(
             ((sign_cfg or {}).get("pair_stats", None) or {}).get("enable", False)
         )
-        rewrite_stats = ScopeTermStats(names=REWRITE_TERMS, n_tasks=n_task, device=sign_dev) if transfer_on else None
+        # The two halves of transfer_stats have different prerequisites and are
+        # gated separately. rewrite_stats DECOMPOSES a rewrite of the teacher's
+        # probabilities, so it needs target mode -- there is nothing to decompose
+        # in position mode, which scales the KL term instead. The ladder needs no
+        # rewrite at all: it measures where the student sits relative to the
+        # off-task teachers, which is a question about four frozen-or-not models
+        # and is exactly as meaningful on a position arm. Gating them together
+        # silently gave the position arm no ladder while its script passed
+        # transfer_stats.enable=True.
+        rewrite_stats = ScopeTermStats(names=REWRITE_TERMS, n_tasks=n_task, device=sign_dev) if rewrite_on else None
         ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
@@ -1589,7 +1599,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 # Keep the original: the diagnostics below measure
                                 # how far the rewrite moved the target, which is a
                                 # statement about the pair.
-                                sign_target_inputs = (sign_on_task_logprobs, candidate_weight)
+                                sign_target_inputs = (sign_on_task_logprobs, candidate_weight, sign_state)
                                 if not sign_measure_only:
                                     # Assigned to fwd_teacher_topk_logprobs (not to
                                     # the teacher-indexed column it may have come
@@ -1817,6 +1827,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         base_logprob=sign_base_logprob,
                                         candidate_weight=sign_target_inputs[1],
                                         teacher_kl=teacher_kld,
+                                        state=sign_target_inputs[2],
                                     ),
                                     response_mask=response_mask,
                                     task_ids=task_ids,

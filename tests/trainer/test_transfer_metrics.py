@@ -585,8 +585,14 @@ def test_the_measurement_gates_never_depend_on_batch_content():
     src = _update_policy_source()
     assert "sign_cfg_on = bool(sign_cfg and sign_cfg.get" in src
     assert 'sign_enabled = sign_cfg_on and "sign_cache_ids" in data.batch.keys()' in src
-    for gate in ("transfer_on = target_mode and bool(", "pair_on = sign_cfg_on and bool("):
+    for gate in ("transfer_on = sign_cfg_on and bool(", "pair_on = sign_cfg_on and bool("):
         assert gate in src, gate
+    # The two halves of transfer_stats have different prerequisites: only the
+    # rewrite decomposition needs a rewrite to decompose. Gating the ladder on
+    # target mode too gave the position arm nothing while its script asked for it.
+    assert "rewrite_on = transfer_on and target_mode" in src
+    assert "if rewrite_on else None" in src
+    assert "if (transfer_on and n_task) else None" in src
     # the constructors must read the config-only flags, never sign_enabled
     for line in src.splitlines():
         if "ScopeTermStats(" in line or "OffTaskLadderStats(" in line or "SignPairCounts(" in line:

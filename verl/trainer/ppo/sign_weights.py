@@ -712,12 +712,21 @@ class TokenStateCounts:
     * ``mass`` -- the on-task teacher's probability summed over those events. A
       token can be reinforced constantly and carry no mass, which means the
       reinforcement reached nothing the teacher was actually going to say.
-    * ``dw`` -- the signed sum of ``(w - 1) * p``, i.e. the token's own
-      contribution to ``Z - 1``. This is the one ranked list that is a statement
-      about the OBJECTIVE rather than about the diagnosis: it is exactly how much
-      of the target's rewrite this token is responsible for, in the same
-      decomposition ``target_kl`` and ``inv_z`` are read from. Summing it over
-      the vocabulary reproduces ``Z - 1``.
+    * ``dq_pos`` / ``dq_neg`` -- the POST-NORMALISATION change to the target,
+      ``dq(v) = p_T(v) * (w(v)/Z - 1)``, accumulated separately by sign. This is
+      what the student is actually distilled toward, and it is not a rescaling of
+      the pre-normalisation ``(w-1) p_T``: since
+      ``dq = (w-1)p_T/Z - p_T (Z-1)/Z``, the second term moves EVERY token in
+      proportion to its own mass, so a high-probability token the weights never
+      touched still loses mass when the rewrite raises others. A quantity built
+      from ``w - 1`` alone reports zero there and misses the whole
+      redistribution.
+
+      Split by sign, and filed per STATE, because both cancellations are real: a
+      token reinforced in one context and suppressed in another nets toward zero,
+      and so does one whose own weight is 1 while Z varies. Net is
+      ``dq_pos + dq_neg``; gross is ``dq_pos - dq_neg``. Reporting only the net
+      drops a token that matters in both directions out of the ranking entirely.
 
     Accumulated dense and sync-free. The alternative -- ``torch.unique`` per
     micro-batch, keyed into a Python dict -- reads the device inside the
@@ -738,7 +747,13 @@ class TokenStateCounts:
         cells = self.n_scopes * self.n_states * self.vocab_size
         self.n = torch.zeros(cells, dtype=torch.int64, device=device)
         self.mass = torch.zeros(cells, dtype=torch.float32, device=device)
-        self.dw = torch.zeros(self.n_scopes * self.vocab_size, dtype=torch.float32, device=device)
+        # Post-normalisation target change, split by sign, on the SAME
+        # (scope, state, token) cells as the two above. float64 because these are
+        # ~1e-3..1e-6 per event summed over millions of atomic adds into a few
+        # cells: in float32 the later increments fall below the running sum's
+        # last bit and are silently dropped.
+        self.dq_pos = torch.zeros(cells, dtype=torch.float64, device=device)
+        self.dq_neg = torch.zeros(cells, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     # -- accumulation ------------------------------------------------------ #
@@ -752,6 +767,7 @@ class TokenStateCounts:
         on_task_logprob: torch.Tensor,
         response_mask: torch.Tensor,
         task_ids: Optional[torch.Tensor] = None,
+        eps: float = 1e-8,
     ) -> None:
         """Fold one micro-batch in.
 
@@ -775,27 +791,42 @@ class TokenStateCounts:
         ids = support_ids.reshape(-1).to(torch.long)
         st = state.reshape(-1).to(torch.long)
         valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(state).reshape(-1)
-        p = on_task_logprob.detach().to(torch.float32).exp().reshape(-1)
-        dw = (weight.detach().to(torch.float32) - 1.0).reshape(-1) * p
 
+        p_k = on_task_logprob.detach().to(torch.float32).exp()   # (bs, resp, k)
+        w_k = weight.detach().to(torch.float32)
+        # The normaliser the rewrite actually divides by, rebuilt here from the
+        # same inputs update_target uses. Without it this class can only report
+        # the pre-normalisation tilt, which is a different quantity.
+        tail = (1.0 - p_k.sum(dim=-1)).clamp(min=eps, max=1.0)
+        z = ((p_k * w_k).sum(dim=-1) + tail).clamp(min=eps)      # (bs, resp)
+        dq_k = p_k.to(torch.float64) * (
+            w_k.to(torch.float64) / z.unsqueeze(-1).to(torch.float64) - 1.0
+        )
+
+        p = p_k.reshape(-1)
+        dq = dq_k.reshape(-1)
         v_f = valid.to(torch.float32)
+        v_d = valid.to(torch.float64)
         v_i = valid.to(torch.int64)
         V, S = self.vocab_size, self.n_states
 
         flat = st * V + ids  # scope 0 starts at offset 0
         self.n.index_add_(0, flat, v_i)
         self.mass.index_add_(0, flat, p * v_f)
-        self.dw.index_add_(0, ids, dw * v_f)
+        self.dq_pos.index_add_(0, flat, dq.clamp(min=0) * v_d)
+        self.dq_neg.index_add_(0, flat, dq.clamp(max=0) * v_d)
 
         if task_ids is None:
             return
         t = task_ids.reshape(-1, 1, 1).expand_as(state).reshape(-1).to(torch.long)
         known = (t >= 0) & valid
+        k_f, k_d = known.to(torch.float32), known.to(torch.float64)
         scope = t.clamp(min=0) + 1
         flat_t = (scope * S + st) * V + ids
         self.n.index_add_(0, flat_t, known.to(torch.int64))
-        self.mass.index_add_(0, flat_t, p * known.to(torch.float32))
-        self.dw.index_add_(0, scope * V + ids, dw * known.to(torch.float32))
+        self.mass.index_add_(0, flat_t, p * k_f)
+        self.dq_pos.index_add_(0, flat_t, dq.clamp(min=0) * k_d)
+        self.dq_neg.index_add_(0, flat_t, dq.clamp(max=0) * k_d)
 
     def all_reduce(self) -> None:
         """Sum the three arrays across the DP group.
@@ -808,7 +839,7 @@ class TokenStateCounts:
         self._cpu_cache = None
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
-        for t in (self.n, self.mass, self.dw):
+        for t in (self.n, self.mass, self.dq_pos, self.dq_neg):
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
 
     # -- rendering --------------------------------------------------------- #
@@ -824,7 +855,8 @@ class TokenStateCounts:
             self._cpu_cache = (
                 self.n.detach().to("cpu").view(self.n_scopes, S, V),
                 self.mass.detach().to("cpu").view(self.n_scopes, S, V),
-                self.dw.detach().to("cpu").view(self.n_scopes, V),
+                self.dq_pos.detach().to("cpu").view(self.n_scopes, S, V),
+                self.dq_neg.detach().to("cpu").view(self.n_scopes, S, V),
             )
         return self._cpu_cache
 
@@ -837,20 +869,21 @@ class TokenStateCounts:
         return f"task{t}"
 
     def scalar_metrics(self, task_names=None, prefix: str = "sign_weight") -> dict:
-        """The shape of the token distribution, as numbers a run can be plotted by.
+        """The shape of the token distribution, and the size of the real change.
 
         ``n_distinct`` and ``top_share`` together separate the two mechanisms in
         the class docstring: a small stable set gives few distinct tokens and a
         high top-N share, a broad tendency gives the opposite. Neither is
         derivable from the existing ``frac_*``.
 
-        ``dw_pos_sum`` / ``dw_neg_sum`` are the two halves of ``Z - 1``. They are
-        reported separately because the whole point of ``inv_z`` is that they do
-        NOT cancel -- reporting only the residual hides how much was pushed each
-        way to produce it.
+        The ``dq`` family reports the POST-NORMALISATION change, positive and
+        negative halves separately, because the point of ``inv_z`` is that they
+        do not cancel. Per acted state as well as pooled, so a token reinforced
+        in one context and suppressed in another is not netted away before it is
+        ever seen.
         """
         out = {}
-        n, _mass, dw = self._cpu()
+        n, _mass, dq_pos, dq_neg = self._cpu()
         N = min(self.top_n, self.vocab_size)
         for scope in range(self.n_scopes):
             scope_name = self._scope_name(scope, task_names)
@@ -863,16 +896,29 @@ class TokenStateCounts:
                 sname = STATE_NAMES[sid]
                 out[f"{head}/token/n_distinct/{sname}"] = float((counts > 0).sum())
                 out[f"{head}/token/top{N}_share/{sname}"] = float(torch.topk(counts, N).values.sum()) / total
-            d = dw[scope]
-            pos, neg = float(d.clamp(min=0).sum()), float(d.clamp(max=0).sum())
+                # The gross effect of this state, by sign. A state whose two
+                # halves are large and nearly equal has been doing work that a
+                # net figure reports as nothing.
+                out[f"{head}/token/dq_pos/{sname}"] = float(dq_pos[scope, sid].sum())
+                out[f"{head}/token/dq_neg/{sname}"] = float(dq_neg[scope, sid].sum())
+
+            pos = float(dq_pos[scope].sum())
+            neg = float(dq_neg[scope].sum())
             if pos == 0.0 and neg == 0.0:
                 continue
-            out[f"{head}/token/dw_pos_sum"] = pos
-            out[f"{head}/token/dw_neg_sum"] = neg
-            absd = d.abs()
-            tot_abs = float(absd.sum())
-            if tot_abs > 0:
-                out[f"{head}/token/dw_abs_top{N}_share"] = float(torch.topk(absd, N).values.sum()) / tot_abs
+            out[f"{head}/token/dq_pos_sum"] = pos
+            out[f"{head}/token/dq_neg_sum"] = neg
+            # Gross, not |net|: the two halves are summed after taking absolute
+            # values, so mutual cancellation is excluded rather than hidden.
+            out[f"{head}/token/dq_abs_sum"] = pos - neg
+            # Per token, net across states, then ranked by magnitude. The
+            # difference between this and dq_abs_sum is exactly how much of the
+            # movement cancels within a single token.
+            per_tok = (dq_pos[scope] + dq_neg[scope]).sum(0).abs()
+            tot = float(per_tok.sum())
+            if tot > 0:
+                out[f"{head}/token/dq_abs_top{N}_share"] = float(torch.topk(per_tok, N).values.sum()) / tot
+                out[f"{head}/token/dq_net_over_gross"] = tot / (pos - neg) if (pos - neg) > 0 else 0.0
         return out
 
     def top_tokens(self, task_names=None) -> list:
@@ -881,60 +927,65 @@ class TokenStateCounts:
         Token ids rather than strings: this runs inside the actor, which has no
         tokenizer. The worker that owns one turns them into text.
 
-        Two rankings per scope, because they answer different questions. By
-        ``count`` within each acted state: which tokens do the teachers keep
-        agreeing (or disagreeing) about -- the shared structure, named. By
-        ``abs_dw`` pooled: which tokens actually moved the target. A token can top
-        one list and be absent from the other, and that gap is itself the finding
-        -- a token reinforced constantly at negligible probability is shared
-        structure the objective never sees.
+        Three rankings per scope, because they answer three different questions
+        and a token can top one while being absent from the others:
+
+        ``count``    -- which tokens do the teachers keep agreeing about. The
+                        shared structure, named.
+        ``mass``     -- which of them the on-task teacher was actually going to
+                        say. A rare candidate at high probability never reaches
+                        the count list and, if its weight is 1, never reaches the
+                        effect list either -- yet it is where the objective lives.
+        ``abs_dq``   -- which tokens the target actually moved, after
+                        normalisation. Pooled over states, since a token has one
+                        net displacement and no single state.
         """
         rows = []
-        n, mass, dw = self._cpu()
+        n, mass, dq_pos, dq_neg = self._cpu()
         N = min(self.top_n, self.vocab_size)
         for scope in range(self.n_scopes):
             scope_name = self._scope_name(scope, task_names) or "__pooled__"
             n_any = n[scope].sum(0)
             mass_any = mass[scope].sum(0)
+            dq_net_any = (dq_pos[scope] + dq_neg[scope]).sum(0)
+            dq_gross_any = (dq_pos[scope] - dq_neg[scope]).sum(0)
+
+            def _row(ranked_by, sid, rank, tok):
+                """One table row. ``sid`` is None for the state-pooled ranking."""
+                if sid is None:
+                    return {
+                        "scope": scope_name, "ranked_by": ranked_by, "state": "__any__",
+                        "rank": rank, "token_id": int(tok),
+                        "count": int(n_any[tok]), "mass": float(mass_any[tok]),
+                        "dq_net": float(dq_net_any[tok]), "dq_gross": float(dq_gross_any[tok]),
+                    }
+                return {
+                    "scope": scope_name, "ranked_by": ranked_by, "state": STATE_NAMES[sid],
+                    "rank": rank, "token_id": int(tok),
+                    "count": int(n[scope, sid, tok]), "mass": float(mass[scope, sid, tok]),
+                    "dq_net": float(dq_pos[scope, sid, tok] + dq_neg[scope, sid, tok]),
+                    "dq_gross": float(dq_pos[scope, sid, tok] - dq_neg[scope, sid, tok]),
+                }
+
             for sid in ACTED_STATES:
-                counts = n[scope, sid]
-                if int(counts.sum()) <= 0:
+                if int(n[scope, sid].sum()) <= 0:
                     continue
-                masses = mass[scope, sid]
-                vals, idx = torch.topk(counts, N)
-                for rank, (c, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
-                    if c <= 0:
-                        break
-                    rows.append({
-                        "scope": scope_name,
-                        "ranked_by": "count",
-                        "state": STATE_NAMES[sid],
-                        "rank": rank,
-                        "token_id": int(tok),
-                        "count": int(c),
-                        "mass": float(masses[tok]),
-                        "dw": float(dw[scope, tok]),
-                    })
-            absd = dw[scope].abs()
+                for ranked_by, series in (("count", n[scope, sid].to(torch.float64)),
+                                          ("mass", mass[scope, sid].to(torch.float64))):
+                    vals, idx = torch.topk(series, N)
+                    for rank, (v, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
+                        if v <= 0:
+                            break
+                        rows.append(_row(ranked_by, sid, rank, tok))
+
+            absd = dq_net_any.abs()
             if float(absd.sum()) <= 0:
                 continue
             vals, idx = torch.topk(absd, N)
             for rank, (a, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
                 if a <= 0:
                     break
-                rows.append({
-                    "scope": scope_name,
-                    "ranked_by": "abs_dw",
-                    # Pooled over states on purpose: dw is the token's net effect,
-                    # and a token that is reinforced in some rows and suppressed in
-                    # others has one net effect and no single state.
-                    "state": "__any__",
-                    "rank": rank,
-                    "token_id": int(tok),
-                    "count": int(n_any[tok]),
-                    "mass": float(mass_any[tok]),
-                    "dw": float(dw[scope, tok]),
-                })
+                rows.append(_row("abs_dq", None, rank, tok))
         return rows
 
 
@@ -1227,6 +1278,18 @@ REWRITE_TERMS = (
     "log_z_sq",
     "cf_clamp_resid",
     "student_tail_mass",
+    # Where the probability the rewrite moves actually goes. Every term below is
+    # a POST-normalisation displacement, so together they are what the student is
+    # distilled toward -- unlike log_z and the alignment terms, which describe the
+    # tilt before Z divides it back out.
+    "mass_shift_agree_pos",
+    "mass_shift_agree_neg",
+    "mass_shift_conflict",
+    "mass_shift_neutral",
+    "mass_shift_tail",
+    "mass_shift_abs",
+    "mass_conservation_error",
+    "tail_tv_share",
 )
 
 
@@ -1237,6 +1300,7 @@ def rewrite_decomposition_terms(
     base_logprob: torch.Tensor,
     candidate_weight: torch.Tensor,
     teacher_kl: torch.Tensor,
+    state: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
 ) -> dict:
     """What the rewrite cost the student, decomposed exactly.
@@ -1315,6 +1379,34 @@ def rewrite_decomposition_terms(
     target_kl = log_z - (p * log_w).sum(dim=-1)
     control_kl = topk_kl_per_token(lp_s, on_task_logprob.detach())
 
+    # ---- where the moved probability lands -------------------------------
+    # dq(v) = p(v) (w(v)/Z - 1). NOT a rescaling of (w-1)p: the second term of
+    # dq = (w-1)p/Z - p(Z-1)/Z moves every token in proportion to its own mass,
+    # so a high-probability token the weights never touched still loses mass when
+    # the rewrite raises others. Reporting only (w-1)p misses that redistribution
+    # entirely, and it is the part the student is actually trained on.
+    dq = p * (w / z.unsqueeze(-1) - 1.0)                      # (bs, resp, k)
+    dq_tail = tail * (1.0 / z - 1.0)                          # (bs, resp)
+
+    def _shift(mask):
+        return (dq * mask.to(dq.dtype)).sum(dim=-1) if mask is not None else dq.sum(dim=-1)
+
+    if state is None:
+        zeros = torch.zeros_like(dq_tail)
+        shift_pos = shift_neg = shift_conf = shift_neu = zeros
+    else:
+        st = state.detach()
+        shift_pos = _shift(st == STATE_AGREE_POS)
+        shift_neg = _shift(st == STATE_AGREE_NEG)
+        shift_conf = _shift((st == STATE_CONFLICT_ON_POS) | (st == STATE_CONFLICT_ON_NEG))
+        # Everything the weight table left at 1. Non-zero anyway, and that is the
+        # whole point: these tokens move only because Z moved.
+        shift_neu = _shift(
+            (st == STATE_NEUTRAL_ON) | (st == STATE_NEUTRAL_OFF_SPLIT) | (st == STATE_NEUTRAL_OFF_SILENT)
+        )
+
+    abs_shift = dq.abs().sum(dim=-1) + dq_tail.abs()
+
     return {
         "cf_cost": cf_cost,
         "control_teacher_kl": control_kl,
@@ -1328,6 +1420,23 @@ def rewrite_decomposition_terms(
         # the support. The student's own leftover is a different number and the
         # one that says how much of its distribution these terms never saw.
         "student_tail_mass": (1.0 - p_s.sum(dim=-1)).clamp(min=0.0, max=1.0),
+        "mass_shift_agree_pos": shift_pos,
+        "mass_shift_agree_neg": shift_neg,
+        "mass_shift_conflict": shift_conf,
+        "mass_shift_neutral": shift_neu,
+        "mass_shift_tail": dq_tail,
+        # Gross movement, the denominator the shares above are shares of. Twice
+        # the total variation between p and the rewritten target.
+        "mass_shift_abs": abs_shift,
+        # Identically zero: dq sums to (sum_S p w + tail)/Z - 1 = 0 over the k+1
+        # categories. Reported so the wiring is checked by the run rather than by
+        # this docstring -- a non-zero value means the tail clamp bound, and the
+        # shares above are then shares of a quantity that does not conserve.
+        "mass_conservation_error": dq.sum(dim=-1) + dq_tail,
+        # How much of the movement is the tail bucket absorbing or releasing. The
+        # tail is one lumped category, so a large share here says the rewrite is
+        # mostly trading against tokens the support never names.
+        "tail_tv_share": dq_tail.abs() / abs_shift.clamp(min=eps),
     }
 
 
