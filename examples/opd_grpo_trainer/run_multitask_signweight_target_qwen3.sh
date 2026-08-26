@@ -169,6 +169,43 @@ set -x
 #   is pure throughput. Keep it equal to the pure-OPD arm's value, or the two arms
 #   train on different rows and the comparison is not one.
 #
+#   THAT FORWARD IS UNBOUNDED IN THE WAY THE TEACHER'S ONCE WAS, and the number
+#   is written down here rather than acted on, because acting on it costs the
+#   comparison. compute_log_prob goes through _forward_micro_batch, so
+#   response_only_logits applies -- but 10 rows x the pinned 512
+#   data.max_response_length is 5,120 response tokens through lm_head:
+#   5,120 * 151,936 * fp32 = 2.90 GiB for the logits, and logsumexp wants a
+#   second buffer the same size, so ~5.8 GiB structurally. For scale, the
+#   teacher's ref.log_prob_micro_batch_size_per_gpu was cut 16 -> 4 after OOMing
+#   twice (the second time asking 3.77 GiB with 3.49 GiB free); 4 bounds that
+#   path at 2,048 tokens = 1.16 GiB, ~2.3 GiB with the temp. This phase's bound
+#   is 2.5x that, in the same regime -- ROLLOUT_KEEP_VLLM_AWAKE=1 means the
+#   engine is awake and holding its KV cache here too.
+#
+#   Not pre-emptively lowered: this key also sets adjust_batch's divisor, so
+#   lowering it changes which rows are dropped and the arm stops training on the
+#   same rows as its pure-OPD control -- and being able to make that comparison
+#   is the whole point of the arm. Left to measurement. IF IT DOES OOM, the fix
+#   that keeps the divisor is rollout.log_prob_use_dynamic_bsz=True (it
+#   interpolates from actor.use_dynamic_bsz, pinned False, so it is off today)
+#   together with rollout.log_prob_max_token_len_per_gpu, which is already passed
+#   below at 18432 and is inert while dynamic bsz is off. That bounds the phase by
+#   TOKENS without touching the divisor, and the pure-OPD control never runs this
+#   phase at all, so it cannot desynchronise the two arms.
+#
+#   Do not price any of this from perf/max_memory_*. Both are torch high-water
+#   marks that span vLLM's allocator pool -- the teacher-indexed arm's 150-step
+#   report logs 115.8 / 145.2 GB against a 94.97 GiB card
+#   (docs/multitask_signweight_teachertopk_150step_report.md section 9) -- so no
+#   headroom can be derived from them. Use nvidia-smi, or the accounting in an
+#   OOM message.
+#
+#   Throughput: expect a new timing_s/old_log_prob column that the pure-OPD arm
+#   does not have. By that report's section 9, three frozen-model forwards over
+#   the batch cost 146.7 s, so one is ~49 s -- roughly +8% on its 618 s step.
+#   That is an order of magnitude, not a prediction: those run at the ref micro
+#   batch of 4, this one at 10, and this one also computes entropy.
+#
 #   actor.ppo_micro_batch_size_per_gpu is 10 for the same reason (it was 5), and
 #   this one is NOT free: it is a different packed GEMM, so gradients differ in
 #   their last bits -- the no_sync_grad_accum class, not bit-identical. It has to

@@ -19,6 +19,7 @@ same row weights as the teacher KL, or ``pg_loss_coef`` stops being the ratio
 between them.
 """
 
+import functools
 import os
 import re
 
@@ -48,6 +49,15 @@ PAIRS = [
         "signweight_target",
         "examples/opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh",
         "examples/opd_trainer/run_multitask_signweight_target_qwen3.sh",
+    ),
+    # The teacher-indexed 1.5/0.5 arm, i.e. the one
+    # docs/multitask_signweight_teachertopk_150step_report.md is about. Its
+    # pure-OPD half is the only arm in this sequence with a completed validation,
+    # so this pair is the one whose control already has numbers.
+    (
+        "signweight_target_teachertopk",
+        "examples/opd_grpo_trainer/run_multitask_signweight_target_teachertopk_qwen3.sh",
+        "examples/opd_trainer/run_multitask_signweight_target_teachertopk_qwen3.sh",
     ),
 ]
 
@@ -225,6 +235,55 @@ def test_the_lock_pins_the_policy_gradient_as_live(name, script, _control):
     assert float(pinned["actor_rollout_ref.actor.pg_loss_coef"]) != 0
     # ...and the advantages the gradient reads have to be group-relative.
     assert pinned["algorithm.adv_estimator"] == "grpo"
+
+
+@functools.lru_cache(maxsize=None)
+def _lock(script):
+    """The intent lock a script points at, parsed.
+
+    Cached: composing a script through Hydra is not cheap and the comparisons
+    below ask for the same handful of locks repeatedly.
+    """
+    return yaml.safe_load(open(os.path.join(REPO, _composed(script).trainer.expected_config)))
+
+
+@pytest.mark.parametrize("name,script,control", PAIRS)
+def test_the_lock_differs_from_its_pure_opd_counterpart_only_in_the_objective(name, script, control):
+    """The locks are the machine-readable statement of what each arm IS, so the
+    difference between a pair's two locks is the difference between the arms.
+    Anything beyond pg_loss_coef and the run's name here means a knob was
+    changed while nobody was looking at it -- the locks' whole job is to make
+    that impossible to do quietly."""
+    grpo, pure = _lock(script), _lock(control)
+    differing = {k for k in set(grpo) | set(pure) if grpo.get(k, object()) != pure.get(k, object())}
+    assert differing == {
+        "actor_rollout_ref.actor.pg_loss_coef",
+        "trainer.project_name",
+        "trainer.experiment_name",
+    }, sorted(differing)
+
+
+def test_the_two_grpo_target_locks_differ_only_in_the_four_scientific_values():
+    """The GRPO half of the invariant
+    ``test_signweight_teacher_indexed_arm.py::test_the_two_target_locks_differ_only_in_the_four_scientific_values``
+    pins on the pure-OPD side: the support and the weight table, and nothing
+    else. Asserted separately rather than assumed from the derivation, because
+    "the GRPO arms were derived from the pure ones" stops being true the first
+    time somebody edits one of them."""
+    student = _lock("examples/opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh")
+    teacher = _lock("examples/opd_grpo_trainer/run_multitask_signweight_target_teachertopk_qwen3.sh")
+    differing = {
+        k for k in set(student) | set(teacher) if student.get(k, object()) != teacher.get(k, object())
+    }
+    assert differing == {
+        "trainer.experiment_name",
+        "actor_rollout_ref.actor.student_indexed_topk",
+        "actor_rollout_ref.ref.student_indexed_topk",
+        "algorithm.opd.sign_weight.agree_weight",
+        "algorithm.opd.sign_weight.agree_neg_weight",
+        "actor_rollout_ref.actor.sign_weight.agree_weight",
+        "actor_rollout_ref.actor.sign_weight.agree_neg_weight",
+    }, sorted(differing)
 
 
 def test_the_arms_do_not_share_a_lock_with_pure_opd():

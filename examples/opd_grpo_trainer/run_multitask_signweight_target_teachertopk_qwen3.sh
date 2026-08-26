@@ -1,6 +1,125 @@
 set -x
 
-# OPD + GRPO multitask (alfworld + search + webshop), Qwen3-1.7B.
+# OPD + GRPO multitask (alfworld + search + webshop), Qwen3-1.7B,
+# WITH CROSS-TEACHER SIGN WEIGHTING IN TARGET MODE.
+
+# ---------------------------------------------------------------------------
+# CROSS-TEACHER SIGN WEIGHTING -- TARGET MODE.
+#
+# TEACHER-INDEXED variant of the target arm, with a stronger symmetric table.
+#
+# Three things differ from opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh, and all
+# three are science, not tuning:
+#
+#   actor.student_indexed_topk=False   the support is the TEACHER's top-20
+#   sign_weight.agree_weight=1.5       was 1.25
+#   sign_weight.agree_neg_weight=0.5   was 0.75
+#
+# The last two are ONE change, not two: the table stays 1 +- delta and delta
+# goes 0.25 -> 0.5. Keeping it symmetric is not cosmetic -- see below.
+#
+# WHAT THIS ARM CAN AND CANNOT BE COMPARED WITH. student_indexed_topk decides
+# which 20 tokens the coarse-grained KL is exact on, so it changes the
+# objective, not the precision of a shared one. This arm is therefore NOT
+# comparable with the three student-indexed arms (control / position / target)
+# -- their numbers answer a different question. Its own control would be a
+# teacher-indexed pure-OPD run, which does not exist yet; without one, read this
+# arm's sign_weight/* diagnostics, not its success rates.
+#
+# WHY TEACHER-INDEXED IS WORTH RUNNING ANYWAY. With the support taken from the
+# student, the weights are not a function of the frozen models alone: the same
+# state gives a different candidate set as the student drifts, so the mechanism
+# is a feedback loop rather than a fixed annotation (measured: frac_agree_pos
+# 0.238 -> 0.193 over 150 steps). A teacher-chosen support removes that -- the
+# weights become a fixed function of four frozen models -- at the cost of the
+# tighter bound the student-indexed support buys, and of putting back the
+# constraint that the off-task teachers can only speak about tokens the on-task
+# teacher ranked.
+#
+# WHY THE TABLE STAYS SYMMETRIC. With w = (1+d, 1-d) the renormaliser is
+# Z = 1 + d*(A - B), where A and B are the position's agree_pos and agree_neg
+# teacher mass. It grows with the DIFFERENCE, not with A, so agree_neg anchors
+# it and the weight does not cancel itself. A one-sided table (agree_neg = 1.0)
+# gives Z = 1 + d*A instead, and at the agreement mass this run measured --
+# concentrated on roughly a tenth of positions, A ~ 0.72 there -- Z reaches 1.36
+# and the effective boost 1.5/1.36 = +10% comes out BELOW the +11% of the
+# 1.25/0.75 table it was meant to strengthen. Symmetry is what makes "raise the
+# multiplier" actually raise the intervention.
+#
+# EXPECTED EFFECT, WRITTEN DOWN BEFORE THE RUN. Against the 1.25/0.75 arm, at
+# firing positions: Z 1.12 -> 1.25, TV 0.081 -> 0.147 (1.80x), the agree_pos
+# boost +11.3% -> +20.3%, the agree_neg cut -33% -> -60%. The multiplier is
+# 1.8x at the estimated concentration, 1.9x at f=0.20 and 2.0x uniform, so
+# unlike the one-sided table this prediction does not depend on a concentration
+# the logs only bound to about a decimal place.
+#
+# WHAT TO WATCH, AND WHY 150 STEPS. sign_weight/target_kl_ratio is
+# KL(p_i || p~) / KL(p_s || p~): both distances to the SAME point, so it says
+# how the rewrite compares with what the student still has to learn. Scaling the
+# measured step-150 values by d gives alfworld 0.354 -> 1.42, webshop 0.223 ->
+# 0.92, search 0.035 -> 0.13. Above 1 the rewrite has moved the target further
+# from the teacher than the student is from the target: the arm is no longer a
+# reweighted distillation but a different objective, and the ratio KEEPS RISING
+# as the student converges. Alfworld is predicted past that line by step 150.
+# That is the reason to stop at 150 and read the ratio before going on, and it
+# has to be stated in any writeup of this arm.
+#   inv_z is predicted near 0.982 against 0.991 measured, so the systematic
+# sharpening sign_weight/target_entropy_delta exists to catch grows only about
+# twofold and stays small. That is not the binding constraint here; the ratio is.
+#
+# All the predictions above are transferred from the STUDENT-indexed run,
+# because that is the only place these masses have been measured. This arm takes
+# its support from the teacher, so the state masses may differ and the numbers
+# should be read as the expectation being tested, not as a forecast.
+#
+# Identical to opd_grpo_trainer/run_multitask_qwen3.sh except for algorithm.opd.sign_weight.*,
+# actor.student_indexed_topk, and the run's own identity -- same teachers, same
+# data, same batch sizes, same eval protocol.
+#
+# THAT IS TWO DIFFERENCES, NOT ONE, so run_multitask_qwen3.sh is NOT the control
+# for this arm: it takes its support from the student, and the support decides
+# which 20 tokens the KL is exact on. The control this arm needs is a pure-OPD
+# run with student_indexed_topk=False and sign_weight.enable=False and nothing
+# else changed. It does not exist yet. Until it does, read this arm's
+# sign_weight/* diagnostics, not its success rates.
+#
+# What the weighting does (verl/trainer/ppo/sign_weights.py): each teacher is a
+# single-task RL fine-tune of one base policy, so sign(log pi_m - log pi_0) says
+# whether task m's RL raised or lowered a candidate token here. The support is
+# the STUDENT's top-k -- the same one the KL already uses -- and all four models
+# (on-task teacher, two off-task teachers, base) are read on it.
+#
+# The two modes DO NOT share a weight table, and that is the point:
+#
+#   position  one scalar per token multiplies the per-token KL. A KL term has no
+#             direction, so agreement counts the same whether the teachers agreed
+#             to raise a token or to lower it: (+,+) and (-,-) both get 1.25. The
+#             minimiser is still the on-task teacher, so this changes how hard
+#             each position is learned and never what the student converges to.
+#   target    the teacher's own probability at that candidate is reweighted and
+#             the distribution renormalised, moving the fixed point to
+#             ~ w(v) p_teacher(v). Here the weight multiplies a PROBABILITY, so
+#             direction is the whole content: (+,+) gets 1.25 and (-,-) gets
+#             0.75. This is the variant that can inject an off-task opinion --
+#             and the one that can inject a wrong one.
+#
+# Conflict is NOT weighted in either arm (disagree_weight=1.0). Target mode
+# refuses any other value rather than pick a direction silently: deferring to the
+# objecting teachers means lowering a token the on-task teacher raised and
+# RAISING one it lowered, and one factor below 1.0 does the second backwards.
+#
+# Cost: three extra frozen forwards per step (the base over all rows, each
+# teacher over the 2/3 of rows that are not its own task), and the hidden-state
+# cache holds four models per row instead of one. enable=False turns all of that
+# off -- no base worker is built, no extra forward runs, nothing is written into
+# the batch -- which is exactly how the control for this arm would be made:
+# take this script, set sign_weight.enable=False, change nothing else.
+#
+# CHECKPOINT DIRECTORY. Arm-specific, and it has to be: the path is
+# default_local_dir/global_step_N and trainer.resume_mode defaults to "auto", so
+# two arms sharing this directory do not merely overwrite each other's
+# checkpoints -- the second one silently RESUMES FROM THE FIRST.
+# ---------------------------------------------------------------------------
 #
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block and NO ${VAR:-default} fallback, so
@@ -14,7 +133,7 @@ set -x
 # Teacher and checkpoint paths are written relative to $HOME so the same script
 # resolves correctly on either machine.
 #
-# INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_config.yaml pins the
+# INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_signweight_target_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
 # protocol). main_opd_grpo validates the composed config against it after its own
 # injection and refuses to start on any mismatch. To change such a knob, edit
@@ -285,7 +404,7 @@ set -x
 # thin enough that it needs measurement, not arithmetic. Do not try it without
 # first logging vLLM's KV usage (VLLM_LOGGING_LEVEL=INFO).
 #
-# actor.student_indexed_topk=True — NOT a speedup. It changes what the top-k KL
+# actor.student_indexed_topk=False — NOT a speedup. It changes what the top-k KL
 # is computed over, so it belongs to the science, is pinned in
 # expected_multitask_config.yaml, and has to be identical across every arm being
 # compared.
@@ -296,8 +415,11 @@ set -x
 #   teacher's top-20 therefore leaves the student's own mass uncovered exactly
 #   where the student has drifted off the teacher, which is the regime the term
 #   exists to penalise; taking A from the student's top-20 covers it. Both are
-#   valid lower bounds on the same full KL (data processing), so this is a
-#   tighter bound, not a different objective.
+#   valid lower bounds on the same full KL (data processing), so the student's
+#   support is the tighter bound. THIS ARM DELIBERATELY TAKES THE LOOSER ONE,
+#   to make the sign weights a function of frozen models only (see the header).
+#   That is why it cannot be compared with the student-indexed arms: two runs
+#   optimising different lower bounds are not a control/treatment pair.
 #   It costs no extra forward. The teacher's output splits as
 #   log p_t(v) = h·W_t[v] - lse_t, and only the last gather depends on the ids —
 #   ~1/42,000 of the teacher forward. So the teacher keeps running inside the
@@ -417,7 +539,7 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --seed 1
 
 python3 -m verl.trainer.main_opd_grpo \
-    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_config.yaml \
+    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_signweight_target_teachertopk_config.yaml \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -447,7 +569,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.model.use_fused_kernels=False \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \
@@ -461,7 +583,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
-    actor_rollout_ref.actor.student_indexed_topk=True \
+    actor_rollout_ref.actor.student_indexed_topk=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.return_rollout_log_probs=True \
     actor_rollout_ref.rollout.disable_log_stats=False \
@@ -496,6 +618,13 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     +algorithm.opd.normalize_loss_by_task=True \
+    +algorithm.opd.sign_weight.enable=True \
+    +algorithm.opd.sign_weight.mode=target \
+    +algorithm.opd.sign_weight.agree_weight=1.5 \
+    +algorithm.opd.sign_weight.agree_neg_weight=0.5 \
+    +algorithm.opd.sign_weight.disagree_weight=1.0 \
+    +algorithm.opd.sign_weight.deadzone=0.1 \
+    +algorithm.opd.sign_weight.base_path=Qwen/Qwen3-1.7B \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \
@@ -515,13 +644,13 @@ python3 -m verl.trainer.main_opd_grpo \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_opd_grpo_multitask' \
-    trainer.experiment_name=opd_grpo_multitask_qwen3_1.7b \
+    trainer.project_name='verl_agent_opd_grpo_signweight_multitask' \
+    trainer.experiment_name=opd_grpo_multitask_signweight_target_teachertopk_qwen3_1.7b \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_multitask \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_qwen3_1.7b \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_target_teachertopk_multitask \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_signweight_target_teachertopk_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \

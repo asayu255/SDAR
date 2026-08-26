@@ -43,6 +43,7 @@ COMPOSED_SCRIPTS = [
     "examples/opd_trainer/run_multitask_signweight_target_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh",
+    "examples/opd_grpo_trainer/run_multitask_signweight_target_teachertopk_qwen3.sh",
     "examples/sdar_trainer/run_multitask_qwen3.sh",
 ]
 
