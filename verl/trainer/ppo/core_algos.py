@@ -454,6 +454,76 @@ def agg_loss_with_sample_weights(
     return loss
 
 
+def agg_loss_by_task_weights(loss_mat: torch.Tensor, loss_mask: torch.Tensor, row_weights: torch.Tensor):
+    """Aggregate a per-token loss as ``sum_i w_i * sum_t loss_it`` over masked tokens.
+
+    The weighted counterpart of ``agg_loss(..., "token-mean")``, and deliberately
+    NOT one of its modes: token-mean divides by the batch's token count, which is
+    exactly the quantity per-task weighting exists to stop deciding the answer.
+    Here the normalisation lives entirely in ``row_weights`` -- see
+    ``verl/trainer/ppo/task_loss_weights.py`` for how they are built and why the
+    sum comes out at the magnitude of the token-mean it replaces.
+
+    Distinct from ``agg_loss_with_sample_weights`` above, which keeps the
+    token-mean's global divisor and uses the weights as per-sample coefficients
+    (a per-sample KL coefficient, say). Both take one scalar per row; only this
+    one lets the rows carry the whole normalisation.
+
+    Args:
+        loss_mat: (bs, response_length) per-token loss.
+        loss_mask: (bs, response_length) which tokens count.
+        row_weights: (bs,) one weight per row.
+
+    Returns:
+        a scalar torch.Tensor.
+    """
+    weights = row_weights.to(device=loss_mat.device, dtype=loss_mat.dtype).view(-1)
+    return ((loss_mat * loss_mask).sum(-1) * weights).sum()
+
+
+def compute_policy_loss_per_token(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+):
+    """The clipped policy objective BEFORE aggregation, plus its diagnostics.
+
+    Split out of ``compute_policy_loss`` so a caller that aggregates differently
+    -- per-task weighting, which cannot go through ``agg_loss`` -- does not have
+    to reimplement the clipping to get at the per-token matrix.
+
+    Returns:
+        (pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower), where ``pg_losses``
+        is (bs, response_length) and the rest are the usual scalars.
+    """
+    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
+
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    return pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,
@@ -493,26 +563,16 @@ def compute_policy_loss(
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
     """
-    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
-
-    negative_approx_kl = log_prob - old_log_prob
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-    pg_losses1 = -advantages * ratio
-    if cliprange_low is None:
-        cliprange_low = cliprange
-    if cliprange_high is None:
-        cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
-
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_per_token(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        cliprange=cliprange,
+        cliprange_low=cliprange_low,
+        cliprange_high=cliprange_high,
+        clip_ratio_c=clip_ratio_c,
+    )
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
