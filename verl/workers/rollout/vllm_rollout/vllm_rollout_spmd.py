@@ -256,6 +256,7 @@ class vLLMRollout(BaseRollout):
                 "max_num_seqs": config.max_num_seqs,
                 "enforce_eager": config.enforce_eager,
             },
+            engine=self.inference_engine,
         )
 
         # Offload vllm model to reduce peak memory usage

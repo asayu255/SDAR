@@ -2062,6 +2062,40 @@ engine を組んだ直後に `[rollout-engine]` を印字する。**次の run �
 vLLM が入っていないと import 自体が失敗するので、そこに置いた診断は
 GPU イメージなしにテストできない —— つまり腐る。
 
+### 実測(2026-08-27、この機械)—— **DUTY 層に回せるつまみは無かった**
+
+```
+vllm 0.8.5
+  async_scheduling             ABSENT
+  num_scheduler_steps          SchedulerConfig
+  disable_async_output_proc    LLM()
+  enable_chunked_prefill       SchedulerConfig
+  max_num_seqs                 SchedulerConfig
+```
+
+| つまみ | この版での状態 | 使えるか |
+| --- | --- | --- |
+| `async_scheduling` | **無い**(0.10.2 以降で追加) | **×** |
+| `num_scheduler_steps` | config には在るが **V0 専用** | V1 core なら無視される |
+| `disable_async_output_proc` | `LLM()` に在るが **V0 専用**、既定で既に有効 | 触っても変わらない |
+
+**つまり 0.8.5 で DUTY 層に効かせる手は無い。** 残る道は vLLM の更新で、
+`setup.py` は `<=0.11.0` を許しているので**可能ではある**が、それは
+**別の実験**である。今回の run に混ぜてはいけない(罠 4)。
+
+**V0 か V1 かで意味が変わる**ので、`[rollout-engine]` に core を出すようにした:
+
+```
+[rollout-engine] vllm 0.8.5, core=v1; overlap knobs: async_scheduling=absent, ...
+```
+
+`VLLM_USE_V1` は**要求であって結果ではない** —— V1 が扱えない構成では V0 に
+落ちるのに変数は 1 のままなので、**env var を読んではいけない。**
+実際に組まれた engine のクラスだけが嘘をつけない。
+
+**DUTY 層の結論は「まだ測っていない」から「この版には手が無い」に変わった。**
+EMPTY(depth)と PARTIAL(pump)は残っており、そちらが先である。
+
 ### 到達可能な数字を並べ直す
 
 | | 全カード空 | 部分空 | duty | node util |

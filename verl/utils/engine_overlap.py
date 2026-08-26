@@ -20,7 +20,7 @@ _OVERLAP_ARGS = (
 )
 
 
-def report_engine_overlap(engine_kwargs, explicit=None) -> None:
+def report_engine_overlap(engine_kwargs, explicit=None, engine=None) -> None:
     """Say which host/GPU overlap knobs this vLLM has, and which are in force.
 
     All-three-cards-busy samples read 87-90%, not 100, and the missing tenth is
@@ -34,6 +34,13 @@ def report_engine_overlap(engine_kwargs, explicit=None) -> None:
     work is knowing which ones exist. ``explicit`` carries the ones the rollout
     already names in its own ``LLM(...)`` call -- without it those would print as
     "<default>", which is a lie about a value we chose.
+
+    ``engine`` is used only to name which engine core is running. That decides
+    whether the knobs above mean anything at all: num_scheduler_steps and
+    disable_async_output_proc are V0 features, so on a V1 core they are present
+    in the signature and ignored in effect -- which is the worst of both, a flag
+    that accepts a value and changes nothing. Reading the class is the only
+    honest way to tell.
 
     Print it once, at build, next to the settings already chosen. Best-effort:
     an engine whose internals moved gets a shorter line, never an exception --
@@ -59,9 +66,26 @@ def report_engine_overlap(engine_kwargs, explicit=None) -> None:
             else:
                 found.append(f"{name}=absent")
         print(
-            f"[rollout-engine] vllm {getattr(vllm, '__version__', '?')}; overlap knobs: "
-            + ", ".join(found),
+            f"[rollout-engine] vllm {getattr(vllm, '__version__', '?')}, "
+            f"core={_engine_core(engine)}; overlap knobs: " + ", ".join(found),
             flush=True,
         )
     except Exception as exc:  # pragma: no cover - diagnostics never fail a run
         print(f"[rollout-engine] could not report overlap knobs: {exc}", flush=True)
+
+
+def _engine_core(engine) -> str:
+    """"v1", "v0", or "unknown" -- read from the object, not from an env var.
+
+    VLLM_USE_V1 is a request, not an outcome: vLLM falls back to V0 for
+    configurations V1 does not support and the variable keeps its value, so a run
+    can ask for V1 and get V0 with nothing saying so. The class the engine
+    actually built cannot lie about it.
+    """
+    inner = getattr(engine, "llm_engine", engine)
+    module = type(inner).__module__ if inner is not None else ""
+    if ".v1." in f".{module}.":
+        return "v1"
+    if module.startswith("vllm."):
+        return "v0"
+    return "unknown"

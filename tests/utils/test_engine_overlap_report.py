@@ -99,3 +99,51 @@ def test_engine_kwargs_win_over_the_explicit_ones(report, monkeypatch, capsys):
     _module(monkeypatch, params=("model", "enable_chunked_prefill"))
     report(engine_kwargs={"enable_chunked_prefill": True}, explicit={"enable_chunked_prefill": False})
     assert "enable_chunked_prefill=True (set here)" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# which engine core is running decides whether the V0 knobs mean anything
+# --------------------------------------------------------------------------- #
+def _engine_from(module_name):
+    inner = type("Core", (), {})
+    inner.__module__ = module_name
+    return type("LLM", (), {"llm_engine": inner()})()
+
+
+def test_a_v1_core_is_named_v1(report, monkeypatch, capsys):
+    """num_scheduler_steps and disable_async_output_proc are V0 features.
+
+    On a V1 core they are in the signature and ignored in effect -- a flag that
+    takes a value and changes nothing, which is the worst kind to reason from.
+    """
+    _module(monkeypatch, params=("model",))
+    report(engine_kwargs={}, engine=_engine_from("vllm.v1.engine.llm_engine"))
+    assert "core=v1" in capsys.readouterr().out
+
+
+def test_a_v0_core_is_named_v0(report, monkeypatch, capsys):
+    _module(monkeypatch, params=("model",))
+    report(engine_kwargs={}, engine=_engine_from("vllm.engine.llm_engine"))
+    assert "core=v0" in capsys.readouterr().out
+
+
+def test_the_core_is_read_from_the_object_not_an_env_var(report, monkeypatch, capsys):
+    """VLLM_USE_V1 is a request. vLLM falls back to V0 for configurations V1
+    cannot serve and the variable keeps its value, so a run can ask for V1 and
+    get V0 with nothing saying so."""
+    _module(monkeypatch, params=("model",))
+    monkeypatch.setenv("VLLM_USE_V1", "1")
+    report(engine_kwargs={}, engine=_engine_from("vllm.engine.llm_engine"))
+    assert "core=v0" in capsys.readouterr().out
+
+
+def test_an_unrecognisable_engine_is_unknown_not_a_guess(report, monkeypatch, capsys):
+    _module(monkeypatch, params=("model",))
+    report(engine_kwargs={}, engine=_engine_from("somebody_elses.engine"))
+    assert "core=unknown" in capsys.readouterr().out
+
+
+def test_no_engine_given_is_still_a_line(report, monkeypatch, capsys):
+    _module(monkeypatch, params=("model",))
+    report(engine_kwargs={})
+    assert "core=unknown" in capsys.readouterr().out
