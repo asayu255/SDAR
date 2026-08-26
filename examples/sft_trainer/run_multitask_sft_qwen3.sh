@@ -533,7 +533,7 @@ export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
 # 40 s of a 70 s batch instead of 4. That happened on port 8001 for 37 days, and
 # it read as "async did not help" and then as "the width did not help" before
 # anyone looked at the 422s. So: probe it here, and refuse to start.
-: "${SEARCH_URL:=http://100.86.45.30:8001/retrieve}"
+: "${SEARCH_URL:=http://100.86.45.30:8000/retrieve}"   # 8000, not 8001 -- see above
 export SEARCH_URL
 if [ "${SEARCH_PREFLIGHT:-1}" != "0" ]; then
   # curl writes 000 itself when it cannot connect, so the fallback assigns rather
@@ -556,6 +556,23 @@ if [ "${SEARCH_PREFLIGHT:-1}" != "0" ]; then
   esac
 fi
 export OFFPOLICY_ACTOR_PIPELINE=${OFFPOLICY_ACTOR_PIPELINE:-1}
+
+# How much of each card vLLM may hold, weights and KV cache together.
+#
+# 0.6 is the TRAINING arm's number and it is not conservatism: this arm keeps
+# FSDP parameters, gradients, optimizer state and the Stage-1 teacher pool on the
+# same cards, and vLLM is a passenger that never generates here (test_freq=-1).
+#
+# An evaluation process holds none of that, so the same 0.6 leaves roughly a
+# third of every card unused. Measured at 0.6, the KV budget is 159,600 tokens
+# per GPU and the heaviest search turn uses 118,000 of them -- so raising this
+# does not speed up the current batch, it buys the headroom that a WIDER one
+# needs (see the val_per_task_batch_size note in eval_checkpoints.sh).
+#
+# eval_checkpoints.sh raises it. Left alone, the training arm is unchanged.
+: "${ROLLOUT_GPU_MEM_UTIL:=0.6}"
+export ROLLOUT_GPU_MEM_UTIL
+
 
 # verl pins CUDA_DEVICE_MAX_CONNECTIONS=1 for every Ray worker
 # (verl/trainer/constants_ppo.py). That is a Megatron requirement -- its
@@ -639,7 +656,7 @@ python3 -m verl.trainer.main_sft_multitask \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEM_UTIL" \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.enforce_eager=False \
@@ -655,7 +672,7 @@ python3 -m verl.trainer.main_sft_multitask \
     env.history_length=4 \
     env.rollout.n=8 \
     env.search.search_url="$SEARCH_URL" \
-    env.search.timeout=600 \
+    env.search.timeout=120 \
     env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
     env.multitask.max_steps.alfworld=50 \
@@ -664,7 +681,7 @@ python3 -m verl.trainer.main_sft_multitask \
     +env.multitask.history_length.alfworld=2 \
     +env.multitask.history_length.search=4 \
     +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size=126 \
+    env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \

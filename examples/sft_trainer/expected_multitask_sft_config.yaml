@@ -152,7 +152,13 @@
 # (its later turns decode for a handful of trajectories in a slot sized for all of
 # them), and raising it means editing this line too -- which is the point of the
 # line: the decision gets recorded rather than passed on a command line.
-"env.multitask.val_per_task_batch_size": 126
+#
+# search is at 252 because that was measured, not assumed: 413 batches become
+# 208 and ms/row does not move, because a decode step costs the same carrying
+# ten sequences or a hundred. It had been living on a command line behind
+# EXPECTED_CONFIG_WAIVE, which is exactly the arrangement this file exists to
+# prevent, so it is written down here.
+"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 252, webshop: 126}
 
 # The retriever policy decides what enters the validation trajectories, so it is
 # pinned here rather than left with the machine knobs. Running out of retries does
@@ -166,7 +172,15 @@
 # timeout stays finite beside it: a peer that goes away without a FIN would
 # otherwise leave the socket waiting for the OS default, and a finite timeout
 # turns that into a connection error the retry loop handles.
-"env.search.timeout": 600
+#
+# 120, not 600. This bounds only the case a socket option cannot reach -- a
+# server that accepted the request and is thinking forever. Everything below
+# that is bounded at the socket now: 5 s on connect and 10 s on a request whose
+# acknowledgement never arrives (SEARCH_CONNECT_TIMEOUT_S,
+# SEARCH_TCP_USER_TIMEOUT_S). The slowest batched search ever measured against
+# this retriever is 7.5 s, so 120 is sixteen times the worst observation and
+# still five times faster to notice a hang than 600 was.
+"env.search.timeout": 120
 "env.search.max_retries": null
 
 # ---- rollout sampling / validation protocol ----------------------------------------

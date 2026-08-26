@@ -213,6 +213,64 @@ def test_waiver_does_not_disarm_other_keys():
     print("PASS: waiving one key still enforces the rest")
 
 
+def _mapping_fixture(tmp_dir, **over):
+    """A pinned MAPPING, which the loader stores as one flattened key per entry."""
+    path = os.path.join(tmp_dir, "expect.yaml")
+    with open(path, "w") as handle:
+        handle.write('"env.multitask.val_per_task_batch_size":\n')
+        handle.write("  alfworld: 126\n  search: 252\n  webshop: 126\n")
+    sizes = {"alfworld": 126, "search": 252, "webshop": 126}
+    sizes.update(over)
+    return OmegaConf.create({"env": {"multitask": {"val_per_task_batch_size": sizes}}}), path
+
+
+def test_a_waiver_covers_the_children_of_a_pinned_mapping():
+    """The operator waives the setting they can type, not the loader's flattening.
+
+    val_per_task_batch_size was pinned as a scalar and is now pinned as a
+    mapping, which the loader splits into one key per task. A waiver naming the
+    parent was valid before that change and has to stay valid, or turning a
+    scalar into a mapping would abort every run still carrying the old waiver --
+    for "naming a key the file does not pin", which is exactly backwards.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        config, expect_file = _mapping_fixture(tmp, search=378)
+        previous = _waive("env.multitask.val_per_task_batch_size")
+        try:
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                checked = enforce_expected_config(config, expect_file)
+        finally:
+            _restore(previous)
+
+    out = captured.getvalue()
+    assert "WAIVED env.multitask.val_per_task_batch_size.search" in out, out
+    assert "running with 378" in out and "says 252" in out, out
+    assert checked == 0, "every child of the waived parent must stop counting as checked"
+    print("PASS: a parent waiver covers a pinned mapping's entries")
+
+
+def test_a_parent_waiver_stops_at_the_dot():
+    """`a.b` must not swallow `a.bc`; a waiver is a key, not a prefix match."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "expect.yaml")
+        with open(path, "w") as handle:
+            handle.write('"trainer.save_freq": 25\n"trainer.save_freq_extra": 7\n')
+        config = OmegaConf.create({"trainer": {"save_freq": 1, "save_freq_extra": 1}})
+        previous = _waive("trainer.save_freq")
+        try:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    enforce_expected_config(config, path)
+            except AssertionError as exc:
+                assert "save_freq_extra" in str(exc), str(exc)
+            else:
+                raise AssertionError("save_freq_extra was swallowed by the save_freq waiver")
+        finally:
+            _restore(previous)
+    print("PASS: a waiver matches on dot boundaries, not string prefixes")
+
+
 def test_waiver_for_an_unpinned_key_is_an_error():
     """A waiver that protects nothing is a typo, and belongs to the same family
     as the typo'd ``+key=`` override this module already catches."""

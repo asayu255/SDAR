@@ -196,14 +196,16 @@ def test_default_budget_is_unchanged():
 # connect is bounded separately from read
 # --------------------------------------------------------------------------- #
 def test_connect_is_bounded_even_when_read_is_generous():
-    """A scalar timeout applies to BOTH phases, which is how a dead route stalls.
+    """A scalar timeout applies to BOTH phases, so connect inherits the read's.
 
-    [Errno 113] No route to host hangs in connect() while the kernel retries
-    ARP. With timeout=600 that wait is 600s wide, and measured it ran about 40 --
-    "search recovered after 2 attempts (41s)" for one backoff of 1s. Those 40
-    seconds are not one row's: the coalescing window's followers wait on the
-    leader unbounded, so the whole window stops, and with three pipeline slots
-    on one retriever the whole node stops.
+    With timeout=600 a connect that never completes waits 600s, and the whole
+    coalescing window waits with it: the followers wait on the leader unbounded
+    by design, and three pipeline slots share one retriever, so the node stops.
+    Bounding connect separately is worth doing on its own account.
+
+    It is NOT, however, where the 40s stalls went -- see
+    test_a_wedged_socket_is_bounded_by_the_user_timeout for the log line that
+    rules connect out.
     """
     session = _Session([_Response(payload={"result": ["doc"]})])
     _call(session, timeout=600)
@@ -232,3 +234,102 @@ def test_the_connect_bound_can_be_turned_off(monkeypatch):
     session = _Session([_Response(payload={"result": ["doc"]})])
     _call(session, timeout=600)
     assert session.timeouts[0] == 600, "0 restores the single scalar requests used to get"
+
+
+# --------------------------------------------------------------------------- #
+# a socket with a request already outstanding
+# --------------------------------------------------------------------------- #
+def _tcp_user_timeout(options):
+    """The TCP_USER_TIMEOUT entry from a socket_options list, or None."""
+    import socket
+
+    opt = getattr(socket, "TCP_USER_TIMEOUT", None)
+    if opt is None:
+        return None
+    for level, name, value in options:
+        if level == socket.IPPROTO_TCP and name == opt:
+            return value
+    return None
+
+
+needs_user_timeout = pytest.mark.skipif(
+    not hasattr(__import__("socket"), "TCP_USER_TIMEOUT"),
+    reason="TCP_USER_TIMEOUT is Linux-only",
+)
+
+
+@needs_user_timeout
+def test_a_wedged_socket_is_bounded_by_the_user_timeout():
+    """The 40s stalls were past connect, on a socket with data outstanding.
+
+    MEASURED, run sft-multitask-eval-20260826-201115: 19 samples of 15s with all
+    three GPUs at 0%, GPU power 282W -> 99W, and host CPU, disk, network and
+    thread count identical to a busy sample. The search log dates them:
+    "search recovered after 2 attempts (41s)".
+
+    TWO attempts is the discriminator. EHOSTUNREACH on a withdrawn route returns
+    at once, so covering 40s of a genuinely dead route would take about nine
+    attempts at this backoff. Two means attempt 1 spent the whole 40s inside one
+    socket and attempt 2, on a fresh connection, succeeded immediately -- which
+    is a wedged connection, not an outage, and lands past connect() where
+    neither the connect bound nor keepalive can reach it. Linux falls back to
+    tcp_retries2 there, about 15 minutes.
+    """
+    value = _tcp_user_timeout(mod._socket_health_options())
+    assert value == int(mod._USER_TIMEOUT_S * 1000), "the option is set in milliseconds"
+    assert 0 < value <= 60_000, "a bound above a minute is not a bound for this workload"
+
+
+@needs_user_timeout
+def test_the_user_timeout_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(mod, "_USER_TIMEOUT_S", 0)
+    assert _tcp_user_timeout(mod._socket_health_options()) is None, "0 keeps the kernel default"
+
+
+def test_keepalive_survives_the_user_timeout():
+    """The two cover different sockets; adding one must not drop the other.
+
+    Keepalive is for an IDLE socket whose peer went away -- nothing outstanding,
+    so TCP_USER_TIMEOUT's clock never starts and only probes find the corpse.
+    """
+    import socket
+
+    options = mod._socket_health_options(idle_s=30, interval_s=10, probes=3)
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in options
+    for name, expected in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            assert (socket.IPPROTO_TCP, opt, expected) in options
+
+
+def test_the_options_reach_the_adapter():
+    """A list nothing installs is a comment. urllib3's kwarg is not public API."""
+
+    class _PoolManager:
+        def __init__(self):
+            self.connection_pool_kw = {}
+
+    class _Adapter:
+        def __init__(self):
+            self.poolmanager = _PoolManager()
+
+    adapter = _Adapter()
+    mod._enable_tcp_keepalive(adapter)
+    installed = adapter.poolmanager.connection_pool_kw["socket_options"]
+    assert installed == mod._socket_health_options()
+
+    # Asserted against the installed list rather than the helper's return value,
+    # so this fails on a build where the option was never added at all.
+    import socket
+
+    if hasattr(socket, "TCP_USER_TIMEOUT"):
+        assert _tcp_user_timeout(installed), "the bound has to reach a real socket to bound anything"
+
+
+def test_an_adapter_without_the_kwarg_does_not_fail_the_run():
+    """A urllib3 that moved its internals costs the tuning, not the evaluation."""
+
+    class _Adapter:
+        poolmanager = None  # attribute access raises inside the helper
+
+    mod._enable_tcp_keepalive(_Adapter())  # must not raise

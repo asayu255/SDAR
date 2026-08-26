@@ -24,11 +24,12 @@
 # validation of a few hours, and it buys back more than it costs: no state of any
 # kind survives from one checkpoint's evaluation to the next.
 #
-# COST. A pass is all three tasks at env.multitask.val_per_task_batch_size=126
-# episodes each, alfworld running to 50 turns -- 3.8 h measured on 3xA6000 (wandb
-# x7g9r7bx). PASS THE STEPS YOU WANT. With no arguments this evaluates the newest
-# checkpoint only, deliberately: `for every checkpoint` at save_freq=25 is twelve
-# of them, i.e. about 45 GPU-hours.
+# COST. A pass is all three tasks (alfworld and webshop at 126 episodes per
+# batch, search at 252), alfworld running to 50 turns -- 1.26 h measured on
+# 3xA6000 for 208 batches (wandb sft-multitask-eval-20260826-201115; it was
+# 3.8 h before the retriever was batching). PASS THE STEPS YOU WANT. With no
+# arguments this evaluates the newest checkpoint only, deliberately: `for every
+# checkpoint` at save_freq=25 is twelve of them, i.e. about 15 GPU-hours.
 #
 # The training run's two validations were at step 150 and 300 (its test_freq was
 # 150), so `eval_checkpoints.sh 150 300` reproduces exactly what it used to do.
@@ -46,9 +47,9 @@
 #   trainer.resume_from_path=.../global_step_<N>
 #
 # Nothing is passed twice; a setting this script cannot reach is one to edit in
-# the run script (raising rollout.gpu_memory_utilization above 0.6 is a fair one
-# to consider here -- an eval process holds no optimizer, gradients or teacher
-# pool, so vLLM can have more of the card for its KV cache).
+# the run script -- or, where evaluation genuinely wants a different value, one
+# the run script reads from the environment. rollout.gpu_memory_utilization is
+# the second kind, and this script raises it (see ROLLOUT_GPU_MEM_UTIL below).
 #
 # The teacher pool does not have to exist for this. algorithm.sft.data_dir is
 # still checked as the identity of the arm, but a val_only process never reads it.
@@ -169,33 +170,50 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # cannot spare them.
 export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-2}"
 
-# WIDER SEARCH BATCHES -- not on by default, because it needs the pinned config
-# edited in the same change.
+# HOW MUCH OF THE CARD vLLM GETS.
+#
+# 0.6 is the training arm's number, and it is right there: that arm keeps FSDP
+# parameters, gradients, optimizer state and a 136.5 GiB teacher pool on the same
+# cards. An eval process holds none of them, so 0.6 leaves about a third of every
+# card idle. 0.75 gives vLLM 36 GiB of the 48, which leaves 12 for FSDP, the CUDA
+# context and NCCL -- measured non-KV use inside the budget is 10.9 GiB, so the
+# KV cache goes from 159,600 tokens per GPU to roughly 224,000.
+#
+# It does NOT speed up the batch that runs today: the heaviest search turn uses
+# 118,000 of the 159,600 it already had. It buys the headroom the NEXT width
+# needs, below.
+#
+# Drop it back to 0.6 if vLLM refuses to start -- that is what an over-subscribed
+# card looks like, and it fails at init rather than part-way through.
+export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.75}"
+
+# SEARCH BATCH WIDTH -- 252 is the default now, in both this repo's pinned config
+# and the run script, because it was measured: 413 batches become 208 and ms/row
+# does not move. It had been living on a command line behind EXPECTED_CONFIG_WAIVE.
 #
 # A search batch's later turns decode for a handful of trajectories in a slot
-# sized for 126: measured, the last two turns take 46% of a batch's generation
-# time to carry 14% of its work, and a decode step costs the same whether it
-# carries ten sequences or a hundred. So those turns are nearly free to widen.
-#
-# To run it, set BOTH (they are checked against each other):
-#
-#   expected_multitask_sft_config.yaml:
-#     "env.multitask.val_per_task_batch_size": {alfworld: 126, search: 252, webshop: 126}
-#
-#   this script, appended to the trainer arguments:
-#     env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}'
+# sized for all of them: measured, the last two turns take 46% of a batch's
+# generation time to carry 14% of its work, and a decode step costs the same
+# whether it carries ten sequences or a hundred. So those turns are nearly free
+# to widen.
 #
 # alfworld and webshop stay at 126: their environment managers are built at this
 # size and alfworld's games are indexed by position within its manager. search's
 # rows and their order do not change, only how they are grouped, so its score
 # does not move.
 #
-# 252 fits the KV cache (159,600 tokens per GPU): the heaviest turn is 64 active
-# at ~1,330 prompt tokens plus 512 of response, about 118,000. 378 would sit at
-# 156,500, which is too close to the edge.
+# THE NEXT EXPERIMENT IS 378, and the KV budget above is what makes it possible.
+# The heaviest turn at 252 is 64 active at ~1,330 prompt tokens plus 512 of
+# response, about 118,000 of 159,600 -- 74%. At 378 that is about 156,500, which
+# was too close to 159,600 to try, and is 70% of the 224,000 that 0.75 gives.
+# Change it in BOTH places (they are checked against each other) and change
+# NOTHING ELSE in the same run:
 #
-# Compare runs on ms/row from the WALL lines, NOT on s/batch or batch number --
-# widening turns 413 batches into 208, so neither is the same quantity twice.
+#   expected_multitask_sft_config.yaml, and run_multitask_sft_qwen3.sh:
+#     env.multitask.val_per_task_batch_size: {alfworld: 126, search: 378, webshop: 126}
+#
+# Compare on ms/row from the WALL lines, NOT on s/batch or batch number --
+# widening turns 208 batches into 139, so neither is the same quantity twice.
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it

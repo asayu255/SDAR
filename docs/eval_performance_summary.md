@@ -107,7 +107,7 @@ GPU エンコーダを取り合って、**同じ 3 クエリの encode が 42 ms
 —— retriever のログに `8 queries` と出ているのを読むまで、バッチ化は効いていた。
 
 
-### 2.3 経路が落ちると、1 本の connect が窓ごと止める
+### 2.3 詰まった socket 1 本が窓ごと止める
 
 §2.2 のあと、定常状態は util 90% に乗った。それでも平均が 76.7% だったのは、
 **30〜45 秒ノード全体が止まる窓**が 45 分に 3〜4 回あるからである。
@@ -138,22 +138,42 @@ batch#50  turn 0:  gen  1.76   envstep 46.01     (他のターンは 0.09〜0.31
 search recovered after 2 attempts (41s)   (33s)   (40s)
 ```
 
-**41/33/40 秒は dip の長さそのもの。** 2 回の試行でバックオフが 1 秒なら、
-**約 40 秒が 1 回の connect の中**にある —— 経路が消えたときカーネルが ARP を
-再送し続ける時間である。`100.86.x.x` は CGNAT レンジで、トンネルの瞬断に見える。
+**41/33/40 秒は dip の長さそのもの。そして「2 回」が犯人を特定する。**
+
+経路が本当に 40 秒落ちていたなら `EHOSTUNREACH` は**待たずに即座に返る**ので、
+このバックオフ(1, 2, 3, … 秒)で 40 秒を埋めるには **9 回**ほど要る。2 回で
+済んだのは、**1 回目が 1 本の socket の中で 40 秒すべてを使い、2 回目が新しい
+接続で即座に成功した**からである。**経路の断ではなく、詰まった 1 本の接続。**
+
+> **当初これを「connect の中」と書いた。間違いである。**
+> connect は成功していて、40 秒は**その先**、要求を出して ACK が返らない
+> socket の中にあった。回数を数えるまで気づかなかった。
 
 **それは 1 行ぶんの 40 秒ではない。** 合流窓の follower は leader を無制限に待つ
-(意図的。`_Coalescer.call`)ので、詰まった connect 1 本が窓の全行を止め、
+(意図的。`_Coalescer.call`)ので、詰まった 1 本が窓の全行を止め、
 3 slot が同じ retriever を叩いているので 3 つとも止まる。
 
-`timeout=600` はスカラーで、requests はスカラーを connect と read の両方に使う。
-**connect だけを 5 秒で切るようにした**(`SEARCH_CONNECT_TIMEOUT_S`)。read は
-そのまま —— 250 クエリのバッチは正当に数秒かかるし、そこを諦めると
-`<information>` にエラー文字列が入る。
+### 3 つの上限が要る
 
-**根治はコードではない。** 落ちているのは経路で、5 秒の connect 上限は
-40 秒の停止を 6 秒に縮めるだけである。`wasabi` と `wakaba` の間の
-リンクを直すのが本筋。
+| 上限 | 守る範囲 | 値 |
+| --- | --- | ---: |
+| `SEARCH_CONNECT_TIMEOUT_S` | connect が完了するまで | 5 s |
+| **`SEARCH_TCP_USER_TIMEOUT_S`** | **未応答のデータを抱えた socket** | **10 s** |
+| `env.search.timeout` | 接続は生きていてサーバが考え込んでいる | 120 s |
+
+`timeout=600` はスカラーで、requests はスカラーを connect と read の両方に使う
+—— だから connect を別に切る。だが**この故障は connect でも idle でもない**ので、
+keepalive(idle 30 秒)も connect 上限もどちらの管轄でもなかった。Linux は
+`tcp_retries2` に従い**約 15 分**、今回はトンネルが先に復帰して 40 秒で済んだ。
+`TCP_USER_TIMEOUT` がちょうどこの穴で、40 秒 → 約 11 秒になる。
+
+`env.search.timeout` を 600 → 120 にしたのは、600 が上限ではなく
+「永遠に待つ」の綴りだったからである。実測の最悪値はバッチ検索 7.5 秒。
+`max_retries=null` は据え置き —— 諦めないことと、詰まりに気づくのが速いことは
+両立する。
+
+**根治はコードではない。** 落ちているのは経路で、上限は被害を 1/4 にするだけ
+である。`wasabi` と `wakaba` の間のリンクを直すのが本筋。
 
 ### 効いた理由が直感と違うもの
 
@@ -390,6 +410,9 @@ ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限�
 ROLLOUT_PER_TASK_ADVANCE=1 task ごとに turn を進める(既定 OFF、§7.6)
 ENV_RESET_REPORT_S=2      これ以上かかった env reset を報告(0 で全部)
 SEARCH_CONNECT_TIMEOUT_S=5  connect だけを別に切る(0 で従来のスカラー、§2.3)
+SEARCH_TCP_USER_TIMEOUT_S=10 未応答データを抱えた socket の上限(0 でカーネル既定、§2.3)
+SEARCH_BATCH_WINDOW_MS=100  合流窓。10 では 252 クエリが 30 本に割れる(§2.2)
+ROLLOUT_GPU_MEM_UTIL=0.75   vLLM に渡すカードの割合(学習は 0.6、評価は 0.75)
 ROLLOUT_ASYNC_REQUIRE=1    pool に載らない呼び出しを fallback させず落とす(測定時は必須)
 ROLLOUT_PUMP_REQUEST_TIMEOUT_S=900  どの rank も finished/failed に載せなかった request を諦める
 ROLLOUT_PUMP_RESULT_TIMEOUT_S=1800  driver 側の保険。0 で無効
@@ -402,21 +425,23 @@ ROLLOUT_PUMP_SEED=1        request ごとに (prompt, row) から seed を作る
 
 ```bash
 ray stop --force
-ROLLOUT_MERGE_GENERATES=1 VAL_PIPELINE_DEPTH=3 \
-EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
-bash examples/sft_trainer/eval_checkpoints.sh \
-  -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
+SEARCH_URL=http://<retriever>:8000/retrieve \
+bash examples/sft_trainer/eval_checkpoints.sh <step>
 ```
 
-`ROLLOUT_KEEP_VLLM_AWAKE`、`SKIP_ROLLOUT_BUILD=0`、`GPU_PROFILER`、
-`ROLLOUT_TURN_TIMING`、`VAL_PIPELINE_DEPTH=2` はスクリプトの既定で入る。
+**これで全部である。** `val_per_task_batch_size={alfworld:126,search:252,webshop:126}`、
+`ROLLOUT_GPU_MEM_UTIL=0.75`、`ROLLOUT_KEEP_VLLM_AWAKE`、`SKIP_ROLLOUT_BUILD=0`、
+`GPU_PROFILER`、`ROLLOUT_TURN_TIMING`、`VAL_PIPELINE_DEPTH=2` はすべて既定で入る。
+`SEARCH_URL` も既定が `:8000` なので、retriever が同じホストなら省ける。
 
-### 恒久化するには 2 つの宿題がある
+### 恒久化の宿題は 1 つ残っている
 
-1. **`EXPECTED_CONFIG_WAIVE` は一時回避である。** `val_per_task_batch_size` は
-   `expected_multitask_sft_config.yaml` で固定されていて、それは正しい
-   —— この値が alfworld の episode を決めるからである。効果が確認できたら
-   マッピング形に書き換えて、決定をファイルに残すこと。
+1. ~~`EXPECTED_CONFIG_WAIVE` は一時回避~~ —— **解消した。**
+   `val_per_task_batch_size` はマッピング形で
+   `expected_multitask_sft_config.yaml` と run script の両方に書き下ろされ、
+   waiver は不要になった。pinned config は mapping を平坦化して持つので、
+   親名の waiver がドット境界で子を覆うようにもしてある(古いコマンドラインが
+   落ちないように)。
 2. **合流は生成を変える(実測)。既定に昇格させてはいけない。**
    同一 checkpoint・同一 retriever・同一 batching で、合流あり/なしの
    `[val-hash]` を search 30 batch ぶん比べた結果:

@@ -121,6 +121,22 @@ def waived_keys() -> List[str]:
     return [key.strip() for key in raw.replace(",", " ").split() if key.strip()]
 
 
+def _waiver_covers(waiver: str, pinned_key: str) -> bool:
+    """Does ``waiver`` excuse ``pinned_key``?
+
+    Exactly, or as its parent. A mapping in the expectations file is stored
+    flattened -- ``val_per_task_batch_size: {alfworld: 126, search: 252}``
+    becomes two pinned keys -- but an operator waives the setting they know
+    about, which is the name they would type on a command line. Without this,
+    turning a pinned scalar into a pinned mapping silently invalidates every
+    existing waiver for it, and the waiver check would then abort the run for
+    naming a key "the file does not pin".
+
+    The boundary is the dot: ``a.b`` covers ``a.b.c`` and not ``a.bc``.
+    """
+    return pinned_key == waiver or pinned_key.startswith(waiver + ".")
+
+
 def check_expected_config(config, expect_file: str) -> List[Tuple[str, Any, Any]]:
     """Return a list of (dotted_key, got, expected) mismatches (empty = OK)."""
     expectations = load_expectations(expect_file)
@@ -144,21 +160,29 @@ def enforce_expected_config(config, expect_file: str, tag: str = "expected-confi
     waived = waived_keys()
     if waived:
         pinned = load_expectations(expect_file)
-        unknown = [key for key in waived if key not in pinned]
+        unknown = [
+            key for key in waived if not any(_waiver_covers(key, name) for name in pinned)
+        ]
         assert not unknown, (
             f"[{tag}] EXPECTED_CONFIG_WAIVE names {unknown}, which "
             f"{expect_file} does not pin. A waiver that protects nothing is a "
             "typo, and silently ignoring it would defeat the point of naming keys."
         )
         for key in waived:
-            got = OmegaConf.select(config, key, default=_MISSING)
-            got_repr = "<missing>" if got is _MISSING else repr(got)
-            print(
-                f"[{tag}] WAIVED {key}: running with {got_repr}, "
-                f"expectations file says {pinned[key]!r}",
-                flush=True,
-            )
-        mismatches = [m for m in mismatches if m[0] not in set(waived)]
+            # A waiver may name a parent of several pinned keys, so report every
+            # one it covers rather than indexing `pinned` by the waiver itself.
+            covered = [name for name in pinned if _waiver_covers(key, name)]
+            for name in covered:
+                got = OmegaConf.select(config, name, default=_MISSING)
+                got_repr = "<missing>" if got is _MISSING else repr(got)
+                print(
+                    f"[{tag}] WAIVED {name}: running with {got_repr}, "
+                    f"expectations file says {pinned[name]!r}",
+                    flush=True,
+                )
+        mismatches = [
+            m for m in mismatches if not any(_waiver_covers(key, m[0]) for key in waived)
+        ]
 
     if mismatches:
         lines = [
@@ -173,8 +197,14 @@ def enforce_expected_config(config, expect_file: str, tag: str = "expected-confi
             "expectations file in the same commit)."
         )
         raise AssertionError("\n".join(lines))
-    n_keys = len(load_expectations(expect_file))
-    checked = n_keys - len(waived)
-    suffix = f", {len(waived)} waived" if waived else ""
+    pinned_names = list(load_expectations(expect_file))
+    # Count the pinned keys a waiver covers, not the waivers: one naming the
+    # parent of a mapping excuses every entry under it, so subtracting the
+    # number of waivers would report more keys checked than were checked.
+    n_waived = sum(
+        1 for name in pinned_names if any(_waiver_covers(key, name) for key in waived)
+    )
+    checked = len(pinned_names) - n_waived
+    suffix = f", {n_waived} waived" if waived else ""
     print(f"[{tag}] OK — {checked} expected keys match the effective config ({expect_file}){suffix}")
     return checked
