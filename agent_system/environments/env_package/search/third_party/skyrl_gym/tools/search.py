@@ -448,6 +448,26 @@ def call_search_api(
     )
 
 
+def _urllib3_default_socket_options():
+    """What urllib3 would have put on the socket if we passed nothing.
+
+    Read from urllib3 rather than hardcoded so a version that adds an option
+    keeps it. The fallback is the value urllib3 has shipped for years, which is
+    the one that matters: TCP_NODELAY off would be a regression, not a default.
+    """
+    try:
+        from urllib3.connection import HTTPConnection
+
+        defaults = HTTPConnection.default_socket_options
+        if defaults:
+            return list(defaults)
+    except Exception as e:  # pragma: no cover - urllib3 internals moved
+        logger.warning(f"could not read urllib3's default socket options ({e}); assuming TCP_NODELAY")
+    import socket
+
+    return [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
 def _socket_health_options(idle_s: int = 30, interval_s: int = 10, probes: int = 3):
     """The socket options that decide how fast a dead retriever peer is noticed.
 
@@ -483,15 +503,27 @@ def _socket_health_options(idle_s: int = 30, interval_s: int = 10, probes: int =
     """
     import socket
 
-    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # urllib3's socket_options kwarg REPLACES its defaults, it does not extend
+    # them, and its default is TCP_NODELAY. Building this list from scratch
+    # therefore turns Nagle back on for the one session that sends nothing but
+    # small JSON POSTs -- against a server that delays its ACKs, that is tens of
+    # milliseconds added to every retrieval, on the hottest path in the run.
+    # Start from whatever urllib3 would have used and add to it.
+    options = list(_urllib3_default_socket_options())
+
+    def add(level, opt, value):
+        if opt is None:
+            return
+        if any(lvl == level and name == opt for lvl, name, _ in options):
+            return  # already carried over from urllib3's defaults
+        options.append((level, opt, value))
+
+    add(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     for name, value in (("TCP_KEEPIDLE", idle_s), ("TCP_KEEPINTVL", interval_s), ("TCP_KEEPCNT", probes)):
-        opt = getattr(socket, name, None)
-        if opt is not None:
-            options.append((socket.IPPROTO_TCP, opt, value))
+        add(socket.IPPROTO_TCP, getattr(socket, name, None), value)
     # Milliseconds, and Linux-only. 0 leaves the kernel default (tcp_retries2).
-    opt = getattr(socket, "TCP_USER_TIMEOUT", None)
-    if opt is not None and _USER_TIMEOUT_S > 0:
-        options.append((socket.IPPROTO_TCP, opt, int(_USER_TIMEOUT_S * 1000)))
+    if _USER_TIMEOUT_S > 0:
+        add(socket.IPPROTO_TCP, getattr(socket, "TCP_USER_TIMEOUT", None), int(_USER_TIMEOUT_S * 1000))
     return options
 
 
@@ -502,6 +534,19 @@ def _enable_tcp_keepalive(adapter, idle_s: int = 30, interval_s: int = 10, probe
         adapter.poolmanager.connection_pool_kw["socket_options"] = options
     except Exception as e:  # pragma: no cover - urllib3 internals moved
         logger.warning(f"could not set socket health options on the search session: {e}")
+        return
+    # Said out loud because silence used to mean either "installed" or "the
+    # logger was never configured", and the difference is 40 s of GPU idle.
+    import socket
+
+    bounds = []
+    if any(o == getattr(socket, "TCP_USER_TIMEOUT", None) for _l, o, _v in options):
+        bounds.append(f"wedged socket {_USER_TIMEOUT_S:.0f}s")
+    else:
+        bounds.append("wedged socket UNBOUNDED (no TCP_USER_TIMEOUT on this platform)")
+    if _CONNECT_TIMEOUT_S > 0:
+        bounds.append(f"connect {_CONNECT_TIMEOUT_S:.0f}s")
+    logger.info(f"search socket bounds: {', '.join(bounds)} ({len(options)} socket options installed)")
 
 
 def _passages2string(retrieval_result):

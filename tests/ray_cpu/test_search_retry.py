@@ -333,3 +333,36 @@ def test_an_adapter_without_the_kwarg_does_not_fail_the_run():
         poolmanager = None  # attribute access raises inside the helper
 
     mod._enable_tcp_keepalive(_Adapter())  # must not raise
+
+
+def test_urllib3s_own_defaults_survive():
+    """socket_options REPLACES urllib3's defaults; it does not extend them.
+
+    urllib3 ships TCP_NODELAY as its default, so building this list from scratch
+    turned Nagle back on for the one session that sends nothing but small JSON
+    POSTs. Against a peer that delays its ACKs that is tens of milliseconds on
+    every retrieval -- on the hottest path in the evaluation, and invisible.
+    """
+    import socket
+
+    options = mod._socket_health_options()
+    assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) in options, (
+        "TCP_NODELAY is urllib3's default and has to survive being added to"
+    )
+    for entry in mod._urllib3_default_socket_options():
+        assert entry in options, f"dropped one of urllib3's own defaults: {entry}"
+
+
+def test_an_option_is_not_installed_twice():
+    """The health options and urllib3's defaults may name the same option."""
+    seen = [(level, name) for level, name, _value in mod._socket_health_options()]
+    assert len(seen) == len(set(seen)), seen
+
+
+def test_urllib3_defaults_fall_back_to_tcp_nodelay(monkeypatch):
+    """A urllib3 that moved the attribute must not cost TCP_NODELAY silently."""
+    import socket
+    import urllib3.connection
+
+    monkeypatch.delattr(urllib3.connection.HTTPConnection, "default_socket_options", raising=False)
+    assert mod._urllib3_default_socket_options() == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
