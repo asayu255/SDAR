@@ -315,6 +315,56 @@ set -x
 #
 # It is NOT in the intent lock, for the same reason the profiler is not: pinning
 # it would make a measurement a precondition of the experiment.
+#
+# DID ANYTHING TRANSFER (algorithm.opd.sign_weight.{transfer_stats,pair_stats}).
+# The arm exists to test whether one task's teacher can reach the student on
+# another task's states, and until now nothing measured that: every number it
+# reported describes the TEACHERS' agreement structure or the SIZE of the
+# rewrite. Three families answer the three questions a write-up has to settle.
+#
+#   Is transfer happening?  transfer/off_travel/{dst}__vs__{src} is where the
+#     student sits between "has not moved" (0, its position at step 0 by
+#     construction -- the lock pins model.path == sign_weight.base_path) and
+#     "as far toward src as its own teacher already is" (1). Both anchors are
+#     exact whatever src is and however far it drifted, which matters because
+#     the teachers' KL coefficients differ 10x and their measured drift 3.7x.
+#     Read it against on_travel = 1 - teacher_kl_now/teacher_kl_step0: a student
+#     that simply has not converged passes "closer than its teacher" for free.
+#     Beside it, sign_weight/*/cf_cost is the rewrite measured at the STUDENT's
+#     own distribution rather than the teacher's, exactly
+#     KL(p_s||p~) - KL(p_s||p), with rewrite_progress = -1 at init and
+#     rewrite_fisher carrying none of the teachers' coefficients.
+#
+#   Common knowledge?  sign_weight/pair/lor/{src}__on__{dst} is the Haldane-
+#     corrected log odds ratio of the two teachers' signs. It is the headline
+#     rather than agree_rate because it divides out each teacher's own
+#     propensity to raise rather than lower, which agree_rate confounds with
+#     association -- and with drift differing 3.7x that confound is not
+#     hypothetical. Quote agree_mass only beside agree_pop_mass and agree_ess:
+#     64% of teacher mass sits on 4.2% of candidates, so a mass-weighted rate
+#     without its effective sample size cannot be told from step noise.
+#
+#   Specialist knowledge?  The whole specialist population is inside the
+#     on-task-silent state, 64% of teacher mass, never decomposed.
+#     sign_weight/blindspot/* is where src has an opinion and dst's own teacher
+#     does not -- knowledge the distillation target structurally cannot carry.
+#     ALWAYS read off_opinion_h1_frac beside it: at p_0 > exp(-deadzone) no
+#     model CAN raise a token past the deadzone, so silence there is arithmetic
+#     and not ignorance. sign_weight/gate/* splits what the unanimity rule
+#     throws away into silence and dissent, which is what says whether a gate
+#     redesign has a target.
+#
+# None of it changes a value. The accumulators read tensors the sign-weight pass
+# already computed -- the student, its own teacher, the base and the off-task
+# teachers are all resident on one support -- so there is no extra forward. Cost
+# is a few kB of counters, two small all-reduces and one host read per
+# update_actor, against a 146.7 s/step sign_weight_forward.
+#
+# NOT in the intent lock, for the reason the profiler is not: a diagnostic that
+# can be switched on mid-run must not become part of what the experiment IS.
+# The one exception is algorithm.opd.sign_weight.measure_only, which suppresses
+# the rewrite and therefore DOES change the loss -- an arm using it is a
+# different arm and needs its own lock, experiment_name and directories.
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
 # retry policy beside it: env.search.max_retries=null waits for a timeout /
@@ -651,6 +701,8 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.sign_weight.base_path=Qwen/Qwen3-1.7B \
     +algorithm.opd.sign_weight.token_stats.enable=True \
     +algorithm.opd.sign_weight.token_stats.top_n=64 \
+    +algorithm.opd.sign_weight.pair_stats.enable=True \
+    +algorithm.opd.sign_weight.transfer_stats.enable=True \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \
