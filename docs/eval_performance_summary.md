@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | **rollout session**(vLLM を turn ごとに寝起きさせない) | 13% の wall | ON |
 | **session の hoist**(batch ごとの wake/sleep も止める) | 10.4% の wall | ON |
-| **retriever のバッチ化**(1 turn 1 リクエスト) | envstep **10.60 → 1.00 s/batch** | ON |
+| **retriever のバッチ化**(1 turn 1 リクエスト) | envstep **10.60 → 1.00 s/batch** | ON —— ただし**サーバがリストを受けなければ黙って無効になる**(§2.1) |
 | **retriever のバージョンずれ検出 + 自動再試行** | envstep 10.8 → 1.0 s(事故復旧) | ON |
 | **`VAL_PIPELINE_DEPTH=2`** | s/batch **17.0 → 14.2** | ON |
 | **search の val batch 252 行** | ms/row **94.8 → 78.0** | OFF(§6) |
@@ -36,6 +36,38 @@
 | 採点時の無駄な detokenize 削除 | 数%(504 回 → 1 回/batch) | ON |
 | **ログ用テーブルの全行 decode 停止** | `log_val_generations=0` なのに全 52k 行の prompt+response を decode していた | ON |
 | **raw_prompt の二重 tokenize 停止** | 同一文字列を 2 回 encode(turn ごと 252 回)。最初の 8 呼び出しで新旧一致を自己検証し、不一致なら永久フォールバック | ON |
+
+
+### 2.1 バッチ化は、サーバ次第で黙って無効になる
+
+`retrieval_server.py` の `QueryRequest.query` は `Union[str, List[str]]` だが、
+**それが入る前の版が動いている URL に当たると 422 が返る。** クライアントは
+1 クエリずつに永久フォールバックし、300 秒ごとに再プローブしてまた断られる
+(`search.py:308-319`)。
+
+**何も失敗しない。** run は完走し、スコアも普通に見え、envstep だけが
+70 秒の batch のうち 4 秒ではなく **40 秒**になる。
+
+実際に起きた:
+
+| run | retriever | util | wall |
+| --- | --- | ---: | ---: |
+| `...-230457` | **:8000**(新しい) | **77.88%** | **1.20 h** |
+| `...-102303` | :8001(37 日前のプロセス) | 57.91% | 2.23 h |
+| `...-131419` | :8001 | 55.70% | 2.11 h |
+| `...-174359` | :8001 | 51.12% | — |
+
+**77.88% を出した唯一の run が、唯一 :8000 を使っていた run である。** この差は
+最初「幅 252 のおかげ」と読み、次に「checkpoint の違い」と読んだ。どちらでもなく
+**ポート**だった。`API Request Error: 422` はログに最初から出ていて、
+「件数が増えていないので一過性」と判断したのが誤り —— 件数ではなく、
+**その 422 が何を無効化しているか**が問題だった。
+
+run script が起動前に probe して**落ちる**ようにした(`SEARCH_PREFLIGHT=0` で無効化、
+URL は `SEARCH_URL` で差し替え)。**URL を変えるのではなく、そのポートの
+retriever を今の `retrieval_server.py` で立て直すのが本筋** —— 古い版が
+動いている限り、どのポートを指しても同じことが起きる。`ROLLOUT_ASYNC_REQUIRE` と同じ理屈で、黙って
+遅い経路に落ちるのを構造的に止める。
 
 ### 効いた理由が直感と違うもの
 
@@ -65,6 +97,10 @@
 ## 4. util が 100% にならない理由 —— 22% の分解
 
 起動後の util 77.8%、空き 22.2%。GPU が空くのは 2 通りしかない。
+
+**これは retriever のバッチ化が効いている前提の分解である**(§2.1)。効いて
+いない run では envstep だけで batch の 57% を占め、この表は当てはまらない。
+使う前に `[rollout-turn-timing]` の SHARE 行で確かめること。
 
 ```
 util = (誰かが generate に入っている割合) × genGPU%
@@ -260,7 +296,6 @@ ROLLOUT_MERGE_GENERATES=1 VAL_PIPELINE_DEPTH=3 \
 EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
 bash examples/sft_trainer/eval_checkpoints.sh \
   -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
-     env.search.search_url='http://<retriever>:8000/retrieve'
 ```
 
 `ROLLOUT_KEEP_VLLM_AWAKE`、`SKIP_ROLLOUT_BUILD=0`、`GPU_PROFILER`、
@@ -375,7 +410,6 @@ ROLLOUT_ASYNC_GENERATE=1 VAL_PIPELINE_DEPTH=3 ROLLOUT_PUMP_REPORT_EVERY=200 \
 EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
 bash examples/sft_trainer/eval_checkpoints.sh \
   -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
-     env.search.search_url='http://<retriever>:8000/retrieve'
 ```
 
 起動直後に出るべき 2 行:

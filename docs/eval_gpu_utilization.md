@@ -1353,3 +1353,93 @@ seed に行番号を混ぜて直した。**「速くする変更」ではなく�
 ——「効かなかった」と「走らなかった」を取り違える —— を構造的に塞ぐ。
 `ROLLOUT_ASYNC_GENERATE` を忘れた REQUIRE 単独は import 時に落とす(それ自体が
 同じ穴になるので)。pool を一度も使わずに終わった run は、終了時にそう言う。
+
+---
+
+## 23. 原因は 37 日前から動いていた retriever だった
+
+### 分解を取ったら、私の仮説が 3 つとも外れていた
+
+`[rollout-turn-timing]` の TOTAL を初めて読んだ(rows=252、1 batch ≈ 70 秒):
+
+| | 秒 | 割合 |
+| --- | ---: | ---: |
+| **envstep** | **~40** | **~57%** |
+| gen(GPU busy) | ~27 | ~39% |
+| preproc | ~2.0 | 2.9% |
+| decode | ~0.15 | 0.2% |
+
+```
+SHARE  gen(GPU-busy)=30〜42%   cpu-glue=58〜70%
+```
+
+**preproc は 2.0 秒**である。§22 で「(a) の 58% が preproc だから preproc を
+バッチ化する」と書いたが、それは §4 —— つまり **retriever が効いている run** の
+分解であって、この run には当てはまらない。的は 3% しかなかった。
+
+空きはほぼ全部 **envstep** だった。
+
+### 原因はログに最初から書いてあった
+
+```
+batched search of 37 queries failed (... 422 Unprocessable Entity ...); retrying singly
+http://100.86.45.30:8001/retrieve rejected a batched request but served the queries
+  individually; batching disabled for it.
+Connection pool is full, discarding connection: 100.86.45.30. Connection pool size: 512
+```
+
+`curl` で確定した:
+
+```
+{"query": ["a","b"]}   -> 422  {"type":"string_type","loc":["body","query"]}
+{"queries": ["a","b"]} -> 422  {"type":"missing","loc":["body","query"]}
+```
+
+サーバのモデルが `query: str` 固定。**複数形も受けないので、クライアント側で
+方言を合わせて回避する道も無い。**
+
+`ps` を見ると答えが同じホストに立っていた:
+
+| pid | port | 経過 |
+| --- | --- | --- |
+| 3080012 | **8001**(run が使っていた) | **37 日 17 時間** |
+| 364474 | 8000 | 1 日 20 時間 |
+
+`examples/search/retriever/retrieval_server.py:350` は
+`query: Union[str, List[str]]` を持っている。8001 はそれが入る前のコピーだった。
+
+### そして 77.88% の run だけが 8000 を使っていた
+
+wandb の config を引いた:
+
+| run | search_url | util | wall |
+| --- | --- | ---: | ---: |
+| `...-230457` | **:8000** | **77.88%** | **1.20 h** |
+| `...-102303` | :8001 | 57.91% | 2.23 h |
+| `...-131419` | :8001 | 55.70% | 2.11 h |
+| `...-174359` | :8001 | 51.12% | — |
+
+**一発で説明がつく。** §21 で「幅 252 のおかげ」と書き、次に「checkpoint の
+違い」と書いた 22 ポイントの差は、**ポート**だった。
+
+### 何を間違えたか
+
+`API Request Error: 422` は**最初に貼られたログから出ていた**。私は
+`grep -c` して「56 件、増えていないので一過性、続行」と判断した。
+**件数だけを見て、その 422 が何を無効化しているかを読まなかった。**
+
+その誤りの上に、async(§20)を作り、per-task advance(§7.6)を作り、
+preproc のバッチ化を提案した。**どれも分解を取る前の推測に基づいていた。**
+§21 で「順序は分解を読む → 一番大きい項を狙う」と書いた直後に、
+その分解を取らずに 2 本実装している。
+
+### 直した
+
+* run script が `SEARCH_URL`(既定 `:8000`)を使うようにした
+* **起動前に 2 クエリのリストを POST して、422 なら落とす**
+  (`SEARCH_PREFLIGHT=0` で無効化)。`ROLLOUT_ASYNC_REQUIRE` と同じ理屈で、
+  黙って 10 倍遅い経路に落ちるのを構造的に止める。3 分岐とも偽サーバで検証済み
+
+見込みは envstep 40 → 約 4 秒、batch 70 → 約 34 秒、util 51 → 77% 前後。
+そこまで戻して初めて §4 の分解が当てはまる状態になり、async と
+per-task advance を測る意味が出る。

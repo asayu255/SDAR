@@ -515,6 +515,46 @@ if [ "${SKIP_ROLLOUT_BUILD}" != "0" ]; then
   export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 fi
 export OFFPOLICY_BATCH_PREFETCH=${OFFPOLICY_BATCH_PREFETCH:-1}
+
+# THE RETRIEVER HAS TO ACCEPT A LIST OF QUERIES, and this checks before the run
+# starts rather than letting it find out for itself.
+#
+# The index is Flat: a search reads the whole 32 GB of embeddings however many
+# queries it is given, so 126 separate requests read it 126 times and one request
+# with 126 queries reads it once. Measured, that is envstep 10.60 -> 1.00 s/batch
+# (docs/eval_performance_summary.md section 2), and the retriever in this repo
+# takes the list (examples/search/retriever/retrieval_server.py: query is
+# Union[str, List[str]]).
+#
+# A server WITHOUT that -- an older copy still running from a previous month --
+# answers the list with 422, and the client then falls back to one query at a
+# time, permanently, re-probing every 300 s and being refused again. Nothing
+# fails: the run completes, the scores look ordinary, and envstep quietly costs
+# 40 s of a 70 s batch instead of 4. That happened on port 8001 for 37 days, and
+# it read as "async did not help" and then as "the width did not help" before
+# anyone looked at the 422s. So: probe it here, and refuse to start.
+: "${SEARCH_URL:=http://100.86.45.30:8001/retrieve}"
+export SEARCH_URL
+if [ "${SEARCH_PREFLIGHT:-1}" != "0" ]; then
+  # curl writes 000 itself when it cannot connect, so the fallback assigns rather
+  # than appends -- `|| echo 000` would concatenate onto that and match nothing.
+  _probe=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$SEARCH_URL" \
+             -H 'Content-Type: application/json' \
+             -d '{"query": ["preflight one", "preflight two"], "topk": 1, "return_scores": true}' 2>/dev/null) \
+    || _probe=000
+  case "${_probe:-000}" in
+    200) ;;
+    000) echo "[search] WARNING: $SEARCH_URL did not answer the preflight probe." >&2
+         echo "         Starting anyway -- curl may be missing, or the retriever may still be loading." >&2 ;;
+    *)   echo "[search] $SEARCH_URL rejected a BATCHED request (HTTP $_probe)." >&2
+         echo "         That retriever only takes one query per request, which costs about 10x on" >&2
+         echo "         env.step and will make every timing number from this run meaningless." >&2
+         echo "         Restart it from examples/search/retriever/retrieval_server.py (its QueryRequest" >&2
+         echo "         takes Union[str, List[str]]), or point SEARCH_URL at one that already does." >&2
+         echo "         SEARCH_PREFLIGHT=0 runs anyway." >&2
+         exit 1 ;;
+  esac
+fi
 export OFFPOLICY_ACTOR_PIPELINE=${OFFPOLICY_ACTOR_PIPELINE:-1}
 
 # verl pins CUDA_DEVICE_MAX_CONNECTIONS=1 for every Ray worker
@@ -614,7 +654,7 @@ python3 -m verl.trainer.main_sft_multitask \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
-    env.search.search_url='http://100.86.45.30:8001/retrieve' \
+    env.search.search_url="$SEARCH_URL" \
     env.search.timeout=600 \
     env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
