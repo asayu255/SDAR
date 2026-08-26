@@ -51,9 +51,11 @@ class _Session:
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
         self.calls = 0
+        self.timeouts = []
 
     def post(self, *args, **kwargs):
         self.calls += 1
+        self.timeouts.append(kwargs.get("timeout"))
         outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
         if isinstance(outcome, Exception):
             raise outcome
@@ -161,8 +163,15 @@ def test_backoff_is_capped(_no_sleeping):
     assert backoff[-1] == mod.MAX_RETRY_DELAY     # and saturates
 
 
-def test_timeout_is_passed_through_including_none():
-    """timeout=None is what makes requests wait indefinitely; it must reach post()."""
+def test_the_read_budget_is_passed_through_including_none():
+    """timeout=None is what makes requests wait indefinitely; it must reach post().
+
+    It reaches it as the READ half of a (connect, read) pair now -- connect is
+    bounded separately, because a dead route stalls there and waiting it out
+    buys nothing (see test_connect_is_bounded_even_when_read_is_generous). The
+    property this test was written for is unchanged: whatever the caller asked
+    to wait for a retriever's ANSWER is what requests is told.
+    """
     seen = []
 
     class _Recording(_Session):
@@ -172,7 +181,7 @@ def test_timeout_is_passed_through_including_none():
 
     _call(_Recording([_Response()]), timeout=None)
     _call(_Recording([_Response()]), timeout=600)
-    assert seen == [None, 600]
+    assert [read for _connect, read in seen] == [None, 600]
 
 
 def test_default_budget_is_unchanged():
@@ -181,3 +190,45 @@ def test_default_budget_is_unchanged():
     response, error = _call(session)
     assert response is None and error is not None
     assert session.calls == mod.MAX_RETRIES
+
+
+# --------------------------------------------------------------------------- #
+# connect is bounded separately from read
+# --------------------------------------------------------------------------- #
+def test_connect_is_bounded_even_when_read_is_generous():
+    """A scalar timeout applies to BOTH phases, which is how a dead route stalls.
+
+    [Errno 113] No route to host hangs in connect() while the kernel retries
+    ARP. With timeout=600 that wait is 600s wide, and measured it ran about 40 --
+    "search recovered after 2 attempts (41s)" for one backoff of 1s. Those 40
+    seconds are not one row's: the coalescing window's followers wait on the
+    leader unbounded, so the whole window stops, and with three pipeline slots
+    on one retriever the whole node stops.
+    """
+    session = _Session([_Response(payload={"result": ["doc"]})])
+    _call(session, timeout=600)
+
+    connect, read = session.timeouts[0]
+    assert connect == mod._CONNECT_TIMEOUT_S
+    assert read == 600, "the read budget must survive; a 250-query batch takes seconds"
+
+
+def test_a_read_budget_shorter_than_the_connect_bound_wins():
+    session = _Session([_Response(payload={"result": ["doc"]})])
+    _call(session, timeout=1)
+    assert session.timeouts[0] == (1, 1)
+
+
+def test_no_read_timeout_still_bounds_the_connect():
+    """timeout=None means "wait for the retriever", not "wait for a dead route"."""
+    session = _Session([_Response(payload={"result": ["doc"]})])
+    _call(session, timeout=None)
+    connect, read = session.timeouts[0]
+    assert connect == mod._CONNECT_TIMEOUT_S and read is None
+
+
+def test_the_connect_bound_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(mod, "_CONNECT_TIMEOUT_S", 0)
+    session = _Session([_Response(payload={"result": ["doc"]})])
+    _call(session, timeout=600)
+    assert session.timeouts[0] == 600, "0 restores the single scalar requests used to get"

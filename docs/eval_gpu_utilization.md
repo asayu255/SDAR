@@ -1555,3 +1555,70 @@ system stream で、そこでは「機械が一瞬死ぬ」ように見えるだ
 
 prefetch を消費できたのかどうかも言う。**打ち手を決めるのはこの数字を見てから。**
 この session で 4 回、分解を取る前に実装して外している。
+
+---
+
+## 26. 止まっていたのは retriever ではなく、そこへの経路だった
+
+§25 で `[env-reset]` を足したが、**空振りだった。** 答えは turn table にあり、
+計器を足す前に読めば済んだ。5 回目の外れである。
+
+### wandb の全系列で dip を挟む
+
+| | dip(util<10) | busy(util≥85) |
+| --- | ---: | ---: |
+| GPU util | 0.0% | 90.3% |
+| **GPU メモリコントローラ** | **0.0%** | 81.3% |
+| GPU smClock | **1800**(ブースト) | 1740 |
+| GPU memAlloc | 59.2% | 59.2% |
+| host CPU | 0.3% | 0.3% |
+| host スレッド / RSS | 868 / 4851 MB | 868 / 4824 MB |
+| disk read | 0 | 0 |
+| network | 1.14 MB/s | 1.12 MB/s |
+
+CPU も disk も network も busy と変わらない。**ノード全体が待っている。**
+
+### span が 3 連続で膨らむ
+
+```
+batch#49, 50, 51     93.1 /  93.9 / 100.3 s
+batch#73, 74, 75     86.7 / 105.7 / 110.2 s
+batch#101,102,103    77.8 /  78.8 /  83.6 s
+```
+
+3 連続 = 3 slot が同時。共有されているものが原因である。
+
+### turn table が名指した
+
+```
+batch#74  turn 2:  gen 13.89   envstep 68.55     (他のターンは 0.08〜0.31)
+batch#50  turn 0:  gen  1.76   envstep 46.01     (他のターンは 0.09〜0.31)
+```
+
+そしてログ:
+
+```
+Connection Error: [Errno 113] No route to host
+Connection Error: ('Connection aborted.', ConnectionResetError(104, ...))
+search recovered after 2 attempts (41s)   after 4 attempts (33s)   after 2 attempts (40s)
+```
+
+**41/33/40 秒 = dip の長さ。** バックオフ 1 秒で 2 試行なら、40 秒は connect の中。
+`100.86.x.x` は CGNAT レンジなので、トンネル(Tailscale/WireGuard)の瞬断に見える。
+
+`Connection pool is full` は **0 件** —— §24 の窓修正で枯渇は解消済み。別の失敗である。
+
+### 1 行の 40 秒ではない
+
+合流窓の follower は leader を**無制限に**待つ(`_Coalescer.call` の意図的な設計)。
+詰まった connect 1 本が窓の全行を止め、3 slot が同じ retriever を叩くので 3 つとも
+止まる。だから「ノード全体が 40 秒死ぬ」ように見える。
+
+### 直したもの
+
+`timeout=600` はスカラーで、requests はスカラーを connect と read の両方に使う。
+**connect だけを 5 秒で切る**(`SEARCH_CONNECT_TIMEOUT_S`、0 で従来どおり)。
+read はそのまま。
+
+**根治ではない。** 落ちているのは `wasabi`→`wakaba` の経路で、5 秒の上限は
+40 秒の停止を 6 秒に縮めるだけである。

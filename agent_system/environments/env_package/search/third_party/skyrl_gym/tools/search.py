@@ -62,6 +62,38 @@ _BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "100")) / 1000.
 # for hours. Re-probing costs one rejected request per period -- the queries are
 # sent singly either way. 0 makes the disable permanent.
 _BATCH_RETRY_S = float(os.environ.get("SEARCH_BATCH_RETRY_S", "300"))
+# CONNECT is bounded separately from READ, because they fail for different
+# reasons and only one of them is worth waiting out.
+#
+# `timeout=600` is a scalar, and requests applies a scalar to both phases. So a
+# route that has gone away -- [Errno 113] No route to host, which is what a
+# WireGuard/Tailscale hiccup looks like from here -- hangs in connect() while
+# the kernel retries ARP, and the caller sits there. Measured in one 45-minute
+# evaluation: "search recovered after 2 attempts (41s)", "(33s)", "(40s)" --
+# one attempt, one backoff, and about forty seconds inside a single connect.
+#
+# Those forty seconds are not one row's. The coalescing window's followers wait
+# on the leader with no bound (deliberately -- see _Coalescer.call), so one
+# stalled connect holds every row in the window, and with three pipeline slots
+# on one retriever it holds all three. In the system stream it looks like the
+# whole node died: GPU 0%, its memory controller 0%, host CPU flat, no disk, no
+# extra network. That accounted for most of what was left of the GPU deficit.
+#
+# A healthy retriever accepts in well under a second on a LAN or a tailnet, so
+# 5 s is generous for connect and turns a dropped route into one fast retry
+# instead of a forty-second stall. READ stays as configured: a batch of 250
+# queries legitimately takes seconds, and giving up on it would put an error
+# string into the trajectory where a document belongs.
+_CONNECT_TIMEOUT_S = float(os.environ.get("SEARCH_CONNECT_TIMEOUT_S", "5"))
+
+
+def _split_timeout(timeout):
+    """(connect, read) for requests, bounding connect however read is set."""
+    if _CONNECT_TIMEOUT_S <= 0:
+        return timeout
+    if timeout is None:
+        return (_CONNECT_TIMEOUT_S, None)
+    return (min(_CONNECT_TIMEOUT_S, timeout), timeout)
 
 
 def _search_api_request(
@@ -160,7 +192,7 @@ def _search_api_request(
                 retrieval_service_url,
                 headers=headers,
                 json=payload,
-                timeout=timeout,
+                timeout=_split_timeout(timeout),
             )
 
             # Check for Gateway Timeout (504) and other server errors for retrying

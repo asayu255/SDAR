@@ -96,6 +96,55 @@ GPU エンコーダを取り合って、**同じ 3 クエリの encode が 42 ms
 「有効だが足りていなかった」。前者はログに 422 として出るが、**後者は何も言わない**
 —— retriever のログに `8 queries` と出ているのを読むまで、バッチ化は効いていた。
 
+
+### 2.3 経路が落ちると、1 本の connect が窓ごと止める
+
+§2.2 のあと、定常状態は util 90% に乗った。それでも平均が 76.7% だったのは、
+**30〜45 秒ノード全体が止まる窓**が 45 分に 3〜4 回あるからである。
+
+wandb の全系列を dip と busy で比べると、止まっているのは GPU だけではない:
+
+| | dip(util<10) | busy(util≥85) |
+| --- | ---: | ---: |
+| GPU util | 0.0% | 90.3% |
+| **GPU メモリコントローラ** | **0.0%** | 81.3% |
+| GPU smClock | **1800**(ブースト) | 1740 |
+| host CPU | 0.3% | 0.3% |
+| disk read | 0 | 0 |
+| network | 1.14 MB/s | 1.12 MB/s |
+
+**CPU も disk も network も動かない。** 小さいリクエストを投げて待っている形しか
+残らない。turn table がそれを名指した:
+
+```
+batch#74  turn 2:  gen 13.89   envstep 68.55     (他のターンは 0.08〜0.31)
+batch#50  turn 0:  gen  1.76   envstep 46.01     (他のターンは 0.09〜0.31)
+```
+
+そしてログに:
+
+```
+[Errno 113] No route to host / Connection reset by peer / RemoteDisconnected
+search recovered after 2 attempts (41s)   (33s)   (40s)
+```
+
+**41/33/40 秒は dip の長さそのもの。** 2 回の試行でバックオフが 1 秒なら、
+**約 40 秒が 1 回の connect の中**にある —— 経路が消えたときカーネルが ARP を
+再送し続ける時間である。`100.86.x.x` は CGNAT レンジで、トンネルの瞬断に見える。
+
+**それは 1 行ぶんの 40 秒ではない。** 合流窓の follower は leader を無制限に待つ
+(意図的。`_Coalescer.call`)ので、詰まった connect 1 本が窓の全行を止め、
+3 slot が同じ retriever を叩いているので 3 つとも止まる。
+
+`timeout=600` はスカラーで、requests はスカラーを connect と read の両方に使う。
+**connect だけを 5 秒で切るようにした**(`SEARCH_CONNECT_TIMEOUT_S`)。read は
+そのまま —— 250 クエリのバッチは正当に数秒かかるし、そこを諦めると
+`<information>` にエラー文字列が入る。
+
+**根治はコードではない。** 落ちているのは経路で、5 秒の connect 上限は
+40 秒の停止を 6 秒に縮めるだけである。`wasabi` と `wakaba` の間の
+リンクを直すのが本筋。
+
 ### 効いた理由が直感と違うもの
 
 * **depth 3 単独は効果ゼロ**(75 ms/row、depth 2 と同じ)。slot を足しても
@@ -309,6 +358,7 @@ ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だ�
 ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限。既定でよい)
 ROLLOUT_PER_TASK_ADVANCE=1 task ごとに turn を進める(既定 OFF、§7.6)
 ENV_RESET_REPORT_S=2      これ以上かかった env reset を報告(0 で全部)
+SEARCH_CONNECT_TIMEOUT_S=5  connect だけを別に切る(0 で従来のスカラー、§2.3)
 ROLLOUT_ASYNC_REQUIRE=1    pool に載らない呼び出しを fallback させず落とす(測定時は必須)
 ROLLOUT_PUMP_REQUEST_TIMEOUT_S=900  どの rank も finished/failed に載せなかった request を諦める
 ROLLOUT_PUMP_RESULT_TIMEOUT_S=1800  driver 側の保険。0 で無効
