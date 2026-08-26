@@ -122,6 +122,31 @@ def test_ranks_disagreeing_on_the_pad_token_is_refused_not_averaged():
         client.handshake()
 
 
+def test_a_model_with_several_end_tokens_handshakes():
+    """Qwen3 reports generation_config.eos_token_id as [151645, 151643].
+
+    get_response_mask takes an int or a list, so a list is a perfectly good answer
+    here; it only has to survive the agreement check, which must not hash it.
+    """
+    eos = [151645, 151643]
+    handshake = [
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": eos}
+    ] * WORLD
+    client = _client(FakeWorkerGroup(handshake=handshake))
+    assert client.handshake()["eos_token_id"] == eos
+
+
+def test_ranks_disagreeing_on_a_list_eos_is_still_caught():
+    handshake = [
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": [1, 2]},
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": [1, 2]},
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": [1]},
+    ]
+    client = _client(FakeWorkerGroup(handshake=handshake))
+    with pytest.raises(PumpUnavailable, match="disagree on eos_token_id.*rank 2"):
+        client.handshake()
+
+
 def test_each_future_gets_its_own_answer():
     wg = FakeWorkerGroup()
     client = _client(wg).start()

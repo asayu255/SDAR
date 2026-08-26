@@ -113,9 +113,16 @@ class PumpClient:
                 )
         first = dict(replies[0])
         for key in ("pad_token_id", "response_length", "eos_token_id"):
-            values = {reply.get(key) for reply in replies}
-            if len(values) != 1:
-                raise PumpUnavailable(f"ranks disagree on {key}: {sorted(map(str, values))}")
+            # Compared by equality rather than through a set, because a model with
+            # several end tokens reports eos_token_id as a list (Qwen3 gives
+            # [151645, 151643]) and a list cannot go into a set.
+            expected = first.get(key)
+            for rank, reply in enumerate(replies[1:], start=1):
+                if reply.get(key) != expected:
+                    raise PumpUnavailable(
+                        f"ranks disagree on {key}: rank 0 says {expected!r}, "
+                        f"rank {rank} says {reply.get(key)!r}"
+                    )
         self.handshake_info = {
             "pad_token_id": first["pad_token_id"],
             "response_length": first["response_length"],
