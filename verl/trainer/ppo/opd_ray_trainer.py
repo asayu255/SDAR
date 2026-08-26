@@ -725,9 +725,9 @@ class OPDRayTrainer(RayPPOTrainer):
 
     # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
-    # No old_log_prob / ref / values / advantage / reward-in-loss.
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
+    # No old_log_prob / ref / values / advantage / reward-in-loss -- those are
+    # what the two hooks below restore for the OPD+GRPO subclass.
+    #
     # Hooks the OPD+GRPO arm overrides. They exist so the two arms share one
     # fit(): everything the loop does around them -- the hidden-state cache,
     # the sign-weight pass, env-reset prefetch, stop_after_steps -- is the part
@@ -942,7 +942,8 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch, metrics, timing_raw
                     )
 
-                    # ---- Per-task teacher forward pass (the only training signal) ----
+                    # ---- Per-task teacher forward pass (the distillation signal;
+                    # on pure OPD the ONLY training signal, on OPD+GRPO one of two) ----
                     with _timer("teacher_forward", timing_raw):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
                         self.compute_teacher_log_probs(
