@@ -1943,3 +1943,109 @@ socket 上限が消すのは p の病的な裾で、depth が消すのは p の�
 | **decode duty cycle の天井** | **約 88〜90%** |
 
 **100% は 1.7B では出ない。** 出せるのはここまでである。
+
+---
+
+## 30. 「88〜90% が天井」は間違い —— 空きは3層で、層ごとに相手が違う
+
+§29 で「1.7B の decode duty cycle だから 88〜90% が天井」と書いた。
+**天井ではない。** duty cycle は物理ではなく、**engine のホスト処理が
+kernel と kernel の間に露出している**というだけで、隠す機構は存在する。
+
+空きは3層あり、**層ごとに効く打ち手が違う**。混ぜていたのが間違いだった。
+
+| 層 | 実測(depth 2) | 何が起きているか | 消すもの |
+| --- | ---: | --- | --- |
+| **EMPTY** 0 枚 | 7.4〜9.3% | 全 slot が env.step | **depth**(p^depth) |
+| **PARTIAL** 1〜2 枚 | 6.7〜8.4% | rank が自分の chunk を終えて、**collective 呼び出しの中で最遅 rank を待っている** | **pump のみ** |
+| **DUTY** 3 枚で 87〜90% | 約 10 pt | engine の 1 step ごとのホスト処理 | **engine 側の overlap** |
+
+### PARTIAL は depth では消えない —— これが重要な訂正
+
+`generate_sequences` は **worker group の collective 呼び出し**で、
+`Dispatch.DP_COMPUTE` が行を 3 rank に分ける。各 rank の `vllm.generate` は
+**自分の chunk が全部終わってから**返り、呼び出し自体は**最遅 rank を待つ**。
+その間、先に終わった rank は空である。
+
+**worker group は一度に 1 呼び出ししか走らせない。** だから slot B の generate は
+slot A の generate が返るまで始まらない —— **depth を上げても、空いた rank に
+次の仕事を渡せない。**
+
+per-GPU 平均は 80.2 / 78.6 / 78.2(spread 2 pt)で、**特定の rank が遅いのではない。**
+毎回ちがう rank が順番に待っている。collective の構造そのものである。
+
+**これを消せるのは pump だけである。** engine をプールとして回し、request を
+個別に投げるので、chunk を終えた rank が次の slot の request をすぐ受け取れる。
+
+> **§21 で async の的を「0.4%」と見積もったのは撤回する。**
+> あの数字は `[val-pipeline]` の `NOTHING running` から出したもので、
+> あの計器は env.step で止まった slot を「実行中」と数える。
+> **device に聞けば PARTIAL だけで 6.7〜8.4% ある。**
+> async は「割に合わない」のではなく、**割に合うかどうかを測れていなかった。**
+
+### 計器に両方を出させる
+
+`[gpu-residency]` は EMPTY と PARTIAL を**分けて**印字する。処方が違うからである。
+
+```
+[gpu-residency] 3612s sampled: 3gpu 85.9%, 2gpu 3.2%, 1gpu 3.5%, 0gpu 7.4%
+                | per-gpu 80 79 78 (spread 2 pt)
+[gpu-residency] EMPTY 7.4% (more batches in flight fill this),
+                PARTIAL 6.7% (a rank idle inside a collective call -- only the
+                pump fills this), rest is the engine's own duty cycle
+```
+
+per-GPU の spread が大きければ**特定 rank の遅れ**、小さければ**collective の構造**。
+prescription が変わるので、同じ行に出す。
+
+### DUTY 層 —— vLLM 側で隠せるものが残っている
+
+1 step の内訳は概ね: schedule(Python)→ input 構築 → **GPU 実行** →
+output 処理(sampling / stop 判定 / 追記)。GPU 実行が約 4.5 ms、
+残りが約 0.5〜0.8 ms 露出して 87〜90% になる。
+
+**すでに取ってあるもの:**
+
+| | 状態 |
+| --- | --- |
+| `enforce_eager=False`(CUDA graph) | **ON** |
+| `detokenize=False` | **ON**(step ごとの逐次 detokenize を止めてある) |
+| `logprobs=None` | **ON**(`return_rollout_log_probs=False`) |
+
+**まだ見ていないもの:** vLLM の **scheduler と GPU 実行の overlap**
+(V1 の `async_scheduling`)、および `enable_chunked_prefill=False` の是非。
+`vllm_rollout_spmd.py` の `engine_kwargs.vllm` は**任意の engine 引数を通す
+素通しの口**なので、コード変更なしに渡せる。存在しない引数は `LLM()` が
+`TypeError` で落とすので、黙って無視されることはない。
+
+**入っている vLLM が何を持っているかを先に見ること:**
+
+```bash
+python - <<'PY'
+import inspect, vllm
+from vllm import LLM
+print("vllm", vllm.__version__)
+sig = set(inspect.signature(LLM.__init__).parameters)
+from vllm.config import SchedulerConfig
+sched = set(getattr(SchedulerConfig, "__dataclass_fields__", {}))
+for name in ("async_scheduling", "num_scheduler_steps", "disable_async_output_proc",
+             "enable_chunked_prefill", "max_num_seqs"):
+    where = "LLM()" if name in sig else ("SchedulerConfig" if name in sched else "ABSENT")
+    print(f"  {name:28s} {where}")
+PY
+```
+
+**推測で渡さない。** バージョンで消えた引数(V0 の `num_scheduler_steps` は
+V1 で削除)を渡すと落ちるだけで、時間を失う。
+
+### 到達可能な数字を並べ直す
+
+| | 全カード空 | 部分空 | duty | node util |
+| --- | ---: | ---: | ---: | ---: |
+| いま(depth 2) | 7〜9% | 7〜8% | 10 pt | **78〜81%** |
+| depth 3 | 2〜3% | 7〜8% | 10 pt | 約 86% |
+| depth 3 + pump | 2〜3% | ~0% | 10 pt | 約 90% |
+| + engine overlap | 2〜3% | ~0% | ? | **測ってから言う** |
+
+**「88〜90% が天井」は取り消す。** depth と pump で 90% 前後までは構造で取れる。
+その先は engine の中の話で、**まだ測っていない。**

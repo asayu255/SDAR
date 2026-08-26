@@ -552,6 +552,15 @@ class _Sampler:
             wall_by_count[busy] += dt
             previous = ts
         total = sum(counts.values())
+        # Per-GPU means over the same window. Whether the partly-busy time is one
+        # rank always waiting or all three taking turns decides the prescription:
+        # a lopsided column is a rank finishing its chunk of a collective call
+        # early and idling until the slowest one returns, which more batches in
+        # flight cannot fix because the worker group runs one call at a time.
+        per_gpu = []
+        for gi in range(n_gpus):
+            col = [vals[gi] for _ts, vals in window if gi < len(vals) and vals[gi] is not None]
+            per_gpu.append((sum(col) / len(col)) if col else None)
         return {
             "n_gpus": n_gpus,
             "samples": total,
@@ -559,6 +568,7 @@ class _Sampler:
             "counts": counts,
             "wall_by_count": wall_by_count,
             "pct": {k: 100.0 * v / total for k, v in counts.items()},
+            "per_gpu": per_gpu,
         }
 
     def per_gpu_util_between(self, t0, t1):
@@ -716,9 +726,18 @@ def format_residency(res) -> str:
     for k in range(n, -1, -1):
         parts.append(f"{k}gpu {res['pct'][k]:.1f}% ({res['wall_by_count'][k]:.0f}s)")
     empty = res["pct"][0]
+    partial = sum(res["pct"][k] for k in range(1, n))
+    per_gpu = res.get("per_gpu") or []
+    spread = ""
+    known = [v for v in per_gpu if v is not None]
+    if len(known) > 1:
+        cols = " ".join("--" if v is None else f"{v:.0f}" for v in per_gpu)
+        spread = f" | per-gpu {cols} (spread {max(known) - min(known):.0f} pt)"
     return (
-        f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) +
-        f" | EMPTY {empty:.1f}% -- this is what more batches in flight can recover"
+        f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
+        f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
+        f"PARTIAL {partial:.1f}% (a rank idle inside a collective call -- only the "
+        f"pump fills this), rest is the engine's own duty cycle"
     )
 
 

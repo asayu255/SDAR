@@ -176,3 +176,42 @@ def test_the_pipeline_says_nothing_extra_when_profiling_is_off(capsys, monkeypat
     out = capsys.readouterr().out
     assert "[val-pipeline]" in out
     assert "[gpu-residency]" not in out, "an unmeasured residency must not print a made-up one"
+
+
+# --------------------------------------------------------------------------- #
+# partial != empty, and the line has to say which
+# --------------------------------------------------------------------------- #
+def test_the_line_separates_empty_from_partial():
+    """They need different fixes, so one number for both prescribes the wrong one.
+
+    EMPTY is every slot outside the GPU: another batch in flight fills it, and
+    the empty share falls as p^depth. PARTIAL is a rank that finished its chunk
+    of a collective generate and is waiting for the slowest rank -- depth cannot
+    fill that, because the worker group runs one call at a time.
+    """
+    sampler = _FakeSampler(_trace([[0, 0, 0]] * 2 + [[90, 0, 0]] * 2 + [[90, 90, 90]] * 16))
+    line = gp.format_residency(sampler.residency_between(0, 1e9))
+    assert "EMPTY 10.0%" in line, line
+    assert "PARTIAL 10.0%" in line, line
+
+
+def test_the_line_reports_the_per_gpu_spread():
+    """A lopsided column is a rank idling, not the engine's duty cycle."""
+    sampler = _FakeSampler(_trace([[90, 30, 30]] * 10))
+    res = sampler.residency_between(0, 1e9)
+    assert res["per_gpu"] == pytest.approx([90.0, 30.0, 30.0])
+    line = gp.format_residency(res)
+    assert "per-gpu 90 30 30" in line, line
+    assert "spread 60 pt" in line, line
+
+
+def test_an_unreadable_card_does_not_fake_a_spread():
+    sampler = _FakeSampler(_trace([[90, None, 90]] * 4))
+    res = sampler.residency_between(0, 1e9)
+    assert res["per_gpu"][1] is None
+    assert "spread 0 pt" in gp.format_residency(res)
+
+
+def test_a_single_gpu_box_prints_no_spread():
+    sampler = _FakeSampler(_trace([[90]] * 4))
+    assert "per-gpu" not in gp.format_residency(sampler.residency_between(0, 1e9))
