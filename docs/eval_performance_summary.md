@@ -286,6 +286,7 @@ chunked prefill と合流、depth 3 と合流。前者は合算がゼロだっ�
 | `[rollout-merge]` | `generate_merge.py` | 合流率と相乗り行数 | — |
 | `[rollout-pump]` | `pump_client.py` | 投入・完了・round 数・rank ごとの in-flight | engine の内側 |
 | `[rollout-advance]` | `rollout_loop.py` | turn が lock-step か task ごとか | どちらが速いか |
+| `[env-reset]` | 同 | **reset の秒数**と、prefetch が効いたか | reset の中の内訳 |
 | turn table `slot=<slot>/<task>` | 同(§7.6 が ON のとき) | **task ごとの内訳** | task をまたぐ相互作用 |
 | `[val-pipeline]` 被覆 | `val_pipeline.py` | **どの slot も走っていない**時間、呼び出しスレッドの内訳 | slot が走っていて GPU が空いている状態 |
 | wandb system stream | wandb | **機械の util(唯一の真値)** | 15 秒点サンプル。原因は言わない |
@@ -307,6 +308,7 @@ ROLLOUT_PUMP_ROUND_S=0.02   1 round の待ち。長いほど RPC は減り、完
 ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だけ)
 ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限。既定でよい)
 ROLLOUT_PER_TASK_ADVANCE=1 task ごとに turn を進める(既定 OFF、§7.6)
+ENV_RESET_REPORT_S=2      これ以上かかった env reset を報告(0 で全部)
 ROLLOUT_ASYNC_REQUIRE=1    pool に載らない呼び出しを fallback させず落とす(測定時は必須)
 ROLLOUT_PUMP_REQUEST_TIMEOUT_S=900  どの rank も finished/failed に載せなかった request を諦める
 ROLLOUT_PUMP_RESULT_TIMEOUT_S=1800  driver 側の保険。0 で無効

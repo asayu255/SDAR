@@ -504,6 +504,10 @@ def _generate_sequences(actor_rollout_wg, batch_input_padded):
     )
 
 
+# Report an env reset that took at least this long. Small enough to catch the
+# ones worth knowing about, large enough that a search reset does not print
+# 200 lines a run. 0 reports every reset.
+_ENV_RESET_REPORT_S = float(os.environ.get("ENV_RESET_REPORT_S", "2"))
 _ROLLOUT_PER_TASK_ADVANCE = os.environ.get("ROLLOUT_PER_TASK_ADVANCE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -1222,9 +1226,22 @@ class TrajectoryCollector:
         }
 
     def _reset_envs(self, envs: EnvironmentManagerBase, env_kwargs):
-        """Consume a matching prefetched reset, or reset synchronously."""
+        """Consume a matching prefetched reset, or reset synchronously.
+
+        TIMED, because until now this was the one part of a rollout no
+        instrument could see. `span` in the WALL line starts after it, and the
+        turn table starts at turn 0's preproc, so a reset that costs 40 seconds
+        with the GPU at its idle floor shows up in neither -- while
+        [val-pipeline] still counts the slot as running, because it is. The only
+        evidence was wandb's system stream, where it looks like the machine
+        briefly died. Say how long it took and whether anything had overlapped
+        it; prefetch_env_reset is wired to the rlsd and skillsd trainers only,
+        so on the validation path the answer is always "no".
+        """
+        started = _now()
         pending = self._env_reset_prefetch
-        if pending is not None and pending["envs_id"] == id(envs):
+        prefetched = pending is not None and pending["envs_id"] == id(envs)
+        if prefetched:
             self._env_reset_prefetch = None
             if not _env_kwargs_equal(pending["kwargs"], env_kwargs):
                 # The prefetched reset already advanced stateful env schedules;
@@ -1233,8 +1250,17 @@ class TrajectoryCollector:
                     "Prefetched env reset consumed with mismatched env_kwargs; "
                     "disable ENV_RESET_PREFETCH or fix the trainer-side prefetch."
                 )
-            return pending["future"].result()
-        return envs.reset(kwargs=env_kwargs)
+            result = pending["future"].result()
+        else:
+            result = envs.reset(kwargs=env_kwargs)
+        elapsed = _now() - started
+        if elapsed >= _ENV_RESET_REPORT_S:
+            print(
+                f"[env-reset] slot={_current_slot()}  {elapsed:.1f}s  "
+                f"{'consumed a prefetch' if prefetched else 'SYNCHRONOUS (nothing overlapped it)'}",
+                flush=True,
+            )
+        return result
 
     def _advance_turn(self, *, rows, turn, task, state, turn_records) -> bool:
         """Run one turn for `rows`, and say whether those rows want another.
