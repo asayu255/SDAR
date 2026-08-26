@@ -38,8 +38,24 @@ RETRY_PROGRESS_EVERY = 60.0
 # the first one for a short window and sending whatever accumulated as a single
 # request turns those 126 reads into one, without the environments knowing.
 _BATCH_ENABLED = os.environ.get("SEARCH_BATCH_REQUESTS", "1").strip().lower() not in ("0", "false", "no", "")
-# Long enough to catch a fan-out, short enough to be noise against an 80 ms query.
-_BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "10")) / 1000.0
+# 100 ms, and NOT the 10 ms this used to be. "Within a few milliseconds of each
+# other" is what the fan-out intends, not what it achieves: 252 threads are
+# started at once (search/envs.py: max_workers = min(batch_size, 256)) but reach
+# this call under the GIL, one at a time, over roughly 300 ms. A 10 ms window
+# therefore opened and closed about thirty times per turn and sent about eight
+# queries each, and those thirty requests then fought over the retriever's single
+# GPU encoder -- the same 3-query request measured 42 ms and 432 ms depending on
+# what else was in flight.
+#
+# Measured, one turn of a 252-row search batch:
+#
+#     window 10 ms  -> envstep 28.32 s,  gen share 37-46%
+#     window 100 ms -> envstep  0.34 s,  gen share 90-94%
+#
+# The window is paid once per turn per pipeline slot and only when there is a
+# query to hold, so 100 ms buys an 80x reduction for 0.4 s across a batch. Going
+# further has little left to win: what remains is 0.34 s.
+_BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "100")) / 1000.0
 # How long a URL stays un-batched after it rejects a list. A retriever restarted
 # with a server that does take lists is the usual reason the answer changes, and
 # nothing else would ever tell us: the flag is set once and an evaluation runs
