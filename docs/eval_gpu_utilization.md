@@ -2038,6 +2038,30 @@ PY
 **推測で渡さない。** バージョンで消えた引数(V0 の `num_scheduler_steps` は
 V1 で削除)を渡すと落ちるだけで、時間を失う。
 
+### 手で叩かなくても、run が自分で答えるようにした
+
+engine を組んだ直後に `[rollout-engine]` を印字する。**次の run のログに
+そのまま出る**ので、上のコマンドを叩く必要はない:
+
+```
+[rollout-engine] vllm 0.11.0; overlap knobs: async_scheduling=<default> (available),
+  num_scheduler_steps=absent, disable_async_output_proc=absent,
+  enable_chunked_prefill=False (set here), max_num_seqs=1024 (set here),
+  enforce_eager=False (set here)
+```
+
+3 状態を区別する: **`(set here)`** = 我々が選んだ値、
+**`<default> (available)`** = この vLLM にはあるが我々は触っていない、
+**`absent`** = このバージョンには存在しない。
+
+`enable_chunked_prefill` などは `engine_kwargs` ではなく `LLM(...)` に直接
+渡っているので、それも `explicit` として渡してある —— **選んだ値を
+「default」と印字するのは、この行が防ごうとしている嘘そのものである。**
+
+診断は `verl/utils/engine_overlap.py` に置いた。`vllm_rollout` パッケージは
+vLLM が入っていないと import 自体が失敗するので、そこに置いた診断は
+GPU イメージなしにテストできない —— つまり腐る。
+
 ### 到達可能な数字を並べ直す
 
 | | 全カード空 | 部分空 | duty | node util |

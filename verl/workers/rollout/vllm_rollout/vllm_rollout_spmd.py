@@ -247,6 +247,17 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
+        from verl.utils.engine_overlap import report_engine_overlap
+
+        report_engine_overlap(
+            engine_kwargs,
+            explicit={
+                "enable_chunked_prefill": config.enable_chunked_prefill,
+                "max_num_seqs": config.max_num_seqs,
+                "enforce_eager": config.enforce_eager,
+            },
+        )
+
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
