@@ -109,6 +109,8 @@ __all__ = [
     "pop_phase",
     "mean_util_between",
     "per_gpu_util_between",
+    "residency_between",
+    "format_residency",
     "now",
     "report_and_reset",
     "report_cumulative",
@@ -508,6 +510,57 @@ class _Sampler:
             return None
         return sum(flat) / len(flat)
 
+    def residency_between(self, t0, t1, busy_thresh=None):
+        """How MANY GPUs were busy at once, over [t0, t1].
+
+        The two instruments that already exist both miss this, in opposite
+        directions, and between them they cost two wrong conclusions:
+
+        * ``[val-pipeline]`` counts a slot as running whenever it is inside a
+          batch. A slot blocked in ``env.step`` is running by that measure while
+          every GPU is empty -- it reported "NOTHING running 0.1%" for a run in
+          which NVML saw 285 s of node-wide idle.
+        * ``genGPU%`` measures only the window inside ``generate``, so it cannot
+          see a gap that happens between generates at all.
+
+        This one asks the only question that decides whether more work in flight
+        would help: at this instant, how many cards had something to do? Zero is
+        recoverable by overlapping another batch; three-at-87% is the decode
+        step's duty cycle and is not.
+
+        Returns ``None`` if the window holds no samples, else a dict:
+        ``n_gpus``, ``samples``, ``wall``, ``counts`` (busy-count -> samples),
+        ``wall_by_count``, and ``pct`` (busy-count -> % of samples).
+        """
+        thresh = _IDLE_THRESH if busy_thresh is None else busy_thresh
+        with self._lock:
+            window = [(ts, vals) for (ts, vals) in self._util_trace if t0 <= ts <= t1]
+        if not window:
+            return None
+        n_gpus = max(len(vals) for _ts, vals in window)
+        counts = {k: 0 for k in range(n_gpus + 1)}
+        wall_by_count = {k: 0.0 for k in range(n_gpus + 1)}
+        # A gap far larger than the sample interval is the sampler having been
+        # stopped, not the GPU having been idle for that long -- charge one
+        # interval for it rather than the whole gap.
+        cap = _INTERVAL * _CONTIGUITY_SLACK
+        previous = None
+        for ts, vals in window:
+            busy = sum(1 for v in vals if v is not None and v >= thresh)
+            dt = _INTERVAL if previous is None else min(ts - previous, cap)
+            counts[busy] += 1
+            wall_by_count[busy] += dt
+            previous = ts
+        total = sum(counts.values())
+        return {
+            "n_gpus": n_gpus,
+            "samples": total,
+            "wall": sum(wall_by_count.values()),
+            "counts": counts,
+            "wall_by_count": wall_by_count,
+            "pct": {k: 100.0 * v / total for k, v in counts.items()},
+        }
+
     def per_gpu_util_between(self, t0, t1):
         """Per-GPU mean SM util in [t0, t1] as a list (one entry per GPU).
 
@@ -646,6 +699,27 @@ def per_gpu_util_between(t0, t1):
     if not enabled() or _sampler is None:
         return None
     return _sampler.per_gpu_util_between(t0, t1)
+
+
+def residency_between(t0, t1, busy_thresh=None):
+    if not enabled() or _sampler is None:
+        return None
+    return _sampler.residency_between(t0, t1, busy_thresh=busy_thresh)
+
+
+def format_residency(res) -> str:
+    """One line: how much of the window had 0, 1, ... n cards with work."""
+    if not res:
+        return ""
+    n = res["n_gpus"]
+    parts = []
+    for k in range(n, -1, -1):
+        parts.append(f"{k}gpu {res['pct'][k]:.1f}% ({res['wall_by_count'][k]:.0f}s)")
+    empty = res["pct"][0]
+    return (
+        f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) +
+        f" | EMPTY {empty:.1f}% -- this is what more batches in flight can recover"
+    )
 
 
 def report_and_reset(label=""):

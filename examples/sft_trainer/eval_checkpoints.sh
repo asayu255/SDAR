@@ -146,8 +146,8 @@ export ROLLOUT_TURN_TIMING="${ROLLOUT_TURN_TIMING:-1}"
 # every 0.3 s on a background thread.
 export GPU_PROFILER="${GPU_PROFILER:-1}"
 
-# VAL_PIPELINE_DEPTH=2 keeps a second validation batch in flight, so one batch's
-# environment, tokenising and scoring overlap the other's generation.
+# VAL_PIPELINE_DEPTH keeps more than one validation batch in flight, so one
+# batch's environment, tokenising and scoring overlap another's generation.
 #
 # MEASURED, same checkpoint and same retriever, on the WALL lines' s/batch:
 # 17.0 s per batch at depth 1 against 14.2 at depth 2, a 16.5% shortening of the
@@ -166,9 +166,39 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # its games are indexed by position within the manager, so a second one would
 # score a different set.
 #
-# The cost is a second set of search environments. Set it to 1 on a box that
-# cannot spare them.
-export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-2}"
+# WHY 3 AND NOT 2. This is the only mechanism in the run that removes GPU-empty
+# windows, and its effect is geometric, so one more slot is worth more than
+# anything else on this list.
+#
+# A slot alternates generate (GPU) and env.step (not GPU). Call p the share of a
+# slot's time outside the GPU. Every card is empty only when EVERY slot is
+# outside at once, and the slots are independent, so that is p^depth:
+#
+#   MEASURED at depth 2 (NVML, run ...-201115, post-startup): every card empty
+#   7.4% of samples -> p ~= 0.27.
+#
+#   depth 2 -> 7.4%      depth 3 -> 2.0%      depth 4 -> 0.5%
+#
+# Nothing else on this list is worth 5 points. Bounding a stalled socket
+# (SEARCH_TCP_USER_TIMEOUT_S) removes the pathological tail of p; depth removes
+# the ordinary body of it, which is much larger.
+#
+# It does NOT change generation. Batches keep their own rows, the worker group
+# still runs one generate at a time, retirement is in submission order and the
+# accumulation stays on the calling thread -- depth only changes which batch is
+# waiting on its environment while another generates. (ROLLOUT_MERGE_GENERATES
+# is the one that changes generation, measured, and is why it is not a default.)
+#
+# The cost is one more set of search environments and their KV cache, which is
+# what ROLLOUT_GPU_MEM_UTIL above pays for. Set it to 1 on a box that cannot
+# spare them; alfworld keeps a single manager either way, so only search (411 of
+# 413 batches) uses the extra slots.
+#
+# Read [gpu-residency] to see whether it worked. Do NOT read [val-pipeline]'s
+# "NOTHING running" for this -- a slot blocked in env.step is running by that
+# measure while every card is idle, which is how depth looked unnecessary once
+# already.
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-3}"
 
 # HOW MUCH OF THE CARD vLLM GETS.
 #

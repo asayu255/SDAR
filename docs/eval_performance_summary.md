@@ -41,9 +41,13 @@
 | **retriever のバッチ化**(1 turn 1 リクエスト) | envstep **10.60 → 1.00 s/batch** | ON —— ただし**サーバがリストを受けなければ黙って無効になる**(§2.1) |
 | **合流窓 10 → 100 ms** | search の turn 1 envstep **28.32 → 0.34 s**、gen 占有 37〜46% → **90〜94%** | ON(§2.2) |
 | **retriever のバージョンずれ検出 + 自動再試行** | envstep 10.8 → 1.0 s(事故復旧) | ON |
-| **`VAL_PIPELINE_DEPTH=2`** | s/batch **17.0 → 14.2** | ON |
-| **search の val batch 252 行** | ms/row **94.8 → 78.0** | OFF(§6) |
-| **`VAL_PIPELINE_DEPTH=3` + generate 合流** | ms/row **74 → 57** | OFF(§6) |
+| **`VAL_PIPELINE_DEPTH=2`** | s/batch **17.0 → 14.2** | 3 に置き換え |
+| **search の val batch 252 行** | ms/row **94.8 → 78.0** | **ON**(pin 済み) |
+| **`VAL_PIPELINE_DEPTH=3`**(合流なし) | 全カード空 7.4% → 2.0%(p^depth、§4.0) | **ON** |
+| **socket の上限**(`TCP_USER_TIMEOUT` 10 s) | 詰まり 1 回 40 s → 約 11 s(§2.3) | ON |
+| **`ROLLOUT_GPU_MEM_UTIL=0.75`**(評価のみ) | KV 159,600 → 約 224,000 token/GPU | ON |
+| **`[gpu-residency]`**(計器) | 既存 2 つが見られない「何枚のカードに仕事があったか」 | ON |
+| `VAL_PIPELINE_DEPTH=3` + generate **合流** | ms/row **74 → 57** | OFF(生成が変わる、§6) |
 | 採点時の無駄な detokenize 削除 | 数%(504 回 → 1 回/batch) | ON |
 | **ログ用テーブルの全行 decode 停止** | `log_val_generations=0` なのに全 52k 行の prompt+response を decode していた | ON |
 | **raw_prompt の二重 tokenize 停止** | 同一文字列を 2 回 encode(turn ごと 252 回)。最初の 8 呼び出しで新旧一致を自己検証し、不一致なら永久フォールバック | ON |
@@ -202,7 +206,26 @@ keepalive(idle 30 秒)も connect 上限もどちらの管轄でもなかった�
 
 ## 4. util が 100% にならない理由
 
-### 4.0 run 全体の分解(NVML、完走 run)
+### 4.0 まず「何枚のカードに仕事があったか」を見る
+
+**空きは2種類あって、打ち手が違う。** 混ぜると処方を間違える。
+
+| 忙しいカード | 割合(depth 2 実測) | 正体 | 打ち手 |
+| ---: | ---: | --- | --- |
+| 3 枚 | 85.9% | それでも util は 87〜90% | **なし**(decode の duty cycle) |
+| 2 枚 | 3.2% | 負荷の偏り | 分配 |
+| 1 枚 | 3.5% | 同上 | 分配 |
+| **0 枚** | **7.4%** | 全 slot が env.step | **batch を増やす(depth)** |
+
+`4.5 ms /(4.5 + 0.6)ms = 88%` —— 1.7B の decode 1 step と host 処理の比が
+そのまま 3 枚とも忙しいときの util である。**1.7B で 100% は物理的に出ない。**
+
+**この表は `[gpu-residency]` が run 中に印字する。** `[val-pipeline]` の
+`NOTHING running` でも `genGPU%` でもこれは見えない —— 前者は env.step で
+止まった slot を「実行中」と数え、後者は generate の外を見ない。
+その盲点で async の的を 0.4% と見積もった(実際は 7.4%、§21 の訂正)。
+
+### 4.0b run 全体の分解(NVML、完走 run)
 
 空き 21.0 pt がどこにあるか。wandb の 15 秒サンプルを 3 つのバケツに分けた。
 
@@ -402,7 +425,7 @@ ROLLOUT_TURN_TIMING=1       turn table と WALL 行
 ROLLOUT_GEN_PHASE_EVERY=50  [gen-phases] / [rollout-phases] の周期
 VAL_PIPELINE_REPORT_EVERY=25 [val-pipeline] の周期(0 で最後だけ)
 ROLLOUT_MERGE_GENERATES=1   generate の合流(既定 OFF)
-VAL_PIPELINE_DEPTH=3        slot 数(合流には 3 以上が要る)
+VAL_PIPELINE_DEPTH=3        slot 数。全カード空は p^depth で減る(§4.0、既定 3)
 ROLLOUT_ASYNC_GENERATE=1    engine をプールとして回す(既定 OFF、合流の上位互換)
 ROLLOUT_PUMP_ROUND_S=0.02   1 round の待ち。長いほど RPC は減り、完了通知は遅れる
 ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だけ)

@@ -91,6 +91,26 @@ class Slot:
         return f"Slot({self.name}, tasks={'any' if self.tasks is None else sorted(self.tasks)})"
 
 
+def _residency_over(spans):
+    """The NVML residency line for the span the launches cover, if sampling is on."""
+    if not spans:
+        return ""
+    try:
+        from verl.utils import gpu_profiler
+    except Exception:  # pragma: no cover - profiler is optional
+        return ""
+    # The spans are perf_counter and the sampler stamps monotonic. Those are the
+    # same clock on Linux and NOT on every platform, and getting it wrong yields
+    # an empty window rather than an error -- which is to say, silence that reads
+    # exactly like "the GPU was never idle". Measure the offset instead.
+    offset = time.monotonic() - time.perf_counter()
+    res = gpu_profiler.residency_between(
+        min(start for start, _end in spans) + offset,
+        max(end for _start, end in spans) + offset,
+    )
+    return gpu_profiler.format_residency(res)
+
+
 def run_pipelined(
     items: Iterable[Any],
     prepare: Callable[[Any], Any],
@@ -165,6 +185,15 @@ def run_pipelined(
             f"scoring {clock['consumer']:.1f}s, waiting on a slot {clock['retire_wait']:.1f}s.",
             flush=True,
         )
+        # The line above answers "was a slot running", which is NOT "was a GPU
+        # running": a slot blocked in env.step is running by that measure while
+        # every card is empty. It said NOTHING running 0.1% for a run in which
+        # NVML saw 285 s of node-wide idle, and that reading is what made the
+        # async pump look like it was chasing 0.4%. Print the device's answer
+        # next to it so the two can never be confused again.
+        residency = _residency_over(spans)
+        if residency:
+            print(residency, flush=True)
 
     def maybe_report():
         if _REPORT_EVERY > 0 and len(spans) and len(spans) % _REPORT_EVERY == 0:
