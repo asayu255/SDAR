@@ -14,6 +14,7 @@ so the teachers live on CPU and only ride to GPU during log-prob computation.
 """
 
 import copy
+import json
 import os
 from pprint import pprint
 
@@ -723,6 +724,28 @@ class OPDRayTrainer(RayPPOTrainer):
         batch.batch["sign_cache_ids"] = sign_cache_ids
         batch.batch["sign_off_tasks"] = off_tasks
 
+    def _dump_sign_token_report(self, actor_output) -> None:
+        """Write the step's per-token sign-weight table.
+
+        The scalar metrics say how CONCENTRATED the weighting is; this says on
+        WHAT. Neither substitutes for the other, and only one of them fits in a
+        wandb column, so the table goes to disk beside the run.
+
+        One file per step rather than one appended file: a resumed run re-writes
+        the steps it repeats instead of appending a second copy of them, which is
+        the difference between a reader taking a groupby and a reader having to
+        work out which duplicate to trust.
+        """
+        rows = actor_output.meta_info.get("sign_token_report", None)
+        dump_dir = self.config.trainer.get("sign_token_dump_dir", None)
+        if not rows or not dump_dir:
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"sign_tokens_step{self.global_steps:06d}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps({"step": self.global_steps, **row}, ensure_ascii=False) + "\n")
+
     # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.
     # No old_log_prob / ref / values / advantage / reward-in-loss -- those are
@@ -1002,6 +1025,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
+                    self._dump_sign_token_report(actor_output)
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir and "token_level_scores" in batch.batch:

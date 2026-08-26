@@ -84,14 +84,13 @@ __all__ = [
     "SIGN_WEIGHT_KEY",
     "SIGN_BASE_TASK",
     "STATE_NAMES",
+    "ACTED_STATES",
     "candidate_weights",
     "position_weights",
     "reweight_teacher_logprobs",
     "normalize_per_task",
-    "sign_state_metrics",
-    "sign_mass_metrics",
-    "teacher_shift_metrics",
-    "target_shift_metrics",
+    "SignWeightStats",
+    "TokenStateCounts",
 ]
 
 # Column the driver writes and the actor reads in ``position`` mode when the
@@ -682,3 +681,257 @@ class SignWeightStats:
                 if tkl:
                     out[f"{head}/target_kl_ratio"] = total / tkl
         return out
+
+
+# --------------------------------------------------------------------------- #
+# Per-vocabulary-token diagnostics.
+# --------------------------------------------------------------------------- #
+# States worth naming a token for. The three neutral ones are "the mechanism did
+# nothing here", and they hold the overwhelming majority of candidates, so a
+# top-N list over them would just be a list of the most frequent tokens in the
+# corpus and would say nothing about the mechanism.
+ACTED_STATES = (STATE_AGREE_POS, STATE_AGREE_NEG, STATE_CONFLICT_ON_POS, STATE_CONFLICT_ON_NEG)
+
+
+class TokenStateCounts:
+    """Which vocabulary tokens the sign weighting actually acts on.
+
+    Everything else in this module reports the mechanism with the vocabulary
+    summed out: ``frac_agree_pos`` says a fifth of candidates were reinforced,
+    and cannot say whether that is the same twenty tokens every step or a
+    different thousand. Those are different mechanisms with the same summary, and
+    the difference decides what a gain would mean -- one is "the tasks share a
+    small stable set of moves", the other is "the tasks share a broad statistical
+    tendency". This class keeps the token identity.
+
+    Three quantities per token, because the three answer different questions:
+
+    * ``n`` -- how OFTEN the token was a candidate in each state. The count of
+      shared-structure events.
+    * ``mass`` -- the on-task teacher's probability summed over those events. A
+      token can be reinforced constantly and carry no mass, which means the
+      reinforcement reached nothing the teacher was actually going to say.
+    * ``dw`` -- the signed sum of ``(w - 1) * p``, i.e. the token's own
+      contribution to ``Z - 1``. This is the one ranked list that is a statement
+      about the OBJECTIVE rather than about the diagnosis: it is exactly how much
+      of the target's rewrite this token is responsible for, in the same
+      decomposition ``target_kl`` and ``inv_z`` are read from. Summing it over
+      the vocabulary reproduces ``Z - 1``.
+
+    Accumulated dense and sync-free. The alternative -- ``torch.unique`` per
+    micro-batch, keyed into a Python dict -- reads the device inside the
+    micro-batch loop thousands of times a step, which is the run-ahead this
+    actor's whole design protects. A dense ``index_add_`` costs one kernel and
+    (scopes * states * V) of memory: 4 * 7 * 151,936 is 34 MB at int64, next to
+    a teacher output projection of 622 MB.
+
+    Scope 0 is the pooled batch; scope ``1 + t`` is task ``t``. Rows whose task
+    is unknown contribute to the pooled scope only.
+    """
+
+    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64):
+        self.vocab_size = int(vocab_size)
+        self.n_states = len(STATE_NAMES)
+        self.n_scopes = 1 + int(n_tasks)
+        self.top_n = int(top_n)
+        cells = self.n_scopes * self.n_states * self.vocab_size
+        self.n = torch.zeros(cells, dtype=torch.int64, device=device)
+        self.mass = torch.zeros(cells, dtype=torch.float32, device=device)
+        self.dw = torch.zeros(self.n_scopes * self.vocab_size, dtype=torch.float32, device=device)
+        self._cpu_cache = None
+
+    # -- accumulation ------------------------------------------------------ #
+
+    def update(
+        self,
+        *,
+        support_ids: torch.Tensor,
+        state: torch.Tensor,
+        weight: torch.Tensor,
+        on_task_logprob: torch.Tensor,
+        response_mask: torch.Tensor,
+        task_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            support_ids: (bs, resp, k) vocabulary ids of the support. Whichever
+                model nominated them -- the student's top-k or the on-task
+                teacher's -- these are the tokens the weights were computed at.
+            state: (bs, resp, k) ``STATE_*``.
+            weight: (bs, resp, k) the candidate weight that was applied.
+            on_task_logprob: (bs, resp, k) on-task teacher log-probs at the support.
+            response_mask: (bs, resp).
+            task_ids: (bs,) or None.
+
+        The validity mask is folded into the VALUES rather than into the indices,
+        so every entry is scattered and the invalid ones add zero. Selecting the
+        valid entries first would need their count on the host.
+        """
+        # Any accumulation invalidates a rendering taken before it. Cheap
+        # insurance against a caller that reads, then keeps folding.
+        self._cpu_cache = None
+        ids = support_ids.reshape(-1).to(torch.long)
+        st = state.reshape(-1).to(torch.long)
+        valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(state).reshape(-1)
+        p = on_task_logprob.detach().to(torch.float32).exp().reshape(-1)
+        dw = (weight.detach().to(torch.float32) - 1.0).reshape(-1) * p
+
+        v_f = valid.to(torch.float32)
+        v_i = valid.to(torch.int64)
+        V, S = self.vocab_size, self.n_states
+
+        flat = st * V + ids  # scope 0 starts at offset 0
+        self.n.index_add_(0, flat, v_i)
+        self.mass.index_add_(0, flat, p * v_f)
+        self.dw.index_add_(0, ids, dw * v_f)
+
+        if task_ids is None:
+            return
+        t = task_ids.reshape(-1, 1, 1).expand_as(state).reshape(-1).to(torch.long)
+        known = (t >= 0) & valid
+        scope = t.clamp(min=0) + 1
+        flat_t = (scope * S + st) * V + ids
+        self.n.index_add_(0, flat_t, known.to(torch.int64))
+        self.mass.index_add_(0, flat_t, p * known.to(torch.float32))
+        self.dw.index_add_(0, scope * V + ids, dw * known.to(torch.float32))
+
+    def all_reduce(self) -> None:
+        """Sum the three arrays across the DP group.
+
+        Rendered from the reduced arrays on every rank, so the numbers the metric
+        reducer averages are already identical and the mean is a no-op -- unlike
+        the pooled ratios elsewhere in this module, a top-N list has no meaningful
+        per-rank average, so it has to be made global before it is taken.
+        """
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        for t in (self.n, self.mass, self.dw):
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+
+    # -- rendering --------------------------------------------------------- #
+
+    def _cpu(self):
+        """One device-to-host transfer, shared by both renderings.
+
+        34 MB over PCIe once per ``update_policy`` is the whole host cost of this
+        diagnostic; doing it per rendering would double it for nothing.
+        """
+        if self._cpu_cache is None:
+            V, S = self.vocab_size, self.n_states
+            self._cpu_cache = (
+                self.n.detach().to("cpu").view(self.n_scopes, S, V),
+                self.mass.detach().to("cpu").view(self.n_scopes, S, V),
+                self.dw.detach().to("cpu").view(self.n_scopes, V),
+            )
+        return self._cpu_cache
+
+    def _scope_name(self, scope: int, task_names) -> Optional[str]:
+        if scope == 0:
+            return None
+        t = scope - 1
+        if task_names and 0 <= t < len(task_names):
+            return task_names[t]
+        return f"task{t}"
+
+    def scalar_metrics(self, task_names=None, prefix: str = "sign_weight") -> dict:
+        """The shape of the token distribution, as numbers a run can be plotted by.
+
+        ``n_distinct`` and ``top_share`` together separate the two mechanisms in
+        the class docstring: a small stable set gives few distinct tokens and a
+        high top-N share, a broad tendency gives the opposite. Neither is
+        derivable from the existing ``frac_*``.
+
+        ``dw_pos_sum`` / ``dw_neg_sum`` are the two halves of ``Z - 1``. They are
+        reported separately because the whole point of ``inv_z`` is that they do
+        NOT cancel -- reporting only the residual hides how much was pushed each
+        way to produce it.
+        """
+        out = {}
+        n, _mass, dw = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        for scope in range(self.n_scopes):
+            scope_name = self._scope_name(scope, task_names)
+            head = prefix if scope_name is None else f"{prefix}/{scope_name}"
+            for sid in ACTED_STATES:
+                counts = n[scope, sid]
+                total = int(counts.sum())
+                if total <= 0:
+                    continue
+                sname = STATE_NAMES[sid]
+                out[f"{head}/token/n_distinct/{sname}"] = float((counts > 0).sum())
+                out[f"{head}/token/top{N}_share/{sname}"] = float(torch.topk(counts, N).values.sum()) / total
+            d = dw[scope]
+            pos, neg = float(d.clamp(min=0).sum()), float(d.clamp(max=0).sum())
+            if pos == 0.0 and neg == 0.0:
+                continue
+            out[f"{head}/token/dw_pos_sum"] = pos
+            out[f"{head}/token/dw_neg_sum"] = neg
+            absd = d.abs()
+            tot_abs = float(absd.sum())
+            if tot_abs > 0:
+                out[f"{head}/token/dw_abs_top{N}_share"] = float(torch.topk(absd, N).values.sum()) / tot_abs
+        return out
+
+    def top_tokens(self, task_names=None) -> list:
+        """The ranked lists themselves, as plain rows for the caller to decode.
+
+        Token ids rather than strings: this runs inside the actor, which has no
+        tokenizer. The worker that owns one turns them into text.
+
+        Two rankings per scope, because they answer different questions. By
+        ``count`` within each acted state: which tokens do the teachers keep
+        agreeing (or disagreeing) about -- the shared structure, named. By
+        ``abs_dw`` pooled: which tokens actually moved the target. A token can top
+        one list and be absent from the other, and that gap is itself the finding
+        -- a token reinforced constantly at negligible probability is shared
+        structure the objective never sees.
+        """
+        rows = []
+        n, mass, dw = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        for scope in range(self.n_scopes):
+            scope_name = self._scope_name(scope, task_names) or "__pooled__"
+            n_any = n[scope].sum(0)
+            mass_any = mass[scope].sum(0)
+            for sid in ACTED_STATES:
+                counts = n[scope, sid]
+                if int(counts.sum()) <= 0:
+                    continue
+                masses = mass[scope, sid]
+                vals, idx = torch.topk(counts, N)
+                for rank, (c, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
+                    if c <= 0:
+                        break
+                    rows.append({
+                        "scope": scope_name,
+                        "ranked_by": "count",
+                        "state": STATE_NAMES[sid],
+                        "rank": rank,
+                        "token_id": int(tok),
+                        "count": int(c),
+                        "mass": float(masses[tok]),
+                        "dw": float(dw[scope, tok]),
+                    })
+            absd = dw[scope].abs()
+            if float(absd.sum()) <= 0:
+                continue
+            vals, idx = torch.topk(absd, N)
+            for rank, (a, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
+                if a <= 0:
+                    break
+                rows.append({
+                    "scope": scope_name,
+                    "ranked_by": "abs_dw",
+                    # Pooled over states on purpose: dw is the token's net effect,
+                    # and a token that is reinforced in some rows and suppressed in
+                    # others has one net effect and no single state.
+                    "state": "__any__",
+                    "rank": rank,
+                    "token_id": int(tok),
+                    "count": int(n_any[tok]),
+                    "mass": float(mass_any[tok]),
+                    "dw": float(dw[scope, tok]),
+                })
+        return rows

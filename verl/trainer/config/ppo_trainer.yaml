@@ -363,6 +363,10 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  # directory for the per-token sign-weight tables (which tokens the weighting
+  # reinforced, suppressed or was in conflict about). No dump if null; also needs
+  # algorithm.opd.sign_weight.token_stats.enable=True to have anything to write.
+  sign_token_dump_dir: null
   # One line per validation instance (index, task, score), so a later
   # comparison between two arms can be PAIRED instead of a difference of two
   # means. The pairing key is the row's position in the pass, which is stable

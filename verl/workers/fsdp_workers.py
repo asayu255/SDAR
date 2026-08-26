@@ -825,6 +825,23 @@ class ActorRolloutRefWorker(Worker):
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
+            # The per-token sign-weight diagnostic, decoded. It rides beside
+            # "metrics" rather than inside it because it is a table, not
+            # scalars, and reduce_metrics would average it into nonsense.
+            # DataProto.concat keeps rank 0's meta_info, which is the right one
+            # here: the actor all-reduced the counts before ranking them, so
+            # every rank carries the same global table.
+            #
+            # This is where the ids become text: the actor process has no
+            # tokenizer. convert_ids_to_tokens, not decode -- the raw piece
+            # (with its space marker) is what identifies the vocabulary entry,
+            # while decode would strip exactly that and merge distinct tokens.
+            token_report = getattr(self.actor, "last_token_report", None)
+            if token_report:
+                pieces = self.tokenizer.convert_ids_to_tokens([r["token_id"] for r in token_report])
+                output.meta_info["sign_token_report"] = [
+                    {**row, "token": piece} for row, piece in zip(token_report, pieces)
+                ]
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")

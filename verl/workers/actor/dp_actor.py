@@ -23,7 +23,7 @@ import logging
 import functools
 import os
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -35,6 +35,7 @@ from verl.trainer.ppo.core_algos import agg_loss, agg_loss_by_task_weights, agg_
 from verl.trainer.ppo.metric_utils import iter_task_row_masks
 from verl.trainer.ppo.sign_weights import (
     SignWeightStats,
+    TokenStateCounts,
     candidate_weights,
     normalize_per_task,
     position_weights,
@@ -231,17 +232,11 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
         )
 
 
-def _supports_logits_to_keep(module) -> bool:
-    """Does the wrapped HF model's forward take ``logits_to_keep``?
+def _unwrap_module(module):
+    """The module that actually defines ``forward``, under FSDP / torch.compile.
 
-    Checked once at construction so ``response_only_logits`` fails at worker init
-    rather than in the first micro-batch. The model arrives wrapped (FSDP, and
-    possibly torch.compile), so unwrap to the module that actually defines
-    forward; the loop is bounded because a broken wrapper chain must not hang
-    startup.
+    The loop is bounded because a broken wrapper chain must not hang startup.
     """
-    import inspect
-
     inner = module
     for _ in range(8):
         nxt = None
@@ -253,6 +248,33 @@ def _supports_logits_to_keep(module) -> bool:
         if nxt is None:
             break
         inner = nxt
+    return inner
+
+
+def model_vocab_size(module) -> Optional[int]:
+    """The wrapped model's vocabulary size, or None if it does not say.
+
+    Needed to size the per-token diagnostic's dense accumulator. None rather than
+    a guess: an accumulator too small would index out of bounds on a real token,
+    and one sized from the largest id seen so far would silently change shape
+    between steps. The caller turns None into "run without the diagnostic".
+    """
+    cfg = getattr(_unwrap_module(module), "config", None)
+    size = getattr(cfg, "vocab_size", None)
+    if size is None:
+        size = getattr(getattr(cfg, "text_config", None), "vocab_size", None)
+    return int(size) if size else None
+
+
+def _supports_logits_to_keep(module) -> bool:
+    """Does the wrapped HF model's forward take ``logits_to_keep``?
+
+    Checked once at construction so ``response_only_logits`` fails at worker init
+    rather than in the first micro-batch.
+    """
+    import inspect
+
+    inner = _unwrap_module(module)
     try:
         params = inspect.signature(inner.forward).parameters
     except (TypeError, ValueError):
@@ -1260,6 +1282,27 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
         sign_stats = SignWeightStats(task_names=task_id_names) if sign_enabled else None
+        # Which vocabulary tokens the weighting acts on. Off unless asked for:
+        # it costs a dense (scopes x states x V) accumulator and one 34 MB
+        # device-to-host read per call, which is nothing next to the step but is
+        # not worth paying on an arm nobody is going to read it for.
+        token_stats = None
+        token_cfg = (sign_cfg.get("token_stats", None) or {}) if sign_enabled else {}
+        if sign_enabled and bool(token_cfg.get("enable", False)):
+            vocab = model_vocab_size(self.actor_module)
+            if vocab is None:
+                print(
+                    "[sign_weight] token_stats requested but the model does not report a "
+                    "vocab_size; running without the per-token diagnostic",
+                    flush=True,
+                )
+            else:
+                token_stats = TokenStateCounts(
+                    vocab_size=vocab,
+                    n_tasks=len(task_id_names or []),
+                    device=next(self.actor_module.parameters()).device,
+                    top_n=int(token_cfg.get("top_n", 64)),
+                )
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -1457,6 +1500,20 @@ class DataParallelPPOActor(BasePPOActor):
                                 task_ids=task_ids,
                                 off_plane_tasks=data.get("sign_off_tasks", None),
                             )
+                            if token_stats is not None:
+                                # The same candidates the stats above summarise,
+                                # kept under their vocabulary ids.
+                                # sign_support_ids is whichever model nominated
+                                # the support, which is exactly the set the
+                                # weights were computed at.
+                                token_stats.update(
+                                    support_ids=sign_support_ids,
+                                    state=sign_state,
+                                    weight=candidate_weight,
+                                    on_task_logprob=sign_on_task_logprobs,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                )
                             if sign_mode == "target":
                                 # Keep the original: the diagnostics below measure
                                 # how far the rewrite moved the target, which is a
@@ -1843,6 +1900,16 @@ class DataParallelPPOActor(BasePPOActor):
             metrics["sign_weight/mode_is_target"] = float(sign_mode == "target")
             if sign_mode == "position":
                 self._refresh_sign_position_means(sign_stats, task_id_names)
+        # Reduced before it is rendered: a top-N list has no meaningful per-rank
+        # average, so unlike the pooled ratios above it has to be made global
+        # first. The ranked rows go on the actor for the worker to decode -- this
+        # process has no tokenizer -- while the shape metrics are scalars and
+        # ride back with everything else.
+        self.last_token_report = None
+        if token_stats is not None:
+            token_stats.all_reduce()
+            metrics.update(token_stats.scalar_metrics(task_names=task_id_names))
+            self.last_token_report = token_stats.top_tokens(task_names=task_id_names)
         # The one read for everything deferred above. torch.stack forces a single
         # host sync here instead of one per micro-batch. Entries carrying a
         # presence weight are summed and divided by how many micro-batches
