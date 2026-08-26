@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple, Dict, Union, Any
+from typing import List, Optional, Sequence, Tuple, Dict, Union, Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
@@ -688,9 +688,42 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         infos = self._merge_infos(task_infos, len(kwargs))
         return observations, infos
 
-    def step(self, text_actions: List[str]):
+    def task_row_indices(self) -> Dict[str, List[int]]:
+        """Which batch rows belong to which task, as decided by the last reset.
+
+        The rollout loop needs this to advance one task at a time: the row sets
+        are disjoint, so two callers holding different tasks write to different
+        rows of every shared array.
+        """
+        return {task: list(indices) for task, indices in self._task_indices.items()}
+
+    def step(self, text_actions: List[str], tasks: Optional[Sequence[str]] = None):
+        """Step the environments.
+
+        ``tasks`` restricts the step to those tasks. The returned arrays are
+        still batch-shaped, but **only the selected tasks' rows carry meaning**
+        -- the rest hold the neutral fill of the merge helpers (None obs, 0
+        reward, False done, None info), not that task's real state. A caller
+        that passes ``tasks`` must therefore read only the rows it asked for.
+        This is what lets each task advance on its own turn counter: alfworld
+        runs to 50 turns without dragging search's finished rows behind it, and
+        one task's env.step overlaps another's generate instead of the whole
+        batch standing still together.
+
+        Per-task state (``_task_steps`` / ``_task_done`` / ``_last_obs_by_task``)
+        is keyed by task and each key is touched by one caller, so concurrent
+        calls for different tasks do not race. Two concurrent calls naming the
+        SAME task would, and nothing here defends against that.
+        """
         if not self._task_indices:
             raise RuntimeError("MultiTaskEnvironmentManager.step called before reset.")
+        if tasks is not None:
+            unknown = [task for task in tasks if task not in self._task_indices]
+            if unknown:
+                raise ValueError(f"step() asked for tasks not in this batch: {unknown}")
+            wanted = set(tasks)
+        else:
+            wanted = None
 
         task_obs = {}
         task_rewards = {}
@@ -700,6 +733,8 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         # Tasks that still need a real environment step (others are short-circuited).
         active_tasks = {}
         for task, indices in self._task_indices.items():
+            if wanted is not None and task not in wanted:
+                continue
             if self._task_done[task].all() or self._task_steps[task] >= self.task_max_steps[task]:
                 task_obs[task] = self._last_obs_by_task[task]
                 task_rewards[task] = np.zeros(len(indices), dtype=np.float32)

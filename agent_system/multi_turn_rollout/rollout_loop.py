@@ -155,6 +155,12 @@ def _say_rollout_env():
         flush=True,
     )
     print(
+        f"[rollout-advance] driver: ROLLOUT_PER_TASK_ADVANCE="
+        f"{os.environ.get('ROLLOUT_PER_TASK_ADVANCE', '<unset>')!r} -> turns are "
+        f"{'per task, each on its own counter' if _ROLLOUT_PER_TASK_ADVANCE else 'lock-step across the whole batch'}",
+        flush=True,
+    )
+    print(
         f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
         f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
         f"{'ON' if _ROLLOUT_KEEP_VLLM_AWAKE else 'OFF (vLLM wakes and sleeps every turn)'}"
@@ -437,6 +443,53 @@ def _generate_sequences(actor_rollout_wg, batch_input_padded):
         len(batch_input_padded),
         actor_rollout_wg.generate_sequences,
     )
+
+
+_ROLLOUT_PER_TASK_ADVANCE = os.environ.get("ROLLOUT_PER_TASK_ADVANCE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _per_task_groups(envs, obs, logprob_prefetch_enabled):
+    """The task -> rows map to advance independently, or None to stay in lockstep.
+
+    Each refusal below names something that is not row-scoped, and so cannot be
+    split between threads that own different rows:
+
+    * the flag is off, or the env manager is single-task (nothing to split)
+    * images: ``obs['image']`` is one array for the whole batch, not a list this
+      can write rows into
+    * old_log_prob prefetch: it appends to one shared list and hands the GPU a
+      second call while env.step runs. It is a training-path feature and
+      validation never turns it on, so this refuses rather than growing a lock.
+    """
+    if not _ROLLOUT_PER_TASK_ADVANCE or logprob_prefetch_enabled:
+        return None
+    if obs.get('image', None) is not None:
+        return None
+    if not hasattr(envs, "task_row_indices"):
+        return None
+    groups = {task: rows for task, rows in envs.task_row_indices().items() if rows}
+    return groups if len(groups) > 1 else None
+
+
+def _splice_obs(obs, next_obs, rows):
+    """Write `rows` of `next_obs` into the shared `obs`, leaving the rest alone.
+
+    The batch-wide caller replaces obs outright. A per-task caller cannot: the
+    other tasks' rows in its answer hold the merge's neutral fill, not their real
+    observations, and overwriting them would hand another thread's trajectories
+    a blank. Every value here is a plain list built by
+    MultiTaskEnvironmentManager._merge_observations, so per-index assignment is
+    the whole operation.
+    """
+    for key, values in next_obs.items():
+        if values is None:
+            continue
+        target = obs.get(key)
+        if not isinstance(target, list):
+            obs[key] = list(values)
+            continue
+        for i in rows:
+            target[int(i)] = values[int(i)]
 
 
 def _token_counts(batch_input_padded, batch_output_padded):
@@ -1124,6 +1177,250 @@ class TrajectoryCollector:
             return pending["future"].result()
         return envs.reset(kwargs=env_kwargs)
 
+    def _advance_turn(self, *, rows, turn, task, state, turn_records) -> bool:
+        """Run one turn for `rows`, and say whether those rows want another.
+
+        `rows` is the set of batch rows this caller owns. Every shared array is
+        written only at those indices, which is what lets two callers holding
+        different tasks run at the same time. `task` is None for the batch-wide
+        caller -- on that path the row set is everything and this reduces to the
+        loop body it was extracted from.
+        """
+        batch_size = state["batch_size"]
+        gen_batch = state["gen_batch"]
+        actor_rollout_wg = state["actor_rollout_wg"]
+        envs = state["envs"]
+        is_done = state["is_done"]
+        obs = state["obs"]
+        total_batch_list = state["total_batch_list"]
+        total_infos = state["total_infos"]
+
+        # Phase-1 throughput optimization: only generate for trajectories that
+        # are still active. Steps belonging to already-finished trajectories
+        # carry active_masks=False and are discarded by gather_rollout_data(),
+        # so generating them is pure wasted GPU compute. This waste is large in
+        # the multitask setting where e.g. search episodes finish within a few
+        # turns while the loop keeps running up to alfworld's max_steps. As
+        # episodes finish, the vLLM generation batch shrinks accordingly.
+        owned_done = is_done[rows]
+        if owned_done.all():
+            return False
+        active_rows = rows[~owned_done]
+        active_masks = np.zeros(batch_size, dtype=bool)
+        active_masks[active_rows] = True
+        active_idx = active_rows
+        _m0 = _now()
+
+        _pre_active_mask = active_masks if _ROLLOUT_SKIP_DONE_PREPROC else None
+        batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
+
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        if "multi_modal_data" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("multi_modal_data")
+        if "raw_prompt" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        batch_input = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+
+        batch_input.meta_info = gen_batch.meta_info
+        _m_preproc = _now()  # end of CPU preprocess (tokenize/pop)
+
+        # Restrict generation to active trajectories only; done rows are filled
+        # back in afterwards (and dropped downstream via active_masks).
+        generate_all = len(active_idx) == batch_size
+        active_batch_input = batch_input if generate_all else batch_input[active_idx]
+
+        # pad to be divisible by dp_size
+        batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
+        _gw0 = gpu_profiler.now()
+        batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
+        _gw1 = gpu_profiler.now()
+        if turn_records is not None:
+            _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)
+        # # unpad
+        active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+        _m_gen = _now()  # end of GPU generation window
+
+        # Scatter active outputs back to the full batch size for union/recording.
+        batch_output = active_batch_output if generate_all else \
+            self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
+
+        batch.non_tensor_batch['uid'] = state["uid_batch"]
+        batch.non_tensor_batch['traj_uid'] = state["traj_uid"]
+
+        batch = batch.union(batch_output)
+
+        if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:
+            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+        else:
+            # Decode only the generated rows; finished rows' scattered filler
+            # is pad-only, which batch_decode(skip_special_tokens=True) would
+            # render as '' anyway.
+            active_actions = self.tokenizer.batch_decode(
+                active_batch_output.batch['responses'], skip_special_tokens=True
+            )
+            text_actions = [''] * batch_size
+            for pos, idx in enumerate(active_idx):
+                text_actions[idx] = active_actions[pos]
+        _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
+
+        def _step_envs():
+            if task is None:
+                return envs.step(text_actions)
+            return envs.step(text_actions, tasks=[task])
+
+        if self._logprob_prefetch_enabled and self._logprob_pending:
+            # Overlap: envs.step (CPU/HTTP/IPC, GPU idle) runs in a background
+            # thread while the GPU prefetches old_log_prob for finished
+            # trajectories. The prefetch call returns before the next
+            # generate_sequences is issued, so it never contends with
+            # generation on the worker actors.
+            if self._env_step_executor is None:
+                self._env_step_executor = ThreadPoolExecutor(max_workers=1)
+            env_future = self._env_step_executor.submit(_step_envs)
+            self._prefetch_pending_log_probs(actor_rollout_wg)
+            next_obs, rewards, dones, infos = env_future.result()
+        else:
+            next_obs, rewards, dones, infos = _step_envs()
+        _m_env = _now()  # end of env.step (CPU / HTTP / IPC)
+
+        if turn_records is not None:
+            turn_records.append({
+                "turn": turn,
+                "active": int(len(active_idx)),
+                "preproc": _m_preproc - _m0,
+                "gen": _m_gen - _m_preproc,
+                "decode": _m_decode - _m_gen,
+                "envstep": _m_env - _m_decode,
+                "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
+                "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
+                "prompt_tok": _prompt_tok,
+                "gen_tok": _gen_tok,
+            })
+
+        if len(rewards.shape) == 2:
+            rewards = rewards.squeeze(1)
+        if len(dones.shape) == 2:
+            # dones is numpy, delete a dimension
+            dones = dones.squeeze(1)
+
+        # Rows this caller may read out of the env's batch-shaped answer. For the
+        # batch-wide caller that is every row, so `probe` is row 0 and the scans
+        # below cover the whole batch exactly as they did inline. A per-task
+        # caller must stay inside its own rows: the others hold the merge's
+        # neutral fill, and are another thread's to write.
+        owned = range(batch_size) if task is None else [int(i) for i in rows]
+        probe = 0 if task is None else int(rows[0])
+
+        is_action_valid = np.ones(batch_size, dtype=bool)
+        if 'is_action_valid' in infos[probe]:
+            for i in owned:
+                is_action_valid[i] = infos[i]['is_action_valid']
+        batch.non_tensor_batch['is_action_valid'] = is_action_valid
+
+        if 'tool_calling' in infos[probe]:
+            tool_callings = state["tool_callings"]
+            for i in active_rows:
+                tool_callings[i] += np.float32(infos[i]['tool_calling'])
+        # Create reward tensor, only assign rewards for active environments
+        state["episode_rewards"][active_masks] += torch_to_numpy(rewards)[active_masks]
+        state["episode_lengths"][active_masks] += 1
+
+        assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+        batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
+        batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+
+        # Update episode lengths for active environments
+        batch_list: list[dict] = to_list_of_dict(batch)
+
+        for i in owned:
+            if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
+                # Finished trajectories' rows carry active_masks=False and are
+                # dropped by gather_rollout_data(); skip materializing them.
+                # Active rows form a prefix of each trajectory's list, so the
+                # enumerate-based turn_step and the last-active-entry scans in
+                # success_evaluator / filter_group_data are unchanged.
+                continue
+            total_batch_list[i].append(batch_list[i])
+            total_infos[i].append(infos[i])
+
+        # Update done states
+        newly_done = np.logical_and(active_masks, dones)
+        if task is None:
+            is_done[:] = np.logical_or(is_done, dones)
+        else:
+            is_done[rows] = np.logical_or(is_done[rows], np.asarray(dones, dtype=bool)[rows])
+
+        if self._logprob_prefetch_enabled:
+            # Trajectories that finished this turn now have all their rows
+            # final; queue them for prefetched old_log_prob on later turns.
+            for i in np.nonzero(newly_done)[0]:
+                for step_idx, row in enumerate(total_batch_list[i]):
+                    if row['active_masks']:
+                        self._logprob_pending.append(((state["traj_uid"][i], step_idx), row))
+
+        # Update observations for next step
+        if task is None:
+            state["obs"] = next_obs
+        else:
+            _splice_obs(obs, next_obs, rows)
+
+        # Another turn only if something this caller owns is still running.
+        return not bool(is_done[rows].all())
+
+    def _advance_per_task(self, groups, state, turn_records, batch_started):
+        """Advance each task's rows on its own turn counter, all at once.
+
+        The batch-wide loop makes every task wait for the slowest one at every
+        turn boundary, which is why preproc and envstep line up across the whole
+        batch and the GPU goes idle for all of them together. Here alfworld's
+        50th turn and search's 4th are simply different points in different
+        threads, so one task's env.step overlaps another's generate.
+
+        The row sets are disjoint (task_row_indices comes from the reset that
+        placed them), so the shared arrays need no lock: every element has one
+        writer. What is NOT safe is two threads naming the same task, and the
+        one-thread-per-task fan-out below is what rules that out.
+        """
+        max_steps = self.config.env.max_steps
+        records = {task: ([] if turn_records is not None else None) for task in groups}
+
+        # slot_label is thread-local, so the child threads cannot read the
+        # pipeline slot the parent is running under. Capture it here.
+        parent_slot = _current_slot()
+
+        def run(task):
+            rows = np.asarray(groups[task], dtype=int)
+            with slot_label(f"{parent_slot}:{task}"):
+                for turn in range(max_steps):
+                    if not self._advance_turn(rows=rows, turn=turn, task=task,
+                                              state=state, turn_records=records[task]):
+                        break
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+            futures = [executor.submit(run, task) for task in groups]
+            for future in futures:
+                future.result()
+
+        if turn_records is not None:
+            # One table per task, and no span on them: the WALL line is per
+            # BATCH, and printing it three times would count this batch three
+            # times in a figure whose whole job is to be comparable between runs.
+            for task in groups:
+                _print_turn_timing(records[task], slot=f"{parent_slot}/{task}",
+                                   rows=len(groups[task]))
+                turn_records.extend(records[task])
+            print(
+                _record_batch_wall(batch_started, _now(), parent_slot,
+                                   rows=state["batch_size"]),
+                flush=True,
+            )
+
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -1179,168 +1476,42 @@ class TrajectoryCollector:
             gpu_profiler.ensure_started()
         _batch_started = _now()
         # Trajectory collection loop
-        for _step in range(self.config.env.max_steps):
-            active_masks = np.logical_not(is_done)
+        # ONE TURN, FOR ONE SET OF ROWS.
+        #
+        # _advance_turn is the only copy of a turn, and both callers go through
+        # it: the batch-wide loop hands it every row, the per-task loop hands it
+        # one task's rows. Two copies would drift in silence -- a turn produces
+        # trajectory rows, not an exception, so a divergence would surface as a
+        # score that moved for no reason anyone could name.
+        state = {
+            "batch_size": batch_size,
+            "gen_batch": gen_batch,
+            "actor_rollout_wg": actor_rollout_wg,
+            "envs": envs,
+            "obs": obs,
+            "is_done": is_done,
+            "uid_batch": uid_batch,
+            "traj_uid": traj_uid,
+            "total_batch_list": total_batch_list,
+            "total_infos": total_infos,
+            "episode_lengths": episode_lengths,
+            "episode_rewards": episode_rewards,
+            "tool_callings": tool_callings,
+        }
 
-            # Phase-1 throughput optimization: only generate for trajectories that
-            # are still active. Steps belonging to already-finished trajectories
-            # carry active_masks=False and are discarded by gather_rollout_data(),
-            # so generating them is pure wasted GPU compute. This waste is large in
-            # the multitask setting where e.g. search episodes finish within a few
-            # turns while the loop keeps running up to alfworld's max_steps. As
-            # episodes finish, the vLLM generation batch shrinks accordingly.
-            if not active_masks.any():
-                break
-            active_idx = np.nonzero(active_masks)[0]
-            _m0 = _now()
-
-            _pre_active_mask = active_masks if _ROLLOUT_SKIP_DONE_PREPROC else None
-            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
-
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            batch_input = batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
-            batch_input.meta_info = gen_batch.meta_info
-            _m_preproc = _now()  # end of CPU preprocess (tokenize/pop)
-
-            # Restrict generation to active trajectories only; done rows are filled
-            # back in afterwards (and dropped downstream via active_masks).
-            generate_all = len(active_idx) == batch_size
-            active_batch_input = batch_input if generate_all else batch_input[active_idx]
-
-            # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
-            _gw0 = gpu_profiler.now()
-            batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
-            _gw1 = gpu_profiler.now()
+        groups = _per_task_groups(envs, obs, self._logprob_prefetch_enabled)
+        if groups is not None:
+            self._advance_per_task(groups, state, _turn_records, _batch_started)
+        else:
+            rows = np.arange(batch_size)
+            for _step in range(self.config.env.max_steps):
+                if not self._advance_turn(rows=rows, turn=_step, task=None,
+                                          state=state, turn_records=_turn_records):
+                    break
             if _turn_records is not None:
-                _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)
-            # # unpad
-            active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
-            _m_gen = _now()  # end of GPU generation window
-
-            # Scatter active outputs back to the full batch size for union/recording.
-            batch_output = active_batch_output if generate_all else \
-                self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
-
-            batch.non_tensor_batch['uid'] = uid_batch
-            batch.non_tensor_batch['traj_uid'] = traj_uid
-
-            batch = batch.union(batch_output)
-
-            if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:
-                text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-            else:
-                # Decode only the generated rows; finished rows' scattered filler
-                # is pad-only, which batch_decode(skip_special_tokens=True) would
-                # render as '' anyway.
-                active_actions = self.tokenizer.batch_decode(
-                    active_batch_output.batch['responses'], skip_special_tokens=True
+                _print_turn_timing(
+                    _turn_records, span=(_batch_started, _now()), slot=_current_slot(), rows=batch_size
                 )
-                text_actions = [''] * batch_size
-                for pos, idx in enumerate(active_idx):
-                    text_actions[idx] = active_actions[pos]
-            _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
-
-            if self._logprob_prefetch_enabled and self._logprob_pending:
-                # Overlap: envs.step (CPU/HTTP/IPC, GPU idle) runs in a background
-                # thread while the GPU prefetches old_log_prob for finished
-                # trajectories. The prefetch call returns before the next
-                # generate_sequences is issued, so it never contends with
-                # generation on the worker actors.
-                if self._env_step_executor is None:
-                    self._env_step_executor = ThreadPoolExecutor(max_workers=1)
-                env_future = self._env_step_executor.submit(envs.step, text_actions)
-                self._prefetch_pending_log_probs(actor_rollout_wg)
-                next_obs, rewards, dones, infos = env_future.result()
-            else:
-                next_obs, rewards, dones, infos = envs.step(text_actions)
-            _m_env = _now()  # end of env.step (CPU / HTTP / IPC)
-
-            if _turn_records is not None:
-                _turn_records.append({
-                    "turn": _step,
-                    "active": int(len(active_idx)),
-                    "preproc": _m_preproc - _m0,
-                    "gen": _m_gen - _m_preproc,
-                    "decode": _m_decode - _m_gen,
-                    "envstep": _m_env - _m_decode,
-                    "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
-                    "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
-                    "prompt_tok": _prompt_tok,
-                    "gen_tok": _gen_tok,
-                })
-
-
-            if len(rewards.shape) == 2:
-                rewards = rewards.squeeze(1)
-            if len(dones.shape) == 2:
-                # dones is numpy, delete a dimension
-                dones = dones.squeeze(1)
-
-            if 'is_action_valid' in infos[0]:
-                batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
-            else:
-                batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
-
-            if 'tool_calling' in infos[0]:
-                tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
-            # Create reward tensor, only assign rewards for active environments
-            # episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
-            episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
-            episode_lengths[active_masks] += 1
-
-            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
-            batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
-            batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
-            
-            # Update episode lengths for active environments
-            batch_list: list[dict] = to_list_of_dict(batch)
-
-            for i in range(batch_size):
-                if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
-                    # Finished trajectories' rows carry active_masks=False and are
-                    # dropped by gather_rollout_data(); skip materializing them.
-                    # Active rows form a prefix of each trajectory's list, so the
-                    # enumerate-based turn_step and the last-active-entry scans in
-                    # success_evaluator / filter_group_data are unchanged.
-                    continue
-                total_batch_list[i].append(batch_list[i])
-                total_infos[i].append(infos[i])
-
-            # Update done states
-            newly_done = np.logical_and(active_masks, dones)
-            is_done = np.logical_or(is_done, dones)
-
-            if self._logprob_prefetch_enabled:
-                # Trajectories that finished this turn now have all their rows
-                # final; queue them for prefetched old_log_prob on later turns.
-                for i in np.nonzero(newly_done)[0]:
-                    for step_idx, row in enumerate(total_batch_list[i]):
-                        if row['active_masks']:
-                            self._logprob_pending.append(((traj_uid[i], step_idx), row))
-
-            # Update observations for next step
-            obs = next_obs
-
-            # Break if all environments are done
-            if is_done.all():
-                break
-
-        if _turn_records is not None:
-            _print_turn_timing(
-                _turn_records, span=(_batch_started, _now()), slot=_current_slot(), rows=batch_size
-            )
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,

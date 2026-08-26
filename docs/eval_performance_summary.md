@@ -222,6 +222,8 @@ chunked prefill と合流、depth 3 と合流。前者は合算がゼロだっ�
 | `[rollout-phases]` | `vllm_rollout_spmd.py` | engine 境界の 3 脚 | engine の内側 |
 | `[rollout-merge]` | `generate_merge.py` | 合流率と相乗り行数 | — |
 | `[rollout-pump]` | `pump_client.py` | 投入・完了・round 数・rank ごとの in-flight | engine の内側 |
+| `[rollout-advance]` | `rollout_loop.py` | turn が lock-step か task ごとか | どちらが速いか |
+| turn table `slot=<slot>/<task>` | 同(§7.6 が ON のとき) | **task ごとの内訳** | task をまたぐ相互作用 |
 | `[val-pipeline]` 被覆 | `val_pipeline.py` | **どの slot も走っていない**時間、呼び出しスレッドの内訳 | slot が走っていて GPU が空いている状態 |
 | wandb system stream | wandb | **機械の util(唯一の真値)** | 15 秒点サンプル。原因は言わない |
 
@@ -241,6 +243,7 @@ ROLLOUT_ASYNC_GENERATE=1    engine をプールとして回す(既定 OFF、合�
 ROLLOUT_PUMP_ROUND_S=0.02   1 round の待ち。長いほど RPC は減り、完了通知は遅れる
 ROLLOUT_PUMP_REPORT_EVERY=0 [rollout-pump] の周期(0 で session 終了時だけ)
 ROLLOUT_PUMP_MAX_IN_FLIGHT=0 engine に同時に預ける上限(0 で無制限。既定でよい)
+ROLLOUT_PER_TASK_ADVANCE=1 task ごとに turn を進める(既定 OFF、§7.6)
 ```
 
 ---
@@ -389,12 +392,83 @@ bash examples/sft_trainer/eval_checkpoints.sh \
 
 ---
 
+## 7.6 per-task advance(task ごとに turn を進める)
+
+`ROLLOUT_PER_TASK_ADVANCE=1`。**§4 の (a) 10.6% を狙う唯一の打ち手**で、async
+(§7.5)が狙った (c) 0.4% とは的が違う。
+
+### 何が問題だったか
+
+turn ループが 1 本しかないので、全 task が毎 turn の境界で最も遅い task を待つ。
+alfworld は 50 turn、search は 4 turn、webshop は 15 turn なので、search が
+4 turn で終わった後も**その行は alfworld の 50 turn 目まで同じループに縛られる**。
+そして §4 の測定どおり、preproc も envstep も互いに取り合って一緒に遅くなるので
+位相がずれず、**3 task が揃って GPU の外にいる時間**ができる。
+
+「揃って」いるのは物理ではなく、lock-step ループがそう並べているからである。
+
+### 何をしたか
+
+| | |
+| --- | --- |
+| `MultiTaskEnvironmentManager.step(text_actions, tasks=[t])` | t だけを step する。`_task_steps` / `_task_done` / `_last_obs_by_task` は元から task キーなので、別 task を持つ呼び出し同士は同じキーに触れない |
+| `task_row_indices()` | task → 行番号。reset が決めた分割そのもので、**互いに素**である |
+| `_advance_turn(rows=..., task=...)` | turn 1 回ぶん。**唯一の実装**で、batch 全体のループも per-task のループも同じものを呼ぶ |
+| `_advance_per_task` | task ごとに 1 スレッド。各スレッドは自分の行だけを書く |
+
+**ロックは無い。** 行集合が互いに素なので、共有配列の各要素に書き手は 1 人しか
+いない。危険なのは「同じ task を 2 スレッドが名指す」ことで、task ごとに 1 本
+という fan-out がそれを構造的に禁じている。
+
+### 断る条件(`_per_task_groups`)
+
+| 条件 | 理由 |
+| --- | --- |
+| flag が OFF / task が 1 つ | 分ける相手がいない |
+| `obs['image']` がある | batch 全体で 1 枚の配列で、行ごとに書き込めるリストではない |
+| `_logprob_prefetch_enabled` | 共有リストに append し、env.step 中に GPU へ 2 本目を投げる。学習側の機構で、検証では立たない |
+
+**trajectory 単位ではなく task 単位である。** manager が持つ turn カウンタが
+task ごとだからで、行ごとにするには alfworld / webshop / search の
+env package を de-vectorize する必要がある(`docs/optimization_report.md` が
+「multi-week」と書いているのはこれ)。**task 単位は (a) の位相ずれを作るには
+足りる**というのがここの賭けで、足りるかどうかは測って決める。
+
+### 生成は変わる
+
+merge と同じ理由で変わる。各 task が自分の行だけで generate するので batch の
+形が変わり、reduction 順序が変わる。**採否は score でしか決められない。**
+`tests/ray_cpu/test_per_task_advance.py` が保証するのは記帳の方 ——
+生成を行ごとの純関数にした条件で、lock-step と per-task が同じ
+`total_batch_list` / rewards / episode_lengths を作ること。
+
+### 走らせ方
+
+```bash
+ray stop --force
+ROLLOUT_PER_TASK_ADVANCE=1 ROLLOUT_ASYNC_GENERATE=1 \
+EXPECTED_CONFIG_WAIVE=env.multitask.val_per_task_batch_size \
+bash examples/sft_trainer/eval_checkpoints.sh 100 \
+  -- env.multitask.val_per_task_batch_size='{alfworld:126,search:252,webshop:126}' \
+  2>&1 | tee /tmp/eval_pta.log
+```
+
+async とは独立に効くが、**組み合わせる意味はある** —— per-task advance は
+3 本の generate 呼び出しを同時に立てるので、pump が無ければそれらは worker
+group 上で直列に並ぶ。§7.5 の pump がそこを埋める。
+
+turn table が **task ごとに 1 枚**出るようになる(`slot=primary/search` など)。
+「タスクごとの内訳が出せない」と書いてあった §6 の穴はここで埋まる。WALL 行は
+batch ごとに 1 本のままで、3 枚の表が 3 本の WALL を出すことはない。
+
+---
+
 ## 8. 残っている打ち手
 
 | | 見込み | コスト |
 | --- | ---: | --- |
 | **preproc の増分トークナイズ** | util +6 pt、wall −8% | 毎 turn 履歴を丸ごと tokenize し直しているのを、token id を持ち回って差分だけにする。**BPE の結合が turn 境界をまたぐと採点が変わる**ので、全 turn で「全履歴 tokenize」と「差分連結」が token 単位で一致することを実軌跡で確認するテストが先 |
-| **trajectory ごとの env step** | util +6 pt(§4a の残り) | いまの async は generate だけを非同期にした。slot の中の turn は依然 lock-step で、全行が生成し終わるまで env に進めない。ここを崩すには env manager が部分集合を step できる必要があり、retriever のバッチ化(envstep 10.60→1.00 s/batch)と両立させるため「窓で束ねる」形が要る |
+| **trajectory ごとの env step** | util +6 pt(§4a の残り) | **task 単位までは実装した(§7.6、既定 OFF、未測定)。** 残るのは行単位で、そこは env package の de-vectorize が要る。retriever のバッチ化(envstep 10.60→1.00 s/batch)と両立させるため「窓で束ねる」形が必要になるのも行単位から |
 | `VAL_PIPELINE_DEPTH=4` | 不明 | 合流率が上がる可能性。ただし CPU 競合(§4a)が先に律速する見込み |
 | retriever の GPU 専有 | +2 pt | `CUDA_VISIBLE_DEVICES` で 1 枚ずつ。第三者(`100.86.45.34`)との調整が要る |
 
