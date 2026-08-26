@@ -187,7 +187,15 @@ def test_accumulation_is_additive_across_micro_batches():
 
 def test_a_rendering_taken_before_more_data_is_not_reused_after_it():
     """The host copy is cached to keep the transfer to one per call; a stale one
-    would report the batch that had already been read."""
+    would report the batch that had already been read.
+
+    The cache FIELD is asserted, not just the values, and that is deliberate.
+    ``Tensor.to("cpu")`` on a tensor already on the CPU returns the same object
+    rather than a copy, so on this test's device a stale cache would still read
+    correctly -- it aliases the live array. The bug only appears on the device
+    the code actually runs on, where the transfer is a real copy, so the
+    invariant has to be checked directly rather than through its symptom.
+    """
     tc = _counts()
     args = dict(
         support_ids=torch.tensor([[[1, 2]]]),
@@ -199,9 +207,18 @@ def test_a_rendering_taken_before_more_data_is_not_reused_after_it():
     args["weight"] = _weight_for(args["state"])
     tc.update(**args)
     assert int(tc._cpu()[0].sum()) == 2
+    assert tc._cpu_cache is not None
+
     tc.update(**args)
+    assert tc._cpu_cache is None, "folding more in must drop a rendering taken before it"
     assert int(tc._cpu()[0].sum()) == 4
-    tc.all_reduce()  # no distributed group here, but it must still drop the cache
+
+    # No distributed group here, so all_reduce is a no-op on the values -- but it
+    # must still drop the cache, or a report rendered before the reduction would
+    # survive it and name one rank's tokens as the batch's.
+    assert tc._cpu_cache is not None
+    tc.all_reduce()
+    assert tc._cpu_cache is None
     assert int(tc._cpu()[0].sum()) == 4
 
 

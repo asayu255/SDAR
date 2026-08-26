@@ -233,6 +233,30 @@ set -x
 #   half to essentially all (hit_rate 0.53 -> 0.99). Same work, less headroom --
 #   so the micro batch has to be sized for the awake-engine case.
 #
+#
+# WHICH TOKENS (algorithm.opd.sign_weight.token_stats). Everything else this arm
+# reports about the weighting has the vocabulary summed out: frac_agree_pos says
+# a fifth of candidates were reinforced and cannot say whether that is the same
+# twenty tokens every step or a different thousand. Those are different
+# mechanisms with identical summaries, and which one this is decides what a gain
+# would mean -- "the tasks share a small stable set of moves" or "the tasks share
+# a broad statistical tendency".
+#
+# On: the shape metrics (sign_weight/*/token/n_distinct, top64_share, and the two
+# halves of Z-1 separately) join the usual scalars, and the ranked table itself is
+# written per step under trainer.sign_token_dump_dir -- top tokens by how OFTEN
+# the teachers agreed about them, and separately by how much they actually moved
+# the target (the signed (w-1)*p, which sums over the vocabulary to Z-1). A token
+# can top one list and be absent from the other, and that gap is the finding.
+#
+# It changes no value. The accumulation is read-only, runs beside the stats the
+# arm already collects, and the weights the loss sees are untouched. What it costs
+# is a dense (4 x 7 x 151,936) accumulator -- 34 MB next to a teacher output
+# projection of 622 MB -- one all-reduce of that, and one device-to-host read, all
+# once per update_actor rather than per micro-batch. Set enable=False to drop it.
+#
+# It is NOT in the intent lock, for the same reason the profiler is not: pinning
+# it would make a measurement a precondition of the experiment.
 # ONE RETRIEVER, POSSIBLY SHARED. env.search.search_url can point at the same
 # server as another concurrent run. What makes that safe is not the URL but the
 # retry policy beside it: env.search.max_retries=null waits for a timeout /
@@ -564,6 +588,8 @@ python3 -m verl.trainer.main_opd \
     +algorithm.opd.sign_weight.disagree_weight=1.0 \
     +algorithm.opd.sign_weight.deadzone=0.1 \
     +algorithm.opd.sign_weight.base_path=Qwen/Qwen3-1.7B \
+    +algorithm.opd.sign_weight.token_stats.enable=True \
+    +algorithm.opd.sign_weight.token_stats.top_n=64 \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \
@@ -590,6 +616,7 @@ python3 -m verl.trainer.main_opd \
     trainer.nnodes=1 \
     trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_signweight_target_teachertopk_multitask \
     trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_signweight_target_teachertopk_qwen3_1.7b \
+    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_multitask_signweight_target_teachertopk_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \

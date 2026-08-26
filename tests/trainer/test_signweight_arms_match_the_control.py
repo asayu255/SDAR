@@ -35,6 +35,10 @@ IDENTITY = {
     "trainer.experiment_name",
     "trainer.default_local_dir",
     "trainer.val_instance_log_dir",
+    # Where the per-token sign-weight tables land. Names the run like the
+    # four above; two arms sharing it would interleave their token tables
+    # into one directory under the same step numbers.
+    "trainer.sign_token_dump_dir",
 }
 
 
