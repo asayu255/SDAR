@@ -1348,3 +1348,152 @@ def test_the_worker_writes_it_beside_the_checkpoint_from_rank_zero_only():
     actor = _actor_source()
     assert "load_sidecar_state(" in actor
     assert "self.cross_teacher_sidecar_path = None" in actor, "consumed once"
+
+
+# --------------------------------------------------------------------------- #
+# the two runs
+# --------------------------------------------------------------------------- #
+import os as _os  # noqa: E402
+
+hydra = pytest.importorskip("hydra")
+yaml = pytest.importorskip("yaml")
+
+from hydra import compose, initialize_config_dir  # noqa: E402
+
+from tests.trainer.test_run_script_overrides_compose import _overrides  # noqa: E402
+
+REPO = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
+CONFIG_DIR = _os.path.join(REPO, "verl", "trainer", "config")
+TREATMENT = "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_qwen3.sh"
+CONTROL = "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_control_qwen3.sh"
+IDENTITY_KEYS = {
+    "trainer.expected_config", "trainer.project_name", "trainer.experiment_name",
+    "trainer.default_local_dir", "trainer.val_instance_log_dir", "trainer.sign_token_dump_dir",
+}
+
+
+def _flat(cfg, prefix=""):
+    from omegaconf import DictConfig
+
+    out = {}
+    for key, value in cfg.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, DictConfig):
+            out.update(_flat(value, prefix=f"{dotted}."))
+        else:
+            out[dotted] = value
+    return out
+
+
+def _effective(script, home="/opt/home/tester"):
+    _os.environ["HOME"] = home
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        return _flat(compose(config_name="ppo_trainer", overrides=list(_overrides(script))))
+
+
+def test_the_control_differs_from_the_treatment_in_the_weight_and_nothing_else():
+    """It is not an ablation -- it is the only run this arm can be compared
+    against. The coefficient moved 1.0 -> 0.01, so every earlier result differs
+    from this one before the mechanism does."""
+    a, b = _effective(TREATMENT), _effective(CONTROL)
+    differing = {k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")}
+    assert differing - IDENTITY_KEYS == {
+        "algorithm.opd.cross_teacher_kl_weight.enable"
+    }, sorted(differing - IDENTITY_KEYS)
+
+
+def test_the_two_runs_do_not_share_a_checkpoint_directory():
+    """resume_mode defaults to auto, so a shared default_local_dir means the
+    second run RESUMES FROM the first and reports it under its own name."""
+    a, b = _effective(TREATMENT), _effective(CONTROL)
+    for key in ("trainer.default_local_dir", "trainer.val_instance_log_dir"):
+        assert a[key] != b[key], key
+
+
+def _composed(script, home="/opt/home/tester"):
+    _os.environ["HOME"] = home
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        return compose(config_name="ppo_trainer", overrides=list(_overrides(script)))
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_each_run_satisfies_its_own_intent_lock(script):
+    """The lock exists to fail in seconds instead of hours, and only does that
+    if the script it guards passes it. Run through the same injection and the
+    same checker the entry point uses -- several pinned keys, the actor-side
+    mirrors among them, do not exist until that injection has run."""
+    from verl.trainer.main_opd_grpo import inject_opd_grpo_config
+    from verl.utils.expected_config import enforce_expected_config
+
+    cfg = _composed(script)
+    inject_opd_grpo_config(cfg)
+    lock = cfg.trainer.expected_config
+    assert lock.startswith("examples/opd_grpo_trainer/"), lock
+    assert enforce_expected_config(cfg, _os.path.join(REPO, lock), tag="test:xt") > 0
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_the_injection_carries_the_block_onto_the_actor(script):
+    """The weight is built inside the actor's forward, so a block that stayed
+    under algorithm.opd would reach nothing and the arm would train plain."""
+    from verl.trainer.main_opd_grpo import inject_opd_grpo_config
+
+    cfg = _composed(script)
+    inject_opd_grpo_config(cfg)
+    xt = cfg.actor_rollout_ref.actor.cross_teacher_kl_weight
+    assert bool(xt.enable) == bool(cfg.algorithm.opd.cross_teacher_kl_weight.enable)
+    assert xt.base_path == cfg.algorithm.opd.cross_teacher_kl_weight.base_path
+    if bool(xt.enable):
+        # The four models are read at ids nobody knows until that forward picks
+        # a support, so the ref side has to keep hidden states.
+        assert cfg.actor_rollout_ref.ref.student_indexed_topk is True
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_the_coefficient_is_pinned_at_the_value_that_rules_out_the_old_baselines(script):
+    cfg = _effective(script)
+    # Authored under algorithm.opd with the other scientific knobs; main_opd
+    # copies it onto the actor at startup, which is why the lock -- validated
+    # AFTER that injection -- is where the actor-side value is checked.
+    assert cfg["algorithm.opd.kl_loss_coef"] == 0.01
+    assert cfg["actor_rollout_ref.actor.pg_loss_coef"] == 1.0
+    lock = yaml.safe_load(open(_os.path.join(REPO, cfg["trainer.expected_config"])))
+    assert lock["actor_rollout_ref.actor.teacher_kl_loss_coef"] == 0.01, (
+        "the coefficient is the reason no earlier run is a baseline; it belongs in the lock"
+    )
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_the_old_mechanism_is_off_and_its_knobs_are_absent(script):
+    """Two mechanisms for one signal. The trainer refuses both at once, and a
+    recipe that carried a stale agree_weight would look like it still meant
+    something."""
+    cfg = _effective(script)
+    assert not cfg.get("algorithm.opd.sign_weight.enable", False)
+    # The ARGUMENTS, not the prose: the header explains what the old table was
+    # and why this arm has none, and a test that forbade the words would forbid
+    # saying so.
+    args = [
+        ln for ln in open(_os.path.join(REPO, script)).read().splitlines()
+        if not ln.lstrip().startswith("#") and "=" in ln
+    ]
+    for knob in ("agree_weight", "agree_neg_weight", "disagree_weight", "deadzone"):
+        assert not [ln for ln in args if knob in ln], knob
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_the_run_takes_the_support_the_mechanism_is_defined_on(script):
+    """Every model is measured on the STUDENT's top-k, and the ref side has to
+    keep hidden states because those ids do not exist until the actor's forward."""
+    cfg = _effective(script)
+    assert cfg["actor_rollout_ref.actor.student_indexed_topk"] is True
+    assert cfg["algorithm.opd.kl_loss_type"] == "topk_kl"
+
+
+def test_the_treatment_pins_the_base_checkpoint_the_whole_scale_is_measured_against():
+    cfg = _effective(TREATMENT)
+    lock = yaml.safe_load(open(_os.path.join(REPO, cfg["trainer.expected_config"])))
+    assert lock["algorithm.opd.cross_teacher_kl_weight.base_path"] == cfg["actor_rollout_ref.model.path"], (
+        "the shifts are relative to the checkpoint the teachers were fine-tuned FROM; "
+        "the student starts there too, which is what makes step 0 the zero of the ladder"
+    )
