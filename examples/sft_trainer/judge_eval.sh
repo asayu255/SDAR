@@ -51,8 +51,26 @@ for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
 done
 
 # Ray prefixes worker output with "(SFTMultiTaskTaskRunner pid=NNN) ". Strip it
-# so the patterns below can anchor on the instrument's own tag.
-_clean() { sed 's/^([^)]*) //' "$1"; }
+# so the patterns below can anchor on the instrument's own tag -- ONCE, into a
+# file, which every check below then greps directly.
+#
+# NOT `sed ... | grep -q`, which is what this used to be. Under `set -o
+# pipefail` an early-exiting grep (-q, -m1) closes the pipe the moment it
+# matches, sed dies of SIGPIPE, and the pipeline reports 141 -- so a pattern
+# that MATCHED reads as absent. It only misfires when the match is early and
+# the file is long, which is every real log and no test log: this script
+# reported "pump off (no [rollout-pump] line)" for two runs that both printed
+# that line in their first seconds, and "TOO EARLY. No residency report yet."
+# directly under the residency report it had just printed. Checks that read to
+# EOF (grep | tail, grep -c) were unaffected, which is why half the output was
+# right and half was inverted.
+_NORMDIR=$(mktemp -d)
+trap 'rm -rf "$_NORMDIR"' EXIT
+_clean() {
+    local out="$_NORMDIR/$(printf '%s' "$1" | md5sum | cut -c1-16)"
+    [ -s "$out" ] || sed 's/^([^)]*) //' "$1" > "$out"
+    printf '%s' "$out"
+}
 
 rule() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
@@ -63,18 +81,19 @@ rule() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 engaged() {
     local log="$1" label="$2"
     printf '%-28s ' "$label"
-    if _clean "$log" | grep -q 'rollout-pump.*driving .* ranks as a pool'; then
-        echo "PUMP ON  -- $(_clean "$log" | grep -m1 -o 'driving [0-9]* ranks as a pool')"
-    elif _clean "$log" | grep -q 'rollout-pump.*staying on the blocking path\|rollout-pump.*handshake failed'; then
+    local f; f=$(_clean "$log")
+    if grep -q 'rollout-pump.*driving .* ranks as a pool' "$f"; then
+        echo "PUMP ON  -- $(grep -m1 -o 'driving [0-9]* ranks as a pool' "$f")"
+    elif grep -q 'rollout-pump.*staying on the blocking path\|rollout-pump.*handshake failed' "$f"; then
         echo "PUMP REFUSED (this log measures the blocking path, not the pump):"
-        _clean "$log" | grep -m1 'rollout-pump.*\(staying on the blocking path\|handshake failed\)' | sed 's/^/    /'
-    elif _clean "$log" | grep -q 'rollout-pump.*the pool was never used'; then
+        grep -m1 'rollout-pump.*\(staying on the blocking path\|handshake failed\)' "$f" | sed 's/^/    /'
+    elif grep -q 'rollout-pump.*the pool was never used' "$f"; then
         echo "PUMP NEVER USED -- every generate took the blocking path"
     else
         echo "pump off (no [rollout-pump] line)"
     fi
     printf '%-28s ' "  slots"
-    _clean "$log" | grep -m1 -o 'VAL_PIPELINE_DEPTH=[0-9]*: [0-9]* slot(s)' || echo "NOT FOUND"
+    grep -m1 -o 'VAL_PIPELINE_DEPTH=[0-9]*: [0-9]* slot(s)' "$f" || echo "NOT FOUND"
 }
 
 # --- 2. the number the change was aimed at ---------------------------------- #
@@ -84,12 +103,13 @@ engaged() {
 residency() {
     local log="$1"
     local line
-    line=$(_clean "$log" | grep 'gpu-residency.*EMPTY' | tail -1)
+    local f; f=$(_clean "$log")
+    line=$(grep 'gpu-residency.*EMPTY' "$f" | tail -1)
     if [ -z "$line" ]; then
         echo "  NOT FOUND -- GPU_PROFILER=0, or the run has not reached its first report"
         return
     fi
-    _clean "$log" | grep 'gpu-residency.*sampled' | tail -1 | sed 's/^/  /'
+    grep 'gpu-residency.*sampled' "$f" | tail -1 | sed 's/^/  /'
     echo "$line" | sed 's/^/  /'
 }
 
@@ -97,7 +117,7 @@ residency() {
 scores() {
     local log="$1"
     local found
-    found=$(_clean "$log" | grep -oE "'val/[^']*(test_score|success_rate)': [0-9.]+" | tail -40)
+    found=$(grep -oE "'val/[^']*(test_score|success_rate)': [0-9.]+" "$(_clean "$log")" | tail -40)
     if [ -z "$found" ]; then
         echo "  NOT FOUND -- the run has not finished validating"
         return
@@ -110,7 +130,7 @@ scores() {
 # [val-hash] is a sha1 of each batch's response ids: same tokens, same digest.
 hashes() {
     local log="$1"
-    _clean "$log" | grep -c 'val-hash' | sed 's/^/  batches hashed: /'
+    grep -c 'val-hash' "$(_clean "$log")" | sed 's/^/  batches hashed: /'
 }
 
 rule "1. did the path under test engage?"
@@ -145,7 +165,7 @@ if [ -n "$CANDIDATE" ]; then
     # Joined on batch index, not diffed as sorted sets, so a run that was killed
     # early still answers: the overlap of the two logs is what gets compared.
     # This is the check that does NOT need a finished run.
-    _digests() { _clean "$1" | sed -n 's/.*val-hash\] batch#\([0-9]*\) .*sha1 \([0-9a-f]*\).*/\1 \2/p' | sort -n -u; }
+    _digests() { sed -n 's/.*val-hash\] batch#\([0-9]*\) .*sha1 \([0-9a-f]*\).*/\1 \2/p' "$(_clean "$1")" | sort -n -u; }
     read -r COMPARED DIFFERING <<<"$(join <(_digests "$CONTROL") <(_digests "$CANDIDATE") \
         | awk '{n++; if ($2 != $3) d++} END {print n+0, d+0}')"
     echo "  batches present in BOTH logs: $COMPARED"
@@ -165,33 +185,70 @@ fi
 # 100k against 632k prompt tokens, a 6x spread that swamps any real difference.
 # ms/row divides it out, which is why the WALL line carries it.
 rule "5. speed -- ms/row, normalised across the batch mix"
+_msrow() { grep -o 'ms/row last[0-9]*=[0-9]* all=[0-9]*' "$(_clean "$1")"; }
 for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
     printf '%-24s ' "$(basename "$f"):"
-    line=$(_clean "$f" | grep -o 'ms/row last[0-9]*=[0-9]* all=[0-9]*' | tail -1)
+    line=$(_msrow "$f" | tail -1)
     if [ -n "$line" ]; then
-        batches=$(_clean "$f" | grep -c 'WALL ')
-        echo "$line   (over $batches batches)"
+        echo "$line   (over $(_msrow "$f" | wc -l | tr -d ' ') batches)"
     else
         echo "NOT FOUND -- no [rollout-turn-timing] WALL line yet"
     fi
 done
+# The two lines above are each run's own last reading, and a run that is 57
+# batches further along has eaten a different slice of the task mix -- which is
+# the trap this whole section exists to avoid, left in place one line further
+# down. `all=` is cumulative, so the Kth reading IS the run's ms/row over its
+# first K batches: take K = the shorter run's length and the two numbers cover
+# the same batches. This is the only pair here that may be subtracted.
+if [ -n "$CANDIDATE" ]; then
+    _k_ctl=$(_msrow "$CONTROL" | wc -l); _k_can=$(_msrow "$CANDIDATE" | wc -l)
+    K=$(( _k_ctl < _k_can ? _k_ctl : _k_can ))
+    if [ "$K" -gt 0 ]; then
+        A=$(_msrow "$CONTROL"   | sed -n "${K}p" | grep -o 'all=[0-9]*' | cut -d= -f2)
+        B=$(_msrow "$CANDIDATE" | sed -n "${K}p" | grep -o 'all=[0-9]*' | cut -d= -f2)
+        printf '  same-prefix (first %s batches of each): control all=%s  candidate all=%s' "$K" "$A" "$B"
+        [ -n "$A" ] && [ -n "$B" ] && [ "$A" -gt 0 ] \
+            && printf '   -> %+.1f%%' "$(awk -v a="$A" -v b="$B" 'BEGIN{print 100*(b-a)/a}')"
+        echo
+    fi
+fi
 cat <<'NOTE'
   Read "all=", not "last=": the last-20 window moves with whichever tasks
-  happened to be in it. Two runs are comparable on this only once both have
-  passed roughly the same batch count, since the mix is not uniform in time.
+  happened to be in it. Compare on the same-prefix line, not on the two
+  per-run lines: the mix is not uniform in time, so two runs at different
+  batch counts are two different experiments.
 NOTE
 
 rule "6. wall"
 for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
     printf '%-24s ' "$(basename "$f"):"
-    _clean "$f" | grep -o 'val-pipeline\] final:.*over [0-9.]*s' | tail -1 \
-        || _clean "$f" | grep -o 'val-pipeline\] after [0-9]*:.*over [0-9.]*s' | tail -1 \
+    _f=$(_clean "$f")
+    grep -o 'val-pipeline\] final:.*over [0-9.]*s' "$_f" | tail -1 \
+        || grep -o 'val-pipeline\] after [0-9]*:.*over [0-9.]*s' "$_f" | tail -1 \
         || echo "NOT FOUND"
 done
+# Same correction as section 5. Each [val-pipeline] report carries the wall so
+# far, so the two runs can be read at a batch count they both reached.
+if [ -n "$CANDIDATE" ]; then
+    _wall_at() { sed -n 's/.*val-pipeline\] \(final\|after [0-9]*\): \([0-9]*\) batches over \([0-9.]*\)s.*/\2 \3/p' "$(_clean "$1")"; }
+    N=$(join <(_wall_at "$CONTROL" | sort -k1,1) <(_wall_at "$CANDIDATE" | sort -k1,1) \
+        | sort -n -k1,1 | tail -1)
+    if [ -n "$N" ]; then
+        set -- $N
+        printf '  same-prefix (%s batches each): control %ss  candidate %ss' "$1" "$2" "$3"
+        awk -v a="$2" -v b="$3" 'BEGIN{if (a>0) printf "   -> %+.1f%%", 100*(b-a)/a}'
+        echo
+    else
+        echo "  same-prefix: no batch count reported by BOTH runs yet"
+        echo "  (VAL_PIPELINE_REPORT_EVERY differed between them -- the reports"
+        echo "   have to land on a common multiple to be paired.)"
+    fi
+fi
 
 # --- what can be decided right now ------------------------------------------ #
 rule "VERDICT"
-_have() { _clean "$1" | grep -q "$2"; }
+_have() { grep -q "$2" "$(_clean "$1")"; }
 
 if [ -z "$CANDIDATE" ]; then
     echo "  One log given -- this is a reading, not a comparison. Pass a control"

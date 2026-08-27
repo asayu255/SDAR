@@ -41,7 +41,11 @@ echo "[env] source      : $SRC"
 echo "[env] destination : $DST"
 echo "[env] vllm        : $VLLM_VERSION"
 
-if conda env list | awk '{print $1}' | grep -qx "$DST"; then
+# Not `conda env list | awk | grep -qx`: with pipefail set, grep -q exits on
+# the match and awk dies of SIGPIPE, so the pipeline returns 141 and an env that
+# EXISTS reads as absent. It survives here only because the listing is short
+# enough to fit the pipe buffer before grep leaves. Substitute first, test after.
+if printf '%s\n' "$(conda env list | awk '{print $1}')" | grep -qx "$DST"; then
     echo "[env] $DST already exists. Remove it first, or pass another name:" >&2
     echo "        conda env remove -n $DST" >&2
     exit 1
