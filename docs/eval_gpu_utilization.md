@@ -2360,3 +2360,88 @@ section 5 が `ms/row all=` を両方から出す。**`last=` ではなく `all=
 
 手で `grep TOTAL` をやり直さないこと。スクリプトに入れたのは、
 **同じ間違いを二度としないためである。**
+
+---
+
+## 34. スパイクの原因 —— 片方は確定、片方は「箱の外を待っている」まで
+
+「原因は結局なんなのか」に、いま言える範囲で正確に答える。
+
+### スパイクは 2 種類あり、片方しか特定できていない
+
+同じ 24 分窓、node util < 60% のサンプル:
+
+| | depth 2 | depth 3 | + pump |
+| --- | ---: | ---: | ---: |
+| **スパイク(<60%)** | 18.4% | 16.9% | **15.8%** |
+| node util | 78.19% | 79.58% | **79.90%** |
+
+**消えていない。** 3 構成でスパイク 18.4% → 15.8%、util +1.7 pt。
+
+内訳(pump run、起動後 210 サンプル):
+
+| 種類 | 割合 | 正体 | 確定か |
+| --- | ---: | --- | :---: |
+| **PARTIAL**(1〜2 枚) | 7.5% | **collective generate の尾**。rank が自分の chunk を終えて最遅 rank を待つ | **✅ 確定** |
+| **EMPTY / DEEP** | **5.2%**(165s) | **箱の外を待っている** | ⚠️ 半分 |
+| **EMPTY / SHALLOW** | 3.3% | 15 秒サンプルのエイリアシング(GPU は窓の大半で動いている) | ✅ 確定 |
+
+### PARTIAL が確定している理由
+
+**機構が予測した動きを 2 回とも見せた。** depth を上げても動かず(collective の
+中なので届かない)、pump を入れると半減した(12.7% → 7.5%、rank が空かなくなる)。
+外れる余地がない。
+
+### DEEP EMPTY —— ここまでは分かっている
+
+power < 130W が続くサンプル 11 本(165 秒)を、busy と突き合わせた:
+
+| | DEEP EMPTY | busy |
+| --- | ---: | ---: |
+| GPU sm util | **1.5%** | 91.7% |
+| GPU power | **87.9 W** | 288.4 W |
+| **GPU メモリコントローラ** | **0.8%** | 78.4% |
+| GPU smClock | 1442 MHz | 1688 MHz |
+| host CPU | **0.6%** | **0.6%** |
+| スレッド数 | 868 | 856 |
+| disk read | 0 | 0 |
+| RSS | 4394 MB | 4355 MB |
+
+**GPU は計算も転送もしていない(メモリコントローラ 0.8%)。ホストも動いていない。
+ディスクも読んでいない。スレッドは全部生きている。**
+
+計算待ちでも帯域待ちでも I/O 待ちでもない。**プロセス全体が、箱の外の何かを
+待っている形**である。
+
+### なぜ「retriever」と断定しないか
+
+外にあるのは retriever だけなので状況証拠は強い。**しかし wandb の
+`system.cpu` は busy でも DEEP EMPTY でも 0.6% で、GIL を握った Python 1 本を
+見分けられる分解能が無い。** 「Python が回っている」と「ソケットを待っている」を
+この計器では区別できない。
+
+**断定できないものを断定しない。** §33 で `grep TOTAL` を根拠に断定しかけて
+外したばかりである。
+
+### 決着させる計器を足した
+
+`cpu_pct`(100% = 1 コア)は gpu_profiler の host sampler が既に取っている。
+それを residency と同じ時刻で切って、`[gpu-residency]` に出す:
+
+```
+[gpu-residency] driver CPU 190% of one core while EMPTY vs 40% while busy
+                -> EMPTY is Python on the driver
+```
+```
+[gpu-residency] driver CPU 3% of one core while EMPTY vs 150% while busy
+                -> EMPTY is a wait OFF the box (retriever, RPC)
+```
+
+**ソケットを待っているプロセスは CPU を焼かない。** そこが唯一の見分けである。
+PARTIAL のサンプルはどちらにも入れない —— 第 3 の状態で、平均に混ぜると嘘になる。
+`psutil` が無ければ**何も言わない**(行は出るが判定は付かない)。
+
+**次の run のログが `EMPTY is ...` を名指す。** そこで初めて打ち手が決まる:
+
+- **Python on the driver** → GIL。GPU の並べ替えでは動かない(§33 の保存則の説明)
+- **a wait OFF the box** → retriever。複製するか、Flat index をやめる

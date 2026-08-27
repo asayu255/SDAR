@@ -20,11 +20,12 @@ from verl.utils import gpu_profiler as gp  # noqa: E402
 class _FakeSampler:
     """Just enough of Sampler for residency_between: a lock and a util trace."""
 
-    def __init__(self, trace):
+    def __init__(self, trace, cpu=None):
         import threading
 
         self._lock = threading.Lock()
         self._util_trace = list(trace)
+        self._cpu_trace = list(cpu or [])
 
     residency_between = gp._Sampler.residency_between
 
@@ -147,9 +148,10 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     class _LiveFakeSampler:
         residency_between = live._Sampler.residency_between
 
-        def __init__(self, trace):
+        def __init__(self, trace, cpu=None):
             self._lock = threading.Lock()
             self._util_trace = list(trace)
+            self._cpu_trace = list(cpu or [])
 
     start = time.perf_counter()
     end = start + 3.0
@@ -215,3 +217,50 @@ def test_an_unreadable_card_does_not_fake_a_spread():
 def test_a_single_gpu_box_prints_no_spread():
     sampler = _FakeSampler(_trace([[90]] * 4))
     assert "per-gpu" not in gp.format_residency(sampler.residency_between(0, 1e9))
+
+
+# --------------------------------------------------------------------------- #
+# WHY the cards were empty: the two causes look identical on the GPU
+# --------------------------------------------------------------------------- #
+def _cpu(trace, pct):
+    """Driver cpu_pct stamped on the same instants as the util trace."""
+    return [(ts, pct(vals)) for ts, vals in trace]
+
+
+def test_python_holding_the_gil_is_named_as_python():
+    """cpu_pct is a percentage of ONE core, so Python at the wheel reads high."""
+    trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
+    cpu = _cpu(trace, lambda v: 190.0 if max(v) == 0 else 40.0)
+    line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
+    assert "driver CPU 190% of one core while EMPTY" in line, line
+    assert "EMPTY is Python on the driver" in line, line
+
+
+def test_a_wait_off_the_box_is_named_as_a_wait():
+    """A process blocked on a socket burns no CPU, which is the whole tell.
+
+    MEASURED on the pump run's deep-idle samples: GPU 1.5%, memory controller
+    0.8%, power 88 W against 288 W, host CPU and thread count indistinguishable
+    from a busy sample, disk at zero. Nothing anywhere was working.
+    """
+    trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
+    cpu = _cpu(trace, lambda v: 3.0 if max(v) == 0 else 150.0)
+    line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
+    assert "EMPTY is a wait OFF the box" in line, line
+
+
+def test_no_cpu_samples_means_no_verdict_rather_than_a_guess():
+    """psutil may be absent. Silence beats naming a cause from no evidence."""
+    trace = _trace([[0, 0, 0]] * 2 + [[90, 90, 90]] * 8)
+    line = gp.format_residency(_FakeSampler(trace).residency_between(0, 1e9))
+    assert "driver CPU" not in line, line
+    assert "EMPTY 20.0%" in line, "the rest of the line still has to print"
+
+
+def test_partial_samples_are_charged_to_neither_side():
+    """One card working is a third case; averaging it into either verdict lies."""
+    trace = _trace([[0, 0, 0]] * 2 + [[90, 0, 0]] * 2 + [[90, 90, 90]] * 6)
+    cpu = _cpu(trace, lambda v: 5.0 if max(v) == 0 else (999.0 if v[1] == 0 else 100.0))
+    res = _FakeSampler(trace, cpu).residency_between(0, 1e9)
+    assert res["cpu_when_empty"] == pytest.approx(5.0)
+    assert res["cpu_when_busy"] == pytest.approx(100.0), "the 1-busy samples must not leak in"

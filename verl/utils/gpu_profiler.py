@@ -411,6 +411,7 @@ class _Sampler:
         self._samples = []
         # lightweight ring of (ts, mean_sm_util) for mean_util_between()
         self._util_trace = []
+        self._cpu_trace = []
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -468,6 +469,9 @@ class _Sampler:
                 # store per-GPU sm so callers can see data-parallel imbalance
                 per_gpu_sm = [g.get("sm_util") for g in per_gpu]
                 self._util_trace.append((t, per_gpu_sm))
+                # Kept in its own list rather than widened into the tuple above,
+                # which two other readers unpack by shape.
+                self._cpu_trace.append((t, (host or {}).get("cpu_pct")))
             self._write_trace(t, phase, per_gpu, host)
 
     def _write_trace(self, t, phase, per_gpu, host):
@@ -561,6 +565,18 @@ class _Sampler:
         for gi in range(n_gpus):
             col = [vals[gi] for _ts, vals in window if gi < len(vals) and vals[gi] is not None]
             per_gpu.append((sum(col) / len(col)) if col else None)
+        # The driver's own CPU, split the same way. This is what separates the
+        # two reasons every card can be empty at once, which look identical on
+        # the GPU and need opposite fixes: Python holding the GIL (cpu near or
+        # above one core) against the whole process waiting on something off the
+        # box (cpu at idle, which is what a retriever round trip looks like).
+        empty_ts = {ts for ts, vals in window if not any(v is not None and v >= thresh for v in vals)}
+        busy_ts = {ts for ts, vals in window if sum(1 for v in vals if v is not None and v >= thresh) == n_gpus}
+        with self._lock:
+            cpu_at = {ts: pct for ts, pct in self._cpu_trace if pct is not None}
+        def _mean(stamps):
+            vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
+            return (sum(vals) / len(vals)) if vals else None
         return {
             "n_gpus": n_gpus,
             "samples": total,
@@ -569,6 +585,8 @@ class _Sampler:
             "wall_by_count": wall_by_count,
             "pct": {k: 100.0 * v / total for k, v in counts.items()},
             "per_gpu": per_gpu,
+            "cpu_when_empty": _mean(empty_ts),
+            "cpu_when_busy": _mean(busy_ts),
         }
 
     def per_gpu_util_between(self, t0, t1):
@@ -593,6 +611,7 @@ class _Sampler:
             samples = self._samples
             self._samples = []
             self._util_trace = []
+            self._cpu_trace = []
         if not samples:
             return
         by_phase = _accumulate(samples, self.n_gpus)
@@ -733,11 +752,19 @@ def format_residency(res) -> str:
     if len(known) > 1:
         cols = " ".join("--" if v is None else f"{v:.0f}" for v in per_gpu)
         spread = f" | per-gpu {cols} (spread {max(known) - min(known):.0f} pt)"
+    why = ""
+    empty_cpu, busy_cpu = res.get("cpu_when_empty"), res.get("cpu_when_busy")
+    if empty_cpu is not None and busy_cpu is not None:
+        # 100% is one core. Python that is holding the GIL shows up here; a
+        # process waiting on a socket does not.
+        verdict = "Python on the driver" if empty_cpu >= 60 else "a wait OFF the box (retriever, RPC)"
+        why = (f"\n[gpu-residency] driver CPU {empty_cpu:.0f}% of one core while EMPTY "
+               f"vs {busy_cpu:.0f}% while busy -> EMPTY is {verdict}")
     return (
         f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
         f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
         f"PARTIAL {partial:.1f}% (a rank idle inside a collective call -- only the "
-        f"pump fills this), rest is the engine's own duty cycle"
+        f"pump fills this), rest is the engine's own duty cycle" + why
     )
 
 
