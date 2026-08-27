@@ -262,18 +262,24 @@ export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.75}"
 # rows and their order do not change, only how they are grouped, so its score
 # does not move.
 #
-# THE NEXT EXPERIMENT IS 378, and the KV budget above is what makes it possible.
-# The heaviest turn at 252 is 64 active at ~1,330 prompt tokens plus 512 of
-# response, about 118,000 of 159,600 -- 74%. At 378 that is about 156,500, which
-# was too close to 159,600 to try, and is 70% of the 224,000 that 0.75 gives.
-# Change it in BOTH places (they are checked against each other) and change
-# NOTHING ELSE in the same run:
+# search IS NOW 378, in both places. The KV budget above is what made it
+# possible: the heaviest turn at 252 is 64 active at ~1,330 prompt tokens plus
+# 512 of response, about 118,000 of the 159,600 the old budget gave -- 74%, too
+# close to try 378 against. 378 needs about 156,500, 70% of the 224,000 that
+# 0.75 gives.
 #
-#   expected_multitask_sft_config.yaml, and run_multitask_sft_qwen3.sh:
-#     env.multitask.val_per_task_batch_size: {alfworld: 126, search: 378, webshop: 126}
+# WHAT IT IS AIMED AT, so the result can be read: 208 batches become 139, so
+# everything the driver does ONCE PER BATCH is divided by 1.5 and everything it
+# does per row is untouched. It is not aimed at the engine's duty cycle and
+# cannot move it.
 #
 # Compare on ms/row from the WALL lines, NOT on s/batch or batch number --
 # widening turns 208 batches into 139, so neither is the same quantity twice.
+# The two runs also cannot be paired on batch index, so [val-hash] says nothing
+# here: the same rows are grouped differently, which is the change.
+#
+# Not aimed at, and known not to move: the ~70 s of env-manager construction,
+# which is per SLOT and not per batch.
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
