@@ -591,7 +591,10 @@ class vLLMRollout(BaseRollout):
             request_id, future = item
             error = future.exception()
             if error is None:
-                finished.append((request_id, list(future.result())))
+                # Same reason as the prompt ids on the way in: an int32 array
+                # is one buffer, a list of ints is one object per token, and
+                # the driver unpickles it on the thread the census reads.
+                finished.append((request_id, np.asarray(future.result(), dtype=np.int32)))
             else:
                 failed.append((request_id, f"{type(error).__name__}: {error}"))
             try:

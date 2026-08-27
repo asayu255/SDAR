@@ -637,6 +637,64 @@ untagged は 1.5 → 1.0 に減ったので、タグ自体は 0.5 ぶん吸収�
 
 ---
 
+## 7duodecies. tail は pump が既に直していた —— そして round_s は的外れだった
+
+### 建てる前に測った
+
+item 6(trajectory 単位)を作ろうとして、その根拠にした turn table が
+**pump OFF の run のものだった**ことに気づいた。pump ON で測り直す:
+
+| turn | active | pump OFF | **pump ON** |
+| ---: | ---: | ---: | ---: |
+| 2 | 58 → 40 | 13.70 s | **5.58 s** |
+| 3 | 12 → 7 | **10.82 s** | **3.17 s** |
+
+**turn 3 が 10.82 → 3.17 秒。** tail は生成 wall の 48% → **32%**。
+
+理由は明快で、slot A の turn 3(7 行)と slot B の turn 1(252 行)が**同じプール
+に入る**ので、engine は 7 行ではなく 259 行を見る。**pump がそれをやっている。**
+
+**環境マネージャの改造は不要だった。** 既定が直した問題を直すコードを書きかけていた。
+
+(なお真の per-trajectory は環境層で塞がれている: `MultiTaskEnvironmentManager.step`
+は `managers[task].step(actions)` にそのタスクの**全行**を渡し、下位マネージャは
+行の部分集合を進める術を持たない。)
+
+### round_s を上げるのは的外れだった
+
+`cpu-glue` が 15.1%(pump OFF の同型 batch では 6.9〜8.1%)なので pump の
+driver コストを疑い、`ROLLOUT_PUMP_ROUND_S=0.1` を出した。**2 点で誤り:**
+
+1. **worker 側は既に long-poll である。** `self._pump_done.get(timeout=timeout_s)`
+   は完了があれば即返る。`round_s` を上げても**待ちは増えない** —— 空ポーリングが
+   減るだけで、私が言った「latency との引き換え」は存在しない。
+2. **そして空ポーリングは主コストではない。**
+
+### 主コストは `.tolist()` だった
+
+```python
+def _as_id_list(prompt_token_ids):
+    return prompt_token_ids.tolist() if hasattr(...) else list(...)
+```
+
+`raw_prompt_ids` は numpy 配列で来る。これを Ray に渡す前に **Python の list へ
+展開**していた —— **1 token につき 1 個の Python int オブジェクト**を作り、
+pickle し、送り、unpickle する。252 request × 約 1,300 token =
+**1 ターンあたり約 33 万オブジェクト**、driver スレッドで、
+**census が `gen` とタグし、カードが空と読む窓の中で。**
+
+int32 配列は pickle protocol 5 の 1 バッファ(memcpy)である。
+**変換は worker の vLLM 境界で行う** —— list が実際に必要なのはそこだけで、
+1 request ぶんを worker が払う。**待ちは 1 ミリ秒も増えない。**
+
+戻り側も同じ。ただし `pad_2d_list_to_length` は `tuple(sub_list)` を作るので、
+**配列で返すだけでは同じコストが下流に移る**。`_pad_rows` に配列専用の経路を
+足した(`np.full` して行ごとに memcpy)。list 経路は一字も変えていない。
+**2 つの経路が同じテンソルを出すことをテストで固定してある** —— ここが違えば、
+生成と無関係な理由で生成が変わる。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**

@@ -299,3 +299,59 @@ def test_the_driver_forwards_every_meta_key_the_sampling_choice_reads():
         f"sampling_kwargs_for reads {sorted(read - set(_PUMP_META_KEYS))}, "
         f"which the driver does not forward"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the two shapes the two paths hand over
+# --------------------------------------------------------------------------- #
+def test_the_array_path_and_the_list_path_agree():
+    """The pump sends int32 arrays; the blocking path sends lists.
+
+    They must pad to the same tensor, because the only reason the pump sends
+    arrays is transport cost -- if the padded result differed, the two paths
+    would generate differently for a reason that has nothing to do with
+    generation.
+    """
+    import numpy as np
+
+    from verl.workers.rollout.generation_output import _pad_rows
+
+    rows = [[1, 2, 3], [4], []]
+    arrays = [np.asarray(row, dtype=np.int32) for row in rows]
+    assert _pad_rows(arrays, 0, 5).tolist() == _pad_rows(rows, 0, 5).tolist()
+    assert _pad_rows(arrays, 0, 5).dtype == _pad_rows(rows, 0, 5).dtype
+
+
+def test_a_row_longer_than_response_length_is_not_truncated():
+    """max_length is a floor on the width, not a cap on a row."""
+    import numpy as np
+
+    from verl.workers.rollout.generation_output import _pad_rows
+
+    long_row = [np.arange(7, dtype=np.int32)]
+    assert _pad_rows(long_row, 0, 3).shape == (1, 7)
+
+
+def test_a_mixed_batch_falls_back_rather_than_guessing():
+    """One list among the arrays means the fast path does not apply."""
+    import numpy as np
+
+    from verl.workers.rollout.generation_output import _pad_rows
+
+    mixed = [np.asarray([1, 2], dtype=np.int32), [3]]
+    assert _pad_rows(mixed, 0, 3).tolist() == [[1, 2, 0], [3, 0, 0]]
+
+
+def test_the_seed_does_not_change_shape_by_shape():
+    """seed_for_prompt now takes the array directly instead of list()-ing it.
+
+    An array and the list of the same ids have to seed identically, or the
+    transport change would silently move what every prompt samples.
+    """
+    import numpy as np
+
+    from verl.workers.rollout.generation_output import seed_for_prompt
+
+    ids = [11, 22, 33]
+    assert seed_for_prompt(np.asarray(ids, dtype=np.int32), 4) == seed_for_prompt(ids, 4)
+    assert seed_for_prompt(np.asarray(ids, dtype=np.int64), 4) == seed_for_prompt(ids, 4)

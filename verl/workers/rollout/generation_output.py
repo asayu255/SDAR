@@ -101,8 +101,34 @@ def seed_for_prompt(prompt_token_ids: Any, row: int = 0) -> int:
     """
     import zlib
 
-    ids = np.asarray(list(prompt_token_ids), dtype=np.int64)
+    # asarray on the sequence itself, not on list(...) of it: this runs once
+    # per request on the worker, and list() of an array rebuilds every token as
+    # a Python object first.
+    ids = np.asarray(prompt_token_ids, dtype=np.int64)
     return zlib.crc32(ids.tobytes() + int(row).to_bytes(8, "little", signed=True)) & 0x7FFFFFFF
+
+
+def _pad_rows(rows, pad_token_id, response_length):
+    """Right-pad ragged token-id rows into one tensor.
+
+    Two paths because the two callers hand over different shapes. The blocking
+    path produces lists and goes to pad_2d_list_to_length, unchanged. The pump
+    sends int32 arrays over Ray, and feeding those to that helper would undo the
+    saving: `tuple(sub_list)` rebuilds one Python object per token, which is the
+    cost the array was avoiding, moved downstream.
+
+    The array path fills once and copies each row in, so a row is a memcpy.
+    """
+    if not rows or not all(isinstance(row, np.ndarray) for row in rows):
+        return pad_2d_list_to_length(rows, pad_token_id, max_length=response_length)
+
+    longest = max((row.shape[0] for row in rows), default=0)
+    width = max(response_length, longest) if response_length else longest
+    out = np.full((len(rows), width), pad_token_id, dtype=np.int64)
+    for i, row in enumerate(rows):
+        if row.shape[0]:
+            out[i, : row.shape[0]] = row
+    return torch.from_numpy(out)
 
 
 def assemble_generation_output(
@@ -137,7 +163,7 @@ def assemble_generation_output(
     if len(response_token_ids) != batch_size:
         raise ValueError(f"expected {batch_size} responses for {batch_size} prompt rows, got {len(response_token_ids)}")
 
-    response = pad_2d_list_to_length(response_token_ids, pad_token_id, max_length=response_length).to(idx.device)
+    response = _pad_rows(response_token_ids, pad_token_id, response_length).to(idx.device)
     if rollout_log_probs is not None:
         rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=response_length).to(idx.device)
         rollout_log_probs = rollout_log_probs.to(torch.float32)

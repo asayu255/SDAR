@@ -454,7 +454,29 @@ def _generate_via_pump(client, batch_input_padded):
 
 
 def _as_id_list(prompt_token_ids):
-    return prompt_token_ids.tolist() if hasattr(prompt_token_ids, "tolist") else list(prompt_token_ids)
+    """Token ids in the cheapest shape Ray can carry them in.
+
+    raw_prompt_ids arrives as a numpy array, and this used to call .tolist() on
+    it before handing it to the pump -- which builds one Python int object per
+    token, to be pickled, sent, and unpickled one at a time. At 252 requests of
+    roughly 1,300 prompt tokens that is about 330,000 objects per turn, on the
+    driver thread, in the window the census tags as `gen` and the cards read
+    empty.
+
+    An int32 array is a buffer: pickle protocol 5 sends it as one memcpy. The
+    worker converts to a list at the vLLM boundary, where a list is actually
+    required, and pays for one request rather than for the whole turn's worth
+    on the driver.
+
+    A plain sequence that is not already an array still becomes one -- the cost
+    of the conversion is the same either way, and doing it here keeps one shape
+    on the wire.
+    """
+    import numpy as np
+
+    if isinstance(prompt_token_ids, np.ndarray):
+        return prompt_token_ids.astype(np.int32, copy=False)
+    return np.fromiter(prompt_token_ids, dtype=np.int32)
 
 
 def _why_the_pump_cannot_serve(batch_input_padded) -> Optional[str]:

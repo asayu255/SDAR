@@ -49,6 +49,12 @@ class PumpClosed(RuntimeError):
     """Raised for a submission after the pump has stopped, or on a dead pump."""
 
 
+def _as_plain_ids(prompt_token_ids) -> List[int]:
+    """A list of ints for vLLM, from whatever shape crossed the wire."""
+    tolist = getattr(prompt_token_ids, "tolist", None)
+    return tolist() if tolist is not None else list(prompt_token_ids)
+
+
 class TokenPump:
     """A pool over one engine: token ids in, token ids out, per request."""
 
@@ -121,7 +127,10 @@ class TokenPump:
                 self._next_id += 1
             self._pending[request_id] = future
             self.submitted += 1
-        self._submissions.put((request_id, list(prompt_token_ids), sampling_params))
+        # Converted here and not on the driver: vLLM wants a list, but the wire
+        # does not, and .tolist() on the driver builds a Python int per token
+        # for every request in the turn before any of them is sent.
+        self._submissions.put((request_id, _as_plain_ids(prompt_token_ids), sampling_params))
         self._wake.set()
         return future
 

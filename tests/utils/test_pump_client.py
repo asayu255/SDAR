@@ -383,3 +383,44 @@ def test_one_client_still_numbers_its_own_requests_in_order():
         client.submit([1], {})
     tails = [int(rid.rsplit("-", 1)[1]) for rid in client._pending]
     assert sorted(tails) == [0, 1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# what crosses Ray per request
+# --------------------------------------------------------------------------- #
+def test_prompt_ids_cross_as_an_array_not_a_list_of_python_ints():
+    """.tolist() on the driver builds one Python object per token, per request.
+
+    252 requests of roughly 1,300 prompt tokens is about 330,000 objects a turn,
+    created, pickled, sent and unpickled one at a time -- on the driver thread,
+    inside the window the residency census tags as `gen` and the cards read
+    empty. An int32 array is one buffer under pickle protocol 5.
+    """
+    import numpy as np
+
+    from agent_system.multi_turn_rollout.rollout_loop import _as_id_list
+
+    out = _as_id_list(np.asarray([5, 6, 7], dtype=np.int64))
+    assert isinstance(out, np.ndarray), "a list here is the cost this avoids"
+    assert out.dtype == np.int32
+    assert out.tolist() == [5, 6, 7]
+
+
+def test_a_plain_sequence_also_becomes_an_array():
+    """One shape on the wire, whatever the caller had."""
+    from agent_system.multi_turn_rollout.rollout_loop import _as_id_list
+
+    out = _as_id_list([5, 6, 7])
+    assert out.tolist() == [5, 6, 7]
+    assert out.dtype.name == "int32"
+
+
+def test_the_worker_converts_back_at_the_vllm_boundary():
+    """vLLM wants a list; the wire does not. The conversion belongs on the worker."""
+    import numpy as np
+
+    from verl.workers.rollout.token_pump import _as_plain_ids
+
+    assert _as_plain_ids(np.asarray([1, 2], dtype=np.int32)) == [1, 2]
+    assert _as_plain_ids([1, 2]) == [1, 2]
+    assert all(type(v) is int for v in _as_plain_ids(np.asarray([1, 2], dtype=np.int32)))
