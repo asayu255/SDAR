@@ -1168,7 +1168,7 @@ def test_the_accumulators_are_gated_on_the_config_and_not_on_the_batch():
             )
         ):
             assert "xt_enabled" not in line, line
-    gate = src[src.index("if xt_cfg_on and n_task:"):src.index("xt_on = ")]
+    gate = src[src.index("if xt_cfg_on:"):src.index("xt_on = ")]
     assert "xt_enabled" not in gate
 
 
@@ -1497,3 +1497,143 @@ def test_the_treatment_pins_the_base_checkpoint_the_whole_scale_is_measured_agai
         "the shifts are relative to the checkpoint the teachers were fine-tuned FROM; "
         "the student starts there too, which is what makes step 0 the zero of the ladder"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the actor's reliability pass, driven end to end
+# --------------------------------------------------------------------------- #
+def test_the_reliability_pass_runs_on_realistic_shapes_and_files_the_right_cells():
+    """The one new path a CPU suite can otherwise only read.
+
+    It looks the EMITTED token up on its own -- one extra id per model, out of
+    the same cached hidden states -- so its shapes differ from everything else
+    here: a width-1 support against the width-k one the weight is built on. A
+    broadcast error between them is invisible until a GPU run reaches
+    update_actor, which is ten minutes in.
+    """
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    bs, resp, k, n_off, vocab = 4, 5, 6, 2, 40
+    torch.manual_seed(70)
+
+    def lp(width):
+        return torch.log_softmax(torch.randn(bs, resp, width + 4), dim=-1)[..., :width]
+
+    actor = object.__new__(DataParallelPPOActor)
+    actor._xt_adv = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    # The support-width lookups the real actor makes against its teacher cache.
+    actor._teacher_logprobs_at = lambda **kw: lp(kw["ids"].size(-1))
+    actor._cross_teacher_planes = lambda data, ids: (
+        lp(ids.size(-1)),
+        torch.stack([lp(ids.size(-1)) for _ in range(n_off)], dim=-1),
+    )
+
+    on, base = lp(k), lp(k)
+    off = torch.stack([lp(k) for _ in range(n_off)], dim=-1)
+    task_ids = torch.tensor([0, 0, 1, 2])
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    built = build_position_weight(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+        ),
+        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), diag_valid=torch.ones(3, dtype=torch.bool),
+        alpha_table=torch.zeros(3, 3),
+        normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    support_ids = torch.randint(0, vocab, (bs, resp, k))
+    data = {
+        "responses": torch.randint(0, vocab, (bs, resp)),
+        "teacher_cache_ids": torch.arange(bs),
+        "input_ids": torch.randint(0, vocab, (bs, resp + 3)),
+        "attention_mask": torch.ones(bs, resp + 3, dtype=torch.long),
+        "sign_off_tasks": planes,
+        "adv_row_value": torch.tensor([1.0, -1.0, 0.5, -0.5]),
+        "adv_group_informative": torch.ones(bs, dtype=torch.bool),
+        "adv_group_id": torch.tensor([0, 0, 1, 1]),
+    }
+    counter = torch.zeros(2, dtype=torch.float64)
+    DataParallelPPOActor._xt_accumulate_reliability(
+        actor, data=data, built=built, student_topk_logprob=lp(k),
+        support_ids=support_ids, response_mask=torch.ones(bs, resp),
+        task_ids=task_ids, diag=(torch.ones(3), torch.ones(3, dtype=torch.bool)),
+        outside_counter=counter,
+    )
+
+    got = actor._xt_adv.alpha(task_names=TASKS)
+    # Rows of task 0 name search and webshop as their sources; a pair nobody's
+    # rows named must have no cell at all.
+    assert ("alfworld", "search") in got and ("alfworld", "webshop") in got
+    assert got[("alfworld", "search")]["n"] == 2.0
+    for row in got.values():
+        assert row["alpha"] >= 0.0
+        assert row["rho"] is None or math.isfinite(row["rho"])
+    assert float(counter[1]) == bs * resp
+    assert 0.0 <= float(counter[0]) <= float(counter[1])
+
+
+def test_an_arm_with_no_advantages_leaves_the_reliability_untouched():
+    """Pure OPD is a configuration, not a failure: alpha stays 0 and the
+    corroboration channel runs alone."""
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    actor = object.__new__(DataParallelPPOActor)
+    actor._xt_adv = AdvantageReliabilityStats(n_tasks=3, device="cpu")
+    DataParallelPPOActor._xt_accumulate_reliability(
+        actor, data={"responses": torch.zeros(1, 1, dtype=torch.long)}, built=None,
+        student_topk_logprob=None, support_ids=None, response_mask=None,
+        task_ids=torch.zeros(1, dtype=torch.long), diag=None,
+        outside_counter=torch.zeros(2, dtype=torch.float64),
+    )
+    assert float(actor._xt_adv.alpha_table().abs().sum()) == 0.0
+
+
+def test_the_statistics_are_collected_on_the_first_ppo_epoch_only():
+    """The weight is needed on every epoch; the statistics are not. Later epochs
+    re-visit the same rows against a student that has already moved, so folding
+    them in counts each trajectory once per epoch and mixes two policies into
+    one cumulative scale."""
+    import ast
+
+    src = _update_policy_source()
+    assert "xt_collect = epoch == 0" in src
+    tree = ast.parse(src)
+
+    def guarded_calls(node, guards=()):
+        """Every call in the tree, paired with the `if` tests enclosing it."""
+        if isinstance(node, ast.If):
+            test = ast.dump(node.test)
+            for child in node.body:
+                yield from guarded_calls(child, guards + (test,))
+            for child in node.orelse:
+                yield from guarded_calls(child, guards)
+            return
+        if isinstance(node, ast.Call):
+            yield node, guards
+        for child in ast.iter_child_nodes(node):
+            yield from guarded_calls(child, guards)
+
+    def name_of(call):
+        f = call.func
+        return ast.unparse(f) if hasattr(ast, "unparse") else getattr(f, "attr", "")
+
+    collected = {}
+    for call, guards in guarded_calls(tree):
+        collected.setdefault(name_of(call), []).append(guards)
+
+    for accumulate in (
+        "self._xt_rms.update",
+        "self._xt_accumulate_reliability",
+        "self._xt_mean.update",
+        "xt_position_stats.update",
+        "xt_state_stats.update",
+        "xt_pair_stats.update",
+    ):
+        sites = collected.get(accumulate, [])
+        assert sites, accumulate
+        for guards in sites:
+            assert any("xt_collect" in g for g in guards), accumulate
+    # ... and the weight itself is NOT gated on it, or later epochs would train
+    # on a different objective from the first.
+    for guards in collected["build_position_weight"]:
+        assert not any("xt_collect" in g for g in guards)

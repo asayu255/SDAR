@@ -1595,7 +1595,15 @@ class DataParallelPPOActor(BasePPOActor):
         # so every rank runs the same collectives whatever its micro-batch holds.
         # The RMS and the reliability are cumulative across the run; the
         # normaliser is a per-step mean, reset below once its snapshot is taken.
-        if xt_cfg_on and n_task:
+        if xt_cfg_on:
+            # Every matrix here is indexed by task. Without task ids there is no
+            # destination, no source and no ordered pair, so the arm would run
+            # its three extra forwards and weight nothing -- and say so nowhere.
+            assert n_task >= 3, (
+                "cross_teacher_kl_weight is indexed by task and needs at least three "
+                f"of them (a destination and two corroborating sources); the batch names {n_task}. "
+                "Multitask routing attaches task_ids -- see RayPPOTrainer._attach_task_ids."
+            )
             if self._xt_rms is None:
                 self._xt_rms = CumulativePolicyShiftRMS(n_tasks=n_task, device=sign_dev)
                 self._xt_mean = PreviousStepTaskKLWeightedMean(n_tasks=n_task, device=sign_dev)
@@ -2022,6 +2030,13 @@ class DataParallelPPOActor(BasePPOActor):
                             "cross_teacher_kl_weight needs the student's top-k support and the "
                             "on-task teacher's log-probs at it"
                         )
+                        # The weight is needed on every PPO epoch; the
+                        # STATISTICS are collected on the first only. Later
+                        # epochs re-visit the same rows against a student that
+                        # has already moved, so folding them in would count each
+                        # trajectory once per epoch and mix two policies into one
+                        # cumulative scale.
+                        xt_collect = epoch == 0
                         with _actor_phase("actor.cross_teacher"):
                             base_logprob, off_logprobs = self._cross_teacher_planes(
                                 data, sign_support_ids
@@ -2034,13 +2049,14 @@ class DataParallelPPOActor(BasePPOActor):
                             # This step's contribution to the CUMULATIVE scale.
                             # Read one step later, so nothing here reaches the
                             # weight built below.
-                            self._xt_rms.update(
-                                shifts=xt_shifts,
-                                student_logprob=student_topk_logprobs,
-                                response_mask=response_mask,
-                                task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                            )
+                            if xt_collect:
+                                self._xt_rms.update(
+                                    shifts=xt_shifts,
+                                    student_logprob=student_topk_logprobs,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                )
                             if xt_rms_snapshot is None:
                                 # Step 0: no scale exists, so no weight does
                                 # either. Not the raw W~ -- that would be a
@@ -2059,16 +2075,17 @@ class DataParallelPPOActor(BasePPOActor):
                                     normalizer=xt_mean_snapshot,
                                     report_epsilon=xt_report_eps,
                                 )
-                                self._xt_accumulate_reliability(
-                                    data=data,
-                                    built=xt_built,
-                                    student_topk_logprob=student_topk_logprobs,
-                                    support_ids=sign_support_ids,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    diag=xt_rms_snapshot,
-                                    outside_counter=xt_outside_topk,
-                                )
+                                if xt_collect:
+                                    self._xt_accumulate_reliability(
+                                        data=data,
+                                        built=xt_built,
+                                        student_topk_logprob=student_topk_logprobs,
+                                        support_ids=sign_support_ids,
+                                        response_mask=response_mask,
+                                        task_ids=task_ids,
+                                        diag=xt_rms_snapshot,
+                                        outside_counter=xt_outside_topk,
+                                    )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -2341,7 +2358,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     deadzone=sign_deadzone,
                                     effect=cand_effect,
                                 )
-                        if xt_built is not None and xt_position_stats is not None:
+                        if xt_built is not None and xt_position_stats is not None and xt_collect:
                             # Read BEFORE the weight multiplies it, everywhere.
                             # The normaliser composes with itself if it is fed
                             # the weighted KL -- and since the first step runs at
