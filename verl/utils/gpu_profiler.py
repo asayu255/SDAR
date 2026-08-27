@@ -619,6 +619,16 @@ class _Sampler:
             vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
             return (sum(vals) / len(vals)) if vals else None
 
+        def _busy_util():
+            vals = [
+                v
+                for _ts, per in window
+                if sum(1 for g in per if g is not None and g >= thresh) == n_gpus
+                for v in per
+                if v is not None
+            ]
+            return (sum(vals) / len(vals)) if vals else None
+
         def _census(stamps, table):
             """Mean number of threads in each activity, over these samples."""
             seen = [table[ts] for ts in stamps if ts in table]
@@ -636,6 +646,13 @@ class _Sampler:
             "per_gpu": per_gpu,
             "cpu_when_empty": _mean(empty_ts),
             "cpu_when_busy": _mean(busy_ts),
+            # Mean util across the cards over the samples where ALL of them had
+            # work. This is the duty cycle -- the engine's own per-step host
+            # processing showing between kernel launches -- and it is the number
+            # an engine setting is aimed at. Node util cannot stand in for it:
+            # node util moves when EMPTY or PARTIAL move, and multi-step
+            # scheduling or async scheduling touch neither.
+            "util_when_busy": _busy_util(),
             "activity_when_empty": _census(empty_ts, act_at),
             "activity_when_busy": _census(busy_ts, act_at),
         }
@@ -798,6 +815,8 @@ def format_residency(res) -> str:
         parts.append(f"{k}gpu {res['pct'][k]:.1f}% ({res['wall_by_count'][k]:.0f}s)")
     empty = res["pct"][0]
     partial = sum(res["pct"][k] for k in range(1, n))
+    busy_util = res.get("util_when_busy")
+    duty = f", reading {busy_util:.1f}%" if busy_util is not None else ""
     per_gpu = res.get("per_gpu") or []
     spread = ""
     known = [v for v in per_gpu if v is not None]
@@ -839,7 +858,9 @@ def format_residency(res) -> str:
         f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
         f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
         f"PARTIAL {partial:.1f}% (a rank idle inside a collective call -- only the "
-        f"pump fills this), rest is the engine's own duty cycle" + why
+        f"pump fills this). All {n} cards had work {res['pct'][n]:.1f}% of the time"
+        + duty + " -- THAT is the engine's duty cycle, and the only number an "
+        "engine setting (multi-step, async scheduling) can move." + why
     )
 
 

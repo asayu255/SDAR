@@ -162,6 +162,14 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     trace = _trace([[0, 0, 0]] * 2 + [[90, 90, 90]] * 8, interval=0.3, t0=start + offset)
     monkeypatch.setattr(live, "_sampler", _LiveFakeSampler(trace))
     monkeypatch.setattr(live, "enabled", lambda: True)
+    # Pinned rather than inherited. These are module globals read at call time,
+    # and test_gpu_profiler_trace.py pops gpu_profiler out of sys.modules and
+    # re-imports it under GPU_PROFILER_INTERVAL=0.02 -- monkeypatch restores the
+    # env var but not the module that already baked it in. Which module ran
+    # first then decides whether this test's percentages hold, and it failed
+    # only in the full three-directory suite because of it.
+    monkeypatch.setattr(live, "_IDLE_THRESH", 30.0)
+    monkeypatch.setattr(live, "_INTERVAL", 0.3)
 
     line = vp._residency_over([(start, end)])
     assert "[gpu-residency]" in line, line
@@ -368,3 +376,41 @@ def test_cpu_is_reported_but_no_longer_used_as_the_verdict():
     assert "driver CPU 4% of one core while EMPTY" in line, line
     assert "(blocked during EMPTY)" in line, line
     assert "EMPTY is Python on the driver" not in line, "cpu alone must not name a cause"
+
+
+# --------------------------------------------------------------------------- #
+# the duty cycle: the only number an engine setting can move
+# --------------------------------------------------------------------------- #
+def test_the_duty_cycle_is_measured_over_all_cards_busy_only():
+    """Node util cannot stand in for it.
+
+    Node util moves whenever EMPTY or PARTIAL move, and multi-step scheduling
+    and async_scheduling touch neither -- they hide the engine's own per-step
+    host work, which only shows in the samples where every card already had
+    something to do. Reading node util for that experiment reads the wrong thing.
+    """
+    trace = _trace([[0, 0, 0]] * 4 + [[89, 90, 88]] * 6)
+    res = _FakeSampler(trace).residency_between(0, 1e9)
+    assert res["util_when_busy"] == pytest.approx(89.0)
+    assert res["util_when_busy"] > 80.0, "the empty samples must not drag it down"
+
+
+def test_partial_samples_are_excluded_from_the_duty_cycle():
+    """A card at zero inside a partial sample is a scheduling gap, not duty."""
+    trace = _trace([[90, 0, 0]] * 5 + [[90, 90, 90]] * 5)
+    assert _FakeSampler(trace).residency_between(0, 1e9)["util_when_busy"] == pytest.approx(90.0)
+
+
+def test_the_line_names_it_as_the_engine_setting_target():
+    trace = _trace([[0, 0, 0]] * 2 + [[92, 92, 92]] * 8)
+    line = gp.format_residency(_FakeSampler(trace).residency_between(0, 1e9))
+    assert "reading 92.0%" in line, line
+    assert "engine's duty cycle" in line, line
+
+
+def test_no_fully_busy_sample_means_no_duty_cycle_rather_than_zero():
+    """Early in a run there may be none, and 0.0% would read as a catastrophe."""
+    trace = _trace([[90, 0, 0]] * 4)
+    res = _FakeSampler(trace).residency_between(0, 1e9)
+    assert res["util_when_busy"] is None
+    assert "reading" not in gp.format_residency(res)

@@ -121,6 +121,11 @@ rule "2. GPU residency -- EMPTY (depth) and PARTIAL (pump)"
 echo "control:"; residency "$CONTROL"
 if [ -n "$CANDIDATE" ]; then echo "candidate:"; residency "$CANDIDATE"; fi
 cat <<'NOTE'
+  PASS for an ENGINE setting (multi-step, async scheduling): the duty cycle --
+                     "All 3 cards had work X% of the time, reading Y%" -- rises.
+                     Y is the only number those settings can move. EMPTY and
+                     PARTIAL are not theirs, and node util is dominated by them,
+                     so node util alone will read as "no effect" either way.
   PASS for the pump: PARTIAL falls toward 0 and EMPTY stays put.
   PASS for depth:    EMPTY falls, PARTIAL does not move.
   Read the in-run line, not a wandb chart: wandb samples every 15 s and this
