@@ -420,6 +420,74 @@ preproc(0.6)を最適化してより大きい塊を外す。
 
 ---
 
+## 7septies. util を上げた run が、いちばん遅い run だった
+
+`sft-multitask-eval-20260827-124410`(V0 + multi-step 4)が完走した。
+
+| 完走 run | 構成 | node util | duty | **wall** |
+| --- | --- | ---: | ---: | ---: |
+| `...-201115` | V1, depth 2, pump なし | 81.2% | — | 1.26 h |
+| `...-092241` | V1, depth 3, **pump** | 79.90% | 91.07% | **0.96 h** |
+| `...-124410` | **V0 + ms4**, depth 3, pump なし | **83.21%** | **92.55%** | 1.24 h |
+
+**util が最も高い run が、pump run より 29% 遅い。**
+そして **util が最も低い run が、最も速い。**
+
+スコアは動いていない(V0 は kernel が変わるので確認が要った):
+
+| | pump (V1) | V0 + ms4 |
+| --- | ---: | ---: |
+| success_rate | 0.3875 | 0.3865 |
+| search(greedy) | 0.3571 | 0.3560 |
+| alfworld(temp 0.4) | 3.634 | 3.770 |
+| webshop(temp 0.4) | 5.696 | 5.528 |
+
+greedy の search が 0.3571 → 0.3560 とほぼ不動なので、**V0 への切替は生成を
+壊していない。** alfworld と webshop は temperature 0.4 のサンプリングで、
+この幅は run 間のばらつきの範囲である。
+
+### 交絡が 2 つある
+
+124410 と 092241 の差は **(V0 + multi-step)** と **(pump の有無)** の 2 つ。
+124410 は pump 無しである。pump 無し同士で比べると:
+
+```
+201115 (V1, depth 2, mem 0.6) 1.26 h
+124410 (V0 + ms4, depth 3, mem 0.75) 1.24 h
+```
+
+**ほぼ同じ。** つまり **0.96 h を買ったのは pump** であって、
+multi-step でも V0 でも depth でもない。
+
+### これが「util を目的関数にするな」の最も明確な実例である
+
+| 目的 | 勝者 |
+| --- | --- |
+| **node util** | V0 + multi-step(83.2%) |
+| **wall** | **pump(0.96 h)** |
+
+同じ 3 台、同じ checkpoint、同じスコア。**util で選ぶと 29% 遅い設定を選ぶ。**
+
+§5 罠 1「占有率を目的関数にした」は、この文書に 3 回踏んだと書いてある。
+**これはその 4 回目を防ぐための実測である。**
+
+### 次に測るべきは pump + multi-step である
+
+両者は別の層を触る(pump は PARTIAL、multi-step は duty)。まだ**一度も
+一緒に走っていない**:
+
+```bash
+VLLM_USE_V1=0 ROLLOUT_REQUIRE_CORE=v0 \
+ROLLOUT_ASYNC_GENERATE=1 ROLLOUT_ASYNC_REQUIRE=1 \
+bash examples/sft_trainer/eval_checkpoints.sh <step> -- \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.num_scheduler_steps=4 \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.multi_step_stream_outputs=false
+```
+
+**判定は wall で。** util は上がって当然で、それでは何も決まらない。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**
