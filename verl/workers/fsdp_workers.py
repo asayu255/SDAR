@@ -1440,6 +1440,14 @@ class ActorRolloutRefWorker(Worker):
             "teacher_paths": {str(k): str(v) for k, v in sorted(dict(teachers).items())},
         }
 
+    # ONE_TO_ALL, matching save_checkpoint above and the critic's own pair: the
+    # same path goes to every rank and each loads its own shard. Without the
+    # decorator RayWorkerGroup never binds the method at all -- _bind_worker_method
+    # only copies over what carries MAGIC_ATTR -- so EVERY resume died with
+    # "'RayWorkerGroup' object has no attribute 'load_checkpoint'", after the
+    # models were built and the checkpoint located. save_checkpoint was
+    # decorated, so runs looked healthy right up to the first restart.
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
