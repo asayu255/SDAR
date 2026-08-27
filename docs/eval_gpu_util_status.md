@@ -274,6 +274,34 @@ driver が EOS と完了を知るのが最大数 step 遅れる。**latency な�
 pump は vLLM の内部 API(`add_request` / `step` / `abort_request`)を直接叩いている。
 **`LLM.generate()` が動くことは、この経路が動く証明にならない。**
 
+### 実際に走らせた結果(2026-08-27 12:27) —— V0 は組めた、weight sync が落ちた
+
+```
+[rollout-engine] vllm 0.8.5, core=v0; overlap knobs: async_scheduling=absent,
+  num_scheduler_steps=4 (set here), disable_async_output_proc=<default> (available),
+  enable_chunked_prefill=False (set here), max_num_seqs=1024 (set here),
+  enforce_eager=False (set here)
+[rollout-engine] ROLLOUT_REQUIRE_CORE=v0: confirmed.
+```
+
+**懸念していた 2 つは杞憂だった。** `external_launcher` と `enable_sleep_mode` は
+V0 でも通り、multi-step も受け付けられた。guard も期待どおり確認を出した。
+
+落ちたのは**別の本物のバグ**である:
+
+```
+AttributeError: 'MultiStepModelRunner' object has no attribute 'model'
+  verl/workers/sharding_manager/fsdp_vllm.py:263 in update_params
+```
+
+`num_scheduler_steps>1` は model runner を **`MultiStepModelRunner` で包む**。
+包みは `.model` を転送せず、実物は `_base_model_runner` にいる。
+FSDP → vLLM の重み同期がそこで死ぬ。
+
+**engine は組め、config は通り、checkpoint も読み終えてから落ちる** ——
+数分入ってから、multi-step とも weight sync とも書かれていない例外で。
+`unwrap_model_runner()` で包みを剥がすようにした。
+
 ---
 
 ## 8. 次の 1 手 —— これだけ

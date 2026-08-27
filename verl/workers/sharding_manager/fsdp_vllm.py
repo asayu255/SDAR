@@ -38,6 +38,7 @@ from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
+from verl.utils.vllm_model_runner import unwrap_model_runner
 from verl.utils.device import get_torch_device
 from verl.utils.fsdp_utils import fsdp_version, layered_summon_lora_params, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.torch_functional import check_cuda_is_available
@@ -74,6 +75,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             # vLLM > v0.6.3
             self.model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner if self.inference_engine else None
+        self.model_runner = unwrap_model_runner(self.model_runner)
 
         self.model_config = model_config
         self.device_mesh = device_mesh
@@ -260,7 +262,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return data.chunk(chunks=self.tp_size)[self.tp_rank]
 
     def update_params(self, updated_params, peft_config=None):
-        model = self.model_runner.model
+        # Unwrapped again here and not only at construction: an engine built
+        # before this manager, or one that re-wraps its runner, would otherwise
+        # hand back the wrapper and fail on .model with an AttributeError that
+        # names neither multi-step nor weight sync.
+        model = unwrap_model_runner(self.model_runner).model
         if peft_config:
             if self.base_sync_done:
                 lora_int_id=int(time.time_ns() % 0x7FFFFFFF)
