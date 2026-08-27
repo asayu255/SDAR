@@ -467,6 +467,101 @@ set -x
 #     effect/weight_kl_corr  the same question bounded, so it compares across
 #       runs.
 #
+#   SEPARATING THE EVIDENCE TOKEN FROM THE AFFECTED TOKEN (2026-08). The single
+#   most important distinction in the token analysis, and the one a single table
+#   cannot make. W is a scalar on the POSITION, so it scales the OPD term's push
+#   on every token in the support -- including tokens no teacher spoke at.
+#   "Search's evidence at `retrieve` raised W here" and "the arm reinforced
+#   `retrieve`" are different claims, and at a position whose OPD term was
+#   pushing something else down harder, the second is false: what it reinforced
+#   there is that suppression.
+#
+#   sign_tokens_step*.jsonl now carries BOTH tables, told apart by ranked_by:
+#     ranked_by=count|mass|abs_effect   the EVIDENCE side, unchanged -- which
+#       candidates a source spoke at and what their share of the moved nats was.
+#     ranked_by=extra_logit_push        the AFFECTED side. Per token, the
+#       unweighted descent direction g0 = coef*p_student*(D - f), what the arm
+#       added ((W-1)*g0), what the objective applied (W*g0), the student's own
+#       probability there and how often it was the token actually emitted.
+#       Filed under direction_class, which is the product of two binary facts:
+#         push_up_amplified / push_up_damped / push_down_amplified /
+#         push_down_damped
+#       Sign alone is not the reading -- a weight above 1 at a token the term was
+#       pushing DOWN amplifies the suppression. kl_weight/push/<class>/* carries
+#       the shares, and mean_p_student beside them says whether the arm was
+#       amplifying tokens the student was ever going to say.
+#
+#   sign_pair_events_step*.jsonl (new file) -- one row per (candidate, SOURCE),
+#     which the per-candidate dump cannot be: it can only report the min and max
+#     over whichever off-task teachers spoke. Nineteen float columns, with the
+#     probabilities and the shifts kept apart:
+#       p_base / p_on / p_source / p_student        real policy probabilities
+#       delta_on_raw / delta_source_raw             nats
+#       delta_on_std / delta_source_std             the same in RMS units
+#       alpha_source / shared_evidence / source_evidence / pre_weight /
+#       applied_weight / teacher_kl /
+#       source_attributed_kl_shift / weighted_logit_push / extra_logit_push /
+#       advantage / reward
+#     STRATIFIED per (dst, src, pair_state) rather than a global top-N, which is
+#     dominated by whichever ordered pair is loudest -- and the event this arm
+#     exists to find, a source acting where it DISAGREES with the on-task
+#     teacher, is a minority of a minority. Three strata per cell: top by
+#     |source_attributed_kl_shift|, top by |extra_logit_push| (not the same rows:
+#     one is the evidence, the other the effect), and a hash spread sample.
+#     GATHERED ACROSS RANKS, unlike the candidate dump -- a rank-0-local sample
+#     is world_size times smaller than a reader assumes. The gather is fixed
+#     shape (groups x per_group), so it is a collective on the config and cannot
+#     hang on a rank whose micro-batches held nothing. ~47 KB a rank.
+#
+#   WHERE THE BUDGET WENT, per TRAJECTORY:
+#     kl_weight[/task]/outcome/{all,adv_positive,adv_negative,success,failure}/
+#       {gross_effect,net_effect,n_rows}, plus
+#       adv_positive_to_negative_effect_ratio, success_to_failure_effect_ratio
+#       and corr_adv_gross_effect. G_i = sum_t |W-1|D / sum_t D is the fraction
+#       of a rollout's own OPD budget the arm redistributed. "The arm moved 3% of
+#       the budget" and "the arm moved 3% of the budget, almost all of it on
+#       rollouts that failed" are the same number and opposite findings. Success
+#       is score > 0; not a causal claim, and the names avoid implying one.
+#
+#   WHEN A SOURCE DISAGREED:
+#     kl_weight/pair_state/{src}__on__{dst}/{agree,conflict,
+#       on_silent_source_active,source_silent}/{position_frac,
+#       source_evidence_mean,kl_shift_net,kl_shift_gross_share}
+#     kl_shift_by_state sums the sources out and evidence/{src}__on__{dst} sums
+#     the states out, so the case the mechanism exists to arbitrate was in
+#     neither. 144 cells at three tasks.
+#
+#   WHAT THE MEASUREMENT CANNOT SEE:
+#     kl_weight/evidence/{src}__on__{dst}/{support_mass,tail_mass} -- how much of
+#     each source teacher's probability lands inside the student's top-k at all.
+#     "Search contributed little to AlfWorld" has three explanations that read
+#     identically -- weak signal, low alpha, or Search's vocabulary simply not in
+#     the support the whole mechanism is measured on -- and only the third is a
+#     measurement artefact rather than a finding.
+#
+#   CHANNEL COUNTERFACTUALS (against the alpha series' MAGNITUDE ones):
+#     kl_weight/channel/no_shared/*        the advantage channel alone -- is the
+#       corroboration term carrying the mechanism, or decoration on top of
+#       "reliable source activity"?
+#     kl_weight/channel/offtask_shared/*   the off-task-only agreement rule, the
+#       option this arm chose against. Each has its own lagged normaliser, so the
+#       comparison is like for like, and neither touches the loss.
+#
+#   PER-PAIR TOKEN TURNOVER:
+#     kl_weight/pair_token/{src}__on__{dst}/turnover/* -- the pooled turnover
+#     cannot tell "a stable set" from "each source contributes a stable set and
+#     they are different sets", and the second is this arm'"'"'s whole claim.
+#
+#   COST AND CADENCE. The dense vocabulary tables are ~307 MB a rank on a step
+#   that collects them (TokenStateCounts 119, LogitPushTokens 111, SignPairTokens
+#   55, RoleTokenCounts 22) and their content is a slow quantity, so they run on
+#   a stride: token_stats.every=5 below. On the steps in between they are not
+#   allocated at all. The stride is a function of the step COUNT, which every
+#   rank shares, never of batch content. token turnover then compares the last
+#   two COLLECTED steps, which is the comparison it was always making. Everything
+#   scalar -- the weight shape, the outcome buckets, rho/RMS, pair_state -- runs
+#   every step and costs a few kilobytes.
+#
 # GO/NO-GO BEFORE THE LONG RUN. If probe/alpha100/effect/kl_shift_gross_frac is
 # below 0.05 on every destination, the arm is not redistributing the OPD budget
 # in any measurable way and the three extra forwards -- about 24% of the step --
@@ -817,9 +912,14 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.cross_teacher_kl_weight.token_stats.top_n=64 \
     +algorithm.opd.cross_teacher_kl_weight.token_stats.roles=True \
     +algorithm.opd.cross_teacher_kl_weight.token_stats.role_top_n=32 \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.every=5 \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.logit_push=True \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.push_top_n=32 \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.enable=True \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.per_step=128 \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.context=16 \
+    +algorithm.opd.cross_teacher_kl_weight.event_dump.pair_strata=True \
+    +algorithm.opd.cross_teacher_kl_weight.event_dump.per_group=4 \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \

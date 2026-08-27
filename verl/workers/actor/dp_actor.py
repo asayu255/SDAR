@@ -37,6 +37,7 @@ from verl.trainer.ppo.sign_weights import (
     REWRITE_TERMS,
     OffTaskLadderStats,
     ScopeTermStats,
+    PairEventSamples,
     SignEventSamples,
     SignPairTokens,
     SignPairCounts,
@@ -59,14 +60,20 @@ from verl.trainer.ppo.sign_weights import (
 )
 from verl.trainer.ppo.cross_teacher_kl_weight import (
     POSITION_TERMS as XT_POSITION_TERMS,
+    CHANNEL_PROBES as XT_CHANNEL_PROBES,
     PROBE_ALPHAS as XT_PROBE_ALPHAS,
     STATE_TERMS as XT_STATE_TERMS,
     AdvantageReliabilityStats,
     CumulativePolicyShiftRMS,
+    LogitPushTokens,
+    OutcomeEffectStats,
     PairEvidenceStats,
+    PairStateEvidenceStats,
     PositionScopeTermStats,
     PreviousStepTaskKLWeightedMean,
     WeightShiftHistogram,
+    opd_logit_push,
+    pair_state_index,
     ROLE_CUT_SUFFIXES as XT_ROLE_CUT_SUFFIXES,
     ROLE_SCOPE_NAMES as XT_ROLE_SCOPE_NAMES,
     TURN_CUT_SUFFIXES as XT_TURN_CUT_SUFFIXES,
@@ -435,11 +442,16 @@ class DataParallelPPOActor(BasePPOActor):
         self._xt_mean_snapshot = None      # {"mean", "valid"} from the previous step
         self._xt_alpha = None              # (T, T) applied reliability
         self._xt_probe_mean = {}           # one normaliser per probe alpha
+        self._xt_channel_mean = {}         # and one per channel counterfactual
         # The previous step's top-N token ids per scope, so turnover has
         # something to compare against. Not in the sidecar: a resumed run losing
         # one step of turnover is cheaper than a resume that silently compares
         # against a table from a different teacher set.
         self._xt_token_prev = None
+        self._xt_pair_token_prev = None
+        # Counts update_policy calls, so the dense-token stride is a function of
+        # something every rank shares. Incremented once per call, at the end.
+        self._xt_step_index = 0
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -550,7 +562,8 @@ class DataParallelPPOActor(BasePPOActor):
     def _xt_token_tables(
         self, *, built, teacher_kl, data, support_ids, student_topk_logprob,
         on_task_logprob, response_mask, task_ids, report_epsilon, tables, roles,
-        planes,
+        planes, raw_shifts=None, alpha_table=None, row_reward=None,
+        row_advantage=None, push=None,
     ):
         """Name the tokens the weighting acted on, and who supplied the evidence.
 
@@ -579,8 +592,8 @@ class DataParallelPPOActor(BasePPOActor):
                 the raw ones the shifts were computed from.
         """
         base_plane, off_planes = planes
-        token_stats, pair_token_stats, event_stats = tables
-        if token_stats is None and pair_token_stats is None and event_stats is None:
+        token_stats, pair_token_stats, event_stats, pair_event_stats = tables
+        if all(t is None for t in tables):
             return
         shift = per_candidate_shift(built, teacher_kl)
         zero_base = torch.zeros_like(built["hat_on"])
@@ -628,6 +641,107 @@ class DataParallelPPOActor(BasePPOActor):
                 reward=(row_scores.sum(dim=-1) if row_scores is not None else None),
                 shift_on=built["hat_on"], shift_off=built["hat_off"],
             )
+        if pair_event_stats is not None and push is not None:
+            self._xt_pair_events(
+                stats=pair_event_stats, built=built, teacher_kl=teacher_kl, data=data,
+                support_ids=support_ids, student_topk_logprob=student_topk_logprob,
+                on_task_logprob=on_task_logprob, response_mask=response_mask,
+                task_ids=task_ids, report_epsilon=report_epsilon, roles=roles,
+                planes=planes, raw_shifts=raw_shifts, alpha_table=alpha_table,
+                row_reward=row_reward, row_advantage=row_advantage, push=push,
+            )
+
+    def _xt_pair_events(
+        self, *, stats, built, teacher_kl, data, support_ids, student_topk_logprob,
+        on_task_logprob, response_mask, task_ids, report_epsilon, roles, planes,
+        raw_shifts, alpha_table, row_reward, row_advantage, push,
+    ):
+        """One row per (candidate, source), with every column the schema names.
+
+        Assembled here rather than inside the sampler because every input is
+        already resident at this call site and passing eighteen tensors through
+        a second function is how two of them come to be the wrong pair.
+        """
+        base_plane, off_planes = planes
+        bs, resp, k = support_ids.shape
+        n_off = off_planes.size(-1)
+        dev = support_ids.device
+        # Three shapes reach this table and each needs its own broadcast. Named
+        # for what they come in as, so a column cannot be widened by the wrong
+        # one and land silently transposed.
+        k4 = lambda t: t.unsqueeze(-1).expand(bs, resp, k, n_off)          # (bs, resp, k)
+        p4 = lambda t: t.reshape(bs, resp, 1, 1).expand(bs, resp, k, n_off)  # (bs, resp)
+
+        state = pair_state_index(
+            hat_on=built["hat_on"], hat_off=built["hat_off"], deadzone=report_epsilon
+        )
+        dst = task_ids.reshape(-1, 1, 1, 1).expand(bs, resp, k, n_off)
+        src = data["sign_off_tasks"].reshape(bs, 1, 1, n_off).expand(bs, resp, k, n_off)
+        alpha = (
+            torch.zeros(bs, n_off, device=dev)
+            if alpha_table is None
+            else alpha_table.to(dev)[
+                task_ids.reshape(-1).clamp(min=0).unsqueeze(-1),
+                data["sign_off_tasks"].to(torch.long).clamp(min=0),
+            ]
+        )
+        inv_mu = (1.0 / built["mu"].clamp(min=1e-12)).unsqueeze(-1)
+        kl32 = teacher_kl.detach().to(torch.float32)
+        src_shift = built["evidence_by_source"] * (inv_mu * kl32.unsqueeze(-1)).unsqueeze(-1)
+        extra = ((built["weight"] - 1.0).unsqueeze(-1) * push["g0"])
+        weighted = built["weight"].unsqueeze(-1) * push["g0"]
+        y1 = data["responses"].unsqueeze(-1)
+        sampled = (support_ids == y1)
+        turn = turn_index(response_mask)
+        role = (
+            torch.zeros(bs, resp, dtype=torch.long, device=dev) if not roles
+            else token_roles(data["responses"], roles)
+        )
+        raw_on = (raw_shifts or {}).get("on", torch.zeros_like(built["hat_on"]))
+        raw_off = (raw_shifts or {}).get("off", torch.zeros_like(built["hat_off"]))
+        zero_row = torch.zeros(bs, device=dev)
+        rew = zero_row if row_reward is None else row_reward.detach().reshape(-1).to(torch.float32)
+        adv = zero_row if row_advantage is None else row_advantage.detach().reshape(-1).to(torch.float32)
+        row4 = lambda t: t.reshape(-1, 1, 1, 1).expand(bs, resp, k, n_off)
+
+        columns = {
+            "token_id": k4(support_ids),
+            "dst": dst, "src": src, "pair_state": state,
+            "state": k4(built["state"]),
+            "role": p4(role), "turn": p4(turn),
+            "position": p4(torch.arange(resp, device=dev).reshape(1, resp).expand(bs, resp)),
+            "row_len": row4(response_mask.to(torch.long).sum(dim=1)),
+            "is_sampled": k4(sampled.to(torch.long)),
+            "p_base": k4(base_plane.detach().to(torch.float32).exp()),
+            "p_on": k4(on_task_logprob.detach().to(torch.float32).exp()),
+            "p_source": off_planes.detach().to(torch.float32).exp(),
+            "p_student": k4(student_topk_logprob.detach().to(torch.float32).exp()),
+            "delta_on_raw": k4(raw_on), "delta_source_raw": raw_off,
+            "delta_on_std": k4(built["hat_on"]), "delta_source_std": built["hat_off"],
+            "alpha_source": alpha.reshape(bs, 1, 1, n_off).expand(bs, resp, k, n_off),
+            "shared_evidence": k4(built["teacher_prob"] * built["common"].abs()),
+            "source_evidence": built["evidence_by_source"],
+            "pre_weight": p4(built["pre_weight"]), "applied_weight": p4(built["weight"]),
+            "teacher_kl": p4(kl32),
+            "source_attributed_kl_shift": src_shift,
+            "weighted_logit_push": k4(weighted), "extra_logit_push": k4(extra),
+            "advantage": row4(adv), "reward": row4(rew),
+        }
+        width = stats.context
+        pad = torch.nn.functional.pad(data["responses"], (width, width))
+        ctx = pad.unfold(1, 2 * width + 1, 1)[:, :resp]          # (bs, resp, 2w+1)
+        stats.update(
+            columns=columns,
+            group=(
+                stats._pair_index(dst.clamp(min=0), src.clamp(min=0)).clamp(min=0)
+                * stats.n_states + state
+            ),
+            valid=(response_mask.to(torch.bool).reshape(bs, resp, 1, 1).expand(bs, resp, k, n_off)
+                   & (dst >= 0) & (src >= 0)),
+            context_ids=ctx.reshape(bs, resp, 1, 1, -1).expand(bs, resp, k, n_off, 2 * width + 1),
+            shift=src_shift,
+            push=k4(extra),
+        )
 
     def _read_sidecar_on_rank_zero(self, path):
         """One reader, then a broadcast. Returns the state, or None if absent.
@@ -763,9 +877,12 @@ class DataParallelPPOActor(BasePPOActor):
                 if bool(cur["valid"][d, m]):
                     out[f"{head}/current"] = float(cur["sigma"][d, m])
                     if float(snap["sigma"][d, m]) > 0:
-                        out[f"{head}/drift_ratio"] = (
-                            float(cur["sigma"][d, m]) / float(snap["sigma"][d, m])
-                        )
+                        # Named both ways: drift_ratio is what a dashboard
+                        # watches, current_to_cumulative is what the write-up
+                        # calls it. One expression, so they cannot disagree.
+                        ratio = float(cur["sigma"][d, m]) / float(snap["sigma"][d, m])
+                        out[f"{head}/drift_ratio"] = ratio
+                        out[f"{head}/current_to_cumulative"] = ratio
                 if d != m and bool(snap["valid"][m, m]) and float(snap["sigma"][m, m]) > 0:
                     out[f"{head}/off_to_in_domain_ratio"] = (
                         float(snap["sigma"][d, m]) / float(snap["sigma"][m, m])
@@ -807,12 +924,26 @@ class DataParallelPPOActor(BasePPOActor):
                 frac = src_row.get("informative_group_frac", None)
                 if frac is not None:
                     out[f"{head}/informative_group_frac_{scope}"] = frac
+            # The two spreads the correlation is a ratio of, this step only. A
+            # rho that collapsed because the ADVANTAGE stopped varying is a
+            # different event from one that collapsed because the source stopped
+            # speaking, and rho alone reports them identically.
+            for key in ("adv_std", "support_score_std", "n_grouped"):
+                if now.get(key, None) is not None:
+                    out[f"{head}/{key}_current"] = now[key]
+                if row.get(key, None) is not None:
+                    out[f"{head}/{key}_cumulative"] = row[key]
             rho_now = now.get("rho", None)
             if rho_now is not None:
                 out[f"{head}/rho_current"] = rho_now
             if row["rho"] is not None:
                 out[f"{head}/rho_cumulative"] = row["rho"]
             if rho_now is not None and row["rho"] is not None:
+                out[f"{head}/rho_current_minus_cumulative"] = rho_now - row["rho"]
+                # What the applied alpha WOULD have been on this step's evidence
+                # alone. The loss never sees it; the gap is what says the applied
+                # one is running on a relationship that has moved.
+                out[f"{head}/alpha_delta"] = max(0.0, rho_now) - row["alpha"]
                 total += 1
                 if rho_now * row["rho"] < 0:
                     disagree += 1
@@ -1602,16 +1733,15 @@ class DataParallelPPOActor(BasePPOActor):
             for key in ("adv_row_value", "adv_group_informative", "adv_group_id"):
                 if key in data.batch.keys():
                     select_keys.append(key)
-            # The event dump reports the row's episode score beside the
-            # candidate: "the weighting fires here" and "the weighting fires
-            # here on rows that went on to score" are different findings. The
-            # sign arm selects this for its own dump; without the same line the
-            # cross-teacher dump's reward column is nan on every row. Uniform
-            # across ranks (the driver builds one batch), so it desynchronises
-            # nothing.
-            if bool((xt_cfg.get("event_dump", None) or {}).get("enable", False)) and (
-                "token_level_scores" in data.batch.keys()
-            ):
+            # The row's episode score. Two readers now: the event dump, where
+            # "the weighting fires here" and "the weighting fires here on rows
+            # that went on to score" are different findings, and the outcome
+            # statistics, where it is what separates success from failure -- the
+            # advantage cannot, being group-relative. Selected whenever the arm
+            # is on rather than on the dump's switch, so turning the dump off
+            # does not silently empty the success buckets. Uniform across ranks
+            # (the driver builds one batch), so it desynchronises nothing.
+            if "token_level_scores" in data.batch.keys():
                 select_keys.append("token_level_scores")
         if sign_enabled:
             # Either support works -- the student's top-k, resolved above, or the
@@ -1812,6 +1942,10 @@ class DataParallelPPOActor(BasePPOActor):
                     probe_name(a): PreviousStepTaskKLWeightedMean(n_tasks=n_task, device=sign_dev)
                     for a in XT_PROBE_ALPHAS
                 }
+                self._xt_channel_mean = {
+                    c: PreviousStepTaskKLWeightedMean(n_tasks=n_task, device=sign_dev)
+                    for c in XT_CHANNEL_PROBES
+                }
                 # A checkpoint's accumulated state, if this process was resumed.
                 # Restored here rather than in load_checkpoint because the
                 # accumulators are indexed by task and do not exist until the
@@ -1880,6 +2014,15 @@ class DataParallelPPOActor(BasePPOActor):
         # 99% of positions and 3.0 at the rest", and those are the two mechanisms
         # the arm is being tested for.
         xt_weight_hist = WeightShiftHistogram(n_tasks=n_task, device=sign_dev) if xt_on else None
+        # When Search DISAGREED with AlfWorld's own teacher, what did the arm do.
+        # The state table sums the sources out and the source table sums the
+        # states out, so the case the mechanism exists to arbitrate is in
+        # neither. 144 cells at three tasks.
+        xt_pair_state_stats = PairStateEvidenceStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        # Per TRAJECTORY, not per position: "the arm moved 3% of the budget" and
+        # "the arm moved 3% of the budget, almost all of it on rollouts that
+        # failed" are the same number and opposite findings.
+        xt_outcome_stats = OutcomeEffectStats(n_tasks=n_task, device=sign_dev) if xt_on else None
         # The per-token side, on the arm's own switches rather than the sign
         # arm's. Without these the run can say a source raised a task's KL by so
         # many nats and cannot name one token it did it at, which is most of
@@ -1887,8 +2030,19 @@ class DataParallelPPOActor(BasePPOActor):
         xt_token_cfg = (xt_cfg.get("token_stats", None) or {}) if xt_cfg_on else {}
         xt_event_cfg = (xt_cfg.get("event_dump", None) or {}) if xt_cfg_on else {}
         xt_token_stats = xt_pair_token_stats = xt_event_stats = None
-        xt_role_token_stats = None
-        if xt_on and (xt_token_cfg.get("enable", False) or xt_event_cfg.get("enable", False)):
+        xt_role_token_stats = xt_push_token_stats = None
+        # The dense tables are ~300 MB of vocabulary-wide buffers and one host
+        # read each. Their content is a slow quantity -- which tokens the
+        # teachers agree about does not turn over between adjacent steps -- so
+        # they run on a stride and are simply not allocated in between. Gated on
+        # the STEP COUNT, which every rank shares, never on batch content.
+        # turnover then compares the last two COLLECTED steps, which is the
+        # comparison it was always making.
+        xt_token_every = max(1, int(xt_token_cfg.get("every", 1)))
+        xt_token_due = (self._xt_step_index % xt_token_every) == 0
+        if xt_on and xt_token_due and (
+            xt_token_cfg.get("enable", False) or xt_event_cfg.get("enable", False)
+        ):
             _vocab = model_vocab_size(self.actor_module)
             if _vocab is None:
                 print(
@@ -1919,12 +2073,36 @@ class DataParallelPPOActor(BasePPOActor):
                         vocab_size=_vocab, device=sign_dev,
                         top_n=int(xt_token_cfg.get("role_top_n", 32)),
                     )
-        if xt_on and xt_event_cfg.get("enable", False):
+                # The tokens whose LOGIT the weight moved, which is a different
+                # set from the tokens whose evidence justified it: W is a scalar
+                # on the position, so every candidate's push is scaled, including
+                # ones no teacher spoke at.
+                if bool(xt_token_cfg.get("logit_push", True)):
+                    xt_push_token_stats = LogitPushTokens(
+                        vocab_size=_vocab, n_tasks=n_task, device=sign_dev,
+                        top_n=int(xt_token_cfg.get("push_top_n", 32)),
+                    )
+        xt_pair_event_stats = None
+        if xt_on and xt_token_due and xt_event_cfg.get("enable", False):
             xt_event_stats = SignEventSamples(
                 capacity=int(xt_event_cfg.get("per_step", 128)),
                 context=int(xt_event_cfg.get("context", 16)),
                 device=sign_dev,
             )
+            # The pair-stratified companion. A global top-N is dominated by
+            # whichever ordered pair is loudest, and the event this arm exists
+            # to find -- a source acting where it DISAGREES with the on-task
+            # teacher -- is structurally a minority of a minority. Sampling per
+            # (dst, src, pair_state) and gathering across ranks is the
+            # difference between "we looked and found none" and "we never
+            # looked".
+            if bool(xt_event_cfg.get("pair_strata", True)):
+                xt_pair_event_stats = PairEventSamples(
+                    n_tasks=n_task,
+                    per_group=int(xt_event_cfg.get("per_group", 4)),
+                    context=int(xt_event_cfg.get("context", 16)),
+                    device=sign_dev,
+                )
         xt_probe_stats = (
             {
                 probe_name(a): ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev)
@@ -1942,6 +2120,26 @@ class DataParallelPPOActor(BasePPOActor):
             {
                 probe_name(a): ScopeTermStats(names=XT_STATE_TERMS, n_tasks=n_task, device=sign_dev)
                 for a in XT_PROBE_ALPHAS
+            }
+            if xt_on
+            else {}
+        )
+        # The channel counterfactuals: not "what if alpha were different" but
+        # "what if this channel were not there". Same lagged-normaliser
+        # machinery as the alpha probes, because a raw W~ has a different spread
+        # from a normalised one and the comparison has to be like for like.
+        xt_channel_stats = (
+            {
+                c: ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev)
+                for c in XT_CHANNEL_PROBES
+            }
+            if xt_on
+            else {}
+        )
+        xt_channel_state_stats = (
+            {
+                c: ScopeTermStats(names=XT_STATE_TERMS, n_tasks=n_task, device=sign_dev)
+                for c in XT_CHANNEL_PROBES
             }
             if xt_on
             else {}
@@ -1966,6 +2164,7 @@ class DataParallelPPOActor(BasePPOActor):
         # weight and not a within-micro-batch mean.
         xt_mean_snapshot = None
         xt_probe_snapshots = {}
+        xt_channel_snapshots = {}
         if xt_on:
             snap = self._xt_mean.snapshot()
             xt_nonfinite[2] += float(snap["nonfinite"])
@@ -1974,6 +2173,10 @@ class DataParallelPPOActor(BasePPOActor):
             for _name, _st in self._xt_probe_mean.items():
                 _snap = _st.snapshot()
                 xt_probe_snapshots[_name] = _snap if bool(_snap["valid"].any()) else None
+                _st.reset()
+            for _name, _st in self._xt_channel_mean.items():
+                _snap = _st.snapshot()
+                xt_channel_snapshots[_name] = _snap if bool(_snap["valid"].any()) else None
                 _st.reset()
 
         # Individual candidates, with the tokens around them. Every other table
@@ -2333,6 +2536,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # ran on a path that did not produce it, and the gradient
                     # comparison is skipped rather than run against a stale one.
                     xt_pg_grad_coef = None
+                    # The row-level columns two blocks below both read. Resolved
+                    # once, here, so the outcome statistics and the event rows
+                    # cannot disagree about what this row scored.
+                    _scores = data.get("token_level_scores", None)
+                    _row_adv = data.get("adv_row_value", None)
+                    _push_for_events = None
                     if xt_enabled:
                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
                             "cross_teacher_kl_weight needs the student's top-k support and the "
@@ -2760,12 +2969,50 @@ class DataParallelPPOActor(BasePPOActor):
                             # Each source's share of W~ - 1, and of the nats that
                             # share went on to move.
                             src_evidence = xt_built["evidence_by_source"].sum(dim=2)
+                            xt_src_kl = (
+                                teacher_kld / xt_built["mu"].clamp(min=1e-12)
+                            ).unsqueeze(-1)
                             xt_pair_stats.update(
                                 evidence=src_evidence,
-                                shift=src_evidence
-                                * (teacher_kld / xt_built["mu"].clamp(min=1e-12)).unsqueeze(-1),
+                                shift=src_evidence * xt_src_kl,
                                 response_mask=response_mask, task_ids=task_ids,
                                 off_plane_tasks=data["sign_off_tasks"],
+                                # How much of each source teacher's probability
+                                # lands inside the student's top-k at all. Free:
+                                # the log-probs are already gathered there.
+                                support_mass=off_logprobs.detach().to(
+                                    torch.float32
+                                ).exp().sum(dim=-2),
+                            )
+                            # The same nats, cut by what the source was doing
+                            # relative to the on-task teacher.
+                            xt_pair_state_stats.update(
+                                state=pair_state_index(
+                                    hat_on=xt_built["hat_on"], hat_off=xt_built["hat_off"],
+                                    deadzone=xt_report_eps,
+                                ),
+                                evidence=xt_built["evidence_by_source"],
+                                shift=xt_built["evidence_by_source"]
+                                * xt_src_kl.unsqueeze(-1),
+                                response_mask=response_mask, task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                            )
+                            # Per trajectory. The row score is what separates
+                            # "spent on rollouts that worked" from "spent on the
+                            # ones that did not", which the advantage alone
+                            # cannot say -- it is group-relative.
+                            xt_outcome_stats.update(
+                                weight=xt_built["weight"], teacher_kl=teacher_kld,
+                                response_mask=response_mask,
+                                advantage=(
+                                    _row_adv
+                                    if _row_adv is not None
+                                    else torch.zeros(
+                                        teacher_kld.size(0), device=teacher_kld.device
+                                    )
+                                ),
+                                task_ids=task_ids,
+                                reward=(None if _scores is None else _scores.sum(dim=-1)),
                             )
                             for name, pre in xt_built["probe_pre_weight"].items():
                                 self._xt_probe_mean[name].update(
@@ -2808,7 +3055,47 @@ class DataParallelPPOActor(BasePPOActor):
                                     xt_state_shift_terms(probe, teacher_kld),
                                     response_mask=response_mask, task_ids=task_ids,
                                 )
+                            for name, pre in xt_built["channel_pre_weight"].items():
+                                self._xt_channel_mean[name].update(
+                                    pre_weight=pre, teacher_kl=teacher_kld,
+                                    response_mask=response_mask, task_ids=task_ids,
+                                    row_weights=task_loss_weight,
+                                )
+                                snap = xt_channel_snapshots.get(name, None)
+                                mu_c = _xt_normalizer_mu(pre, snap, task_ids)
+                                chan = {
+                                    "weight": pre / mu_c, "pre_weight": pre, "mu": mu_c,
+                                    "evidence": xt_built["channel_evidence"][name],
+                                    "state": xt_built["state"],
+                                    "teacher_prob": xt_built["teacher_prob"],
+                                    "available": xt_built["available"],
+                                    "evidence_shared": xt_built["evidence_shared"],
+                                    "evidence_shared_offtask_only": xt_built[
+                                        "evidence_shared_offtask_only"
+                                    ],
+                                }
+                                xt_channel_stats[name].update(
+                                    xt_position_terms(chan, teacher_kld),
+                                    response_mask=response_mask, task_ids=task_ids,
+                                )
+                                xt_channel_state_stats[name].update(
+                                    xt_state_shift_terms(chan, teacher_kld),
+                                    response_mask=response_mask, task_ids=task_ids,
+                                )
                         if xt_built is not None and xt_collect:
+                            # Built once here whether or not the dense push
+                            # table is on: the event rows carry the same two
+                            # columns and must not compute them a second way.
+                            _push_for_events = (
+                                opd_logit_push(
+                                    student_logprob=student_topk_logprobs,
+                                    teacher_logprob=sign_cand_inputs["on_task_logprob"],
+                                    teacher_kl=teacher_kld,
+                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                )
+                                if (xt_push_token_stats is not None or xt_pair_event_stats is not None)
+                                else None
+                            )
                             self._xt_token_tables(
                                 built=xt_built, teacher_kl=teacher_kld, data=data,
                                 support_ids=sign_cand_inputs["support_ids"],
@@ -2816,9 +3103,17 @@ class DataParallelPPOActor(BasePPOActor):
                                 on_task_logprob=sign_cand_inputs["on_task_logprob"],
                                 response_mask=response_mask, task_ids=task_ids,
                                 report_epsilon=xt_report_eps,
-                                tables=(xt_token_stats, xt_pair_token_stats, xt_event_stats),
+                                tables=(
+                                    xt_token_stats, xt_pair_token_stats,
+                                    xt_event_stats, xt_pair_event_stats,
+                                ),
                                 roles=sign_role_tags,
                                 planes=(base_logprob, off_logprobs),
+                                raw_shifts=xt_shifts,
+                                alpha_table=xt_alpha_snapshot,
+                                row_reward=(None if _scores is None else _scores.sum(dim=-1)),
+                                row_advantage=_row_adv,
+                                push=_push_for_events,
                             )
                             if xt_role_token_stats is not None and xt_roles_mb is not None:
                                 xt_role_token_stats.update(
@@ -2826,6 +3121,28 @@ class DataParallelPPOActor(BasePPOActor):
                                     roles=xt_roles_mb,
                                     effect=per_candidate_shift(xt_built, teacher_kld),
                                     response_mask=response_mask,
+                                )
+                            if xt_push_token_stats is not None:
+                                # The OTHER token table. The one above names the
+                                # candidates whose evidence justified the weight;
+                                # this one names the tokens whose logit the
+                                # weight then moved, which is every token in the
+                                # support. Conflating them is how "Search
+                                # reinforced retrieve" gets written about a
+                                # position where what it reinforced is the
+                                # suppression of something else.
+                                _y1 = data["responses"].unsqueeze(-1)
+                                _push = _push_for_events
+                                xt_push_token_stats.update(
+                                    support_ids=sign_cand_inputs["support_ids"],
+                                    g0=_push["g0"],
+                                    weight=xt_built["weight"],
+                                    coef_applied_weight=xt_built["weight"],
+                                    response_mask=response_mask, task_ids=task_ids,
+                                    sampled_onehot=(
+                                        sign_cand_inputs["support_ids"] == _y1
+                                    ).to(teacher_kld.dtype),
+                                    p_student=_push["p_student"],
                                 )
                             if xt_grad_stats is not None and xt_pg_grad_coef is not None:
                                 # Analytic, so the diagnostic cannot perturb the
@@ -3103,6 +3420,8 @@ class DataParallelPPOActor(BasePPOActor):
             self._xt_adv.all_reduce()
             for _st in self._xt_probe_mean.values():
                 _st.all_reduce()
+            for _st in self._xt_channel_mean.values():
+                _st.all_reduce()
             # Every rank derives the same table from the same reduced moments,
             # so no broadcast is needed to keep them agreeing.
             self._xt_alpha = self._xt_adv.alpha_table()
@@ -3128,6 +3447,10 @@ class DataParallelPPOActor(BasePPOActor):
             metrics.update(position_weight_metrics(xt_position_stats.sums(task_names=task_id_names)))
             metrics.update(state_shift_metrics(xt_state_stats.sums(task_names=task_id_names)))
             metrics.update(xt_pair_stats.metrics(task_names=task_id_names))
+            xt_pair_state_stats.all_reduce()
+            metrics.update(xt_pair_state_stats.metrics(task_names=task_id_names))
+            xt_outcome_stats.all_reduce()
+            metrics.update(xt_outcome_stats.metrics(task_names=task_id_names))
             if xt_grad_stats is not None:
                 xt_grad_stats.all_reduce()
                 metrics.update(gradient_metrics(xt_grad_stats.sums(task_names=task_id_names)))
@@ -3182,9 +3505,22 @@ class DataParallelPPOActor(BasePPOActor):
             if xt_pair_token_stats is not None:
                 xt_pair_token_stats.all_reduce()
                 metrics.update(xt_pair_token_stats.scalar_metrics(task_names=task_id_names))
+                # Per pair, because the pooled turnover cannot tell "a stable
+                # set" from "each source contributes a stable set and they are
+                # different sets" -- and the second is this arm's whole claim.
+                _pt, _pt_ids = xt_pair_token_stats.turnover(
+                    previous=self._xt_pair_token_prev,
+                    task_names=task_id_names, prefix="kl_weight",
+                )
+                metrics.update(_pt)
+                if _pt_ids:
+                    self._xt_pair_token_prev = _pt_ids
             if xt_role_token_stats is not None:
                 xt_role_token_stats.all_reduce()
                 metrics.update(xt_role_token_stats.scalar_metrics(prefix="kl_weight"))
+            if xt_push_token_stats is not None:
+                xt_push_token_stats.all_reduce()
+                metrics.update(xt_push_token_stats.scalar_metrics(task_names=task_id_names))
             metrics.update(self._xt_rms_metrics(task_id_names))
             metrics.update(self._xt_reliability_metrics(task_id_names))
             def _publish_probe(name, rendered, suffixes):
@@ -3209,6 +3545,26 @@ class DataParallelPPOActor(BasePPOActor):
                         position_weight_metrics({None: _sums[None]}),
                         ("/w_pre_mean", "/shared_share"),
                     )
+            for _name, _st in xt_channel_stats.items():
+                _st.all_reduce()
+                _sums = _st.sums(task_names=task_id_names)
+                # Per task as well as pooled: "is the corroboration channel
+                # carrying this" can have different answers on three tasks, and
+                # the arm is one mechanism across all three.
+                for key, value in xt_select_metrics(
+                    position_weight_metrics(_sums),
+                    ("/kl_shift_gross_frac", "/kl_scale", "/w_cv"),
+                ).items():
+                    metrics[key.replace("kl_weight/", f"kl_weight/channel/{_name}/", 1)] = value
+            for _name, _st in xt_channel_state_stats.items():
+                _st.all_reduce()
+                _sums = _st.sums(task_names=task_id_names)
+                if None not in _sums:
+                    continue
+                for key, value in xt_select_metrics(
+                    state_shift_metrics({None: _sums[None]}), ("/gross_share",)
+                ).items():
+                    metrics[key.replace("kl_weight/", f"kl_weight/channel/{_name}/", 1)] = value
             for _name, _st in xt_probe_state_stats.items():
                 _st.all_reduce()
                 _sums = _st.sums(task_names=task_id_names)
@@ -3234,6 +3590,10 @@ class DataParallelPPOActor(BasePPOActor):
                 "adv": self._xt_adv, "alpha": self._xt_alpha,
             }
             self.cross_teacher_task_order = list(task_id_names or [])
+            # One per call, after everything that read it. A plain python int on
+            # every rank, incremented in lockstep, so the dense-token stride
+            # cannot make two ranks disagree about whether a table exists.
+            self._xt_step_index += 1
         if position_stats is not None:
             # Only the ratios: the raw per-position means would put w_sq and
             # kl_sq in the log, which are not quantities anyone reads. The
@@ -3266,9 +3626,22 @@ class DataParallelPPOActor(BasePPOActor):
                 # scope="role:<name>", which is what already tells the two apart,
                 # and a third file is a third thing a reader has to join.
                 self.last_token_report += xt_role_token_stats.top_tokens()
+            if xt_push_token_stats is not None:
+                # Same file, and told apart by ranked_by="extra_logit_push" plus
+                # the direction_class column no other row carries. A reader
+                # filtering on either gets exactly the affected-logit table.
+                self.last_token_report += xt_push_token_stats.top_tokens(
+                    task_names=task_id_names
+                )
         # A second file rather than a discriminator column in the first: the two
         # tables are keyed differently (scope/state against dst/src/class) and
         # merging them would make every row carry the other's empty columns.
+        # Its own file: the rows are keyed by (dst, src, pair_state) and carry
+        # nineteen float columns no other table has, so merging them into the
+        # candidate dump would give every other row nineteen empty ones.
+        self.last_pair_event_report = None
+        if xt_pair_event_stats is not None:
+            self.last_pair_event_report = xt_pair_event_stats.rows(task_names=task_id_names)
         self.last_pair_token_report = None
         if pair_token_stats is not None:
             pair_token_stats.all_reduce()

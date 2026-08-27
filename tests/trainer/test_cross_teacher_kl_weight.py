@@ -3188,3 +3188,539 @@ def test_the_pair_token_table_is_wired_to_the_per_source_shift():
     tok = src[src.index("token_stats.update("):]
     tok = tok[: tok.index("\n            )")]
     assert "effect=shift," in tok
+
+
+# --------------------------------------------------------------------------- #
+# the evidence token and the token whose logit moved are not the same token
+# --------------------------------------------------------------------------- #
+def test_the_unweighted_push_is_the_gradient_of_the_unweighted_opd_term():
+    """One definition, read by the norm metric and by the push table. A second
+    copy is how 'the arm amplified this token' and 'the arm's gradient norm'
+    come to describe different quantities under one name."""
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+    from verl.trainer.ppo.cross_teacher_kl_weight import opd_logit_push
+
+    torch.manual_seed(100)
+    k, V, coef = 4, 9, 0.01
+    logits = torch.randn(1, 1, V, requires_grad=True)
+    teacher = torch.log_softmax(torch.randn(1, 1, V), -1)[..., :k]
+    lp = torch.log_softmax(logits, -1)
+    kl = topk_kl_per_token(lp[..., :k], teacher)
+    (coef * kl).sum().backward()
+    auto = -logits.grad[0, 0]
+
+    got = opd_logit_push(
+        student_logprob=lp[..., :k].detach(), teacher_logprob=teacher,
+        teacher_kl=kl.detach(), coef=coef,
+    )
+    assert torch.allclose(got["g0"][0, 0], auto[:k], atol=1e-7)
+    assert float(got["g0_tail"][0, 0]) == pytest.approx(float(auto[k:].sum()), rel=1e-4)
+
+
+def test_the_four_direction_classes_are_the_product_of_two_facts():
+    """Sign alone is not the reading: a weight above 1 at a token the term was
+    pushing DOWN amplifies the suppression, and calling that 'reinforced' would
+    invert the claim."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        PUSH_CLASSES, push_direction_class,
+    )
+
+    g0 = torch.tensor([[[-1.0, 1.0], [-1.0, 1.0]]])
+    w = torch.tensor([[0.5, 2.0]])
+    cls = push_direction_class(g0, w)
+    named = [[PUSH_CLASSES[int(c)] for c in row] for row in cls[0]]
+    assert named[0] == ["push_down_damped", "push_up_damped"]
+    assert named[1] == ["push_down_amplified", "push_up_amplified"]
+
+
+def test_the_push_table_names_the_support_not_the_tokens_that_supplied_evidence():
+    """The claim this separation protects: W is a scalar on the POSITION, so
+    every token in the support has its logit moved, including ones no teacher
+    spoke at. A table conflating the two would say 'Search reinforced retrieve'
+    when what it reinforced there is the suppression of something else."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        LogitPushTokens, PUSH_CLASSES, opd_logit_push,
+    )
+
+    bs, resp, k = 2, 3, 4
+    student = _lp(bs, resp, k, seed=101)
+    teacher = _lp(bs, resp, k, seed=102)
+    kl = torch.rand(bs, resp) + 0.1
+    push = opd_logit_push(
+        student_logprob=student, teacher_logprob=teacher, teacher_kl=kl, coef=0.01
+    )
+    w = torch.tensor([[0.6, 1.4, 1.0], [2.0, 0.9, 1.1]])
+    support = torch.arange(bs * resp * k).reshape(bs, resp, k) % 40
+    mask = torch.ones(bs, resp)
+    mask[1, 2] = 0.0
+
+    tbl = LogitPushTokens(vocab_size=64, n_tasks=3, device="cpu", top_n=4)
+    tbl.update(
+        support_ids=support, g0=push["g0"], weight=w, coef_applied_weight=w,
+        response_mask=mask, task_ids=torch.tensor([0, 1]),
+        sampled_onehot=torch.nn.functional.one_hot(
+            torch.zeros(bs, resp, dtype=torch.long), k
+        ).to(torch.float32),
+        p_student=push["p_student"],
+    )
+    buf = tbl._cpu()
+    i = {t: j for j, t in enumerate(tbl.TERMS)}
+    # The pooled scope holds EVERY masked candidate, not just the ones a teacher
+    # spoke at: k per live position.
+    assert float(buf[0, :, :, i["n"]].sum()) == pytest.approx(float(mask.sum()) * k)
+    # And the added push is exactly (W - 1) * g0 over those.
+    want = ((w.unsqueeze(-1) - 1.0) * push["g0"] * mask.unsqueeze(-1)).sum()
+    assert float(buf[0, :, :, i["extra"]].sum()) == pytest.approx(float(want), abs=1e-9)
+    # A weight of exactly 1 adds nothing, whatever g0 was doing there.
+    assert float(buf[0, :, :, i["extra_abs"]].sum()) > 0
+    unity = ((w == 1.0).unsqueeze(-1) * push["g0"].abs() * mask.unsqueeze(-1)).sum()
+    assert float(unity) > 0, "there is such a position"
+    # Classes partition the count, and the shares sum to one.
+    m = tbl.scalar_metrics(task_names=TASKS)
+    shares = [m[f"kl_weight/push/{c}/gross_share"] for c in PUSH_CLASSES
+              if f"kl_weight/push/{c}/gross_share" in m]
+    assert sum(shares) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_the_push_table_refuses_two_different_weights():
+    """The class and the magnitude have to come from the SAME W, or a token is
+    filed under one and measured under the other."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import LogitPushTokens
+
+    tbl = LogitPushTokens(vocab_size=8, n_tasks=1, device="cpu")
+    kw = dict(
+        support_ids=torch.zeros(1, 1, 2, dtype=torch.long),
+        g0=torch.ones(1, 1, 2), response_mask=torch.ones(1, 1),
+    )
+    with pytest.raises(AssertionError, match="APPLIED weight"):
+        tbl.update(weight=torch.ones(1, 1), coef_applied_weight=torch.full((1, 1), 2.0), **kw)
+
+
+def test_the_push_rows_say_which_direction_and_carry_the_students_own_mass():
+    """'The arm amplified this token' and 'the arm amplified a token the student
+    was never going to say' are different findings with the same nats."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import LogitPushTokens
+
+    tbl = LogitPushTokens(vocab_size=16, n_tasks=1, device="cpu", top_n=3)
+    tbl.update(
+        support_ids=torch.tensor([[[1, 2]]]),
+        g0=torch.tensor([[[1.0, -1.0]]]),
+        weight=torch.tensor([[2.0]]), coef_applied_weight=torch.tensor([[2.0]]),
+        response_mask=torch.ones(1, 1), task_ids=torch.tensor([0]),
+        sampled_onehot=torch.tensor([[[1.0, 0.0]]]),
+        p_student=torch.tensor([[[0.7, 0.2]]]),
+    )
+    rows = {(r["scope"], r["token_id"]): r for r in tbl.top_tokens(task_names=["a"])}
+    up = rows[("__pooled__", 1)]
+    down = rows[("__pooled__", 2)]
+    assert up["direction_class"] == "push_up_amplified"
+    assert down["direction_class"] == "push_down_amplified"
+    assert up["extra_logit_push"] == pytest.approx(1.0)
+    assert down["extra_logit_push"] == pytest.approx(-1.0)
+    assert up["p_student_mean"] == pytest.approx(0.7)
+    assert up["sampled_count"] == 1 and down["sampled_count"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# per-trajectory: which rollouts the budget went to
+# --------------------------------------------------------------------------- #
+def test_the_outcome_buckets_separate_where_the_budget_went():
+    """'The arm moved 3% of the budget' and 'the arm moved 3% of the budget,
+    almost all of it on rollouts that failed' are the same number and opposite
+    findings."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import OutcomeEffectStats
+
+    acc = OutcomeEffectStats(n_tasks=3, device="cpu")
+    # Two rows: the first has a positive advantage and a scored episode and a
+    # weight far from 1; the second is the opposite on both counts.
+    acc.update(
+        weight=torch.tensor([[2.0, 2.0], [1.0, 1.0]]),
+        teacher_kl=torch.tensor([[1.0, 1.0], [1.0, 1.0]]),
+        response_mask=torch.ones(2, 2),
+        advantage=torch.tensor([1.5, -1.5]),
+        task_ids=torch.tensor([0, 0]),
+        reward=torch.tensor([1.0, 0.0]),
+    )
+    m = acc.metrics(task_names=TASKS)
+    assert m["kl_weight/outcome/adv_positive/gross_effect"] == pytest.approx(1.0)
+    assert m["kl_weight/outcome/adv_negative/gross_effect"] == pytest.approx(0.0)
+    assert m["kl_weight/outcome/success/gross_effect"] == pytest.approx(1.0)
+    assert m["kl_weight/outcome/failure/gross_effect"] == pytest.approx(0.0)
+    # Both sides have to exist for the ratio, and the zero side is not an
+    # infinity -- a step with no failures is not a step with an infinite ratio.
+    assert "kl_weight/outcome/success_to_failure_effect_ratio" not in m
+    assert m["kl_weight/outcome/all/n_rows"] == pytest.approx(2.0)
+    assert m["kl_weight/alfworld/outcome/adv_positive/gross_effect"] == pytest.approx(1.0)
+
+
+def test_the_outcome_correlation_is_over_trajectories_not_positions():
+    """The trajectory-level companion to weight_kl_corr. A per-position reading
+    cannot say whether the ROLLOUTS the arm spent on were the ones that scored."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import OutcomeEffectStats
+
+    n = 30
+    a = torch.linspace(-1.0, 1.0, n)
+    # G_i = |w - 1| exactly, since every KL is 1 -- so making w track a makes
+    # the correlation +1.
+    acc = OutcomeEffectStats(n_tasks=1, device="cpu")
+    acc.update(
+        weight=(1.0 + a.abs() * a.sign() * 0 + (1.0 + a)).reshape(n, 1).expand(n, 4).contiguous(),
+        teacher_kl=torch.ones(n, 4), response_mask=torch.ones(n, 4),
+        advantage=a, task_ids=torch.zeros(n, dtype=torch.long),
+    )
+    m = acc.metrics(task_names=["a"])
+    assert m["kl_weight/outcome/corr_adv_gross_effect"] > 0.9
+    # Success buckets stay empty without a reward: the advantage is
+    # group-relative and says nothing about whether the episode succeeded.
+    assert "kl_weight/outcome/success/gross_effect" not in m
+
+
+def test_a_row_with_no_kl_contributes_no_ratio():
+    """G_i divides by the row's own KL. A padded row would otherwise enter the
+    correlation as a zero it did not earn."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import OutcomeEffectStats
+
+    acc = OutcomeEffectStats(n_tasks=1, device="cpu")
+    acc.update(
+        weight=torch.tensor([[2.0], [2.0]]), teacher_kl=torch.tensor([[1.0], [0.0]]),
+        response_mask=torch.ones(2, 1), advantage=torch.tensor([1.0, 1.0]),
+        task_ids=torch.zeros(2, dtype=torch.long),
+    )
+    assert acc.metrics()["kl_weight/outcome/all/n_rows"] == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# source x disagreement state
+# --------------------------------------------------------------------------- #
+def test_the_pair_state_table_keeps_both_axes_the_others_collapse():
+    """kl_shift_by_state sums the sources out; evidence/{src}__on__{dst} sums the
+    states out. 'When Search disagreed with AlfWorld's own teacher, what did the
+    arm do' is in neither, and arbitrating exactly that is the mechanism."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        PAIR_STATES, PairStateEvidenceStats, pair_state_index,
+    )
+
+    hat_on = torch.tensor([[[[1.0], [0.0], [1.0], [0.0]]]]).squeeze(-1).unsqueeze(0)
+    hat_on = torch.tensor([[[1.0, 0.0, 1.0, 0.0]]])           # (1, 1, 4)
+    hat_off = torch.tensor([[[[1.0], [1.0], [-1.0], [0.0]]]])  # (1, 1, 4, 1)
+    st = pair_state_index(hat_on=hat_on, hat_off=hat_off, deadzone=0.1)
+    assert [PAIR_STATES[int(x)] for x in st[0, 0, :, 0]] == [
+        "agree", "on_silent_source_active", "conflict", "source_silent",
+    ]
+
+    acc = PairStateEvidenceStats(n_tasks=3, device="cpu")
+    acc.update(
+        state=st,
+        evidence=torch.ones(1, 1, 4, 1),
+        shift=torch.tensor([[[[2.0], [3.0], [-5.0], [7.0]]]]),
+        response_mask=torch.ones(1, 1),
+        task_ids=torch.tensor([0]), off_plane_tasks=torch.tensor([[1]]),
+    )
+    m = acc.metrics(task_names=TASKS)
+    head = "kl_weight/pair_state/search__on__alfworld"
+    for s in PAIR_STATES:
+        assert m[f"{head}/{s}/position_frac"] == pytest.approx(0.25)
+    assert m[f"{head}/conflict/kl_shift_net"] == pytest.approx(-5.0)
+    shares = [m[f"{head}/{s}/kl_shift_gross_share"] for s in PAIR_STATES]
+    assert sum(shares) == pytest.approx(1.0)
+    assert m[f"{head}/source_silent/kl_shift_gross_share"] == pytest.approx(7.0 / 17.0)
+
+
+# --------------------------------------------------------------------------- #
+# the channel counterfactuals
+# --------------------------------------------------------------------------- #
+def test_the_channel_probes_remove_a_channel_rather_than_scaling_one():
+    """The alpha series asks 'what if the advantage channel were scaled
+    differently'. These ask 'what if a channel were not there', which is the
+    ablation the design decisions were made on."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import CHANNEL_PROBES
+
+    got, _ = _built(alpha=0.5)
+    assert set(got["channel_pre_weight"]) == set(CHANNEL_PROBES)
+    live = got["pre_weight"]
+    no_shared = got["channel_pre_weight"]["no_shared"]
+    off_shared = got["channel_pre_weight"]["offtask_shared"]
+    # Dropping the corroboration term can only lower the pre-weight: every term
+    # in W~ - 1 is non-negative.
+    assert bool((no_shared <= live + 1e-6).all())
+    assert float((live - no_shared).abs().sum()) > 0, "the channel carries something"
+    # And the off-task-only rule is the counterfactual the arm chose against, so
+    # it is a different number from both.
+    assert float((off_shared - live).abs().sum()) > 0
+    assert got["channel_evidence"]["no_shared"].shape == got["evidence"].shape
+
+
+def test_a_channel_probe_is_zero_where_the_position_is_unavailable():
+    got, _ = _built(diag_valid=[True, False, True])
+    idx = (~got["available"]).nonzero().flatten()
+    assert idx.numel()
+    for name, pre in got["channel_pre_weight"].items():
+        for i in idx.tolist():
+            assert torch.allclose(pre[i], torch.ones_like(pre[i])), name
+            assert float(got["channel_evidence"][name][i].abs().max()) == 0.0, name
+
+
+# --------------------------------------------------------------------------- #
+# support coverage
+# --------------------------------------------------------------------------- #
+def test_support_mass_separates_a_weak_source_from_an_invisible_one():
+    """'Search contributed little to AlfWorld' has three explanations that read
+    identically -- weak signal, low alpha, or Search's vocabulary simply not in
+    the support the whole mechanism is measured on."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import PairEvidenceStats
+
+    acc = PairEvidenceStats(n_tasks=3, device="cpu")
+    acc.update(
+        evidence=torch.ones(2, 3, 2), shift=torch.ones(2, 3, 2),
+        response_mask=torch.ones(2, 3), task_ids=torch.tensor([0, 0]),
+        off_plane_tasks=torch.tensor([[1, 2], [1, 2]]),
+        # Search covers most of the student's top-k here; WebShop almost none.
+        support_mass=torch.stack(
+            [torch.full((2, 3), 0.8), torch.full((2, 3), 0.02)], dim=-1
+        ),
+    )
+    m = acc.metrics(task_names=TASKS)
+    assert m["kl_weight/evidence/search__on__alfworld/support_mass"] == pytest.approx(0.8)
+    assert m["kl_weight/evidence/webshop__on__alfworld/tail_mass"] == pytest.approx(0.98)
+    # Absent rather than zero when the caller did not measure it.
+    bare = PairEvidenceStats(n_tasks=3, device="cpu")
+    bare.update(
+        evidence=torch.ones(1, 2, 1), shift=torch.ones(1, 2, 1),
+        response_mask=torch.ones(1, 2), task_ids=torch.tensor([0]),
+        off_plane_tasks=torch.tensor([[1]]),
+    )
+    assert "kl_weight/evidence/search__on__alfworld/support_mass" not in bare.metrics(
+        task_names=TASKS
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the pair-stratified dump, end to end through the real assembly
+# --------------------------------------------------------------------------- #
+def _pair_event_rows(bs=6, resp=4, k=5, n_off=2, per_group=2, seed=120):
+    """Drive dp_actor's own column assembly, not a reimplementation of it."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import opd_logit_push
+    from verl.trainer.ppo.sign_weights import PairEventSamples
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    torch.manual_seed(seed)
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1)
+    shifts = compute_raw_policy_shifts(
+        on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+    )
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    alpha = torch.full((3, 3), 0.6)
+    alpha.fill_diagonal_(0.0)
+    built = build_position_weight(
+        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        # Not all ones: with a unit divisor the raw and standardized columns are
+        # the same number and the test that they are separate would pass on a
+        # table that had merged them.
+        diag=torch.tensor([0.5, 2.0, 1.5]), alpha_table=alpha,
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    kl = torch.rand(bs, resp) + 0.1
+    mask = torch.ones(bs, resp)
+    mask[0, -1] = 0.0
+    support = torch.randint(0, 500, (bs, resp, k))
+    data = {
+        "responses": torch.randint(0, 500, (bs, resp)),
+        "sign_off_tasks": planes,
+    }
+    push = opd_logit_push(
+        student_logprob=_lp(bs, resp, k), teacher_logprob=on, teacher_kl=kl, coef=0.01
+    )
+    stats = PairEventSamples(n_tasks=3, per_group=per_group, context=2, device="cpu")
+    DataParallelPPOActor._xt_pair_events(
+        None, stats=stats, built=built, teacher_kl=kl, data=data,
+        support_ids=support, student_topk_logprob=_lp(bs, resp, k),
+        on_task_logprob=on, response_mask=mask, task_ids=task_ids,
+        report_epsilon=0.1, roles=None, planes=(base, off), raw_shifts=shifts,
+        alpha_table=alpha, row_reward=torch.rand(bs), row_advantage=torch.randn(bs),
+        push=push,
+    )
+    return stats.rows(task_names=TASKS), built, stats
+
+
+def test_the_pair_event_rows_carry_the_source_specific_columns():
+    """A per-candidate row can only report the min and max over whichever
+    off-task teachers spoke. 'What did Search bring to AlfWorld' needs Search's
+    own probability, Search's own shift and Search's own alpha ON THE ROW."""
+    from verl.trainer.ppo.sign_weights import (
+        PAIR_EVENT_FLOATS, PAIR_EVENT_INTS, PAIR_STATES,
+    )
+
+    rows, _built, stats = _pair_event_rows()
+    assert rows, "the sampler produced nothing"
+    for r in rows:
+        assert set(PAIR_EVENT_INTS) - {"dst", "src", "pair_state", "state", "role"} <= set(r)
+        assert set(PAIR_EVENT_FLOATS) <= set(r)
+        assert r["dst"] != r["src"], "the diagonal is structurally absent"
+        assert r["pair_state"] in PAIR_STATES
+        assert 0.0 < r["p_base"] <= 1.0 and 0.0 < r["p_source"] <= 1.0
+        assert 0.0 < r["p_on"] <= 1.0 and 0.0 < r["p_student"] <= 1.0
+        assert r["alpha_source"] == pytest.approx(0.6)
+        assert "context_ids" in r and len(r["context_ids"]) == 5
+    # Every stratum is present and they are not the same rows.
+    assert {r["stratum"] for r in rows} == set(stats.STRATA)
+
+
+def test_the_pair_event_sampling_is_per_cell_so_a_rare_pair_survives():
+    """A global top-N is dominated by whichever ordered pair is loudest, and the
+    event this arm exists to find is a minority of a minority. Every cell that
+    occurred at all has to be represented."""
+    rows, _built, stats = _pair_event_rows(per_group=2)
+    seen = {}
+    for r in rows:
+        if r["stratum"] != "top_shift":
+            continue
+        seen.setdefault((r["dst"], r["src"], r["pair_state"]), 0)
+        seen[(r["dst"], r["src"], r["pair_state"])] += 1
+    assert len(seen) >= 4, sorted(seen)
+    assert max(seen.values()) <= 2, "per_group is a per-cell cap, not a global one"
+
+
+def test_the_two_top_strata_rank_on_different_quantities():
+    """One is about the evidence, the other about the effect on the student.
+    Collapsing them is exactly the conflation this whole split exists to stop."""
+    rows, _built, _stats = _pair_event_rows(per_group=3)
+    by = {}
+    for r in rows:
+        by.setdefault(r["stratum"], []).append(r)
+    shift_top = max(abs(r["source_attributed_kl_shift"]) for r in by["top_shift"])
+    push_top = max(abs(r["extra_logit_push"]) for r in by["top_push"])
+    assert shift_top >= max(
+        abs(r["source_attributed_kl_shift"]) for r in by["spread"]
+    ), "top_shift really is the top of its key"
+    assert push_top >= max(abs(r["extra_logit_push"]) for r in by["spread"])
+    # And the two rankings do not coincide -- if they did, one of them is
+    # measuring the other and the split buys nothing.
+    ids = lambda name: {(r["dst"], r["src"], r["token_id"], r["position"]) for r in by[name]}
+    assert ids("top_shift") != ids("top_push")
+
+
+def test_the_pair_event_row_reports_the_raw_shift_and_the_standardized_one():
+    """delta_*_raw is in nats and delta_*_std is in the teacher's own RMS units.
+    A single column would make report_epsilon incomparable across teachers or
+    the nats incomparable with the model's own log-probs."""
+    rows, built, _stats = _pair_event_rows()
+    assert any(
+        r["delta_source_raw"] != pytest.approx(r["delta_source_std"], rel=1e-6)
+        for r in rows
+    ), "the two columns are not the same number"
+    for r in rows:
+        # p_source is a probability; delta_source_raw is its log-ratio to base,
+        # so exp of the second times p_base recovers the first.
+        assert r["p_source"] == pytest.approx(
+            r["p_base"] * math.exp(r["delta_source_raw"]), rel=1e-4
+        )
+
+
+def test_a_masked_position_never_reaches_the_pair_dump():
+    rows, _built, _stats = _pair_event_rows()
+    for r in rows:
+        assert r["position"] < r["row_len"] or r["row_len"] == 0
+
+
+def test_an_empty_cell_does_not_hand_its_slots_to_the_loudest_one():
+    """The per-cell guarantee is the whole point. topk over an all-masked cell
+    still returns indices -- of rows belonging to OTHER cells -- so retaining
+    their unmasked scores lets a cell that never fired donate its slots to the
+    cell that fired most, and the stratification silently becomes a global
+    top-N wearing per-cell labels."""
+    import collections
+
+    rows, _built, stats = _pair_event_rows(per_group=2)
+    per_cell = collections.Counter(
+        (r["stratum"], r["dst"], r["src"], r["pair_state"]) for r in rows
+    )
+    assert per_cell, "the sampler produced nothing"
+    over = {k: v for k, v in per_cell.items() if v > stats.per_group}
+    assert not over, over
+    # And the total is at most the cap, not exactly it -- a run where some cells
+    # never fired must come out SHORT rather than padded from elsewhere.
+    for stratum in stats.STRATA:
+        n = sum(v for k, v in per_cell.items() if k[0] == stratum)
+        assert n <= stats.n_groups * stats.per_group
+    assert sum(per_cell.values()) < len(stats.STRATA) * stats.n_groups * stats.per_group
+
+
+class _FakeGather:
+    """Emulate ``all_gather`` over R ranks that ran identical data."""
+
+    def __init__(self, ranks):
+        self.ranks = ranks
+        self._saved = None
+
+    def __enter__(self):
+        import verl.trainer.ppo.sign_weights as mod
+
+        self._saved = mod.torch.distributed
+        ranks = self.ranks
+
+        class _Dist:
+            ReduceOp = type("ReduceOp", (), {"SUM": "sum"})
+
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def is_initialized():
+                return True
+
+            @staticmethod
+            def get_world_size():
+                return ranks
+
+            @staticmethod
+            def get_rank():
+                return 0
+
+            @staticmethod
+            def all_gather(out, src):
+                for t in out:
+                    t.copy_(src)
+
+            @staticmethod
+            def all_reduce(t, op=None):
+                t.mul_(ranks)
+
+        mod.torch.distributed = _Dist
+        return self
+
+    def __exit__(self, *a):
+        import verl.trainer.ppo.sign_weights as mod
+
+        mod.torch.distributed = self._saved
+        return False
+
+
+def test_the_pair_dump_gathers_every_rank_and_still_caps_each_cell():
+    """A rank-0-local sample is world_size times smaller than a reader assumes,
+    and for a cell that fires a handful of times a step that is the difference
+    between a few examples and none. The gather is FIXED SHAPE -- groups x
+    per_group whatever the batch held -- so it is a collective on the config and
+    cannot hang on a rank whose micro-batches held nothing."""
+    import collections
+
+    solo, _b, stats = _pair_event_rows(per_group=2)
+    with _FakeGather(3):
+        gathered, _b2, stats2 = _pair_event_rows(per_group=2)
+    # Same data on every rank, so the re-selection keeps the same per-cell cap.
+    per_cell = collections.Counter(
+        (r["stratum"], r["dst"], r["src"], r["pair_state"]) for r in gathered
+    )
+    assert not {k: v for k, v in per_cell.items() if v > stats2.per_group}
+    # The rows survive the pack/unpack round trip intact: ids stay exact through
+    # the float64 transport and the labels come back as labels.
+    assert {r["token_id"] for r in gathered} <= {r["token_id"] for r in solo} | {
+        r["token_id"] for r in gathered
+    }
+    for r in gathered:
+        assert isinstance(r["dst"], str) and isinstance(r["src"], str)
+        assert r["token_id"] == int(r["token_id"])
+        assert 0.0 < r["p_source"] <= 1.0

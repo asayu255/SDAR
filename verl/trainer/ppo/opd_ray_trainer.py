@@ -797,6 +797,7 @@ class OPDRayTrainer(RayPPOTrainer):
             ("sign_token_report", "sign_tokens"),
             ("sign_pair_token_report", "sign_pair_tokens"),
             ("sign_event_report", "sign_events"),
+            ("sign_pair_event_report", "sign_pair_events"),
         ):
             rows = actor_output.meta_info.get(key, None)
             if not rows:

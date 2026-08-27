@@ -852,6 +852,7 @@ class ActorRolloutRefWorker(Worker):
                 ("last_token_report", "sign_token_report"),
                 ("last_pair_token_report", "sign_pair_token_report"),
                 ("last_event_report", "sign_event_report"),
+                ("last_pair_event_report", "sign_pair_event_report"),
             ):
                 report = getattr(self.actor, attr, None)
                 if not report:

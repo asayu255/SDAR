@@ -121,6 +121,10 @@ __all__ = [
     "token_roles",
     "turn_index",
     "RoleTokenCounts",
+    "PAIR_STATES",
+    "PAIR_EVENT_INTS",
+    "PAIR_EVENT_FLOATS",
+    "PairEventSamples",
     "SignEventSamples",
 ]
 
@@ -2451,6 +2455,46 @@ class SignPairTokens:
                         )
         return out
 
+    def turnover(self, previous=None, task_names=None, prefix: str = "sign_weight"):
+        """Per PAIR, is it the same vocabulary each step?
+
+        The pooled turnover cannot answer this. "The arm acts on a stable set of
+        tokens" and "each source contributes a stable set, and they are different
+        sets" produce the same pooled Jaccard, and the second is the claim this
+        arm is for -- that the tasks share structure a particular OTHER task can
+        supply. A pair whose set churns while the pooled one is stable is a pair
+        contributing noise into a stable total.
+
+        Same two readings as :meth:`TokenStateCounts.turnover`: set membership,
+        and the share of THIS step's attributed nats that landed on tokens the
+        previous step had ranked. Returns ``(metrics, state)``; the first call
+        returns no metrics because there is nothing to compare against.
+        """
+        _n, _mass, eff = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        out, state = {}, {}
+        for pair, dst, src in self._pairs(task_names):
+            per_tok = eff[pair].sum(0).abs()
+            tot = float(per_tok.sum())
+            if tot <= 0:
+                continue
+            vals, idx = torch.topk(per_tok, N)
+            cur = [int(t) for v, t in zip(vals.tolist(), idx.tolist()) if v > 0]
+            if not cur:
+                continue
+            key = f"{src}__on__{dst}"
+            state[key] = cur
+            prev = (previous or {}).get(key)
+            if not prev:
+                continue
+            a, b = set(cur), set(prev)
+            head = f"{prefix}/pair_token/{key}/turnover"
+            out[f"{head}/top{N}_jaccard"] = len(a & b) / len(a | b)
+            keep = torch.zeros(self.vocab_size, dtype=torch.bool)
+            keep[torch.tensor(sorted(b), dtype=torch.long)] = True
+            out[f"{head}/effect_carryover"] = float(per_tok[keep].sum()) / tot
+        return out, state
+
     def top_tokens(self, task_names=None) -> list:
         """The ranked rows themselves, ids not strings -- the actor has no tokenizer.
 
@@ -2743,6 +2787,261 @@ class RoleTokenCounts:
                         "effect_net": float(net[tok]), "effect_gross": float(gross[tok]),
                     })
         return rows
+
+
+# The four things a source can be doing at a candidate, relative to the on-task
+# teacher. The existing state table sums the sources out and the existing source
+# table sums the states out, so "what did the arm do when Search DISAGREED with
+# AlfWorld's own teacher" -- which is the case the mechanism exists to arbitrate
+# -- is in neither. Defined here rather than beside the accumulator that fills
+# it, because the event sampler below needs the names and lives on this side of
+# the import edge.
+PAIR_STATES = ("agree", "conflict", "on_silent_source_active", "source_silent")
+
+
+# One row per (candidate, SOURCE), against SignEventSamples' one row per
+# candidate. The extra axis is the whole point: "what did Search bring to
+# AlfWorld" needs Search's own probability, Search's own shift and Search's own
+# alpha on the row, and a per-candidate row can only carry the min and max over
+# whichever off-task teachers happened to speak.
+PAIR_EVENT_INTS = (
+    "token_id", "dst", "src", "pair_state", "state", "role", "turn",
+    "position", "row_len", "is_sampled",
+)
+PAIR_EVENT_FLOATS = (
+    # what the four models said, as probabilities
+    "p_base", "p_on", "p_source", "p_student",
+    # and the shifts, raw nats and RMS units, never mixed with the above
+    "delta_on_raw", "delta_source_raw", "delta_on_std", "delta_source_std",
+    # the mechanism at this candidate
+    "alpha_source", "shared_evidence", "source_evidence",
+    "pre_weight", "applied_weight",
+    # what it cost and what it moved
+    "teacher_kl", "source_attributed_kl_shift",
+    "weighted_logit_push", "extra_logit_push",
+    # and what happened to the rollout it sat in
+    "advantage", "reward",
+)
+
+
+class PairEventSamples:
+    """Individual (candidate, source) events, stratified so the rare ones survive.
+
+    Two problems with a single global top-N, both of which this fixes.
+
+    STRATIFICATION. A global ranking by ``|effect|`` is dominated by whichever
+    ordered pair happens to be loudest, and the interesting event -- Search's
+    evidence acting on an AlfWorld state where the two teachers DISAGREE -- is
+    structurally a minority of a minority. Sampling per ``(dst, src, pair_state)``
+    guarantees every cell that occurred at all is represented, which is the
+    difference between "we looked and found none" and "we never looked".
+
+    CROSS-RANK. ``SignEventSamples`` is rank-0 local, so what lands on disk is a
+    sample of one shard -- unbiased, but ``world_size`` times smaller than a
+    reader assumes, and for a cell that fires a handful of times a step that is
+    the difference between a few examples and none. Here each rank selects its
+    own fixed-size slate and they are ``all_gather``ed: the shape is decided by
+    the config (groups x strata x per_group), never by batch content, so the
+    collective is uniform. About 140 KB a rank at three tasks.
+
+    Three strata per cell, because they answer different questions and the same
+    row rarely tops two of them:
+
+    ``top_shift``  the largest ``|source_attributed_kl_shift|`` -- where this
+                   source moved the most of this task's KL budget.
+    ``top_push``   the largest ``|extra_logit_push|`` -- where the weighting
+                   changed a student logit the most. NOT the same rows: the
+                   first is about the evidence, the second about the effect on
+                   the student, and keeping both is what lets the write-up say
+                   which token supplied the reason and which token moved.
+    ``spread``     a deterministic hash sample, so the median event is
+                   represented and a mechanism whose extremes are
+                   unrepresentative is visible as such.
+    """
+
+    STRATA = ("top_shift", "top_push", "spread")
+    _HASH = 2654435761
+
+    def __init__(self, *, n_tasks: int, per_group: int = 4, context: int = 8, device=None):
+        self.n_tasks = T = int(n_tasks)
+        self.n_states = len(PAIR_STATES)
+        self.n_groups = max(T * (T - 1), 1) * self.n_states
+        self.per_group = int(per_group)
+        self.context = int(context)
+        self.device = device
+        self._ints, self._floats, self._ctx, self._scores = {}, {}, {}, {}
+        for s in self.STRATA:
+            self._ints[s], self._floats[s], self._ctx[s], self._scores[s] = [], [], [], []
+        self._seen = 0
+
+    def _pair_index(self, dst, src):
+        """(dst, src) -> 0..T*(T-1)-1, skipping the structurally empty diagonal."""
+        return dst * (self.n_tasks - 1) + src - (src > dst).to(torch.long)
+
+    def update(self, *, columns: dict, group: torch.Tensor, valid: torch.Tensor,
+               context_ids: torch.Tensor, shift: torch.Tensor, push: torch.Tensor) -> None:
+        """Take this micro-batch's slate.
+
+        Args:
+            columns: every name in :data:`PAIR_EVENT_INTS` and
+                :data:`PAIR_EVENT_FLOATS`, each broadcastable to
+                ``(bs, resp, k, n_off)``.
+            group: (bs, resp, k, n_off) the cell index.
+            valid: (bs, resp, k, n_off) bool.
+            context_ids: (bs, resp, k, n_off, 2 * context + 1).
+            shift: the ``top_shift`` ranking key.
+            push: the ``top_push`` ranking key.
+
+        Sync-free: ``per_group`` topk calls over a masked score, and small device
+        tensors appended to a list. Nothing is read to the host until
+        :meth:`rows`.
+        """
+        n = group.numel()
+        idx = torch.arange(self._seen, self._seen + n, device=group.device, dtype=torch.long)
+        self._seen += n
+        g = group.reshape(-1)
+        ok = valid.reshape(-1)
+        ints = torch.stack(
+            [columns[c].expand_as(group).reshape(-1).to(torch.long) for c in PAIR_EVENT_INTS],
+            dim=-1,
+        )
+        floats = torch.stack(
+            [columns[c].expand_as(group).reshape(-1).to(torch.float64) for c in PAIR_EVENT_FLOATS],
+            dim=-1,
+        )
+        ctx = context_ids.reshape(n, -1)
+        keys = {
+            "top_shift": shift.reshape(-1).abs().to(torch.float64),
+            "top_push": push.reshape(-1).abs().to(torch.float64),
+            "spread": ((idx * self._HASH) % 2147483647).to(torch.float64),
+        }
+        take = min(self.per_group, n)
+        for name, key in keys.items():
+            # -1 sorts below every real score and is dropped at render time, so a
+            # cell with fewer than per_group events keeps only what it had.
+            for cell in range(self.n_groups):
+                score = torch.where(ok & (g == cell), key, torch.full_like(key, -1.0))
+                _v, sel = torch.topk(score, take)
+                self._scores[name].append(score[sel])
+                self._ints[name].append(ints[sel])
+                self._floats[name].append(floats[sel])
+                self._ctx[name].append(ctx[sel])
+
+    def _slate(self):
+        """This rank's final selection, as fixed-shape padded tensors."""
+        cap = self.n_groups * self.per_group
+        n_i, n_f = len(PAIR_EVENT_INTS), len(PAIR_EVENT_FLOATS)
+        width = 2 * self.context + 1
+        out = {}
+        for name in self.STRATA:
+            ints = torch.zeros((cap, n_i), dtype=torch.long)
+            floats = torch.zeros((cap, n_f), dtype=torch.float64)
+            ctx = torch.zeros((cap, width), dtype=torch.long)
+            score = torch.full((cap,), -1.0, dtype=torch.float64)
+            if self._scores[name]:
+                s = torch.cat(self._scores[name])
+                i_all = torch.cat(self._ints[name])
+                f_all = torch.cat(self._floats[name])
+                c_all = torch.cat(self._ctx[name])
+                # Re-rank per cell over the concatenation, so the result is what
+                # one pass over the whole mini-batch would have produced.
+                cells = self._cell_of(i_all)
+                for cell in range(self.n_groups):
+                    pick = torch.where(cells == cell, s, torch.full_like(s, -1.0))
+                    take = min(self.per_group, pick.numel())
+                    v, sel = torch.topk(pick, take)
+                    lo = cell * self.per_group
+                    ints[lo : lo + take] = i_all[sel].to("cpu")
+                    floats[lo : lo + take] = f_all[sel].to("cpu")
+                    ctx[lo : lo + take] = c_all[sel].to("cpu")
+                    # The MASKED score, not the original. topk on an all-masked
+                    # cell still returns indices -- of rows belonging to other
+                    # cells -- and writing their real scores here would let a
+                    # cell that never fired hand its slots to a cell that fired
+                    # a lot, which is exactly the per-cell guarantee this class
+                    # exists to make.
+                    score[lo : lo + take] = v.to("cpu")
+            out[name] = (ints, floats, ctx, score)
+        return out
+
+    def _cell_of(self, ints: torch.Tensor) -> torch.Tensor:
+        dst = ints[:, PAIR_EVENT_INTS.index("dst")]
+        src = ints[:, PAIR_EVENT_INTS.index("src")]
+        st = ints[:, PAIR_EVENT_INTS.index("pair_state")]
+        pair = self._pair_index(dst.clamp(min=0), src.clamp(min=0))
+        return pair.clamp(min=0) * self.n_states + st.clamp(min=0)
+
+    def rows(self, task_names=None) -> list:
+        """Gather every rank's slate, re-select per cell, and render on rank 0.
+
+        The gather is FIXED SHAPE -- ``groups * per_group`` rows whatever the
+        batch held -- so it is a collective on the config and cannot hang on a
+        rank whose micro-batches happened to hold nothing.
+        """
+        dist_on = torch.distributed.is_available() and torch.distributed.is_initialized()
+        world = torch.distributed.get_world_size() if dist_on else 1
+        rank = torch.distributed.get_rank() if dist_on else 0
+        mine = self._slate()
+
+        out = []
+        for name in self.STRATA:
+            ints, floats, ctx, score = mine[name]
+            if dist_on and world > 1:
+                dev = self.device or ints.device
+                packed = [
+                    torch.cat(
+                        [ints.to(torch.float64), floats, ctx.to(torch.float64),
+                         score.unsqueeze(-1)],
+                        dim=-1,
+                    ).to(dev)
+                ]
+                buf = [torch.zeros_like(packed[0]) for _ in range(world)]
+                torch.distributed.all_gather(buf, packed[0])
+                if rank != 0:
+                    continue
+                merged = torch.cat(buf, dim=0).to("cpu")
+                n_i, n_f = len(PAIR_EVENT_INTS), len(PAIR_EVENT_FLOATS)
+                w = 2 * self.context + 1
+                ints = merged[:, :n_i].to(torch.long)
+                floats = merged[:, n_i : n_i + n_f]
+                ctx = merged[:, n_i + n_f : n_i + n_f + w].to(torch.long)
+                score = merged[:, -1]
+                cells = self._cell_of(ints)
+                sel = []
+                for cell in range(self.n_groups):
+                    pick = torch.where(cells == cell, score, torch.full_like(score, -1.0))
+                    take = min(self.per_group, pick.numel())
+                    v, s = torch.topk(pick, take)
+                    # Filter on the MASKED value, for the reason above: a cell
+                    # with nothing in it must contribute nothing, not the best
+                    # rows of whichever cell was loudest.
+                    sel.append(s[v >= 0])
+                if not sel:
+                    continue
+                sel = torch.cat(sel)
+                ints, floats, ctx = ints[sel], floats[sel], ctx[sel]
+            elif rank != 0:
+                continue
+            else:
+                keep = score >= 0
+                ints, floats, ctx = ints[keep], floats[keep], ctx[keep]
+
+            name_of = lambda t: (
+                task_names[t] if task_names and 0 <= t < len(task_names)
+                else (None if t < 0 else f"task{t}")
+            )
+            for iv, fv, cv in zip(ints.tolist(), floats.tolist(), ctx.tolist()):
+                row = {"table": "pair_event", "stratum": name}
+                row.update(dict(zip(PAIR_EVENT_INTS, (int(x) for x in iv))))
+                row.update(dict(zip(PAIR_EVENT_FLOATS, (float(x) for x in fv))))
+                row["dst"] = name_of(row["dst"])
+                row["src"] = name_of(row["src"])
+                row["pair_state"] = PAIR_STATES[row["pair_state"]] if 0 <= row["pair_state"] < len(PAIR_STATES) else str(row["pair_state"])
+                row["state"] = STATE_NAMES.get(row["state"], str(row["state"]))
+                row["role"] = ROLE_NAMES.get(row["role"], str(row["role"]))
+                row["context_ids"] = [int(x) for x in cv]
+                out.append(row)
+        return out
 
 
 def turn_index(response_mask: torch.Tensor) -> torch.Tensor:

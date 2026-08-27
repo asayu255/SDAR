@@ -112,6 +112,7 @@ from typing import Optional
 
 import torch
 
+from verl.trainer.ppo.sign_weights import PAIR_STATES
 from verl.trainer.ppo.sign_weights import ROLE_NAMES as _ROLE_NAMES
 from verl.trainer.ppo.sign_weights import STATE_NAMES as _STATE_NAMES
 
@@ -134,13 +135,23 @@ __all__ = [
     "POSITION_TERMS",
     "STATE_TERMS",
     "PROBE_ALPHAS",
+    "CHANNEL_PROBES",
     "probe_name",
     "PairEvidenceStats",
+    "PAIR_STATES",
+    "pair_state_index",
+    "PairStateEvidenceStats",
     "build_position_weight",
     "assert_all_finite",
     "position_terms",
     "per_candidate_shift",
     "GRAD_TERMS",
+    "opd_logit_push",
+    "PUSH_CLASSES",
+    "push_direction_class",
+    "LogitPushTokens",
+    "OUTCOME_BUCKETS",
+    "OutcomeEffectStats",
     "logit_gradient_terms",
     "gradient_metrics",
     "state_shift_terms",
@@ -1085,6 +1096,7 @@ class AdvantageReliabilityStats:
         # the rows that carried a usable group id, which is what tells the two
         # apart.
         cell["_s_between"] = float(between[dst, src]) if float(grouped[dst, src]) > 0 else None
+        cell["_grouped"] = float(grouped[dst, src])
         return cell
 
     @staticmethod
@@ -1155,6 +1167,17 @@ class AdvantageReliabilityStats:
                 rho = self._corr(cell, "a", "s") if cell["n"] > 0 else None
                 row = {
                     "n": cell["n"],
+                    # The two spreads the correlation is a ratio of. A rho that
+                    # collapses because the ADVANTAGE stopped varying is a
+                    # different event from one that collapses because the source
+                    # stopped saying anything, and the correlation alone reports
+                    # them identically.
+                    "adv_std": math.sqrt(max(self._cov(cell, "a", "a"), 0.0)),
+                    "support_score_std": math.sqrt(max(self._cov(cell, "s", "s"), 0.0)),
+                    # Rows that carried a usable prompt-group id, i.e. how much
+                    # of the group centring the within-group variance actually
+                    # rests on.
+                    "n_grouped": cell.get("_grouped", 0.0),
                     # What fraction of the rows offered to this pair had a prompt
                     # group with a spread of advantages. GRPO is group-relative,
                     # so a group whose rollouts all scored the same gives every
@@ -1315,6 +1338,11 @@ STATE_TERMS = tuple(f"shift_{n}" for n in _STATE_NAMES.values()) + ("shift_norm_
 # would say nothing about what the finished mechanism can do.
 PROBE_ALPHAS = (0.0, 0.1, 1.0)
 
+# The channel counterfactuals. Named rather than numbered because they are not a
+# series: each removes a different part of the evidence, and reading them as a
+# ladder would suggest an ordering they do not have.
+CHANNEL_PROBES = ("no_shared", "offtask_shared")
+
 # The per-position scopes. Role comes from the tag scan; turn from the runs of
 # ones in the multi-turn loss mask.
 #
@@ -1369,6 +1397,121 @@ def probe_name(alpha: float) -> str:
     return f"alpha{int(round(float(alpha) * 100)):03d}"
 
 
+
+
+def pair_state_index(*, hat_on, hat_off, deadzone: float) -> torch.Tensor:
+    """(bs, resp, k, n_off) index into :data:`PAIR_STATES`.
+
+    Labels only, on the STANDARDIZED shifts against a zero base, so the deadzone
+    is in RMS units and means the same thing for every teacher -- the same rule
+    the state table and the token tables use, and the reason they can be read
+    side by side.
+    """
+    on = torch.sign(hat_on.detach()) * (hat_on.detach().abs() > deadzone)
+    off = torch.sign(hat_off.detach()) * (hat_off.detach().abs() > deadzone)
+    on_c = on.unsqueeze(-1)
+    speaks = off != 0
+    on_silent = on_c == 0
+    agree = (~on_silent) & speaks & (off == on_c)
+    conflict = (~on_silent) & speaks & (off != on_c)
+    blind = on_silent & speaks
+    idx = torch.full_like(off, PAIR_STATES.index("source_silent"), dtype=torch.long)
+    idx = torch.where(agree, torch.full_like(idx, PAIR_STATES.index("agree")), idx)
+    idx = torch.where(conflict, torch.full_like(idx, PAIR_STATES.index("conflict")), idx)
+    idx = torch.where(
+        blind, torch.full_like(idx, PAIR_STATES.index("on_silent_source_active")), idx
+    )
+    return idx
+
+
+class PairStateEvidenceStats:
+    """Per ordered (destination, source) AND per disagreement state.
+
+    The two tables it sits between each collapse the axis the other keeps:
+    ``kl_shift_by_state`` sums the sources out, ``evidence/{src}__on__{dst}``
+    sums the states out. Neither can answer "when Search disagreed with
+    AlfWorld's own teacher, what did the arm do" -- and arbitrating exactly that
+    is what the mechanism is for, so it is the table the write-up is built on.
+
+    ``(T, T, 4, 4)`` float64 -- 144 cells at three tasks. The cost is one
+    ``index_add_`` over the candidate axis per source per micro-batch.
+    """
+
+    TERMS = ("n", "evidence", "shift", "shift_abs")
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = T = int(n_tasks)
+        self.n_states = S = len(PAIR_STATES)
+        self.buf = torch.zeros(T * T * S * len(self.TERMS), dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, state, evidence, shift, response_mask, task_ids, off_plane_tasks) -> None:
+        """``state``/``evidence``/``shift`` are (bs, resp, k, n_off)."""
+        self._cpu_cache = None
+        T, S, K = self.n_tasks, self.n_states, len(self.TERMS)
+        # (bs, resp, 1): the mask is per position, and every quantity below is
+        # sliced to (bs, resp, k) before it is used.
+        m = response_mask.to(torch.float64).unsqueeze(-1)
+        e = evidence.detach().to(torch.float64) * m.unsqueeze(-1)
+        s = shift.detach().to(torch.float64) * m.unsqueeze(-1)
+        dst = task_ids.reshape(-1, 1, 1).expand_as(state[..., 0])
+        for c in range(state.size(-1)):
+            src = off_plane_tasks[:, c].reshape(-1, 1, 1).expand_as(state[..., c])
+            ok = ((dst >= 0) & (src >= 0)).to(torch.float64)
+            cell = ((dst.clamp(min=0) * T + src.clamp(min=0)) * S + state[..., c]) * K
+            vals = torch.stack(
+                [m.expand_as(e[..., c]) * ok, e[..., c] * ok, s[..., c] * ok,
+                 s[..., c].abs() * ok],
+                dim=-1,
+            )
+            flat = (cell.unsqueeze(-1) + torch.arange(K, device=vals.device)).reshape(-1)
+            self.buf.index_add_(0, flat, vals.reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(
+                self.n_tasks, self.n_tasks, self.n_states, len(self.TERMS)
+            )
+        return self._cpu_cache
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        buf = self._cpu()
+        i = {t: j for j, t in enumerate(self.TERMS)}
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for dst in range(self.n_tasks):
+            for src in range(self.n_tasks):
+                if src == dst:
+                    continue
+                cells = buf[dst, src]
+                total_n = float(cells[:, i["n"]].sum())
+                total_abs = float(cells[:, i["shift_abs"]].sum())
+                if total_n <= 0:
+                    continue
+                head = f"{prefix}/pair_state/{name(src)}__on__{name(dst)}"
+                for st in range(self.n_states):
+                    sname = PAIR_STATES[st]
+                    n = float(cells[st, i["n"]])
+                    out[f"{head}/{sname}/position_frac"] = n / total_n
+                    if n <= 0:
+                        continue
+                    out[f"{head}/{sname}/source_evidence_mean"] = (
+                        float(cells[st, i["evidence"]]) / n
+                    )
+                    out[f"{head}/{sname}/kl_shift_net"] = float(cells[st, i["shift"]]) / n
+                    if total_abs > 0:
+                        out[f"{head}/{sname}/kl_shift_gross_share"] = (
+                            float(cells[st, i["shift_abs"]]) / total_abs
+                        )
+        return out
+
+
 class PairEvidenceStats:
     """Per ordered (destination, source), how much evidence that source supplied.
 
@@ -1379,26 +1522,44 @@ class PairEvidenceStats:
     mostly empty.
     """
 
-    TERMS = ("evidence", "shift", "n")
+    # ``support_mass`` is the source teacher's probability that lands INSIDE the
+    # student's top-k at all. Without it, "Search contributed little to
+    # AlfWorld" has three explanations that read identically -- the signal is
+    # weak, alpha is low, or Search's vocabulary is simply not in the support
+    # the whole mechanism is measured on -- and only the third is a measurement
+    # artefact rather than a finding. Free: the log-probs are already gathered.
+    TERMS = ("evidence", "shift", "support_mass", "n")
 
     def __init__(self, *, n_tasks: int, device):
         self.n_tasks = T = int(n_tasks)
         self.buf = torch.zeros(T * T * len(self.TERMS), dtype=torch.float64, device=device)
         self._cpu_cache = None
 
-    def update(self, *, evidence, shift, response_mask, task_ids, off_plane_tasks) -> None:
-        """``evidence`` and ``shift`` are (bs, resp, n_off)."""
+    def update(self, *, evidence, shift, response_mask, task_ids, off_plane_tasks,
+               support_mass=None) -> None:
+        """``evidence`` and ``shift`` are (bs, resp, n_off).
+
+        Args:
+            support_mass: (bs, resp, n_off) the source teacher's probability
+                summed over the student's top-k, or None to leave the column at
+                zero rather than guessing a coverage that was not measured.
+        """
         self._cpu_cache = None
         T, K = self.n_tasks, len(self.TERMS)
         m = response_mask.to(torch.float64).unsqueeze(-1)
         e = evidence.detach().to(torch.float64) * m
         s = shift.detach().to(torch.float64) * m
+        cov = (
+            torch.zeros_like(e) if support_mass is None
+            else support_mass.detach().to(torch.float64) * m
+        )
         dst = task_ids.reshape(-1).to(torch.long)
         for c in range(e.size(-1)):
             src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
             ok = ((dst >= 0) & (src >= 0)).to(torch.float64)
             vals = torch.stack(
                 [e[..., c].sum(dim=1) * ok, s[..., c].sum(dim=1) * ok,
+                 cov[..., c].sum(dim=1) * ok,
                  (response_mask.to(torch.float64).sum(dim=1)) * ok],
                 dim=-1,
             )
@@ -1418,14 +1579,22 @@ class PairEvidenceStats:
         buf = self._cpu_cache
         name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
         out = {}
+        i = {t: j for j, t in enumerate(self.TERMS)}
         for dst in range(self.n_tasks):
             for src in range(self.n_tasks):
-                if src == dst or float(buf[dst, src, 2]) <= 0:
+                if src == dst or float(buf[dst, src, i["n"]]) <= 0:
                     continue
-                n = float(buf[dst, src, 2])
+                n = float(buf[dst, src, i["n"]])
                 head = f"{prefix}/evidence/{name(src)}__on__{name(dst)}"
-                out[f"{head}/source_shift_mean"] = float(buf[dst, src, 0]) / n
-                out[f"{head}/kl_shift_attributed"] = float(buf[dst, src, 1]) / n
+                out[f"{head}/source_shift_mean"] = float(buf[dst, src, i["evidence"]]) / n
+                out[f"{head}/kl_shift_attributed"] = float(buf[dst, src, i["shift"]]) / n
+                mass = float(buf[dst, src, i["support_mass"]]) / n
+                if mass > 0:
+                    out[f"{head}/support_mass"] = mass
+                    # What the mechanism CANNOT see of this source, because the
+                    # measurement runs on the student's top-k and the teacher's
+                    # mass is elsewhere.
+                    out[f"{head}/tail_mass"] = 1.0 - mass
         return out
 
 
@@ -1769,6 +1938,36 @@ def build_position_weight(
         disagree_weight=1.0, deadzone=float(report_epsilon),
     )
 
+    # CHANNEL counterfactuals, against the alpha series' MAGNITUDE ones. The
+    # probes ask "what if the advantage channel were scaled differently"; these
+    # ask "what if a channel were not there at all", which is the ablation the
+    # design decisions were actually made on:
+    #
+    #   no_shared       the advantage channel alone -- is the corroboration term
+    #                   carrying the mechanism, or is it decoration on top of
+    #                   "reliable source activity"?
+    #   offtask_shared  the off-task-only agreement rule, the D-2 option this
+    #                   arm chose against. Its cost is the on-task teacher's
+    #                   silence at 64% of teacher mass, and this is that cost as
+    #                   a weight rather than as an evidence total.
+    #
+    # Both reuse this call's alphas, its standardization and its availability
+    # mask, so the only difference from the shipped weight is the channel.
+    channels = {
+        "no_shared": candidate_kl_evidence(
+            common=torch.zeros_like(dec["common"]), hat_off=hat_off, source_alpha=row_alpha
+        ),
+        "offtask_shared": evidence_offtask_only,
+    }
+    channel_pre = {}
+    channel_evidence = {}
+    for cname, e_c in channels.items():
+        p_c = position_pre_weight(evidence=e_c, on_task_logprob=on_task_logprob)
+        channel_pre[cname] = torch.where(avail.reshape(-1, 1), p_c, torch.ones_like(p_c))
+        channel_evidence[cname] = torch.where(
+            avail.reshape(-1, 1, 1), e_c, torch.zeros_like(e_c)
+        )
+
     probes = {}
     probe_evidence = {}
     for a in probe_alphas:
@@ -1814,7 +2013,361 @@ def build_position_weight(
         "evidence_by_source": p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs(),
         "probe_pre_weight": probes,
         "probe_evidence": probe_evidence,
+        "channel_pre_weight": channel_pre,
+        "channel_evidence": channel_evidence,
     }
+
+
+class LogitPushTokens:
+    """Which STUDENT tokens the weighting amplified or damped, and by how much.
+
+    NOT the same table as :class:`TokenStateCounts`, and the difference is the
+    one most likely to be misread. That table names the tokens whose EVIDENCE
+    justified the weight -- the candidates a source spoke at. This one names the
+    tokens whose LOGIT the weight then moved, which is every token in the
+    support, because W is a scalar on the position and the OPD term already had
+    a direction at each of them.
+
+    A token can be in one and not the other. Search's evidence at ``retrieve``
+    can raise W at a position whose OPD term is pushing ``the`` down harder than
+    anything else, and the sentence "Search reinforced ``retrieve``" would be
+    false: what Search reinforced there is the suppression of ``the``. Reporting
+    one table under both readings is the error this class exists to prevent.
+
+    The unweighted descent direction on logit u is
+
+        g0(u) = coef * p_student(u) * (D - f(u))
+
+    the applied one is ``W * g0(u)``, and what the mechanism ADDED is
+    ``(W - 1) * g0(u)``. Filed by :data:`PUSH_CLASSES`, because sign alone is
+    not the reading: a weight above 1 at a token the term was pushing DOWN
+    amplifies the suppression, and a table that called that "reinforced" would
+    invert the claim.
+
+    Columns per (scope, class, token):
+
+    ``n``          candidate occurrences.
+    ``extra``      sum of ``(W - 1) * g0``, signed. The mechanism's own addition.
+    ``extra_abs``  the same in absolute value, so a token pushed both ways
+                   across contexts is not netted out of its own ranking.
+    ``weighted``   sum of ``W * g0``, the push the objective actually applied.
+    ``mass``       the student's probability there, so "the arm amplified this
+                   token" can be read against whether the student was ever going
+                   to say it.
+    ``sampled``    how often it was the token actually emitted.
+
+    Memory is ``(1 + n_tasks) * 4 * V`` cells. At Qwen3's vocabulary and three
+    tasks that is 2.4M cells and about 97 MB, which is why the whole dense-token
+    family is stride-gated: see ``token_stats.every``.
+    """
+
+    TERMS = ("n", "extra", "extra_abs", "weighted", "mass", "sampled")
+
+    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 32):
+        self.vocab_size = V = int(vocab_size)
+        self.n_scopes = S = 1 + int(n_tasks)
+        self.n_classes = C = len(PUSH_CLASSES)
+        self.top_n = int(top_n)
+        # float64 for the reason every other table here uses it: millions of
+        # atomic adds of ~1e-6 lose their tail in float32, and index_add_ does
+        # not promise an order.
+        self.buf = torch.zeros(S * C * V * len(self.TERMS), dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, support_ids, g0, weight, coef_applied_weight, response_mask,
+               task_ids=None, sampled_onehot=None, p_student=None) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            g0: (bs, resp, k) the UNWEIGHTED descent direction, from
+                :func:`opd_logit_push`.
+            weight: (bs, resp) the applied W.
+            coef_applied_weight: (bs, resp) the same W -- passed separately only
+                so a caller cannot silently hand the pre-normalisation weight to
+                one argument and the applied one to the other.
+            sampled_onehot: (bs, resp, k) one at the emitted token, or None.
+            p_student: (bs, resp, k), or None to take it from nothing -- the mass
+                column then stays zero rather than guessing.
+        """
+        assert weight is coef_applied_weight or torch.equal(weight, coef_applied_weight), (
+            "LogitPushTokens takes the APPLIED weight for both the class and the "
+            "magnitude; two different weights would file a token under one and "
+            "measure it under the other"
+        )
+        self._cpu_cache = None
+        V, C, K = self.vocab_size, self.n_classes, len(self.TERMS)
+        m = response_mask.unsqueeze(-1).to(torch.float64)
+        g = g0.detach().to(torch.float64)
+        w = weight.detach().to(torch.float64).unsqueeze(-1)
+        extra = (w - 1.0) * g
+        cls = push_direction_class(g0, weight)
+        tok = support_ids.clamp(min=0, max=V - 1).to(torch.long)
+
+        cols = [
+            m.expand_as(g),
+            extra * m,
+            extra.abs() * m,
+            w * g * m,
+            (torch.zeros_like(g) if p_student is None else p_student.detach().to(torch.float64)) * m,
+            (torch.zeros_like(g) if sampled_onehot is None
+             else sampled_onehot.detach().to(torch.float64)) * m,
+        ]
+        vals = torch.stack(cols, dim=-1).reshape(-1, K)
+        base = (cls * V + tok).reshape(-1) * K
+        offs = torch.arange(K, device=vals.device)
+        # Pooled scope first, then the row's task -- the same two-pass rule the
+        # other dense tables use, so an untagged row still reaches the pooled
+        # table instead of inventing a task.
+        self.buf.index_add_(0, (base.unsqueeze(-1) + offs).reshape(-1), vals.reshape(-1))
+        if task_ids is None:
+            return
+        t = task_ids.reshape(-1, 1, 1).expand_as(cls).reshape(-1).to(torch.long)
+        known = ((t >= 0) & (t < self.n_scopes - 1)).to(torch.float64).unsqueeze(-1)
+        scoped = (t.clamp(min=0, max=self.n_scopes - 2) + 1) * (C * V) * K + base
+        self.buf.index_add_(0, (scoped.unsqueeze(-1) + offs).reshape(-1), (vals * known).reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(
+                self.n_scopes, self.n_classes, self.vocab_size, len(self.TERMS)
+            )
+        return self._cpu_cache
+
+    def _scope_name(self, scope, task_names):
+        if scope == 0:
+            return None
+        t = scope - 1
+        return task_names[t] if task_names and t < len(task_names) else f"task{t}"
+
+    def scalar_metrics(self, task_names=None, prefix: str = "kl_weight") -> dict:
+        """How the added push splits over the four directions, and how spread.
+
+        ``share`` is of the GROSS added push, so the four sum to 1 and a class
+        that cancels itself across contexts is not reported as inactive.
+        """
+        buf = self._cpu()
+        out = {}
+        idx = {t: i for i, t in enumerate(self.TERMS)}
+        N = min(self.top_n, self.vocab_size)
+        for scope in range(self.n_scopes):
+            name = self._scope_name(scope, task_names)
+            head = prefix if name is None else f"{prefix}/{name}"
+            gross_all = float(buf[scope, :, :, idx["extra_abs"]].sum())
+            if gross_all <= 0:
+                continue
+            out[f"{head}/push/extra_abs_total"] = gross_all
+            out[f"{head}/push/extra_net_total"] = float(buf[scope, :, :, idx["extra"]].sum())
+            for c, cname in enumerate(PUSH_CLASSES):
+                cell = buf[scope, c]
+                gross = float(cell[:, idx["extra_abs"]].sum())
+                if gross <= 0:
+                    continue
+                h = f"{head}/push/{cname}"
+                out[f"{h}/gross_share"] = gross / gross_all
+                out[f"{h}/net"] = float(cell[:, idx["extra"]].sum())
+                out[f"{h}/n_distinct"] = float((cell[:, idx["n"]] > 0).sum())
+                per_tok = cell[:, idx["extra_abs"]]
+                out[f"{h}/top{N}_share"] = float(torch.topk(per_tok, N).values.sum()) / gross
+                # Was the arm amplifying tokens the student was going to say, or
+                # ones it was not? The two are different mechanisms with the same
+                # nats.
+                n_cell = float(cell[:, idx["n"]].sum())
+                if n_cell > 0:
+                    out[f"{h}/mean_p_student"] = float(cell[:, idx["mass"]].sum()) / n_cell
+                    out[f"{h}/sampled_frac"] = float(cell[:, idx["sampled"]].sum()) / n_cell
+        return out
+
+    def top_tokens(self, task_names=None) -> list:
+        """Ranked rows in the shared dump schema, one ranking per class."""
+        buf = self._cpu()
+        idx = {t: i for i, t in enumerate(self.TERMS)}
+        N = min(self.top_n, self.vocab_size)
+        rows = []
+        for scope in range(self.n_scopes):
+            name = self._scope_name(scope, task_names) or "__pooled__"
+            for c, cname in enumerate(PUSH_CLASSES):
+                cell = buf[scope, c]
+                series = cell[:, idx["extra_abs"]]
+                if float(series.sum()) <= 0:
+                    continue
+                vals, ids = torch.topk(series, N)
+                for rank, (v, tok) in enumerate(zip(vals.tolist(), ids.tolist())):
+                    if v <= 0:
+                        break
+                    n_tok = float(cell[tok, idx["n"]])
+                    rows.append({
+                        "scope": name, "ranked_by": "extra_logit_push",
+                        "direction_class": cname, "rank": rank, "token_id": int(tok),
+                        "count": int(n_tok),
+                        "extra_logit_push": float(cell[tok, idx["extra"]]),
+                        "extra_logit_push_abs": v,
+                        "weighted_logit_push": float(cell[tok, idx["weighted"]]),
+                        "p_student_mean": (float(cell[tok, idx["mass"]]) / n_tok) if n_tok else 0.0,
+                        "sampled_count": int(cell[tok, idx["sampled"]]),
+                    })
+        return rows
+
+
+# Which trajectories the arm spent its budget on. The buckets are outcome
+# facts about the ROW, not about the position, so a row lands in "all" and in
+# exactly one of each opposed pair -- the pairs are reported as a ratio and the
+# "all" bucket is the denominator that makes each pair's shares add up.
+OUTCOME_BUCKETS = ("all", "adv_positive", "adv_negative", "success", "failure")
+
+# Per-row moments. g is the row's gross effect fraction, a its advantage: the
+# correlation between them is the one number that says whether the mechanism
+# tracks the reward signal at the TRAJECTORY level, which no per-position
+# reading can answer.
+OUTCOME_TERMS = ("n", "gross", "net", "kl", "g", "gg", "a", "aa", "ag")
+
+
+class OutcomeEffectStats:
+    """Did the weighting spend its KL budget on the rollouts that worked?
+
+    Every other reading here is per position or per token. This one is per
+    TRAJECTORY, because "the arm moved 3% of the budget" and "the arm moved 3%
+    of the budget, almost all of it on rollouts that failed" are the same
+    number and opposite findings -- and the second is the one a reviewer asks
+    about.
+
+    For row i,
+
+        G_i = sum_t |W - 1| D  /  sum_t D
+
+    the fraction of its own OPD budget the arm redistributed. Reported per task
+    and per outcome bucket, plus ``Corr(A, G)`` over rows, which is the
+    trajectory-level companion to the position-level ``weight_kl_corr``.
+
+    NOT a causal claim, and the metric names avoid implying one: the advantage
+    is observed, the weight is built from frozen teachers, and nothing here
+    randomises anything. What it establishes is which side of the reward signal
+    the budget went to, which is a fact about the run rather than an inference
+    from it.
+
+    Success is ``row score > 0``. On alfworld and webshop the episode score is
+    binary and this is exactly success; on a graded task it is "scored at all",
+    which is why the bucket is named for the outcome and not for the task.
+    """
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = T = int(n_tasks)
+        self.n_buckets = B = len(OUTCOME_BUCKETS)
+        self.n_terms = K = len(OUTCOME_TERMS)
+        self.buf = torch.zeros((1 + T) * B * K, dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, weight, teacher_kl, response_mask, advantage,
+               task_ids=None, reward=None) -> None:
+        """Fold one micro-batch of ROWS in.
+
+        Args:
+            weight: (bs, resp) the applied W.
+            teacher_kl: (bs, resp) the UNWEIGHTED per-token KL.
+            advantage: (bs,) the row's GRPO advantage.
+            reward: (bs,) the row's episode score, or None -- the two success
+                buckets then stay empty rather than being filled from the
+                advantage, which is group-relative and says nothing about
+                whether the episode succeeded.
+        """
+        self._cpu_cache = None
+        B, K = self.n_buckets, self.n_terms
+        m = response_mask.to(torch.float64)
+        d = teacher_kl.detach().to(torch.float64) * m
+        gross_row = ((weight.detach().to(torch.float64) - 1.0).abs() * d).sum(dim=1)
+        net_row = ((weight.detach().to(torch.float64) - 1.0) * d).sum(dim=1)
+        kl_row = d.sum(dim=1)
+        live = kl_row > 0
+        g = torch.where(live, gross_row / kl_row.clamp(min=1e-12), torch.zeros_like(kl_row))
+        a = advantage.detach().reshape(-1).to(torch.float64)
+        ok = live.to(torch.float64)
+
+        vals = torch.stack(
+            [ok, gross_row * ok, net_row * ok, kl_row * ok,
+             g * ok, g * g * ok, a * ok, a * a * ok, a * g * ok],
+            dim=-1,
+        )                                                        # (bs, K)
+        sel = [
+            torch.ones_like(ok),
+            (a > 0).to(torch.float64),
+            (a < 0).to(torch.float64),
+        ]
+        if reward is None:
+            sel += [torch.zeros_like(ok), torch.zeros_like(ok)]
+        else:
+            r = reward.detach().reshape(-1).to(torch.float64)
+            sel += [(r > 0).to(torch.float64), (r <= 0).to(torch.float64)]
+
+        for b, pick in enumerate(sel):
+            row = vals * pick.unsqueeze(-1)
+            self.buf[b * K : (b + 1) * K] += row.sum(dim=0)
+            if task_ids is None:
+                continue
+            t = task_ids.reshape(-1).to(torch.long)
+            known = ((t >= 0) & (t < self.n_tasks)).to(torch.float64).unsqueeze(-1)
+            base = (t.clamp(min=0, max=max(self.n_tasks - 1, 0)) + 1) * B * K + b * K
+            flat = (base.unsqueeze(-1) + torch.arange(K, device=row.device)).reshape(-1)
+            self.buf.index_add_(0, flat, (row * known).reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(
+                1 + self.n_tasks, self.n_buckets, self.n_terms
+            )
+        return self._cpu_cache
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        buf = self._cpu()
+        i = {t: j for j, t in enumerate(OUTCOME_TERMS)}
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for scope in range(1 + self.n_tasks):
+            head = prefix if scope == 0 else f"{prefix}/{name(scope - 1)}"
+            cells = {}
+            for b, bucket in enumerate(OUTCOME_BUCKETS):
+                cell = buf[scope, b]
+                n = float(cell[i["n"]])
+                if n <= 0:
+                    continue
+                kl = float(cell[i["kl"]])
+                cells[bucket] = gross = (float(cell[i["gross"]]) / kl) if kl > 0 else 0.0
+                out[f"{head}/outcome/{bucket}/gross_effect"] = gross
+                out[f"{head}/outcome/{bucket}/net_effect"] = (
+                    (float(cell[i["net"]]) / kl) if kl > 0 else 0.0
+                )
+                out[f"{head}/outcome/{bucket}/n_rows"] = n
+            # The two contrasts. A ratio rather than a difference so it reads the
+            # same at any teacher_kl_loss_coef, and only when both sides exist --
+            # a step with no failures is not a step with an infinite ratio.
+            for hi, lo, label in (
+                ("adv_positive", "adv_negative", "adv_positive_to_negative"),
+                ("success", "failure", "success_to_failure"),
+            ):
+                if hi in cells and lo in cells and cells[lo] > 1e-12:
+                    out[f"{head}/outcome/{label}_effect_ratio"] = cells[hi] / cells[lo]
+            # Corr(A, G) over rows, from the pooled bucket's moments.
+            cell = buf[scope, 0]
+            n = float(cell[i["n"]])
+            if n >= 3:
+                va = float(cell[i["aa"]]) / n - (float(cell[i["a"]]) / n) ** 2
+                vg = float(cell[i["gg"]]) / n - (float(cell[i["g"]]) / n) ** 2
+                if va > 0 and vg > 0:
+                    cov = float(cell[i["ag"]]) / n - (float(cell[i["a"]]) / n) * (
+                        float(cell[i["g"]]) / n
+                    )
+                    out[f"{head}/outcome/corr_adv_gross_effect"] = cov / math.sqrt(va * vg)
+        return out
 
 
 def assert_all_finite(counts: dict) -> None:
@@ -1887,6 +2440,64 @@ def per_candidate_shift(built: dict, teacher_kl: torch.Tensor) -> torch.Tensor:
 GRAD_TERMS = ("g_opd_sq", "g_grpo_sq", "g_dot")
 
 
+def opd_logit_push(
+    *,
+    student_logprob: torch.Tensor,
+    teacher_logprob: torch.Tensor,
+    teacher_kl: torch.Tensor,
+    coef: float,
+    eps: float = 1e-8,
+) -> dict:
+    """The UNWEIGHTED OPD descent direction on each logit, and the pieces of it.
+
+        g0(u) = coef * p_student(u) * (D - f(u)),   f = log p_student - log p_on
+
+    One definition, read by two things that must not disagree: the norm-and-
+    cosine metric, which weights it and squares it, and the per-token push table,
+    which classifies its sign against W. A second copy is how "the arm amplified
+    this token" and "the arm's gradient norm" come to describe different
+    quantities under one name.
+
+    Sign convention is DESCENT: positive means the objective is pushing this
+    logit up. Checked against autograd in the tests.
+    """
+    lp_s = student_logprob.detach().to(torch.float32)
+    lp_t = teacher_logprob.detach().to(torch.float32)
+    p_s = lp_s.exp()
+    tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)
+    f = lp_s - lp_t
+    f_tail = tail_s.log() - tail_logprob(lp_t, eps)
+    d = teacher_kl.detach().to(torch.float32).unsqueeze(-1)
+    return {
+        "g0": coef * p_s * (d - f),
+        "g0_tail": coef * tail_s * (d.squeeze(-1) - f_tail),
+        "p_student": p_s,
+        "tail_student": tail_s,
+        "gap": f,
+    }
+
+
+# What the weighting did to a logit the OPD term was already pushing. The four
+# cells are the product of two binary facts -- which way the unweighted term was
+# pushing, and whether the arm scaled that push up or down -- and they are the
+# only honest way to say "the mechanism reinforced this token", because a weight
+# above 1 on a position whose OPD term was pushing a token DOWN reinforces the
+# suppression, not the token.
+PUSH_CLASSES = (
+    "push_down_damped",       # g0 < 0, W < 1
+    "push_down_amplified",    # g0 < 0, W > 1
+    "push_up_damped",         # g0 > 0, W < 1
+    "push_up_amplified",      # g0 > 0, W > 1
+)
+
+
+def push_direction_class(g0: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """(bs, resp, k) index into :data:`PUSH_CLASSES`."""
+    up = (g0 > 0).to(torch.long)
+    amp = (weight.unsqueeze(-1) > 1.0).to(torch.long).expand_as(up)
+    return up * 2 + amp
+
+
 def logit_gradient_terms(
     *,
     student_logprob: torch.Tensor,
@@ -1943,17 +2554,14 @@ def logit_gradient_terms(
             what these are. Absent -> every row counts once, which is what an
             unweighted run does.
     """
-    lp_s = student_logprob.detach().to(torch.float32)
-    lp_t = teacher_logprob.detach().to(torch.float32)
-    p_s = lp_s.exp()
-    tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)
-    f = lp_s - lp_t
-    f_tail = tail_s.log() - tail_logprob(lp_t, eps)
-
-    d = teacher_kl.detach().to(torch.float32).unsqueeze(-1)
+    push = opd_logit_push(
+        student_logprob=student_logprob, teacher_logprob=teacher_logprob,
+        teacher_kl=teacher_kl, coef=coef, eps=eps,
+    )
+    p_s, tail_s = push["p_student"], push["tail_student"]
     w = weight.detach().to(torch.float32).unsqueeze(-1)
-    g_opd = coef * w * p_s * (d - f)
-    g_opd_tail = (coef * w.squeeze(-1) * tail_s * (d.squeeze(-1) - f_tail))
+    g_opd = w * push["g0"]
+    g_opd_tail = w.squeeze(-1) * push["g0_tail"]
 
     # Descent, to match g_opd's sign: the caller's coefficient is the LOSS
     # derivative, and (bs, resp, 1) so it broadcasts over the candidates.
