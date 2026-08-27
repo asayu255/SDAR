@@ -542,6 +542,23 @@ export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
 export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
 export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
+# WHERE THIS RUN'S CHECKPOINTS GO. Empty by default, so the paths below are
+# byte-for-byte what they were and an existing run resumes exactly as before.
+#
+# Set it to start a SEPARATE run of this same arm. resume_mode is `auto`, so a
+# second run pointed at a directory that already holds global_step_* does not
+# start over -- it resumes, and a directory holding a COMPLETED run resumes to
+# the final step and exits with nothing done. That is not an error and prints no
+# warning, which is how it is mistaken for a launch failure.
+#
+# The tag deliberately does not touch experiment_name or project_name: those are
+# pinned in the intent lock as the identity of the CONFIG, and a re-run of the
+# same arm is the same experiment. Only the two $HOME-derived paths move, which
+# is why they are the two the lock leaves unpinned.
+#
+#   RUN_TAG=v2 bash <this script> ...   -> $HOME/checkpoints/<arm>_v2
+export RUN_TAG=${RUN_TAG:-}
+
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
@@ -677,8 +694,8 @@ python3 -m verl.trainer.main_opd \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_signweight_position_multitask \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_signweight_position_qwen3_1.7b \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_signweight_position_multitask${RUN_TAG:+_$RUN_TAG} \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_signweight_position_qwen3_1.7b${RUN_TAG:+_$RUN_TAG} \
     trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_multitask_signweight_position_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \

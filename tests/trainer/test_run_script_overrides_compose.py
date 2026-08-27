@@ -56,7 +56,8 @@ def _overrides(path):
 
     The command is one backslash-continued line, so read until a line that does
     not continue. `$@` is the caller's trailing overrides and `$HOME` is expanded
-    by the shell before Hydra sees it, so do both here too.
+    by the shell before Hydra sees it, so do both here too -- and `${VAR:+...}`
+    likewise, for the optional RUN_TAG suffix on the run's own directories.
     """
     text = open(os.path.join(REPO, path)).read()
     marker = re.search(r"python3 -m verl\.trainer\.main_\w+", text)
@@ -70,6 +71,14 @@ def _overrides(path):
             break
     cmd = " ".join(line.rstrip().rstrip("\\").strip() for line in lines)
     cmd = re.sub(r"python3 -m verl\.trainer\.main_\w+", "", cmd).replace('"$@"', "")
+    # bash's ${VAR:+text} -- "text, but only if VAR is set and non-empty". The run
+    # scripts use it for the RUN_TAG suffix, whose default is unset, and unset is
+    # the configuration every test here is about: the arm's own directory. Dropped
+    # rather than expanded because that is exactly what bash does with it. Not
+    # something os.path.expandvars implements, and a leftover ${...} reaches
+    # OmegaConf as an INTERPOLATION, which fails to resolve and takes the whole
+    # compose down -- a shell construct read as a config reference.
+    cmd = re.sub(r"\$\{(\w+):\+[^}]*\}", "", cmd)
 
     def _unquote(tok):
         # The shell removes a matching pair of surrounding quotes before Hydra
