@@ -30,7 +30,7 @@ _clean() {
 _first() { grep -m1 -o "$2" "$1" || true; }
 
 printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
-    LOG PUMP CORE STEPS DEPTH BATCHES WALL MS/ROW SCORE
+    LOG PUMP CORE STEPS DEPTH BATCHES WALL ALL/LAST SCORE
 printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
     -------------------------- ------ ----- ------ ------ -------- --------- -------- -----
 
@@ -62,9 +62,24 @@ for log in "$@"; do
     last=$(grep -o 'val-pipeline\] \(final\|after [0-9]*\): [0-9]* batches over [0-9.]*s' "$f" | tail -1)
     batches=$(printf '%s' "$last" | grep -o '[0-9]* batches' | cut -d' ' -f1)
     wall=$(printf '%s' "$last" | grep -o 'over [0-9.]*s' | sed 's/over //')
+    # No [val-pipeline] report yet -- it prints every VAL_PIPELINE_REPORT_EVERY
+    # batches -- but the WALL lines are per batch and are already there. Count
+    # those rather than printing "?", which reads as "this log is unreadable"
+    # when the run is simply young.
+    if [ -z "$batches" ]; then
+        batches=$(grep -c 'ms/row last' "$f")
+        wall="not-yet"   # fits the column; the "*" already says it is running
+    fi
     case "$last" in *final:*) ;; *) batches="${batches:-?}*" ;; esac  # * = still going
 
-    msrow=$(grep -o 'ms/row last[0-9]*=[0-9]* all=[0-9]*' "$f" | tail -1 | grep -o 'all=[0-9]*' | cut -d= -f2)
+    # last= AND all=. all= is cumulative from batch 1, so on a young run it is
+    # mostly the ~70 s of env-manager construction and the first CUDA graph
+    # capture: a run three batches in read 112 against a finished run's 67 and
+    # the difference was startup. last= is a moving window and sheds that.
+    msline=$(grep -o 'ms/row last[0-9]*=[0-9]* all=[0-9]*' "$f" | tail -1)
+    msrow=$(printf '%s' "$msline" | grep -o 'all=[0-9]*' | cut -d= -f2)
+    mslast=$(printf '%s' "$msline" | grep -o 'last[0-9]*=[0-9]*' | cut -d= -f2)
+    [ -n "$mslast" ] && msrow="${msrow}/${mslast}"
     score=$(grep -o "'val/success_rate': [0-9.]*" "$f" | tail -1 | grep -o '[0-9.]*$')
 
     printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \

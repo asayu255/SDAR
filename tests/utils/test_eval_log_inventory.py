@@ -120,3 +120,34 @@ def test_a_run_older_than_the_engine_line_reports_no_engine_columns(tmp_path, lo
     fields = row(inventory(old, *logs), "eval_window.log")
     assert fields[2] == "?" and fields[3] == "?"
     assert fields[5] == "208"  # everything not derived from the engine still reads
+
+
+def test_a_run_with_no_report_yet_still_says_how_many_batches(tmp_path, logs):
+    """"?" reads as "unreadable log"; the run is just young.
+
+    [val-pipeline] prints every VAL_PIPELINE_REPORT_EVERY batches, but the WALL
+    lines are per batch and are already there.
+    """
+    young = write_log(tmp_path / "eval_378.log", pump=True, core="V1", steps="<default>",
+                      depth=3, batches=3, wall=0, ms_row=112)
+    # Drop the [val-pipeline] report but keep the WALL lines, which is what a
+    # run under 25 batches looks like at the default report interval.
+    kept = [line for line in young.read_text().splitlines() if "val-pipeline] after" not in line]
+    wall_line = next(line for line in kept if "ms/row" in line)
+    young.write_text("\n".join(kept + [wall_line, wall_line]) + "\n")
+
+    fields = row(inventory(young, *logs), "eval_378.log")
+    assert fields[5] == "3*"          # counted from the WALL lines
+    assert fields[6] == "not-yet"     # rather than "?", which reads as unreadable
+
+
+def test_the_cumulative_and_windowed_speed_are_both_shown(logs):
+    """all= is dominated by startup on a young run; last= is not.
+
+    A run three batches in read all=112 against a finished run's all=67, and
+    the whole of the difference was ~70 s of env-manager construction and the
+    first CUDA graph capture divided by three batches instead of 183.
+    """
+    out = inventory(*logs)
+    assert "ALL/LAST" in out
+    assert row(out, "eval_pump.log")[-2] == "73/73"
