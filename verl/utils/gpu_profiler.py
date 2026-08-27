@@ -629,6 +629,18 @@ class _Sampler:
             ]
             return (sum(vals) / len(vals)) if vals else None
 
+        def _bands(stamps):
+            """Share of these samples with the driver blocked / between / running."""
+            vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
+            if not vals:
+                return None
+            n = len(vals)
+            return {
+                "blocked": 100.0 * sum(1 for v in vals if v < 20) / n,
+                "between": 100.0 * sum(1 for v in vals if 20 <= v < 60) / n,
+                "running": 100.0 * sum(1 for v in vals if v >= 60) / n,
+            }
+
         def _census(stamps, table):
             """Mean number of threads in each activity, over these samples."""
             seen = [table[ts] for ts in stamps if ts in table]
@@ -646,6 +658,16 @@ class _Sampler:
             "per_gpu": per_gpu,
             "cpu_when_empty": _mean(empty_ts),
             "cpu_when_busy": _mean(busy_ts),
+            # The mean names neither mode of a two-mode distribution. A run
+            # whose EMPTY samples are half at 5% (blocked on a future) and half
+            # at 100% (working) reads 52%, which the verdict then calls
+            # UNRESOLVED -- true of the mean and true of nothing that happened.
+            "empty_cpu_bands": _bands(empty_ts),
+            # And the census restricted to the samples where the driver WAS
+            # working, which is the only place "where" is a meaningful question.
+            "activity_when_empty_running": _census(
+                {ts for ts in empty_ts if cpu_at.get(ts, 0.0) >= 60}, act_at
+            ),
             # Mean util across the cards over the samples where ALL of them had
             # work. This is the duty cycle -- the engine's own per-step host
             # processing showing between kernel launches -- and it is the number
@@ -881,8 +903,34 @@ def format_residency(res) -> str:
                 f"core while EMPTY against {busy_cpu:.0f}% while busy{where}")
 
     elif empty_cpu is not None:
-        why += (f"\n[gpu-residency] -> EMPTY is UNRESOLVED: driver CPU {empty_cpu:.0f}% of one core "
-                f"(vs {busy_cpu:.0f}% while busy) is neither blocked nor clearly running")
+        bands = res.get("empty_cpu_bands") or {}
+        if bands and max(bands.get("blocked", 0), bands.get("running", 0)) >= 25:
+            # Two modes, not one middling state. Say how EMPTY splits between
+            # them and what the working half was doing -- the mean was hiding
+            # both answers behind a number that described neither.
+            running_census = res.get("activity_when_empty_running") or {}
+            top = max(running_census.items(), key=lambda kv: -(-kv[1]), default=(None, 0.0))
+            where = f", mostly in {top[0]}" if top[0] and top[1] >= 0.5 * max(slots, 1) else ""
+            why += (
+                f"\n[gpu-residency] -> EMPTY SPLITS: driver BLOCKED (cpu<20%) for "
+                f"{bands.get('blocked', 0):.0f}% of it, RUNNING (cpu>=60%) for "
+                f"{bands.get('running', 0):.0f}%, between for {bands.get('between', 0):.0f}%"
+                f" (mean {empty_cpu:.0f}% of one core against {busy_cpu:.0f}% while busy)."
+            )
+            if running_census:
+                shown = ", ".join(
+                    f"{k} {v:.1f}" for k, v in sorted(running_census.items(), key=lambda kv: -kv[1])
+                    if v >= 0.05
+                )
+                why += f"\n[gpu-residency]    while RUNNING-and-empty the slots were in: {shown}{where}"
+            why += (
+                "\n[gpu-residency]    BLOCKED is work the GPU does not have yet -- the tail of a "
+                "turn, or a slot waiting on another. RUNNING is driver Python. They need "
+                "different fixes and the mean names neither."
+            )
+        else:
+            why += (f"\n[gpu-residency] -> EMPTY is UNRESOLVED: driver CPU {empty_cpu:.0f}% of one core "
+                    f"(vs {busy_cpu:.0f}% while busy) is neither blocked nor clearly running")
     elif dominates:
         why += f"\n[gpu-residency] -> EMPTY is mostly {top_name}, but with no CPU sample to corroborate it"
     return (

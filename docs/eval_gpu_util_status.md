@@ -583,6 +583,60 @@ bash examples/sft_trainer/eval_checkpoints.sh <step> -- \
 
 ---
 
+## 7undecies. `record` と `assemble` は外れ。そして 52% は平均だった
+
+pump + multi-step の run:
+
+```
+while EMPTY the slots were in: envstep 1.1, gen 0.6, preproc 0.2
+                               (of 3 slots; 1.0 in no tagged phase)
+-> EMPTY is UNRESOLVED: driver CPU 52% of one core (vs 23% while busy)
+   is neither blocked nor clearly running
+```
+
+### 仮説は外れた
+
+**`record` も `assemble` も 0.05 未満、つまり出てこない。**
+`to_list_of_dict` が毎ターン 252 行を展開しているのも、`gather_rollout_data` が
+全 turn を pad するのも、**EMPTY の原因ではなかった。**
+
+untagged は 1.5 → 1.0 に減ったので、タグ自体は 0.5 ぶん吸収している。
+**残り 1.0(3 slot の 1/3)はまだ外。**
+
+### そして 52% は「中くらい」ではなく、二峰の平均だった
+
+前 2 run は 80%・82%。今回 pump ありで 52%。**pump ON では driver は
+`_generate_via_pump` で Future を待つので CPU を焼かない** —— つまり
+**待っているサンプルと働いているサンプルが混ざり、平均が中間に落ちた。**
+
+`UNRESOLVED` は平均に対しては正しく、**起きたことのどれに対しても正しくない。**
+
+### 直したもの —— 平均をやめて分ける
+
+```
+-> EMPTY SPLITS: driver BLOCKED (cpu<20%) for 50% of it, RUNNING (cpu>=60%)
+   for 50%, between for 0% (mean 52% of one core against 23% while busy).
+   while RUNNING-and-empty the slots were in: envstep 1.1, gen 0.6, preproc 0.2
+   BLOCKED is work the GPU does not have yet -- the tail of a turn, or a slot
+   waiting on another. RUNNING is driver Python. They need different fixes and
+   the mean names neither.
+```
+
+**BLOCKED と RUNNING は打ち手が違う:**
+
+| | 正体 | 打ち手 |
+| --- | --- | --- |
+| **BLOCKED** | GPU に渡す仕事がまだ無い —— **turn の尾**、または slot が別の slot を待っている | trajectory 単位の進行(§7novies の 48%) |
+| **RUNNING** | driver の Python | その phase を速くする |
+
+**「どこで」を問う意味があるのは RUNNING の側だけ**なので、census を
+そちらに限定したものも出す。全サンプルの census は、待っている時間の
+「どこで」まで混ぜてしまう。
+
+一様に 45% のような**本当に中くらい**の場合は、引き続き `UNRESOLVED` と言って決めない。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**

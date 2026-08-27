@@ -500,3 +500,61 @@ def test_a_large_untagged_remainder_is_the_headline_number():
     line = gp.format_residency(res)
     assert "1.6 in no tagged phase" in line, line
     assert "no single phase dominates" in line, line
+
+
+# --------------------------------------------------------------------------- #
+# a mean over two modes describes neither
+# --------------------------------------------------------------------------- #
+def _bimodal(trace, low, high, busy_cpu, act_empty):
+    cpu = []
+    i = 0
+    for ts, v in trace:
+        if max(v) == 0:
+            cpu.append((ts, low if i % 2 else high))
+            i += 1
+        else:
+            cpu.append((ts, busy_cpu))
+    act = [(ts, dict(act_empty) if max(v) == 0 else {"gen": 3}) for ts, v in trace]
+    return _FakeSampler(trace, cpu, act).residency_between(0, 1e9)
+
+
+def test_a_two_mode_empty_is_split_rather_than_averaged():
+    """MEASURED, pump + multi-step: "driver CPU 52% of one core ... UNRESOLVED".
+
+    52% is the mean of samples at ~5% (blocked on a future) and ~100%
+    (working). It is true of the mean and true of nothing that happened, and
+    the verdict then refused to decide -- correctly, on a number that should
+    never have been a single number.
+    """
+    trace = _trace([[0, 0, 0]] * 6 + [[92, 92, 92]] * 6)
+    res = _bimodal(trace, 5.0, 99.0, 23.0, {"envstep": 1.1, "gen": 0.6})
+    line = gp.format_residency(res)
+    assert "EMPTY SPLITS" in line, line
+    assert "BLOCKED (cpu<20%) for 50%" in line, line
+    assert "RUNNING (cpu>=60%) for 50%" in line, line
+    assert "UNRESOLVED" not in line, "a split is an answer; UNRESOLVED was the absence of one"
+
+
+def test_the_split_says_what_the_working_half_was_doing():
+    """Only the running half makes "where" a meaningful question."""
+    trace = _trace([[0, 0, 0]] * 6 + [[92, 92, 92]] * 6)
+    res = _bimodal(trace, 5.0, 99.0, 23.0, {"envstep": 1.1, "gen": 0.6})
+    assert res["activity_when_empty_running"], "the running samples need their own census"
+    assert "while RUNNING-and-empty the slots were in" in gp.format_residency(res)
+
+
+def test_a_genuinely_middling_cpu_still_refuses():
+    """Every sample at 45% is one mode, and it is not evidence for either."""
+    trace = _trace([[0, 0, 0]] * 6 + [[92, 92, 92]] * 6)
+    cpu = _cpu(trace, lambda v: 45.0 if max(v) == 0 else 20.0)
+    line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
+    assert "UNRESOLVED" in line, line
+    assert "EMPTY SPLITS" not in line, line
+
+
+def test_the_bands_are_shares_of_the_empty_samples():
+    trace = _trace([[0, 0, 0]] * 4 + [[92, 92, 92]] * 6)
+    cpu = _cpu(trace, lambda v: 3.0 if max(v) == 0 else 90.0)
+    res = _FakeSampler(trace, cpu).residency_between(0, 1e9)
+    assert res["empty_cpu_bands"]["blocked"] == pytest.approx(100.0)
+    assert res["empty_cpu_bands"]["running"] == pytest.approx(0.0)
