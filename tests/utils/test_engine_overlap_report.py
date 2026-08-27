@@ -147,3 +147,59 @@ def test_no_engine_given_is_still_a_line(report, monkeypatch, capsys):
     _module(monkeypatch, params=("model",))
     report(engine_kwargs={})
     assert "core=unknown" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# asking for a core is not getting one
+# --------------------------------------------------------------------------- #
+def test_a_core_that_matches_the_request_is_confirmed(monkeypatch, capsys):
+    mod = importlib.import_module("verl.utils.engine_overlap")
+    monkeypatch.setattr(mod, "_REQUIRE_CORE", "v0")
+    mod.require_core("v0")
+    assert "ROLLOUT_REQUIRE_CORE=v0: confirmed" in capsys.readouterr().out
+
+
+def test_a_silent_fallback_to_the_other_core_stops_the_run(monkeypatch):
+    """VLLM_USE_V1=0 is a request; vLLM falls back rather than failing.
+
+    This rollout hands it two things V0 may not serve -- external_launcher and
+    enable_sleep_mode -- and a fallback produces a working run that measures the
+    core you were trying to compare against. That is the shape of the two
+    failures that already cost whole runs here: a pool that refused and fell
+    back to the blocking path, and a retriever that fell back to one query at a
+    time. Both completed and both measured the control twice.
+    """
+    mod = importlib.import_module("verl.utils.engine_overlap")
+    monkeypatch.setattr(mod, "_REQUIRE_CORE", "v0")
+    with pytest.raises(RuntimeError, match="but vLLM built core=v1"):
+        mod.require_core("v1")
+
+
+def test_an_unrecognisable_core_also_stops_the_run(monkeypatch):
+    """"unknown" is not "the one I asked for", and guessing is what this stops."""
+    mod = importlib.import_module("verl.utils.engine_overlap")
+    monkeypatch.setattr(mod, "_REQUIRE_CORE", "v0")
+    with pytest.raises(RuntimeError, match="core=unknown"):
+        mod.require_core("unknown")
+
+
+def test_without_the_variable_nothing_is_enforced(monkeypatch, capsys):
+    """Opt-in: a run that never asked for a core must not start failing."""
+    mod = importlib.import_module("verl.utils.engine_overlap")
+    monkeypatch.setattr(mod, "_REQUIRE_CORE", "")
+    mod.require_core("v1")
+    assert capsys.readouterr().out == ""
+
+
+def test_the_guard_runs_even_when_the_knob_report_failed(monkeypatch, capsys):
+    """A moved vLLM internal costs the diagnostic line, not the guard.
+
+    Losing the report is cosmetic; losing the guard silently restores exactly
+    the failure it exists to prevent.
+    """
+    mod = importlib.import_module("verl.utils.engine_overlap")
+    _module(monkeypatch, raise_on_import=True)
+    monkeypatch.setattr(mod, "_REQUIRE_CORE", "v0")
+    with pytest.raises(RuntimeError, match="ROLLOUT_REQUIRE_CORE=v0"):
+        mod.report_engine_overlap(engine_kwargs={}, engine=_engine_from("vllm.v1.engine.llm_engine"))
+    assert "could not report overlap knobs" in capsys.readouterr().out

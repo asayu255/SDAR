@@ -5,11 +5,16 @@ without vLLM installed, and a diagnostic that cannot be tested without a GPU
 image is a diagnostic that rots. Nothing here imports vLLM at module scope.
 """
 
+import os
+
 # Engine arguments that decide whether the engine's own per-step host work is
 # exposed between kernel launches or hidden behind them. Which of these exists
 # depends on the vLLM version -- V0's multi-step scheduler was removed in V1 and
 # replaced by async scheduling -- so this asks the installed engine rather than
 # assuming, and prints what it found.
+_REQUIRE_CORE = os.environ.get("ROLLOUT_REQUIRE_CORE", "").strip().lower()
+
+
 _OVERLAP_ARGS = (
     "async_scheduling",           # V1: overlap the scheduler with the forward
     "num_scheduler_steps",        # V0 multi-step; absent on V1
@@ -65,13 +70,51 @@ def report_engine_overlap(engine_kwargs, explicit=None, engine=None) -> None:
                 found.append(f"{name}=<default> (available)")
             else:
                 found.append(f"{name}=absent")
+        core = _engine_core(engine)
         print(
             f"[rollout-engine] vllm {getattr(vllm, '__version__', '?')}, "
-            f"core={_engine_core(engine)}; overlap knobs: " + ", ".join(found),
+            f"core={core}; overlap knobs: " + ", ".join(found),
             flush=True,
         )
     except Exception as exc:  # pragma: no cover - diagnostics never fail a run
         print(f"[rollout-engine] could not report overlap knobs: {exc}", flush=True)
+        core = _engine_core(engine)
+    require_core(core)
+
+
+def require_core(core: str) -> None:
+    """Fail the run when the engine core is not the one that was asked for.
+
+    VLLM_USE_V1=0 is a request. vLLM decides for itself and falls back to V1 for
+    configurations V0 cannot serve -- and this rollout hands it two that V0 may
+    not: distributed_executor_backend="external_launcher" and
+    enable_sleep_mode=True. A fallback does not raise; it produces a working run
+    that measures the core you were trying to compare against.
+
+    That is the exact shape of the two failures that have already cost whole
+    runs here: a pool that refused and fell back to the blocking path, and a
+    retriever that rejected batched queries and fell back to one at a time.
+    Both ran to completion, both looked ordinary, and both measured the control
+    twice. So this is opt-in and loud rather than a warning:
+
+        ROLLOUT_REQUIRE_CORE=v0 ... bash examples/sft_trainer/eval_checkpoints.sh
+
+    num_scheduler_steps is a V0 feature. Setting it on a V1 core is accepted and
+    ignored, which is worse than an error, and this is what catches that.
+    """
+    if not _REQUIRE_CORE:
+        return
+    if core == _REQUIRE_CORE:
+        print(f"[rollout-engine] ROLLOUT_REQUIRE_CORE={_REQUIRE_CORE}: confirmed.", flush=True)
+        return
+    raise RuntimeError(
+        f"ROLLOUT_REQUIRE_CORE={_REQUIRE_CORE} but vLLM built core={core}. "
+        "vLLM chose the other engine rather than failing -- most likely this "
+        "configuration is one the requested core cannot serve (external_launcher "
+        "and enable_sleep_mode are the two this rollout passes). Refusing to "
+        "start, because the run would otherwise measure the core you were "
+        "comparing against. Unset ROLLOUT_REQUIRE_CORE to run anyway."
+    )
 
 
 def _engine_core(engine) -> str:

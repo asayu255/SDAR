@@ -197,6 +197,85 @@ native BLAS は複数コアぶん出る)。**判定を撤回した。**
 
 ---
 
+## 7ter. 0.8.5 のまま engine 内部に手がある —— V0 の multi-step
+
+「0.8.5 には手が無い」も**不正確だった**。正しくは
+**「0.8.5 の V1 経路に `async_scheduling` が無い」**である。
+同じパッケージに V0 が同梱されていて、`VLLM_USE_V1=0` で切り替わり、
+V0 には `num_scheduler_steps`(multi-step scheduling)がある。
+
+`num_scheduler_steps=4` なら 1 回の scheduling で最大 4 回 forward を進めるので、
+**decode step ごとに露出している host scheduling が約 1/4 になる。**
+狙うのは 3 枚とも忙しいときの 91.07% より上、約 8.9 pt である。
+
+### コード側の前提は満たされている(確認済み)
+
+| | |
+| --- | :---: |
+| `engine_kwargs.vllm` がそのまま `LLM(...)` へ届く | ✅ |
+| pump の sampling params に `RequestOutputKind.FINAL_ONLY` が載っている | ✅ `vllm_rollout_spmd.py:110` |
+| この経路が `VLLM_USE_V1` を強制していない | ✅ |
+| `enable_chunked_prefill=False` / PP なし / spec decoding なし | ✅ multi-step の非互換条件に当たらない |
+
+### 確認できない前提が 2 つある —— だから guard を入れた
+
+この rollout は V0 が serve できるか分からないものを 2 つ渡している:
+
+- `distributed_executor_backend="external_launcher"`
+- `enable_sleep_mode=True`
+
+**`VLLM_USE_V1=0` は要求であって結果ではない。** vLLM は serve できない構成では
+**落ちずに V1 へ戻る。** そのとき `num_scheduler_steps` は
+**受け取られて無視される** —— エラーより悪い。
+
+これは既に 2 回まるごと run を潰した失敗と同じ形である
+(pool が断って blocking path に落ちた、retriever が 422 で 1 クエリずつに落ちた)。
+どちらも完走し、どちらも普通に見え、どちらも**対照を 2 回測っていた**。
+
+```bash
+ROLLOUT_REQUIRE_CORE=v0   # 違う core が組まれたら build で落ちる
+```
+
+### A → B → C → D(core の変更を効果から分離する)
+
+| | core | steps | 目的 |
+| --- | --- | ---: | --- |
+| A | V1 | 1 | いまの基準 |
+| B | V0 | 1 | **V1→V0 それ自体の影響**(V0 が遅い可能性がある) |
+| C | V0 | 4 | multi-step の効果 |
+| D | V0 | 8 | 追加効果と latency |
+
+```bash
+# B
+VLLM_USE_V1=0 ROLLOUT_REQUIRE_CORE=v0 \
+bash examples/sft_trainer/eval_checkpoints.sh <step>
+
+# C
+VLLM_USE_V1=0 ROLLOUT_REQUIRE_CORE=v0 \
+bash examples/sft_trainer/eval_checkpoints.sh <step> -- \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.num_scheduler_steps=4 \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.multi_step_stream_outputs=false
+```
+
+**B を飛ばして C から測ってはいけない。** V0 が V1 より遅ければ、
+multi-step の利得と core の損失が同じ数字の中で相殺される。
+
+### multi-step で必ず確かめること
+
+driver が EOS と完了を知るのが最大数 step 遅れる。**latency なら問題ないが、
+生成が変わるなら別である。**
+
+- `[val-hash]` が A と一致するか(greedy なので一致すべき)
+- 各 task の score
+- pump の Future が全部完了するか(`[pump] N requests, N finished, 0 timed out`)
+- `max_tokens` の超過。verl は `response_length` に切り詰めるので、
+  **超過しても黙って消える** —— hash で見るしかない
+
+pump は vLLM の内部 API(`add_request` / `step` / `abort_request`)を直接叩いている。
+**`LLM.generate()` が動くことは、この経路が動く証明にならない。**
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**
