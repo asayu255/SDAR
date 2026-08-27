@@ -54,6 +54,26 @@ from verl.trainer.ppo.sign_weights import (
     token_roles,
     reweight_teacher_logprobs,
 )
+from verl.trainer.ppo.cross_teacher_kl_weight import (
+    POSITION_TERMS as XT_POSITION_TERMS,
+    PROBE_ALPHAS as XT_PROBE_ALPHAS,
+    STATE_TERMS as XT_STATE_TERMS,
+    AdvantageReliabilityStats,
+    CumulativePolicyShiftRMS,
+    PairEvidenceStats,
+    PreviousStepTaskKLWeightedMean,
+    build_position_weight,
+    compute_raw_policy_shifts,
+    decompose_common_residual,
+    load_sidecar_state,
+    position_terms as xt_position_terms,
+    position_weight_metrics,
+    probe_name,
+    residual_support_score,
+    standardize_policy_shifts,
+    state_shift_metrics,
+    state_shift_terms as xt_state_shift_terms,
+)
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import actor_capture, gpu_profiler
@@ -295,6 +315,24 @@ def _supports_logits_to_keep(module) -> bool:
     return "logits_to_keep" in params or "num_logits_to_keep" in params
 
 
+def _xt_apply_normalizer(pre_weight, snapshot, task_ids):
+    """A probe's applied weight: the same divisor rule the training path uses.
+
+    The probes exist to bracket the go/no-go, so they have to be measured the
+    way the arm is measured -- a raw W~ has a different spread from a normalised
+    one, and the threshold is on the normalised quantity.
+    """
+    if snapshot is None or task_ids is None:
+        return torch.ones_like(pre_weight)
+    dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
+    mean = snapshot["mean"].to(pre_weight.device, pre_weight.dtype)
+    valid = snapshot["valid"].to(pre_weight.device)
+    mu = mean[dst].reshape(-1, 1).expand_as(pre_weight)
+    return torch.where(
+        valid[dst].reshape(-1, 1), pre_weight / mu.clamp(min=1e-12), torch.ones_like(pre_weight)
+    )
+
+
 def _grad_sync_context(module, active: bool):
     """FSDP's no_sync() for one micro-batch, or None when it does not apply.
 
@@ -358,6 +396,17 @@ class DataParallelPPOActor(BasePPOActor):
         # mean; None until one has been measured, which is what makes the first
         # step run unnormalised rather than by a guess.
         self._sign_position_means = None
+        # The parameter-free cross-teacher arm's one-step-lag state. Cumulative
+        # across the whole run for the RMS and the reliability, per step for the
+        # normaliser; all three are built lazily because they are indexed by task
+        # and the task list arrives with the first batch.
+        self._xt_rms = None
+        self._xt_mean = None
+        self._xt_adv = None
+        self._xt_rms_snapshot = None       # (diag, diag_valid) from the previous step
+        self._xt_mean_snapshot = None      # {"mean", "valid"} from the previous step
+        self._xt_alpha = None              # (T, T) applied reliability
+        self._xt_probe_mean = {}           # one normaliser per probe alpha
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -440,6 +489,155 @@ class DataParallelPPOActor(BasePPOActor):
         s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
         return full_s_lp[:, -response_length - 1 : -1, :]
+
+    def _cross_teacher_planes(self, data, support_ids):
+        """``(base, off_teachers)`` log-probs at ``support_ids``.
+
+        The same exchange the on-task teacher went through, once per model: the
+        base policy in column 0 of ``sign_cache_ids``, then this row's off-task
+        teachers. They were cached by the driver on the rows they are off-task
+        for, at the same granularity, so the lookup is the same shape.
+
+        Shared by both cross-teacher arms because both need exactly these four
+        models on exactly one support; a second copy is how the two would come
+        to read different things and still be called the same experiment.
+        """
+        sign_ids = data["sign_cache_ids"]
+        planes = [
+            self._teacher_logprobs_at(
+                cache_ids=sign_ids[:, c],
+                ids=support_ids,
+                input_ids=data["input_ids"],
+                attention_mask=data["attention_mask"],
+            )
+            for c in range(sign_ids.size(1))
+        ]
+        return planes[0], torch.stack(planes[1:], dim=-1)
+
+    def _xt_accumulate_reliability(
+        self, *, data, built, student_topk_logprob, support_ids, response_mask,
+        task_ids, diag, outside_counter,
+    ):
+        """This step's rows into the reliability statistic, read one step later.
+
+        The score is the source's RESIDUAL opinion at the token the student
+        actually emitted, measured against what that opinion was worth on
+        average under the student's own distribution. The residual rather than
+        the full shift so that the part every teacher shares -- generically good
+        tokens -- cannot inflate one source's credit; the FULL shift is what the
+        alpha this produces then gates, and keeping the two apart is the whole
+        reason the evidence function does not take a residual.
+
+        The emitted token is usually in the support but need not be, so it is
+        looked up on its own: one extra id per model, resolved from the same
+        cached hidden states, with no extra forward and -- deliberately -- no
+        change to the KL's support. Widening the support to include it would
+        move the loss to make a diagnostic tidier.
+
+        Does nothing on an arm with no advantages, which leaves alpha at zero
+        and the corroboration channel running alone. That is the pure-OPD case
+        and it is a configuration, not a failure.
+        """
+        row_adv = data.get("adv_row_value", None)
+        informative = data.get("adv_group_informative", None)
+        if row_adv is None or informative is None or task_ids is None:
+            return
+
+        y1 = data["responses"].unsqueeze(-1)
+        on_y = self._teacher_logprobs_at(
+            cache_ids=data["teacher_cache_ids"], ids=y1,
+            input_ids=data["input_ids"], attention_mask=data["attention_mask"],
+        )
+        base_y, off_y = self._cross_teacher_planes(data, y1)
+        std_y = standardize_policy_shifts(
+            shifts=compute_raw_policy_shifts(
+                on_task_logprob=on_y, off_task_logprobs=off_y, base_logprob=base_y
+            ),
+            diag=diag[0], diag_valid=diag[1],
+            task_ids=task_ids, off_plane_tasks=data["sign_off_tasks"],
+        )
+        keep = built["available"].reshape(-1, 1, 1).to(std_y["on"].dtype)
+        hat_on_y, hat_off_y = std_y["on"] * keep, std_y["off"] * keep.unsqueeze(-1)
+        dec_y = decompose_common_residual(hat_on=hat_on_y, hat_off=hat_off_y)
+
+        score = residual_support_score(
+            residual_at_sampled=dec_y["residual"][:, :, 0, :],
+            residual=built["residual"],
+            student_logprob=student_topk_logprob,
+            response_mask=response_mask,
+        )
+        # The same score for the row's OWN teacher, carried only so the
+        # diagnostics can partial it out: "this source agrees with the row's own
+        # teacher" is the obvious confound for "this source predicts reward".
+        on_score = residual_support_score(
+            residual_at_sampled=(hat_on_y - dec_y["common"])[:, :, :1],
+            residual=(built["hat_on"] - built["common"]).unsqueeze(-1),
+            student_logprob=student_topk_logprob,
+            response_mask=response_mask,
+        ).reshape(-1)
+
+        self._xt_adv.update(
+            advantage=row_adv,
+            support_score=score,
+            on_support_score=on_score,
+            length=response_mask.to(torch.float32).sum(dim=1),
+            informative=informative,
+            task_ids=task_ids,
+            off_plane_tasks=data["sign_off_tasks"],
+            group_ids=data.get("adv_group_id", None),
+        )
+        # Coverage of the centring approximation: the expectation the score is
+        # measured against runs over the top-k with a zero tail residual, so an
+        # emitted token outside it is not in its own baseline.
+        inside = (support_ids == y1).any(dim=-1)
+        valid = response_mask.to(torch.bool)
+        outside_counter[0] += ((~inside) & valid).sum().to(torch.float64)
+        outside_counter[1] += valid.sum().to(torch.float64)
+
+    def _xt_rms_metrics(self, task_id_names) -> dict:
+        """The scale itself, and how far out of its domain each teacher reaches.
+
+        ``off_to_in_domain_ratio`` is the direct measurement of the thing the
+        DIAGONAL divisor exists to preserve: how much less a teacher moves on
+        another task's states than on its own. Dividing by the
+        destination-conditioned RMS instead would force this to 1 by
+        construction and call the resulting noise a full unit of signal.
+        """
+        snap = self._xt_rms.snapshot()
+        name = lambda t: task_id_names[t] if task_id_names and t < len(task_id_names) else f"task{t}"
+        out = {}
+        for d in range(self._xt_rms.n_tasks):
+            if float(snap["n"][d]) <= 0:
+                continue
+            for m in range(self._xt_rms.n_tasks):
+                if not bool(snap["valid"][d, m]):
+                    continue
+                out[f"kl_weight/rms/{name(m)}__on__{name(d)}/cumulative"] = float(snap["sigma"][d, m])
+                if d != m and bool(snap["valid"][m, m]) and float(snap["sigma"][m, m]) > 0:
+                    out[f"kl_weight/rms/{name(m)}__on__{name(d)}/off_to_in_domain_ratio"] = (
+                        float(snap["sigma"][d, m]) / float(snap["sigma"][m, m])
+                    )
+            out[f"kl_weight/rms/{name(d)}/n_positions"] = float(snap["n"][d])
+        return out
+
+    def _xt_reliability_metrics(self, task_id_names) -> dict:
+        """alpha, and everything that says whether to believe it.
+
+        ``rho_lcb95`` and the two partials are reported and never multiplied
+        into anything: a confidence level is a knob, and so is a choice of which
+        confound to trust. What they are for is reading a positive alpha that
+        the rectifier's own small-sample bias could have produced on its own.
+        """
+        out = {}
+        for (dst, src), row in self._xt_adv.alpha(task_names=task_id_names).items():
+            head = f"kl_weight/adv/{src}__on__{dst}"
+            out[f"{head}/alpha_applied"] = row["alpha"]
+            out[f"{head}/n_rollouts_cumulative"] = row["n"]
+            out[f"{head}/veto_rate"] = float(row["rho"] is not None and row["rho"] < 0)
+            for key in ("rho", "rho_lcb95", "rho_length_controlled", "rho_length_on_controlled"):
+                if row[key] is not None:
+                    out[f"{head}/{key}"] = row[key]
+        return out
 
     def _refresh_sign_position_means(self, stats, task_id_names):
         """Per-task mean position weight, pooled over ranks, for the NEXT call.
@@ -1194,6 +1392,31 @@ class DataParallelPPOActor(BasePPOActor):
         # otherwise skip an all_reduce and hang every other rank.
         sign_cfg_on = bool(sign_cfg and sign_cfg.get("enable", False))
         sign_enabled = sign_cfg_on and "sign_cache_ids" in data.batch.keys()
+        # The parameter-free arm. It reads the same four models on the same
+        # support and reaches the loss through the same one line, so it shares
+        # every gate the sign arm has and differs only in how the scalar is
+        # built. Both at once would train an arm that is neither.
+        xt_cfg = self.config.get("cross_teacher_kl_weight", None)
+        xt_cfg_on = bool(xt_cfg and xt_cfg.get("enable", False))
+        assert not (sign_cfg_on and xt_cfg_on), (
+            "sign_weight and cross_teacher_kl_weight are two mechanisms for one signal "
+            "and both multiply the same teacher KL; enable one"
+        )
+        xt_enabled = xt_cfg_on and "sign_cache_ids" in data.batch.keys()
+        xt_report_eps = float((xt_cfg or {}).get("report_epsilon", 0.1))
+        if xt_enabled:
+            assert teacher_topk_kl and use_teacher_kl_loss, (
+                "cross_teacher_kl_weight scales the teacher KL over a shared top-k "
+                "support; it needs kl_loss_type=topk_kl and use_teacher_kl_loss=true"
+            )
+            assert student_indexed_topk, (
+                "cross_teacher_kl_weight measures every model on the STUDENT's top-k "
+                "(support: student_topk); set actor.student_indexed_topk=true"
+            )
+            select_keys += ["sign_cache_ids", "sign_off_tasks"]
+            for key in ("adv_row_value", "adv_group_informative", "adv_group_id"):
+                if key in data.batch.keys():
+                    select_keys.append(key)
         if sign_enabled:
             # Either support works -- the student's top-k, resolved above, or the
             # teacher's own, already selected into select_keys by the branch above.
@@ -1368,6 +1591,78 @@ class DataParallelPPOActor(BasePPOActor):
         ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
+        # The parameter-free arm's three accumulators, built on the config alone
+        # so every rank runs the same collectives whatever its micro-batch holds.
+        # The RMS and the reliability are cumulative across the run; the
+        # normaliser is a per-step mean, reset below once its snapshot is taken.
+        if xt_cfg_on and n_task:
+            if self._xt_rms is None:
+                self._xt_rms = CumulativePolicyShiftRMS(n_tasks=n_task, device=sign_dev)
+                self._xt_mean = PreviousStepTaskKLWeightedMean(n_tasks=n_task, device=sign_dev)
+                self._xt_adv = AdvantageReliabilityStats(
+                    n_tasks=n_task, device=sign_dev,
+                    max_groups=int((xt_cfg or {}).get("max_groups", 512)),
+                )
+                self._xt_alpha = torch.zeros((n_task, n_task), dtype=torch.float32)
+                self._xt_probe_mean = {
+                    probe_name(a): PreviousStepTaskKLWeightedMean(n_tasks=n_task, device=sign_dev)
+                    for a in XT_PROBE_ALPHAS
+                }
+                # A checkpoint's accumulated state, if this process was resumed.
+                # Restored here rather than in load_checkpoint because the
+                # accumulators are indexed by task and do not exist until the
+                # first batch names them.
+                pending = getattr(self, "cross_teacher_sidecar_path", None)
+                if pending and os.path.exists(pending):
+                    restored = load_sidecar_state(
+                        torch.load(pending, map_location="cpu", weights_only=False),
+                        rms=self._xt_rms, mean=self._xt_mean, adv=self._xt_adv,
+                        identity=getattr(self, "cross_teacher_identity", {}) or {},
+                    )
+                    self._xt_rms_snapshot = self._xt_rms.diagonal()
+                    if restored is not None:
+                        self._xt_alpha = restored.to(torch.float32)
+                    print(f"[cross_teacher] resumed accumulated state from {pending}", flush=True)
+                self.cross_teacher_sidecar_path = None
+        xt_on = xt_cfg_on and self._xt_rms is not None
+        xt_position_stats = (
+            ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev) if xt_on else None
+        )
+        xt_state_stats = (
+            ScopeTermStats(names=XT_STATE_TERMS, n_tasks=n_task, device=sign_dev) if xt_on else None
+        )
+        xt_pair_stats = PairEvidenceStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        xt_probe_stats = (
+            {
+                probe_name(a): ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev)
+                for a in XT_PROBE_ALPHAS
+            }
+            if xt_on
+            else {}
+        )
+        # The alpha the loss uses is the PREVIOUS step's: this step's rows are
+        # still being scored, and reading them here would make the objective
+        # depend on the order the micro-batches ran in.
+        xt_alpha_snapshot = self._xt_alpha if xt_on else None
+        xt_rms_snapshot = self._xt_rms_snapshot if xt_on else None
+        xt_outside_topk = torch.zeros(2, dtype=torch.float64, device=sign_dev) if xt_on else None
+        # The normaliser is a per-STEP mean: taken here from what the last call
+        # accumulated, then cleared so this call's rows become the next one's
+        # divisor. Reading this step's own would make the objective depend on
+        # how the batch was split into micro-batches. Absent -- the first step
+        # that has a scale but no mean yet -- means W is exactly 1, not the raw
+        # weight and not a within-micro-batch mean.
+        xt_mean_snapshot = None
+        xt_probe_snapshots = {}
+        if xt_on:
+            snap = self._xt_mean.snapshot()
+            xt_mean_snapshot = snap if bool(snap["valid"].any()) else None
+            self._xt_mean.reset()
+            for _name, _st in self._xt_probe_mean.items():
+                _snap = _st.snapshot()
+                xt_probe_snapshots[_name] = _snap if bool(_snap["valid"].any()) else None
+                _st.reset()
+
         # Individual candidates, with the tokens around them. Every other table
         # here is an aggregate, and an aggregate cannot be read for a mechanism:
         # "the weighting acts on the same forty tokens" and "it acts on
@@ -1603,23 +1898,9 @@ class DataParallelPPOActor(BasePPOActor):
                             "log-probs at it; got neither. It requires teacher_kl_loss_type=topk_kl."
                         )
                         with _actor_phase("actor.sign_weight"):
-                            sign_ids = data["sign_cache_ids"]
-                            # Same exchange the on-task teacher went through, once
-                            # per model: the base policy in column 0, then this
-                            # row's off-task teachers. They were cached by the
-                            # driver on the rows they are off-task for, at the same
-                            # granularity, so the lookup is the same shape.
-                            planes = [
-                                self._teacher_logprobs_at(
-                                    cache_ids=sign_ids[:, c],
-                                    ids=sign_support_ids,
-                                    input_ids=data["input_ids"],
-                                    attention_mask=data["attention_mask"],
-                                )
-                                for c in range(sign_ids.size(1))
-                            ]
-                            base_logprob = planes[0]
-                            off_logprobs = torch.stack(planes[1:], dim=-1)
+                            base_logprob, off_logprobs = self._cross_teacher_planes(
+                                data, sign_support_ids
+                            )
                             # The rewrite decomposition runs further down, past the
                             # end of this block, and needs the base to measure the
                             # teacher's own travel against.
@@ -1735,6 +2016,60 @@ class DataParallelPPOActor(BasePPOActor):
                                 if not sign_measure_only:
                                     sign_position_weight = pos_w_norm
                     
+                    xt_built = None
+                    if xt_enabled:
+                        assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
+                            "cross_teacher_kl_weight needs the student's top-k support and the "
+                            "on-task teacher's log-probs at it"
+                        )
+                        with _actor_phase("actor.cross_teacher"):
+                            base_logprob, off_logprobs = self._cross_teacher_planes(
+                                data, sign_support_ids
+                            )
+                            xt_shifts = compute_raw_policy_shifts(
+                                on_task_logprob=sign_on_task_logprobs,
+                                off_task_logprobs=off_logprobs,
+                                base_logprob=base_logprob,
+                            )
+                            # This step's contribution to the CUMULATIVE scale.
+                            # Read one step later, so nothing here reaches the
+                            # weight built below.
+                            self._xt_rms.update(
+                                shifts=xt_shifts,
+                                student_logprob=student_topk_logprobs,
+                                response_mask=response_mask,
+                                task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                            )
+                            if xt_rms_snapshot is None:
+                                # Step 0: no scale exists, so no weight does
+                                # either. Not the raw W~ -- that would be a
+                                # silent increase in distillation strength for
+                                # as long as the RMS takes to appear.
+                                xt_built = None
+                            else:
+                                xt_built = build_position_weight(
+                                    shifts=xt_shifts,
+                                    on_task_logprob=sign_on_task_logprobs,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                    diag=xt_rms_snapshot[0],
+                                    diag_valid=xt_rms_snapshot[1],
+                                    alpha_table=xt_alpha_snapshot,
+                                    normalizer=xt_mean_snapshot,
+                                    report_epsilon=xt_report_eps,
+                                )
+                                self._xt_accumulate_reliability(
+                                    data=data,
+                                    built=xt_built,
+                                    student_topk_logprob=student_topk_logprobs,
+                                    support_ids=sign_support_ids,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    diag=xt_rms_snapshot,
+                                    outside_counter=xt_outside_topk,
+                                )
+
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
                         policy_loss_fn = compute_policy_loss
@@ -2006,6 +2341,57 @@ class DataParallelPPOActor(BasePPOActor):
                                     deadzone=sign_deadzone,
                                     effect=cand_effect,
                                 )
+                        if xt_built is not None and xt_position_stats is not None:
+                            # Read BEFORE the weight multiplies it, everywhere.
+                            # The normaliser composes with itself if it is fed
+                            # the weighted KL -- and since the first step runs at
+                            # W = 1 it would be right exactly once and drift from
+                            # the second, where no metric is looking. kl_scale
+                            # would also be 1 by construction rather than by
+                            # measurement.
+                            self._xt_mean.update(
+                                pre_weight=xt_built["pre_weight"], teacher_kl=teacher_kld,
+                                response_mask=response_mask, task_ids=task_ids,
+                                row_weights=task_loss_weight,
+                            )
+                            xt_position_stats.update(
+                                xt_position_terms(xt_built, teacher_kld),
+                                response_mask=response_mask, task_ids=task_ids,
+                            )
+                            xt_state_stats.update(
+                                xt_state_shift_terms(xt_built, teacher_kld),
+                                response_mask=response_mask, task_ids=task_ids,
+                            )
+                            # Each source's share of W~ - 1, and of the nats that
+                            # share went on to move.
+                            src_evidence = xt_built["evidence_by_source"].sum(dim=2)
+                            xt_pair_stats.update(
+                                evidence=src_evidence,
+                                shift=src_evidence
+                                * (teacher_kld / xt_built["mu"].clamp(min=1e-12)).unsqueeze(-1),
+                                response_mask=response_mask, task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                            )
+                            for name, pre in xt_built["probe_pre_weight"].items():
+                                self._xt_probe_mean[name].update(
+                                    pre_weight=pre, teacher_kl=teacher_kld,
+                                    response_mask=response_mask, task_ids=task_ids,
+                                    row_weights=task_loss_weight,
+                                )
+                                snap = xt_probe_snapshots.get(name, None)
+                                probe = {
+                                    "weight": _xt_apply_normalizer(pre, snap, task_ids),
+                                    "pre_weight": pre,
+                                    "available": xt_built["available"],
+                                    "evidence_shared": xt_built["evidence_shared"],
+                                }
+                                xt_probe_stats[name].update(
+                                    xt_position_terms(probe, teacher_kld),
+                                    response_mask=response_mask, task_ids=task_ids,
+                                )
+                        if xt_built is not None:
+                            # The one line the whole module exists to reach.
+                            teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
                         if sign_position_weight is not None:
                             # position mode: a positive per-token scalar, computed
                             # from frozen models, so it scales the gradient at this
@@ -2236,6 +2622,50 @@ class DataParallelPPOActor(BasePPOActor):
             rewrite_stats.all_reduce()
             metrics.update(rewrite_stats.metrics(task_names=task_id_names))
             metrics.update(rewrite_ratio_metrics(rewrite_stats.sums(task_names=task_id_names)))
+        if xt_on:
+            # Unconditional and in a fixed order: gated on the config alone, so a
+            # rank whose micro-batches held no informative group still runs every
+            # collective its neighbours do.
+            self._xt_rms.all_reduce()
+            self._xt_rms_snapshot = self._xt_rms.diagonal()
+            self._xt_mean.all_reduce()
+            self._xt_adv.all_reduce()
+            for _st in self._xt_probe_mean.values():
+                _st.all_reduce()
+            # Every rank derives the same table from the same reduced moments,
+            # so no broadcast is needed to keep them agreeing.
+            self._xt_alpha = self._xt_adv.alpha_table()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(xt_outside_topk, op=torch.distributed.ReduceOp.SUM)
+
+            xt_position_stats.all_reduce()
+            xt_state_stats.all_reduce()
+            xt_pair_stats.all_reduce()
+            metrics.update(position_weight_metrics(xt_position_stats.sums(task_names=task_id_names)))
+            metrics.update(state_shift_metrics(xt_state_stats.sums(task_names=task_id_names)))
+            metrics.update(xt_pair_stats.metrics(task_names=task_id_names))
+            metrics.update(self._xt_rms_metrics(task_id_names))
+            metrics.update(self._xt_reliability_metrics(task_id_names))
+            for _name, _st in xt_probe_stats.items():
+                _st.all_reduce()
+                probe = position_weight_metrics(_st.sums(task_names=task_id_names))
+                for key, value in probe.items():
+                    if key.endswith("/w_cv") or key.endswith("/kl_shift_gross_frac"):
+                        metrics[key.replace("kl_weight/", f"kl_weight/probe/{_name}/", 1)] = value
+            total = float(xt_outside_topk[1])
+            if total > 0:
+                metrics["kl_weight/adv/frac_sampled_outside_topk"] = float(xt_outside_topk[0]) / total
+            metrics["kl_weight/cold_start_state"] = float(
+                0 if xt_rms_snapshot is None else (1 if xt_mean_snapshot is None else 2)
+            )
+            # What the worker writes beside the actor checkpoint. Held by
+            # reference: the objects keep accumulating and the save reads them
+            # at whatever step it happens on.
+            self.cross_teacher_state = {
+                "rms": self._xt_rms, "mean": self._xt_mean,
+                "adv": self._xt_adv, "alpha": self._xt_alpha,
+            }
+            self.cross_teacher_task_order = list(task_id_names or [])
         if position_stats is not None:
             # Only the ratios: the raw per-position means would put w_sq and
             # kl_sq in the log, which are not quantities anyone reads. The

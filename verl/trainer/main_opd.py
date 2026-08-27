@@ -56,7 +56,16 @@ def inject_distillation_config(config) -> None:
         sign_cfg = opd_cfg.get("sign_weight", None)
         if sign_cfg is not None:
             config.actor_rollout_ref.actor.sign_weight = sign_cfg
-        if sign_cfg is not None and bool(sign_cfg.get("enable", False)):
+        # The parameter-free arm. Same journey for the same reason -- the weight
+        # is built where the student's top-k exists, which is inside the actor's
+        # forward -- and the same prerequisite on the ref side, since it reads
+        # the same four models at ids nobody knows until that forward runs.
+        xt_cfg = opd_cfg.get("cross_teacher_kl_weight", None)
+        if xt_cfg is not None:
+            config.actor_rollout_ref.actor.cross_teacher_kl_weight = xt_cfg
+        if (sign_cfg is not None and bool(sign_cfg.get("enable", False))) or (
+            xt_cfg is not None and bool(xt_cfg.get("enable", False))
+        ):
             # The frozen models the weights read (base, and each row's off-task
             # teachers) are scored at ids nobody knows until the training forward
             # picks a support, so they have to keep their hidden states and

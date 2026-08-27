@@ -1364,6 +1364,7 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
+        self._save_cross_teacher_sidecar(local_path)
         dist.barrier()
 
         if self._is_lora and isinstance(self.actor_module, PeftModel):
@@ -1395,11 +1396,56 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def _save_cross_teacher_sidecar(self, local_path):
+        """The parameter-free arm's accumulated state, beside the actor's.
+
+        Written by rank 0 only, into the same directory and at the same step as
+        the checkpoint it belongs to. It is training state rather than a
+        diagnostic: resuming the parameters while starting the RMS, the
+        normaliser and the reliability moments from zero puts the run back at
+        cold start -- every weight 1 for two steps, then a scale rebuilt from a
+        handful of positions -- with a step number in the hundreds on the logs
+        and nothing in the metrics to say so.
+        """
+        from verl.trainer.ppo.cross_teacher_kl_weight import SIDECAR_NAME, sidecar_state
+
+        state = getattr(self.actor, "cross_teacher_state", None)
+        if state is None or dist.get_rank() != 0:
+            return
+        os.makedirs(local_path, exist_ok=True)
+        torch.save(
+            sidecar_state(**state, identity=self._cross_teacher_identity()),
+            os.path.join(local_path, SIDECAR_NAME),
+        )
+
+    def _cross_teacher_identity(self) -> dict:
+        """What the accumulated numbers are measured against.
+
+        A resume that disagrees on any of it is not this run continued: the
+        shifts are relative to one base checkpoint, the RMS is per teacher, the
+        log-probs were normalised at one temperature, and every matrix here is
+        indexed by task order.
+        """
+        xt = (self.config.actor.get("cross_teacher_kl_weight", None) or {})
+        return {
+            "base_path": xt.get("base_path", None),
+            "temperature": float(self.config.rollout.temperature),
+            "task_order": list(getattr(self.actor, "cross_teacher_task_order", []) or []),
+        }
+
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        # Handed to the actor rather than loaded here: the accumulators are
+        # indexed by task and do not exist until the first batch names them, so
+        # the restore happens where they are built.
+        if getattr(self, "actor", None) is not None:
+            from verl.trainer.ppo.cross_teacher_kl_weight import SIDECAR_NAME
+
+            self.actor.cross_teacher_sidecar_path = os.path.join(local_path, SIDECAR_NAME)
+            self.actor.cross_teacher_identity = self._cross_teacher_identity()
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

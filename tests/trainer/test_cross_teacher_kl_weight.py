@@ -981,3 +981,370 @@ def test_the_specialist_state_has_a_column_and_is_where_budget_is_taken_from():
     assert float(got["pre_weight"]) == pytest.approx(1.0), "no off-task evidence at all"
     assert float(got["weight"]) < 1.0, "so it loses budget to the task's other positions"
     assert int(got["state"][0, 0, 0]) == 6, "neutral_off_task_silent"
+
+
+# --------------------------------------------------------------------------- #
+# group centring inside the reliability statistic
+# --------------------------------------------------------------------------- #
+def _adv_grouped(advantage, support, groups, **kw):
+    a = torch.as_tensor(advantage, dtype=torch.float32)
+    n = a.numel()
+    stats = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=kw.pop("max_groups", 8))
+    stats.update(
+        advantage=a,
+        support_score=torch.as_tensor(support, dtype=torch.float32).reshape(n, 1),
+        on_support_score=torch.zeros(n), length=torch.ones(n),
+        informative=torch.ones(n, dtype=torch.bool),
+        task_ids=torch.zeros(n, dtype=torch.long),
+        off_plane_tasks=torch.full((n, 1), 1),
+        group_ids=torch.as_tensor(groups, dtype=torch.long),
+    )
+    return stats.alpha(task_names=TASKS)[("alfworld", "search")]
+
+
+def test_a_per_prompt_offset_in_the_support_score_is_divided_out():
+    """A prompt every rollout finds hard shifts the whole group's score. The
+    advantage it is correlated against has already had exactly that removed, so
+    leaving it in only deflates a real correlation -- which on a statistic this
+    noisy is the difference between a signal and a shrug."""
+    # Two groups, identical within-group structure, wildly different offsets.
+    a = [-1.0, 1.0, -1.0, 1.0]
+    s = [-1.0, 1.0, 99.0, 101.0]
+    groups = [0, 0, 1, 1]
+    assert _adv_grouped(a, s, groups)["rho"] == pytest.approx(1.0, abs=1e-6)
+    # Without the grouping the offset dominates and the correlation collapses.
+    flat = _adv(a, s).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert abs(flat["rho"]) < 0.1
+
+
+def test_one_group_holding_every_row_reproduces_the_ordinary_variance():
+    """The refinement has to degenerate cleanly, or it is a different statistic."""
+    torch.manual_seed(50)
+    a, s = torch.randn(60), torch.randn(60)
+    grouped = _adv_grouped(a.tolist(), s.tolist(), [0] * 60)["rho"]
+    plain = _adv(a.tolist(), s.tolist()).alpha(task_names=TASKS)[("alfworld", "search")]["rho"]
+    assert grouped == pytest.approx(plain, abs=1e-9)
+
+
+def test_the_group_pooling_survives_being_split_across_micro_batches():
+    """A group's rollouts land in different micro-batches and on different
+    ranks, so centring locally would centre a fragment."""
+    a = [-1.0, 1.0, -1.0, 1.0]
+    s = [-1.0, 1.0, 99.0, 101.0]
+    groups = [0, 1, 0, 1]
+    whole = _adv_grouped(a, s, groups)["rho"]
+    split = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    for r in range(4):
+        split.update(
+            advantage=torch.tensor([a[r]]), support_score=torch.tensor([[s[r]]]),
+            on_support_score=torch.zeros(1), length=torch.ones(1),
+            informative=torch.ones(1, dtype=torch.bool),
+            task_ids=torch.zeros(1, dtype=torch.long), off_plane_tasks=torch.full((1, 1), 1),
+            group_ids=torch.tensor([groups[r]]),
+        )
+    assert split.alpha(task_names=TASKS)[("alfworld", "search")]["rho"] == pytest.approx(whole, abs=1e-9)
+
+
+def test_a_group_id_past_the_buffer_loses_power_rather_than_mixing_prompts():
+    a = [-1.0, 1.0, -1.0, 1.0]
+    s = [-1.0, 1.0, 99.0, 101.0]
+    got = _adv_grouped(a, s, [0, 0, 99, 99], max_groups=8)
+    assert got["n"] == 4, "the moments still see every row"
+    assert got["rho"] is not None
+
+
+def test_the_group_buffer_is_part_of_the_resumable_state():
+    stats = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    stats.update(
+        advantage=torch.tensor([-1.0, 1.0]), support_score=torch.tensor([[0.0], [2.0]]),
+        on_support_score=torch.zeros(2), length=torch.ones(2),
+        informative=torch.ones(2, dtype=torch.bool),
+        task_ids=torch.zeros(2, dtype=torch.long), off_plane_tasks=torch.full((2, 1), 1),
+        group_ids=torch.tensor([0, 0]),
+    )
+    other = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    other.load_state_dict(stats.state_dict())
+    assert torch.allclose(stats.group, other.group)
+    with pytest.raises(AssertionError, match="max_groups"):
+        AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4).load_state_dict(stats.state_dict())
+
+
+# --------------------------------------------------------------------------- #
+# the residual support score
+# --------------------------------------------------------------------------- #
+def test_the_support_score_measures_the_choice_and_not_how_opinionated_the_source_is():
+    """z = r(y) - E_student[r]. A source that likes every candidate equally
+    scores zero however loudly it likes them."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import residual_support_score
+
+    student = torch.log(torch.tensor([[[0.5, 0.5]]]))
+    flat = residual_support_score(
+        residual_at_sampled=torch.tensor([[[7.0]]]),
+        residual=torch.full((1, 1, 2, 1), 7.0),
+        student_logprob=student, response_mask=torch.ones(1, 1),
+    )
+    assert float(flat) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_backing_the_emitted_token_above_the_students_average_scores_positive():
+    from verl.trainer.ppo.cross_teacher_kl_weight import residual_support_score
+
+    student = torch.log(torch.tensor([[[0.5, 0.5]]]))
+    got = residual_support_score(
+        residual_at_sampled=torch.tensor([[[3.0]]]),
+        residual=torch.tensor([[[[3.0], [1.0]]]]),
+        student_logprob=student, response_mask=torch.ones(1, 1),
+    )
+    assert float(got) == pytest.approx(3.0 - 2.0, abs=1e-5)
+
+
+def test_the_trajectory_score_is_a_sum_over_valid_positions():
+    """A sum, because the policy gradient adds each valid token to the loss.
+    The length-normalised reading is carried as a diagnostic moment instead of
+    replacing it."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import residual_support_score
+
+    student = torch.log(torch.full((1, 3, 2), 0.5))
+    got = residual_support_score(
+        residual_at_sampled=torch.tensor([[[2.0], [2.0], [50.0]]]),
+        residual=torch.zeros(1, 3, 2, 1),
+        student_logprob=student, response_mask=torch.tensor([[1.0, 1.0, 0.0]]),
+    )
+    assert float(got) == pytest.approx(4.0, abs=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# The wiring: what a CPU suite can still check about a GPU-only path
+# --------------------------------------------------------------------------- #
+from tests.trainer.test_transfer_metrics import _update_policy_source  # noqa: E402
+
+
+def _actor_source() -> str:
+    import inspect
+
+    from verl.workers.actor import dp_actor
+
+    return open(inspect.getsourcefile(dp_actor), encoding="utf-8").read()
+
+
+def test_every_reader_of_the_kl_runs_before_the_weight_multiplies_it():
+    """The normaliser composes with itself if it is fed the weighted KL, and
+    since the first step runs at W = 1 it would be right exactly once and drift
+    from the second. kl_scale would also come out 1 by construction rather than
+    by measurement."""
+    src = _update_policy_source()
+    multiply = src.index('teacher_kld = teacher_kld * xt_built["weight"]')
+    for reader in (
+        "self._xt_mean.update(",
+        "xt_position_stats.update(",
+        "xt_state_stats.update(",
+        "xt_pair_stats.update(",
+    ):
+        assert src.index(reader) < multiply, reader
+
+
+def test_the_weight_is_the_only_thing_that_touches_the_loss():
+    """One line, and it multiplies the teacher KL. No target rewrite, no
+    per-vocabulary-term weighting, and nothing on the policy gradient."""
+    src = _update_policy_source()
+    assert src.count('teacher_kld = teacher_kld * xt_built["weight"]') == 1
+    # The arm's own block in the micro-batch loop, not the config gate above it.
+    block = src[src.index("xt_built = None\n"):]
+    block = block[: block.index("loss_mode = ")]
+    for forbidden in ("reweight_teacher_logprobs", "pg_loss", "advantages"):
+        assert forbidden not in block, forbidden
+
+
+def test_the_accumulators_are_gated_on_the_config_and_not_on_the_batch():
+    """A rank whose micro-batch carries no sign columns must still build them,
+    or the all-reduces below it deadlock against its neighbours'."""
+    src = _update_policy_source()
+    for line in src.splitlines():
+        if any(
+            ctor in line
+            for ctor in (
+                "CumulativePolicyShiftRMS(", "PreviousStepTaskKLWeightedMean(",
+                "AdvantageReliabilityStats(", "PairEvidenceStats(",
+            )
+        ):
+            assert "xt_enabled" not in line, line
+    gate = src[src.index("if xt_cfg_on and n_task:"):src.index("xt_on = ")]
+    assert "xt_enabled" not in gate
+
+
+def test_the_collectives_run_unconditionally_once_the_arm_is_on():
+    src = _update_policy_source()
+    tail = src[src.rindex("        if xt_on:"):]
+    for call in (
+        "self._xt_rms.all_reduce()", "self._xt_mean.all_reduce()",
+        "self._xt_adv.all_reduce()", "xt_position_stats.all_reduce()",
+        "xt_state_stats.all_reduce()", "xt_pair_stats.all_reduce()",
+    ):
+        assert call in tail, call
+    # ... and no line between the gate and the last of them is itself a branch,
+    # so none can be skipped on what a rank's micro-batches happened to hold.
+    head = tail[: tail.index("xt_pair_stats.all_reduce()")].splitlines()[1:]
+    branches = [
+        ln.strip() for ln in head
+        if ln.strip().startswith(("if ", "elif ", "while ")) and "is_initialized" not in ln
+    ]
+    assert not branches, branches
+
+
+def test_the_normaliser_is_snapshotted_and_then_cleared_in_that_order():
+    """One step's lag. Snapshotting after the reset would hand every step an
+    empty divisor; not resetting at all would make it a run-long average, which
+    is a different mechanism."""
+    src = _update_policy_source()
+    block = src[src.index("xt_mean_snapshot = None"):src.index("# Individual candidates")]
+    assert block.index("self._xt_mean.snapshot()") < block.index("self._xt_mean.reset()")
+
+
+def test_the_micro_batch_is_never_treated_as_a_dataproto():
+    src = _update_policy_source()
+    body = src[src.index('responses = data["responses"]'):]
+    offenders = [ln.strip() for ln in body.splitlines() if "data.batch" in ln.split("#")[0]]
+    assert not offenders, offenders
+
+
+def test_the_two_mechanisms_refuse_to_run_together():
+    """They are two ways to spend one signal and both multiply the same KL.
+    Together they train an arm that is neither and report both sets of metrics
+    as if they described it."""
+    for src in (_actor_source(), open("verl/trainer/ppo/opd_ray_trainer.py").read()):
+        assert "sign_weight and cross_teacher_kl_weight" in src or (
+            "algorithm.opd.sign_weight and algorithm.opd.cross_teacher_kl_weight" in src
+        )
+
+
+def test_the_driver_shares_one_gate_for_the_cache_and_the_base_worker():
+    """The four models, the hidden-state cache and the sign_cache_ids columns
+    are the same for both arms; only what the ACTOR does with them differs. A
+    per-mechanism gate is how the second arm came to run three extra forwards
+    and then read nothing."""
+    src = open("verl/trainer/ppo/opd_ray_trainer.py").read()
+    for marker in (
+        "self.cross_teacher_enabled = self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled",
+        "self.need_hidden_cache = self.student_indexed_topk or self.cross_teacher_enabled",
+        "if not self.cross_teacher_enabled:",
+    ):
+        assert marker in src, marker
+    # and no cache gate is left on the sign flag alone
+    for line in src.splitlines():
+        if "sign_weight_enabled" in line and "cross_teacher" not in line:
+            assert "self.sign_weight_enabled = " in line or "check_sign_weight" in line or (
+                "if self.sign_weight_enabled:" in line
+            ), line
+
+
+def test_the_config_injection_carries_the_block_to_the_actor():
+    """The weight is built where the student's top-k exists, which is inside the
+    actor's forward, so the settings have to reach the actor config while
+    staying authored under algorithm.opd with the other scientific knobs."""
+    src = open("verl/trainer/main_opd.py").read()
+    assert "config.actor_rollout_ref.actor.cross_teacher_kl_weight = xt_cfg" in src
+    assert 'xt_cfg = opd_cfg.get("cross_teacher_kl_weight", None)' in src
+    # and it takes the ref-side prerequisite with it
+    forced = src[src.index('xt_cfg = opd_cfg.get("cross_teacher_kl_weight", None)'):]
+    assert "config.actor_rollout_ref.ref.student_indexed_topk = True" in forced
+
+
+def test_the_grpo_trainer_attaches_what_the_reliability_needs():
+    src = open("verl/trainer/ppo/opd_grpo_ray_trainer.py").read()
+    for col in ("adv_row_value", "adv_group_informative", "adv_group_id"):
+        assert f'batch.batch["{col}"]' in src, col
+    # padding copies carry their original's uid, so leaving them in counts one
+    # trajectory twice
+    assert "PADDING_ROW_KEY" in src
+
+
+# --------------------------------------------------------------------------- #
+# the resumable state
+# --------------------------------------------------------------------------- #
+from verl.trainer.ppo.cross_teacher_kl_weight import (  # noqa: E402
+    SIDECAR_NAME,
+    load_sidecar_state,
+    sidecar_state,
+)
+
+
+def _accumulated(seed=60):
+    rms = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    b = _rms_batch(bs=2, resp=3, k=3, n_off=2, seed=seed)
+    _fold_rms(rms, b, torch.tensor([0, 1]), torch.tensor([[1, 2], [0, 2]]))
+    mean = PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu")
+    mean.update(
+        pre_weight=1.0 + torch.rand(2, 3), teacher_kl=torch.rand(2, 3) + 0.1,
+        response_mask=torch.ones(2, 3), task_ids=torch.tensor([0, 1]),
+    )
+    adv = _adv([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0])
+    return rms, mean, adv
+
+
+IDENTITY = {"base_path": "Qwen/Qwen3-1.7B", "temperature": 1.0, "task_order": TASKS}
+
+
+def test_the_accumulated_state_survives_a_resume():
+    """It is training state, not a diagnostic. Restoring the parameters and
+    starting these from zero puts the run back at cold start -- weight 1 for two
+    steps, then a scale rebuilt from a handful of positions -- with a step number
+    in the hundreds on the logs and nothing in the metrics to say so."""
+    rms, mean, adv = _accumulated()
+    blob = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=adv.alpha_table(), identity=IDENTITY)
+
+    r2 = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    m2 = PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu")
+    a2 = AdvantageReliabilityStats(n_tasks=3, device="cpu")
+    alpha = load_sidecar_state(blob, rms=r2, mean=m2, adv=a2, identity=IDENTITY)
+
+    assert torch.allclose(rms.snapshot()["sigma"], r2.snapshot()["sigma"])
+    assert torch.allclose(mean.snapshot()["mean"], m2.snapshot()["mean"])
+    assert torch.allclose(adv.alpha_table(), a2.alpha_table())
+    assert torch.allclose(alpha, adv.alpha_table())
+
+
+@pytest.mark.parametrize("key,value", [
+    ("base_path", "Qwen/Qwen3-4B"),
+    ("temperature", 0.7),
+    ("task_order", ["search", "alfworld", "webshop"]),
+])
+def test_a_resume_that_changes_what_the_numbers_mean_is_refused(key, value):
+    """The shifts are relative to ONE base checkpoint, the log-probs were
+    normalised at one temperature, and every matrix here is indexed by task
+    order. Blending across a change would keep the arithmetic finite and the
+    meaning gone."""
+    rms, mean, adv = _accumulated()
+    blob = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=None, identity=IDENTITY)
+    with pytest.raises(AssertionError, match=key):
+        load_sidecar_state(
+            blob,
+            rms=CumulativePolicyShiftRMS(n_tasks=3, device="cpu"),
+            mean=PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu"),
+            adv=AdvantageReliabilityStats(n_tasks=3, device="cpu"),
+            identity={**IDENTITY, key: value},
+        )
+
+
+def test_an_unknown_sidecar_version_is_refused_rather_than_guessed():
+    rms, mean, adv = _accumulated()
+    blob = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=None, identity=IDENTITY)
+    blob["version"] = 2
+    with pytest.raises(AssertionError, match="version"):
+        load_sidecar_state(
+            blob, rms=rms, mean=mean, adv=adv, identity=IDENTITY,
+        )
+
+
+def test_the_worker_writes_it_beside_the_checkpoint_from_rank_zero_only():
+    src = open("verl/workers/fsdp_workers.py").read()
+    assert "self._save_cross_teacher_sidecar(local_path)" in src
+    block = src[src.index("def _save_cross_teacher_sidecar"):src.index("def _cross_teacher_identity")]
+    assert "dist.get_rank() != 0" in block, "one writer"
+    # The filename comes from the module rather than being spelled twice: a
+    # writer and a reader that disagree about it fail as a silent cold start.
+    assert "SIDECAR_NAME" in src and SIDECAR_NAME not in src
+    # ... and the restore is deferred to where the accumulators exist
+    assert "self.actor.cross_teacher_sidecar_path = " in src
+    actor = _actor_source()
+    assert "load_sidecar_state(" in actor
+    assert "self.cross_teacher_sidecar_path = None" in actor, "consumed once"

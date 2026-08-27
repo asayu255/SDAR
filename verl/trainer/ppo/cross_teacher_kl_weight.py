@@ -113,8 +113,12 @@ __all__ = [
     "position_pre_weight",
     "PreviousStepTaskKLWeightedMean",
     "group_center",
+    "SIDECAR_NAME",
+    "sidecar_state",
+    "load_sidecar_state",
     "ADV_MOMENTS",
     "AdvantageReliabilityStats",
+    "residual_support_score",
     "POSITION_TERMS",
     "STATE_TERMS",
     "PROBE_ALPHAS",
@@ -457,6 +461,51 @@ def candidate_kl_evidence(
     return common_ev.abs() + (a * hat_off.abs()).sum(dim=-1)
 
 
+SIDECAR_NAME = "cross_teacher_kl_weight_state.pt"
+
+
+def sidecar_state(*, rms, mean, adv, alpha, identity: dict) -> dict:
+    """Everything the arm needs to resume as if it had never stopped.
+
+    The cumulative RMS, the previous step's normaliser and the reliability
+    moments are TRAINING STATE, not diagnostics. Restoring the actor's
+    parameters and starting these from zero would put the run back at cold start
+    -- every weight 1 for two steps, then a scale rebuilt from a handful of
+    positions -- while the logs show a step number in the hundreds. Nothing in
+    the metrics distinguishes that from the mechanism having stopped working.
+
+    ``identity`` pins what the numbers mean: the base checkpoint the shifts are
+    measured against, the teachers, the temperature the log-probs were taken at,
+    and the task order the matrices are indexed by. A resume that disagrees on
+    any of them is not this run continued, and is refused rather than blended.
+    """
+    return {
+        "version": 1,
+        "identity": dict(identity),
+        "rms": rms.state_dict(),
+        "position_weight": mean.state_dict(),
+        "advantage": adv.state_dict(),
+        "last_alpha": alpha.detach().to("cpu") if alpha is not None else None,
+    }
+
+
+def load_sidecar_state(state: dict, *, rms, mean, adv, identity: dict):
+    """Restore, after checking the identity. Returns the stored alpha table."""
+    assert int(state.get("version", 0)) == 1, f"unknown sidecar version {state.get('version')}"
+    stored = dict(state.get("identity", {}))
+    for key, value in identity.items():
+        if key in stored and stored[key] != value:
+            raise AssertionError(
+                f"cross_teacher_kl_weight resume mismatch on {key!r}: checkpoint has "
+                f"{stored[key]!r}, this run has {value!r}. The accumulated scale and "
+                "reliability are measured against that, so they cannot be carried over."
+            )
+    rms.load_state_dict(state["rms"])
+    mean.load_state_dict(state["position_weight"])
+    adv.load_state_dict(state["advantage"])
+    return state.get("last_alpha", None)
+
+
 def position_pre_weight(*, evidence: torch.Tensor, on_task_logprob: torch.Tensor) -> torch.Tensor:
     """``W~ = sum_v p_teacher(v) [1 + e(v)] + p_teacher(tail)``, i.e. ``1 + E[e]``.
 
@@ -682,10 +731,23 @@ class AdvantageReliabilityStats:
     also when the student is most plastic.
     """
 
-    def __init__(self, *, n_tasks: int, device):
+    def __init__(self, *, n_tasks: int, device, max_groups: int = 512):
         self.n_tasks = T = int(n_tasks)
         self.n_moments = len(ADV_MOMENTS)
+        self.max_groups = G = int(max_groups)
         self.buf = torch.zeros(T * T * self.n_moments, dtype=torch.float64, device=device)
+        # Per (pair, prompt group): the group's summed support score and its row
+        # count. This is what makes the group centring EXACT without a second
+        # pass over the step. A group's rollouts land in different micro-batches
+        # and on different ranks, so centring locally would centre a fragment;
+        # index_add_ pools them here and the all-reduce finishes the job.
+        #
+        # The advantage is already group-relative, so its group means are zero
+        # and the covariance needs no correction. Only the support score's
+        # variance does, and
+        #     sum (S - S_g)^2 = sum S^2 - sum_g (sum_g S)^2 / n_g
+        # turns these two columns into that.
+        self.group = torch.zeros(T * T * G * 2, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     def update(
@@ -698,6 +760,7 @@ class AdvantageReliabilityStats:
         informative: torch.Tensor,
         task_ids: torch.Tensor,
         off_plane_tasks: torch.Tensor,
+        group_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """Fold one batch of ROWS in. Trajectory-level, not per position.
 
@@ -708,6 +771,10 @@ class AdvantageReliabilityStats:
             length: (bs,) valid response tokens.
             informative: (bs,) bool -- the row's prompt group had a spread of
                 advantages. Padding copies are false.
+            group_ids: (bs,) dense prompt-group index, or None to skip the
+                group centring. Out-of-range ids are dropped from the centring
+                rather than wrapped, so an oversized batch loses statistical
+                power instead of mixing two prompts into one group.
         """
         self._cpu_cache = None
         T, M = self.n_tasks, self.n_moments
@@ -730,25 +797,47 @@ class AdvantageReliabilityStats:
                 for y in ADV_VARS[i:]
             ]
             vals = torch.stack(cols, dim=-1)                     # (bs, M)
-            base = (dst.clamp(min=0) * T + src.clamp(min=0)) * M
-            flat = (base.unsqueeze(-1) + torch.arange(M, device=vals.device)).reshape(-1)
+            pair = dst.clamp(min=0) * T + src.clamp(min=0)
+            flat = (pair.unsqueeze(-1) * M + torch.arange(M, device=vals.device)).reshape(-1)
             self.buf.index_add_(0, flat, vals.reshape(-1))
+
+            if group_ids is not None:
+                g = group_ids.reshape(-1).to(torch.long)
+                g_ok = ok * ((g >= 0) & (g < self.max_groups)).to(torch.float64)
+                cell = (pair * self.max_groups + g.clamp(min=0, max=self.max_groups - 1)) * 2
+                idx = torch.stack([cell, cell + 1], dim=-1).reshape(-1)
+                self.group.index_add_(0, idx, torch.stack([s * g_ok, g_ok], dim=-1).reshape(-1))
 
     def all_reduce(self) -> None:
         self._cpu_cache = None
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
-        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+        for t in (self.buf, self.group):
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
 
     def _cpu(self):
         if self._cpu_cache is None:
-            T, M = self.n_tasks, self.n_moments
-            self._cpu_cache = self.buf.detach().to("cpu").view(T, T, M)
+            T, M, G = self.n_tasks, self.n_moments, self.max_groups
+            self._cpu_cache = (
+                self.buf.detach().to("cpu").view(T, T, M),
+                self.group.detach().to("cpu").view(T, T, G, 2),
+            )
         return self._cpu_cache
 
     def _cell(self, dst: int, src: int) -> dict:
-        buf = self._cpu()
-        return {name: float(buf[dst, src, i]) for i, name in enumerate(ADV_MOMENTS)}
+        buf, grp = self._cpu()
+        cell = {name: float(buf[dst, src, i]) for i, name in enumerate(ADV_MOMENTS)}
+        # The between-group part of the support score's spread, subtracted below
+        # so the correlation is against the WITHIN-group score. A prompt every
+        # rollout finds hard shifts the whole group, and the advantage it is
+        # correlated with has already had exactly that removed.
+        totals, counts = grp[dst, src, :, 0], grp[dst, src, :, 1]
+        keep = counts > 0
+        # None, not 0.0, when no group was ever named: 0.0 would mean "the groups
+        # explain none of the spread", which is a claim, and would silently turn
+        # the variance below into an uncentred second moment.
+        cell["_s_between"] = float((totals[keep].square() / counts[keep]).sum()) if bool(keep.any()) else None
+        return cell
 
     @staticmethod
     def _cov(cell: dict, x: str, y: str) -> float:
@@ -756,7 +845,17 @@ class AdvantageReliabilityStats:
         if n <= 1:
             return 0.0
         key = f"{x}{y}" if f"{x}{y}" in cell else f"{y}{x}"
-        return cell[key] / n - (cell[x] / n) * (cell[y] / n)
+        raw = cell[key] / n - (cell[x] / n) * (cell[y] / n)
+        between = cell.get("_s_between", None)
+        if x == "s" and y == "s" and between is not None:
+            # Within-group variance: sum (S - S_g)^2 = sum S^2 - sum_g (sum S_g)^2/n_g.
+            # The covariance needs no such correction -- the advantage is
+            # group-centred already, so its group means are zero and the cross
+            # term vanishes. One group holding every row reproduces the ordinary
+            # variance exactly, which is what makes this a refinement and not a
+            # different statistic.
+            return max((cell["ss"] - between) / n, 0.0)
+        return raw
 
     @classmethod
     def _corr(cls, cell: dict, x: str, y: str) -> Optional[float]:
@@ -837,15 +936,61 @@ class AdvantageReliabilityStats:
         return table
 
     def state_dict(self) -> dict:
-        return {"n_tasks": self.n_tasks, "moments": ADV_MOMENTS, "buf": self.buf.detach().to("cpu")}
+        return {
+            "n_tasks": self.n_tasks,
+            "moments": ADV_MOMENTS,
+            "max_groups": self.max_groups,
+            "buf": self.buf.detach().to("cpu"),
+            "group": self.group.detach().to("cpu"),
+        }
 
     def load_state_dict(self, state: dict) -> None:
         assert int(state["n_tasks"]) == self.n_tasks, "task count changed across resume"
         assert tuple(state["moments"]) == ADV_MOMENTS, (
             "the moment layout changed; a resumed buffer would be read column-wise wrong"
         )
+        assert int(state["max_groups"]) == self.max_groups, (
+            "max_groups changed; the per-group buffer would be re-indexed onto other prompts"
+        )
         self.buf.copy_(state["buf"].to(self.buf.device, self.buf.dtype))
+        self.group.copy_(state["group"].to(self.group.device, self.group.dtype))
         self._cpu_cache = None
+
+
+def residual_support_score(
+    *,
+    residual_at_sampled: torch.Tensor,
+    residual: torch.Tensor,
+    student_logprob: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """(bs, n_off) how much each source's residual backed the tokens actually emitted.
+
+    Per position, ``z = r(y) - E_{pi_student}[r]``: the source's source-specific
+    opinion at the token the student chose, measured against what that opinion
+    was worth on average under the student's own distribution. Centring against
+    the student rather than against zero is what makes ``z`` a statement about
+    the CHOICE and not about how opinionated the source is at this state.
+
+    Summed over valid positions rather than averaged. The policy gradient adds
+    each valid token to the loss, so a sum is what corresponds to the local
+    gradient contribution; the length-normalised version is carried as a
+    diagnostic through the ``l`` moment instead of replacing this.
+
+    The expectation runs over the top-k with the tail's residual taken as zero:
+    no teacher was read outside the support, so there is no residual there to
+    average. When the emitted token is itself outside the top-k the expectation
+    therefore excludes it, which is a real approximation and is why
+    ``frac_sampled_outside_topk`` is a required metric rather than a nicety.
+
+    Args:
+        residual_at_sampled: (bs, resp, n_off) the residual at the emitted token.
+        residual: (bs, resp, k, n_off) the residual over the support.
+    """
+    p = student_logprob.detach().to(residual.dtype).exp()
+    expect = (p.unsqueeze(-1) * residual).sum(dim=-2)
+    z = residual_at_sampled - expect
+    return (z * response_mask.to(z.dtype).unsqueeze(-1)).sum(dim=1)
 
 
 # --------------------------------------------------------------------------- #

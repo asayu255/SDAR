@@ -126,6 +126,31 @@ def compute_opd_data_metrics_by_task(batch: DataProto) -> dict:
     )
 
 
+def check_cross_teacher_kl_weight_prerequisites(*, teacher_topk_kl, base_policy_path, n_teachers):
+    """What the parameter-free arm needs before it can run.
+
+    The same three structural requirements the sign arm has -- a shared top-k
+    support, the exact base checkpoint the teachers were fine-tuned from, and at
+    least one off-task teacher -- and one more: corroboration is measured among
+    the OFF-TASK teachers, so two of them are needed before the channel exists
+    at all. One teacher agreeing with itself is not corroboration, and with a
+    single source the arm silently degenerates to the reliability channel alone.
+    """
+    assert teacher_topk_kl, (
+        "cross_teacher_kl_weight requires algorithm.opd.kl_loss_type=topk_kl: the "
+        "single-token estimator gives no support for the four models to share"
+    )
+    assert base_policy_path, (
+        "cross_teacher_kl_weight requires algorithm.opd.cross_teacher_kl_weight.base_path "
+        "(the pre-RL policy the teachers' shifts are measured against)"
+    )
+    assert n_teachers >= 3, (
+        "cross_teacher_kl_weight needs at least two off-task teachers: the "
+        "corroboration channel is their agreement with EACH OTHER, and one "
+        "source cannot corroborate itself"
+    )
+
+
 def check_sign_weight_prerequisites(*, mode, teacher_topk_kl, base_policy_path, n_teachers):
     """What an arm needs before the weighting can run at all.
 
@@ -192,6 +217,23 @@ class OPDRayTrainer(RayPPOTrainer):
         # arm had before.
         sw_cfg = dict(opd_cfg.get("sign_weight", {}) or {})
         self.sign_weight_enabled = bool(sw_cfg.get("enable", False))
+        # The parameter-free arm (verl/trainer/ppo/cross_teacher_kl_weight.py).
+        # It reads exactly the same four models on exactly the same support, so
+        # it shares every piece of driver plumbing below -- the base worker, the
+        # hidden-state cache, the sign_cache_ids columns -- and differs only in
+        # what the ACTOR does with them.
+        xt_cfg = dict(opd_cfg.get("cross_teacher_kl_weight", {}) or {})
+        self.cross_teacher_kl_weight_enabled = bool(xt_cfg.get("enable", False))
+        assert not (self.sign_weight_enabled and self.cross_teacher_kl_weight_enabled), (
+            "algorithm.opd.sign_weight and algorithm.opd.cross_teacher_kl_weight are two "
+            "mechanisms for one signal and both multiply the same teacher KL. Enabling "
+            "both would train an arm that is neither and report both sets of metrics as "
+            "if they described it; pick one."
+        )
+        # Who needs base, the cache and the extra forwards -- as opposed to who
+        # builds a weight out of them. Every gate below is this one, so adding a
+        # third consumer never means finding the cache gates again.
+        self.cross_teacher_enabled = self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled
         # Who needs the hidden-state cache, which is NOT the same question as who
         # picks the top-k support. student_indexed_topk needs it because the
         # on-task teacher is scored at ids that do not exist until the actor's
@@ -200,13 +242,22 @@ class OPDRayTrainer(RayPPOTrainer):
         # alone left a teacher-indexed weighted arm with no output projections
         # registered, no cache cleared between steps, and no witness -- while the
         # driver still ran the three extra forwards that fill it.
-        self.need_hidden_cache = self.student_indexed_topk or self.sign_weight_enabled
+        self.need_hidden_cache = self.student_indexed_topk or self.cross_teacher_enabled
         self.sign_weight_mode = str(sw_cfg.get("mode", "target"))
-        self.base_policy_path = sw_cfg.get("base_path", None)
+        self.base_policy_path = (
+            xt_cfg.get("base_path", None) if self.cross_teacher_kl_weight_enabled
+            else sw_cfg.get("base_path", None)
+        )
         self.base_wg = None
         if self.sign_weight_enabled:
             check_sign_weight_prerequisites(
                 mode=self.sign_weight_mode,
+                teacher_topk_kl=self.teacher_topk_kl,
+                base_policy_path=self.base_policy_path,
+                n_teachers=len(self.teacher_paths),
+            )
+        if self.cross_teacher_kl_weight_enabled:
+            check_cross_teacher_kl_weight_prerequisites(
                 teacher_topk_kl=self.teacher_topk_kl,
                 base_policy_path=self.base_policy_path,
                 n_teachers=len(self.teacher_paths),
@@ -258,7 +309,7 @@ class OPDRayTrainer(RayPPOTrainer):
         # self.teacher_wg, because those are keyed by task and drive the routing: a
         # fourth entry there would have to survive _normalize_task_name and would
         # then be looked up for rows that do not exist.
-        if self.sign_weight_enabled:
+        if self.cross_teacher_enabled:
             base_cfg = copy.deepcopy(self.config.actor_rollout_ref)
             with open_dict(base_cfg):
                 base_cfg.model.path = self.base_policy_path
@@ -296,7 +347,7 @@ class OPDRayTrainer(RayPPOTrainer):
         # teachers, so the count has to include it before the first registration:
         # the stack is allocated once, at n_tasks * vocab, by whoever registers
         # first.
-        n_teachers = len(self._teacher_keys) + (1 if self.sign_weight_enabled else 0)
+        n_teachers = len(self._teacher_keys) + (1 if self.cross_teacher_enabled else 0)
         for slot, (task, key) in enumerate(self._teacher_keys.items()):
             wg = all_wg[key]
             wg.init_model()
@@ -318,7 +369,7 @@ class OPDRayTrainer(RayPPOTrainer):
                 # peaked here, before vLLM measures free memory.
                 wg.register_teacher_lm_head(task, slot=slot, n_tasks=n_teachers)
 
-        if self.sign_weight_enabled:
+        if self.cross_teacher_enabled:
             self.base_wg = all_wg["base_policy"]
             self.base_wg.init_model()
             if self.need_hidden_cache and not bool(self.config.trainer.get("val_only", False)):
@@ -644,7 +695,7 @@ class OPDRayTrainer(RayPPOTrainer):
             -- but the pairwise agreement rates are the cheapest form of the
             transferability matrix and they cannot be built without it.
         """
-        if not self.sign_weight_enabled:
+        if not self.cross_teacher_enabled:
             return
 
         task_names = batch.non_tensor_batch.get("task_name", None)
@@ -995,7 +1046,7 @@ class OPDRayTrainer(RayPPOTrainer):
                     # The weights themselves are built in the actor, where the
                     # student's top-k exists; this only puts the other three models
                     # into the same cache the on-task teacher is already in.
-                    if self.sign_weight_enabled:
+                    if self.cross_teacher_enabled:
                         with _timer("sign_weight_forward", timing_raw):
                             self.compute_sign_weight_cache(batch)
 

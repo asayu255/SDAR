@@ -29,6 +29,7 @@ quietly stops being true. So this subclass overrides only the two hooks
 """
 
 import numpy as np
+import torch
 
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import (
@@ -43,6 +44,8 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
 )
 from verl.trainer.ppo.reward import compute_reward
+
+from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 from agent_system.multi_turn_rollout import compute_log_prob_with_prefetch
 
@@ -127,7 +130,84 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
             )
 
+            batch = self._attach_advantage_reliability_columns(batch)
+
         return batch, reward_extra_infos_dict
+
+    def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:
+        """Per row: its advantage, and whether its prompt group carried any signal.
+
+        The parameter-free cross-teacher arm calibrates each source teacher by
+        correlating its residual support for the tokens the student emitted
+        against the advantage of the trajectory it emitted them in, so it needs
+        both a per-ROW advantage and a marker for which rows can inform that
+        correlation. Both are driver-side facts -- the actor sees micro-batches
+        and cannot see a prompt group at all -- and both are cheap here.
+
+        ``adv_group_informative`` is false wherever the group has no spread of
+        advantage. GRPO is group-relative, so a prompt whose rollouts all scored
+        the same gives every one of its rows an advantage of zero; folding those
+        into the correlation adds variance to the support score against none in
+        the advantage and drags every pair's estimate toward zero for a reason
+        that has nothing to do with the teachers. The comparison is against the
+        advantages already computed -- no new threshold is introduced.
+
+        Padding rows are excluded outright: ``adjust_batch`` appends them as
+        copies carrying their original's uid, so leaving them in would count one
+        trajectory twice.
+        """
+        adv = batch.batch["advantages"]
+        mask = batch.batch["response_mask"].to(adv.dtype)
+        denom = mask.sum(dim=-1).clamp(min=1)
+        row_adv = (adv * mask).sum(dim=-1) / denom
+
+        # Outcome GRPO broadcasts one score across the row, and the reliability
+        # correlation is a statement about trajectories. Checked rather than
+        # assumed: a step-level estimator would make the row mean an average of
+        # different things and the correlation would quietly change meaning.
+        spread = ((adv - row_adv.unsqueeze(-1)).abs() * mask).max()
+        if float(spread) > 1e-4:
+            print(
+                f"[cross_teacher] advantages vary within a row (max deviation {float(spread):.3g}); "
+                "the reliability correlation uses the masked row mean",
+                flush=True,
+            )
+
+        uids = batch.non_tensor_batch.get("uid", batch.non_tensor_batch.get("traj_uid", None))
+        real = torch.ones_like(row_adv, dtype=torch.bool)
+        padding = batch.batch.get(PADDING_ROW_KEY, None)
+        if padding is not None:
+            real &= ~padding.reshape(-1).to(torch.bool)
+        informative = torch.zeros_like(real)
+        if uids is not None:
+            by_uid = {}
+            for i, u in enumerate(np.asarray(uids).reshape(-1).tolist()):
+                if bool(real[i]):
+                    by_uid.setdefault(u, []).append(i)
+            for rows in by_uid.values():
+                vals = [float(row_adv[i]) for i in rows]
+                if len(vals) > 1 and max(vals) - min(vals) > 0:
+                    for i in rows:
+                        informative[i] = True
+
+        # A DENSE group index, because the reliability statistic centres the
+        # support score within the prompt group and a group's rollouts land in
+        # different micro-batches and on different ranks: the accumulator pools
+        # them by this id and all-reduces, which is exact where centring a local
+        # fragment would not be. Dense and batch-local -- it names a prompt
+        # within this step and nothing beyond it.
+        group_id = torch.full_like(row_adv, -1, dtype=torch.long)
+        if uids is not None:
+            order = {}
+            for i, u in enumerate(np.asarray(uids).reshape(-1).tolist()):
+                if not bool(real[i]):
+                    continue
+                group_id[i] = order.setdefault(u, len(order))
+
+        batch.batch["adv_row_value"] = row_adv
+        batch.batch["adv_group_informative"] = informative
+        batch.batch["adv_group_id"] = group_id
+        return batch
 
     def _data_metrics(self, batch: DataProto) -> dict:
         """The full advantage-bearing statistics, which this arm's batch carries.

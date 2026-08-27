@@ -67,6 +67,12 @@ def _make_trainer(teachers, base, enabled=True):
     trainer.teacher_wg = teachers
     trainer.base_wg = base
     trainer.sign_weight_enabled = enabled
+    # The cache, the base worker and these columns are shared with the
+    # parameter-free arm, so what gates them is "either mechanism", not "the
+    # sign one". Set explicitly rather than derived, because a helper that
+    # guesses it would stop noticing when the gate moves again.
+    trainer.cross_teacher_kl_weight_enabled = False
+    trainer.cross_teacher_enabled = enabled
     trainer.teacher_topk_kl = True
     trainer.teacher_kl_topk = 20
     trainer.student_indexed_topk = True
