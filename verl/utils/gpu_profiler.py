@@ -213,8 +213,40 @@ def _frame_key(frame) -> str:
     return f"{os.path.basename(code.co_filename)}:{frame.f_lineno} {code.co_name}"
 
 
+# Innermost frames that mean "parked", by (file, function). A thread here is
+# waiting and burning no CPU, which is a different finding from a thread
+# running Python -- they need opposite fixes and the list must not merge them.
+# The set is not exhaustive and cannot be: an unlisted blocking primitive reads
+# as RUNNING, which is why the cpu_pct band, not this, decides the verdict.
+_PARKED_FRAMES = frozenset({
+    ("threading.py", "wait"), ("threading.py", "acquire"),
+    ("threading.py", "_wait_for_tstate_lock"), ("threading.py", "join"),
+    ("thread.py", "_worker"),                      # idle concurrent.futures worker
+    ("queue.py", "get"), ("queue.py", "put"),
+    ("_base.py", "wait"), ("_base.py", "result"),  # concurrent.futures
+    ("selectors.py", "select"), ("selectors.py", "poll"),
+    ("socket.py", "readinto"), ("socket.py", "accept"),
+    ("ssl.py", "read"), ("ssl.py", "recv_into"),
+    ("connection.py", "_recv"), ("connection.py", "_recv_bytes"),
+    ("subprocess.py", "_try_wait"), ("subprocess.py", "wait"),
+})
+
+
+def _is_parked(frame) -> bool:
+    code = frame.f_code
+    return (os.path.basename(code.co_filename), code.co_name) in _PARKED_FRAMES
+
+
 def stack_snapshot() -> List[str]:
-    """One key per live thread: our deepest frame, and the innermost frame."""
+    """One key per live thread: our deepest frame, and the innermost frame.
+
+    Prefixed "R " when the innermost frame is running and "B " when it is a
+    known wait, and "-" instead of a repo frame when the thread is not in this
+    repository's code at all. The first reading of this printed 126.58 threads
+    on concurrent.futures' idle _worker, above every frame that meant anything:
+    a machine running 140 threads has ~135 parked ones, and a top-N list that
+    ranks by count is a list of them.
+    """
     if not _STACKS:
         return []
     out = []
@@ -235,13 +267,14 @@ def stack_snapshot() -> List[str]:
             depth += 1
         if innermost is None:
             continue  # this thread is inside the profiler; it is not the subject
+        state = "B" if _is_parked(innermost) else "R"
         inner_key = _frame_key(innermost)
         if repo is None:
-            out.append(f"(no repo frame) <- {inner_key}")
+            out.append(f"{state} -")
         elif repo is innermost:
-            out.append(inner_key)
+            out.append(f"{state} {inner_key}")
         else:
-            out.append(f"{_frame_key(repo)} <- {inner_key}")
+            out.append(f"{state} {_frame_key(repo)} <- {inner_key}")
     return out
 
 
@@ -714,7 +747,7 @@ class _Sampler:
             names = {k for snap in seen for k in snap}
             return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
 
-        def _stacks(stamps, top=6):
+        def _stacks(stamps, top=60):
             """The frames the threads were actually on, over these samples.
 
             Mean threads per sample on each frame, so it reads in the same unit
@@ -726,6 +759,10 @@ class _Sampler:
             if not seen:
                 return None
             counted = Counter(key for keys in seen for key in keys)
+            # Deep, and truncated by the FORMATTER after it has split running
+            # from parked. Truncating here ranks by raw count, and the raw count
+            # is led by a hundred-odd parked infrastructure threads -- which is
+            # how a six-entry list came back holding nothing but them.
             return [(key, n / len(seen)) for key, n in counted.most_common(top)]
         wall = sum(wall_by_count.values()) or 1.0
         return {
@@ -977,17 +1014,43 @@ def format_residency(res) -> str:
         why += line
 
     # The frames, whenever the tags leave a third of a thread or more
-    # unaccounted for. Printed as mean threads per sample, the same unit as the
-    # census above, so "1.2" means the same thing on both lines.
+    # unaccounted for.
+    #
+    # THESE TWO LINES ARE NOT IN THE SAME UNIT and saying so is the whole of
+    # this comment. The census counts threads that entered a tagged phase --
+    # four of them on this run. The frames count every live thread in the
+    # process, and a machine running the pump, Ray, a retriever pool and three
+    # slots has well over a hundred, nearly all parked. The first reading put
+    # "126.58 (no repo frame) <- thread.py:81 _worker" at the top, which is
+    # concurrent.futures' idle workers waiting for work that is not coming, and
+    # pushed the one thread burning 65% of a core off the end of the list.
+    #
+    # So: threads outside this repository collapse to a count, because nothing
+    # here can act on them; threads inside it are listed and split by whether
+    # they are running Python or parked, because those need opposite fixes.
     stacks = res.get("stacks_when_empty") or []
     if stacks and untagged >= 0.33:
+        outside = sum(mean for key, mean in stacks if key.endswith(" -"))
+        ours = [(key[2:], key[0], mean) for key, mean in stacks if not key.endswith(" -")]
+        running = [(k, m) for k, state, m in ours if state == "R" and m >= 0.05]
+        parked = [(k, m) for k, state, m in ours if state == "B" and m >= 0.05]
         why += (
-            f"\n[gpu-residency]    {untagged:.1f} of those threads are in NO tagged phase. "
-            "Where they actually were, asked of the interpreter:"
+            f"\n[gpu-residency]    {untagged:.1f} of the tagged slots are in NO tagged phase. "
+            f"Mean live threads per EMPTY sample, from the interpreter "
+            f"({outside:.0f} outside this repo, parked or otherwise):"
         )
-        for key, mean in stacks:
-            if mean >= 0.05:
-                why += f"\n[gpu-residency]      {mean:5.2f}  {key}"
+        for label, rows in (("RUNNING Python", running), ("PARKED, burning nothing", parked)):
+            if rows:
+                why += f"\n[gpu-residency]      -- {label} --"
+                for key, mean in rows[:8]:
+                    why += f"\n[gpu-residency]      {mean:5.2f}  {key}"
+                if len(rows) > 8:
+                    why += f"\n[gpu-residency]      ... and {len(rows) - 8} more below {rows[8][1]:.2f}"
+        if not running:
+            why += (
+                "\n[gpu-residency]      -- nothing of ours was RUNNING; the CPU above is being "
+                "burned outside this repo, or by a wait this list does not know is one --"
+            )
 
     if driver_blocked:
         why += ("\n[gpu-residency] -> EMPTY is a WAIT OFF THE BOX: the driver burned "

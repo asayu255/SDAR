@@ -475,3 +475,55 @@ val_pipeline.py:181 retire <- threading.py:327 wait
 [gpu-residency]      1.20  rollout_loop.py:1408 _scatter_active_to_full
 [gpu-residency]      0.60  val_pipeline.py:181 retire <- threading.py:327 wait
 ```
+
+## 13bis. その計器の最初の実測 —— と、そこにあった単位のバグ
+
+```
+2.8 of those threads are in NO tagged phase. Where they actually were:
+  126.58  (no repo frame) <- thread.py:81 _worker
+   10.78  search.py:343 call <- threading.py:320 wait
+    9.00  (no repo frame) <- threading.py:320 wait
+    2.00  (no repo frame) <- threading.py:324 wait
+    1.00  (no repo frame) <- runners.py:44 run
+    0.98  val_pipeline.py:181 retire <- threading.py:320 wait
+-> EMPTY is the DRIVER RUNNING PYTHON: 65% of one core while EMPTY vs 20% while busy
+```
+
+**`2.8` と `126.58` は単位が違う。** census はタグ付きスレッド(この run で 4 本)を
+数え、frame は**プロセス内の全生存スレッド**を数える。pump・Ray・retriever pool・
+3 スロットを動かしている機械には 140 本近いスレッドがあり、その大半は駐車中。
+`thread.py:81 _worker` は `concurrent.futures` の**待機中ワーカー**で、来ない仕事を
+待っているだけ。**pct をサンプル数で割っていたのと同じ種類の誤り**を、
+新しい計器で作った。
+
+そして実害が出た: 上位 6 件が駐車スレッドで埋まり、**1 コアの 65% を焼いている
+当のスレッドがリストから溢れた。** 探しているものだけが表示されない。
+
+### 直した形
+
+- **repo 外のスレッドは 1 つの数に畳む** —— ここから手が出せないので、
+  1 行ずつ並べる価値がない
+- **repo 内のスレッドは RUNNING と PARKED に分けて並べる** —— 処方が正反対
+- **打ち切りは分類の後** —— 生の件数で切ると、切った先に駐車スレッドしか残らない
+
+```
+2.0 of the tagged slots are in NO tagged phase. Mean live threads per EMPTY
+sample, from the interpreter (138 outside this repo, parked or otherwise):
+  -- RUNNING Python --
+   0.67  rollout_loop.py:1408 _scatter_active_to_full
+   0.33  rollout_loop.py:872 preprocess_single_sample
+  -- PARKED, burning nothing --
+   7.33  search.py:343 call <- threading.py:320 wait
+   0.33  val_pipeline.py:181 retire <- threading.py:320 wait
+```
+
+### 最初の実測から、それでも読み取れたこと
+
+`search.py:343` は `slot.done.wait()` —— **バッチ合体の follower 待ち**で、
+10.78 本は 1 本の実 HTTP にぶら下がっている設計どおりの姿。CPU は焼いていない。
+ただし **EMPTY の最中に retriever が in-flight である**ことは言っている。
+
+そして census が retriever を「0.05 未満」として除外していた理由も分かった:
+`envstep` タグは**呼び出しスレッド**に付いており、検索ツールが自前の pool
+スレッドで実際の HTTP を行う分は、そのタグの外側にある。**census は構造的に
+retriever のスレッドを数えていなかった。**

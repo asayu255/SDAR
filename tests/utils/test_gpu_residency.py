@@ -652,17 +652,17 @@ def test_the_stacks_are_aggregated_over_the_empty_samples_only():
     ts = [100.0 + i * 0.3 for i in range(4)]
     trace = list(zip(ts, [[0, 0, 0], [0, 0, 0], [90, 90, 90], [90, 90, 90]]))
     stacks = [
-        (ts[0], ["rollout_loop.py:1 a", "rollout_loop.py:2 b"]),
-        (ts[1], ["rollout_loop.py:1 a"]),
-        (ts[2], ["rollout_loop.py:9 busy"]),
-        (ts[3], ["rollout_loop.py:9 busy"]),
+        (ts[0], ["R rollout_loop.py:1 a", "R rollout_loop.py:2 b"]),
+        (ts[1], ["R rollout_loop.py:1 a"]),
+        (ts[2], ["R rollout_loop.py:9 busy"]),
+        (ts[3], ["R rollout_loop.py:9 busy"]),
     ]
     res = _FakeSampler(trace, stacks=stacks).residency_between(0, 1e9)
     empty = dict(res["stacks_when_empty"])
-    assert empty["rollout_loop.py:1 a"] == pytest.approx(1.0)   # in both empty samples
-    assert empty["rollout_loop.py:2 b"] == pytest.approx(0.5)   # in one of two
-    assert "rollout_loop.py:9 busy" not in empty                # that one was busy
-    assert dict(res["stacks_when_busy"])["rollout_loop.py:9 busy"] == pytest.approx(1.0)
+    assert empty["R rollout_loop.py:1 a"] == pytest.approx(1.0)   # in both empty samples
+    assert empty["R rollout_loop.py:2 b"] == pytest.approx(0.5)   # in one of two
+    assert "R rollout_loop.py:9 busy" not in empty                # that one was busy
+    assert dict(res["stacks_when_busy"])["R rollout_loop.py:9 busy"] == pytest.approx(1.0)
 
 
 def test_the_frames_print_when_the_tags_leave_a_third_of_a_thread_unclaimed():
@@ -672,7 +672,7 @@ def test_the_frames_print_when_the_tags_leave_a_third_of_a_thread_unclaimed():
     # slots_seen is the most threads ever tagged at once, so the fixture has to
     # show three before one of them can be missing.
     act = [(ts[0], {"gen": 3}), (ts[1], {"gen": 1})]
-    stacks = [(t, ["rollout_loop.py:1408 _scatter_active_to_full"] * 2) for t in ts]
+    stacks = [(t, ["R rollout_loop.py:1408 _scatter_active_to_full"] * 2) for t in ts]
     out = gp.format_residency(_FakeSampler(trace, act=act, stacks=stacks).residency_between(0, 1e9))
     assert "in NO tagged phase" in out
     assert "_scatter_active_to_full" in out
@@ -681,3 +681,78 @@ def test_the_frames_print_when_the_tags_leave_a_third_of_a_thread_unclaimed():
     act_full = [(t, {"gen": 3}) for t in ts]
     out = gp.format_residency(_FakeSampler(trace, act=act_full, stacks=stacks).residency_between(0, 1e9))
     assert "in NO tagged phase" not in out
+
+
+def test_a_hundred_parked_infrastructure_threads_do_not_bury_the_one_that_matters():
+    """The first real reading of this instrument was six lines of noise.
+
+    A machine running the pump, Ray, a retriever pool and three slots has well
+    over a hundred live threads and nearly all of them are parked. Ranking by
+    raw count put "126.58 (no repo frame) <- thread.py:81 _worker" -- idle
+    concurrent.futures workers waiting for work that is not coming -- at the
+    top, and pushed the single thread burning 65% of a core off the end of a
+    six-entry list. The fix is not a longer list: it is to collapse what cannot
+    be acted on and to split running from parked before truncating.
+    """
+    ts = [100.0 + i * 0.3 for i in range(2)]
+    trace = list(zip(ts, [[0, 0, 0], [0, 0, 0]]))
+    act = [(ts[0], {"gen": 3}), (ts[1], {"gen": 1})]
+    infra = ["B -"] * 138
+    stacks = [
+        (t, infra
+            + ["B search.py:343 call <- threading.py:320 wait"] * 11
+            + ["R rollout_loop.py:1408 _scatter_active_to_full"])
+        for t in ts
+    ]
+    out = gp.format_residency(_FakeSampler(trace, act=act, stacks=stacks).residency_between(0, 1e9))
+
+    assert "138 outside this repo" in out          # counted, not listed
+    assert "thread.py" not in out                  # and not one line each
+    assert "RUNNING Python" in out
+    assert "_scatter_active_to_full" in out        # survived 138 louder threads
+    assert "PARKED, burning nothing" in out
+    assert "search.py:343" in out
+    # Running is listed above parked: it is the half that explains a CPU figure.
+    assert out.index("RUNNING Python") < out.index("PARKED, burning nothing")
+
+
+def test_it_says_so_when_nothing_of_ours_was_running():
+    """A CPU figure with no RUNNING frame under it is a contradiction, not a blank."""
+    ts = [100.0 + i * 0.3 for i in range(2)]
+    trace = list(zip(ts, [[0, 0, 0], [0, 0, 0]]))
+    act = [(ts[0], {"gen": 3}), (ts[1], {"gen": 1})]
+    stacks = [(t, ["B -"] * 40 + ["B val_pipeline.py:181 retire <- threading.py:320 wait"]) for t in ts]
+    out = gp.format_residency(_FakeSampler(trace, act=act, stacks=stacks).residency_between(0, 1e9))
+    assert "nothing of ours was RUNNING" in out
+
+
+def test_a_parked_frame_is_labelled_parked_and_a_live_one_is_not():
+    """The classification the two lists rest on."""
+    import queue
+    import threading
+    import time
+
+    gate, seen = queue.Queue(), {}
+
+    def waiter():
+        gate.get(timeout=5)
+
+    def spinner():
+        deadline = time.perf_counter() + 0.4
+        while time.perf_counter() < deadline:
+            pass
+
+    threading.Thread(target=waiter, daemon=True).start()
+    threading.Thread(target=spinner, daemon=True).start()
+
+    def probe():
+        time.sleep(0.15)
+        seen["keys"] = gp.stack_snapshot()
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    gate.put(None)
+
+    states = [k[0] for k in seen["keys"]]
+    assert "B" in states and "R" in states, seen["keys"]
