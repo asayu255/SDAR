@@ -1,0 +1,776 @@
+"""Parameter-free cross-teacher weighting of the on-task OPD KL.
+
+The arm produces one number per token position, ``W``, multiplies the per-token
+teacher KL by it, and changes nothing else. Everything below is about the two
+places where that number could quietly mean something other than what the design
+says, plus the identities that let it be read as a quantity at all.
+
+* **Scale.** ``delta`` is in nats and the three teachers were trained at KL
+  coefficients differing 10x, so raw magnitudes are not on a common footing. The
+  divisor is each teacher's OWN in-domain RMS -- the DIAGONAL of the ordered-pair
+  matrix -- and the tests pin that it is the diagonal, because dividing by the
+  destination-conditioned RMS instead would stretch a teacher's out-of-domain
+  noise up to a full unit and silently undo the reason the deadzone was dropped.
+
+* **Monotonicity.** Corroboration must never score lower than conflict. The
+  obvious formula, ``|c| + sum alpha|delta_hat - c|``, does exactly that once
+  ``alpha`` passes ``1/n_off``; the shipped one does not, for every ``alpha`` in
+  [0, 1], and that is asserted rather than argued.
+
+Plus the invariant the normaliser exists for: on the snapshot it was built from,
+``sum W*D / sum D`` is 1 -- not ``mean(W)``, which is a different number whenever
+the weight and the KL are correlated, i.e. exactly when the arm is doing
+something.
+"""
+
+import math
+
+import pytest
+
+np = pytest.importorskip("numpy")
+torch = pytest.importorskip("torch")
+
+try:
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        ADV_MOMENTS,
+        AdvantageReliabilityStats,
+        CumulativePolicyShiftRMS,
+        PreviousStepTaskKLWeightedMean,
+        candidate_kl_evidence,
+        compute_raw_policy_shifts,
+        decompose_common_residual,
+        group_center,
+        position_pre_weight,
+        standardize_policy_shifts,
+        tail_logprob,
+    )
+except Exception as e:  # pragma: no cover - environment without full deps
+    pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
+
+
+TASKS = ["alfworld", "search", "webshop"]
+
+
+def _lp(bs, resp, k, scale=1.0, seed=None):
+    """A full-vocab log-softmax gathered at k ids, so the support's mass is < 1."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    return torch.log_softmax(scale * torch.randn(bs, resp, k + 6), dim=-1)[..., :k]
+
+
+# --------------------------------------------------------------------------- #
+# raw shifts
+# --------------------------------------------------------------------------- #
+def test_the_shift_is_the_log_ratio_against_the_shared_base():
+    on, base = _lp(2, 3, 4, seed=0), _lp(2, 3, 4, seed=1)
+    off = torch.stack([_lp(2, 3, 4, seed=2), _lp(2, 3, 4, seed=3)], dim=-1)
+    s = compute_raw_policy_shifts(on_task_logprob=on, off_task_logprobs=off, base_logprob=base)
+    assert torch.allclose(s["on"], on - base)
+    assert torch.allclose(s["off"][..., 0], off[..., 0] - base)
+
+
+def test_the_tail_is_the_supports_complement_and_eps_is_only_a_floor():
+    """The leftover is real probability mass, not a rounding error: it is what
+    makes every expectation here run over something that sums to 1."""
+    lp = torch.log(torch.tensor([[[0.5, 0.25]]]))
+    assert float(tail_logprob(lp).exp()) == pytest.approx(0.25, abs=1e-6)
+    # A support that covers everything: the clamp binds and the result is finite
+    # rather than -inf. Numerical safety only, never a transfer-strength knob.
+    full = torch.log(torch.tensor([[[0.5, 0.5]]]))
+    assert torch.isfinite(tail_logprob(full)).all()
+    assert float(tail_logprob(full).exp()) < 1e-6
+
+
+def test_the_tail_shift_compares_the_same_supports_complement():
+    """Not a per-candidate value: the lumped mass outside the support, on both
+    sides of the ratio, so it can sit in the same expectation as the rest."""
+    on, base = _lp(1, 1, 4, seed=4), _lp(1, 1, 4, seed=5)
+    off = _lp(1, 1, 4, seed=6).unsqueeze(-1)
+    s = compute_raw_policy_shifts(on_task_logprob=on, off_task_logprobs=off, base_logprob=base)
+    expect = math.log(1 - float(on.exp().sum())) - math.log(1 - float(base.exp().sum()))
+    assert float(s["tail_on"]) == pytest.approx(expect, abs=1e-5)
+
+
+def test_a_teacher_identical_to_the_base_shifts_nothing():
+    base = _lp(2, 2, 3, seed=7)
+    s = compute_raw_policy_shifts(
+        on_task_logprob=base, off_task_logprobs=base.unsqueeze(-1), base_logprob=base
+    )
+    for key in ("on", "off", "tail_on", "tail_off"):
+        assert float(s[key].abs().max()) == pytest.approx(0.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# the RMS matrix
+# --------------------------------------------------------------------------- #
+def _rms_batch(*, bs, resp, k, n_off, seed=0):
+    torch.manual_seed(seed)
+    return {
+        "student": _lp(bs, resp, k),
+        "on": _lp(bs, resp, k),
+        "off": torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1),
+        "base": _lp(bs, resp, k),
+    }
+
+
+def _fold_rms(stats, b, task_ids, off_plane_tasks, mask=None):
+    bs, resp = b["on"].shape[:2]
+    stats.update(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=b["on"], off_task_logprobs=b["off"], base_logprob=b["base"]
+        ),
+        student_logprob=b["student"],
+        response_mask=torch.ones(bs, resp) if mask is None else mask,
+        task_ids=task_ids,
+        off_plane_tasks=off_plane_tasks,
+    )
+    return stats
+
+
+def test_the_diagonal_is_the_teacher_measured_where_it_operates():
+    """THE test for the scale choice.
+
+    Teacher 1 is loud on its own task's states and quiet on task 0's. The
+    diagonal must report the loud number and the off-diagonal the quiet one; a
+    destination-conditioned divisor would use the quiet one and stretch that
+    teacher's out-of-domain noise back up to a full unit.
+    """
+    torch.manual_seed(11)
+    bs, resp, k = 4, 5, 3
+    base = _lp(bs, resp, k, seed=12)
+    student = _lp(bs, resp, k, seed=13)
+    stats = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+
+    def rows(dst, on_gain, off_gain, plane_task):
+        shifts = {
+            "on": torch.full((bs, resp, k), on_gain),
+            "off": torch.full((bs, resp, k, 1), off_gain),
+            "tail_on": torch.full((bs, resp), on_gain),
+            "tail_off": torch.full((bs, resp, 1), off_gain),
+        }
+        stats.update(
+            shifts=shifts, student_logprob=student, response_mask=torch.ones(bs, resp),
+            task_ids=torch.full((bs,), dst), off_plane_tasks=torch.full((bs, 1), plane_task),
+        )
+
+    # task 1's own rows: teacher 1 is the on-task one and moves by 2.0
+    rows(dst=1, on_gain=2.0, off_gain=0.0, plane_task=2)
+    # task 0's rows: teacher 1 is off-task here and moves by 0.5
+    rows(dst=0, on_gain=1.0, off_gain=0.5, plane_task=1)
+
+    diag, valid = stats.diagonal()
+    snap = stats.snapshot()
+    assert bool(valid[1]) and float(diag[1]) == pytest.approx(2.0, abs=1e-6)
+    assert float(snap["sigma"][0, 1]) == pytest.approx(0.5, abs=1e-6)
+    # The ratio IS the domain-applicability reading, and it survives.
+    assert float(snap["sigma"][0, 1] / diag[1]) == pytest.approx(0.25, abs=1e-6)
+    del base
+
+
+def test_the_rms_is_a_student_weighted_expectation_not_a_slot_average():
+    """Twenty candidates the student has ruled out must not outvote the one it
+    is about to emit."""
+    bs, resp, k = 1, 1, 3
+    student = torch.log(torch.tensor([[[0.90, 0.005, 0.005]]]))
+    shifts = {
+        "on": torch.tensor([[[1.0, 10.0, 10.0]]]),
+        "off": torch.zeros(bs, resp, k, 1),
+        "tail_on": torch.zeros(bs, resp),
+        "tail_off": torch.zeros(bs, resp, 1),
+    }
+    stats = CumulativePolicyShiftRMS(n_tasks=1, device="cpu")
+    stats.update(
+        shifts=shifts, student_logprob=student, response_mask=torch.ones(bs, resp),
+        task_ids=torch.zeros(bs, dtype=torch.long), off_plane_tasks=torch.zeros(bs, 1, dtype=torch.long),
+    )
+    diag, _ = stats.diagonal()
+    # slot mean would be sqrt((1+100+100)/3) = 8.19; the student's measure gives
+    # 0.9*1 + 0.005*100 + 0.005*100 = 1.9 (the 0.09 tail carries shift 0).
+    assert float(diag[0]) == pytest.approx(math.sqrt(1.9), abs=1e-4)
+
+
+def test_the_rms_does_not_depend_on_the_micro_batch_split():
+    b = _rms_batch(bs=4, resp=3, k=3, n_off=2, seed=14)
+    ids = torch.tensor([0, 1, 2, 0])
+    planes = torch.tensor([[1, 2], [0, 2], [0, 1], [1, 2]])
+    whole = _fold_rms(CumulativePolicyShiftRMS(n_tasks=3, device="cpu"), b, ids, planes)
+    split = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    for r in range(4):
+        _fold_rms(
+            split,
+            {key: v[r : r + 1] for key, v in b.items()},
+            ids[r : r + 1],
+            planes[r : r + 1],
+        )
+    assert torch.allclose(whole.snapshot()["sigma"], split.snapshot()["sigma"], atol=1e-9)
+
+
+def test_padding_and_masked_positions_reach_no_cell():
+    b = _rms_batch(bs=2, resp=3, k=3, n_off=1, seed=15)
+    stats = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    mask = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    _fold_rms(stats, b, torch.tensor([0, -1]), torch.tensor([[1], [1]]), mask=mask)
+    assert float(stats.snapshot()["n"][0]) == 1.0
+    assert float(stats.snapshot()["n"][1]) == 0.0
+
+
+def test_an_unobserved_or_zero_cell_is_unavailable_and_not_epsilon_patched():
+    stats = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    _diag, valid = stats.diagonal()
+    assert not bool(valid.any()), "nothing observed yet"
+    # A teacher identical to the base: every shift is exactly zero, so the
+    # second moment is zero and the cell has no scale to offer.
+    stats.update(
+        shifts={
+            "on": torch.zeros(1, 1, 2), "off": torch.zeros(1, 1, 2, 1),
+            "tail_on": torch.zeros(1, 1), "tail_off": torch.zeros(1, 1, 1),
+        },
+        student_logprob=_lp(1, 1, 2, seed=17), response_mask=torch.ones(1, 1),
+        task_ids=torch.zeros(1, dtype=torch.long), off_plane_tasks=torch.zeros(1, 1, dtype=torch.long),
+    )
+    _diag, valid = stats.diagonal()
+    assert not bool(valid[0]), "a zero sigma is unavailable, not a tiny divisor"
+
+
+def test_the_rms_state_survives_a_round_trip():
+    b = _rms_batch(bs=2, resp=2, k=3, n_off=2, seed=18)
+    a = _fold_rms(CumulativePolicyShiftRMS(n_tasks=3, device="cpu"), b,
+                  torch.tensor([0, 1]), torch.tensor([[1, 2], [0, 2]]))
+    c = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    c.load_state_dict(a.state_dict())
+    assert torch.allclose(a.snapshot()["sigma"], c.snapshot()["sigma"])
+    with pytest.raises(AssertionError):
+        CumulativePolicyShiftRMS(n_tasks=2, device="cpu").load_state_dict(a.state_dict())
+
+
+# --------------------------------------------------------------------------- #
+# standardisation
+# --------------------------------------------------------------------------- #
+def _std(delta_on, delta_off, diag, valid=None, dst=0, planes=(1, 2)):
+    bs = delta_on.size(0)
+    d = torch.as_tensor(diag, dtype=torch.float32)
+    return standardize_policy_shifts(
+        shifts={"on": delta_on, "off": delta_off},
+        diag=d,
+        diag_valid=torch.ones_like(d, dtype=torch.bool) if valid is None else torch.as_tensor(valid),
+        task_ids=torch.full((bs,), dst),
+        off_plane_tasks=torch.tensor(planes).view(1, -1).expand(bs, -1).contiguous(),
+    )
+
+
+def test_scaling_a_teachers_whole_shift_leaves_the_standardized_one_alone():
+    """The KL coefficients differed 10x; that must not reach the weight."""
+    on = torch.tensor([[[1.0, -2.0, 0.5]]])
+    off = torch.tensor([[[[1.0, 0.5], [-2.0, 1.0], [0.5, -0.25]]]])
+    a = _std(on, off, diag=[1.0, 1.0, 1.0])
+    b = _std(on * 4, off * 4, diag=[4.0, 4.0, 4.0])
+    assert torch.allclose(a["on"], b["on"], atol=1e-6)
+    assert torch.allclose(a["off"], b["off"], atol=1e-6)
+
+
+def test_the_ratios_between_a_teachers_own_tokens_are_preserved():
+    on = torch.tensor([[[1.0, 3.0, -2.0]]])
+    off = torch.zeros(1, 1, 3, 2)
+    got = _std(on, off, diag=[2.0, 1.0, 1.0])["on"]
+    assert torch.allclose(got, on / 2.0, atol=1e-6)
+
+
+def test_a_quiet_out_of_domain_source_keeps_a_small_standardized_shift():
+    """The property the diagonal buys, stated as an assertion.
+
+    Halving a source's shift on THIS destination, with its own in-domain RMS
+    fixed, halves what the evidence sees. Under a destination-conditioned
+    divisor both would come out at one unit and the difference would vanish.
+    """
+    on = torch.ones(1, 1, 3)
+    loud = torch.full((1, 1, 3, 1), 1.0)
+    quiet = torch.full((1, 1, 3, 1), 0.5)
+    diag = [1.0, 1.0]
+    a = _std(on, loud, diag=diag, planes=(1,))["off"]
+    b = _std(on, quiet, diag=diag, planes=(1,))["off"]
+    assert torch.allclose(b, a * 0.5, atol=1e-6)
+
+
+def test_a_row_whose_scale_is_missing_is_marked_unavailable():
+    on = torch.ones(2, 1, 2)
+    off = torch.ones(2, 1, 2, 2)
+    got = _std(on, off, diag=[1.0, 1.0, 1.0], valid=[True, True, False])
+    assert got["row_available"].tolist() == [False, False], "source 2 has no scale"
+    got = _std(on, off, diag=[1.0, 1.0, 1.0], valid=[False, True, True])
+    assert got["row_available"].tolist() == [False, False], "the destination has no scale"
+    got = _std(on, off, diag=[1.0, 1.0, 1.0], valid=[True, True, True])
+    assert got["row_available"].tolist() == [True, True]
+
+
+def test_an_untagged_row_is_unavailable_and_indexes_nothing():
+    on, off = torch.ones(1, 1, 2), torch.ones(1, 1, 2, 1)
+    got = standardize_policy_shifts(
+        shifts={"on": on, "off": off},
+        diag=torch.tensor([1.0, 1.0]), diag_valid=torch.tensor([True, True]),
+        task_ids=torch.tensor([-1]), off_plane_tasks=torch.tensor([[1]]),
+    )
+    assert got["row_available"].tolist() == [False]
+    assert torch.isfinite(got["on"]).all()
+
+
+# --------------------------------------------------------------------------- #
+# common / common_ev / residual
+# --------------------------------------------------------------------------- #
+def _one(on_v, off_v):
+    """One candidate: on-task shift ``on_v`` and a list of off-task shifts."""
+    hat_on = torch.tensor([[[float(on_v)]]])
+    hat_off = torch.tensor([[[[float(x) for x in off_v]]]])
+    return decompose_common_residual(hat_on=hat_on, hat_off=hat_off)
+
+
+def test_common_is_the_minimum_every_teacher_including_the_on_task_one_guarantees():
+    got = _one(1.0, [3.0, 2.0])
+    assert float(got["common"]) == pytest.approx(1.0)
+    got = _one(-1.0, [-3.0, -2.0])
+    assert float(got["common"]) == pytest.approx(-1.0)
+
+
+def test_one_dissenting_teacher_zeroes_the_on_task_inclusive_common():
+    assert float(_one(1.0, [-3.0, 2.0])["common"]) == 0.0
+    assert float(_one(0.0, [3.0, 2.0])["common"]) == 0.0, "a silent on-task teacher breaks it"
+
+
+def test_common_never_exceeds_the_on_task_shift():
+    for on_v in (0.2, 1.0, 5.0):
+        got = _one(on_v, [9.0, 9.0])
+        assert abs(float(got["common"])) <= on_v + 1e-6
+
+
+def test_the_residual_completes_the_source_shift():
+    got = _one(1.0, [3.0, 2.0])
+    c = float(got["common"])
+    assert float(got["residual"][..., 0]) == pytest.approx(3.0 - c)
+    assert float(got["residual"][..., 1]) == pytest.approx(2.0 - c)
+
+
+def test_common_ev_is_the_off_task_teachers_own_unanimity():
+    """Off-task only, because the on-task teacher is silent at 64% of teacher
+    mass and an on-task-inclusive minimum would kill the channel there."""
+    assert float(_one(0.0, [3.0, 2.0])["common_ev"]) == pytest.approx(2.0)
+    assert float(_one(0.0, [3.0, 2.0])["common"]) == 0.0
+    assert float(_one(1.0, [3.0, -2.0])["common_ev"]) == 0.0, "the sources split"
+
+
+def test_common_ev_ignores_whether_the_on_task_teacher_agrees():
+    """Deliberate, and the reason kl_shift_by_state is a required metric.
+
+    A KL term has no direction to disagree with: "both other tasks moved
+    decisively here" is a statement about the position, not about who was right.
+    """
+    agree = float(_one(1.0, [3.0, 2.0])["common_ev"])
+    oppose = float(_one(-1.0, [3.0, 2.0])["common_ev"])
+    assert agree == pytest.approx(oppose) == pytest.approx(2.0)
+
+
+def test_a_single_source_cannot_corroborate_itself():
+    assert float(_one(1.0, [3.0])["common_ev"]) == 0.0
+
+
+def test_a_near_zero_shift_attenuates_itself_without_a_deadzone():
+    """No fixed gate: the minimum drags the corroboration down continuously, so
+    drift noise costs a small number instead of tripping a threshold."""
+    for eps in (1e-1, 1e-3, 1e-6):
+        # rel, not abs: the shifts are float32 and 0.1 is 0.10000000149 there.
+        assert float(_one(1.0, [3.0, eps])["common_ev"]) == pytest.approx(eps, rel=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# candidate evidence -- the monotonicity that the design turns on
+# --------------------------------------------------------------------------- #
+def _evidence(on_v, off_v, alpha):
+    d = _one(on_v, off_v)
+    a = torch.full((1, len(off_v)), float(alpha))
+    return float(candidate_kl_evidence(common_ev=d["common_ev"], hat_off=torch.tensor(
+        [[[[float(x) for x in off_v]]]]), source_alpha=a))
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.2, 0.5, 0.75, 1.0])
+def test_corroboration_never_scores_below_conflict_at_any_alpha(alpha):
+    """The defect this formula exists to avoid.
+
+    ``|c| + sum alpha|delta_hat - c|`` subtracts the shared part from every
+    source, crediting agreement once and debiting it n_off times, so past
+    ``alpha = 1/n_off`` a split scores HIGHER. Here the gap is ``|c_ev|``,
+    independent of alpha.
+    """
+    unanimous = _evidence(1.0, [3.0, 2.0], alpha)
+    split = _evidence(1.0, [3.0, -2.0], alpha)
+    assert unanimous - split == pytest.approx(2.0, abs=1e-5)
+
+
+def test_the_broken_alternative_would_have_failed_that():
+    """Pinned as a counter-example so the fix cannot be undone as a cleanup."""
+    def broken(on_v, off_v, alpha):
+        d = _one(on_v, off_v)
+        r = d["residual"].reshape(-1)
+        return abs(float(d["common"])) + alpha * float(r.abs().sum())
+
+    assert broken(1.0, [3.0, 2.0], 1.0) < broken(1.0, [3.0, -2.0], 1.0)
+
+
+def test_evidence_is_non_negative_and_zero_only_with_no_signal():
+    assert _evidence(0.0, [0.0, 0.0], 1.0) == pytest.approx(0.0)
+    for on_v, off_v, a in ((1.0, [3.0, -2.0], 0.3), (-1.0, [-1.0, -1.0], 1.0), (0.0, [2.0, 2.0], 0.0)):
+        assert _evidence(on_v, off_v, a) >= 0.0
+
+
+def test_alpha_zero_leaves_only_the_corroboration_bonus():
+    assert _evidence(1.0, [3.0, 2.0], 0.0) == pytest.approx(2.0)
+
+
+def test_alpha_one_admits_the_full_standardized_source_shift():
+    """The full shift, not the residual: alpha is estimated on the residual and
+    applied to the whole thing, and mixing those is the reversal above."""
+    assert _evidence(1.0, [3.0, 2.0], 1.0) == pytest.approx(2.0 + 3.0 + 2.0)
+
+
+def test_sources_are_summed_not_averaged():
+    one = _evidence(1.0, [3.0, 3.0], 1.0)
+    assert one == pytest.approx(3.0 + 3.0 + 3.0), "min is 3, both sources add 3"
+
+
+def test_alpha_is_per_source():
+    d = _one(1.0, [3.0, 2.0])
+    e = candidate_kl_evidence(
+        common_ev=d["common_ev"],
+        hat_off=torch.tensor([[[[3.0, 2.0]]]]),
+        source_alpha=torch.tensor([[1.0, 0.0]]),
+    )
+    assert float(e) == pytest.approx(2.0 + 3.0)
+
+
+def test_the_evidence_signature_cannot_be_handed_a_residual():
+    """Structural: alpha gates the full shift, and the residual belongs to the
+    reliability and attribution paths only."""
+    import inspect
+
+    params = set(inspect.signature(candidate_kl_evidence).parameters)
+    assert params == {"common_ev", "hat_off", "source_alpha"}
+
+
+# --------------------------------------------------------------------------- #
+# position weight
+# --------------------------------------------------------------------------- #
+def test_the_collapsed_form_matches_the_explicit_sum_over_the_support_and_tail():
+    on = _lp(2, 3, 5, seed=20)
+    e = torch.rand(2, 3, 5)
+    p = on.exp()
+    explicit = (p * (1.0 + e)).sum(-1) + (1.0 - p.sum(-1))
+    assert torch.allclose(position_pre_weight(evidence=e, on_task_logprob=on), explicit, atol=1e-6)
+
+
+def test_no_evidence_leaves_the_position_untouched():
+    on = _lp(2, 3, 4, seed=21)
+    got = position_pre_weight(evidence=torch.zeros(2, 3, 4), on_task_logprob=on)
+    assert torch.allclose(got, torch.ones(2, 3), atol=1e-6)
+
+
+def test_the_teachers_own_mass_decides_how_much_a_candidate_counts():
+    on = torch.log(torch.tensor([[[0.80, 0.01]]]))
+    heavy = position_pre_weight(evidence=torch.tensor([[[1.0, 0.0]]]), on_task_logprob=on)
+    light = position_pre_weight(evidence=torch.tensor([[[0.0, 1.0]]]), on_task_logprob=on)
+    assert float(heavy) == pytest.approx(1.80, abs=1e-5)
+    assert float(light) == pytest.approx(1.01, abs=1e-5)
+
+
+def test_the_tail_is_neutral_so_a_thin_support_is_modulated_thinly():
+    thin = torch.log(torch.tensor([[[0.05, 0.05]]]))   # 90% of the mass is tail
+    got = position_pre_weight(evidence=torch.full((1, 1, 2), 2.0), on_task_logprob=thin)
+    assert float(got) == pytest.approx(1.0 + 0.1 * 2.0, abs=1e-5)
+
+
+def test_the_weight_grows_linearly_in_the_evidence():
+    on = _lp(1, 1, 3, seed=22)
+    e = torch.rand(1, 1, 3)
+    a = position_pre_weight(evidence=e, on_task_logprob=on) - 1.0
+    b = position_pre_weight(evidence=e * 3.0, on_task_logprob=on) - 1.0
+    assert float(b) == pytest.approx(float(a) * 3.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# the normaliser -- and the invariant it exists for
+# --------------------------------------------------------------------------- #
+def _mean_stats(pre, kl, task_ids, mask=None, row_weights=None, n_tasks=3):
+    stats = PreviousStepTaskKLWeightedMean(n_tasks=n_tasks, device="cpu")
+    stats.update(
+        pre_weight=pre, teacher_kl=kl,
+        response_mask=torch.ones_like(pre) if mask is None else mask,
+        task_ids=task_ids, row_weights=row_weights,
+    )
+    return stats
+
+
+def test_the_snapshot_makes_kl_scale_exactly_one_and_not_the_mean_weight():
+    """THE invariant. ``mean(W)`` and ``sum(WD)/sum(D)`` are different numbers
+    whenever the weight and the KL are correlated -- which is exactly when the
+    arm is doing something -- and the one the coefficient's meaning depends on
+    is the second."""
+    torch.manual_seed(30)
+    n = 2000
+    pre = (1.0 + torch.rand(n)).view(1, n)
+    kl = (0.5 + pre * torch.rand(1, n))           # deliberately correlated
+    ids = torch.zeros(1, dtype=torch.long)
+    mu = float(_mean_stats(pre, kl, ids).snapshot()["mean"][0])
+    w = pre / mu
+    # In float64, as the accumulator holds it, the identity is exact.
+    kl64 = kl.to(torch.float64)
+    w64 = pre.to(torch.float64) / mu
+    assert float((w64 * kl64).sum() / kl64.sum()) == pytest.approx(1.0, abs=1e-12)
+    # The weight the loss actually applies is float32, so what a run sees is the
+    # identity to about 1e-7. Stated rather than hidden: kl_scale is read off a
+    # live batch and this is its floor.
+    assert float((w * kl).sum() / kl.sum()) == pytest.approx(1.0, abs=1e-6)
+    assert abs(float(w.mean()) - 1.0) > 1e-3, "the plain mean is NOT 1 here, and need not be"
+
+    plain = float(pre.mean())
+    w_plain = pre / plain
+    assert float(w_plain.mean()) == pytest.approx(1.0)
+    assert abs(float((w_plain * kl).sum() / kl.sum()) - 1.0) > 1e-3, (
+        "a plain-mean normaliser leaves the effective OPD strength off 1"
+    )
+
+
+def test_each_task_gets_its_own_normaliser():
+    pre = torch.tensor([[2.0, 2.0], [1.0, 1.0]])
+    kl = torch.ones(2, 2)
+    snap = _mean_stats(pre, kl, torch.tensor([0, 1])).snapshot()
+    assert float(snap["mean"][0]) == pytest.approx(2.0)
+    assert float(snap["mean"][1]) == pytest.approx(1.0)
+    assert not bool(snap["valid"][2])
+
+
+def test_the_normaliser_weights_positions_by_the_kl_they_carry():
+    """A position with no KL cannot vote on how the KL budget is split."""
+    pre = torch.tensor([[3.0, 1.0]])
+    kl = torch.tensor([[0.0, 1.0]])
+    snap = _mean_stats(pre, kl, torch.zeros(1, dtype=torch.long)).snapshot()
+    assert float(snap["mean"][0]) == pytest.approx(1.0)
+
+
+def test_the_row_weights_of_the_loss_aggregation_are_the_ones_used():
+    """The invariant has to hold for the quantity that enters the objective, not
+    for an unweighted stand-in of it."""
+    pre = torch.tensor([[2.0], [1.0]])
+    kl = torch.ones(2, 1)
+    ids = torch.zeros(2, dtype=torch.long)
+    flat = float(_mean_stats(pre, kl, ids).snapshot()["mean"][0])
+    tilted = float(_mean_stats(pre, kl, ids, row_weights=torch.tensor([3.0, 1.0])).snapshot()["mean"][0])
+    assert flat == pytest.approx(1.5)
+    assert tilted == pytest.approx((3 * 2 + 1 * 1) / 4)
+
+
+def test_masked_and_untagged_rows_are_excluded():
+    pre = torch.tensor([[5.0, 1.0], [9.0, 9.0]])
+    kl = torch.ones(2, 2)
+    snap = _mean_stats(pre, kl, torch.tensor([0, -1]), mask=torch.tensor([[0.0, 1.0], [1.0, 1.0]])).snapshot()
+    assert float(snap["mean"][0]) == pytest.approx(1.0)
+
+
+def test_the_normaliser_does_not_depend_on_the_micro_batch_split():
+    torch.manual_seed(31)
+    pre, kl = 1.0 + torch.rand(6, 4), torch.rand(6, 4) + 0.1
+    ids = torch.tensor([0, 1, 2, 0, 1, 2])
+    whole = _mean_stats(pre, kl, ids).snapshot()["mean"]
+    split = PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu")
+    for r in range(6):
+        split.update(
+            pre_weight=pre[r : r + 1], teacher_kl=kl[r : r + 1],
+            response_mask=torch.ones(1, 4), task_ids=ids[r : r + 1], row_weights=None,
+        )
+    assert torch.allclose(whole, split.snapshot()["mean"], atol=1e-12)
+
+
+def test_feeding_the_weighted_kl_back_in_would_drift_and_the_unweighted_one_does_not():
+    """The failure mode is silent: step 1 runs at W = 1 so it is right exactly
+    once, and the compounding starts at step 2 where no metric is looking."""
+    torch.manual_seed(32)
+    pre = (1.0 + torch.rand(1, 400))
+    kl = 0.5 + pre * torch.rand(1, 400)
+    ids = torch.zeros(1, dtype=torch.long)
+
+    mu1 = float(_mean_stats(pre, kl, ids).snapshot()["mean"][0])
+    # correct: the same unweighted KL again on an unchanged distribution
+    mu2 = float(_mean_stats(pre, kl, ids).snapshot()["mean"][0])
+    assert mu2 == pytest.approx(mu1, abs=1e-12)
+    # wrong: the KL after the weight multiplied it
+    mu2_bad = float(_mean_stats(pre, kl * (pre / mu1), ids).snapshot()["mean"][0])
+    assert abs(mu2_bad - mu1) > 1e-3
+
+
+def test_the_normaliser_state_survives_a_round_trip():
+    pre, kl = 1.0 + torch.rand(2, 3), torch.rand(2, 3) + 0.1
+    a = _mean_stats(pre, kl, torch.tensor([0, 1]))
+    b = PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu")
+    b.load_state_dict(a.state_dict())
+    assert torch.allclose(a.snapshot()["mean"], b.snapshot()["mean"])
+    a.reset()
+    assert not bool(a.snapshot()["valid"].any())
+
+
+# --------------------------------------------------------------------------- #
+# group centring
+# --------------------------------------------------------------------------- #
+def test_group_centring_removes_each_prompts_own_offset():
+    vals = torch.tensor([10.0, 12.0, 100.0, 102.0])
+    got = group_center(vals, torch.tensor([0, 0, 1, 1]), torch.ones(4))
+    assert got.tolist() == pytest.approx([-1.0, 1.0, -1.0, 1.0])
+
+
+def test_group_centring_ignores_invalid_rows_in_the_mean():
+    vals = torch.tensor([10.0, 12.0, 1000.0])
+    got = group_center(vals, torch.tensor([0, 0, 0]), torch.tensor([1.0, 1.0, 0.0]))
+    assert got[:2].tolist() == pytest.approx([-1.0, 1.0])
+
+
+def test_group_centring_works_per_column_for_multi_source_scores():
+    vals = torch.tensor([[1.0, 10.0], [3.0, 30.0]])
+    got = group_center(vals, torch.tensor([0, 0]), torch.ones(2))
+    assert torch.allclose(got, torch.tensor([[-1.0, -10.0], [1.0, 10.0]]))
+
+
+# --------------------------------------------------------------------------- #
+# advantage reliability
+# --------------------------------------------------------------------------- #
+def _adv(advantage, support, *, dst=0, planes=(1,), informative=None, length=None, on_score=None):
+    a = torch.as_tensor(advantage, dtype=torch.float32)
+    s = torch.as_tensor(support, dtype=torch.float32).reshape(a.numel(), -1)
+    n = a.numel()
+    stats = AdvantageReliabilityStats(n_tasks=3, device="cpu")
+    stats.update(
+        advantage=a,
+        support_score=s,
+        on_support_score=torch.zeros(n) if on_score is None else torch.as_tensor(on_score, dtype=torch.float32),
+        length=torch.ones(n) if length is None else torch.as_tensor(length, dtype=torch.float32),
+        informative=torch.ones(n, dtype=torch.bool) if informative is None else torch.as_tensor(informative),
+        task_ids=torch.full((n,), dst),
+        off_plane_tasks=torch.tensor(planes).view(1, -1).expand(n, -1).contiguous(),
+    )
+    return stats
+
+
+def test_a_source_that_ranks_the_rollouts_the_way_the_reward_does_gets_alpha_one():
+    a = [1.0, 2.0, 3.0, 4.0]
+    got = _adv(a, a).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho"] == pytest.approx(1.0, abs=1e-6)
+    assert got["alpha"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_an_anti_correlated_source_is_vetoed_and_not_inverted():
+    got = _adv([1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho"] == pytest.approx(-1.0, abs=1e-6)
+    assert got["alpha"] == 0.0, "vetoed; the shift is not re-used with the sign flipped"
+
+
+def test_an_uninformative_source_lands_near_zero():
+    torch.manual_seed(33)
+    a = torch.randn(400).tolist()
+    s = torch.randn(400).tolist()
+    got = _adv(a, s).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert abs(got["rho"]) < 0.2 and got["alpha"] < 0.2
+
+
+def test_the_correlation_matches_the_textbook_one():
+    torch.manual_seed(34)
+    a, s = torch.randn(200), None
+    s = 0.7 * a + 0.7 * torch.randn(200)
+    got = _adv(a.tolist(), s.tolist()).alpha(task_names=TASKS)[("alfworld", "search")]
+    expect = float(np.corrcoef(a.numpy(), s.numpy())[0, 1])
+    assert got["rho"] == pytest.approx(expect, abs=1e-5)
+
+
+def test_groups_with_no_reward_spread_and_padding_copies_do_not_enter():
+    """GRPO is group-relative, so a prompt whose rollouts all scored the same
+    gives every row an advantage of zero: folding it in adds variance to S
+    against none in A and drags every correlation toward zero."""
+    a = [1.0, 2.0, 3.0, 4.0]
+    ref = _adv(a, a).alpha(task_names=TASKS)[("alfworld", "search")]
+    padded = _adv(
+        a + [0.0, 0.0, 0.0], a + [50.0, -50.0, 7.0],
+        informative=[True] * 4 + [False] * 3,
+    ).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert padded["n"] == ref["n"] == 4
+    assert padded["rho"] == pytest.approx(ref["rho"], abs=1e-9)
+
+
+def test_each_ordered_pair_is_its_own_cell():
+    a = [1.0, 2.0, 3.0, 4.0]
+    stats = _adv(a, [[x, -x] for x in a], planes=(1, 2))
+    got = stats.alpha(task_names=TASKS)
+    assert got[("alfworld", "search")]["alpha"] == pytest.approx(1.0, abs=1e-6)
+    assert got[("alfworld", "webshop")]["alpha"] == 0.0
+    assert ("search", "alfworld") not in got, "no rows of task search were folded in"
+
+
+def test_the_table_is_zero_on_the_diagonal_and_where_undefined():
+    table = _adv([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]).alpha_table()
+    assert table.shape == (3, 3)
+    assert float(table[0, 0]) == 0.0
+    assert float(table[0, 1]) == pytest.approx(1.0, abs=1e-6)
+    assert float(table[1, 0]) == 0.0, "never observed"
+
+
+def test_reliability_does_not_depend_on_the_batch_split():
+    torch.manual_seed(35)
+    a, s = torch.randn(12), torch.randn(12)
+    whole = _adv(a.tolist(), s.tolist()).alpha_table()
+    split = AdvantageReliabilityStats(n_tasks=3, device="cpu")
+    for r in range(0, 12, 4):
+        split.update(
+            advantage=a[r : r + 4], support_score=s[r : r + 4].reshape(4, 1),
+            on_support_score=torch.zeros(4), length=torch.ones(4),
+            informative=torch.ones(4, dtype=torch.bool),
+            task_ids=torch.zeros(4, dtype=torch.long), off_plane_tasks=torch.full((4, 1), 1),
+        )
+    assert torch.allclose(whole, split.alpha_table(), atol=1e-6)
+
+
+def test_too_few_rows_leave_alpha_undefined_rather_than_confident():
+    got = _adv([1.0, 2.0], [1.0, 2.0]).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho"] is None and got["alpha"] == 0.0
+
+
+def test_the_lower_confidence_bound_is_reported_and_never_applied():
+    """A confidence level is a knob and this arm has none, so the bound is a
+    diagnostic. It is what says when a positive alpha is indistinguishable from
+    the rectifier's own small-sample bias."""
+    torch.manual_seed(36)
+    a = torch.randn(20)
+    s = 0.4 * a + torch.randn(20)
+    got = _adv(a.tolist(), s.tolist()).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho_lcb95"] is not None
+    assert got["rho_lcb95"] < got["rho"]
+    assert got["alpha"] == pytest.approx(max(0.0, got["rho"]))
+
+
+def test_the_length_and_on_task_controls_are_reported_and_never_applied():
+    torch.manual_seed(37)
+    n = 300
+    length = torch.rand(n) * 10 + 1
+    a = length + 0.2 * torch.randn(n)          # reward confounded with length
+    s = length + 0.2 * torch.randn(n)          # so is the support score
+    got = _adv(a.tolist(), s.tolist(), length=length).alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho"] > 0.9, "the raw correlation is almost all length"
+    assert abs(got["rho_length_controlled"]) < 0.3, "and almost none of it survives the control"
+    assert got["alpha"] == pytest.approx(max(0.0, got["rho"]))
+
+
+def test_the_reliability_state_survives_a_round_trip():
+    stats = _adv([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0])
+    other = AdvantageReliabilityStats(n_tasks=3, device="cpu")
+    other.load_state_dict(stats.state_dict())
+    assert torch.allclose(stats.alpha_table(), other.alpha_table())
+    bad = dict(stats.state_dict())
+    bad["moments"] = ("n", "a")
+    with pytest.raises(AssertionError, match="moment layout"):
+        AdvantageReliabilityStats(n_tasks=3, device="cpu").load_state_dict(bad)
+
+
+def test_the_moment_layout_is_complete_enough_for_the_partials():
+    assert ADV_MOMENTS[0] == "n"
+    for pair in ("as", "al", "ao", "sl", "so", "lo"):
+        assert pair in ADV_MOMENTS, pair
