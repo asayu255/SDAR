@@ -2047,7 +2047,7 @@ def test_the_analytic_opd_gradient_matches_autograd():
     got = logit_gradient_terms(
         student_logprob=lp[..., :k].detach(), teacher_logprob=teacher,
         weight=torch.full((1, 1), W), teacher_kl=kl.detach(),
-        advantage=torch.zeros(1), sampled_onehot=torch.zeros(1, 1, k), coef=coef,
+        pg_grad_coef=torch.zeros(1, 1), sampled_onehot=torch.zeros(1, 1, k), coef=coef,
     )
     # the tail bucket carries the rest of the vocabulary, so the norm covers it
     assert float(got["g_opd_sq"]) == pytest.approx(
@@ -2056,9 +2056,11 @@ def test_the_analytic_opd_gradient_matches_autograd():
 
 
 def test_the_analytic_policy_gradient_matches_autograd_at_ratio_one():
-    """Where these are collected -- the first PPO epoch -- the ratio is 1 and the
-    closed form is exact. A later epoch's clipping would make it an
-    approximation, which is why the collection is gated on epoch 0."""
+    """The logit-space half of the closed form: given the loss's derivative with
+    respect to log pi(y), the descent direction on logit v is that coefficient
+    times (1[v=y] - p). At ratio 1 and outside the clip the coefficient is -A,
+    which is the case checked here; policy_loss_gradient_coef supplies it
+    everywhere else, and its own autograd test covers the branches."""
     torch.manual_seed(81)
     k, V, A, slot = 4, 9, 2.5, 2
     logits = torch.randn(1, 1, V, requires_grad=True)
@@ -2072,17 +2074,24 @@ def test_the_analytic_policy_gradient_matches_autograd_at_ratio_one():
     assert torch.allclose(analytic, auto[:k], atol=1e-5)
 
 
-def test_the_advantage_broadcasts_over_positions_and_not_only_candidates():
-    """(bs, 1) happens to work at response length 1 and nowhere else."""
+def test_the_policy_coefficient_is_per_position_not_per_row():
+    """It used to be the row's advantage, broadcast. The clipped objective's
+    derivative is not constant along a row -- one token can be past the bound
+    and the next inside it -- so a per-row quantity cannot represent it, and a
+    position clipped off has to read as zero rather than as the row's A."""
     bs, resp, k = 3, 5, 4
     lp = torch.log_softmax(torch.randn(bs, resp, k + 3), -1)[..., :k]
+    coefs = torch.randn(bs, resp)
+    coefs[:, 2] = 0.0  # this column is clipped off in every row
     got = logit_gradient_terms(
         student_logprob=lp, teacher_logprob=lp,
         weight=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp),
-        advantage=torch.randn(bs), sampled_onehot=torch.zeros(bs, resp, k), coef=0.01,
+        pg_grad_coef=coefs, sampled_onehot=torch.zeros(bs, resp, k), coef=0.01,
     )
     for name in GRAD_TERMS:
         assert got[name].shape == (bs, resp), name
+    assert torch.allclose(got["g_grpo_sq"][:, 2], torch.zeros(bs)), "clipped off"
+    assert float(got["g_grpo_sq"][:, [0, 1, 3, 4]].sum()) > 0
 
 
 def test_the_interference_metrics_are_a_ratio_and_a_cosine():
@@ -2097,7 +2106,7 @@ def test_the_interference_metrics_are_a_ratio_and_a_cosine():
         logit_gradient_terms(
             student_logprob=lp, teacher_logprob=torch.log_softmax(torch.randn(bs, resp, k), -1),
             weight=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp) + 0.1,
-            advantage=torch.tensor([1.0, -1.0]),
+            pg_grad_coef=torch.tensor([[1.0, -1.0, 0.0], [-2.0, 0.5, 1.5]]),
             sampled_onehot=torch.nn.functional.one_hot(
                 torch.randint(0, k, (bs, resp)), k
             ).float(),
@@ -2610,3 +2619,572 @@ def test_the_role_tag_ids_reach_the_actor_on_any_arm():
         assert any(_is(s, "self.actor") and not _is(s, "sign_role_tag_ids") for s in body), (
             "the tag ids are gated on something the actor's construction is not"
         )
+
+
+# --------------------------------------------------------------------------- #
+# the policy gradient the metric compares against is the one the run takes
+# --------------------------------------------------------------------------- #
+def test_the_closed_form_pg_coefficient_is_the_loss_differentiated():
+    """It IS compute_policy_loss_per_token differentiated. Autograd is the only
+    honest check: a change to the objective that is not mirrored in the closed
+    form has to fail here rather than quietly report the old gradient."""
+    from verl.trainer.ppo.core_algos import (
+        compute_policy_loss_per_token,
+        policy_loss_gradient_coef,
+    )
+
+    torch.manual_seed(5)
+    bs, resp = 6, 9
+    old = torch.randn(bs, resp).double()
+    # Wide enough that every branch is exercised: inside the clip, above it,
+    # below it, and past the dual-clip bound on negative advantages.
+    lp = (old + torch.randn(bs, resp).double() * 0.9).requires_grad_(True)
+    adv = torch.randn(bs, resp).double() * 2.0
+    mask = torch.ones(bs, resp).double()
+    kw = dict(cliprange=0.2, cliprange_low=0.2, cliprange_high=0.28, clip_ratio_c=3.0)
+
+    losses, *_ = compute_policy_loss_per_token(
+        old_log_prob=old, log_prob=lp, advantages=adv, response_mask=mask, **kw
+    )
+    losses.sum().backward()
+    want = lp.grad
+    got = policy_loss_gradient_coef(
+        old_log_prob=old, log_prob=lp.detach(), advantages=adv, **kw
+    )
+    assert torch.allclose(got, want, atol=1e-10), (got - want).abs().max()
+
+    # And the branches really were hit, or the agreement above is vacuous.
+    r = (lp.detach() - old).exp()
+    assert bool(((r > 1.28) & (adv > 0)).any()), "clip above, positive advantage"
+    assert bool(((r < 0.8) & (adv < 0)).any()), "clip below, negative advantage"
+    assert float((got == 0).double().mean()) > 0.05, "some positions are clipped off"
+
+
+def test_the_pg_coefficient_is_not_the_advantage_once_the_ratio_moves():
+    """The first mini-batch of the first epoch runs at ratio 1; the other five
+    do not, because each takes an optimizer step. A metric using -A would be
+    reporting a gradient the run stopped taking after 60 of its 360 rows."""
+    from verl.trainer.ppo.core_algos import policy_loss_gradient_coef
+
+    old = torch.zeros(1, 4)
+    adv = torch.tensor([[1.0, 1.0, -1.0, -1.0]])
+    kw = dict(cliprange=0.2, clip_ratio_c=3.0)
+
+    at_one = policy_loss_gradient_coef(
+        old_log_prob=old, log_prob=old.clone(), advantages=adv, **kw
+    )
+    assert torch.allclose(at_one, -adv), "ratio 1, nothing clipped"
+
+    moved = policy_loss_gradient_coef(
+        old_log_prob=old, log_prob=torch.full((1, 4), 0.3), advantages=adv, **kw
+    )
+    r = math.exp(0.3)
+    assert r > 1.2, "the point is to be past the upper bound"
+    # Positive advantage above the upper bound: the clamped branch wins and the
+    # gradient is exactly zero. Negative advantage: pg1 stays larger, so the
+    # coefficient survives as -A*r -- which is what the dual clip bounds, not
+    # the ratio clip.
+    assert float(moved[0, 0]) == pytest.approx(0.0)
+    assert float(moved[0, 2]) == pytest.approx(r, rel=1e-6)
+    assert not torch.allclose(moved, -adv)
+
+
+def test_the_gradient_metric_reads_the_real_coefficient_and_both_coefficients():
+    """A ratio between what the two terms contribute to ONE objective. At 0.01
+    against 1.0 the coefficients are most of the answer, and the per-task row
+    weight decides how much each row contributes to the pooled norms."""
+    got, _ = _built()
+    bs, resp, k = got["hat_on"].shape
+    kl = torch.rand(bs, resp) + 0.1
+    onehot = torch.zeros(bs, resp, k)
+    onehot[..., 0] = 1.0
+    student = _lp(bs, resp, k, seed=7)
+
+    def terms(**over):
+        kw = dict(
+            student_logprob=student, teacher_logprob=got["hat_on"],
+            weight=got["weight"], teacher_kl=kl,
+            pg_grad_coef=torch.full((bs, resp), -1.0),
+            sampled_onehot=onehot, coef=0.01, pg_coef=1.0,
+        )
+        kw.update(over)
+        return logit_gradient_terms(**kw)
+
+    base = terms()
+    # A coefficient of zero -- every position clipped off -- leaves no policy
+    # gradient at all, which -A could never report.
+    dead = terms(pg_grad_coef=torch.zeros(bs, resp))
+    assert float(dead["g_grpo_sq"].sum()) == pytest.approx(0.0)
+    assert float(dead["g_dot"].sum()) == pytest.approx(0.0)
+    assert float(dead["g_opd_sq"].sum()) == pytest.approx(float(base["g_opd_sq"].sum()))
+
+    # pg_loss_coef scales the policy side quadratically and the cross term once.
+    half = terms(pg_coef=0.5)
+    assert float(half["g_grpo_sq"].sum()) == pytest.approx(
+        0.25 * float(base["g_grpo_sq"].sum()), rel=1e-5
+    )
+    assert float(half["g_dot"].sum()) == pytest.approx(
+        0.5 * float(base["g_dot"].sum()), rel=1e-5
+    )
+
+    # The row weight multiplies BOTH, so it cannot move a per-row cosine and
+    # must move the pooled one whenever the rows differ.
+    rw = torch.linspace(0.5, 2.0, bs)
+    w = terms(row_weight=rw)
+    cos = lambda t: float(t["g_dot"].sum()) / math.sqrt(
+        float(t["g_opd_sq"].sum()) * float(t["g_grpo_sq"].sum())
+    )
+    assert cos(w) != pytest.approx(cos(base), rel=1e-6)
+    flat = terms(row_weight=torch.full((bs,), 1.0))
+    assert cos(flat) == pytest.approx(cos(base), rel=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# who actually caused the nats a source is charged with
+# --------------------------------------------------------------------------- #
+def test_a_silent_source_is_charged_no_effect():
+    """alpha = 0 for one teacher and non-zero for the other: only the second
+    raised the weight, so only the second may appear in the table. Filing the
+    position's whole shift against every source that spoke reports the opposite
+    -- and it is the table 'what did Search bring to AlfWorld' is read from."""
+    from verl.trainer.ppo.sign_weights import SignPairTokens
+
+    torch.manual_seed(90)
+    bs, resp, k, n_off = 4, 3, 5, 2
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1)
+    shifts = compute_raw_policy_shifts(
+        on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+    )
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    # Column 0's source is trusted, column 1's is not.
+    alpha = torch.zeros(3, 3)
+    for row in range(bs):
+        alpha[int(task_ids[row]), int(planes[row, 0])] = 1.0
+    got = build_position_weight(
+        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=alpha,
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    kl = torch.rand(bs, resp) + 0.1
+    inv_mu = (1.0 / got["mu"].clamp(min=1e-12)).unsqueeze(-1)
+    source_shift = got["evidence_by_source"] * (inv_mu * kl.unsqueeze(-1)).unsqueeze(-1)
+    assert float(source_shift[..., 1].abs().sum()) == pytest.approx(0.0), "alpha = 0"
+    assert float(source_shift[..., 0].abs().sum()) > 0
+
+    tbl = SignPairTokens(n_tasks=3, vocab_size=64, device="cpu", top_n=4)
+    tbl.update(
+        support_ids=torch.randint(0, 64, (bs, resp, k)),
+        on_task_logprob=got["hat_on"], off_task_logprobs=got["hat_off"],
+        base_logprob=torch.zeros_like(got["hat_on"]),
+        response_mask=torch.ones(bs, resp), task_ids=task_ids,
+        off_plane_tasks=planes, deadzone=0.1,
+        effect=source_shift, mass=got["teacher_prob"],
+    )
+    _n, _mass, eff = tbl._cpu()
+    # Only the trusted source carries nats. Read back through the pair index the
+    # table itself builds, so this checks the routing and not just the input.
+    charged = {}
+    for row in range(bs):
+        d, s0, s1 = int(task_ids[row]), int(planes[row, 0]), int(planes[row, 1])
+        charged.setdefault((d, s0), 0.0)
+        charged.setdefault((d, s1), 0.0)
+    for (d, s) in charged:
+        pair = d * 2 + s - (1 if s > d else 0)
+        charged[(d, s)] = float(eff[pair].abs().sum())
+    trusted = [v for (d, s), v in charged.items() if float(alpha[d, s]) > 0]
+    silent = [v for (d, s), v in charged.items() if float(alpha[d, s]) == 0]
+    assert sum(trusted) > 0
+    assert sum(silent) == pytest.approx(0.0), "a source with alpha = 0 moved nothing"
+
+
+def test_the_pair_table_still_takes_one_effect_column_for_the_sign_arm():
+    """The sign arm's weight is a function of the sign PATTERN and cannot be
+    decomposed over the teachers that produced it, so filing the total against
+    each source is the right answer there. Both shapes have to keep working."""
+    from verl.trainer.ppo.sign_weights import SignPairTokens
+
+    bs, resp, k, n_off = 2, 2, 3, 2
+    kw = dict(
+        support_ids=torch.randint(0, 32, (bs, resp, k)),
+        on_task_logprob=_lp(bs, resp, k, seed=91),
+        off_task_logprobs=torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1),
+        base_logprob=_lp(bs, resp, k),
+        response_mask=torch.ones(bs, resp),
+        task_ids=torch.tensor([0, 1]),
+        off_plane_tasks=torch.tensor([[1, 2], [0, 2]]),
+        deadzone=0.05,
+    )
+    flat = SignPairTokens(n_tasks=3, vocab_size=32, device="cpu")
+    flat.update(effect=torch.full((bs, resp, k), 0.25), **kw)
+    per_src = SignPairTokens(n_tasks=3, vocab_size=32, device="cpu")
+    per_src.update(effect=torch.full((bs, resp, k, n_off), 0.25), **kw)
+    # Same value in every column -> the two agree, which is what makes the
+    # three-dimensional form a special case rather than a different table.
+    assert torch.allclose(flat._cpu()[2], per_src._cpu()[2])
+
+    with pytest.raises(AssertionError, match="columns for"):
+        SignPairTokens(n_tasks=3, vocab_size=32, device="cpu").update(
+            effect=torch.zeros(bs, resp, k, n_off + 1), **kw
+        )
+
+
+# --------------------------------------------------------------------------- #
+# what the event dump says the four models said
+# --------------------------------------------------------------------------- #
+def test_the_event_dump_columns_named_for_probabilities_hold_probabilities():
+    """SignEventSamples exponentiates what it is given. Handed the standardized
+    shifts it wrote exp(delta_hat) into p_on and exp(0) = 1 into p_base -- and
+    nothing downstream could tell, because both are finite and in range."""
+    from verl.trainer.ppo.sign_weights import EVENT_FLOATS, SignEventSamples
+
+    bs, resp, k, n_off = 2, 3, 4, 2
+    on = _lp(bs, resp, k, seed=95)
+    base = _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1)
+    shift_on = torch.randn(bs, resp, k)
+    ev = SignEventSamples(capacity=8, context=2, device="cpu")
+    ev.update(
+        support_ids=torch.randint(0, 50, (bs, resp, k)),
+        state=torch.zeros(bs, resp, k, dtype=torch.long),
+        weight=torch.ones(bs, resp, k), effect=torch.randn(bs, resp, k),
+        on_task_logprob=on, off_task_logprobs=off, base_logprob=base,
+        student_logprob=_lp(bs, resp, k), response_mask=torch.ones(bs, resp),
+        responses=torch.randint(0, 50, (bs, resp)),
+        norm=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp),
+        task_ids=torch.tensor([0, 1]),
+        shift_on=shift_on, shift_off=torch.randn(bs, resp, k, n_off),
+    )
+    rows = ev.rows()
+    assert rows
+    for r in rows:
+        for col in ("p_base", "p_on", "p_student", "p_off_lo", "p_off_hi"):
+            assert 0.0 < r[col] <= 1.0, (col, r[col])
+        # p_base = 1 exactly is the signature of the bug: exp of a zero base.
+        assert r["p_base"] != pytest.approx(1.0)
+    # The shifts are their own columns and are NOT constrained to (0, 1].
+    assert {"shift_on", "shift_off_lo", "shift_off_hi"} <= set(EVENT_FLOATS)
+    assert any(r["shift_on"] < 0 for r in rows), "a shift can be negative"
+    assert all(r["shift_off_lo"] <= r["shift_off_hi"] for r in rows)
+
+
+def test_an_arm_without_standardized_shifts_reports_nan_rather_than_zero():
+    """Zero is a value a shift can legitimately take, so an arm that never
+    measured one has to say so."""
+    from verl.trainer.ppo.sign_weights import SignEventSamples
+
+    bs, resp, k = 1, 2, 3
+    ev = SignEventSamples(capacity=4, context=1, device="cpu")
+    ev.update(
+        support_ids=torch.randint(0, 20, (bs, resp, k)),
+        state=torch.zeros(bs, resp, k, dtype=torch.long),
+        weight=torch.ones(bs, resp, k), effect=torch.ones(bs, resp, k),
+        on_task_logprob=_lp(bs, resp, k, seed=96),
+        off_task_logprobs=torch.stack([_lp(bs, resp, k)], dim=-1),
+        base_logprob=_lp(bs, resp, k), student_logprob=_lp(bs, resp, k),
+        response_mask=torch.ones(bs, resp), responses=torch.randint(0, 20, (bs, resp)),
+        norm=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp),
+    )
+    for r in ev.rows():
+        for col in ("shift_on", "shift_off_lo", "shift_off_hi", "reward"):
+            assert r[col] != r[col], f"{col} should be nan, got {r[col]}"
+
+
+def test_the_cross_teacher_dump_selects_the_row_score_it_reports():
+    """The reward column exists on both arms, and only the sign arm was adding
+    the batch key it comes from -- so on this arm every row read nan."""
+    src = _update_policy_source()
+    xt = src[src.index('select_keys += ["sign_cache_ids", "sign_off_tasks"]'):]
+    xt = xt[: xt.index("if sign_enabled:")]
+    assert '"token_level_scores" in data.batch.keys()' in xt
+    assert 'select_keys.append("token_level_scores")' in xt
+
+
+def test_the_event_dump_is_handed_the_real_planes_and_the_shifts_separately():
+    import inspect
+
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    src = inspect.getsource(DataParallelPPOActor._xt_token_tables)
+    call = src[src.index("event_stats.update("):]
+    assert "on_task_logprob=on_task_logprob" in call
+    assert "off_task_logprobs=off_planes" in call
+    assert "base_logprob=base_plane" in call
+    assert 'shift_on=built["hat_on"]' in call
+    assert 'shift_off=built["hat_off"]' in call
+    # And the aggregate tables keep the standardized form, whose deadzone is in
+    # RMS units and comparable across teachers.
+    agg = src[: src.index("event_stats.update(")]
+    assert 'on_task_logprob=built["hat_on"]' in agg
+    assert "base_logprob=zero_base" in agg
+
+
+# --------------------------------------------------------------------------- #
+# the KL the weight multiplies
+# --------------------------------------------------------------------------- #
+def test_a_nonfinite_teacher_kl_is_neutralised_and_counted_not_multiplied_by_one():
+    """W = 1 is not a guard: 1 * NaN is NaN, and 0 * NaN at a masked position is
+    NaN too, so agg_loss carries it into backward and the optimizer steps before
+    the step-end check ever runs."""
+    src = _update_policy_source()
+    block = src[src.index("if xt_nonfinite is not None:"):]
+    block = block[: block.index("# Read BEFORE the position weight")]
+    assert "torch.isfinite(teacher_kld)" in block
+    assert "xt_nonfinite[3]" in block
+    assert "torch.where(" in block and "torch.zeros_like(teacher_kld)" in block
+    # Counted inside the mask only: a padded position is not a teacher failure.
+    assert "response_mask.to(torch.bool)" in block
+    # Before the weight multiplies it, and before the cold-start branch, so the
+    # first step is covered too -- there xt_built is None and the KL still
+    # reaches the loss.
+    assert src.index("if xt_nonfinite is not None:") < src.index(
+        'teacher_kld = teacher_kld * xt_built["weight"]'
+    )
+    assert "teacher_kl" in src[src.index("assert_all_finite({"):][:400]
+
+
+def test_the_nonfinite_tally_has_a_slot_for_every_channel_it_reports():
+    src = _update_policy_source()
+    alloc = src[src.index("xt_nonfinite = torch.zeros("):]
+    alloc = alloc[: alloc.index("\n")]
+    reported = src[src.index("assert_all_finite({"):]
+    reported = reported[: reported.index("})")]
+    assert alloc.count("torch.zeros(4") == 1, alloc
+    assert reported.count("xt_nonfinite[") == 4, reported
+
+
+# --------------------------------------------------------------------------- #
+# is the cumulative estimate still describing the run
+# --------------------------------------------------------------------------- #
+def test_the_rms_current_scope_is_this_steps_rows_and_the_cumulative_is_not():
+    """The weight divides by the cumulative sigma. Over 150 steps the student
+    moves, so the teachers' shifts on its states are not stationary and a
+    divisor that averages step 1 into step 150 is a scale nobody chose. Only a
+    step-local reading can say so."""
+    acc = CumulativePolicyShiftRMS(n_tasks=3, device="cpu")
+    ids = torch.tensor([0, 0])
+    planes = torch.tensor([[1, 2], [1, 2]])
+    mask = torch.ones(2, 4)
+
+    def feed(scale):
+        # The student's whole mass on the support, so the tail contributes
+        # nothing and sigma is exactly |scale|.
+        acc.update(
+            shifts={
+                "on": torch.full((2, 4, 3), scale),
+                "off": torch.full((2, 4, 3, 2), scale),
+                "tail_on": torch.zeros(2, 4),
+                "tail_off": torch.zeros(2, 4, 2),
+            },
+            student_logprob=torch.full((2, 4, 3), math.log(1 / 3)),
+            response_mask=mask, task_ids=ids, off_plane_tasks=planes,
+        )
+        acc.all_reduce()
+
+    feed(1.0)
+    first = acc.snapshot()
+    assert acc.snapshot(scope="current")["sigma"][0, 0] == pytest.approx(
+        float(first["sigma"][0, 0]), rel=1e-9
+    ), "one step in, the two coincide"
+
+    feed(3.0)
+    cum, now = acc.snapshot(), acc.snapshot(scope="current")
+    assert float(now["sigma"][0, 0]) == pytest.approx(3.0, rel=1e-6), "this step alone"
+    assert float(cum["sigma"][0, 0]) == pytest.approx(math.sqrt(5.0), rel=1e-6), "both steps"
+    assert float(now["sigma"][0, 0]) > float(cum["sigma"][0, 0]), "the drift is visible"
+    # And the cumulative path is untouched: the diagonal the weight divides by
+    # still comes from the cumulative snapshot.
+    diag, _valid = acc.diagonal()
+    assert float(diag[0]) == pytest.approx(float(cum["sigma"][0, 0]), rel=1e-9)
+
+
+def test_the_current_scope_is_empty_before_the_first_reduce():
+    """Not zero, not the pending delta: no step has been folded, so there is
+    nothing to report and every cell is invalid."""
+    acc = CumulativePolicyShiftRMS(n_tasks=2, device="cpu")
+    now = acc.snapshot(scope="current")
+    assert not bool(now["valid"].any())
+    assert float(now["n"].sum()) == 0.0
+
+
+def test_the_reliability_current_scope_sees_only_this_steps_rollouts():
+    """rho_cumulative is what alpha is built from. rho_current is the only thing
+    that can say it has gone stale -- and a pair whose two disagree in sign is
+    one where the applied alpha and this step's own evidence point opposite
+    ways."""
+    acc = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    n = 40
+    planes = torch.zeros(n, 2, dtype=torch.long)
+    planes[:, 0] = 1
+    planes[:, 1] = 2
+
+    def feed(sign):
+        s = torch.linspace(-1.0, 1.0, n)
+        acc.update(
+            advantage=sign * s,
+            support_score=torch.stack([s, torch.randn(n) * 0.01], dim=-1),
+            on_support_score=torch.zeros(n), length=torch.full((n,), 100.0),
+            informative=torch.ones(n, dtype=torch.bool),
+            task_ids=torch.zeros(n, dtype=torch.long),
+            off_plane_tasks=planes, group_ids=torch.arange(n) % 8,
+        )
+        acc.all_reduce()
+
+    feed(+1.0)
+    up = acc.alpha(task_names=TASKS)[("alfworld", "search")]
+    assert up["rho"] > 0.9
+    now = acc.alpha(task_names=TASKS, scope="current")[("alfworld", "search")]
+    assert now["rho"] == pytest.approx(up["rho"], rel=1e-6), "one step in, the same rows"
+
+    # Two more steps the same way, then one that reverses: the cumulative
+    # estimate still leans positive while this step alone says the opposite,
+    # which is the situation the sign-disagreement flag exists to name. (An
+    # exactly cancelling pair would put the cumulative rho at 0, where there is
+    # no sign to disagree with.)
+    feed(+1.0)
+    feed(-1.0)
+    cum = acc.alpha(task_names=TASKS)[("alfworld", "search")]
+    step = acc.alpha(task_names=TASKS, scope="current")[("alfworld", "search")]
+    assert step["rho"] < -0.9, "this step alone reversed"
+    assert step["n"] == pytest.approx(float(n)), "and it is this step's rows only"
+    assert cum["n"] == pytest.approx(3.0 * n)
+    assert abs(cum["rho"]) < abs(step["rho"]), "the cumulative one is diluted"
+    # The disagreement this reports is exactly a sign flip between the two.
+    assert step["rho"] * cum["rho"] < 0
+
+
+def test_the_informative_fraction_separates_no_signal_from_no_spread():
+    """Every rollout of a prompt scoring the same gives every row zero advantage.
+    Without this column, 'the source does not predict reward' and 'there was
+    nothing to predict' are the same alpha."""
+    acc = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
+    n = 20
+    planes = torch.zeros(n, 2, dtype=torch.long)
+    planes[:, 0], planes[:, 1] = 1, 2
+    informative = torch.zeros(n, dtype=torch.bool)
+    informative[: n // 4] = True
+    acc.update(
+        advantage=torch.randn(n), support_score=torch.randn(n, 2),
+        on_support_score=torch.zeros(n), length=torch.full((n,), 50.0),
+        informative=informative, task_ids=torch.zeros(n, dtype=torch.long),
+        off_plane_tasks=planes, group_ids=torch.arange(n) % 8,
+    )
+    acc.all_reduce()
+    row = acc.alpha(task_names=TASKS)[("alfworld", "search")]
+    assert row["informative_group_frac"] == pytest.approx(0.25)
+    assert row["n"] == pytest.approx(float(n // 4)), "only the informative rows"
+
+
+def test_a_pair_with_no_informative_row_still_reports_that_it_was_offered():
+    """Otherwise the pair goes missing from the log entirely, which reads as
+    'not measured' when what happened is 'measured, and there was nothing in
+    it'."""
+    acc = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    n = 8
+    planes = torch.zeros(n, 2, dtype=torch.long)
+    planes[:, 0], planes[:, 1] = 1, 2
+    acc.update(
+        advantage=torch.zeros(n), support_score=torch.randn(n, 2),
+        on_support_score=torch.zeros(n), length=torch.full((n,), 10.0),
+        informative=torch.zeros(n, dtype=torch.bool),
+        task_ids=torch.zeros(n, dtype=torch.long),
+        off_plane_tasks=planes, group_ids=torch.arange(n) % 4,
+    )
+    acc.all_reduce()
+    row = acc.alpha(task_names=TASKS)[("alfworld", "search")]
+    assert row["n"] == 0.0
+    assert row["alpha"] == 0.0
+    assert row["rho"] is None
+    assert row["informative_group_frac"] == pytest.approx(0.0)
+
+
+def test_weight_kl_lift_says_whether_the_weight_landed_where_the_kl_was():
+    """At exactly 1 the weight and the KL are uncorrelated, which is the arm
+    being a scalar on the whole term -- teacher_kl_loss_coef with extra steps.
+    That is the null this whole mechanism is tested against."""
+    def render(w, kl):
+        stats = ScopeTermStats(names=POSITION_TERMS, n_tasks=0, device="cpu")
+        built = {
+            "weight": w, "pre_weight": w, "available": torch.ones(w.size(0), dtype=torch.bool),
+            "evidence_shared": torch.zeros_like(w),
+            "evidence_shared_offtask_only": torch.zeros_like(w),
+        }
+        stats.update(position_terms(built, kl), response_mask=torch.ones_like(kl), task_ids=None)
+        return position_weight_metrics(stats.sums())
+
+    w = torch.tensor([[1.0, 2.0, 1.0, 2.0]])
+    aligned = render(w, torch.tensor([[0.1, 1.0, 0.1, 1.0]]))
+    against = render(w, torch.tensor([[1.0, 0.1, 1.0, 0.1]]))
+    flat = render(w, torch.tensor([[0.5, 0.5, 0.5, 0.5]]))
+
+    assert aligned["kl_weight/effect/weight_kl_lift"] > 1.0
+    assert against["kl_weight/effect/weight_kl_lift"] < 1.0
+    assert flat["kl_weight/effect/weight_kl_lift"] == pytest.approx(1.0)
+    assert aligned["kl_weight/effect/weight_kl_corr"] == pytest.approx(1.0, abs=1e-6)
+    assert against["kl_weight/effect/weight_kl_corr"] == pytest.approx(-1.0, abs=1e-6)
+    # No spread in the KL -> no correlation to report, rather than a zero that
+    # reads as "measured and found nothing".
+    assert "kl_weight/effect/weight_kl_corr" not in flat
+
+
+def test_the_offered_count_survives_a_resume_and_an_old_sidecar_reads_as_absent():
+    """The numerator of informative_group_frac was already in the sidecar. A
+    denominator that restarts at zero would make the fraction read above 1, or
+    undefined, for as long as the run took to re-accumulate it."""
+    planes = torch.zeros(6, 2, dtype=torch.long)
+    planes[:, 0], planes[:, 1] = 1, 2
+    inf = torch.tensor([True, True, False, False, False, False])
+
+    def fed():
+        acc = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+        acc.update(
+            advantage=torch.randn(6), support_score=torch.randn(6, 2),
+            on_support_score=torch.zeros(6), length=torch.full((6,), 10.0),
+            informative=inf, task_ids=torch.zeros(6, dtype=torch.long),
+            off_plane_tasks=planes, group_ids=torch.arange(6) % 4,
+        )
+        acc.all_reduce()
+        return acc
+
+    saved = fed().state_dict()
+    assert "offered" in saved
+    restored = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    restored.load_state_dict(saved)
+    assert restored.alpha(task_names=TASKS)[("alfworld", "search")][
+        "informative_group_frac"
+    ] == pytest.approx(2.0 / 6.0)
+
+    # A sidecar written before the key existed: absent, not a ratio over a
+    # denominator that restarted.
+    old = dict(saved)
+    old.pop("offered")
+    old.pop("doffered")
+    stale = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    stale.load_state_dict(old)
+    row = stale.alpha(task_names=TASKS)[("alfworld", "search")]
+    assert row["informative_group_frac"] is None
+    assert row["n"] == pytest.approx(2.0), "the moments still came back"
+
+
+def test_the_pair_token_table_is_wired_to_the_per_source_shift():
+    """The routing is right and the input has to be too. Handed the position's
+    TOTAL shift the table is correct arithmetic on the wrong quantity, and every
+    source reads back carrying every other source's nats plus the corroboration
+    term none of them caused."""
+    import inspect
+
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    src = inspect.getsource(DataParallelPPOActor._xt_token_tables)
+    assert 'source_shift = built["evidence_by_source"]' in src
+    call = src[src.index("pair_token_stats.update("):]
+    call = call[: call.index("\n            )")]
+    assert "effect=source_shift" in call, call
+    assert "effect=shift" not in call, "the pooled total is the bug"
+    # And the per-state / per-token tables keep the total, which is what they
+    # decompose -- the two must not be swapped.
+    tok = src[src.index("token_stats.update("):]
+    tok = tok[: tok.index("\n            )")]
+    assert "effect=shift," in tok

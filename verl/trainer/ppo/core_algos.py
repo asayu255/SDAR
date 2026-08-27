@@ -540,6 +540,68 @@ def compute_policy_loss_per_token(
     return pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def policy_loss_gradient_coef(
+    old_log_prob,
+    log_prob,
+    advantages,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+):
+    """``d(pg_losses)/d(log_prob)`` per token, in closed form.
+
+    For a diagnostic that wants the policy gradient's DIRECTION without paying a
+    second backward. Kept beside :func:`compute_policy_loss_per_token` because it
+    is that function differentiated: every branch below is one of its lines, and
+    a test differentiates the loss with autograd and compares, so a change to the
+    objective that is not mirrored here fails rather than silently reporting the
+    old gradient.
+
+    Why a caller cannot just use ``-A``. That is the coefficient at ratio 1 and
+    outside the clip, which holds only for the FIRST mini-batch of the first PPO
+    epoch: every ``ppo_mini_batch_size`` rows take an optimizer step, so with 360
+    rows at a mini-batch of 60 the ratio has already moved for five of the six.
+    Past that the un-clipped coefficient is ``-A*r``, and inside a bound clip
+    branch it is exactly zero -- a position the objective is no longer pushing at
+    all, which a metric reporting ``-A`` would still count at full magnitude.
+
+    The three branches, in the loss's own order:
+
+    * ``max(pg1, pg2)`` selects the clamped branch only when it is strictly
+      larger, and it can only be larger when the clamp bound -- so selecting it
+      IS the gradient being zero. Note this does not fire for a negative
+      advantage above the range: there ``pg1 > pg2`` and the coefficient stays
+      ``-A*r``, which is what the dual clip below exists to bound.
+    * ``min(pg3, clip1)`` with ``pg3 = -A * clip_ratio_c`` is constant in
+      ``log_prob``, so selecting it is also a zero.
+    * ``where(A < 0, ...)`` decides which of the two applies.
+
+    Returns:
+        (bs, response_length), the same shape as ``pg_losses``. Not masked --
+        the caller's own response mask is what decides which positions count.
+    """
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    # Strictly greater: on a tie the clamp did not bind and both branches carry
+    # the same derivative, so which one autograd picks cannot change the answer.
+    took_clamped = pg_losses2 > pg_losses1
+
+    pg_losses3 = -advantages * clip_ratio_c
+    took_dual = (advantages < 0) & (pg_losses3 < clip_pg_losses1)
+
+    live = (~took_clamped) & (~took_dual)
+    return -advantages * ratio * live.to(ratio.dtype)
+
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,

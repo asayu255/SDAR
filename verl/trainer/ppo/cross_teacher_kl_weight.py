@@ -277,6 +277,8 @@ class CumulativePolicyShiftRMS:
         # This step's rank-local contribution. See ACCUMULATION.
         self.dq = torch.zeros(T * T, dtype=torch.float64, device=device)
         self.dn = torch.zeros(T, dtype=torch.float64, device=device)
+        # Set by all_reduce: the delta it just folded. None before the first.
+        self._step = None
         self._cpu_cache = None
 
     def update(
@@ -339,42 +341,66 @@ class CumulativePolicyShiftRMS:
         micro-batches held nothing still runs the same collective its neighbours
         do. Reducing ``total`` here instead is the bug ACCUMULATION describes.
         """
-        self._cpu_cache = None
+        self._cpu_cache = {}
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             for t in (self.dq, self.dn):
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        # This step's reduced delta, kept before it is cleared. The cumulative
+        # sigma is what the weight divides by and what has the sample size; the
+        # step's own is the only thing that can say the cumulative one has gone
+        # stale. Over 150 steps the student moves, so a teacher's shift on its
+        # own task is not a stationary quantity, and a divisor that averages the
+        # first fifty steps into the last is a scale nobody chose.
+        self._step = (self.dq.detach().clone(), self.dn.detach().clone())
         self.q += self.dq
         self.n += self.dn
         self.dq.zero_()
         self.dn.zero_()
 
-    def _cpu(self):
-        if self._cpu_cache is None:
+    SCOPES = ("cumulative", "current")
+
+    def _cpu(self, scope: str = "cumulative"):
+        assert scope in self.SCOPES, scope
+        if not isinstance(self._cpu_cache, dict):
+            self._cpu_cache = {}
+        if scope not in self._cpu_cache:
             T = self.n_tasks
-            # The pending delta travels with them so the check below costs no
-            # extra transfer. Rendering a total that has not absorbed this step
-            # yet is a silently stale number, and the whole reason the delta
-            # exists is that silently wrong statistics are the failure mode here.
-            self._cpu_cache = (
-                self.q.detach().to("cpu").view(T, T),
-                self.n.detach().to("cpu"),
-                float(self.dn.detach().to("cpu").abs().sum()),
-            )
-        q, n, pending = self._cpu_cache
+            if scope == "current":
+                q, n = self._step if self._step is not None else (
+                    torch.zeros(T * T, dtype=torch.float64), torch.zeros(T, dtype=torch.float64)
+                )
+                self._cpu_cache[scope] = (
+                    q.detach().to("cpu").view(T, T), n.detach().to("cpu"), 0.0
+                )
+            else:
+                # The pending delta travels with them so the check below costs no
+                # extra transfer. Rendering a total that has not absorbed this step
+                # yet is a silently stale number, and the whole reason the delta
+                # exists is that silently wrong statistics are the failure mode here.
+                self._cpu_cache[scope] = (
+                    self.q.detach().to("cpu").view(T, T),
+                    self.n.detach().to("cpu"),
+                    float(self.dn.detach().to("cpu").abs().sum()),
+                )
+        q, n, pending = self._cpu_cache[scope]
         assert pending == 0.0, (
             "CumulativePolicyShiftRMS was rendered with an unreduced step delta; "
             "call all_reduce() at the step boundary before reading the scale"
         )
         return q, n
 
-    def snapshot(self) -> dict:
+    def snapshot(self, scope: str = "cumulative") -> dict:
         """``{"sigma": (T, T), "valid": (T, T), "n": (T,)}`` on the host.
 
         A cell is valid only with positive count, positive sigma and a finite
         value. An invalid cell is never patched with an epsilon: a denominator
         invented to avoid a division is a transfer strength nobody chose.
+
+        ``scope="current"`` renders the same quantities from THIS step's rows
+        alone. Diagnostic only -- :meth:`diagonal`, which is what the weight
+        divides by, takes the cumulative snapshot and nothing else.
         """
-        q, n = self._cpu()
+        q, n = self._cpu(scope)
         denom = n.clamp(min=1.0).unsqueeze(-1)
         sigma = (q / denom).sqrt()
         valid = (n > 0).unsqueeze(-1) & (sigma > 0) & torch.isfinite(sigma)
@@ -866,6 +892,13 @@ class AdvantageReliabilityStats:
         # exactly one step, so sum_g (sum_g S)^2 / n_g decomposes over steps and
         # this column is exact.
         self.between = torch.zeros(T * T, dtype=torch.float64, device=device)
+        # Rows offered to the pair, informative or not. Cumulative, with its own
+        # step delta, on the same rule as everything else here.
+        self.offered = torch.zeros(T * T, dtype=torch.float64, device=device)
+        self.doffered = torch.zeros_like(self.offered)
+        # Set by all_reduce: (moments, between, grouped, offered) for the step it
+        # just folded. None before the first one.
+        self._step = None
         # How many rows ever carried a usable group id, per pair. It is what
         # distinguishes "the groups explain none of the spread" from "no group
         # was ever named", and those two must not both read as zero.
@@ -928,6 +961,14 @@ class AdvantageReliabilityStats:
             s = support_score[:, c].reshape(-1).to(torch.float64)
             src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
             ok = (keep_row & (src >= 0)).to(torch.float64)
+            # Every row the pair was OFFERED, before the informative filter. Its
+            # own accumulator rather than a moment, because it must not be
+            # divided by ``n`` the way the moments are -- ``n`` is what it is the
+            # denominator of. A step where GRPO found no spread in any group
+            # contributes rows here and none there, which is the one case a
+            # correlation cannot report on itself: it simply goes missing.
+            offered = ((dst >= 0) & (src >= 0)).to(torch.float64)
+            self.doffered.index_add_(0, dst.clamp(min=0) * T + src.clamp(min=0), offered)
             v = {"a": a, "s": s, "l": l, "o": o}
             cols = [ok]
             cols += [v[x] * ok for x in ADV_VARS]
@@ -956,41 +997,83 @@ class AdvantageReliabilityStats:
         that survives the step boundary: the ids naming the cells are re-issued
         next step and mean something else.
         """
-        self._cpu_cache = None
+        self._cpu_cache = {}
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            for t in (self.dbuf, self.group):
+            for t in (self.dbuf, self.group, self.doffered):
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-        self.buf += self.dbuf
-        self.dbuf.zero_()
 
         T, G = self.n_tasks, self.max_groups
         grp = self.group.view(T * T, G, 2)
         totals, counts = grp[..., 0], grp[..., 1]
-        self.between += torch.where(
+        step_between = torch.where(
             counts > 0, totals.square() / counts.clamp(min=1.0), torch.zeros_like(totals)
         ).sum(dim=-1)
-        self.grouped += counts.sum(dim=-1)
+        step_grouped = counts.sum(dim=-1)
+        # This step alone, kept before the delta is cleared. rho estimated on
+        # the cumulative moments is the one the loss uses and the one with the
+        # sample size; rho on this step alone is the only thing that can say the
+        # cumulative one has gone stale, which over 150 steps of a moving
+        # student is the question. Each prompt group belongs to exactly one
+        # step, so the between-group correction decomposes over steps and this
+        # is an exact statistic rather than an approximation of one.
+        self._step = (
+            self.dbuf.detach().clone(), step_between.detach().clone(),
+            step_grouped.detach().clone(), self.doffered.detach().clone(),
+        )
+
+        self.buf += self.dbuf
+        self.dbuf.zero_()
+        self.between += step_between
+        self.grouped += step_grouped
+        self.offered += self.doffered
+        self.doffered.zero_()
         self.group.zero_()
 
-    def _cpu(self):
-        if self._cpu_cache is None:
+    SCOPES = ("cumulative", "current")
+
+    def _cpu(self, scope: str = "cumulative"):
+        assert scope in self.SCOPES, scope
+        if not isinstance(self._cpu_cache, dict):
+            self._cpu_cache = {}
+        if scope not in self._cpu_cache:
             T, M = self.n_tasks, self.n_moments
-            self._cpu_cache = (
-                self.buf.detach().to("cpu").view(T, T, M),
-                self.between.detach().to("cpu").view(T, T),
-                self.grouped.detach().to("cpu").view(T, T),
-                float(self.dbuf.detach().to("cpu").abs().sum()),
-            )
-        buf, between, grouped, pending = self._cpu_cache
+            if scope == "current":
+                # The step's own contribution, stashed by all_reduce before it
+                # cleared the delta. Empty before the first reduce, which renders
+                # as no rows and therefore no rho -- the honest answer.
+                if self._step is None:
+                    zeros = torch.zeros(T * T * M, dtype=torch.float64)
+                    step = (zeros, torch.zeros(T * T, dtype=torch.float64),
+                            torch.zeros(T * T, dtype=torch.float64),
+                            torch.zeros(T * T, dtype=torch.float64))
+                else:
+                    step = self._step
+                self._cpu_cache[scope] = (
+                    step[0].detach().to("cpu").view(T, T, M),
+                    step[1].detach().to("cpu").view(T, T),
+                    step[2].detach().to("cpu").view(T, T),
+                    step[3].detach().to("cpu").view(T, T),
+                    0.0,
+                )
+            else:
+                self._cpu_cache[scope] = (
+                    self.buf.detach().to("cpu").view(T, T, M),
+                    self.between.detach().to("cpu").view(T, T),
+                    self.grouped.detach().to("cpu").view(T, T),
+                    self.offered.detach().to("cpu").view(T, T),
+                    float(self.dbuf.detach().to("cpu").abs().sum()),
+                )
+        buf, between, grouped, offered, pending = self._cpu_cache[scope]
         assert pending == 0.0, (
             "AdvantageReliabilityStats was rendered with an unreduced step delta; "
             "call all_reduce() at the step boundary before reading alpha"
         )
-        return buf, between, grouped
+        return buf, between, grouped, offered
 
-    def _cell(self, dst: int, src: int) -> dict:
-        buf, between, grouped = self._cpu()
+    def _cell(self, dst: int, src: int, scope: str = "cumulative") -> dict:
+        buf, between, grouped, offered = self._cpu(scope)
         cell = {name: float(buf[dst, src, i]) for i, name in enumerate(ADV_MOMENTS)}
+        cell["_offered"] = float(offered[dst, src])
         # The between-group part of the support score's spread, subtracted below
         # so the correlation is against the WITHIN-group score. A prompt every
         # rollout finds hard shifts the whole group, and the advantage it is
@@ -1049,29 +1132,47 @@ class AdvantageReliabilityStats:
         r = -p[0, 1] / math.sqrt(denom)
         return max(-1.0, min(1.0, r)) if math.isfinite(r) else None
 
-    def alpha(self, *, task_names=None) -> dict:
+    def alpha(self, *, task_names=None, scope: str = "cumulative") -> dict:
         """``{(dst_name, src_name): {...}}`` -- the applied alpha and its diagnostics.
 
-        ``alpha`` is the only field the loss may read. ``rho_lcb95`` and the two
-        partials are reported next to it and never multiplied into anything: the
-        first would introduce a confidence level, and the last two a choice of
-        which confound to trust, and both are knobs.
+        ``alpha`` is the only field the loss may read, and only at the default
+        scope: ``current`` is this step's rows alone, which is a diagnostic of
+        whether the cumulative estimate has gone stale and has neither the
+        sample size nor the stability to weight anything.
+
+        ``rho_lcb95`` and the two partials are reported next to it and never
+        multiplied into anything: the first would introduce a confidence level,
+        and the last two a choice of which confound to trust, and both are knobs.
         """
         out = {}
         for dst in range(self.n_tasks):
             for src in range(self.n_tasks):
                 if src == dst:
                     continue
-                cell = self._cell(dst, src)
-                if cell["n"] <= 0:
+                cell = self._cell(dst, src, scope)
+                if cell["n"] <= 0 and cell["_offered"] <= 0:
                     continue
-                rho = self._corr(cell, "a", "s")
+                rho = self._corr(cell, "a", "s") if cell["n"] > 0 else None
                 row = {
                     "n": cell["n"],
+                    # What fraction of the rows offered to this pair had a prompt
+                    # group with a spread of advantages. GRPO is group-relative,
+                    # so a group whose rollouts all scored the same gives every
+                    # row zero advantage and contributes no information; a low
+                    # fraction is why an alpha is small, and without it the two
+                    # readings "the source does not predict reward" and "there
+                    # was nothing to predict" are the same number.
+                    "informative_group_frac": (
+                        cell["n"] / cell["_offered"] if cell["_offered"] > 0 else None
+                    ),
                     "rho": rho,
                     "alpha": 0.0 if rho is None else max(0.0, rho),
-                    "rho_length_controlled": self._partial(cell, "a", "s", ["l"]),
-                    "rho_length_on_controlled": self._partial(cell, "a", "s", ["l", "o"]),
+                    "rho_length_controlled": (
+                        self._partial(cell, "a", "s", ["l"]) if cell["n"] > 0 else None
+                    ),
+                    "rho_length_on_controlled": (
+                        self._partial(cell, "a", "s", ["l", "o"]) if cell["n"] > 0 else None
+                    ),
                     "rho_lcb95": None,
                 }
                 if rho is not None and cell["n"] > 3 and abs(rho) < 1.0:
@@ -1110,6 +1211,12 @@ class AdvantageReliabilityStats:
             "between": self.between.detach().to("cpu"),
             "grouped": self.grouped.detach().to("cpu"),
             "group": self.group.detach().to("cpu"),
+            # Rows offered, so informative_group_frac survives a resume with the
+            # denominator its numerator was accumulated against. A sidecar
+            # written before this key existed loads as zero, which renders the
+            # fraction as absent rather than as a ratio over a partial count.
+            "offered": self.offered.detach().to("cpu"),
+            "doffered": self.doffered.detach().to("cpu"),
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -1124,6 +1231,7 @@ class AdvantageReliabilityStats:
         for name, dst in (
             ("dbuf", self.dbuf), ("between", self.between),
             ("grouped", self.grouped), ("group", self.group),
+            ("offered", self.offered), ("doffered", self.doffered),
         ):
             src = state.get(name, None)
             dst.copy_(torch.zeros_like(dst) if src is None else src.to(dst.device, dst.dtype))
@@ -1178,6 +1286,7 @@ POSITION_TERMS = (
     "w_pre",
     "w_pre_sq",
     "kl",
+    "kl_sq",
     "w_kl",
     "kl_shift_abs",
     "evidence",
@@ -1743,6 +1852,7 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
         "w_pre": pre,
         "w_pre_sq": pre * pre,
         "kl": kl,
+        "kl_sq": kl * kl,
         "w_kl": w * kl,
         "kl_shift_abs": (w - 1.0).abs() * kl,
         "evidence": pre - 1.0,
@@ -1783,9 +1893,11 @@ def logit_gradient_terms(
     teacher_logprob: torch.Tensor,
     weight: torch.Tensor,
     teacher_kl: torch.Tensor,
-    advantage: torch.Tensor,
+    pg_grad_coef: torch.Tensor,
     sampled_onehot: torch.Tensor,
     coef: float,
+    pg_coef: float = 1.0,
+    row_weight: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
 ) -> dict:
     """How the weighted OPD term and the policy gradient push the same logits.
@@ -1794,10 +1906,19 @@ def logit_gradient_terms(
 
         g_opd(v) = coef * W * p_student(v) * (D - f(v)),   f = log p_s - log p_t
 
-    and for the policy gradient, at ratio 1 -- which is where these statistics
-    are collected, the first PPO epoch --
+    and for the policy term, whose per-token loss derivative
+    ``dL/d log pi(y)`` the caller supplies,
 
-        g_grpo(v) = A * (1[v = y] - p_student(v)).
+        g_grpo(v) = -pg_coef * (dL/d log pi(y)) * (1[v = y] - p_student(v)).
+
+    THE COEFFICIENT IS NOT ``A``. It is ``-A*r`` outside the clip and exactly
+    zero inside a bound clip branch, and ``r`` is 1 only for the first
+    mini-batch of the first PPO epoch -- every ``ppo_mini_batch_size`` rows take
+    an optimizer step. :func:`core_algos.policy_loss_gradient_coef` is that
+    derivative in closed form, differentiated from the loss the run actually
+    minimises and pinned against autograd; passing ``advantages`` here instead
+    would report the gradient of a different objective, at full magnitude on
+    positions the real one has stopped pushing at all.
 
     Both are exact on the support the KL already runs over, so the norms and the
     cosine come out of tensors that are already resident. A second backward
@@ -1805,11 +1926,22 @@ def logit_gradient_terms(
     changing the run it describes.
 
     Args:
+        pg_grad_coef: (bs, resp) ``d(pg_losses)/d(log_prob)``.
         sampled_onehot: (bs, resp, k) one at the emitted token's slot in the
             support, zero elsewhere -- and all-zero when the emitted token is
             outside the top-k, in which case its spike is folded into the tail
             bucket. That is an approximation, and it is why
             ``frac_sampled_outside_topk`` is reported next to these.
+        coef: ``teacher_kl_loss_coef``.
+        pg_coef: ``pg_loss_coef``. Both terms carry their coefficient because
+            the ratio is between what the two contribute to ONE objective, and
+            at 0.01 against 1.0 the coefficients are most of the answer.
+        row_weight: (bs,) the per-task loss weight, when the run normalises the
+            loss per task. It multiplies BOTH terms -- the loss applies it to
+            both -- so it cannot change a per-row ratio or cosine, but it does
+            change how much each row contributes to the POOLED ones, which is
+            what these are. Absent -> every row counts once, which is what an
+            unweighted run does.
     """
     lp_s = student_logprob.detach().to(torch.float32)
     lp_t = teacher_logprob.detach().to(torch.float32)
@@ -1823,10 +1955,9 @@ def logit_gradient_terms(
     g_opd = coef * w * p_s * (d - f)
     g_opd_tail = (coef * w.squeeze(-1) * tail_s * (d.squeeze(-1) - f_tail))
 
-    # (bs, 1, 1): the advantage is per ROW and has to broadcast over positions
-    # as well as candidates. unsqueeze(-1) alone gives (bs, 1), which happens to
-    # work at response length 1 and nowhere else.
-    a = advantage.detach().to(torch.float32).reshape(-1, 1, 1)
+    # Descent, to match g_opd's sign: the caller's coefficient is the LOSS
+    # derivative, and (bs, resp, 1) so it broadcasts over the candidates.
+    a = -float(pg_coef) * pg_grad_coef.detach().to(torch.float32).unsqueeze(-1)
     # 1[v = y] lives at the emitted token. Inside the support that is one slot;
     # outside it, the tail bucket carries the whole spike.
     onehot = sampled_onehot.to(torch.float32)
@@ -1834,11 +1965,19 @@ def logit_gradient_terms(
     g_grpo = a * (onehot - p_s)
     g_grpo_tail = a.squeeze(-1) * ((1.0 - in_support) - tail_s)
 
-    return {
+    out = {
         "g_opd_sq": (g_opd * g_opd).sum(dim=-1) + g_opd_tail * g_opd_tail,
         "g_grpo_sq": (g_grpo * g_grpo).sum(dim=-1) + g_grpo_tail * g_grpo_tail,
         "g_dot": (g_opd * g_grpo).sum(dim=-1) + g_opd_tail * g_grpo_tail,
     }
+    if row_weight is not None:
+        # Squared for the squared terms, so the reported norms are those of the
+        # weighted gradient rather than of the weighted squared gradient.
+        rw = row_weight.detach().to(torch.float32).reshape(-1, 1)
+        rw2 = rw * rw
+        out = {"g_opd_sq": out["g_opd_sq"] * rw2, "g_grpo_sq": out["g_grpo_sq"] * rw2,
+               "g_dot": out["g_dot"] * rw2}
+    return out
 
 
 def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
@@ -1935,9 +2074,27 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # "reliable source activity", not agreement.
             out[f"{head}/evidence/shared_share"] = tot["evidence_shared"] / tot["evidence"]
         if abs(tot["kl"]) > 1e-12:
-            out[f"{head}/effect/kl_scale"] = tot["w_kl"] / tot["kl"]
+            kl_scale = tot["w_kl"] / tot["kl"]
+            out[f"{head}/effect/kl_scale"] = kl_scale
             out[f"{head}/effect/kl_shift_gross_frac"] = tot["kl_shift_abs"] / tot["kl"]
-            out[f"{head}/effect/kl_scale_lag_error"] = tot["w_kl"] / tot["kl"] - 1.0
+            out[f"{head}/effect/kl_scale_lag_error"] = kl_scale - 1.0
+            # DID THE WEIGHT LAND WHERE THE KL WAS. kl_scale is the KL-weighted
+            # mean of W and w_mean is the plain one, so their ratio is the lift a
+            # position gets for carrying KL. Above 1 the arm put its budget on
+            # the positions that already had the most to distil; at exactly 1 the
+            # weight and the KL are uncorrelated and the arm is a scalar on the
+            # whole term, i.e. teacher_kl_loss_coef with extra steps. This is the
+            # cheapest statement of what the mechanism is doing and it costs no
+            # accumulation -- both sums were already here.
+            if abs(w_mean) > 1e-12:
+                out[f"{head}/effect/weight_kl_lift"] = kl_scale / w_mean
+            # The same question as a correlation, which unlike the lift is
+            # bounded and comparable across runs. kl_sq is the one column added
+            # for it.
+            kl_var = max(tot["kl_sq"] / n - (tot["kl"] / n) ** 2, 0.0)
+            if w_var > 0 and kl_var > 0:
+                cov = tot["w_kl"] / n - w_mean * (tot["kl"] / n)
+                out[f"{head}/effect/weight_kl_corr"] = cov / math.sqrt(w_var * kl_var)
         out[f"{head}/effect/kl_unweighted"] = tot["kl"] / n
         out[f"{head}/effect/kl_weighted"] = tot["w_kl"] / n
         out[f"{head}/effect/kl_shift_net"] = (tot["w_kl"] - tot["kl"]) / n

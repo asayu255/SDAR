@@ -2287,9 +2287,21 @@ class SignPairTokens:
                 base -- which is what makes its deadzone comparable across
                 teachers -- and those do not exponentiate to a probability.
                 Defaults to ``exp(on_task_logprob)``.
-            effect: (bs, resp, k) from :func:`candidate_effect`, or None on an
-                arm that applies no weight -- the counts and the mass are still
-                the answer to "who names what", and ``eff`` simply stays zero.
+            effect: (bs, resp, k) from :func:`candidate_effect`, or
+                (bs, resp, k, n_off) when the arm can say which SOURCE caused
+                which part of it, or None on an arm that applies no weight --
+                the counts and the mass are still the answer to "who names
+                what", and ``eff`` simply stays zero.
+
+                The three-dimensional form files the SAME total against every
+                source that spoke at the candidate. That is right for the sign
+                arm, whose weight table is a function of the sign PATTERN and
+                cannot be decomposed over the teachers that produced it. It is
+                wrong for a weight built as a sum over sources: there,
+                "what did Search bring to AlfWorld" reads back as Search's share
+                plus WebShop's plus the part neither caused, and a source with
+                alpha = 0 shows up carrying effect it contributed none of. Pass
+                the four-dimensional form and each source gets its own column.
 
         The signs are recomputed here rather than taken from
         :func:`candidate_weights`, for the reason :class:`SignPairCounts` does
@@ -2315,6 +2327,14 @@ class SignPairTokens:
             if effect is None
             else effect.detach().to(torch.float64)
         )
+        # (bs, resp, k) shared by every source, or (bs, resp, k, n_off) sliced
+        # per source in the loop below.
+        eff_per_source = eff.dim() == on_task_logprob.dim() + 1
+        if eff_per_source:
+            assert eff.size(-1) == off_task_logprobs.size(-1), (
+                f"per-source effect has {eff.size(-1)} columns for "
+                f"{off_task_logprobs.size(-1)} off-task teachers"
+            )
         dst = task_ids.reshape(-1).to(torch.long)
         dst_b = dst.view(-1, 1, 1)
         on_silent = sign_on == 0
@@ -2345,7 +2365,8 @@ class SignPairTokens:
 
             self.n.index_add_(0, flat, ok.reshape(-1).to(torch.int64))
             self.mass.index_add_(0, flat, (p_on * ok).reshape(-1))
-            self.eff.index_add_(0, flat, (eff * ok).reshape(-1))
+            eff_c = eff[..., c] if eff_per_source else eff
+            self.eff.index_add_(0, flat, (eff_c * ok).reshape(-1))
 
     def all_reduce(self) -> None:
         self._cpu_cache = None
@@ -2764,6 +2785,15 @@ EVENT_FLOATS = (
     "norm",         # Z (target) or the applied position weight (position)
     "teacher_kl",   # the position's per-token KL, before any weighting
     "reward",       # the row's episode score, or nan when the arm has none
+    # The parameter-free arm's own quantity: delta / sigma, the teacher's move
+    # away from the base in units of its OWN in-domain RMS. A SEPARATE column
+    # from the four probabilities rather than a substitute for them -- a
+    # standardized shift does not exponentiate to a probability, and a dump that
+    # put one in p_on would report exp(delta_hat) under a name every reader
+    # takes for pi_teacher(v). nan on an arm that has no standardization.
+    "shift_on",
+    "shift_off_lo",
+    "shift_off_hi",
 )
 
 
@@ -2836,6 +2866,8 @@ class SignEventSamples:
         task_ids: Optional[torch.Tensor] = None,
         roles: Optional[torch.Tensor] = None,
         reward: Optional[torch.Tensor] = None,
+        shift_on: Optional[torch.Tensor] = None,
+        shift_off: Optional[torch.Tensor] = None,
     ) -> None:
         """Sample this micro-batch's candidates into both strata.
 
@@ -2892,6 +2924,15 @@ class SignEventSamples:
             else reward.detach().to(torch.float32).reshape(-1)
         )
         cols_f.append(rew.view(bs, 1, 1).expand(bs, resp, k))
+        # nan, not zero: an arm without a standardization has not measured this,
+        # and zero is a value the column can legitimately take.
+        nan_col = torch.full((bs, resp, k), float("nan"), device=dev)
+        cols_f.append(nan_col if shift_on is None else shift_on.detach().to(torch.float32))
+        if shift_off is None:
+            cols_f.extend([nan_col, nan_col])
+        else:
+            s_off = shift_off.detach().to(torch.float32)
+            cols_f.extend([s_off.min(dim=-1).values, s_off.max(dim=-1).values])
         flat_f = torch.stack([c.reshape(-1).to(torch.float64) for c in cols_f], dim=-1)
 
         role = (

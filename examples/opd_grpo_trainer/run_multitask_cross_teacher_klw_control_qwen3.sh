@@ -411,6 +411,62 @@ set -x
 #     and its own evidence, so its columns sum to that probe's (W-1)D and not to
 #     the shipped arm's.
 #
+#   THE THREE ANALYSIS CORRECTIONS (2026-08). Each was a diagnostic reporting
+#   something other than what its name said, and none touched the loss.
+#
+#   grpo/grad_* now uses the REAL clipped objective's per-token derivative
+#     (core_algos.policy_loss_gradient_coef, pinned against autograd), not A.
+#     360 rows at ppo_mini_batch_size=60 is six optimizer steps per epoch, so
+#     the ratio is 1 only for the first sixth of the first epoch; after that the
+#     coefficient is -A*r, and inside a bound clip branch it is exactly zero --
+#     a position the objective has stopped pushing at all, which a metric using
+#     A still counted at full magnitude. Both coefficients (0.01 and 1.0) and
+#     the per-task row weight now multiply both terms, because the ratio is
+#     between what the two contribute to ONE objective.
+#
+#   sign_pair_tokens_step*.jsonl now files each off-task teacher's OWN share.
+#     It used to record the position's whole shift against every source that
+#     spoke, so with alpha_Search = 1 and alpha_WebShop = 0 both read back
+#     carrying the same nats -- and "what did Search bring to AlfWorld" included
+#     WebShop's contribution plus the corroboration term neither caused. The
+#     corroboration term reaches no source column on purpose: it is what ALL the
+#     teachers agreed on, and it is reported whole by evidence/shared_*.
+#
+#   sign_events_step*.jsonl now carries real probabilities in p_base / p_on /
+#     p_off_lo / p_off_hi. They were being fed the STANDARDIZED shifts, which
+#     the class exponentiates -- so p_base was exp(0) = 1 on every row and p_on
+#     was exp(delta_hat). The shifts ride in their own shift_on / shift_off_lo /
+#     shift_off_hi columns instead. The reward column also now has the batch key
+#     it comes from: this arm never selected token_level_scores, so every row
+#     read nan.
+#
+#   Plus: a non-finite teacher KL is now zeroed and counted rather than left to
+#     reach backward. W = 1 was not a guard -- 1 * NaN is NaN, and so is 0 * NaN
+#     at a masked position -- and the optimizer steps before the step-end check
+#     fires, so a NaN on-task teacher log-prob would destroy the weights and
+#     only then be reported. kl_weight/nonfinite covers four channels now.
+#
+#   NON-STATIONARITY (the run is 150 steps and the student moves):
+#     rms/*/current and /drift_ratio   the scale from THIS step's rows against
+#       the cumulative one the weight divides by. Away from 1 by a lot means the
+#       divisor is standardising against a policy that no longer exists.
+#     adv/*/rho_current and /rho_cumulative, and adv/rho_sign_disagree -- the
+#       fraction of ordered pairs whose step-local rho has the opposite sign to
+#       the cumulative one alpha is built from.
+#     adv/*/informative_group_frac_{cumulative,current}  what fraction of the
+#       rows offered to a pair had a prompt group with a spread of advantages.
+#       Without it, "the source does not predict reward" and "there was nothing
+#       to predict" are the same alpha.
+#
+#   WHAT MOVED W:
+#     effect/weight_kl_lift  the KL-weighted mean of W over the plain mean. At
+#       exactly 1 the weight and the KL are uncorrelated, which is the arm being
+#       a scalar on the whole term -- teacher_kl_loss_coef with extra steps, and
+#       the null this mechanism is tested against. Above 1 it put its budget on
+#       the positions that already had the most to distil.
+#     effect/weight_kl_corr  the same question bounded, so it compares across
+#       runs.
+#
 # GO/NO-GO BEFORE THE LONG RUN. If probe/alpha100/effect/kl_shift_gross_frac is
 # below 0.05 on every destination, the arm is not redistributing the OPD budget
 # in any measurable way and the three extra forwards -- about 24% of the step --
