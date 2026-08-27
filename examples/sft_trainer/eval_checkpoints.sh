@@ -68,6 +68,32 @@ SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="$SFT_DIR/run_multitask_sft_qwen3.sh"
 [ -f "$RUN_SCRIPT" ] || { echo "missing $RUN_SCRIPT" >&2; exit 1; }
 
+# RAY'S TEMP DIRECTORY IS PER USER, because /tmp/ray is not.
+#
+# On a shared box every user's Ray defaults to the same /tmp/ray, and a raylet
+# that connects to another user's runtime-env agent gets a protocol mismatch:
+#
+#   runtime_env_agent_client.cc:339: Runtime Env Agent timed out in 30000ms.
+#   Status: Disconnected: on_read bad version, bytes_transferred 0
+#   The raylet exited immediately -> node marked dead -> ActorDiedError
+#
+# which cost a 504 run at 21:49 with two other users' jobs on the machine. It
+# is not a load problem -- that box was 50% idle with 201 GiB free -- and not a
+# stale session of ours. It is two Ray versions sharing one socket directory.
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray-$(id -un)}"
+mkdir -p "$RAY_TMPDIR" 2>/dev/null || true
+
+# AND SAY WHAT ELSE WAS ON THE MACHINE, in the log, at the start.
+#
+# Every judgement in this arm is ms/row and wall on a box other people use. A
+# run taken beside a job holding fifty cores is not comparable to one taken on
+# a quiet machine, and nothing in the log said which had happened -- so a 1.5%
+# difference could be the change or could be the neighbours. One line, so the
+# measurement carries its own context.
+_CORES=$(nproc 2>/dev/null || echo '?')
+echo "[eval] machine     : $_CORES cores, load$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null | sed 's/^/ /')" \
+     "-- a loaded box moves ms/row; compare runs taken under similar load"
+
 # HOW MUCH OF THE CARD vLLM GETS.
 #
 # 0.6 is the training arm's number, and it is right there: that arm keeps FSDP

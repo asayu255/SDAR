@@ -218,3 +218,32 @@ def test_the_guard_refuses_a_width_the_budget_cannot_hold():
     )
     assert done.returncode != 0
     assert "will preempt" in done.stderr, done.stderr[-2000:]
+
+
+def test_ray_gets_a_temp_directory_that_is_not_shared_with_other_users():
+    """/tmp/ray is per machine; two Ray versions in it kill the raylet.
+
+    The failure is not obviously about this: the raylet reports
+    "Runtime Env Agent timed out in 30000ms ... on_read bad version" and the
+    job dies with ActorDiedError before any actor runs, which reads as load or
+    as a stale session of our own. It is neither -- it is a protocol mismatch
+    against somebody else's agent on a shared box.
+    """
+    import re
+    text = EVAL_SH.read_text()
+    m = re.search(r'export RAY_TMPDIR="\$\{RAY_TMPDIR:-([^"]+)\}"', text)
+    assert m, "eval_checkpoints.sh no longer isolates RAY_TMPDIR"
+    default = m.group(1)
+    assert default != "/tmp/ray", "that is the shared default this exists to avoid"
+    assert "id -un" in default or "USER" in default, default
+
+
+def test_the_run_records_what_else_was_on_the_machine():
+    """ms/row is the judgement axis and it moves with the neighbours."""
+    done = subprocess.run(
+        ["bash", str(EVAL_SH)], capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    out = done.stdout + done.stderr
+    assert "[eval] machine" in out
+    assert "load" in out
