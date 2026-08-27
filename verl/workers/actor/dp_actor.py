@@ -37,6 +37,7 @@ from verl.trainer.ppo.sign_weights import (
     REWRITE_TERMS,
     OffTaskLadderStats,
     ScopeTermStats,
+    SignEventSamples,
     SignPairTokens,
     SignPairCounts,
     SignWeightStats,
@@ -50,6 +51,7 @@ from verl.trainer.ppo.sign_weights import (
     POSITION_TERMS,
     position_decomposition_terms,
     position_ratio_metrics,
+    token_roles,
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
@@ -1210,6 +1212,15 @@ class DataParallelPPOActor(BasePPOActor):
                 "actor.use_teacher_kl_loss=true or algorithm.opd.sign_weight.enable=false"
             )
             select_keys += ["sign_cache_ids", "sign_off_tasks"]
+            # The event dump reports the row's episode score beside the
+            # candidate, because "the weighting fires here" and "the weighting
+            # fires here on rows that went on to score" are different findings.
+            # Config-gated, and the presence check is uniform across ranks (the
+            # driver builds one batch), so it cannot desynchronise anything.
+            if bool((sign_cfg.get("event_dump", None) or {}).get("enable", False)) and (
+                "token_level_scores" in data.batch.keys()
+            ):
+                select_keys.append("token_level_scores")
         sign_mode = str(sign_cfg.get("mode", "target")) if sign_enabled else None
         sign_agree = float(sign_cfg.get("agree_weight", 1.25)) if sign_enabled else 1.0
         sign_agree_neg = float(sign_cfg.get("agree_neg_weight", 0.75)) if sign_enabled else 1.0
@@ -1357,6 +1368,24 @@ class DataParallelPPOActor(BasePPOActor):
         ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
+        # Individual candidates, with the tokens around them. Every other table
+        # here is an aggregate, and an aggregate cannot be read for a mechanism:
+        # "the weighting acts on the same forty tokens" and "it acts on
+        # <think>'s connectives" produce the same top-N list.
+        event_cfg = (sign_cfg.get("event_dump", None) or {}) if sign_cfg_on else {}
+        event_stats = (
+            SignEventSamples(
+                capacity=int(event_cfg.get("per_step", 128)),
+                context=int(event_cfg.get("context", 16)),
+                device=sign_dev,
+            )
+            if (sign_cfg_on and bool(event_cfg.get("enable", False)))
+            else None
+        )
+        # {tag: [ids]}, set by the worker at startup -- this process has no
+        # tokenizer. Absent means the role column reports "format" throughout,
+        # which is honest: nothing was classified.
+        sign_role_tags = getattr(self, "sign_role_tag_ids", None)
         # The observer arm: measure everything, change nothing. NOT the same as
         # setting all three weights to 1.0 -- reweight_teacher_logprobs still
         # subtracts a log z that differs from 0 by float error, and its tail
@@ -1918,6 +1947,46 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     effect=cand_effect,
                                 )
+                            if event_stats is not None:
+                                # The normaliser the effect column was divided
+                                # by, so a row can be read without knowing which
+                                # mode produced it: Z in target mode, the applied
+                                # position weight in position mode. position_weights
+                                # rebuilds Z exactly -- it IS sum_v p w + tail.
+                                norm = (
+                                    sign_position_inputs[1]
+                                    if sign_position_inputs is not None
+                                    else position_weights(
+                                        sign_cand_inputs["weight"],
+                                        sign_cand_inputs["on_task_logprob"],
+                                    )
+                                )
+                                responses_mb = data["responses"]
+                                event_stats.update(
+                                    support_ids=sign_cand_inputs["support_ids"],
+                                    state=sign_cand_inputs["state"],
+                                    weight=sign_cand_inputs["weight"],
+                                    effect=cand_effect,
+                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                    off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
+                                    base_logprob=sign_cand_inputs["base_logprob"],
+                                    student_logprob=student_topk_logprobs,
+                                    response_mask=response_mask,
+                                    responses=responses_mb,
+                                    norm=norm,
+                                    teacher_kl=teacher_kld,
+                                    task_ids=task_ids,
+                                    roles=(
+                                        token_roles(responses_mb, sign_role_tags)
+                                        if sign_role_tags
+                                        else None
+                                    ),
+                                    reward=(
+                                        data["token_level_scores"].sum(dim=-1)
+                                        if "token_level_scores" in data.batch.keys()
+                                        else None
+                                    ),
+                                )
                             if pair_token_stats is not None and task_ids is not None:
                                 # Which tokens each off-task teacher sends into
                                 # THIS task's states. The counts answer it on
@@ -2195,6 +2264,14 @@ class DataParallelPPOActor(BasePPOActor):
             pair_token_stats.all_reduce()
             metrics.update(pair_token_stats.scalar_metrics(task_names=task_id_names))
             self.last_pair_token_report = pair_token_stats.top_tokens(task_names=task_id_names)
+        # NOT all-reduced, and it cannot be: a sum is a sum but a sample is not,
+        # and gathering variable-length selections across ranks to re-sample them
+        # would be a collective whose size depends on batch content. What lands
+        # on disk is a sample of rank 0's shard -- itself a random shard of the
+        # batch, so unbiased, but world_size times smaller than it looks.
+        self.last_event_report = None
+        if event_stats is not None:
+            self.last_event_report = event_stats.rows(task_names=task_id_names)
         # The one read for everything deferred above. torch.stack forces a single
         # host sync here instead of one per micro-batch. Entries carrying a
         # presence weight are summed and divided by how many micro-batches

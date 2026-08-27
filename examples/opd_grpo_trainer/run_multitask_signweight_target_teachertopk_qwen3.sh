@@ -363,6 +363,29 @@ set -x
 #     (agree / conflict / blindspot; a silent sender has nothing to file) and
 #     the structurally empty src == dst diagonal is not allocated.
 #
+#   What KIND of token, and in what sentence?  event_dump writes individual
+#     candidates to sign_events_step*.jsonl -- the four models' probabilities at
+#     that candidate, the weight, the effect, the turn and position in the
+#     episode, the row's episode score, and the decoded text around it. Every
+#     other table here is an aggregate, and an aggregate cannot be read for a
+#     mechanism: "the weighting acts on the same forty tokens every step" and
+#     "it acts on the connectives inside <think>" produce the same top-N list.
+#     Two strata per step, because either alone misleads: `top` is the largest
+#     |effect| (where the mechanism is loudest, and the natural thing to quote)
+#     and `spread` is a hash-ordered pseudo-random sample (what the MEDIAN event
+#     looks like, which is what says whether the extremes are representative).
+#     Each row carries a role -- reasoning / env_action / tool_call / env_obs /
+#     tag / format -- read off the <think>, <action>, <search>, <answer> and
+#     <information> spans the prompts define. A weight that fires almost
+#     entirely inside <think> is a claim about reasoning style; the same number
+#     concentrated inside <action> is a claim about which moves the tasks share,
+#     and no scalar in this run can tell those apart.
+#     RANK-0 LOCAL, unlike everything else here: a sum can be all-reduced and a
+#     sample cannot, so the file holds a sample of one rank's shard. Unbiased,
+#     but world_size times smaller than it looks.
+#     Cost: per_step * 2 rows of about 40 numbers, one host read per
+#     update_actor. context=16 tokens either side.
+#
 #   Specialist knowledge?  The whole specialist population is inside the
 #     on-task-silent state, 64% of teacher mass, never decomposed.
 #     sign_weight/blindspot/* is where src has an opinion and dst's own teacher
@@ -722,6 +745,9 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.sign_weight.token_stats.top_n=64 \
     +algorithm.opd.sign_weight.pair_stats.enable=True \
     +algorithm.opd.sign_weight.pair_stats.tokens=True \
+    +algorithm.opd.sign_weight.event_dump.enable=True \
+    +algorithm.opd.sign_weight.event_dump.per_step=128 \
+    +algorithm.opd.sign_weight.event_dump.context=16 \
     +algorithm.opd.sign_weight.transfer_stats.enable=True \
     env.env_name=multitask \
     env.seed=1 \

@@ -671,6 +671,18 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
+            # The actor has no tokenizer, and the event dump needs to know which
+            # token ids open and close <think> / <action> / <search> / <answer>
+            # to say what KIND of position an event sat at. Tokenised once here,
+            # where a tokenizer exists, and handed down as ids. add_special_tokens
+            # is off: the tag is being matched as a substring of a response, not
+            # encoded as a standalone sequence, so a BOS in front of it would
+            # match nothing.
+            from verl.trainer.ppo.sign_weights import TAG_ROLES
+
+            self.actor.sign_role_tag_ids = {
+                tag: self.tokenizer.encode(tag, add_special_tokens=False) for tag in TAG_ROLES
+            }
 
         if self._is_rollout:
             # Priced, because nothing else here reports it. The engine is built
@@ -839,14 +851,25 @@ class ActorRolloutRefWorker(Worker):
             for attr, key in (
                 ("last_token_report", "sign_token_report"),
                 ("last_pair_token_report", "sign_pair_token_report"),
+                ("last_event_report", "sign_event_report"),
             ):
                 report = getattr(self.actor, attr, None)
                 if not report:
                     continue
                 pieces = self.tokenizer.convert_ids_to_tokens([r["token_id"] for r in report])
-                output.meta_info[key] = [
-                    {**row, "token": piece} for row, piece in zip(report, pieces)
-                ]
+                rows = [{**row, "token": piece} for row, piece in zip(report, pieces)]
+                # Event rows also carry the window around the position. Decoded
+                # here rather than dumped as ids for the same reason the token
+                # column is: the trainer would have to hold a second tokenizer,
+                # and a reader would have to hold a third. decode, not
+                # convert_ids_to_tokens, because this one is meant to be READ --
+                # the point is the sentence the event sat in.
+                for row in rows:
+                    ctx = row.pop("context_ids", None)
+                    if ctx is None:
+                        continue
+                    row["context"] = self.tokenizer.decode(ctx, skip_special_tokens=False)
+                output.meta_info[key] = rows
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")

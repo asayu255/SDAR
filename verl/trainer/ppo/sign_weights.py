@@ -116,6 +116,11 @@ __all__ = [
     "candidate_effect",
     "PAIR_TOKEN_CLASSES",
     "SignPairTokens",
+    "TAG_ROLES",
+    "ROLE_NAMES",
+    "token_roles",
+    "turn_index",
+    "SignEventSamples",
 ]
 
 # Column the driver writes and the actor reads in ``position`` mode when the
@@ -2395,3 +2400,374 @@ class SignPairTokens:
                             "effect_net": float(eff[p, cid, tok]),
                         })
         return rows
+
+
+# --------------------------------------------------------------------------- #
+# what kind of token a position is
+# --------------------------------------------------------------------------- #
+# Every scalar in this module is an average over positions of very different
+# kinds. A weight that fires almost entirely inside <think> is a claim about
+# reasoning style; the same number concentrated on the contents of <action> is a
+# claim about which moves the tasks share. Those are different findings with the
+# same summary, and nothing so far can tell them apart.
+ROLE_FORMAT = 0       # between the tagged spans: whitespace, chat scaffolding
+ROLE_REASONING = 1    # inside <think> ... </think>
+ROLE_ENV_ACTION = 2   # inside <action> ... </action>, the move the env executes
+ROLE_TOOL_CALL = 3    # inside <search> / <answer>, a call or a final answer
+ROLE_ENV_OBS = 4      # inside <information>, returned BY the env
+ROLE_TAG = 5          # the tag tokens themselves -- pure syntax
+
+ROLE_NAMES = {
+    ROLE_FORMAT: "format",
+    ROLE_REASONING: "reasoning",
+    ROLE_ENV_ACTION: "env_action",
+    ROLE_TOOL_CALL: "tool_call",
+    ROLE_ENV_OBS: "env_obs",
+    ROLE_TAG: "tag",
+}
+
+# The tag vocabulary these environments actually use (agent_system/environments/
+# prompts/*.py): alfworld / sokoban / webshop reason in <think> and act in
+# <action>; search reasons in <think>, calls in <search> and finishes in
+# <answer>, with the retriever's reply wrapped in <information>. A closing tag
+# returns the stream to ROLE_FORMAT rather than to whatever was open before it,
+# because these spans do not nest here.
+TAG_ROLES = {
+    "<think>": ROLE_REASONING,
+    "</think>": ROLE_FORMAT,
+    "<action>": ROLE_ENV_ACTION,
+    "</action>": ROLE_FORMAT,
+    "<search>": ROLE_TOOL_CALL,
+    "</search>": ROLE_FORMAT,
+    "<answer>": ROLE_TOOL_CALL,
+    "</answer>": ROLE_FORMAT,
+    "<information>": ROLE_ENV_OBS,
+    "</information>": ROLE_FORMAT,
+}
+
+
+def token_roles(responses: torch.Tensor, tag_ids: dict) -> torch.Tensor:
+    """(bs, resp) role code per position, from the tag ids alone.
+
+    Done on the token ids rather than on decoded text because this runs inside
+    the actor, which has no tokenizer -- the worker tokenises the ten tag strings
+    once at startup and hands the ids down. A tag is usually several tokens
+    ("<", "think", ">"), so each one is matched as a SEQUENCE: L shifted
+    comparisons per tag, ten tags, over a (bs, resp) int tensor. That is about
+    fifty elementwise compares per micro-batch, against a forward pass.
+
+    The scan is a ``cummax`` over ``position * n_tags + tag_code`` at the
+    positions where a tag ends, which makes "the most recently opened tag" a
+    single kernel rather than a loop over the response length.
+
+    Args:
+        responses: (bs, resp) token ids.
+        tag_ids: ``{tag_string: [ids]}``; a tag absent from the dict, or one
+            whose ids are empty, is simply never matched. Tag strings outside
+            :data:`TAG_ROLES` are ignored rather than refused, so a caller can
+            hand over its whole special-token table.
+
+    Returns:
+        (bs, resp) int64 in :data:`ROLE_NAMES`. Positions before any tag are
+        ``ROLE_FORMAT``: nothing has been opened, which is what that means.
+    """
+    bs, T = responses.shape
+    device = responses.device
+    role = torch.full((bs, T), ROLE_FORMAT, dtype=torch.long, device=device)
+    if T == 0:
+        return role
+
+    tags = [(t, ids) for t, ids in tag_ids.items() if t in TAG_ROLES and len(ids or ())]
+    if not tags:
+        return role
+    K = len(tags)
+
+    pos = torch.arange(T, device=device).unsqueeze(0)
+    # -1 = "no tag ends here". Encoded together with the position so one cummax
+    # recovers both which tag was last and that it was in fact seen.
+    event = torch.full((bs, T), -1, dtype=torch.long, device=device)
+    is_tag = torch.zeros((bs, T), dtype=torch.bool, device=device)
+
+    for code, (_tag, ids) in enumerate(tags):
+        L = len(ids)
+        if L > T:
+            continue
+        match = torch.ones((bs, T - L + 1), dtype=torch.bool, device=device)
+        for i, tid in enumerate(ids):
+            match = match & (responses[:, i : T - L + 1 + i] == int(tid))
+        ends = torch.zeros((bs, T), dtype=torch.bool, device=device)
+        ends[:, L - 1 :] = match
+        event = torch.where(ends, pos * K + code, event)
+        # The tag's own span, so its tokens are reported as syntax rather than
+        # as the first tokens of what they open.
+        for back in range(L):
+            shifted = torch.zeros((bs, T), dtype=torch.bool, device=device)
+            if back == 0:
+                shifted = ends
+            else:
+                shifted[:, :-back] = ends[:, back:]
+            is_tag = is_tag | shifted
+
+    last = torch.cummax(event, dim=1).values
+    seen = last >= 0
+    code = last.clamp(min=0) % K
+    # code -> role, as a small gather rather than K comparisons.
+    lookup = torch.tensor(
+        [TAG_ROLES[tag] for tag, _ in tags], dtype=torch.long, device=device
+    )
+    role = torch.where(seen, lookup[code], role)
+    return torch.where(is_tag, torch.full_like(role, ROLE_TAG), role)
+
+
+def turn_index(response_mask: torch.Tensor) -> torch.Tensor:
+    """(bs, resp) which generated segment each position belongs to, 0-based.
+
+    ``response_mask`` is the multi-turn loss mask: 1 on tokens the model
+    produced, 0 on the environment's replies spliced in between. A turn is
+    therefore a maximal run of ones, and its index is the running count of
+    0 -> 1 transitions. Positions inside an environment reply carry the index of
+    the turn they follow, which is what a reader wants -- the observation that
+    preceded turn n+1 belongs with turn n's consequences.
+
+    On a single-turn arm the mask is all ones and every position is turn 0,
+    which is the correct answer rather than a degenerate one.
+    """
+    m = response_mask.to(torch.bool)
+    prev = torch.zeros_like(m)
+    prev[:, 1:] = m[:, :-1]
+    starts = m & (~prev)
+    return starts.to(torch.long).cumsum(dim=1).clamp(min=1) - 1
+
+
+# --------------------------------------------------------------------------- #
+# individual events, with the text around them
+# --------------------------------------------------------------------------- #
+# Ints and floats are kept in separate tensors because a token id must survive
+# the round trip exactly and a float64 mantissa stops being able to promise that
+# at 2^53 -- which a vocabulary of 151,936 is nowhere near, but a position
+# encoded into the same tensor as a probability is a bug waiting for a bigger
+# model. Column order is the schema; both lists are the schema's only definition.
+EVENT_INTS = ("token_id", "task_id", "state", "role", "turn", "position", "row_len")
+EVENT_FLOATS = (
+    "p_base",       # pi_0 at the candidate: what the shared base said
+    "p_on",         # the on-task teacher
+    "p_student",    # the student, i.e. whether the edit has landed yet
+    "p_off_lo",     # the least enthusiastic off-task teacher
+    "p_off_hi",     # the most
+    "weight",       # the candidate weight the table assigned
+    "effect",       # candidate_effect: the post-normalisation change, signed
+    "norm",         # Z (target) or the applied position weight (position)
+    "teacher_kl",   # the position's per-token KL, before any weighting
+    "reward",       # the row's episode score, or nan when the arm has none
+)
+
+
+class SignEventSamples:
+    """A bounded sample of individual candidates, with the tokens around them.
+
+    Everything else in this module is an aggregate. Aggregates are what a claim
+    is made of, but they cannot be read for a MECHANISM: "the weighting acts on
+    the same forty tokens every step" and "it acts on <think>'s connectives"
+    produce identical top-N tables, and only looking at instances separates them.
+    This class is the instances -- one row per sampled candidate, carrying the
+    four models' probabilities at it, the weight, the effect, where in the
+    episode it sat and what was being written around it.
+
+    Two strata, because either alone is misleading:
+
+    ``top``     the largest ``|effect|`` seen. Where the mechanism is loudest,
+                and the natural thing to quote -- but a table of extremes says
+                nothing about the median event, and a mechanism whose extremes
+                are unrepresentative is exactly the failure mode worth catching.
+    ``spread``  a pseudo-random sample. The key is a multiplicative hash of a
+                running index, not an RNG: a generator would either need its
+                state synchronised across ranks or produce a sample nobody can
+                reproduce, and the hash is deterministic given the batch order.
+
+    RANK-0 LOCAL, unlike every other table here. The aggregates are all-reduced
+    before rendering because a sum is a sum; a sample is not, and gathering
+    variable-length selections across ranks to re-sample them would be a
+    collective whose size depends on batch content. What lands on disk is
+    therefore a sample of ONE rank's shard -- which is itself a random shard of
+    the batch, so the sample is unbiased, but its size is world_size times
+    smaller than a reader might assume. Said here because the file cannot say it.
+
+    Sync-free in the micro-batch loop: each call does one ``topk`` per stratum
+    and appends small device tensors to a list. Nothing is read to the host until
+    :meth:`rows`, once per ``update_policy``.
+    """
+
+    STRATA = ("top", "spread")
+    # Knuth's multiplicative constant. Any odd 32-bit multiplier with a
+    # well-mixed bit pattern does; this one is only here to make the choice
+    # explicit rather than magic.
+    _HASH = 2654435761
+
+    def __init__(self, *, capacity: int = 128, context: int = 8, device=None):
+        self.capacity = int(capacity)
+        self.context = int(context)
+        self.device = device
+        self._ints = {k: [] for k in self.STRATA}
+        self._floats = {k: [] for k in self.STRATA}
+        self._ctx = {k: [] for k in self.STRATA}
+        self._scores = {k: [] for k in self.STRATA}
+        self._seen = 0   # a python int: no device read, and stable across calls
+
+    def update(
+        self,
+        *,
+        support_ids: torch.Tensor,
+        state: torch.Tensor,
+        weight: torch.Tensor,
+        effect: torch.Tensor,
+        on_task_logprob: torch.Tensor,
+        off_task_logprobs: torch.Tensor,
+        base_logprob: torch.Tensor,
+        student_logprob: torch.Tensor,
+        response_mask: torch.Tensor,
+        responses: torch.Tensor,
+        norm: torch.Tensor,
+        teacher_kl: torch.Tensor,
+        task_ids: Optional[torch.Tensor] = None,
+        roles: Optional[torch.Tensor] = None,
+        reward: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Sample this micro-batch's candidates into both strata.
+
+        Args:
+            norm: (bs, resp) the per-position normaliser -- ``Z`` in target mode,
+                the applied position weight in position mode. One column rather
+                than two because a row already says which mode it came from
+                through the arm it was dumped by, and two columns of which one is
+                always empty is how a schema rots.
+            roles: (bs, resp) from :func:`token_roles`, or None when the tag ids
+                were not available -- the row then reports ``format`` for
+                everything, which is honest: nothing was classified.
+            reward: (bs,) the row's episode score, or None on an arm that has
+                none. Absent becomes NaN in the column rather than 0.0, which is
+                a score.
+        """
+        bs, resp, k = support_ids.shape
+        n = bs * resp * k
+        dev = support_ids.device
+        valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(support_ids).reshape(-1)
+
+        eff = effect.detach().to(torch.float64).reshape(-1)
+        idx = torch.arange(self._seen, self._seen + n, device=dev, dtype=torch.long)
+        self._seen += n
+        scores = {
+            # -1 sorts below every real score, so invalid entries are taken only
+            # when there is nothing else -- and they are dropped at render time.
+            "top": torch.where(valid, eff.abs(), torch.full_like(eff, -1.0)),
+            "spread": torch.where(
+                valid,
+                ((idx * self._HASH) % 2147483647).to(torch.float64),
+                torch.full_like(eff, -1.0),
+            ),
+        }
+
+        p_off = off_task_logprobs.detach().to(torch.float32).exp()
+        cols_f = [
+            base_logprob.detach().to(torch.float32).exp(),
+            on_task_logprob.detach().to(torch.float32).exp(),
+            student_logprob.detach().to(torch.float32).exp(),
+            p_off.min(dim=-1).values,
+            p_off.max(dim=-1).values,
+            weight.detach().to(torch.float32),
+            # float64 all the way: this column is the ranking key, and rounding
+            # it to float32 on the way out would make the value a row is chosen
+            # for disagree with the value the row reports.
+            effect.detach().to(torch.float64),
+            norm.detach().to(torch.float32).unsqueeze(-1).expand(bs, resp, k),
+            teacher_kl.detach().to(torch.float32).unsqueeze(-1).expand(bs, resp, k),
+        ]
+        rew = (
+            torch.full((bs,), float("nan"), device=dev)
+            if reward is None
+            else reward.detach().to(torch.float32).reshape(-1)
+        )
+        cols_f.append(rew.view(bs, 1, 1).expand(bs, resp, k))
+        flat_f = torch.stack([c.reshape(-1).to(torch.float64) for c in cols_f], dim=-1)
+
+        role = (
+            torch.zeros((bs, resp), dtype=torch.long, device=dev) if roles is None else roles.to(torch.long)
+        )
+        tid = (
+            torch.full((bs,), -1, dtype=torch.long, device=dev)
+            if task_ids is None
+            else task_ids.reshape(-1).to(torch.long)
+        )
+        row_len = response_mask.to(torch.long).sum(dim=1)
+        pos = torch.arange(resp, device=dev).view(1, resp).expand(bs, resp)
+        cols_i = [
+            support_ids.to(torch.long),
+            tid.view(bs, 1, 1).expand(bs, resp, k),
+            state.to(torch.long),
+            role.unsqueeze(-1).expand(bs, resp, k),
+            turn_index(response_mask).unsqueeze(-1).expand(bs, resp, k),
+            pos.unsqueeze(-1).expand(bs, resp, k),
+            row_len.view(bs, 1, 1).expand(bs, resp, k),
+        ]
+        flat_i = torch.stack([c.reshape(-1) for c in cols_i], dim=-1)
+
+        # The window around each event, gathered once per stratum below. Built
+        # here so the clamped index arithmetic is written once.
+        w = 2 * self.context + 1
+        take = min(self.capacity, n)
+        for name, score in scores.items():
+            vals, sel = torch.topk(score, take)
+            self._scores[name].append(vals)
+            self._ints[name].append(flat_i[sel])
+            self._floats[name].append(flat_f[sel])
+            if responses.size(1) == resp:
+                # Advanced indexing rather than gather: the row index and the
+                # column window are both per-EVENT here, and gather would want
+                # an index shaped like `responses` instead.
+                row = torch.div(sel, resp * k, rounding_mode="floor")          # (take,)
+                col = torch.div(sel, k, rounding_mode="floor") % resp          # (take,)
+                span = col.unsqueeze(-1) + torch.arange(
+                    -self.context, self.context + 1, device=dev
+                )                                                              # (take, w)
+                # Clamped, not padded: at the ends of a response the window
+                # repeats the edge token, which reads as an edge in the dump and
+                # costs no sentinel value that a decoder would have to know.
+                self._ctx[name].append(responses[row.unsqueeze(-1), span.clamp(min=0, max=resp - 1)])
+            else:
+                self._ctx[name].append(torch.zeros((take, w), dtype=responses.dtype, device=dev))
+
+    def rows(self, task_names=None) -> list:
+        """Merge the per-micro-batch selections and read them once.
+
+        The merge re-runs the same ``topk`` over the concatenation, so the result
+        is what a single pass over the whole mini-batch would have produced --
+        for ``top`` exactly, and for ``spread`` exactly as well, since the hash
+        is a function of a running index and not of the split.
+        """
+        out = []
+        for name in self.STRATA:
+            if not self._scores[name]:
+                continue
+            scores = torch.cat(self._scores[name])
+            ints = torch.cat(self._ints[name])
+            floats = torch.cat(self._floats[name])
+            ctx = torch.cat(self._ctx[name])
+            take = min(self.capacity, scores.numel())
+            _v, sel = torch.topk(scores, take)
+            keep = scores[sel] >= 0
+            sel = sel[keep]
+            ints_c = ints[sel].to("cpu").tolist()
+            floats_c = floats[sel].to("cpu").tolist()
+            ctx_c = ctx[sel].to("cpu").tolist()
+            for rank, (iv, fv, cv) in enumerate(zip(ints_c, floats_c, ctx_c)):
+                row = {"table": "event", "stratum": name, "rank": rank}
+                row.update(dict(zip(EVENT_INTS, (int(x) for x in iv))))
+                row.update(dict(zip(EVENT_FLOATS, (float(x) for x in fv))))
+                t = row.pop("task_id")
+                row["task"] = (
+                    task_names[t] if task_names and 0 <= t < len(task_names) else (None if t < 0 else f"task{t}")
+                )
+                row["state"] = STATE_NAMES.get(row["state"], str(row["state"]))
+                row["role"] = ROLE_NAMES.get(row["role"], str(row["role"]))
+                row["context_ids"] = [int(x) for x in cv]
+                out.append(row)
+        return out
