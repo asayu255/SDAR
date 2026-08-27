@@ -363,11 +363,21 @@ def test_the_event_sampler_is_gated_on_the_config_and_not_on_the_batch():
     sampler itself is not all-reduced, but it is constructed beside the ones
     that are and a batch-content gate there is how the pattern gets copied."""
     src = _update_policy_source()
-    line = [ln for ln in src.splitlines() if "SignEventSamples(" in ln]
-    assert line, "SignEventSamples is not constructed"
-    ctor = src[src.index("event_stats = ("):src.index("SignEventSamples(") + 400]
+    assert "SignEventSamples(" in src, "SignEventSamples is not constructed"
+    # The sign arm's own construction. The parameter-free arm builds one too, on
+    # its own config flag, so the anchor has to name which is being checked.
+    ctor = src[src.index("event_stats = ("):]
+    ctor = ctor[: ctor.index("else None")]
     assert "sign_enabled" not in ctor, ctor
     assert "sign_cfg_on" in ctor
+    # The parameter-free arm builds one too, on its own flag, and the same rule
+    # applies to it: a rank whose micro-batch carries no sign columns must still
+    # take the same branch its neighbours do.
+    xt = src[src.index("xt_event_stats = SignEventSamples("):]
+    guard = src[: src.index("xt_event_stats = SignEventSamples(")].rsplit("if ", 1)[-1]
+    assert "xt_enabled" not in guard, guard
+    assert "xt_on" in guard, guard
+    del xt
 
 
 def test_the_micro_batch_is_never_treated_as_a_dataproto():

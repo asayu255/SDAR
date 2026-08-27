@@ -1998,3 +1998,160 @@ def test_the_failure_is_raised_after_the_collectives_not_inside_them():
     tail = src[src.rindex("        if xt_on:"):]
     reduce_at = tail.rindex("torch.distributed.all_reduce(_t")
     assert tail.index("assert_all_finite(") > reduce_at
+
+
+# --------------------------------------------------------------------------- #
+# token attribution and the gradient-interference metrics
+# --------------------------------------------------------------------------- #
+from verl.trainer.ppo.cross_teacher_kl_weight import (  # noqa: E402
+    GRAD_TERMS,
+    gradient_metrics,
+    logit_gradient_terms,
+    per_candidate_shift,
+)
+
+
+def test_the_per_candidate_shift_is_the_summand_of_the_state_table():
+    """One definition, three tables. The per-state table, the per-token table
+    and the source attribution all decompose the same nats, and computing it
+    three times is how three views of one number drift apart."""
+    got, _ = _built(bs=3, resp=4, seed=46)
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    per_cand = per_candidate_shift(got, kl)
+    state = state_shift_terms(got, kl)
+    attributed = sum(state[t] for t in STATE_TERMS if t != "shift_norm_offset")
+    assert torch.allclose(per_cand.sum(dim=-1), attributed, atol=1e-5)
+
+
+def test_the_analytic_opd_gradient_matches_autograd():
+    """The claim that lets the interference metric cost no second backward -- and
+    a second backward would not merely be expensive, it would make a diagnostic
+    able to change the run it describes."""
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+
+    torch.manual_seed(80)
+    k, V, W, coef = 4, 9, 1.7, 0.01
+    logits = torch.randn(1, 1, V, requires_grad=True)
+    teacher = torch.log_softmax(torch.randn(1, 1, V), -1)[..., :k]
+
+    lp = torch.log_softmax(logits, -1)
+    kl = topk_kl_per_token(lp[..., :k], teacher)
+    (coef * W * kl).sum().backward()
+    auto = -logits.grad[0, 0].clone()
+
+    p_s = lp[..., :k].detach().exp()
+    f = lp[..., :k].detach() - teacher
+    analytic = coef * W * p_s * (kl.detach().unsqueeze(-1) - f)
+    assert torch.allclose(analytic[0, 0], auto[:k], atol=1e-6)
+
+    got = logit_gradient_terms(
+        student_logprob=lp[..., :k].detach(), teacher_logprob=teacher,
+        weight=torch.full((1, 1), W), teacher_kl=kl.detach(),
+        advantage=torch.zeros(1), sampled_onehot=torch.zeros(1, 1, k), coef=coef,
+    )
+    # the tail bucket carries the rest of the vocabulary, so the norm covers it
+    assert float(got["g_opd_sq"]) == pytest.approx(
+        float((analytic ** 2).sum() + auto[k:].sum() ** 2), rel=1e-4
+    )
+
+
+def test_the_analytic_policy_gradient_matches_autograd_at_ratio_one():
+    """Where these are collected -- the first PPO epoch -- the ratio is 1 and the
+    closed form is exact. A later epoch's clipping would make it an
+    approximation, which is why the collection is gated on epoch 0."""
+    torch.manual_seed(81)
+    k, V, A, slot = 4, 9, 2.5, 2
+    logits = torch.randn(1, 1, V, requires_grad=True)
+    lp = torch.log_softmax(logits, -1)
+    (-A * lp[0, 0, slot]).backward()
+    auto = -logits.grad[0, 0]
+
+    onehot = torch.zeros(1, 1, k)
+    onehot[0, 0, slot] = 1.0
+    analytic = A * (onehot[0, 0] - lp[..., :k].detach().exp()[0, 0])
+    assert torch.allclose(analytic, auto[:k], atol=1e-5)
+
+
+def test_the_advantage_broadcasts_over_positions_and_not_only_candidates():
+    """(bs, 1) happens to work at response length 1 and nowhere else."""
+    bs, resp, k = 3, 5, 4
+    lp = torch.log_softmax(torch.randn(bs, resp, k + 3), -1)[..., :k]
+    got = logit_gradient_terms(
+        student_logprob=lp, teacher_logprob=lp,
+        weight=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp),
+        advantage=torch.randn(bs), sampled_onehot=torch.zeros(bs, resp, k), coef=0.01,
+    )
+    for name in GRAD_TERMS:
+        assert got[name].shape == (bs, resp), name
+
+
+def test_the_interference_metrics_are_a_ratio_and_a_cosine():
+    """The ratio says how much of the update the OPD term is responsible for at
+    all -- at coefficient 0.01 that is the first thing a reader wants and the
+    last thing a loss curve shows."""
+    bs, resp, k = 2, 3, 4
+    torch.manual_seed(82)
+    lp = torch.log_softmax(torch.randn(bs, resp, k + 3), -1)[..., :k]
+    stats = ScopeTermStats(names=GRAD_TERMS, n_tasks=3, device="cpu")
+    stats.update(
+        logit_gradient_terms(
+            student_logprob=lp, teacher_logprob=torch.log_softmax(torch.randn(bs, resp, k), -1),
+            weight=torch.ones(bs, resp), teacher_kl=torch.rand(bs, resp) + 0.1,
+            advantage=torch.tensor([1.0, -1.0]),
+            sampled_onehot=torch.nn.functional.one_hot(
+                torch.randint(0, k, (bs, resp)), k
+            ).float(),
+            coef=0.01,
+        ),
+        response_mask=torch.ones(bs, resp), task_ids=torch.tensor([0, 1]),
+    )
+    m = gradient_metrics(stats.sums(task_names=TASKS))
+    assert m["kl_weight/grpo/grad_norm_ratio"] > 0
+    assert -1.0 - 1e-6 <= m["kl_weight/grpo/grad_cosine"] <= 1.0 + 1e-6
+    for name in m:
+        assert "max" not in name and "min" not in name, name
+
+
+def test_a_perfectly_aligned_pair_reads_cosine_one():
+    stats = ScopeTermStats(names=GRAD_TERMS, n_tasks=0, device="cpu")
+    stats.update(
+        {"g_opd_sq": torch.tensor([[4.0]]), "g_grpo_sq": torch.tensor([[9.0]]),
+         "g_dot": torch.tensor([[6.0]])},
+        response_mask=torch.ones(1, 1), task_ids=None,
+    )
+    m = gradient_metrics(stats.sums())
+    assert m["kl_weight/grpo/grad_cosine"] == pytest.approx(1.0)
+    assert m["kl_weight/grpo/grad_norm_ratio"] == pytest.approx(2.0 / 3.0)
+
+
+def test_the_token_tables_are_driven_from_the_new_arms_own_switches():
+    """The existing dumps are gated on the sign arm's config, so without this
+    the run can say a source raised a task's KL by so many nats and cannot name
+    one token it did it at."""
+    src = _update_policy_source()
+    assert 'xt_token_cfg = (xt_cfg.get("token_stats", None) or {})' in src
+    assert 'xt_event_cfg = (xt_cfg.get("event_dump", None) or {})' in src
+    for ctor in ("TokenStateCounts(", "SignPairTokens(", "SignEventSamples("):
+        assert src.count(ctor) >= 2, f"{ctor} is not built for the new arm"
+    # the tables read the standardized shifts, so their labels and deadzone are
+    # in RMS units and comparable across teachers
+    actor = _actor_source()
+    helper = actor[actor.index("def _xt_token_tables"):]
+    helper = helper[: helper.index("def _read_sidecar_on_rank_zero")]
+    assert 'base_logprob=zero_base' in helper
+    assert 'mass=built["teacher_prob"]' in helper, (
+        "a standardized shift does not exponentiate to a probability"
+    )
+    assert "per_candidate_shift(" in helper
+
+
+def test_the_gradient_metric_is_collected_where_the_ratio_is_one():
+    src = _update_policy_source()
+    assert "logit_gradient_terms(" in src
+    block = src[src.index("xt_grad_stats.update("):]
+    block = block[: block.index("response_mask=")]
+    assert "coef=float(self.config.get(" in block, "the real OPD coefficient, not 1"
+    # Epoch 0 only: a later epoch's clipping makes the closed form for the
+    # policy gradient an approximation rather than an identity.
+    guard = src[: src.index("xt_grad_stats.update(")]
+    assert "if xt_built is not None and xt_collect:" in guard

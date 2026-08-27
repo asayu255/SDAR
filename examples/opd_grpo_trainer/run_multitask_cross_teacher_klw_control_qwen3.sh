@@ -38,18 +38,16 @@ set -x
 #              teacher that barely moves out of domain up to a full unit, which
 #              is what the deadzone used to suppress. The off-diagonal is still
 #              recorded, as off_to_in_domain_ratio.
-#   c_ev       the OFF-TASK teachers' unanimous minimum. A continuous min, not a
-#              sign test, so a near-zero shift contributes near zero and no
-#              deadzone is needed. Off-task only because the on-task teacher is
-#              silent at 64% of teacher mass, and an on-task-inclusive minimum
-#              would kill the channel across two thirds of what this measures.
+#   c          the minimum EVERY teacher in the run guarantees, the on-task one
+#              included. A continuous min, not a sign test, so a near-zero shift
+#              contributes near zero and no deadzone is needed.
 #   alpha      per ordered task pair, the correlation between that source's
 #              RESIDUAL support for the tokens the student actually emitted and
 #              the GRPO advantage of the trajectory it emitted them in.
 #              Rectified at zero: an anti-correlated source is vetoed, never
 #              inverted -- nothing says a reversed policy shift points anywhere
 #              useful. This is the ONE thing GRPO contributes to the mechanism.
-#   e          |c_ev| + sum_m alpha_m |delta_hat_m|, per candidate.
+#   e          |c| + sum_m alpha_m |delta_hat_m|, per candidate.
 #   W~         1 + sum_v p_teacher(v) e(v), per position.
 #   W          W~ / mu_d, the PREVIOUS step's KL-weighted per-task mean.
 #
@@ -69,11 +67,16 @@ set -x
 # that product is not a divergence and, on a reverse KL, raising a term's weight
 # pushes the token DOWN whenever log(p_student/p_teacher) > -1.
 #
-# Corroboration is measured among the off-task teachers, so a position where the
-# other two tasks unanimously OPPOSE the on-task teacher scores like one where
-# they agree with it. That is deliberate -- a KL term has no direction to
-# disagree with -- and it is why kl_shift_by_state below is required reading
-# rather than optional.
+# Corroboration requires EVERY teacher, the on-task one included in both the
+# unanimity test and the minimum. Off-task unanimity alone was tried and is not
+# what this arm runs: it credits a position where the other two tasks decisively
+# OPPOSE the on-task teacher exactly as it credits one where they agree, and the
+# KL that then gets strengthened points at the very opinion they contradicted,
+# with no advantage-side evidence behind it -- at alpha=0 a (-1,+3,+2) candidate
+# would score 2 instead of 0. The price is real and is measured rather than
+# assumed: c is capped by the on-task shift and that teacher is silent at ~64%
+# of teacher mass, so evidence/shared_offtask_only_* reports what the other rule
+# WOULD have contributed. Nothing in the loss reads it.
 #
 # Cost: three extra frozen forwards per step (the base over all rows, each
 # teacher over the 2/3 of rows that are not its own task), the same the sign arm
@@ -315,6 +318,38 @@ set -x
 #     the same normaliser and never touch the loss. They exist because at
 #     alpha=0 the corroboration channel is alone and it is structurally the
 #     minority one, so a gate read there is a lower bound, not the mechanism.
+#
+#   token_stats / event_dump name the tokens. Without them the run can say a
+#     source raised a task's KL by so many nats and cannot point at one token it
+#     did it at, which is most of what a write-up needs. Three files land under
+#     trainer.sign_token_dump_dir:
+#       sign_tokens_step*.jsonl       per (scope, state, token): how often, how
+#         much on-task teacher mass, and the nats the weighting moved there.
+#       sign_pair_tokens_step*.jsonl  per (destination, source, class, token) --
+#         WHICH tokens each off-task teacher's evidence acted on in each other
+#         task's states, with token_overlap saying whether the two sources name
+#         the same ones. This is the "what did Search bring to AlfWorld" table.
+#       sign_events_step*.jsonl       individual candidates with the four models'
+#         values, the weight, the turn and position, the row's score, and the
+#         decoded text around them, in a top-|effect| and a hash-ordered sample.
+#     The state labels and the deadzone in these are in RMS UNITS, not nats:
+#     they are computed on the standardized shifts against a zero base, which is
+#     what makes report_epsilon comparable across teachers. It reaches no weight.
+#     What a row can be read as: "Search-derived token evidence strengthened the
+#     whole KL toward AlfWorld's own teacher at this position". NOT "a Search
+#     token was injected into AlfWorld" -- a position scalar cannot do that.
+#
+#   grpo/grad_norm_ratio and grpo/grad_cosine are analytic, in logit space, over
+#     the top-k plus the tail: the descent direction for the weighted OPD term
+#     is coef*W*p_s*(D - f) and for the policy gradient A*(1[v=y] - p_s), both
+#     exact on tensors already resident. No second backward, so the diagnostic
+#     cannot perturb the update it describes -- and both forms are checked
+#     against autograd in the tests. The ratio is how much of the update the OPD
+#     term is responsible for at all, which at coefficient 0.01 is the first
+#     thing a reader wants and the last thing a loss curve shows. A persistently
+#     negative cosine means the weighting is spending its budget against the
+#     reward signal, which is a finding rather than a bug. Collected on the first
+#     PPO epoch, where the ratio is 1 and the closed form is an identity.
 #
 # GO/NO-GO BEFORE THE LONG RUN. If probe/alpha100/effect/kl_shift_gross_frac is
 # below 0.05 on every destination, the arm is not redistributing the OPD budget
@@ -662,6 +697,11 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.cross_teacher_kl_weight.base_path=Qwen/Qwen3-1.7B \
     +algorithm.opd.cross_teacher_kl_weight.report_epsilon=0.1 \
     +algorithm.opd.cross_teacher_kl_weight.max_groups=512 \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.enable=True \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.top_n=64 \
+    +algorithm.opd.cross_teacher_kl_weight.event_dump.enable=True \
+    +algorithm.opd.cross_teacher_kl_weight.event_dump.per_step=128 \
+    +algorithm.opd.cross_teacher_kl_weight.event_dump.context=16 \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \

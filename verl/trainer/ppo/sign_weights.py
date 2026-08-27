@@ -2222,11 +2222,18 @@ class SignPairTokens:
         off_plane_tasks: torch.Tensor,
         deadzone: float,
         effect: Optional[torch.Tensor] = None,
+        mass: Optional[torch.Tensor] = None,
     ) -> None:
         """Fold one micro-batch in.
 
         Args:
             support_ids: (bs, resp, k) vocabulary ids of the support.
+            mass: (bs, resp, k) the on-task teacher's probability, when the
+                caller's ``on_task_logprob`` is not a log-probability. The
+                parameter-free arm passes STANDARDIZED shifts against a zero
+                base -- which is what makes its deadzone comparable across
+                teachers -- and those do not exponentiate to a probability.
+                Defaults to ``exp(on_task_logprob)``.
             effect: (bs, resp, k) from :func:`candidate_effect`, or None on an
                 arm that applies no weight -- the counts and the mass are still
                 the answer to "who names what", and ``eff`` simply stays zero.
@@ -2241,7 +2248,11 @@ class SignPairTokens:
         V = self.vocab_size
         valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(on_task_logprob)
 
-        p_on = on_task_logprob.detach().to(torch.float32).exp()
+        p_on = (
+            on_task_logprob.detach().to(torch.float32).exp()
+            if mass is None
+            else mass.detach().to(torch.float32)
+        )
         sign_on = _deadzoned_sign(on_task_logprob.detach() - base_logprob.detach(), deadzone)
         sign_off = _deadzoned_sign(
             off_task_logprobs.detach() - base_logprob.detach().unsqueeze(-1), deadzone

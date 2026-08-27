@@ -138,6 +138,10 @@ __all__ = [
     "build_position_weight",
     "assert_all_finite",
     "position_terms",
+    "per_candidate_shift",
+    "GRAD_TERMS",
+    "logit_gradient_terms",
+    "gradient_metrics",
     "state_shift_terms",
     "position_weight_metrics",
     "state_shift_metrics",
@@ -1445,6 +1449,122 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     }
 
 
+def per_candidate_shift(built: dict, teacher_kl: torch.Tensor) -> torch.Tensor:
+    """(bs, resp, k) each candidate's share of the nats the weighting moved.
+
+    ``(W - 1) D`` splits into a part the candidates caused and the normaliser's
+    own offset:
+
+        (W - 1) D  =  [ sum_v p_d(v) e(v) / mu ] D  +  (1/mu - 1) D
+
+    and this is the summand of the first term. It is the ONE definition the
+    per-state table, the per-token table and the source attribution all read, so
+    three tables that are meant to decompose the same quantity cannot come to
+    disagree about what it is.
+    """
+    inv_mu = 1.0 / built["mu"].clamp(min=1e-12)
+    kl = teacher_kl.detach().to(torch.float32)
+    return built["teacher_prob"] * built["evidence"] * inv_mu.unsqueeze(-1) * kl.unsqueeze(-1)
+
+
+# The three per-position scalars the gradient-interference metrics are built
+# from. Analytic, in LOGIT space, over the top-k plus the tail bucket: the two
+# gradients are known in closed form there, so no second backward is needed and
+# the metric cannot perturb the one the optimizer takes.
+GRAD_TERMS = ("g_opd_sq", "g_grpo_sq", "g_dot")
+
+
+def logit_gradient_terms(
+    *,
+    student_logprob: torch.Tensor,
+    teacher_logprob: torch.Tensor,
+    weight: torch.Tensor,
+    teacher_kl: torch.Tensor,
+    advantage: torch.Tensor,
+    sampled_onehot: torch.Tensor,
+    coef: float,
+    eps: float = 1e-8,
+) -> dict:
+    """How the weighted OPD term and the policy gradient push the same logits.
+
+    For the reverse KL the descent direction on logit ``v`` is
+
+        g_opd(v) = coef * W * p_student(v) * (D - f(v)),   f = log p_s - log p_t
+
+    and for the policy gradient, at ratio 1 -- which is where these statistics
+    are collected, the first PPO epoch --
+
+        g_grpo(v) = A * (1[v = y] - p_student(v)).
+
+    Both are exact on the support the KL already runs over, so the norms and the
+    cosine come out of tensors that are already resident. A second backward
+    would cost a full pass and, worse, would make a diagnostic capable of
+    changing the run it describes.
+
+    Args:
+        sampled_onehot: (bs, resp, k) one at the emitted token's slot in the
+            support, zero elsewhere -- and all-zero when the emitted token is
+            outside the top-k, in which case its spike is folded into the tail
+            bucket. That is an approximation, and it is why
+            ``frac_sampled_outside_topk`` is reported next to these.
+    """
+    lp_s = student_logprob.detach().to(torch.float32)
+    lp_t = teacher_logprob.detach().to(torch.float32)
+    p_s = lp_s.exp()
+    tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)
+    f = lp_s - lp_t
+    f_tail = tail_s.log() - tail_logprob(lp_t, eps)
+
+    d = teacher_kl.detach().to(torch.float32).unsqueeze(-1)
+    w = weight.detach().to(torch.float32).unsqueeze(-1)
+    g_opd = coef * w * p_s * (d - f)
+    g_opd_tail = (coef * w.squeeze(-1) * tail_s * (d.squeeze(-1) - f_tail))
+
+    # (bs, 1, 1): the advantage is per ROW and has to broadcast over positions
+    # as well as candidates. unsqueeze(-1) alone gives (bs, 1), which happens to
+    # work at response length 1 and nowhere else.
+    a = advantage.detach().to(torch.float32).reshape(-1, 1, 1)
+    # 1[v = y] lives at the emitted token. Inside the support that is one slot;
+    # outside it, the tail bucket carries the whole spike.
+    onehot = sampled_onehot.to(torch.float32)
+    in_support = onehot.sum(dim=-1).clamp(max=1.0)
+    g_grpo = a * (onehot - p_s)
+    g_grpo_tail = a.squeeze(-1) * ((1.0 - in_support) - tail_s)
+
+    return {
+        "g_opd_sq": (g_opd * g_opd).sum(dim=-1) + g_opd_tail * g_opd_tail,
+        "g_grpo_sq": (g_grpo * g_grpo).sum(dim=-1) + g_grpo_tail * g_grpo_tail,
+        "g_dot": (g_opd * g_grpo).sum(dim=-1) + g_opd_tail * g_grpo_tail,
+    }
+
+
+def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
+    """Norm ratio and cosine between the two terms that share the logits.
+
+    The ratio says how much of the update the OPD term is responsible for at
+    all -- at ``teacher_kl_loss_coef = 0.01`` that is the first thing a reader
+    wants and the last thing a loss curve shows. The cosine says whether the two
+    are pulling the same way; a persistently negative one means the weighting is
+    spending its budget against the reward signal, which is a finding and not a
+    bug.
+    """
+    out = {}
+    for scope, tot in sums.items():
+        head = prefix if scope is None else f"{prefix}/{scope}"
+        n = tot["n"]
+        if n <= 0:
+            continue
+        opd = math.sqrt(max(tot["g_opd_sq"], 0.0))
+        grpo = math.sqrt(max(tot["g_grpo_sq"], 0.0))
+        out[f"{head}/grpo/grad_norm_opd"] = opd
+        out[f"{head}/grpo/grad_norm_grpo"] = grpo
+        if grpo > 1e-12:
+            out[f"{head}/grpo/grad_norm_ratio"] = opd / grpo
+        if opd > 1e-12 and grpo > 1e-12:
+            out[f"{head}/grpo/grad_cosine"] = tot["g_dot"] / (opd * grpo)
+    return out
+
+
 def state_shift_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     """The exact partition of ``(W - 1) D`` over the seven states plus the offset.
 
@@ -1455,7 +1575,7 @@ def state_shift_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     """
     kl = teacher_kl.detach().to(torch.float32)
     inv_mu = 1.0 / built["mu"].clamp(min=1e-12)
-    per_cand = built["teacher_prob"] * built["evidence"] * inv_mu.unsqueeze(-1) * kl.unsqueeze(-1)
+    per_cand = per_candidate_shift(built, teacher_kl)
     state = built["state"]
     out = {}
     for sid, name in _STATE_NAMES.items():
