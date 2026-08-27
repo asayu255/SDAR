@@ -97,10 +97,11 @@ import atexit
 import contextlib
 import os
 import re
+import sys
 import threading
 import time
-from typing import Dict
-from collections import defaultdict
+from typing import Dict, List
+from collections import Counter, defaultdict
 
 # Leading alignment flag + field width of a format spec such as ">9.0f".
 _WIDTH_RE = re.compile(r"([<>^]?)(\d+)")
@@ -181,6 +182,67 @@ def activity(name: str):
 def activity_snapshot() -> Dict[str, int]:
     with _ACTIVITY_LOCK:
         return dict(_ACTIVITY)
+
+
+# Where the threads actually are, asked of the interpreter rather than of a tag.
+#
+# The census answers "which tagged phase", and twice now the answer has been
+# "none of them": 1.0 of 3 slots, then 2.1 of 4, in no tagged phase while every
+# card was idle. Both times the response was to guess at a region and tag it --
+# record/assemble, then the env reset -- and both guesses measured below 0.05 of
+# a slot. A residual that survives two prescriptions is not going to be named by
+# a third guess.
+#
+# sys._current_frames() does not guess. It returns the frame every live thread
+# is executing right now, so a thread blocked in a socket read says socket.py
+# and a thread rebuilding tensors says the line it is on. Two frames are kept
+# per thread: the deepest one inside this repository, which says WHICH of our
+# code is responsible, and the innermost frame of all, which says what it is
+# doing there -- and those differ precisely in the interesting cases, where our
+# code is waiting inside somebody else's.
+# Measured at 49.8 us per snapshot with 14 live threads, which at the 0.3 s
+# sampling cadence is 0.63 s over a 3800 s run -- and it is spent on the
+# profiler thread, not on a slot. Off by env var anyway, because an instrument
+# that cannot be turned off cannot be ruled out as the cause of what it sees.
+_STACKS = os.environ.get("GPU_PROFILER_STACKS", "1").strip().lower() not in ("0", "false", "no", "off")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _frame_key(frame) -> str:
+    code = frame.f_code
+    return f"{os.path.basename(code.co_filename)}:{frame.f_lineno} {code.co_name}"
+
+
+def stack_snapshot() -> List[str]:
+    """One key per live thread: our deepest frame, and the innermost frame."""
+    if not _STACKS:
+        return []
+    out = []
+    me = threading.get_ident()
+    for ident, frame in sys._current_frames().items():
+        if ident == me:
+            continue
+        innermost, repo, walk, depth = frame, None, frame, 0
+        while walk is not None and depth < 200:
+            name = walk.f_code.co_filename
+            if "gpu_profiler" in name:
+                repo = None
+                innermost = None
+                break
+            if repo is None and name.startswith(_REPO_ROOT):
+                repo = walk
+            walk = walk.f_back
+            depth += 1
+        if innermost is None:
+            continue  # this thread is inside the profiler; it is not the subject
+        inner_key = _frame_key(innermost)
+        if repo is None:
+            out.append(f"(no repo frame) <- {inner_key}")
+        elif repo is innermost:
+            out.append(inner_key)
+        else:
+            out.append(f"{_frame_key(repo)} <- {inner_key}")
+    return out
 
 
 def now() -> float:
@@ -451,6 +513,7 @@ class _Sampler:
         self._util_trace = []
         self._cpu_trace = []
         self._act_trace = []
+        self._stack_trace = []
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -512,6 +575,7 @@ class _Sampler:
                 # which two other readers unpack by shape.
                 self._cpu_trace.append((t, (host or {}).get("cpu_pct")))
                 self._act_trace.append((t, activity_snapshot()))
+                self._stack_trace.append((t, stack_snapshot()))
             self._write_trace(t, phase, per_gpu, host)
 
     def _write_trace(self, t, phase, per_gpu, host):
@@ -615,6 +679,7 @@ class _Sampler:
         with self._lock:
             cpu_at = {ts: pct for ts, pct in self._cpu_trace if pct is not None}
             act_at = dict(self._act_trace)
+            stack_at = dict(self._stack_trace)
         def _mean(stamps):
             vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
             return (sum(vals) / len(vals)) if vals else None
@@ -648,6 +713,20 @@ class _Sampler:
                 return None
             names = {k for snap in seen for k in snap}
             return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
+
+        def _stacks(stamps, top=6):
+            """The frames the threads were actually on, over these samples.
+
+            Mean threads per sample on each frame, so it reads in the same unit
+            as the census beside it -- "1.2 of 3 slots were here" -- and the two
+            can be compared directly instead of one being a share and the other
+            a count.
+            """
+            seen = [stack_at[ts] for ts in stamps if ts in stack_at]
+            if not seen:
+                return None
+            counted = Counter(key for keys in seen for key in keys)
+            return [(key, n / len(seen)) for key, n in counted.most_common(top)]
         wall = sum(wall_by_count.values()) or 1.0
         return {
             "n_gpus": n_gpus,
@@ -687,6 +766,10 @@ class _Sampler:
             # scheduling or async scheduling touch neither.
             "util_when_busy": _busy_util(),
             "activity_when_empty": _census(empty_ts, act_at),
+            # The same question asked of the interpreter instead of the tags,
+            # for the part of EMPTY that no tag has ever claimed.
+            "stacks_when_empty": _stacks(empty_ts),
+            "stacks_when_busy": _stacks(busy_ts),
             "activity_when_busy": _census(busy_ts, act_at),
             # The most threads ever counted at once, which is the slot count in
             # practice. Without it "envstep 1.1" has no denominator and reads as
@@ -718,6 +801,7 @@ class _Sampler:
             self._util_trace = []
             self._cpu_trace = []
             self._act_trace = []
+            self._stack_trace = []
         if not samples:
             return
         by_phase = _accumulate(samples, self.n_gpus)
@@ -884,13 +968,26 @@ def format_residency(res) -> str:
     driver_running = empty_cpu is not None and empty_cpu >= 60
     driver_blocked = empty_cpu is not None and empty_cpu < 20
 
+    untagged = max(0.0, slots - accounted) if slots else 0.0
     if ranked:
         shown = ", ".join(f"{k} {v:.1f}" for k, v in ranked if v >= 0.05) or "nothing recorded"
         line = f"\n[gpu-residency] while EMPTY the slots were in: {shown}"
         if slots:
-            untagged = max(0.0, slots - accounted)
             line += f" (of {slots:.0f} slots; {untagged:.1f} in no tagged phase)"
         why += line
+
+    # The frames, whenever the tags leave a third of a thread or more
+    # unaccounted for. Printed as mean threads per sample, the same unit as the
+    # census above, so "1.2" means the same thing on both lines.
+    stacks = res.get("stacks_when_empty") or []
+    if stacks and untagged >= 0.33:
+        why += (
+            f"\n[gpu-residency]    {untagged:.1f} of those threads are in NO tagged phase. "
+            "Where they actually were, asked of the interpreter:"
+        )
+        for key, mean in stacks:
+            if mean >= 0.05:
+                why += f"\n[gpu-residency]      {mean:5.2f}  {key}"
 
     if driver_blocked:
         why += ("\n[gpu-residency] -> EMPTY is a WAIT OFF THE BOX: the driver burned "

@@ -20,13 +20,14 @@ from verl.utils import gpu_profiler as gp  # noqa: E402
 class _FakeSampler:
     """Just enough of Sampler for residency_between: a lock and a util trace."""
 
-    def __init__(self, trace, cpu=None, act=None):
+    def __init__(self, trace, cpu=None, act=None, stacks=None):
         import threading
 
         self._lock = threading.Lock()
         self._util_trace = list(trace)
         self._cpu_trace = list(cpu or [])
         self._act_trace = list(act or [])
+        self._stack_trace = list(stacks or [])
 
     residency_between = gp._Sampler.residency_between
 
@@ -151,11 +152,12 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     class _LiveFakeSampler:
         residency_between = live._Sampler.residency_between
 
-        def __init__(self, trace, cpu=None, act=None):
+        def __init__(self, trace, cpu=None, act=None, stacks=None):
             self._lock = threading.Lock()
             self._util_trace = list(trace)
             self._cpu_trace = list(cpu or [])
             self._act_trace = list(act or [])
+            self._stack_trace = list(stacks or [])
 
     start = time.perf_counter()
     end = start + 3.0
@@ -600,3 +602,82 @@ def test_the_shares_are_weighted_by_WALL_not_by_sample_count():
     # property a reader assumes and the old one did not have.
     for k, seconds in res["wall_by_count"].items():
         assert res["pct"][k] == pytest.approx(100.0 * seconds / res["wall"])
+
+
+# --------------------------------------------------------------------------- #
+# Asking the interpreter instead of the tags
+# --------------------------------------------------------------------------- #
+def test_a_thread_waiting_inside_repo_code_names_both_frames():
+    """Our frame says whose fault it is; the innermost says what it is doing.
+
+    They differ in exactly the case that matters -- our code blocked inside
+    somebody else's -- and a key that carried only one of them would answer
+    either "val_pipeline" (so what) or "queue.py: get" (whose queue?).
+    """
+    import queue
+    import threading
+    import time
+
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    gate, seen = queue.Queue(), {}
+
+    def sampler():
+        time.sleep(0.25)
+        seen["keys"] = gp.stack_snapshot()
+        gate.put(None)
+
+    threading.Thread(target=sampler, name="probe", daemon=True).start()
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(2)]
+    list(run_pipelined([1], lambda x: x, lambda _p: None,
+                       lambda _p, _s: gate.get(timeout=5), slots))
+
+    keys = seen["keys"]
+    # The worker: repo code blocked in the standard library. Both halves,
+    # because "threading.py: wait" alone would not say who is waiting -- and
+    # Queue.get parks in a Condition, so the innermost frame is threading's,
+    # not queue's. That is the point of keeping our frame too.
+    joined = [k for k in keys if "<-" in k]
+    assert joined, keys
+    assert any(k.split(" <- ")[1].startswith("threading.py") for k in joined), keys
+    assert any("test_gpu_residency.py" in k.split(" <- ")[0] for k in joined), keys
+    # The calling thread, which the census could never see: parked in retire()
+    # waiting on the future. This is a real finding, not scaffolding -- an
+    # untagged thread that is blocked, not running.
+    assert any("val_pipeline.py" in k and "retire" in k for k in keys), keys
+
+
+def test_the_stacks_are_aggregated_over_the_empty_samples_only():
+    """Mean threads per sample, the same unit as the census beside it."""
+    ts = [100.0 + i * 0.3 for i in range(4)]
+    trace = list(zip(ts, [[0, 0, 0], [0, 0, 0], [90, 90, 90], [90, 90, 90]]))
+    stacks = [
+        (ts[0], ["rollout_loop.py:1 a", "rollout_loop.py:2 b"]),
+        (ts[1], ["rollout_loop.py:1 a"]),
+        (ts[2], ["rollout_loop.py:9 busy"]),
+        (ts[3], ["rollout_loop.py:9 busy"]),
+    ]
+    res = _FakeSampler(trace, stacks=stacks).residency_between(0, 1e9)
+    empty = dict(res["stacks_when_empty"])
+    assert empty["rollout_loop.py:1 a"] == pytest.approx(1.0)   # in both empty samples
+    assert empty["rollout_loop.py:2 b"] == pytest.approx(0.5)   # in one of two
+    assert "rollout_loop.py:9 busy" not in empty                # that one was busy
+    assert dict(res["stacks_when_busy"])["rollout_loop.py:9 busy"] == pytest.approx(1.0)
+
+
+def test_the_frames_print_when_the_tags_leave_a_third_of_a_thread_unclaimed():
+    """The line only earns its space when the census has failed to explain."""
+    ts = [100.0 + i * 0.3 for i in range(2)]
+    trace = list(zip(ts, [[0, 0, 0], [0, 0, 0]]))
+    # slots_seen is the most threads ever tagged at once, so the fixture has to
+    # show three before one of them can be missing.
+    act = [(ts[0], {"gen": 3}), (ts[1], {"gen": 1})]
+    stacks = [(t, ["rollout_loop.py:1408 _scatter_active_to_full"] * 2) for t in ts]
+    out = gp.format_residency(_FakeSampler(trace, act=act, stacks=stacks).residency_between(0, 1e9))
+    assert "in NO tagged phase" in out
+    assert "_scatter_active_to_full" in out
+
+    # Everything tagged -> nothing to explain, no frame dump.
+    act_full = [(t, {"gen": 3}) for t in ts]
+    out = gp.format_residency(_FakeSampler(trace, act=act_full, stacks=stacks).residency_between(0, 1e9))
+    assert "in NO tagged phase" not in out

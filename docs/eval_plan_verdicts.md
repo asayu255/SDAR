@@ -407,3 +407,71 @@ pickle は `gen` の中で起きるので、この変更で `cpu-glue` は(比�
 エンジン固定・両方完走・同一 208 バッチ。**wall −13.5%、ms/row −13.1%。**
 これまでの 0.96 h 対 1.24 h は pump とエンジンを同時に変えていたので、
 pump 単独の値はこれが初めて。
+
+---
+
+## 12. env reset は EMPTY の正体ではなかった(仮説の棄却)
+
+`_reset_envs` は毎バッチの先頭、generate の前に走り、検証パスでは prefetch が
+効かない。EMPTY はバッチあたり 1.50s / 1.40s で、`ENV_RESET_REPORT_S` の既定は
+2 秒 —— **ちょうど探している大きさの reset は 1 行も出ない**。形が合いすぎていた。
+
+累計を取った結果:
+
+```
+[env-reset] cumulative: 20 resets, 69.4s (3.47s each), 0 overlapped
+[env-reset] cumulative: 25 resets, 69.5s (2.78s each), 0 overlapped
+```
+
+**reset 21〜25 の 5 回で 0.1 秒。1 回あたり 0.02 秒。**
+69.4 秒は最初の数回 —— スロットごとの env manager 構築 —— の**一度きりの費用**で、
+バッチあたりの費用ではない。208 バッチなら約 73 秒、run 全体の **1.9%**。
+EMPTY は約 9%。**中身ではない。**
+
+同時に、これは案3(幅 252→378)の機構の一つを否定する: widening は
+バッチ数を 2/3 にするが、スロット数は変えないので、この 69 秒は消えない。
+
+## 13. 当てずっぽうをやめて、インタプリタに訊く
+
+census の残差は減らなかった:
+
+```
+while EMPTY the slots were in: gen 0.8, envstep 0.6, preproc 0.4
+                               (of 4 slots; 2.1 in no tagged phase)
+```
+
+(`4 slots` は 3 スロット + 呼び出しスレッド。`val_pipeline` の
+`dataload`/`prepare`/`scoring` は呼び出しスレッドで数えられるため。)
+
+**2 回続けて外した。** 1 回目は record/assemble、2 回目は envreset ——
+どちらも実測で 0.05 スロット未満だった。2 つの処方を生き延びた残差は、
+3 つ目の当てずっぽうでは名前がつかない。
+
+`sys._current_frames()` は当てずっぽうをしない。全スレッドが**いま実行している
+フレーム**を返す。スレッドごとに 2 つ保持する:
+
+- **repo 内の最深フレーム** —— 我々のどのコードの責任か
+- **最内フレーム(全体)** —— そこで何をしているのか
+
+この 2 つは**まさに興味深い場合に食い違う** —— 我々のコードが他人のコードの中で
+待っているとき。実測で出た例:
+
+```
+val_pipeline.py:181 retire <- threading.py:327 wait
+```
+
+これは呼び出しスレッドが future を待って**ブロックしている** —— census には
+原理的に見えないもので、しかも「driver が Python を回している」でもない。
+
+コストは **14 スレッドで 1 回 49.8 µs、0.3 秒間隔・3800 秒の run 全体で 0.63 秒**
+(profiler スレッド上、スロット上ではない)。`GPU_PROFILER_STACKS=0` で止まる ——
+**止められない計器は、見ているものの原因として除外できない。**
+
+出力は census が説明できていないとき(無タグ ≥ 0.33 スレッド)だけ出る:
+
+```
+[gpu-residency]    2.1 of those threads are in NO tagged phase.
+                   Where they actually were, asked of the interpreter:
+[gpu-residency]      1.20  rollout_loop.py:1408 _scatter_active_to_full
+[gpu-residency]      0.60  val_pipeline.py:181 retire <- threading.py:327 wait
+```

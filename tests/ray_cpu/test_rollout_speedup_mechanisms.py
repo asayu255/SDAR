@@ -341,7 +341,16 @@ def test_the_env_reset_is_counted_in_the_activity_census():
     envstep, record and assemble, and this was none of them: it is part of what
     "1.0 of 3 slots in no tagged phase while EMPTY" was made of.
     """
-    from verl.utils import gpu_profiler
+    # THE MODULE ROLLOUT_LOOP HOLDS, not a fresh import of the same name.
+    # test_gpu_profiler_trace.py pops gpu_profiler out of sys.modules and
+    # re-imports it under a different interval, so "from verl.utils import
+    # gpu_profiler" here can hand back a second module object with its own
+    # _ACTIVITY dict -- and the census the code under test writes to would then
+    # be a different dict from the one this reads. It passes alone and fails in
+    # a full run, which is the worst way for a test to be wrong.
+    import agent_system.multi_turn_rollout.rollout_loop as rl
+
+    gpu_profiler = rl.gpu_profiler
 
     collector = TrajectoryCollector.__new__(TrajectoryCollector)
     collector._env_reset_prefetch = None
