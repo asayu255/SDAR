@@ -134,22 +134,46 @@ util が +0.32 に見えるのは基準値(3 枚とも忙しいときの util)�
 
 | 主張 | 確認 |
 | --- | :---: |
-| `environment.yml` は **vllm 0.11.0** を固定しているが、動いているのは **0.8.5** | **✅ 事実** |
+| `environment.yml` は **vllm 0.11.0** を固定しているが、動いているのは **0.8.5** | ✅ ただし下記 |
 | pump も最後に `[future.result(...) for future in futures]` で **batch 全体を待つ** | **✅ 事実**(`rollout_loop.py:440`) |
 | `_run_full_preprocess` は active row を **Python で 1 件ずつ** | **✅ 事実**(dict 内包) |
 
-### 1 つめが今日の話を変える
+### 1 つめの訂正 —— `environment.yml` はこの機械の記録ではない
 
-**`async_scheduling` は「vLLM を更新する計画」ではなく、`environment.yml` が
-既に指している版を入れるだけである。**
+「`environment.yml` が指している版を入れるだけ」と一度書いたが、**言い過ぎである。**
+中身を読むと:
 
 ```
-environment.yml:250  vllm==0.11.0     ← 固定されている
-実際に import される  vllm 0.8.5       ← ユーザの probe 出力
+name: verl-agent                          ← 動いているのは sdar-multitask
+channels: ... sankuai.com ...             ← 社内ミラー
+torch==2.8.0  transformers==4.57.3  vllm==0.11.0  xformers==0.0.32.post1
 ```
 
-ただし 0.8.5 → 0.11.0 は kernel も reduction 順も変わるので、
-**過去のスコアは全部比較対象でなくなる。** 単独の実験にすること。
+**別名の環境を、別のチャンネルから作る vendored な成果物**であって、
+「本来こうだった環境がずれた記録」ではない。**ここから復元してはいけない。**
+
+### それでも 0.11.0 に上げる価値はある(そして代償がある)
+
+`async_scheduling`(V1 が scheduler を forward に被せる)は **0.10.2 より前に存在しない**。
+3 枚とも忙しいのに 91% しか出ない残り約 9 pt に対する、**唯一残った打ち手**である。
+
+**代償は 2 つ:**
+
+1. **torch 2.6 → 2.8。** vLLM 0.8.5 は torch 2.6、0.11.0 は 2.8 を要求する。
+   2.6 に対してビルドされたもの(flash-attn、flashinfer、xformers、apex、
+   自前の CUDA 拡張)は**インストール時には落ちず、import か最初の kernel で落ちる。**
+2. **kernel と reduction 順が変わる。** 0.8.5 で測ったスコアは**全部**比較対象でなくなる。
+
+だから**現環境は触らず、クローンに入れる**:
+
+```bash
+bash examples/sft_trainer/clone_env_vllm011.sh sdar-multitask sdar-vllm011
+```
+
+clone → `pip install vllm==0.11.0` → **pip が何を変えたかの diff** →
+torch / vllm / flash_attn / flashinfer / xformers の import 確認 →
+`LLM()` に `async_scheduling` があるかの確認、まで一度に出る。
+落ちたら元の環境は無傷なので、クローンを捨てるだけで済む。
 
 ### 私の cpu_pct 判定は弱かった —— レビューの指摘が正しい
 
@@ -224,4 +248,4 @@ grep 'EMPTY is' /tmp/<log>
 | 4 | `grep TOTAL \| tail -3` を切り分けの根拠に | 別の batch を比べていた(promptTok が 6 倍違う)。§5 罠 3 と同じ |
 | 5 | util を目的関数に最適化(3 回目) | 効いたかは wall と ms/row でしか言えない |
 | 6 | `cpu_pct >= 60` を「GIL を握っている」の証明に | 証明できるのは「CPU を使っている」まで。Rust tokenizer は GIL を離す。**activity census に置き換えた**(§7bis) |
-| 7 | 動いている vLLM の版を確かめずに「0.8.5 には手が無い」 | `environment.yml` は 0.11.0 を固定している。**入っていないだけだった** |
+| 7 | 動いている vLLM の版を確かめずに「0.8.5 には手が無い」 | 版は確かめるべきだった。ただし §7bis のとおり `environment.yml` は**別環境の vendored な成果物**で、「入っていないだけ」も言い過ぎだった —— **2 段階で間違えた** |
