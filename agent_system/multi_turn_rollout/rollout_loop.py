@@ -1399,86 +1399,92 @@ class TrajectoryCollector:
             next_obs, rewards, dones, infos = _step_envs()
         _m_env = _now()  # end of env.step (CPU / HTTP / IPC)
 
-        if turn_records is not None:
-            turn_records.append({
-                "turn": turn,
-                "active": int(len(active_idx)),
-                "preproc": _m_preproc - _m0,
-                "gen": _m_gen - _m_preproc,
-                "decode": _m_decode - _m_gen,
-                "envstep": _m_env - _m_decode,
-                "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
-                "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
-                "prompt_tok": _prompt_tok,
-                "gen_tok": _gen_tok,
-            })
+        # Everything from here to the end of the turn is driver Python, and none
+        # of it was tagged: the census read "1.5 of 3 slots in no tagged phase"
+        # while every card was empty and the driver held 80% of a core.
+        # to_list_of_dict alone expands the whole 252-row DataProto into dicts,
+        # every turn.
+        with gpu_profiler.activity("record"):
+            if turn_records is not None:
+                turn_records.append({
+                    "turn": turn,
+                    "active": int(len(active_idx)),
+                    "preproc": _m_preproc - _m0,
+                    "gen": _m_gen - _m_preproc,
+                    "decode": _m_decode - _m_gen,
+                    "envstep": _m_env - _m_decode,
+                    "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
+                    "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
+                    "prompt_tok": _prompt_tok,
+                    "gen_tok": _gen_tok,
+                })
 
-        if len(rewards.shape) == 2:
-            rewards = rewards.squeeze(1)
-        if len(dones.shape) == 2:
-            # dones is numpy, delete a dimension
-            dones = dones.squeeze(1)
+            if len(rewards.shape) == 2:
+                rewards = rewards.squeeze(1)
+            if len(dones.shape) == 2:
+                # dones is numpy, delete a dimension
+                dones = dones.squeeze(1)
 
-        # Rows this caller may read out of the env's batch-shaped answer. For the
-        # batch-wide caller that is every row, so `probe` is row 0 and the scans
-        # below cover the whole batch exactly as they did inline. A per-task
-        # caller must stay inside its own rows: the others hold the merge's
-        # neutral fill, and are another thread's to write.
-        owned = range(batch_size) if task is None else [int(i) for i in rows]
-        probe = 0 if task is None else int(rows[0])
+            # Rows this caller may read out of the env's batch-shaped answer. For the
+            # batch-wide caller that is every row, so `probe` is row 0 and the scans
+            # below cover the whole batch exactly as they did inline. A per-task
+            # caller must stay inside its own rows: the others hold the merge's
+            # neutral fill, and are another thread's to write.
+            owned = range(batch_size) if task is None else [int(i) for i in rows]
+            probe = 0 if task is None else int(rows[0])
 
-        is_action_valid = np.ones(batch_size, dtype=bool)
-        if 'is_action_valid' in infos[probe]:
+            is_action_valid = np.ones(batch_size, dtype=bool)
+            if 'is_action_valid' in infos[probe]:
+                for i in owned:
+                    is_action_valid[i] = infos[i]['is_action_valid']
+            batch.non_tensor_batch['is_action_valid'] = is_action_valid
+
+            if 'tool_calling' in infos[probe]:
+                tool_callings = state["tool_callings"]
+                for i in active_rows:
+                    tool_callings[i] += np.float32(infos[i]['tool_calling'])
+            # Create reward tensor, only assign rewards for active environments
+            state["episode_rewards"][active_masks] += torch_to_numpy(rewards)[active_masks]
+            state["episode_lengths"][active_masks] += 1
+
+            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+            batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
+            batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+
+            # Update episode lengths for active environments
+            batch_list: list[dict] = to_list_of_dict(batch)
+
             for i in owned:
-                is_action_valid[i] = infos[i]['is_action_valid']
-        batch.non_tensor_batch['is_action_valid'] = is_action_valid
+                if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
+                    # Finished trajectories' rows carry active_masks=False and are
+                    # dropped by gather_rollout_data(); skip materializing them.
+                    # Active rows form a prefix of each trajectory's list, so the
+                    # enumerate-based turn_step and the last-active-entry scans in
+                    # success_evaluator / filter_group_data are unchanged.
+                    continue
+                total_batch_list[i].append(batch_list[i])
+                total_infos[i].append(infos[i])
 
-        if 'tool_calling' in infos[probe]:
-            tool_callings = state["tool_callings"]
-            for i in active_rows:
-                tool_callings[i] += np.float32(infos[i]['tool_calling'])
-        # Create reward tensor, only assign rewards for active environments
-        state["episode_rewards"][active_masks] += torch_to_numpy(rewards)[active_masks]
-        state["episode_lengths"][active_masks] += 1
+            # Update done states
+            newly_done = np.logical_and(active_masks, dones)
+            if task is None:
+                is_done[:] = np.logical_or(is_done, dones)
+            else:
+                is_done[rows] = np.logical_or(is_done[rows], np.asarray(dones, dtype=bool)[rows])
 
-        assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
-        batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
-        batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+            if self._logprob_prefetch_enabled:
+                # Trajectories that finished this turn now have all their rows
+                # final; queue them for prefetched old_log_prob on later turns.
+                for i in np.nonzero(newly_done)[0]:
+                    for step_idx, row in enumerate(total_batch_list[i]):
+                        if row['active_masks']:
+                            self._logprob_pending.append(((state["traj_uid"][i], step_idx), row))
 
-        # Update episode lengths for active environments
-        batch_list: list[dict] = to_list_of_dict(batch)
-
-        for i in owned:
-            if _ROLLOUT_COMPACT_RECORD and not active_masks[i]:
-                # Finished trajectories' rows carry active_masks=False and are
-                # dropped by gather_rollout_data(); skip materializing them.
-                # Active rows form a prefix of each trajectory's list, so the
-                # enumerate-based turn_step and the last-active-entry scans in
-                # success_evaluator / filter_group_data are unchanged.
-                continue
-            total_batch_list[i].append(batch_list[i])
-            total_infos[i].append(infos[i])
-
-        # Update done states
-        newly_done = np.logical_and(active_masks, dones)
-        if task is None:
-            is_done[:] = np.logical_or(is_done, dones)
-        else:
-            is_done[rows] = np.logical_or(is_done[rows], np.asarray(dones, dtype=bool)[rows])
-
-        if self._logprob_prefetch_enabled:
-            # Trajectories that finished this turn now have all their rows
-            # final; queue them for prefetched old_log_prob on later turns.
-            for i in np.nonzero(newly_done)[0]:
-                for step_idx, row in enumerate(total_batch_list[i]):
-                    if row['active_masks']:
-                        self._logprob_pending.append(((state["traj_uid"][i], step_idx), row))
-
-        # Update observations for next step
-        if task is None:
-            state["obs"] = next_obs
-        else:
-            _splice_obs(obs, next_obs, rows)
+            # Update observations for next step
+            if task is None:
+                state["obs"] = next_obs
+            else:
+                _splice_obs(obs, next_obs, rows)
 
         # Another turn only if something this caller owns is still running.
         return not bool(is_done[rows].all())
@@ -1764,14 +1770,17 @@ class TrajectoryCollector:
         assert len(total_batch_list) == len(totoal_tool_callings)
         
 
-        # Create trajectory data
-        gen_batch_output: DataProto = self.gather_rollout_data(
-            total_batch_list=total_batch_list,
-            episode_rewards=total_episode_rewards,
-            episode_lengths=total_episode_lengths,
-            success=total_success,
-            traj_uid=total_traj_uid,
-            tool_callings=totoal_tool_callings,
-        )
+        # Create trajectory data. Pads every turn of every trajectory into one
+        # DataProto on the driver, after the last generate has returned -- so
+        # the cards are empty for all of it.
+        with gpu_profiler.activity("assemble"):
+            gen_batch_output: DataProto = self.gather_rollout_data(
+                total_batch_list=total_batch_list,
+                episode_rewards=total_episode_rewards,
+                episode_lengths=total_episode_lengths,
+                success=total_success,
+                traj_uid=total_traj_uid,
+                tool_callings=totoal_tool_callings,
+            )
         
         return gen_batch_output

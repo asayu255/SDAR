@@ -873,6 +873,8 @@ def format_residency(res) -> str:
             "prepare": "batch preparation on the calling thread",
             "scoring": "reward accumulation on the calling thread",
             "envstep": "envstep -- the driver's work around the call, not the retriever",
+            "record": "per-turn bookkeeping (to_list_of_dict expands the whole batch every turn)",
+            "assemble": "gather_rollout_data, padding every turn of every trajectory",
         }.get(top_name, top_name)
         where = f", mostly in {named}" if dominates else ", and no single phase dominates"
         why += (f"\n[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: {empty_cpu:.0f}% of one "

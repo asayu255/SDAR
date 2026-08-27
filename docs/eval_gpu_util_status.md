@@ -488,6 +488,65 @@ bash examples/sft_trainer/eval_checkpoints.sh <step> -- \
 
 ---
 
+## 7octies. EMPTY の半分は、まだどこにも計上されていなかった
+
+タグを 3 つ足したあとの実測(V0 + ms4、pump なし):
+
+```
+[gpu-residency] while EMPTY the slots were in: gen 0.8, preproc 0.5, scoring 0.1
+                (of 3 slots; 1.5 in no tagged phase)
+[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: 80% of one core while
+                EMPTY against 11% while busy, and no single phase dominates
+```
+
+| 読めること | |
+| --- | --- |
+| **`envstep` が消えた**(0.05 未満) | **retriever は原因ではない。確定。** |
+| 80%/11% (前回 82%/15%) | **driver が Python を回している。2 run で一致。** |
+| **`1.5 in no tagged phase`** | **半分がまだ計器の外** |
+| `gen 0.8` | generate 呼び出しの中にいるのに**カードは空** —— Ray RPC と DataProto の直列化 |
+
+### 塞いだもの
+
+| タグ | 何 |
+| --- | --- |
+| **`record`** | turn の後半すべて。`to_list_of_dict(batch)` が**毎ターン 252 行の DataProto を dict に展開**している |
+| **`assemble`** | `gather_rollout_data` —— 最後の generate が返ったあとに全 turn × 全 trajectory を pad する。**その間カードは全部空** |
+
+### `no single phase dominates` が示唆すること
+
+タグを 6 つに増やしても過半を取る phase が無い。**driver は 1 箇所で詰まっているのではなく、
+ほぼ 1 コア飽和(= GIL 律速)で全体的に忙しい。**
+
+**単一の phase を速くしても、別の phase が同じだけ露出する** —— §5 の「空きの保存」と同じ形。
+`record` と `assemble` が名指しされれば話は変わるが、**それは次の run が言う。**
+
+---
+
+## 7novies. tail turn —— 生成 wall の半分が、token の 2 割に使われている
+
+同じログの turn table。search batch の 1 本(batch#9):
+
+| turn | active | gen | genTok |
+| ---: | ---: | ---: | ---: |
+| 0 | 252 | 1.26 s | 4,879 |
+| 1 | 252 | 25.54 s | 52,401 |
+| **2** | **58** | **13.70 s** | 11,273 |
+| **3** | **12** | **10.82 s** | 2,514 |
+
+**turn 2+3 = 生成 wall の 48%、token の 19%。** batch#8 では **59% / 25%**。
+
+turn 3 は **12 行で 2,514 token に 10.8 秒** —— 1 step あたり 53 ms。
+`genGPU%` は 78〜94 なので、**GPU は「忙しい」と読まれる。忙しく、かつ無駄である。**
+
+**これは util では見えない。** duty cycle も EMPTY も PARTIAL も、この 10 秒を正常と報告する。
+
+これを直すのは **trajectory 単位の進行**(計画 6)である。turn 1 で終わった 240 行が
+turn 3 の 12 行を待つ理由はない。**preproc は turn あたり 0.14〜1.3 秒**なので、
+batch tokenizer(計画 4)はここには桁が届かない。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**

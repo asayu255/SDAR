@@ -159,7 +159,10 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     end = start + 3.0
     # Stamped on the sampler's clock, which is what the conversion has to hit.
     offset = time.monotonic() - time.perf_counter()
-    trace = _trace([[0, 0, 0]] * 2 + [[90, 90, 90]] * 8, interval=0.3, t0=start + offset)
+    # Started inside the window, not on its edge: _residency_over recomputes
+    # the offset, and a sample stamped exactly at the boundary can land a
+    # microsecond outside it and drop out of the count.
+    trace = _trace([[0, 0, 0]] * 2 + [[90, 90, 90]] * 8, interval=0.3, t0=start + offset + 0.05)
     monkeypatch.setattr(live, "_sampler", _LiveFakeSampler(trace))
     monkeypatch.setattr(live, "enabled", lambda: True)
     # Pinned rather than inherited. These are module globals read at call time,
@@ -468,3 +471,32 @@ def test_envstep_under_a_running_driver_still_says_it_is_not_the_retriever():
     trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
     line = gp.format_residency(_both(trace, 90.0, 20.0, {"envstep": 2.6}))
     assert "not the retriever" in line, line
+
+
+def test_the_per_turn_bookkeeping_is_nameable():
+    """MEASURED: "1.5 of 3 slots in no tagged phase", half the driver's time.
+
+    to_list_of_dict expands the whole 252-row DataProto into dicts on every
+    turn, and gather_rollout_data pads every turn of every trajectory after the
+    last generate returns -- both on the driver, both with the cards empty, and
+    neither was in any phase.
+    """
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"record": 2.6}))
+    assert "to_list_of_dict expands the whole batch" in line, line
+
+
+def test_the_final_assembly_is_nameable():
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"assemble": 2.6}))
+    assert "gather_rollout_data" in line, line
+
+
+def test_a_large_untagged_remainder_is_the_headline_number():
+    """Half in no phase means the tagging is the thing to fix, not the phases."""
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    res = _both(trace, 80.0, 11.0, {"gen": 0.8, "preproc": 0.5, "scoring": 0.1})
+    assert res["slots_seen"] == 3
+    line = gp.format_residency(res)
+    assert "1.6 in no tagged phase" in line, line
+    assert "no single phase dominates" in line, line
