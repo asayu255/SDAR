@@ -198,9 +198,11 @@ class PumpClient:
             # tokens cross Ray as one buffer, and list() on an array rebuilds
             # every token as an np.int32 scalar -- heavier than the Python ints
             # the array was replacing. Measured on 252 x 1,300 tokens under
-            # pickle protocol 5: 1.2 ms and 1.32 MB as arrays against 627.6 ms
-            # and 4.92 MB as a list of scalars. The worker calls _as_plain_ids
-            # at the vLLM boundary, which is the only place a list is required.
+            # pickle protocol 5: 3.3 ms and 1.32 MB as arrays against 922.1 ms
+            # and 4.92 MB as a list of scalars -- the sizes are exact, the
+            # timings move by about a third from run to run on a busy box and
+            # the ratio does not. The worker calls _as_plain_ids at the vLLM
+            # boundary, which is the only place a list is required.
             self._inbox.append((request_id, _as_wire_ids(prompt_token_ids), carried))
             self.submitted += 1
         self._wake.set()
