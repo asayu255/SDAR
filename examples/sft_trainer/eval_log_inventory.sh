@@ -44,8 +44,17 @@ for log in "$@"; do
     grep -q 'rollout-pump.*driving .* ranks as a pool' "$f" && pump=ON
     grep -q 'rollout-pump.*staying on the blocking path\|rollout-pump.*handshake failed' "$f" && pump=REFUSED
 
+    # STEPS is only knowable from the [rollout-engine] line. A run older than
+    # that line reports no core, and defaulting its steps to 1 would state as
+    # measured the very thing that cannot be read -- which is how a log gets
+    # mistaken for a valid control. No engine line, no engine columns.
     core=$(_first "$f" 'core=[A-Za-z0-9]*'); core=${core#core=}
-    steps=$(_first "$f" 'num_scheduler_steps=[0-9]*'); steps=${steps#num_scheduler_steps=}
+    if [ -n "$core" ]; then
+        steps=$(_first "$f" 'num_scheduler_steps=[0-9]*'); steps=${steps#num_scheduler_steps=}
+        steps=${steps:-1}   # =<default> or =absent both mean ordinary scheduling
+    else
+        steps="?"
+    fi
     depth=$(_first "$f" 'VAL_PIPELINE_DEPTH=[0-9]*'); depth=${depth#VAL_PIPELINE_DEPTH=}
 
     # The last report, final or periodic -- and whether it was the final one,
@@ -59,7 +68,7 @@ for log in "$@"; do
     score=$(grep -o "'val/success_rate': [0-9.]*" "$f" | tail -1 | grep -o '[0-9.]*$')
 
     printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
-        "$(basename "$log")" "$pump" "${core:-?}" "${steps:-1}" "${depth:-?}" \
+        "$(basename "$log")" "$pump" "${core:-?}" "$steps" "${depth:-?}" \
         "${batches:-?}" "${wall:-?}" "${msrow:-?}" "${score:-unfinished}"
 done
 

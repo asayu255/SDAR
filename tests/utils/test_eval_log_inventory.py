@@ -105,3 +105,18 @@ def test_a_pump_line_in_a_long_log_is_not_lost_to_sigpipe(logs):
     out = inventory(*logs)
     assert out.count(" ON ") == 3
     assert " off " not in out
+
+
+def test_a_run_older_than_the_engine_line_reports_no_engine_columns(tmp_path, logs):
+    """An unknown engine must not print as "1 step", which reads as measured.
+
+    The 8/26 runs predate [rollout-engine]. Printing STEPS=1 for them would
+    have made eval_window.log look like a valid V1 control for a V1 candidate
+    when nothing in it says which core it ran.
+    """
+    old = write_log(tmp_path / "eval_window.log", pump=False, core="V1", steps=1, depth=3,
+                    batches=208, wall=4534.0, ms_row=86, score="0.3869")
+    old.write_text("\n".join(l for l in old.read_text().splitlines() if "rollout-engine" not in l) + "\n")
+    fields = row(inventory(old, *logs), "eval_window.log")
+    assert fields[2] == "?" and fields[3] == "?"
+    assert fields[5] == "208"  # everything not derived from the engine still reads
