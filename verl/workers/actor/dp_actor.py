@@ -1962,6 +1962,13 @@ class DataParallelPPOActor(BasePPOActor):
                                     )
                                 )
                                 responses_mb = data["responses"]
+                                # .get, not `in data.batch`: by this point the
+                                # micro-batch is a TensorDict (or a plain dict on
+                                # the multi-modal path) and has no .batch. The
+                                # column is absent on an arm whose reward manager
+                                # failed, which is a monitoring failure and must
+                                # not take the step down.
+                                row_scores = data.get("token_level_scores", None)
                                 event_stats.update(
                                     support_ids=sign_cand_inputs["support_ids"],
                                     state=sign_cand_inputs["state"],
@@ -1981,11 +1988,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         if sign_role_tags
                                         else None
                                     ),
-                                    reward=(
-                                        data["token_level_scores"].sum(dim=-1)
-                                        if "token_level_scores" in data.batch.keys()
-                                        else None
-                                    ),
+                                    reward=(row_scores.sum(dim=-1) if row_scores is not None else None),
                                 )
                             if pair_token_stats is not None and task_ids is not None:
                                 # Which tokens each off-task teacher sends into

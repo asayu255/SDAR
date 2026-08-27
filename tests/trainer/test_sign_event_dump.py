@@ -370,6 +370,24 @@ def test_the_event_sampler_is_gated_on_the_config_and_not_on_the_batch():
     assert "sign_cfg_on" in ctor
 
 
+def test_the_micro_batch_is_never_treated_as_a_dataproto():
+    """Inside the loop ``data`` is a TensorDict, or a plain dict on the
+    multi-modal path -- the DataProto is unpacked at the top of the body. A
+    ``data.batch.keys()`` there raises AttributeError on the first step of every
+    run, which is the kind of thing a CPU test suite cannot see and a 618 s/step
+    job discovers ten minutes in."""
+    src = _update_policy_source()
+    # From just after the unpack -- the one line that legitimately reaches
+    # through .batch is the isinstance(data, DataProto) branch that flattens it.
+    body = src[src.index('responses = data["responses"]'):]
+    offenders = [
+        line.strip()
+        for line in body.splitlines()
+        if "data.batch" in line.split("#")[0]
+    ]
+    assert not offenders, offenders
+
+
 def test_the_candidate_effect_is_computed_once_for_every_table():
     """Three tables rank by it. Three calls would let them disagree."""
     src = _update_policy_source()
