@@ -2326,17 +2326,37 @@ bash examples/sft_trainer/eval_checkpoints.sh <step>
 伸びる**。1 batch 4 turn なら 0.4 秒 / 14 秒 = 2.9%。glue が 3.4 pt 戻るなら
 釣り合う。合格条件は **PARTIAL 7% 前後のまま、glue が 8% に戻ること。**
 
-### driver の Python か retriever かを分ける grep
+### 撤回 —— `grep TOTAL | tail -3` は比較になっていない
 
-`SHARE` 行は preproc + decode + envstep を合計してしまう。turn table の
-`TOTAL` 行は分かれている:
+上の grep を出したが、**間違いである。** `TOTAL` 行は **1 batch の合計**で、
+batch は alfworld(126 行 × 50 turn)/ search(252 行 × 4)/ webshop(126 行 × 15)の
+どれかである。2 つのログの `tail -3` は**別の batch を 3 つずつ**拾う。
+
+実際に出た値:
+
+| | promptTok | preproc | envstep |
+| --- | ---: | ---: | ---: |
+| pump | 472k / **100k** / 632k | 2.5 / 0.6 / 3.4 | 1.8 / 0.8 / 2.3 |
+| depth 3 | 353k / 372k / 398k | 2.8 / 2.6 / 1.9 | 1.3 / 1.2 / 1.4 |
+
+**トークン数が 6 倍違う。** promptTok 10 万で割ると preproc は
+0.53/0.60/0.54 対 0.79/0.70/0.48 で **pump のほうがむしろ低い**、envstep は
+0.38/**0.80**/0.36 対 0.37/0.32/0.35 で **1 本だけ外れ値** —— どちらとも言えない。
+
+**これは §5 の罠 3(span と s/batch を突き合わせた)と同じ間違いである。**
+正規化されていない量を run 間で比べた。
+
+### 正しい軸は `WALL` 行の `ms/row`
+
+batch 構成の違いを割り算で落としてあるのがこの列で、そのために存在する。
 
 ```bash
-grep 'TOTAL' /tmp/eval_pump.log   | tail -3
-grep 'TOTAL' /tmp/eval_depth3.log | tail -3
+bash examples/sft_trainer/judge_eval.sh <control.log> <candidate.log>
 ```
 
-- **`preproc` / `decode` が増えて `envstep` が変わらない** → driver の Python(GIL)
-- **`envstep` が増えた** → retriever の取り合い
+section 5 が `ms/row all=` を両方から出す。**`last=` ではなく `all=` を読むこと**
+—— last20 の窓はその時どの task が入っていたかで動く。また、mix は時間的に
+一様ではないので、**両者が同程度の batch 数を通過してから**でないと比較にならない。
 
-**打ち手が完全に別なので、これを先に見ること。**
+手で `grep TOTAL` をやり直さないこと。スクリプトに入れたのは、
+**同じ間違いを二度としないためである。**

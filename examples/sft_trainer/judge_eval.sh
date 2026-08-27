@@ -153,9 +153,32 @@ if [ -n "$CANDIDATE" ]; then
 NOTE
 fi
 
-rule "5. wall"
+# --- 5. the only speed number that survives a different batch mix ----------- #
+# NOT the turn table's TOTAL row. That is per batch, and a batch is alfworld
+# (126 rows to 50 turns), search (252 rows to 4) or webshop (126 rows to 15), so
+# `tail -3` on two logs compares three different batches -- seen in practice at
+# 100k against 632k prompt tokens, a 6x spread that swamps any real difference.
+# ms/row divides it out, which is why the WALL line carries it.
+rule "5. speed -- ms/row, normalised across the batch mix"
 for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
-    printf '%-28s ' "$(basename "$f"):"
+    printf '%-24s ' "$(basename "$f"):"
+    line=$(_clean "$f" | grep -o 'ms/row last[0-9]*=[0-9]* all=[0-9]*' | tail -1)
+    if [ -n "$line" ]; then
+        batches=$(_clean "$f" | grep -c 'WALL ')
+        echo "$line   (over $batches batches)"
+    else
+        echo "NOT FOUND -- no [rollout-turn-timing] WALL line yet"
+    fi
+done
+cat <<'NOTE'
+  Read "all=", not "last=": the last-20 window moves with whichever tasks
+  happened to be in it. Two runs are comparable on this only once both have
+  passed roughly the same batch count, since the mix is not uniform in time.
+NOTE
+
+rule "6. wall"
+for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
+    printf '%-24s ' "$(basename "$f"):"
     _clean "$f" | grep -o 'val-pipeline\] final:.*over [0-9.]*s' | tail -1 \
         || _clean "$f" | grep -o 'val-pipeline\] after [0-9]*:.*over [0-9.]*s' | tail -1 \
         || echo "NOT FOUND"
