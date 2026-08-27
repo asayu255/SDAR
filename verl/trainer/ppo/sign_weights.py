@@ -49,12 +49,16 @@ Two ways to spend the signal, selected by ``mode``. THEY DO NOT SHARE A WEIGHT
 TABLE, and that is not an oversight:
 
 ``position``
-    One scalar per token position multiplies the whole per-token KL. The weight
+    One scalar per token position multiplies the whole per-token KL -- the
+    weighting applied to the DIVERGENCE rather than to a probability. The weight
     is a positive constant with respect to the student, so the minimiser of the
     weighted loss is still the on-task teacher's distribution: this reallocates
-    *how hard* each position is learned and cannot move the target. Direction is
-    meaningless here -- a KL term has no sign to follow -- so agreement counts
-    the same whether the teachers agreed to raise a token or to lower it.
+    *how hard* each position is learned and cannot move the target. Exactly, at
+    a position weighted by ``W``, every student logit's gradient is the
+    unweighted one times ``W`` -- the direction is untouched and only the step
+    length at that position changes. Direction is meaningless here -- a KL term
+    has no sign to follow -- so agreement counts the same whether the teachers
+    agreed to raise a token or to lower it.
 
 ``target``
     The on-task teacher's distribution itself is reweighted candidate-wise and
@@ -66,14 +70,28 @@ TABLE, and that is not an oversight:
     probability of tokens every teacher agreed to suppress, i.e. undo the very
     edit the agreement is evidence for.
 
-Note what ``target`` deliberately does NOT do: multiply the individual terms of
-the KL sum. The distillation loss here is a *reverse* KL,
+Note what NEITHER mode does: multiply the individual terms of the KL sum. That
+third option is the other thing "weight the KL directly" could mean, and it is
+the one deliberately not taken. The distillation loss here is a *reverse* KL,
 ``sum_v p_student(v) (log p_student(v) - log p_teacher(v))``, whose per-candidate
-term is a cost the student pays for its own mass at ``v``. Scaling that term up
-makes the student put *less* mass on ``v`` -- the exact opposite of "both
-teachers like this token, learn it harder". Reweighting the target instead gets
-the intended direction and keeps the loss a proper divergence (non-negative,
-zero only at the target), which the term-wise product is not.
+term is a cost the student pays for its own mass at ``v``. Writing
+``f_v = log p_student(v) - log p_teacher(v)``, the descent direction on logit
+``j`` under term weights ``w`` is
+
+    p_student(j) * ( E_student[w (f + 1)] - w_j (f_j + 1) )
+
+so raising ``w_j`` pushes token ``j`` DOWN whenever ``f_j > -1``, i.e. at every
+candidate where the teacher holds less than ``e`` times the student's mass --
+the exact opposite of "both teachers like this token, learn it harder". Measured
+on a five-candidate example: at ``w_j = 1.5`` on a token the student already
+matches the teacher on, the update moves from ``0`` to ``-0.120``; at ``w_j =
+2.0``, to ``-0.240``. The sign only flips in the far-gap regime ``f_j < -1``,
+which makes the weight's meaning depend on how far the student currently is
+rather than on what the teachers said. On top of that the term-wise product is
+not a divergence at all -- it can go negative, and its minimum is not the
+teacher -- whereas ``position`` scales a whole non-negative KL and ``target``
+distils to a genuine distribution. Both of those keep the property that the loss
+is zero only at the target; the term-wise product does not.
 """
 
 import math
@@ -92,6 +110,9 @@ __all__ = [
     "normalize_per_task",
     "SignWeightStats",
     "TokenStateCounts",
+    "POSITION_TERMS",
+    "position_decomposition_terms",
+    "position_ratio_metrics",
 ]
 
 # Column the driver writes and the actor reads in ``position`` mode when the
@@ -712,21 +733,37 @@ class TokenStateCounts:
     * ``mass`` -- the on-task teacher's probability summed over those events. A
       token can be reinforced constantly and carry no mass, which means the
       reinforcement reached nothing the teacher was actually going to say.
-    * ``dq_pos`` / ``dq_neg`` -- the POST-NORMALISATION change to the target,
-      ``dq(v) = p_T(v) * (w(v)/Z - 1)``, accumulated separately by sign. This is
-      what the student is actually distilled toward, and it is not a rescaling of
-      the pre-normalisation ``(w-1) p_T``: since
-      ``dq = (w-1)p_T/Z - p_T (Z-1)/Z``, the second term moves EVERY token in
-      proportion to its own mass, so a high-probability token the weights never
-      touched still loses mass when the rewrite raises others. A quantity built
-      from ``w - 1`` alone reports zero there and misses the whole
-      redistribution.
+    * ``eff_pos`` / ``eff_neg`` -- the POST-NORMALISATION effect the weighting had
+      at that token, accumulated separately by sign. WHAT that effect is depends
+      on the mode, because the two modes act on different objects, and reporting
+      one formula under both would put nats and probabilities in the same column:
+
+      ``target``   ``dq(v) = p_T(v) * (w(v)/Z - 1)``, the change to the target
+                   distribution -- what the student is actually distilled toward.
+                   It is not a rescaling of the pre-normalisation ``(w-1) p_T``:
+                   since ``dq = (w-1)p_T/Z - p_T (Z-1)/Z``, the second term moves
+                   EVERY token in proportion to its own mass, so a
+                   high-probability token the weights never touched still loses
+                   mass when the rewrite raises others. A quantity built from
+                   ``w - 1`` alone reports zero there and misses the whole
+                   redistribution.
+      ``position`` ``dkl(v) = p_T(v) * (w(v)/m - 1) * KL``, in NATS: the target
+                   does not move here, so the only thing a token can be credited
+                   with is its share of the cost the weighting added to this
+                   position. The same formula with the per-task normalising mean
+                   ``m`` where target mode has ``Z``, times the KL the weight
+                   multiplies -- because a weight of 1.25 at a position whose KL
+                   is zero changes the loss by zero, and a table without the
+                   factor would rank that token first. Summed over tokens and
+                   positions it is the nats the arm added, up to the tail's own
+                   ``tail * (1/m - 1) * KL``, which no token can be charged for.
 
       Split by sign, and filed per STATE, because both cancellations are real: a
       token reinforced in one context and suppressed in another nets toward zero,
-      and so does one whose own weight is 1 while Z varies. Net is
-      ``dq_pos + dq_neg``; gross is ``dq_pos - dq_neg``. Reporting only the net
-      drops a token that matters in both directions out of the ranking entirely.
+      and so does one whose own weight is 1 while the normaliser varies. Net is
+      ``eff_pos + eff_neg``; gross is ``eff_pos - eff_neg``. Reporting only the
+      net drops a token that matters in both directions out of the ranking
+      entirely.
 
     Accumulated dense and sync-free. The alternative -- ``torch.unique`` per
     micro-batch, keyed into a Python dict -- reads the device inside the
@@ -739,21 +776,28 @@ class TokenStateCounts:
     is unknown contribute to the pooled scope only.
     """
 
-    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64):
+    # What the effect columns hold, by mode. Carried into the metric names and
+    # into every dumped row, so a table can never be read as the other quantity.
+    EFFECT_KIND = {"target": "dq", "position": "dkl_nats"}
+
+    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64, mode: str = "target"):
+        assert mode in self.EFFECT_KIND, f"mode must be one of {sorted(self.EFFECT_KIND)}, got {mode!r}"
         self.vocab_size = int(vocab_size)
         self.n_states = len(STATE_NAMES)
         self.n_scopes = 1 + int(n_tasks)
         self.top_n = int(top_n)
+        self.mode = mode
+        self.effect = self.EFFECT_KIND[mode]
         cells = self.n_scopes * self.n_states * self.vocab_size
         self.n = torch.zeros(cells, dtype=torch.int64, device=device)
         self.mass = torch.zeros(cells, dtype=torch.float32, device=device)
-        # Post-normalisation target change, split by sign, on the SAME
+        # Post-normalisation effect, split by sign, on the SAME
         # (scope, state, token) cells as the two above. float64 because these are
         # ~1e-3..1e-6 per event summed over millions of atomic adds into a few
         # cells: in float32 the later increments fall below the running sum's
         # last bit and are silently dropped.
-        self.dq_pos = torch.zeros(cells, dtype=torch.float64, device=device)
-        self.dq_neg = torch.zeros(cells, dtype=torch.float64, device=device)
+        self.eff_pos = torch.zeros(cells, dtype=torch.float64, device=device)
+        self.eff_neg = torch.zeros(cells, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     # -- accumulation ------------------------------------------------------ #
@@ -767,6 +811,8 @@ class TokenStateCounts:
         on_task_logprob: torch.Tensor,
         response_mask: torch.Tensor,
         task_ids: Optional[torch.Tensor] = None,
+        position_scale: Optional[torch.Tensor] = None,
+        teacher_kl: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> None:
         """Fold one micro-batch in.
@@ -780,6 +826,12 @@ class TokenStateCounts:
             on_task_logprob: (bs, resp, k) on-task teacher log-probs at the support.
             response_mask: (bs, resp).
             task_ids: (bs,) or None.
+            position_scale: (bs, resp) ``position`` mode only, REQUIRED there --
+                the per-task mean the position weight was divided by. Not
+                rebuildable here: it is the PREVIOUS step's mean over the whole
+                batch, and a micro-batch cannot see it.
+            teacher_kl: (bs, resp) ``position`` mode only, REQUIRED there -- the
+                per-token KL BEFORE the weight multiplied it.
 
         The validity mask is folded into the VALUES rather than into the indices,
         so every entry is scattered and the invalid ones add zero. Selecting the
@@ -794,17 +846,31 @@ class TokenStateCounts:
 
         p_k = on_task_logprob.detach().to(torch.float32).exp()   # (bs, resp, k)
         w_k = weight.detach().to(torch.float32)
-        # The normaliser the rewrite actually divides by, rebuilt here from the
-        # same inputs update_target uses. Without it this class can only report
-        # the pre-normalisation tilt, which is a different quantity.
-        tail = (1.0 - p_k.sum(dim=-1)).clamp(min=eps, max=1.0)
-        z = ((p_k * w_k).sum(dim=-1) + tail).clamp(min=eps)      # (bs, resp)
-        dq_k = p_k.to(torch.float64) * (
+        if self.mode == "target":
+            # The normaliser the rewrite actually divides by, rebuilt here from
+            # the same inputs update_target uses. Without it this class can only
+            # report the pre-normalisation tilt, which is a different quantity.
+            tail = (1.0 - p_k.sum(dim=-1)).clamp(min=eps, max=1.0)
+            z = ((p_k * w_k).sum(dim=-1) + tail).clamp(min=eps)  # (bs, resp)
+            scale = torch.ones_like(z)
+        else:
+            # position mode: nothing is renormalised per position -- the weight
+            # is divided by ONE number per task -- and the KL is the factor that
+            # decides whether a weight mattered at all. Refuse rather than
+            # substitute: falling back on the target-mode Z here is exactly the
+            # mislabelling this branch exists to remove.
+            assert position_scale is not None and teacher_kl is not None, (
+                "position mode needs position_scale and teacher_kl; the "
+                "target-mode normaliser is a different quantity"
+            )
+            z = position_scale.detach().to(torch.float32).clamp(min=eps)
+            scale = teacher_kl.detach().to(torch.float32)
+        eff_k = p_k.to(torch.float64) * (
             w_k.to(torch.float64) / z.unsqueeze(-1).to(torch.float64) - 1.0
-        )
+        ) * scale.unsqueeze(-1).to(torch.float64)
 
         p = p_k.reshape(-1)
-        dq = dq_k.reshape(-1)
+        dq = eff_k.reshape(-1)
         v_f = valid.to(torch.float32)
         v_d = valid.to(torch.float64)
         v_i = valid.to(torch.int64)
@@ -813,8 +879,8 @@ class TokenStateCounts:
         flat = st * V + ids  # scope 0 starts at offset 0
         self.n.index_add_(0, flat, v_i)
         self.mass.index_add_(0, flat, p * v_f)
-        self.dq_pos.index_add_(0, flat, dq.clamp(min=0) * v_d)
-        self.dq_neg.index_add_(0, flat, dq.clamp(max=0) * v_d)
+        self.eff_pos.index_add_(0, flat, dq.clamp(min=0) * v_d)
+        self.eff_neg.index_add_(0, flat, dq.clamp(max=0) * v_d)
 
         if task_ids is None:
             return
@@ -825,8 +891,8 @@ class TokenStateCounts:
         flat_t = (scope * S + st) * V + ids
         self.n.index_add_(0, flat_t, known.to(torch.int64))
         self.mass.index_add_(0, flat_t, p * k_f)
-        self.dq_pos.index_add_(0, flat_t, dq.clamp(min=0) * k_d)
-        self.dq_neg.index_add_(0, flat_t, dq.clamp(max=0) * k_d)
+        self.eff_pos.index_add_(0, flat_t, dq.clamp(min=0) * k_d)
+        self.eff_neg.index_add_(0, flat_t, dq.clamp(max=0) * k_d)
 
     def all_reduce(self) -> None:
         """Sum the three arrays across the DP group.
@@ -839,7 +905,7 @@ class TokenStateCounts:
         self._cpu_cache = None
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
-        for t in (self.n, self.mass, self.dq_pos, self.dq_neg):
+        for t in (self.n, self.mass, self.eff_pos, self.eff_neg):
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
 
     # -- rendering --------------------------------------------------------- #
@@ -855,8 +921,8 @@ class TokenStateCounts:
             self._cpu_cache = (
                 self.n.detach().to("cpu").view(self.n_scopes, S, V),
                 self.mass.detach().to("cpu").view(self.n_scopes, S, V),
-                self.dq_pos.detach().to("cpu").view(self.n_scopes, S, V),
-                self.dq_neg.detach().to("cpu").view(self.n_scopes, S, V),
+                self.eff_pos.detach().to("cpu").view(self.n_scopes, S, V),
+                self.eff_neg.detach().to("cpu").view(self.n_scopes, S, V),
             )
         return self._cpu_cache
 
@@ -876,14 +942,17 @@ class TokenStateCounts:
         high top-N share, a broad tendency gives the opposite. Neither is
         derivable from the existing ``frac_*``.
 
-        The ``dq`` family reports the POST-NORMALISATION change, positive and
-        negative halves separately, because the point of ``inv_z`` is that they
-        do not cancel. Per acted state as well as pooled, so a token reinforced
-        in one context and suppressed in another is not netted away before it is
-        ever seen.
+        The effect family reports the POST-NORMALISATION change, positive and
+        negative halves separately, because the point of the normaliser is that
+        they do not cancel. Per acted state as well as pooled, so a token
+        reinforced in one context and suppressed in another is not netted away
+        before it is ever seen. Its key carries the mode's own name for the
+        quantity -- ``dq`` (probability) or ``dkl_nats`` (nats) -- so the two
+        arms never write different things into one series.
         """
         out = {}
-        n, _mass, dq_pos, dq_neg = self._cpu()
+        n, _mass, eff_pos, eff_neg = self._cpu()
+        e = self.effect
         N = min(self.top_n, self.vocab_size)
         for scope in range(self.n_scopes):
             scope_name = self._scope_name(scope, task_names)
@@ -899,26 +968,26 @@ class TokenStateCounts:
                 # The gross effect of this state, by sign. A state whose two
                 # halves are large and nearly equal has been doing work that a
                 # net figure reports as nothing.
-                out[f"{head}/token/dq_pos/{sname}"] = float(dq_pos[scope, sid].sum())
-                out[f"{head}/token/dq_neg/{sname}"] = float(dq_neg[scope, sid].sum())
+                out[f"{head}/token/{e}_pos/{sname}"] = float(eff_pos[scope, sid].sum())
+                out[f"{head}/token/{e}_neg/{sname}"] = float(eff_neg[scope, sid].sum())
 
-            pos = float(dq_pos[scope].sum())
-            neg = float(dq_neg[scope].sum())
+            pos = float(eff_pos[scope].sum())
+            neg = float(eff_neg[scope].sum())
             if pos == 0.0 and neg == 0.0:
                 continue
-            out[f"{head}/token/dq_pos_sum"] = pos
-            out[f"{head}/token/dq_neg_sum"] = neg
+            out[f"{head}/token/{e}_pos_sum"] = pos
+            out[f"{head}/token/{e}_neg_sum"] = neg
             # Gross, not |net|: the two halves are summed after taking absolute
             # values, so mutual cancellation is excluded rather than hidden.
-            out[f"{head}/token/dq_abs_sum"] = pos - neg
+            out[f"{head}/token/{e}_abs_sum"] = pos - neg
             # Per token, net across states, then ranked by magnitude. The
-            # difference between this and dq_abs_sum is exactly how much of the
-            # movement cancels within a single token.
-            per_tok = (dq_pos[scope] + dq_neg[scope]).sum(0).abs()
+            # difference between this and the gross sum is exactly how much of
+            # the movement cancels within a single token.
+            per_tok = (eff_pos[scope] + eff_neg[scope]).sum(0).abs()
             tot = float(per_tok.sum())
             if tot > 0:
-                out[f"{head}/token/dq_abs_top{N}_share"] = float(torch.topk(per_tok, N).values.sum()) / tot
-                out[f"{head}/token/dq_net_over_gross"] = tot / (pos - neg) if (pos - neg) > 0 else 0.0
+                out[f"{head}/token/{e}_abs_top{N}_share"] = float(torch.topk(per_tok, N).values.sum()) / tot
+                out[f"{head}/token/{e}_net_over_gross"] = tot / (pos - neg) if (pos - neg) > 0 else 0.0
         return out
 
     def top_tokens(self, task_names=None) -> list:
@@ -936,19 +1005,23 @@ class TokenStateCounts:
                         say. A rare candidate at high probability never reaches
                         the count list and, if its weight is 1, never reaches the
                         effect list either -- yet it is where the objective lives.
-        ``abs_dq``   -- which tokens the target actually moved, after
+        ``abs_effect`` -- which tokens the weighting actually moved, after
                         normalisation. Pooled over states, since a token has one
-                        net displacement and no single state.
+                        net displacement and no single state. What "moved" means
+                        is the mode's: a probability in ``target``, nats of
+                        weighted KL in ``position``. Every row carries
+                        ``effect_kind`` so the two are never read as one series.
         """
         rows = []
-        n, mass, dq_pos, dq_neg = self._cpu()
+        n, mass, eff_pos, eff_neg = self._cpu()
+        kind = self.effect
         N = min(self.top_n, self.vocab_size)
         for scope in range(self.n_scopes):
             scope_name = self._scope_name(scope, task_names) or "__pooled__"
             n_any = n[scope].sum(0)
             mass_any = mass[scope].sum(0)
-            dq_net_any = (dq_pos[scope] + dq_neg[scope]).sum(0)
-            dq_gross_any = (dq_pos[scope] - dq_neg[scope]).sum(0)
+            eff_net_any = (eff_pos[scope] + eff_neg[scope]).sum(0)
+            eff_gross_any = (eff_pos[scope] - eff_neg[scope]).sum(0)
 
             def _row(ranked_by, sid, rank, tok):
                 """One table row. ``sid`` is None for the state-pooled ranking."""
@@ -957,14 +1030,17 @@ class TokenStateCounts:
                         "scope": scope_name, "ranked_by": ranked_by, "state": "__any__",
                         "rank": rank, "token_id": int(tok),
                         "count": int(n_any[tok]), "mass": float(mass_any[tok]),
-                        "dq_net": float(dq_net_any[tok]), "dq_gross": float(dq_gross_any[tok]),
+                        "effect_kind": kind,
+                        "effect_net": float(eff_net_any[tok]),
+                        "effect_gross": float(eff_gross_any[tok]),
                     }
                 return {
                     "scope": scope_name, "ranked_by": ranked_by, "state": STATE_NAMES[sid],
                     "rank": rank, "token_id": int(tok),
                     "count": int(n[scope, sid, tok]), "mass": float(mass[scope, sid, tok]),
-                    "dq_net": float(dq_pos[scope, sid, tok] + dq_neg[scope, sid, tok]),
-                    "dq_gross": float(dq_pos[scope, sid, tok] - dq_neg[scope, sid, tok]),
+                    "effect_kind": kind,
+                    "effect_net": float(eff_pos[scope, sid, tok] + eff_neg[scope, sid, tok]),
+                    "effect_gross": float(eff_pos[scope, sid, tok] - eff_neg[scope, sid, tok]),
                 }
 
             for sid in ACTED_STATES:
@@ -978,14 +1054,14 @@ class TokenStateCounts:
                             break
                         rows.append(_row(ranked_by, sid, rank, tok))
 
-            absd = dq_net_any.abs()
+            absd = eff_net_any.abs()
             if float(absd.sum()) <= 0:
                 continue
             vals, idx = torch.topk(absd, N)
             for rank, (a, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
                 if a <= 0:
                     break
-                rows.append(_row("abs_dq", None, rank, tok))
+                rows.append(_row("abs_effect", None, rank, tok))
         return rows
 
 
@@ -1468,6 +1544,232 @@ def rewrite_ratio_metrics(sums: dict, prefix: str = "sign_weight") -> dict:
         # the arm has only ever reported the second. The variance is what says
         # how far apart they are allowed to be.
         out[f"{head}/log_z_var"] = max(tot["log_z_sq"] / n - mean_lz * mean_lz, 0.0)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# position mode: the weight that multiplies the KL itself
+# --------------------------------------------------------------------------- #
+# The four disjoint groups the position weight decomposes over. ``w - 1`` is
+# exactly ``sum_v p(v) (w(v) - 1)`` -- the tail contributes nothing because its
+# weight is 1 -- so grouping the candidates partitions the whole departure from
+# neutrality with no residual. Conflict and the three neutral states are pooled
+# because position mode gives every member of each the same weight, so splitting
+# them further would produce columns that are equal by construction.
+POSITION_STATE_GROUPS = (
+    ("agree_pos", (STATE_AGREE_POS,)),
+    ("agree_neg", (STATE_AGREE_NEG,)),
+    ("conflict", (STATE_CONFLICT_ON_POS, STATE_CONFLICT_ON_NEG)),
+    ("neutral", (STATE_NEUTRAL_ON, STATE_NEUTRAL_OFF_SPLIT, STATE_NEUTRAL_OFF_SILENT)),
+)
+
+# Quantiles of the weight TABLE's range, not of the observed weights. A fixed
+# cut is what makes the band comparable across steps: a moving quantile would
+# report the same share at every step by construction, which is the one thing
+# these are meant to detect.
+POSITION_BANDS = (0.25, 0.50, 0.75)
+
+POSITION_TERMS = (
+    "w_pre",
+    "w_pre_sq",
+    "w",
+    "w_sq",
+    "kl",
+    "kl_sq",
+    "w_kl",
+    "kl_shift_abs",
+) + tuple(f"w_from_{name}" for name, _ in POSITION_STATE_GROUPS) + tuple(
+    f"band{int(q * 100):02d}_{suffix}" for q in POSITION_BANDS for suffix in ("n", "kl")
+)
+
+
+def position_decomposition_terms(
+    *,
+    position_weight: torch.Tensor,
+    applied_weight: torch.Tensor,
+    candidate_weight: torch.Tensor,
+    state: torch.Tensor,
+    on_task_logprob: torch.Tensor,
+    teacher_kl: torch.Tensor,
+    weight_range: tuple,
+) -> dict:
+    """Per-position terms for the direct-KL (``position``) arm.
+
+    ``target`` mode has :func:`rewrite_decomposition_terms` because its weight
+    moves a distribution and the question is where the probability went. Here the
+    weight moves nothing: it multiplies a scalar cost, so the question is a
+    different one -- how many nats the weighting added or removed, and whether it
+    spent them where the student was already wrong or where it was already right.
+    Nothing in the ``target`` family answers that, and the position arm has until
+    now reported a single number for the whole mechanism
+    (``w_mean_pre_norm``), which cannot tell a redistribution from a coefficient
+    change.
+
+    Every term is ``(bs, resp)`` and goes straight into :class:`ScopeTermStats`.
+
+    Args:
+        position_weight: (bs, resp) BEFORE per-task normalisation, i.e. the raw
+            ``sum_v p(v) w(v) + tail``. On a fixed scale set by the weight table,
+            which is what makes the bands below comparable across steps.
+        applied_weight: (bs, resp) AFTER normalisation -- the number that actually
+            multiplied the KL. Pass the same tensor twice on a step that ran
+            unnormalised, and pass what WOULD have been applied under
+            ``measure_only``: an observer arm still has to report the weights it
+            declined to use.
+        candidate_weight: (bs, resp, k).
+        state: (bs, resp, k) ``STATE_*``.
+        on_task_logprob: (bs, resp, k) on-task teacher log-probs at the support.
+        teacher_kl: (bs, resp) the per-token KL BEFORE the weight multiplies it.
+            The unweighted one on purpose: ``w_kl / kl`` is then the factor the
+            arm applied to the total, and taking the already-weighted KL would
+            make that ratio 1 by construction.
+        weight_range: ``(lo, hi)`` of the weight table, used only to place a
+            position inside the band it belongs to.
+    """
+    p = on_task_logprob.detach().to(torch.float32).exp()
+    w_k = candidate_weight.detach().to(torch.float32)
+    # Sums over v to position_weight - 1 exactly: the tail's weight is 1, so it
+    # drops out of the excess rather than being neglected.
+    excess = p * (w_k - 1.0)
+
+    kl = teacher_kl.detach().to(torch.float32)
+    w = applied_weight.detach().to(torch.float32)
+    wp = position_weight.detach().to(torch.float32)
+
+    terms = {
+        "w_pre": wp,
+        "w_pre_sq": wp * wp,
+        "w": w,
+        "w_sq": w * w,
+        "kl": kl,
+        "kl_sq": kl * kl,
+        # What the loss saw. The difference from ``kl`` is the whole effect of
+        # the arm on the objective's size, and it is signed.
+        "w_kl": w * kl,
+        # Gross rather than net: an arm that adds a nat here and removes one
+        # there reports zero net and is doing the redistribution it exists to do.
+        "kl_shift_abs": (w - 1.0).abs() * kl,
+    }
+    for name, sids in POSITION_STATE_GROUPS:
+        sel = torch.zeros_like(state, dtype=torch.bool)
+        for sid in sids:
+            sel = sel | (state == sid)
+        terms[f"w_from_{name}"] = (excess * sel.to(excess.dtype)).sum(dim=-1)
+
+    lo = min(float(weight_range[0]), 1.0)
+    hi = max(float(weight_range[1]), 1.0)
+    span = hi - lo
+    if span <= 0:
+        frac = torch.zeros_like(wp)
+    else:
+        frac = ((wp - lo) / span).clamp(min=0.0, max=1.0)
+    for q in POSITION_BANDS:
+        band = (frac >= q).to(kl.dtype)
+        tag = f"band{int(q * 100):02d}"
+        terms[f"{tag}_n"] = band
+        terms[f"{tag}_kl"] = band * kl
+    return terms
+
+
+def position_ratio_metrics(sums: dict, prefix: str = "sign_weight") -> dict:
+    """What the direct-KL weighting did, from sums rather than means of ratios.
+
+    Five readings, in the order a write-up needs them.
+
+    ``w_mean`` / ``w_std`` / ``w_cv`` -- the applied weight's distribution.
+    ``w_mean`` is the one number that says whether the normalisation is holding:
+    it is 1 by construction only if the per-task means it divides by were exact,
+    and they are the PREVIOUS step's, so the drift from 1 is how stale they were.
+    ``w_cv`` is the spread that drift is measured against -- a 1% drift matters
+    at a 2% spread and does not at 20%.
+
+    ``kl_scale`` = ``sum w*kl / sum kl`` -- the factor the arm applied to the
+    total teacher KL. This is the number that separates the mechanism from a
+    change to ``teacher_kl_loss_coef``: at exactly 1 the arm only redistributed,
+    and any departure is distillation strength that the weighting bought without
+    saying so. Note it is NOT ``w_mean``: they coincide only when the weight and
+    the KL are uncorrelated, which is precisely what the arm hopes is false.
+
+    ``kl_shift_net`` / ``kl_shift_gross`` -- nats per token added, and nats per
+    token moved. Their ratio is the redistribution measure: near 0 the arm
+    shuffled effort between positions, near 1 it scaled every position the same
+    way and is a coefficient change wearing a mechanism's clothes.
+
+    ``w_kl_lift`` = ``E[w*kl] / (E[w] E[kl])`` and ``w_kl_corr``, its
+    correlation form. THE headline for the position arm: it says where the
+    weighting spent its budget. Above 1 the extra effort landed on positions the
+    student was ALREADY far from its teacher on -- the weighting piled onto
+    tokens ordinary distillation was going to fix anyway. Below 1 it landed where
+    the student had nearly converged, which is the only regime where a
+    redistribution can change the outcome rather than the schedule. The lift is
+    scale-free in both arguments; the correlation is the same statement bounded
+    to [-1, 1], and needs the two variances, which is why they are accumulated.
+
+    ``band*_kl_share`` vs ``band*_n_share`` -- how concentrated the weighting is
+    and whether the concentrated part carries the KL. The bands are cuts of the
+    weight TABLE's range, so a share that moves across steps is the arm changing
+    and not the cut.
+
+    Args:
+        sums: the mapping :meth:`ScopeTermStats.sums` returns.
+    """
+    out = {}
+    for scope_name, tot in sums.items():
+        head = prefix if scope_name is None else f"{prefix}/{scope_name}"
+        n = tot["n"]
+        if n <= 0:
+            continue
+        w_mean = tot["w"] / n
+        w_var = max(tot["w_sq"] / n - w_mean * w_mean, 0.0)
+        kl_mean = tot["kl"] / n
+        kl_var = max(tot["kl_sq"] / n - kl_mean * kl_mean, 0.0)
+        wpre_mean = tot["w_pre"] / n
+        wpre_var = max(tot["w_pre_sq"] / n - wpre_mean * wpre_mean, 0.0)
+
+        out[f"{head}/pos/w_mean"] = w_mean
+        out[f"{head}/pos/w_std"] = math.sqrt(w_var)
+        out[f"{head}/pos/w_cv"] = math.sqrt(w_var) / w_mean if abs(w_mean) > 1e-12 else 0.0
+        # Signed, and not folded into w_mean: "the normaliser was stale by +0.4%"
+        # and "the weights average 1.004" are the same number and only the first
+        # is a sentence about the run.
+        out[f"{head}/pos/w_norm_drift"] = w_mean - 1.0
+        out[f"{head}/pos/w_pre_mean"] = wpre_mean
+        out[f"{head}/pos/w_pre_std"] = math.sqrt(wpre_var)
+
+        if abs(tot["kl"]) > 1e-12:
+            out[f"{head}/pos/kl_scale"] = tot["w_kl"] / tot["kl"]
+        out[f"{head}/pos/kl_shift_net"] = (tot["w_kl"] - tot["kl"]) / n
+        gross = tot["kl_shift_abs"] / n
+        out[f"{head}/pos/kl_shift_gross"] = gross
+        if gross > 1e-12:
+            out[f"{head}/pos/kl_shift_net_over_gross"] = ((tot["w_kl"] - tot["kl"]) / n) / gross
+
+        denom = w_mean * kl_mean
+        if abs(denom) > 1e-12:
+            out[f"{head}/pos/w_kl_lift"] = (tot["w_kl"] / n) / denom
+        if w_var > 1e-24 and kl_var > 1e-24:
+            cov = tot["w_kl"] / n - w_mean * kl_mean
+            out[f"{head}/pos/w_kl_corr"] = cov / math.sqrt(w_var * kl_var)
+
+        # The exact partition of w_pre - 1. Reported as a share so it is readable
+        # next to the others, and only when there is something to divide by --
+        # at a table that never fires the shares are 0/0, not 0.
+        excess = wpre_mean - 1.0
+        for name, _ in POSITION_STATE_GROUPS:
+            out[f"{head}/pos/w_from/{name}"] = tot[f"w_from_{name}"] / n
+            if abs(excess) > 1e-12:
+                out[f"{head}/pos/w_share/{name}"] = (tot[f"w_from_{name}"] / n) / excess
+
+        for q in POSITION_BANDS:
+            tag = f"band{int(q * 100):02d}"
+            n_share = tot[f"{tag}_n"] / n
+            out[f"{head}/pos/{tag}_n_share"] = n_share
+            if abs(tot["kl"]) > 1e-12:
+                kl_share = tot[f"{tag}_kl"] / tot["kl"]
+                out[f"{head}/pos/{tag}_kl_share"] = kl_share
+                # >1: the heavily weighted positions are also the expensive ones.
+                if n_share > 1e-12:
+                    out[f"{head}/pos/{tag}_kl_lift"] = kl_share / n_share
     return out
 
 

@@ -609,7 +609,13 @@ def test_measure_only_suppresses_both_writes_and_nothing_else():
     body = src.split("if not sign_measure_only:")
     assert len(body) == 3, "both the target write and the position write must be gated"
     assert "reweight_teacher_logprobs(" in body[1]
-    assert "normalize_per_task(" in body[2]
-    # the measurement itself is NOT gated on it
+    # The position arm's gate is the ASSIGNMENT, not the arithmetic behind it:
+    # normalize_per_task has to run either way so an observer arm can report the
+    # weights it declined to apply. Gating the call instead would leave
+    # measure_only with nothing to measure, which is the opposite of the point.
+    assert "sign_position_weight = pos_w_norm" in body[2]
+    # ... and it runs BEFORE that gate, i.e. outside it in both directions.
+    assert "normalize_per_task(" in src and "normalize_per_task(" not in body[2]
     head = src.split("if not sign_measure_only:")[0]
+    # the measurement itself is NOT gated on it
     assert "candidate_weights(" in head

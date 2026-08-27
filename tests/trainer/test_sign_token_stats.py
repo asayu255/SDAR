@@ -83,7 +83,7 @@ def test_counts_mass_and_effect_are_what_the_candidates_say():
         response_mask=mask,
         task_ids=torch.tensor([0, 1]),
     )
-    n, mass, dq_pos, dq_neg = tc._cpu()
+    n, mass, eff_pos, eff_neg = tc._cpu()
 
     # token 7 is reinforced at all three VALID positions
     assert int(n[0, STATE_AGREE_POS, 7]) == 3
@@ -99,14 +99,14 @@ def test_counts_mass_and_effect_are_what_the_candidates_say():
 
     # dq carries the direction, and it is filed under the STATE, so a token
     # reinforced here and suppressed elsewhere does not net away before it is seen.
-    assert float(dq_pos[0, STATE_AGREE_POS, 7]) > 0
-    assert float(dq_neg[0, STATE_AGREE_NEG, 9]) < 0
+    assert float(eff_pos[0, STATE_AGREE_POS, 7]) > 0
+    assert float(eff_neg[0, STATE_AGREE_NEG, 9]) < 0
     # This fixture has one 1.5 and one 0.5 over equal masses, so Z is exactly 1
     # and the rewrite is a pure swap: nothing else moves. Pinned because it is
     # the one configuration where dq and (w-1)p agree, and a test that happened
     # to sit here would prove nothing about the difference between them.
-    assert float(dq_pos[0, STATE_NEUTRAL_ON, 8]) == pytest.approx(0.0, abs=1e-12)
-    assert float(dq_neg[0, STATE_NEUTRAL_ON, 8]) == pytest.approx(0.0, abs=1e-12)
+    assert float(eff_pos[0, STATE_NEUTRAL_ON, 8]) == pytest.approx(0.0, abs=1e-12)
+    assert float(eff_neg[0, STATE_NEUTRAL_ON, 8]) == pytest.approx(0.0, abs=1e-12)
 
 
 def test_a_token_the_weights_never_touched_still_moves():
@@ -128,15 +128,15 @@ def test_a_token_the_weights_never_touched_still_moves():
         support_ids=torch.tensor([[[41, 42, 43]]]), state=state, weight=weight,
         on_task_logprob=logp, response_mask=torch.ones(1, 1), task_ids=None,
     )
-    _n, _m, dq_pos, dq_neg = tc._cpu()
+    _n, _m, eff_pos, eff_neg = tc._cpu()
 
     # the untouched token: (w-1)p is zero by construction...
     assert float((weight[0, 0, 2] - 1.0) * logp[0, 0, 2].exp()) == pytest.approx(0.0, abs=1e-12)
     # ...but its share of the target really did fall
-    assert float(dq_neg[0, STATE_NEUTRAL_ON, 43]) < -1e-4
-    assert float(dq_pos[0, STATE_NEUTRAL_ON, 43]) == pytest.approx(0.0, abs=1e-12)
+    assert float(eff_neg[0, STATE_NEUTRAL_ON, 43]) < -1e-4
+    assert float(eff_pos[0, STATE_NEUTRAL_ON, 43]) == pytest.approx(0.0, abs=1e-12)
     # and the reinforced ones gained, net of that same pull-back
-    assert float(dq_pos[0, STATE_AGREE_POS, 41]) > 0
+    assert float(eff_pos[0, STATE_AGREE_POS, 41]) > 0
 
 
 def test_the_padding_positions_contribute_nothing():
@@ -203,8 +203,8 @@ def test_the_effect_column_conserves_mass_over_the_whole_distribution():
         support_ids=support, state=state, weight=weight,
         on_task_logprob=logp, response_mask=mask, task_ids=None,
     )
-    _n, _m, dq_pos, dq_neg = tc._cpu()
-    on_support = float(dq_pos[0].sum() + dq_neg[0].sum())
+    _n, _m, eff_pos, eff_neg = tc._cpu()
+    on_support = float(eff_pos[0].sum() + eff_neg[0].sum())
 
     # what the support gained must be what the tail lost
     p = logp.exp()
@@ -363,16 +363,16 @@ def test_the_table_names_the_tokens_and_ranks_them_by_each_question():
     # most of the position's mass raises Z almost as much, and the normaliser
     # takes the gain straight back. A pre-normalisation (w-1)p would have ranked
     # it first and overstated what the student is actually pulled toward.
-    by_effect = [r for r in rows if r["ranked_by"] == "abs_dq"]
+    by_effect = [r for r in rows if r["ranked_by"] == "abs_effect"]
     assert by_effect[0]["token_id"] == 11, by_effect
-    assert abs(by_effect[0]["dq_net"]) > abs([r for r in by_effect if r["token_id"] == 12][0]["dq_net"])
+    assert abs(by_effect[0]["effect_net"]) > abs([r for r in by_effect if r["token_id"] == 12][0]["effect_net"])
     # and suppression shows up with a negative effect
     neg = [r for r in by_effect if r["token_id"] == 13]
-    assert neg and neg[0]["dq_net"] < 0
+    assert neg and neg[0]["effect_net"] < 0
 
     for r in rows:
         assert set(r) == {"scope", "ranked_by", "state", "rank", "token_id",
-                          "count", "mass", "dq_net", "dq_gross"}
+                          "count", "mass", "effect_kind", "effect_net", "effect_gross"}
 
 
 def test_the_table_is_scoped_per_task_as_well_as_pooled():
@@ -400,7 +400,7 @@ def test_a_token_can_top_one_ranking_and_be_absent_from_the_other():
     _fill(tc, [22], STATE_AGREE_POS, n_positions=1, logp=-0.01)   # once, all the mass
     rows = tc.top_tokens()
     top_count = [r for r in rows if r["ranked_by"] == "count"][0]
-    top_effect = [r for r in rows if r["ranked_by"] == "abs_dq"][0]
+    top_effect = [r for r in rows if r["ranked_by"] == "abs_effect"][0]
     assert top_count["token_id"] == 21
     assert top_effect["token_id"] == 22
 
@@ -428,12 +428,12 @@ def test_the_states_it_files_under_are_the_ones_candidate_weights_produced():
         state=state, weight=weight, on_task_logprob=on,
         response_mask=torch.ones(1, 1), task_ids=torch.tensor([0]),
     )
-    n, _mass, dq_pos, dq_neg = tc._cpu()
+    n, _mass, eff_pos, eff_neg = tc._cpu()
     assert int(n[0, STATE_AGREE_POS, 31]) == 1
     assert int(n[0, STATE_AGREE_NEG, 32]) == 1
     # the reinforced token is pushed up, the suppressed one down
-    assert float(dq_pos[0, STATE_AGREE_POS, 31]) > 0
-    assert float(dq_neg[0, STATE_AGREE_NEG, 32]) < 0
+    assert float(eff_pos[0, STATE_AGREE_POS, 31]) > 0
+    assert float(eff_neg[0, STATE_AGREE_NEG, 32]) < 0
 
 
 def test_a_conflict_is_recorded_as_its_own_state():
@@ -456,7 +456,7 @@ def test_a_conflict_is_recorded_as_its_own_state():
     rows = [r for r in tc.top_tokens() if r["state"] == "conflict_on_pos"]
     assert rows and rows[0]["token_id"] == 9
     # weight 1.0 in target mode -> no effect on the target, and dw says so
-    assert rows[0]["dq_net"] == pytest.approx(0.0, abs=1e-9)
+    assert rows[0]["effect_net"] == pytest.approx(0.0, abs=1e-9)
 
 
 # --------------------------------------------------------------------------- #
@@ -489,7 +489,7 @@ def test_the_driver_writes_the_table_only_when_asked(tmp_path):
         _dump_sign_token_report = OPDRayTrainer._dump_sign_token_report
 
     rows = [{"scope": "__pooled__", "ranked_by": "count", "state": "agree_pos",
-             "rank": 0, "token_id": 7, "count": 3, "mass": 0.4, "dq_net": 0.2, "token": "Ġthe"}]
+             "rank": 0, "token_id": 7, "count": 3, "mass": 0.4, "effect_net": 0.2, "token": "Ġthe"}]
     out = DataProto(meta_info={"sign_token_report": rows})
 
     from omegaconf import OmegaConf
@@ -528,7 +528,7 @@ def test_a_resumed_step_overwrites_rather_than_appends(tmp_path):
     fake.global_steps = 5
     fake.config = OmegaConf.create({"trainer": {"sign_token_dump_dir": str(tmp_path)}})
     row = {"scope": "__pooled__", "ranked_by": "count", "state": "agree_pos",
-           "rank": 0, "token_id": 1, "count": 1, "mass": 0.1, "dq_net": 0.0, "token": "a"}
+           "rank": 0, "token_id": 1, "count": 1, "mass": 0.1, "effect_net": 0.0, "token": "a"}
     for _ in range(3):
         fake._dump_sign_token_report(DataProto(meta_info={"sign_token_report": [row]}))
     path = os.path.join(tmp_path, "sign_tokens_step000005.jsonl")

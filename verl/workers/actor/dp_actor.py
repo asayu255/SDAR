@@ -45,6 +45,9 @@ from verl.trainer.ppo.sign_weights import (
     candidate_weights,
     normalize_per_task,
     position_weights,
+    POSITION_TERMS,
+    position_decomposition_terms,
+    position_ratio_metrics,
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
@@ -1196,6 +1199,14 @@ class DataParallelPPOActor(BasePPOActor):
                 "sign weighting needs a top-k support for the four models to share; "
                 "set algorithm.opd.kl_loss_type=topk_kl"
             )
+            # The weighting reaches the loss ONLY through the teacher KL -- in
+            # both modes -- and its diagnostics are read off that KL, so with the
+            # term switched off the whole mechanism is three frozen forwards
+            # producing nothing. Refuse rather than run inert.
+            assert use_teacher_kl_loss, (
+                "sign weighting only acts on the teacher KL, which is off; set "
+                "actor.use_teacher_kl_loss=true or algorithm.opd.sign_weight.enable=false"
+            )
             select_keys += ["sign_cache_ids", "sign_off_tasks"]
         sign_mode = str(sign_cfg.get("mode", "target")) if sign_enabled else None
         sign_agree = float(sign_cfg.get("agree_weight", 1.25)) if sign_enabled else 1.0
@@ -1319,6 +1330,28 @@ class DataParallelPPOActor(BasePPOActor):
         # silently gave the position arm no ladder while its script passed
         # transfer_stats.enable=True.
         rewrite_stats = ScopeTermStats(names=REWRITE_TERMS, n_tasks=n_task, device=sign_dev) if rewrite_on else None
+        # The position arm's counterpart, and NOT gated behind transfer_stats.
+        # rewrite_stats is a decomposition of an optional diagnostic; this is the
+        # only readout of what the direct-KL weighting did at all -- the arm has
+        # until now reported one number, w_mean_pre_norm, which cannot tell a
+        # redistribution from a larger teacher_kl_loss_coef. It costs a
+        # (1+T, len(POSITION_TERMS)+1) float64 buffer and one all-reduce of it.
+        position_stats = (
+            ScopeTermStats(names=POSITION_TERMS, n_tasks=n_task, device=sign_dev)
+            if (sign_cfg_on and not target_mode)
+            else None
+        )
+        # The table's own range, so the concentration bands below are cuts of
+        # something fixed rather than of the observed weights: a moving quantile
+        # would report the same share at every step by construction.
+        sign_weight_range = (
+            (
+                min(1.0, float((sign_cfg or {}).get("agree_weight", 1.0)), float((sign_cfg or {}).get("disagree_weight", 1.0))),
+                max(1.0, float((sign_cfg or {}).get("agree_weight", 1.0)), float((sign_cfg or {}).get("disagree_weight", 1.0))),
+            )
+            if sign_cfg_on
+            else (1.0, 1.0)
+        )
         ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
@@ -1348,6 +1381,11 @@ class DataParallelPPOActor(BasePPOActor):
                     n_tasks=len(task_id_names or []),
                     device=next(self.actor_module.parameters()).device,
                     top_n=int(token_cfg.get("top_n", 64)),
+                    # The effect column means different things in the two modes
+                    # -- a probability displacement against nats of weighted KL
+                    # -- so the mode is what decides the formula AND the name it
+                    # is reported under.
+                    mode="target" if target_mode else "position",
                 )
 
         for epoch in range(self.config.ppo_epochs):
@@ -1497,6 +1535,8 @@ class DataParallelPPOActor(BasePPOActor):
                     # ---- cross-teacher sign agreement --------------------- #
                     sign_position_weight = None
                     sign_target_inputs = None
+                    sign_position_inputs = None
+                    sign_cand_inputs = None
                     sign_base_logprob = None
                     if sign_enabled:
                         # Refuse rather than skip. This block used to be guarded on
@@ -1581,20 +1621,15 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                 )
-                            if token_stats is not None:
-                                # The same candidates the stats above summarise,
-                                # kept under their vocabulary ids.
-                                # sign_support_ids is whichever model nominated
-                                # the support, which is exactly the set the
-                                # weights were computed at.
-                                token_stats.update(
-                                    support_ids=sign_support_ids,
-                                    state=sign_state,
-                                    weight=candidate_weight,
-                                    on_task_logprob=sign_on_task_logprobs,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                )
+                            # The per-token tables and the position family both
+                            # need the KL, which is not built until the loss
+                            # below, so what happens here is only to stash the
+                            # tensors they read. sign_support_ids is whichever
+                            # model nominated the support, i.e. exactly the set
+                            # the weights were computed at.
+                            sign_cand_inputs = (
+                                sign_support_ids, sign_state, candidate_weight, sign_on_task_logprobs
+                            )
                             if sign_mode == "target":
                                 # Keep the original: the diagnostics below measure
                                 # how far the rewrite moved the target, which is a
@@ -1624,15 +1659,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 # the micro-batch's own is exactly the wrong
                                 # fallback, so the first step runs unnormalised --
                                 # sign_weight/*/w_mean_pre_norm records by how much.
-                                if not sign_measure_only:
-                                    sign_position_weight = (
-                                        normalize_per_task(
-                                            pos_w, response_mask, task_ids,
-                                            means=self._sign_position_means,
-                                        )
-                                        if self._sign_position_means is not None
-                                        else pos_w
+                                pos_w_norm = (
+                                    normalize_per_task(
+                                        pos_w, response_mask, task_ids,
+                                        means=self._sign_position_means,
                                     )
+                                    if self._sign_position_means is not None
+                                    else pos_w
+                                )
+                                # Computed either way, applied only when the arm
+                                # is live: an observer arm still has to report
+                                # the weights it declined to spend, and gating
+                                # the arithmetic instead of the assignment would
+                                # leave measure_only with nothing to measure.
+                                sign_position_inputs = (pos_w, pos_w_norm)
+                                if not sign_measure_only:
+                                    sign_position_weight = pos_w_norm
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -1790,6 +1832,50 @@ class DataParallelPPOActor(BasePPOActor):
                                 logprob=log_prob,
                                 ref_logprob=data["teacher_log_probs"],
                                 kl_penalty=teacher_kl_loss_type,
+                            )
+                        # Read BEFORE the position weight multiplies it. The
+                        # unweighted KL is what makes w_kl/kl the factor the arm
+                        # applied to the total; taking the weighted one would
+                        # make that ratio 1 by construction, and the per-token
+                        # effect table would be crediting tokens with a cost the
+                        # weighting had already inflated.
+                        if sign_position_inputs is not None and position_stats is not None:
+                            pre_w, applied_w = sign_position_inputs
+                            position_stats.update(
+                                position_decomposition_terms(
+                                    position_weight=pre_w,
+                                    applied_weight=applied_w,
+                                    candidate_weight=sign_cand_inputs[2],
+                                    state=sign_cand_inputs[1],
+                                    on_task_logprob=sign_cand_inputs[3],
+                                    teacher_kl=teacher_kld,
+                                    weight_range=sign_weight_range,
+                                ),
+                                response_mask=response_mask,
+                                task_ids=task_ids,
+                            )
+                        if token_stats is not None and sign_cand_inputs is not None:
+                            # The same candidates the stats above summarise, kept
+                            # under their vocabulary ids. In position mode the
+                            # per-task normaliser is recovered as pre/applied
+                            # rather than plumbed separately: it is one number per
+                            # task and the two tensors that carry it are already
+                            # here.
+                            extra = {}
+                            if sign_position_inputs is not None:
+                                pre_w, applied_w = sign_position_inputs
+                                extra = {
+                                    "position_scale": pre_w / applied_w.clamp(min=1e-8),
+                                    "teacher_kl": teacher_kld,
+                                }
+                            token_stats.update(
+                                support_ids=sign_cand_inputs[0],
+                                state=sign_cand_inputs[1],
+                                weight=sign_cand_inputs[2],
+                                on_task_logprob=sign_cand_inputs[3],
+                                response_mask=response_mask,
+                                task_ids=task_ids,
+                                **extra,
                             )
                         if sign_position_weight is not None:
                             # position mode: a positive per-token scalar, computed
@@ -2021,6 +2107,14 @@ class DataParallelPPOActor(BasePPOActor):
             rewrite_stats.all_reduce()
             metrics.update(rewrite_stats.metrics(task_names=task_id_names))
             metrics.update(rewrite_ratio_metrics(rewrite_stats.sums(task_names=task_id_names)))
+        if position_stats is not None:
+            # Only the ratios: the raw per-position means would put w_sq and
+            # kl_sq in the log, which are not quantities anyone reads. The
+            # ratios are formed from sums for the reason rewrite_ratio_metrics
+            # is -- a mean of per-position quotients weights a position that
+            # carried none of the KL the same as one that carried it all.
+            position_stats.all_reduce()
+            metrics.update(position_ratio_metrics(position_stats.sums(task_names=task_id_names)))
         if ladder_stats is not None:
             ladder_stats.all_reduce()
             metrics.update(ladder_stats.metrics(task_names=task_id_names))
