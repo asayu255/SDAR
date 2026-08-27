@@ -10,6 +10,28 @@
 # this arm concluded twice that a change "did nothing". Each check below says
 # NOT FOUND when the line is absent, which is a different answer from 0.
 #
+# WHAT NEEDS A FINISHED RUN, AND WHAT DOES NOT. Only the scores do, and only
+# when the change reached the tokens. Everything else is readable within a few
+# minutes:
+#
+#   did the pump engage?   first seconds     ([rollout-pump])
+#   did PARTIAL fall?      first report      ([gpu-residency]; set
+#                                             VAL_PIPELINE_REPORT_EVERY=5 to
+#                                             get one in a couple of minutes)
+#   did generation change? as batches land   ([val-hash], compared by index)
+#   the scores             only at the end
+#
+# So: if PARTIAL did not fall, stop the run -- the scores are moot. If it fell
+# AND the digests match the control's, generation is unchanged, the scores
+# cannot move, and no finished run is needed either. The VERDICT section at the
+# bottom says which of those three you are in.
+#
+# A wandb chart shows the spikes but cannot answer any of this. It samples every
+# 15 s against this instrument's 0.3 s, which aliases a sub-second signal and
+# inflated PARTIAL from 8.0% to 14.6% on the same run; it does not separate a
+# node that is idle from one card working while two wait; and it never sees the
+# tokens.
+#
 # THE TWO-PART RULE. A change to the rollout is kept only if BOTH hold:
 #
 #   1. the number it was aimed at moves, and
@@ -109,20 +131,25 @@ rule "3. scores -- these must NOT move"
 echo "control:"; scores "$CONTROL"
 if [ -n "$CANDIDATE" ]; then echo "candidate:"; scores "$CANDIDATE"; fi
 
+DIFFERING=""
+COMPARED=0
 if [ -n "$CANDIDATE" ]; then
     rule "4. per-batch generation digests"
     echo "control:";   hashes "$CONTROL"
     echo "candidate:"; hashes "$CANDIDATE"
-    differing=$(diff \
-        <(_clean "$CONTROL"   | grep -o 'val-hash.*' | sort) \
-        <(_clean "$CANDIDATE" | grep -o 'val-hash.*' | sort) \
-        | grep -c '^<' || true)
-    echo "  batches whose responses differ: $differing"
+    # Joined on batch index, not diffed as sorted sets, so a run that was killed
+    # early still answers: the overlap of the two logs is what gets compared.
+    # This is the check that does NOT need a finished run.
+    _digests() { _clean "$1" | sed -n 's/.*val-hash\] batch#\([0-9]*\) .*sha1 \([0-9a-f]*\).*/\1 \2/p' | sort -n -u; }
+    read -r COMPARED DIFFERING <<<"$(join <(_digests "$CONTROL") <(_digests "$CANDIDATE") \
+        | awk '{n++; if ($2 != $3) d++} END {print n+0, d+0}')"
+    echo "  batches present in BOTH logs: $COMPARED"
+    echo "  of those, responses differ:   $DIFFERING"
     cat <<'NOTE'
-  A non-zero count is not by itself a rejection -- it is the question the scores
-  answer. It says the change reached the tokens, so "the scores did not move"
-  has to come from the scores rather than from an assumption that nothing could
-  have moved them.
+  This is the early answer. If the overlap is non-trivial and nothing differs,
+  the change did not reach the tokens and the scores cannot move -- no finished
+  run is needed. If batches differ, only the scores can say whether it matters,
+  and those print once, at the end.
 NOTE
 fi
 
@@ -133,3 +160,29 @@ for f in "$CONTROL" ${CANDIDATE:+"$CANDIDATE"}; do
         || _clean "$f" | grep -o 'val-pipeline\] after [0-9]*:.*over [0-9.]*s' | tail -1 \
         || echo "NOT FOUND"
 done
+
+# --- what can be decided right now ------------------------------------------ #
+rule "VERDICT"
+_have() { _clean "$1" | grep -q "$2"; }
+
+if [ -z "$CANDIDATE" ]; then
+    echo "  One log given -- this is a reading, not a comparison. Pass a control"
+    echo "  log as the first argument to judge anything."
+elif ! _have "$CANDIDATE" 'gpu-residency.*EMPTY'; then
+    echo "  TOO EARLY. No residency report yet. It prints every"
+    echo "  VAL_PIPELINE_REPORT_EVERY batches (default 25); set it to 5 for a"
+    echo "  first read within a couple of minutes."
+elif [ "${COMPARED:-0}" -gt 0 ] && [ "${DIFFERING:-0}" -eq 0 ]; then
+    echo "  DECIDABLE NOW, and no finished run is needed:"
+    echo "    $COMPARED batches overlap and every digest matches, so generation"
+    echo "    is unchanged and the scores cannot move. Judge on section 2 alone."
+elif [ "${DIFFERING:-0}" -gt 0 ]; then
+    echo "  NEEDS A FINISHED RUN, but only for the scores:"
+    echo "    $DIFFERING of $COMPARED overlapping batches generated different"
+    echo "    tokens. Section 2 already tells you whether it was worth it; the"
+    echo "    scores tell you whether you are allowed to keep it."
+    echo "    If section 2 shows no gain, stop the run now -- the scores are moot."
+else
+    echo "  Residency is readable (section 2) but no batch overlaps yet, so"
+    echo "  nothing can be said about generation. Give it a few more batches."
+fi
