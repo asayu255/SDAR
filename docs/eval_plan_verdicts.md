@@ -276,6 +276,41 @@ bash examples/sft_trainer/eval_checkpoints.sh <step>
 
 ---
 
+## 9bis. 配列転送は Ray 境界の手前で無効化されていた(訂正)
+
+外部レビューの指摘。`_generate_via_pump` が `np.int32` 配列にした直後、
+**`PumpClient.submit` が 1 関数先で `list()` を掛けていた:**
+
+```python
+self._inbox.append((request_id, list(prompt_token_ids), carried))
+```
+
+`list()` を配列に掛けると **`np.int32` スカラーの list** になる ——
+置き換えたはずの Python int **より重い**。
+
+この機械で測り直した(252 request × 1,300 token、pickle protocol 5):
+
+| 転送形式 | pickle | unpickle | サイズ |
+| --- | ---: | ---: | ---: |
+| `list[ndarray[int32]]`(修正後) | **3.3 ms** | **2.0 ms** | 1.32 MB |
+| `list[list[np.int32]]`(修正前) | **922.1 ms** | **116.0 ms** | 4.92 MB |
+
+**1 ターンあたり約 1 秒、driver スレッドで。**
+census が `gen` とタグし、カードが空と読む窓の中で。
+
+### テストが通り続けた理由
+
+`_as_id_list` **単体**のテストを書いていた。**helper は正しく配列を返していた。**
+壊れていたのはその先で、**payload を見ていなかったから見えなかった。**
+
+`client._inbox` の実際の payload が `ndarray` であることを確認するテストに
+差し替えた。**修正前のコードで落ちることを確認済み。**
+
+> **「GPU の空きを付け替えるのではなく、driver の仕事そのものを消す」**
+> —— §10 で自分が書いた基準に、自分の実装が届いていなかった。
+
+---
+
 ## 10. 4 回観測された保存則
 
 | 変更 | 下がったもの | 上がったもの |

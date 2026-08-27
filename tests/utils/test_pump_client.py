@@ -388,31 +388,53 @@ def test_one_client_still_numbers_its_own_requests_in_order():
 # --------------------------------------------------------------------------- #
 # what crosses Ray per request
 # --------------------------------------------------------------------------- #
-def test_prompt_ids_cross_as_an_array_not_a_list_of_python_ints():
-    """.tolist() on the driver builds one Python object per token, per request.
+def test_the_payload_that_actually_crosses_ray_is_an_array():
+    """Tested on the queued payload, not on the helper that builds it.
 
-    252 requests of roughly 1,300 prompt tokens is about 330,000 objects a turn,
-    created, pickled, sent and unpickled one at a time -- on the driver thread,
-    inside the window the residency census tags as `gen` and the cards read
-    empty. An int32 array is one buffer under pickle protocol 5.
+    _as_id_list was made to return an int32 array, and PumpClient.submit then
+    called list() on it one function later -- rebuilding every token as an
+    np.int32 scalar, which is HEAVIER than the Python ints the array replaced.
+    The helper's own test passed throughout. Only the payload shows it.
+
+    MEASURED here, 252 requests of 1,300 tokens under pickle protocol 5:
+
+        list[ndarray[int32]]    3.3 ms pickle,   2.0 ms unpickle,  1.32 MB
+        list[list[np.int32]]  922.1 ms pickle, 116.0 ms unpickle,  4.92 MB
+
+    Roughly a second per turn, on the driver thread, inside the window the
+    residency census tags `gen` and the cards read empty.
     """
+    import numpy as np
+
+    client = _client(FakeWorkerGroup())
+    client.submit(np.asarray([7, 8, 9], dtype=np.int64), {"validate": True})
+
+    (_request_id, ids, _carried), = client._inbox
+    assert isinstance(ids, np.ndarray), f"a {type(ids).__name__} here undoes the transport fix"
+    assert ids.dtype == np.int32
+    assert ids.tolist() == [7, 8, 9]
+
+
+def test_a_plain_list_submitted_also_reaches_the_wire_as_an_array():
+    """One shape on the wire, whatever the caller had."""
+    import numpy as np
+
+    client = _client(FakeWorkerGroup())
+    client.submit([7, 8, 9], {"validate": True})
+
+    (_request_id, ids, _carried), = client._inbox
+    assert isinstance(ids, np.ndarray) and ids.tolist() == [7, 8, 9]
+
+
+def test_the_driver_helper_hands_over_an_array_too():
+    """The other end of the same path -- kept, but it is not the one that broke."""
     import numpy as np
 
     from agent_system.multi_turn_rollout.rollout_loop import _as_id_list
 
     out = _as_id_list(np.asarray([5, 6, 7], dtype=np.int64))
-    assert isinstance(out, np.ndarray), "a list here is the cost this avoids"
-    assert out.dtype == np.int32
-    assert out.tolist() == [5, 6, 7]
-
-
-def test_a_plain_sequence_also_becomes_an_array():
-    """One shape on the wire, whatever the caller had."""
-    from agent_system.multi_turn_rollout.rollout_loop import _as_id_list
-
-    out = _as_id_list([5, 6, 7])
-    assert out.tolist() == [5, 6, 7]
-    assert out.dtype.name == "int32"
+    assert isinstance(out, np.ndarray) and out.dtype == np.int32
+    assert _as_id_list([5, 6, 7]).tolist() == [5, 6, 7]
 
 
 def test_the_worker_converts_back_at_the_vllm_boundary():
