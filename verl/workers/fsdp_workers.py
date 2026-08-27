@@ -1427,10 +1427,16 @@ class ActorRolloutRefWorker(Worker):
         indexed by task order.
         """
         xt = (self.config.actor.get("cross_teacher_kl_weight", None) or {})
+        teachers = xt.get("teacher_paths", None) or {}
         return {
             "base_path": xt.get("base_path", None),
             "temperature": float(self.config.rollout.temperature),
             "task_order": list(getattr(self.actor, "cross_teacher_task_order", []) or []),
+            # The teachers themselves, not just the base. Every delta is
+            # log pi_teacher - log pi_base, so swapping ONE teacher checkpoint
+            # changes the scale, the corroboration and the reliability for every
+            # pair that teacher appears in -- and leaves the base path matching.
+            "teacher_paths": {str(k): str(v) for k, v in sorted(dict(teachers).items())},
         }
 
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

@@ -124,6 +124,9 @@ def _fold_rms(stats, b, task_ids, off_plane_tasks, mask=None):
         task_ids=task_ids,
         off_plane_tasks=off_plane_tasks,
     )
+    # The step boundary. update() writes a rank-local delta; all_reduce() is what
+    # folds it into the cumulative total, exactly as update_policy does.
+    stats.all_reduce()
     return stats
 
 
@@ -157,6 +160,7 @@ def test_the_diagonal_is_the_teacher_measured_where_it_operates():
     rows(dst=1, on_gain=2.0, off_gain=0.0, plane_task=2)
     # task 0's rows: teacher 1 is off-task here and moves by 0.5
     rows(dst=0, on_gain=1.0, off_gain=0.5, plane_task=1)
+    stats.all_reduce()
 
     diag, valid = stats.diagonal()
     snap = stats.snapshot()
@@ -183,6 +187,7 @@ def test_the_rms_is_a_student_weighted_expectation_not_a_slot_average():
         shifts=shifts, student_logprob=student, response_mask=torch.ones(bs, resp),
         task_ids=torch.zeros(bs, dtype=torch.long), off_plane_tasks=torch.zeros(bs, 1, dtype=torch.long),
     )
+    stats.all_reduce()
     diag, _ = stats.diagonal()
     # slot mean would be sqrt((1+100+100)/3) = 8.19; the student's measure gives
     # 0.9*1 + 0.005*100 + 0.005*100 = 1.9 (the 0.09 tail carries shift 0).
@@ -228,6 +233,7 @@ def test_an_unobserved_or_zero_cell_is_unavailable_and_not_epsilon_patched():
         student_logprob=_lp(1, 1, 2, seed=17), response_mask=torch.ones(1, 1),
         task_ids=torch.zeros(1, dtype=torch.long), off_plane_tasks=torch.zeros(1, 1, dtype=torch.long),
     )
+    stats.all_reduce()
     _diag, valid = stats.diagonal()
     assert not bool(valid[0]), "a zero sigma is unavailable, not a tiny divisor"
 
@@ -348,23 +354,30 @@ def test_the_residual_completes_the_source_shift():
     assert float(got["residual"][..., 1]) == pytest.approx(2.0 - c)
 
 
-def test_common_ev_is_the_off_task_teachers_own_unanimity():
-    """Off-task only, because the on-task teacher is silent at 64% of teacher
-    mass and an on-task-inclusive minimum would kill the channel there."""
-    assert float(_one(0.0, [3.0, 2.0])["common_ev"]) == pytest.approx(2.0)
-    assert float(_one(0.0, [3.0, 2.0])["common"]) == 0.0
+def test_common_ev_is_the_off_task_only_counterfactual_and_reaches_no_weight():
+    """Computed, reported, never applied.
+
+    It answers the one question the all-teacher rule cannot: how much
+    corroboration the on-task teacher's silence costs, at the ~64% of teacher
+    mass where it says nothing. That the two differ exactly there is the point.
+    """
+    silent = _one(0.0, [3.0, 2.0])
+    assert float(silent["common"]) == 0.0, "the applied bonus needs the on-task teacher"
+    assert float(silent["common_ev"]) == pytest.approx(2.0), "the counterfactual sees it"
     assert float(_one(1.0, [3.0, -2.0])["common_ev"]) == 0.0, "the sources split"
 
 
-def test_common_ev_ignores_whether_the_on_task_teacher_agrees():
-    """Deliberate, and the reason kl_shift_by_state is a required metric.
-
-    A KL term has no direction to disagree with: "both other tasks moved
-    decisively here" is a statement about the position, not about who was right.
-    """
-    agree = float(_one(1.0, [3.0, 2.0])["common_ev"])
-    oppose = float(_one(-1.0, [3.0, 2.0])["common_ev"])
-    assert agree == pytest.approx(oppose) == pytest.approx(2.0)
+def test_the_counterfactual_is_reported_beside_the_applied_share():
+    """A number in the logs rather than an assumption in a docstring: the gap
+    between them IS the price of requiring the on-task teacher to have spoken."""
+    got, ctx = _built(bs=4, resp=6, seed=45)
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    m = _fold_position(got, kl, ctx["task_ids"])
+    assert "kl_weight/evidence/shared_mean" in m
+    assert "kl_weight/evidence/shared_offtask_only_mean" in m
+    assert m["kl_weight/evidence/shared_offtask_only_mean"] >= m["kl_weight/evidence/shared_mean"] - 1e-9, (
+        "leaving a teacher out of a minimum cannot lower it"
+    )
 
 
 def test_a_single_source_cannot_corroborate_itself():
@@ -385,7 +398,7 @@ def test_a_near_zero_shift_attenuates_itself_without_a_deadzone():
 def _evidence(on_v, off_v, alpha):
     d = _one(on_v, off_v)
     a = torch.full((1, len(off_v)), float(alpha))
-    return float(candidate_kl_evidence(common_ev=d["common_ev"], hat_off=torch.tensor(
+    return float(candidate_kl_evidence(common=d["common"], hat_off=torch.tensor(
         [[[[float(x) for x in off_v]]]]), source_alpha=a))
 
 
@@ -395,12 +408,29 @@ def test_corroboration_never_scores_below_conflict_at_any_alpha(alpha):
 
     ``|c| + sum alpha|delta_hat - c|`` subtracts the shared part from every
     source, crediting agreement once and debiting it n_off times, so past
-    ``alpha = 1/n_off`` a split scores HIGHER. Here the gap is ``|c_ev|``,
-    independent of alpha.
+    ``alpha = 1/n_off`` a split scores HIGHER. Here the gap is ``|c|``,
+    independent of alpha -- and, since the corroboration is all-teacher, it
+    holds for a sign flipped on ANY teacher and not only on a source.
     """
     unanimous = _evidence(1.0, [3.0, 2.0], alpha)
-    split = _evidence(1.0, [3.0, -2.0], alpha)
-    assert unanimous - split == pytest.approx(2.0, abs=1e-5)
+    assert unanimous - _evidence(1.0, [3.0, -2.0], alpha) == pytest.approx(1.0, abs=1e-5)
+    assert unanimous - _evidence(-1.0, [3.0, 2.0], alpha) == pytest.approx(1.0, abs=1e-5)
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_sources_that_contradict_the_on_task_teacher_earn_no_corroboration(alpha):
+    """The reason the bonus is all-teacher and not off-task-only.
+
+    Off-task unanimity alone credits a position where the other two tasks
+    DECISIVELY OPPOSE the on-task teacher exactly as it credits one where they
+    agree with it -- and the KL that then gets strengthened points at the very
+    opinion they contradicted, with no advantage-side evidence behind it. At
+    alpha = 0 that candidate would score 2 instead of 0.
+    """
+    assert _evidence(-1.0, [3.0, 2.0], alpha) == pytest.approx(alpha * 5.0, abs=1e-5)
+    d = _one(-1.0, [3.0, 2.0])
+    assert float(d["common"]) == 0.0
+    assert float(d["common_ev"]) == pytest.approx(2.0), "still measured, never applied"
 
 
 def test_the_broken_alternative_would_have_failed_that():
@@ -420,28 +450,29 @@ def test_evidence_is_non_negative_and_zero_only_with_no_signal():
 
 
 def test_alpha_zero_leaves_only_the_corroboration_bonus():
-    assert _evidence(1.0, [3.0, 2.0], 0.0) == pytest.approx(2.0)
+    # min over {on, off1, off2} = min(1, 3, 2) = 1
+    assert _evidence(1.0, [3.0, 2.0], 0.0) == pytest.approx(1.0)
 
 
 def test_alpha_one_admits_the_full_standardized_source_shift():
     """The full shift, not the residual: alpha is estimated on the residual and
     applied to the whole thing, and mixing those is the reversal above."""
-    assert _evidence(1.0, [3.0, 2.0], 1.0) == pytest.approx(2.0 + 3.0 + 2.0)
+    assert _evidence(1.0, [3.0, 2.0], 1.0) == pytest.approx(1.0 + 3.0 + 2.0)
 
 
 def test_sources_are_summed_not_averaged():
-    one = _evidence(1.0, [3.0, 3.0], 1.0)
+    one = _evidence(3.0, [3.0, 3.0], 1.0)
     assert one == pytest.approx(3.0 + 3.0 + 3.0), "min is 3, both sources add 3"
 
 
 def test_alpha_is_per_source():
     d = _one(1.0, [3.0, 2.0])
     e = candidate_kl_evidence(
-        common_ev=d["common_ev"],
+        common=d["common"],
         hat_off=torch.tensor([[[[3.0, 2.0]]]]),
         source_alpha=torch.tensor([[1.0, 0.0]]),
     )
-    assert float(e) == pytest.approx(2.0 + 3.0)
+    assert float(e) == pytest.approx(1.0 + 3.0)
 
 
 def test_the_evidence_signature_cannot_be_handed_a_residual():
@@ -450,7 +481,7 @@ def test_the_evidence_signature_cannot_be_handed_a_residual():
     import inspect
 
     params = set(inspect.signature(candidate_kl_evidence).parameters)
-    assert params == {"common_ev", "hat_off", "source_alpha"}
+    assert params == {"common", "hat_off", "source_alpha"}
 
 
 # --------------------------------------------------------------------------- #
@@ -650,6 +681,7 @@ def _adv(advantage, support, *, dst=0, planes=(1,), informative=None, length=Non
         task_ids=torch.full((n,), dst),
         off_plane_tasks=torch.tensor(planes).view(1, -1).expand(n, -1).contiguous(),
     )
+    stats.all_reduce()
     return stats
 
 
@@ -726,6 +758,7 @@ def test_reliability_does_not_depend_on_the_batch_split():
             informative=torch.ones(4, dtype=torch.bool),
             task_ids=torch.zeros(4, dtype=torch.long), off_plane_tasks=torch.full((4, 1), 1),
         )
+    split.all_reduce()
     assert torch.allclose(whole, split.alpha_table(), atol=1e-6)
 
 
@@ -999,6 +1032,7 @@ def _adv_grouped(advantage, support, groups, **kw):
         off_plane_tasks=torch.full((n, 1), 1),
         group_ids=torch.as_tensor(groups, dtype=torch.long),
     )
+    stats.all_reduce()
     return stats.alpha(task_names=TASKS)[("alfworld", "search")]
 
 
@@ -1042,6 +1076,7 @@ def test_the_group_pooling_survives_being_split_across_micro_batches():
             task_ids=torch.zeros(1, dtype=torch.long), off_plane_tasks=torch.full((1, 1), 1),
             group_ids=torch.tensor([groups[r]]),
         )
+    split.all_reduce()
     assert split.alpha(task_names=TASKS)[("alfworld", "search")]["rho"] == pytest.approx(whole, abs=1e-9)
 
 
@@ -1062,6 +1097,7 @@ def test_the_group_buffer_is_part_of_the_resumable_state():
         task_ids=torch.zeros(2, dtype=torch.long), off_plane_tasks=torch.full((2, 1), 1),
         group_ids=torch.tensor([0, 0]),
     )
+    stats.all_reduce()
     other = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=8)
     other.load_state_dict(stats.state_dict())
     assert torch.allclose(stats.group, other.group)
@@ -1281,7 +1317,12 @@ def _accumulated(seed=60):
     return rms, mean, adv
 
 
-IDENTITY = {"base_path": "Qwen/Qwen3-1.7B", "temperature": 1.0, "task_order": TASKS}
+IDENTITY = {
+    "base_path": "Qwen/Qwen3-1.7B",
+    "temperature": 1.0,
+    "task_order": TASKS,
+    "teacher_paths": {"alfworld": "/t/a", "search": "/t/s", "webshop": "/t/w"},
+}
 
 
 def test_the_accumulated_state_survives_a_resume():
@@ -1307,6 +1348,10 @@ def test_the_accumulated_state_survives_a_resume():
     ("base_path", "Qwen/Qwen3-4B"),
     ("temperature", 0.7),
     ("task_order", ["search", "alfworld", "webshop"]),
+    # One teacher swapped. Every delta is log pi_teacher - log pi_base, so this
+    # changes the scale, the corroboration and the reliability for every pair
+    # that teacher appears in -- and leaves base_path matching.
+    ("teacher_paths", {"alfworld": "/t/a", "search": "/t/OTHER", "webshop": "/t/w"}),
 ])
 def test_a_resume_that_changes_what_the_numbers_mean_is_refused(key, value):
     """The shifts are relative to ONE base checkpoint, the log-probs were
@@ -1323,6 +1368,53 @@ def test_a_resume_that_changes_what_the_numbers_mean_is_refused(key, value):
             adv=AdvantageReliabilityStats(n_tasks=3, device="cpu"),
             identity={**IDENTITY, key: value},
         )
+
+
+def test_a_checkpoint_that_does_not_record_an_identity_key_is_refused():
+    """An absent key used to pass, which made the check strictly WEAKER the older
+    the checkpoint was -- exactly backwards, since an old checkpoint is the one
+    most likely to have been written under a different base or teacher set."""
+    rms, mean, adv = _accumulated()
+    partial = {k: v for k, v in IDENTITY.items() if k != "teacher_paths"}
+    blob = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=None, identity=partial)
+    with pytest.raises(AssertionError, match="does not record"):
+        load_sidecar_state(
+            blob,
+            rms=CumulativePolicyShiftRMS(n_tasks=3, device="cpu"),
+            mean=PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu"),
+            adv=AdvantageReliabilityStats(n_tasks=3, device="cpu"),
+            identity=IDENTITY,
+        )
+
+
+def test_one_reader_then_a_broadcast_rather_than_every_rank_opening_the_file():
+    """Rank 0 writes it, so rank 0 reads it. Every rank opening the same path
+    works on a shared filesystem and silently does not elsewhere: a rank that
+    read a stale copy would continue from a different accumulated scale than its
+    neighbours, and the weight is built rank-locally so nothing compares them."""
+    actor = _actor_source()
+    assert "def _read_sidecar_on_rank_zero" in actor
+    block = actor[actor.index("def _read_sidecar_on_rank_zero"):]
+    block = block[: block.index("def _xt_accumulate_reliability")]
+    assert "get_rank() if dist_on else 0" in block
+    assert "broadcast_object_list" in block
+    assert "torch.load(" in block
+    # the presence decision travels with the payload, so ranks cannot disagree
+    # about whether to cold-start
+    assert block.index("payload[0] = torch.load(") < block.index("broadcast_object_list")
+
+
+def test_the_identity_written_by_the_worker_names_the_teachers():
+    src = open("verl/workers/fsdp_workers.py").read()
+    block = src[src.index("def _cross_teacher_identity"):]
+    block = block[: block.index("def load_checkpoint")]
+    for key in ("base_path", "temperature", "task_order", "teacher_paths"):
+        assert f'"{key}"' in block, key
+    inject = open("verl/trainer/main_opd.py").read()
+    assert "cross_teacher_kl_weight.teacher_paths" in inject, (
+        "the actor config is where the identity is written from, so the teachers "
+        "have to reach it"
+    )
 
 
 def test_an_unknown_sidecar_version_is_refused_rather_than_guessed():
@@ -1559,6 +1651,7 @@ def test_the_reliability_pass_runs_on_realistic_shapes_and_files_the_right_cells
         task_ids=task_ids, diag=(torch.ones(3), torch.ones(3, dtype=torch.bool)),
         outside_counter=counter,
     )
+    actor._xt_adv.all_reduce()
 
     got = actor._xt_adv.alpha(task_names=TASKS)
     # Rows of task 0 name search and webshop as their sources; a pair nobody's
@@ -1585,6 +1678,7 @@ def test_an_arm_with_no_advantages_leaves_the_reliability_untouched():
         task_ids=torch.zeros(1, dtype=torch.long), diag=None,
         outside_counter=torch.zeros(2, dtype=torch.float64),
     )
+    actor._xt_adv.all_reduce()
     assert float(actor._xt_adv.alpha_table().abs().sum()) == 0.0
 
 
@@ -1637,3 +1731,270 @@ def test_the_statistics_are_collected_on_the_first_ppo_epoch_only():
     # on a different objective from the first.
     for guards in collected["build_position_weight"]:
         assert not any("xt_collect" in g for g in guards)
+
+
+# --------------------------------------------------------------------------- #
+# what R > 1 does to a cumulative buffer
+# --------------------------------------------------------------------------- #
+class _FakeCollective:
+    """Emulate ``all_reduce(SUM)`` over R ranks that ran identical data.
+
+    Every rank holds the same buffer here, so a SUM across R of them is a
+    multiply by R. That is exactly the operation the real collective performs,
+    and it is enough to catch the bug it hides: reducing a CUMULATIVE buffer
+    gives ``Q_n = R*Q_{n-1} + sum_r delta_n`` instead of ``Q_{n-1} + sum_r
+    delta_n``. The failure looks like success -- Q and N inflate together so
+    sigma does not blow up, it freezes -- so nothing short of this catches it.
+    """
+
+    def __init__(self, ranks):
+        self.ranks = ranks
+        self._saved = None
+
+    def __enter__(self):
+        import verl.trainer.ppo.cross_teacher_kl_weight as mod
+
+        self._saved = mod.torch.distributed
+        ranks = self.ranks
+
+        class _Dist:
+            ReduceOp = type("ReduceOp", (), {"SUM": "sum"})
+
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def is_initialized():
+                return True
+
+            @staticmethod
+            def all_reduce(tensor, op=None):
+                tensor.mul_(ranks)
+
+        mod.torch.distributed = _Dist
+        return self
+
+    def __exit__(self, *exc):
+        import verl.trainer.ppo.cross_teacher_kl_weight as mod
+
+        mod.torch.distributed = self._saved
+        return False
+
+
+def _rms_step(stats, gain, n_pos=1):
+    lp = torch.log(torch.full((1, n_pos, 2), 0.4))
+    stats.update(
+        shifts={
+            "on": torch.full((1, n_pos, 2), float(gain)),
+            "off": torch.zeros(1, n_pos, 2, 1),
+            "tail_on": torch.zeros(1, n_pos),
+            "tail_off": torch.zeros(1, n_pos, 1),
+        },
+        student_logprob=lp, response_mask=torch.ones(1, n_pos),
+        task_ids=torch.zeros(1, dtype=torch.long),
+        off_plane_tasks=torch.zeros(1, 1, dtype=torch.long),
+    )
+
+
+def test_the_cumulative_scale_is_not_reduced_a_second_time_each_step():
+    """THE regression for the two-rank bug.
+
+    A single-rank suite cannot see it: all_reduce is the identity at R=1, and
+    every existing test runs there. At R=2 the shipped-before-this version
+    double-counted the running total every step, so step 1 came to carry half
+    the cumulative by step 8 and the scale stopped tracking the run.
+    """
+    gains = [1.0, 3.0, 5.0, 7.0]
+    single = CumulativePolicyShiftRMS(n_tasks=1, device="cpu")
+    for g in gains:
+        _rms_step(single, g)
+        _rms_step(single, g)          # two ranks' worth of rows, one process
+        single.all_reduce()
+
+    with _FakeCollective(ranks=2):
+        dual = CumulativePolicyShiftRMS(n_tasks=1, device="cpu")
+        for g in gains:
+            _rms_step(dual, g)        # each rank contributes its own half
+            dual.all_reduce()
+
+    assert float(dual.n[0]) == float(single.n[0])
+    assert float(dual.q[0]) == pytest.approx(float(single.q[0]), rel=1e-12)
+    assert float(dual.diagonal()[0][0]) == pytest.approx(float(single.diagonal()[0][0]), rel=1e-12)
+
+
+def test_every_step_keeps_its_own_weight_in_the_cumulative_scale():
+    """The symptom the double reduce produced, stated directly: with it, the
+    first step's contribution dominates exponentially and sigma freezes."""
+    with _FakeCollective(ranks=2):
+        stats = CumulativePolicyShiftRMS(n_tasks=1, device="cpu")
+        _rms_step(stats, 1.0)
+        stats.all_reduce()
+        early = float(stats.diagonal()[0][0])
+        for _ in range(6):
+            _rms_step(stats, 9.0)
+            stats.all_reduce()
+        late = float(stats.diagonal()[0][0])
+    # Six steps of a 9x louder teacher must move the scale most of the way there.
+    assert late > 0.8 * 9.0, f"the scale froze near its first step ({early} -> {late})"
+
+
+def test_the_reliability_moments_are_not_reduced_a_second_time_each_step():
+    def fold(stats, a, s, groups):
+        n = len(a)
+        stats.update(
+            advantage=torch.tensor(a), support_score=torch.tensor(s).reshape(n, 1),
+            on_support_score=torch.zeros(n), length=torch.ones(n),
+            informative=torch.ones(n, dtype=torch.bool),
+            task_ids=torch.zeros(n, dtype=torch.long), off_plane_tasks=torch.full((n, 1), 1),
+            group_ids=torch.tensor(groups),
+        )
+
+    steps = [([-1.0, 1.0], [-2.0, 2.0], [0, 0]), ([-1.0, 1.0], [1.0, -1.0], [0, 0])]
+    single = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    for a, s, g in steps:
+        fold(single, a, s, g)
+        fold(single, a, s, g)
+        single.all_reduce()
+
+    with _FakeCollective(ranks=2):
+        dual = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+        for a, s, g in steps:
+            fold(dual, a, s, g)
+            dual.all_reduce()
+
+    assert torch.allclose(dual.buf, single.buf, rtol=1e-12)
+    assert torch.allclose(dual.between, single.between, rtol=1e-12)
+
+
+def test_group_ids_from_different_steps_are_never_pooled():
+    """``adv_group_id`` is dense and re-issued from zero every step, so a buffer
+    that survived the step would add step 1's group 0 to step 2's unrelated
+    group 0 and then square the sum. Merging groups understates the
+    between-group term, which overstates the within-group variance and pulls
+    every correlation toward zero -- undoing the centring it exists for."""
+    stats = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+
+    def fold(s_values):
+        n = len(s_values)
+        stats.update(
+            advantage=torch.tensor([-1.0, 1.0]), support_score=torch.tensor(s_values).reshape(n, 1),
+            on_support_score=torch.zeros(n), length=torch.ones(n),
+            informative=torch.ones(n, dtype=torch.bool),
+            task_ids=torch.zeros(n, dtype=torch.long), off_plane_tasks=torch.full((n, 1), 1),
+            group_ids=torch.tensor([0, 0]),
+        )
+
+    # Two steps whose "group 0" are different prompts with wildly different
+    # offsets. Pooled, their summed score nearly cancels and the between-group
+    # term collapses; kept apart, each offset is removed on its own.
+    fold([-1.0, 1.0])
+    stats.all_reduce()
+    fold([999.0, 1001.0])
+    stats.all_reduce()
+
+    got = stats.alpha(task_names=TASKS)[("alfworld", "search")]
+    assert got["rho"] == pytest.approx(1.0, abs=1e-6), (
+        "each step's own group offset must be divided out, not merged with the other's"
+    )
+
+
+def test_the_between_group_correction_survives_a_resume():
+    stats = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    stats.update(
+        advantage=torch.tensor([-1.0, 1.0]), support_score=torch.tensor([[9.0], [11.0]]),
+        on_support_score=torch.zeros(2), length=torch.ones(2),
+        informative=torch.ones(2, dtype=torch.bool),
+        task_ids=torch.zeros(2, dtype=torch.long), off_plane_tasks=torch.full((2, 1), 1),
+        group_ids=torch.tensor([0, 0]),
+    )
+    stats.all_reduce()
+    other = AdvantageReliabilityStats(n_tasks=3, device="cpu", max_groups=4)
+    other.load_state_dict(stats.state_dict())
+    assert torch.allclose(stats.between, other.between)
+    assert torch.allclose(stats.grouped, other.grouped)
+    assert other.alpha(task_names=TASKS)[("alfworld", "search")]["rho"] == pytest.approx(
+        stats.alpha(task_names=TASKS)[("alfworld", "search")]["rho"], abs=1e-12
+    )
+
+
+def test_rendering_before_the_step_boundary_is_refused_rather_than_stale():
+    """A total that has not absorbed this step yet is a silently wrong number,
+    and silently wrong statistics are this module's whole failure mode."""
+    stats = CumulativePolicyShiftRMS(n_tasks=1, device="cpu")
+    _rms_step(stats, 1.0)
+    with pytest.raises(AssertionError, match="unreduced step delta"):
+        stats.diagonal()
+    stats.all_reduce()
+    assert float(stats.diagonal()[0][0]) > 0
+
+
+# --------------------------------------------------------------------------- #
+# non-finite: protect the loss, then fail loudly
+# --------------------------------------------------------------------------- #
+def test_a_non_finite_teacher_neutralises_the_position_and_is_counted():
+    """It must not reach the loss, and it must not pass for silence either.
+
+    A non-finite weight multiplied into the KL is a non-finite gradient and a
+    poisoned optimizer state. Forcing W = 1 stops that; the COUNT is what stops
+    a corrupted teacher from looking like a quiet mechanism for the next
+    thousand steps.
+    """
+    on = torch.log(torch.full((2, 1, 2), 0.4))
+    bad = on.clone()
+    bad[1, 0, 0] = float("nan")
+    shifts = compute_raw_policy_shifts(
+        on_task_logprob=on, off_task_logprobs=bad.unsqueeze(-1).expand(2, 1, 2, 2).contiguous(),
+        base_logprob=on,
+    )
+    got = build_position_weight(
+        shifts=shifts, on_task_logprob=on, task_ids=torch.zeros(2, dtype=torch.long),
+        off_plane_tasks=torch.tensor([[1, 2], [1, 2]]), diag=torch.ones(3),
+        diag_valid=torch.ones(3, dtype=torch.bool), alpha_table=torch.ones(3, 3),
+        normalizer={"mean": torch.ones(3), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    assert torch.isfinite(got["weight"]).all(), "the loss never sees it"
+    assert torch.isfinite(got["pre_weight"]).all()
+    assert int(got["nonfinite"]) > 0, "and it is not mistaken for silence"
+
+
+def test_a_non_finite_normaliser_is_invalid_rather_than_a_nan_in_the_loss():
+    """``den > 0`` alone lets a NaN numerator through: clamp propagates NaN and
+    torch.where selects the valid branch, so it rides mu into the weight."""
+    m = PreviousStepTaskKLWeightedMean(n_tasks=1, device="cpu")
+    m.num[0] = float("nan")
+    m.den[0] = 5.0
+    snap = m.snapshot()
+    assert not bool(snap["valid"][0])
+    assert snap["nonfinite"] == 1
+
+    lp = torch.log(torch.full((1, 1, 2), 0.4))
+    got = build_position_weight(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=lp, off_task_logprobs=lp.unsqueeze(-1).expand(1, 1, 2, 2).contiguous(),
+            base_logprob=lp,
+        ),
+        on_task_logprob=lp, task_ids=torch.zeros(1, dtype=torch.long),
+        off_plane_tasks=torch.tensor([[0, 0]]), diag=torch.ones(1),
+        diag_valid=torch.ones(1, dtype=torch.bool), alpha_table=torch.zeros(1, 1),
+        normalizer=snap,
+    )
+    assert torch.isfinite(got["weight"]).all()
+    assert float(got["weight"]) == pytest.approx(1.0)
+
+
+def test_the_step_fails_on_any_non_finite_and_says_which_stage():
+    from verl.trainer.ppo.cross_teacher_kl_weight import assert_all_finite
+
+    assert_all_finite({"weight": 0, "cumulative_scale": 0, "normaliser": 0})
+    with pytest.raises(AssertionError, match="cumulative_scale=3"):
+        assert_all_finite({"weight": 0, "cumulative_scale": 3, "normaliser": 0})
+
+
+def test_the_failure_is_raised_after_the_collectives_not_inside_them():
+    """One rank leaving a collective its neighbours are still waiting on hangs
+    the job instead of ending it."""
+    src = _update_policy_source()
+    tail = src[src.rindex("        if xt_on:"):]
+    reduce_at = tail.rindex("torch.distributed.all_reduce(_t")
+    assert tail.index("assert_all_finite(") > reduce_at

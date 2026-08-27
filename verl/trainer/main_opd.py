@@ -63,6 +63,16 @@ def inject_distillation_config(config) -> None:
         xt_cfg = opd_cfg.get("cross_teacher_kl_weight", None)
         if xt_cfg is not None:
             config.actor_rollout_ref.actor.cross_teacher_kl_weight = xt_cfg
+            # The teachers travel with the block. The accumulated scale and the
+            # reliability are all measured as log pi_teacher - log pi_base, so
+            # swapping ONE teacher checkpoint changes every number for every
+            # pair it appears in while leaving base_path matching -- and the
+            # resume identity is written from the actor's config, which is the
+            # only place that would otherwise never see them.
+            with open_dict(config):
+                config.actor_rollout_ref.actor.cross_teacher_kl_weight.teacher_paths = (
+                    opd_cfg.get("teacher_paths", None)
+                )
         if (sign_cfg is not None and bool(sign_cfg.get("enable", False))) or (
             xt_cfg is not None and bool(xt_cfg.get("enable", False))
         ):

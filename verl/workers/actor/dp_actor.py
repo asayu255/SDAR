@@ -66,6 +66,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     compute_raw_policy_shifts,
     decompose_common_residual,
     load_sidecar_state,
+    assert_all_finite,
     position_terms as xt_position_terms,
     position_weight_metrics,
     probe_name,
@@ -513,6 +514,29 @@ class DataParallelPPOActor(BasePPOActor):
             for c in range(sign_ids.size(1))
         ]
         return planes[0], torch.stack(planes[1:], dim=-1)
+
+    def _read_sidecar_on_rank_zero(self, path):
+        """One reader, then a broadcast. Returns the state, or None if absent.
+
+        Rank 0 writes the sidecar, so rank 0 reads it. Letting every rank open
+        the same file works on a shared filesystem and silently does not
+        elsewhere: a rank that reads a stale or missing copy continues from a
+        DIFFERENT accumulated scale than its neighbours, and since the weight is
+        built rank-locally nothing downstream compares them. The broadcast makes
+        that impossible rather than unlikely.
+
+        The presence decision is broadcast too. If rank 0 has no file and the
+        others do, they must all agree to cold-start, or the ranks that restored
+        would be one step ahead in every statistic.
+        """
+        dist_on = torch.distributed.is_available() and torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if dist_on else 0
+        payload = [None]
+        if rank == 0 and path and os.path.exists(path):
+            payload[0] = torch.load(path, map_location="cpu", weights_only=False)
+        if dist_on:
+            torch.distributed.broadcast_object_list(payload, src=0)
+        return payload[0]
 
     def _xt_accumulate_reliability(
         self, *, data, built, student_topk_logprob, support_ids, response_mask,
@@ -1621,9 +1645,10 @@ class DataParallelPPOActor(BasePPOActor):
                 # accumulators are indexed by task and do not exist until the
                 # first batch names them.
                 pending = getattr(self, "cross_teacher_sidecar_path", None)
-                if pending and os.path.exists(pending):
+                blob = self._read_sidecar_on_rank_zero(pending)
+                if blob is not None:
                     restored = load_sidecar_state(
-                        torch.load(pending, map_location="cpu", weights_only=False),
+                        blob,
                         rms=self._xt_rms, mean=self._xt_mean, adv=self._xt_adv,
                         identity=getattr(self, "cross_teacher_identity", {}) or {},
                     )
@@ -1654,6 +1679,11 @@ class DataParallelPPOActor(BasePPOActor):
         xt_alpha_snapshot = self._xt_alpha if xt_on else None
         xt_rms_snapshot = self._xt_rms_snapshot if xt_on else None
         xt_outside_topk = torch.zeros(2, dtype=torch.float64, device=sign_dev) if xt_on else None
+        # Non-finite tallies, accumulated on the device so counting them costs no
+        # sync inside the micro-batch loop, and read once at the step boundary.
+        # Slot 0 is the weight path, slot 1 the accumulated scale, slot 2 the
+        # normaliser.
+        xt_nonfinite = torch.zeros(3, dtype=torch.float64, device=sign_dev) if xt_on else None
         # The normaliser is a per-STEP mean: taken here from what the last call
         # accumulated, then cleared so this call's rows become the next one's
         # divisor. Reading this step's own would make the objective depend on
@@ -1664,6 +1694,7 @@ class DataParallelPPOActor(BasePPOActor):
         xt_probe_snapshots = {}
         if xt_on:
             snap = self._xt_mean.snapshot()
+            xt_nonfinite[2] += float(snap["nonfinite"])
             xt_mean_snapshot = snap if bool(snap["valid"].any()) else None
             self._xt_mean.reset()
             for _name, _st in self._xt_probe_mean.items():
@@ -2075,6 +2106,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     normalizer=xt_mean_snapshot,
                                     report_epsilon=xt_report_eps,
                                 )
+                                xt_nonfinite[0] += xt_built["nonfinite"]
                                 if xt_collect:
                                     self._xt_accumulate_reliability(
                                         data=data,
@@ -2401,6 +2433,9 @@ class DataParallelPPOActor(BasePPOActor):
                                     "pre_weight": pre,
                                     "available": xt_built["available"],
                                     "evidence_shared": xt_built["evidence_shared"],
+                                    "evidence_shared_offtask_only": xt_built[
+                                        "evidence_shared_offtask_only"
+                                    ],
                                 }
                                 xt_probe_stats[name].update(
                                     xt_position_terms(probe, teacher_kld),
@@ -2652,8 +2687,20 @@ class DataParallelPPOActor(BasePPOActor):
             # Every rank derives the same table from the same reduced moments,
             # so no broadcast is needed to keep them agreeing.
             self._xt_alpha = self._xt_adv.alpha_table()
+            # The accumulated scale, checked once it is global.
+            snap = self._xt_rms.snapshot()
+            xt_nonfinite[1] += float((~torch.isfinite(snap["sigma"])).sum())
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.all_reduce(xt_outside_topk, op=torch.distributed.ReduceOp.SUM)
+                for _t in (xt_outside_topk, xt_nonfinite):
+                    torch.distributed.all_reduce(_t, op=torch.distributed.ReduceOp.SUM)
+            # After the collectives, so every rank raises together or none does:
+            # an exception thrown before one would leave the others waiting in a
+            # collective and hang the job instead of ending it.
+            assert_all_finite({
+                "weight": xt_nonfinite[0],
+                "cumulative_scale": xt_nonfinite[1],
+                "normaliser": xt_nonfinite[2],
+            })
 
             xt_position_stats.all_reduce()
             xt_state_stats.all_reduce()

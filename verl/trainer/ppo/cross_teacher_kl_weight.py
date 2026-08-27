@@ -50,15 +50,17 @@ The chain, and where each link's scale comes from rather than from a config:
                Dividing by the destination-conditioned RMS would stretch the
                noise of a teacher that barely moves out of domain up to one full
                unit, which is the very thing the deadzone used to suppress.
-``c_ev``       corroboration: the off-task teachers' unanimous minimum. A
-               continuous min rather than a sign test, so a shift that is nearly
-               zero contributes nearly nothing and no deadzone is needed.
+``c``          corroboration: the minimum every teacher IN THE RUN guarantees,
+               the on-task one included in both the unanimity test and the
+               minimum. A continuous min rather than a sign test, so a shift
+               that is nearly zero contributes nearly nothing and no deadzone is
+               needed.
 ``alpha``      per ordered task pair, the correlation between that source's
                RESIDUAL support for the tokens the student actually generated
                and the GRPO advantage of the trajectory it generated them in.
                Rectified at zero: a source that anti-correlates is vetoed, not
                inverted.
-``e``          ``|c_ev| + sum_m alpha_m |delta_hat_m|``, the candidate evidence.
+``e``          ``|c| + sum_m alpha_m |delta_hat_m|``, the candidate evidence.
 ``W~``         ``1 + sum_v p_teacher(v) e(v)``, the position's raw weight.
 ``W``          ``W~ / mu_d``, where ``mu_d`` is the PREVIOUS step's KL-weighted
                per-task mean. That divisor is what keeps this a redistribution
@@ -76,24 +78,33 @@ magnitudes. At ``alpha=1`` the whole thing collapses to
 ``sum|delta_hat| - (n_off-1)|c|``, i.e. corroboration is penalised. ``W`` is a
 dimensionless effort scalar with no conservation law to respect, so the
 subtraction buys nothing; dropping it makes
-``e(off-task unanimous) - e(off-task split) = |c_ev| >= 0`` hold for every
-``alpha`` in [0, 1].
+``e(unanimous) - e(split) = |c| >= 0`` hold for every ``alpha`` in [0, 1] and
+for a sign flipped on ANY teacher, the on-task one included.
 
-**Corroboration is measured among the OFF-TASK teachers only.** Including the
-on-task teacher in the minimum -- ``c = sign(d) min_j |delta_hat_j|`` over
-``{d} u off`` -- caps the bonus at the on-task teacher's own shift, and the
-on-task teacher is silent at 64% of teacher mass (the shipped run's
-``neutral_on_task_silent`` state). The corroboration channel would then be dead
-across two thirds of the mass this arm is trying to say something about. Note
-what that choice does and does not buy: flipping an OFF-TASK sign breaks the
-unanimity and costs ``|c_ev|``, but flipping the ON-TASK sign does not, so a
-position where the other two tasks unanimously oppose the on-task teacher scores
-the same as one where they agree with it. That is deliberate -- a KL term has no
-direction to disagree with, and "both other tasks moved decisively here" is a
-statement about the position, not about who was right -- but it is exactly why
-``kl_shift_by_state`` is a required metric rather than an optional one. The
-signed, on-task-inclusive ``c`` is still computed, and is what the residual, the
-reliability estimate and the attribution tables are built from.
+**Corroboration requires every teacher, not just the off-task ones.** ``c`` is
+``1[all teachers share a sign] * sign(d) * min_j |delta_hat_j|`` over
+``{d} u off``, so a candidate earns the bonus only where the whole run moved it
+the same way. The alternative -- unanimity among the off-task teachers alone --
+was tried and is not what this arm runs, because it credits a position where the
+other two tasks decisively OPPOSE the on-task teacher exactly as it credits one
+where they agree with it. The KL that then gets strengthened points at the
+on-task teacher, i.e. at the very opinion the sources contradicted, and it does
+so with no advantage-side evidence behind it: at ``alpha = 0`` a
+``(-1, +3, +2)`` candidate would score 2 instead of 0.
+
+The price of requiring the on-task teacher to have spoken is real and is
+measured rather than assumed. ``c`` is capped by ``|delta_hat_d|`` and the
+on-task teacher is silent at about 64% of teacher mass (the shipped run's
+``neutral_on_task_silent`` state), so the corroboration channel is quiet across
+most of the support and the ``alpha``-gated source term carries the arm there.
+:func:`decompose_common_residual` therefore also returns the off-task-only
+``common_ev`` and the metrics report what it WOULD have contributed --
+``evidence/shared_offtask_only_*`` beside the applied ``evidence/shared_*`` --
+so the size of the quiet region is a number in the logs. Nothing in the loss
+reads it.
+
+The signed ``c`` is also what the residual, the reliability estimate and the
+attribution tables are built from, so one decomposition serves all four.
 """
 
 import math
@@ -125,6 +136,7 @@ __all__ = [
     "probe_name",
     "PairEvidenceStats",
     "build_position_weight",
+    "assert_all_finite",
     "position_terms",
     "state_shift_terms",
     "position_weight_metrics",
@@ -222,10 +234,33 @@ class CumulativePolicyShiftRMS:
     design protects.
     """
 
+    ACCUMULATION = """Why a delta buffer, and not just one cumulative one.
+
+    ``all_reduce`` is called once per step, and the buffer it reduces must hold
+    THIS STEP's contribution only. Reducing the running total instead gives
+
+        Q_n = R * Q_{n-1} + sum_r delta_{n,r}
+
+    at world size R -- every rank already holds the previous global total, so the
+    sum counts it R times. The failure is silent and, worse, looks like success:
+    Q and N inflate together so sigma does not blow up, it FREEZES. At R=2 and
+    step 8, step 1 carries 50% of the cumulative and step 8 carries 0.4%, so the
+    scale stops tracking the run while reporting a reassuringly stable number.
+    The same recursion hits every moment of the reliability statistic equally,
+    which leaves alpha pinned at its step-1 estimate.
+
+    So: ``update`` writes into ``delta``, ``all_reduce`` reduces ``delta``, folds
+    it into ``total`` once, and zeroes it. ``total`` is never reduced.
+    """
+
     def __init__(self, *, n_tasks: int, device):
         self.n_tasks = T = int(n_tasks)
+        # Cumulative across the run, already global. Never all-reduced.
         self.q = torch.zeros(T * T, dtype=torch.float64, device=device)
         self.n = torch.zeros(T, dtype=torch.float64, device=device)
+        # This step's rank-local contribution. See ACCUMULATION.
+        self.dq = torch.zeros(T * T, dtype=torch.float64, device=device)
+        self.dn = torch.zeros(T, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     def update(
@@ -272,31 +307,49 @@ class CumulativePolicyShiftRMS:
         dst_c = dst.clamp(min=0)
 
         # Diagonal: the row's own teacher, on its own task's states.
-        self.q.index_add_(0, dst_c * T + dst_c, (m_on * mask).sum(dim=1) * row_ok)
-        self.n.index_add_(0, dst_c, (mask.sum(dim=1)) * row_ok)
+        self.dq.index_add_(0, dst_c * T + dst_c, (m_on * mask).sum(dim=1) * row_ok)
+        self.dn.index_add_(0, dst_c, (mask.sum(dim=1)) * row_ok)
 
         # Off-diagonal: each plane's teacher on THIS destination's states.
         for c in range(d_off.size(-1)):
             src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
             ok = row_ok * (src >= 0).to(torch.float64)
-            self.q.index_add_(0, dst_c * T + src.clamp(min=0), (m_off[..., c] * mask).sum(dim=1) * ok)
+            self.dq.index_add_(0, dst_c * T + src.clamp(min=0), (m_off[..., c] * mask).sum(dim=1) * ok)
 
     def all_reduce(self) -> None:
-        """Sum across the DP group. Unconditional: gated on config, never on data."""
+        """Reduce THIS STEP's delta, fold it in once, and clear it.
+
+        Unconditional: gated on config, never on data, so a rank whose
+        micro-batches held nothing still runs the same collective its neighbours
+        do. Reducing ``total`` here instead is the bug ACCUMULATION describes.
+        """
         self._cpu_cache = None
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            return
-        for t in (self.q, self.n):
-            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            for t in (self.dq, self.dn):
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        self.q += self.dq
+        self.n += self.dn
+        self.dq.zero_()
+        self.dn.zero_()
 
     def _cpu(self):
         if self._cpu_cache is None:
             T = self.n_tasks
+            # The pending delta travels with them so the check below costs no
+            # extra transfer. Rendering a total that has not absorbed this step
+            # yet is a silently stale number, and the whole reason the delta
+            # exists is that silently wrong statistics are the failure mode here.
             self._cpu_cache = (
                 self.q.detach().to("cpu").view(T, T),
                 self.n.detach().to("cpu"),
+                float(self.dn.detach().to("cpu").abs().sum()),
             )
-        return self._cpu_cache
+        q, n, pending = self._cpu_cache
+        assert pending == 0.0, (
+            "CumulativePolicyShiftRMS was rendered with an unreduced step delta; "
+            "call all_reduce() at the step boundary before reading the scale"
+        )
+        return q, n
 
     def snapshot(self) -> dict:
         """``{"sigma": (T, T), "valid": (T, T), "n": (T,)}`` on the host.
@@ -324,7 +377,15 @@ class CumulativePolicyShiftRMS:
         return snap["sigma"][idx, idx].clone(), snap["valid"][idx, idx].clone()
 
     def state_dict(self) -> dict:
-        return {"n_tasks": self.n_tasks, "q": self.q.detach().to("cpu"), "n": self.n.detach().to("cpu")}
+        # The delta is empty between steps -- checkpoints are taken there -- but
+        # it travels anyway rather than being asserted away: a resume that
+        # silently dropped a partial step would be indistinguishable from one
+        # that never had it.
+        return {
+            "n_tasks": self.n_tasks,
+            "q": self.q.detach().to("cpu"), "n": self.n.detach().to("cpu"),
+            "dq": self.dq.detach().to("cpu"), "dn": self.dn.detach().to("cpu"),
+        }
 
     def load_state_dict(self, state: dict) -> None:
         assert int(state["n_tasks"]) == self.n_tasks, (
@@ -333,6 +394,8 @@ class CumulativePolicyShiftRMS:
         )
         self.q.copy_(state["q"].to(self.q.device, self.q.dtype))
         self.n.copy_(state["n"].to(self.n.device, self.n.dtype))
+        self.dq.copy_(state.get("dq", torch.zeros_like(self.dq)).to(self.dq.device, self.dq.dtype))
+        self.dn.copy_(state.get("dn", torch.zeros_like(self.dn)).to(self.dn.device, self.dn.dtype))
         self._cpu_cache = None
 
 
@@ -394,16 +457,18 @@ def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
 
     ``common``     ``1[all teachers incl. the on-task one share a sign] *
                    sign(hat_on) * min_j |hat_j|``. Signed, on-task inclusive,
-                   and bounded by ``|hat_on|``. This is the one the residual is
-                   defined against, so it is what the reliability estimate and
-                   the attribution tables see.
+                   and bounded by ``|hat_on|``. THIS is the corroboration the KL
+                   evidence uses, and it is also what the residual is defined
+                   against, so the reliability estimate and the attribution
+                   tables see the same decomposition the weight does.
     ``common_ev``  ``1[the OFF-TASK teachers share a sign] * min_m |hat_m|``,
-                   the corroboration bonus the KL evidence uses. Off-task only,
-                   because the on-task teacher is silent at 64% of teacher mass
-                   and including it would kill the channel across two thirds of
-                   what this arm measures. Zero when there is fewer than one
-                   other voice to corroborate with -- one teacher agreeing with
-                   itself is not corroboration.
+                   the same quantity with the on-task teacher left out. NOT used
+                   by the loss -- see the module docstring for why crediting a
+                   position where the sources contradict the on-task teacher is
+                   the wrong bonus -- and reported as a counterfactual so the
+                   cost of requiring the on-task teacher to have spoken is a
+                   measurement. Zero with fewer than two off-task voices: one
+                   teacher agreeing with itself is not corroboration.
     ``residual``   ``hat_m - common``. What is left of source ``m`` once the
                    part every teacher shares is taken out; the reliability
                    correlation is measured on THIS so that generally-good
@@ -435,14 +500,30 @@ def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
 
 def candidate_kl_evidence(
     *,
-    common_ev: torch.Tensor,
+    common: torch.Tensor,
     hat_off: torch.Tensor,
     source_alpha: torch.Tensor,
 ) -> torch.Tensor:
-    """``e = |c_ev| + sum_m alpha_m |hat_delta_m|``. (bs, resp, k), non-negative.
+    """``e = |c| + sum_m alpha_m |hat_delta_m|``. (bs, resp, k), non-negative.
+
+    ``c`` is the ALL-TEACHER corroboration -- the on-task teacher included in
+    both the unanimity test and the minimum. A candidate earns the bonus only
+    where every teacher in the run moved it the same way, which is what makes
+    the bonus a statement about shared structure rather than about the other
+    tasks agreeing with each other over the on-task teacher's objection.
+
+    The consequence is worth stating because it is the cost of that choice: the
+    on-task teacher is silent at about 64% of teacher mass, and ``c`` is capped
+    by its shift, so the corroboration channel is quiet across most of the
+    support. :func:`decompose_common_residual` still returns the off-task-only
+    ``common_ev``, which is reported as a counterfactual so the size of that
+    quiet region is a measurement rather than an assumption -- but nothing in
+    the loss reads it.
 
     Args:
-        common_ev: (bs, resp, k) from :func:`decompose_common_residual`.
+        common: (bs, resp, k) the on-task-inclusive corroboration from
+            :func:`decompose_common_residual`. Signed there, absolute here: a KL
+            term has no direction to carry.
         hat_off: (bs, resp, k, n_off) standardized source shifts. The FULL
             shift, not the residual -- see the module docstring for why
             subtracting the common part here makes corroboration score lower
@@ -458,7 +539,7 @@ def candidate_kl_evidence(
     a = source_alpha.to(hat_off.dtype)
     while a.dim() < hat_off.dim():
         a = a.unsqueeze(1)
-    return common_ev.abs() + (a * hat_off.abs()).sum(dim=-1)
+    return common.abs() + (a * hat_off.abs()).sum(dim=-1)
 
 
 SIDECAR_NAME = "cross_teacher_kl_weight_state.pt"
@@ -490,11 +571,24 @@ def sidecar_state(*, rms, mean, adv, alpha, identity: dict) -> dict:
 
 
 def load_sidecar_state(state: dict, *, rms, mean, adv, identity: dict):
-    """Restore, after checking the identity. Returns the stored alpha table."""
+    """Restore, after checking the identity. Returns the stored alpha table.
+
+    Every key the caller names must be PRESENT in the checkpoint and must match.
+    An absent key used to pass, which made the check strictly weaker the older
+    the checkpoint was -- exactly backwards, since an older checkpoint is the one
+    most likely to have been written under a different base or teacher set.
+    """
     assert int(state.get("version", 0)) == 1, f"unknown sidecar version {state.get('version')}"
     stored = dict(state.get("identity", {}))
     for key, value in identity.items():
-        if key in stored and stored[key] != value:
+        if key not in stored:
+            raise AssertionError(
+                f"cross_teacher_kl_weight resume: the checkpoint's identity does not record "
+                f"{key!r}, so it cannot be shown to describe this run. The accumulated scale "
+                "and reliability are only meaningful against a known base, teacher set and "
+                "temperature; start the arm fresh rather than assume."
+            )
+        if stored[key] != value:
             raise AssertionError(
                 f"cross_teacher_kl_weight resume mismatch on {key!r}: checkpoint has "
                 f"{stored[key]!r}, this run has {value!r}. The accumulated scale and "
@@ -629,7 +723,19 @@ class PreviousStepTaskKLWeightedMean:
             self._cpu_cache = (self.num.detach().to("cpu"), self.den.detach().to("cpu"))
         num, den = self._cpu_cache
         mean = num / den.clamp(min=1e-30)
-        return {"mean": mean, "valid": den > 0, "den": den}
+        # Positive AND finite. Without the second half a non-finite numerator
+        # passes ``den > 0``, and the NaN then rides mu into the weight and out
+        # into the loss -- clamp propagates NaN and torch.where selects the
+        # valid branch. The caller reads ``nonfinite`` and fails the step; the
+        # LOSS is protected here, so the failure is loud instead of a poisoned
+        # optimizer state.
+        finite = torch.isfinite(mean) & (mean > 0)
+        return {
+            "mean": mean,
+            "valid": (den > 0) & finite,
+            "den": den,
+            "nonfinite": int(((den > 0) & ~finite).sum()),
+        }
 
     def reset(self) -> None:
         """Start the next step's accumulation. The snapshot is a per-STEP mean."""
@@ -735,7 +841,19 @@ class AdvantageReliabilityStats:
         self.n_tasks = T = int(n_tasks)
         self.n_moments = len(ADV_MOMENTS)
         self.max_groups = G = int(max_groups)
+        # Cumulative and already global; never all-reduced. See
+        # CumulativePolicyShiftRMS.ACCUMULATION for why the delta exists.
         self.buf = torch.zeros(T * T * self.n_moments, dtype=torch.float64, device=device)
+        self.dbuf = torch.zeros_like(self.buf)
+        # The between-group sum of squares, accumulated as a CORRECTED SCALAR per
+        # pair rather than rebuilt from group cells. Each prompt group belongs to
+        # exactly one step, so sum_g (sum_g S)^2 / n_g decomposes over steps and
+        # this column is exact.
+        self.between = torch.zeros(T * T, dtype=torch.float64, device=device)
+        # How many rows ever carried a usable group id, per pair. It is what
+        # distinguishes "the groups explain none of the spread" from "no group
+        # was ever named", and those two must not both read as zero.
+        self.grouped = torch.zeros(T * T, dtype=torch.float64, device=device)
         # Per (pair, prompt group): the group's summed support score and its row
         # count. This is what makes the group centring EXACT without a second
         # pass over the step. A group's rollouts land in different micro-batches
@@ -747,6 +865,12 @@ class AdvantageReliabilityStats:
         # variance does, and
         #     sum (S - S_g)^2 = sum S^2 - sum_g (sum_g S)^2 / n_g
         # turns these two columns into that.
+        # STEP-LOCAL, and that is the whole point. ``adv_group_id`` is dense and
+        # re-issued from zero every step, so a buffer that survived the step
+        # would add step 1's group 0 to step 2's unrelated group 0 and then
+        # square the sum. Merging groups understates the between-group term
+        # (Cauchy-Schwarz), which overstates the within-group variance and pulls
+        # every correlation toward zero -- undoing the centring this exists for.
         self.group = torch.zeros(T * T * G * 2, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
@@ -799,7 +923,7 @@ class AdvantageReliabilityStats:
             vals = torch.stack(cols, dim=-1)                     # (bs, M)
             pair = dst.clamp(min=0) * T + src.clamp(min=0)
             flat = (pair.unsqueeze(-1) * M + torch.arange(M, device=vals.device)).reshape(-1)
-            self.buf.index_add_(0, flat, vals.reshape(-1))
+            self.dbuf.index_add_(0, flat, vals.reshape(-1))
 
             if group_ids is not None:
                 g = group_ids.reshape(-1).to(torch.long)
@@ -809,34 +933,59 @@ class AdvantageReliabilityStats:
                 self.group.index_add_(0, idx, torch.stack([s * g_ok, g_ok], dim=-1).reshape(-1))
 
     def all_reduce(self) -> None:
+        """Reduce this step's moments and groups, fold both in, and clear.
+
+        The group cells are reduced and then COLLAPSED here, into one
+        between-group sum of squares per pair, because that is the only form
+        that survives the step boundary: the ids naming the cells are re-issued
+        next step and mean something else.
+        """
         self._cpu_cache = None
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            return
-        for t in (self.buf, self.group):
-            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            for t in (self.dbuf, self.group):
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        self.buf += self.dbuf
+        self.dbuf.zero_()
+
+        T, G = self.n_tasks, self.max_groups
+        grp = self.group.view(T * T, G, 2)
+        totals, counts = grp[..., 0], grp[..., 1]
+        self.between += torch.where(
+            counts > 0, totals.square() / counts.clamp(min=1.0), torch.zeros_like(totals)
+        ).sum(dim=-1)
+        self.grouped += counts.sum(dim=-1)
+        self.group.zero_()
 
     def _cpu(self):
         if self._cpu_cache is None:
-            T, M, G = self.n_tasks, self.n_moments, self.max_groups
+            T, M = self.n_tasks, self.n_moments
             self._cpu_cache = (
                 self.buf.detach().to("cpu").view(T, T, M),
-                self.group.detach().to("cpu").view(T, T, G, 2),
+                self.between.detach().to("cpu").view(T, T),
+                self.grouped.detach().to("cpu").view(T, T),
+                float(self.dbuf.detach().to("cpu").abs().sum()),
             )
-        return self._cpu_cache
+        buf, between, grouped, pending = self._cpu_cache
+        assert pending == 0.0, (
+            "AdvantageReliabilityStats was rendered with an unreduced step delta; "
+            "call all_reduce() at the step boundary before reading alpha"
+        )
+        return buf, between, grouped
 
     def _cell(self, dst: int, src: int) -> dict:
-        buf, grp = self._cpu()
+        buf, between, grouped = self._cpu()
         cell = {name: float(buf[dst, src, i]) for i, name in enumerate(ADV_MOMENTS)}
         # The between-group part of the support score's spread, subtracted below
         # so the correlation is against the WITHIN-group score. A prompt every
         # rollout finds hard shifts the whole group, and the advantage it is
         # correlated with has already had exactly that removed.
-        totals, counts = grp[dst, src, :, 0], grp[dst, src, :, 1]
-        keep = counts > 0
+        #
         # None, not 0.0, when no group was ever named: 0.0 would mean "the groups
         # explain none of the spread", which is a claim, and would silently turn
-        # the variance below into an uncentred second moment.
-        cell["_s_between"] = float((totals[keep].square() / counts[keep]).sum()) if bool(keep.any()) else None
+        # the variance below into an uncentred second moment. ``grouped`` counts
+        # the rows that carried a usable group id, which is what tells the two
+        # apart.
+        cell["_s_between"] = float(between[dst, src]) if float(grouped[dst, src]) > 0 else None
         return cell
 
     @staticmethod
@@ -941,6 +1090,9 @@ class AdvantageReliabilityStats:
             "moments": ADV_MOMENTS,
             "max_groups": self.max_groups,
             "buf": self.buf.detach().to("cpu"),
+            "dbuf": self.dbuf.detach().to("cpu"),
+            "between": self.between.detach().to("cpu"),
+            "grouped": self.grouped.detach().to("cpu"),
             "group": self.group.detach().to("cpu"),
         }
 
@@ -953,7 +1105,12 @@ class AdvantageReliabilityStats:
             "max_groups changed; the per-group buffer would be re-indexed onto other prompts"
         )
         self.buf.copy_(state["buf"].to(self.buf.device, self.buf.dtype))
-        self.group.copy_(state["group"].to(self.group.device, self.group.dtype))
+        for name, dst in (
+            ("dbuf", self.dbuf), ("between", self.between),
+            ("grouped", self.grouped), ("group", self.group),
+        ):
+            src = state.get(name, None)
+            dst.copy_(torch.zeros_like(dst) if src is None else src.to(dst.device, dst.dtype))
         self._cpu_cache = None
 
 
@@ -1009,6 +1166,7 @@ POSITION_TERMS = (
     "kl_shift_abs",
     "evidence",
     "evidence_shared",
+    "evidence_shared_offtask_only",
     "available",
 )
 
@@ -1156,10 +1314,27 @@ def build_position_weight(
     row_alpha = alpha[dst.unsqueeze(-1), src]                       # (bs, n_off)
 
     evidence = candidate_kl_evidence(
-        common_ev=dec["common_ev"], hat_off=hat_off, source_alpha=row_alpha
+        common=dec["common"], hat_off=hat_off, source_alpha=row_alpha
+    )
+    # The off-task-only variant, computed and never applied. It answers the one
+    # question the all-teacher rule cannot: how much corroboration the on-task
+    # teacher's silence is costing, at the 64% of teacher mass where it says
+    # nothing. A counterfactual, so it is reported beside the applied share and
+    # reaches no weight.
+    evidence_offtask_only = candidate_kl_evidence(
+        common=dec["common_ev"], hat_off=hat_off, source_alpha=row_alpha
     )
     pre = position_pre_weight(evidence=evidence, on_task_logprob=on_task_logprob)
     pre = torch.where(avail.reshape(-1, 1), pre, torch.ones_like(pre))
+    # A teacher log-prob that arrived non-finite reaches here as a non-finite
+    # weight, and a non-finite weight multiplied into the KL is a non-finite
+    # gradient and a poisoned optimizer state. Neutralise the position and COUNT
+    # it: the count is all-reduced at the step boundary and fails the step
+    # there, which is a synchronised point every rank reaches. Silently
+    # continuing at W = 1 would leave a corrupted teacher looking like a quiet
+    # mechanism.
+    finite_pre = torch.isfinite(pre)
+    pre = torch.where(finite_pre, pre, torch.ones_like(pre))
 
     # mu, and the weight. Gathered per row from a per-task snapshot, so a task
     # whose normaliser is not observed yet keeps weight 1 while the others do not
@@ -1173,6 +1348,9 @@ def build_position_weight(
         mu = mean[dst].reshape(-1, 1).expand_as(pre)
         mu_valid = valid[dst] & avail
     weight = torch.where(mu_valid.reshape(-1, 1), pre / mu.clamp(min=1e-12), torch.ones_like(pre))
+    finite_w = torch.isfinite(weight)
+    weight = torch.where(finite_w, weight, torch.ones_like(weight))
+    nonfinite = (~finite_pre).sum() + (~finite_w).sum()
 
     # Labels only. candidate_weights is called on the STANDARDIZED shifts with a
     # zero base, so report_epsilon is in RMS units and comparable across
@@ -1188,7 +1366,7 @@ def build_position_weight(
     probes = {}
     for a in probe_alphas:
         e_a = candidate_kl_evidence(
-            common_ev=dec["common_ev"], hat_off=hat_off,
+            common=dec["common"], hat_off=hat_off,
             source_alpha=torch.full_like(row_alpha, float(a)),
         )
         p_a = position_pre_weight(evidence=e_a, on_task_logprob=on_task_logprob)
@@ -1198,6 +1376,8 @@ def build_position_weight(
     return {
         "weight": weight,
         "pre_weight": pre,
+        # A device scalar, so counting costs no host sync inside the loop.
+        "nonfinite": nonfinite,
         "mu": mu,
         "available": avail,
         "hat_on": hat_on,
@@ -1208,12 +1388,41 @@ def build_position_weight(
         "evidence": evidence,
         "state": state,
         "teacher_prob": p_teacher,
-        # sum_v p_d(v) |c_ev(v)| -- the corroboration channel's share of W~ - 1.
-        "evidence_shared": (p_teacher * dec["common_ev"].abs()).sum(dim=-1),
+        # sum_v p_d(v) |c(v)| -- the corroboration channel's share of W~ - 1.
+        "evidence_shared": (p_teacher * dec["common"].abs()).sum(dim=-1),
+        # The same thing the off-task-only rule would have produced. Reported,
+        # never applied: the gap between the two IS the price of requiring the
+        # on-task teacher to have spoken.
+        "evidence_shared_offtask_only": (p_teacher * dec["common_ev"].abs()).sum(dim=-1),
+        "evidence_offtask_only": (p_teacher * evidence_offtask_only).sum(dim=-1),
         # (bs, resp, n_off): each source's share of the same quantity.
         "evidence_by_source": p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs(),
         "probe_pre_weight": probes,
     }
+
+
+def assert_all_finite(counts: dict) -> None:
+    """Fail the step on any non-finite the arm saw, at a synchronised point.
+
+    Every caller reaches this line, so raising here cannot deadlock the way an
+    exception inside the micro-batch loop would -- one rank leaving a collective
+    its neighbours are still waiting on hangs the job instead of ending it.
+
+    Failing rather than neutralising is the point. A non-finite teacher log-prob,
+    a normaliser that went to NaN, a scale that came back inf: each of those has
+    a cause, and each looks from the metrics exactly like "the mechanism found
+    nothing to do". The weights are already forced to 1 by the time this runs,
+    so the loss for the failing step was never corrupted; what this stops is the
+    NEXT thousand steps continuing on a silently inert arm.
+    """
+    bad = {name: int(value) for name, value in counts.items() if int(value) > 0}
+    if bad:
+        raise AssertionError(
+            "cross_teacher_kl_weight saw non-finite values this step: "
+            + ", ".join(f"{name}={n}" for name, n in sorted(bad.items()))
+            + ". The weights were forced to 1 so the loss is intact, but the cause is "
+            "upstream -- check the teacher/base log-probs and the accumulated scale."
+        )
 
 
 def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
@@ -1231,6 +1440,7 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
         "kl_shift_abs": (w - 1.0).abs() * kl,
         "evidence": pre - 1.0,
         "evidence_shared": built["evidence_shared"],
+        "evidence_shared_offtask_only": built["evidence_shared_offtask_only"],
         "available": built["available"].reshape(-1, 1).expand_as(w).to(torch.float32),
     }
 
@@ -1287,6 +1497,15 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
         out[f"{head}/position/available_frac"] = tot["available"] / n
         out[f"{head}/evidence/total_mean"] = tot["evidence"] / n
         out[f"{head}/evidence/shared_mean"] = tot["evidence_shared"] / n
+        out[f"{head}/evidence/shared_offtask_only_mean"] = tot["evidence_shared_offtask_only"] / n
+        # The counterfactual, never applied. Above 1 by a lot means the on-task
+        # teacher's silence is where the corroboration channel goes quiet, which
+        # is the known cost of the all-teacher rule and the number that says how
+        # large it actually is on this run.
+        if abs(tot["evidence_shared"]) > 1e-12:
+            out[f"{head}/evidence/shared_offtask_only_ratio"] = (
+                tot["evidence_shared_offtask_only"] / tot["evidence_shared"]
+            )
         if abs(tot["evidence"]) > 1e-12:
             # Which channel is carrying the mechanism. Near 1 the corroboration
             # bonus IS the arm; near 0 it is decoration and what the run tests is
