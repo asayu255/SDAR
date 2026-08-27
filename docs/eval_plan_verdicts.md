@@ -1,0 +1,296 @@
+# 6 項目の改良案に対する実測判定(2026-08-27)
+
+外部から提示された改良案 6 項目に、**このリポジトリで実際に測った結果**で答える。
+各項目の事実記述は**ほぼすべて正しい**。分かれたのは**効果の見積もりと優先順**である。
+
+対象は `trainer.val_only=True` の multitask 評価(Qwen3-1.7B、A6000 × 3)。
+一次資料は `docs/eval_gpu_util_status.md`、時系列は `docs/eval_gpu_utilization.md`。
+
+---
+
+## 0. まず、天井の表を差し替える
+
+提示された表:
+
+| 段階 | GPU util |
+| --- | ---: |
+| 現在 | 79.90% |
+| EMPTY を完全に除去 | 87.96% |
+| PARTIAL も完全に除去 | 91.07% |
+| vLLM 内部 gap も完全に隠蔽 | 理論上 100% |
+
+**最後の行が測定で否定された。** `num_scheduler_steps=4` で duty は
+91.07% → **92.55%**。gap を scheduler 由来 S とそれ以外 R に分けると:
+
+```
+S + R   = 8.93   (steps=1)
+S/4 + R = 7.45   (steps=4)
+→ S = 1.97,  R = 6.96
+```
+
+**engine 設定が触れるのは 9 pt のうち 2 pt だけ。** `steps=8` は +0.24 pt。
+残る 7 pt は step ごとの output 処理、CUDA graph replay、forward 内部の隙間で、
+`engine_kwargs` から触れるつまみは無い。
+
+そして**測って分かった最も重要なこと**は、この表の縦軸そのものである:
+
+| 完走 run | 構成 | node util | duty | **wall** | success |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `...-092241` | V1, depth 3, **pump** | 79.90% | 91.07% | **0.96 h** | 0.3875 |
+| `...-124410` | **V0 + ms4**, depth 3 | **83.21%** | **92.55%** | 1.24 h | 0.3865 |
+| `...-201115` | V1, depth 2 | 81.2% | — | 1.26 h | 0.3869 |
+
+**util が最も高い構成が、最も速い構成より 29% 遅い。** 同じ checkpoint、
+同じ 3 枚、スコアは 3 本とも 0.001 以内。**util で選ぶと 29% 遅い設定を選ぶ。**
+
+「実用上の目標は 95〜99% かつ ms/row 最小」という指摘は正しいが、
+**この 2 つは並立しない。** wall が決める。
+
+---
+
+## 1. trajectory 単位の連続実行 —— **不要になった**
+
+### 事実記述は正しい
+
+`responses = [future.result(timeout=timeout) for future in futures]` が
+batch 全体を待つ —— **確認した**(`rollout_loop.py`)。
+
+### だが、それが直すはずだった tail は pump が既に直していた
+
+item 1 を作りかけて、根拠にした turn table が **pump OFF の run** だったことに
+気づいた。pump ON で測り直すと:
+
+| turn | active | pump OFF | **pump ON** |
+| ---: | ---: | ---: | ---: |
+| 2 | 58 → 40 | 13.70 s | **5.58 s** |
+| 3 | 12 → 7 | **10.82 s** | **3.17 s** |
+
+slot A の turn 3(7 行)と slot B の turn 1(252 行)が**同じプールに入る**ので、
+engine は 7 行ではなく 259 行を見る。tail は生成 wall の 48% → **32%**。
+
+### そして真の per-trajectory は環境層で塞がれている
+
+`MultiTaskEnvironmentManager.step` は `managers[task].step(actions)` に
+**そのタスクの全行**を渡す。下位マネージャは行の部分集合を進める術を持たず、
+部分ステップは `_task_steps` を破綻させる。**環境マネージャの改造が前提**になる。
+
+**判定: 生成側は完了、環境側は測定された的が残っていない。着手しない。**
+
+---
+
+## 2. `async_scheduling` —— **落とす**
+
+### バージョン不一致の指摘は正しい
+
+`environment.yml` は `vllm==0.11.0` を固定、実機は **0.8.5**。確認した。
+そして 0.8.5 の **V0** には `num_scheduler_steps` がある —— これも正しく、
+実際に動いた(`[rollout-engine] vllm 0.8.5, core=v0`)。
+
+### だが的は 8.93 pt ではなく約 2 pt である
+
+§0 の分解のとおり **S = 1.97 pt**。`async_scheduling` が隠すのは**同じ S**。
+
+0.8.5 → 0.11.0 は kernel と reduction 順が変わるので、**過去のスコアが
+全部比較対象でなくなる。** 約 2 pt にその代償は見合わない。
+
+**判定: 保留。** やるなら独立実験として、スコア基準の作り直しを込みで。
+
+### 付随して直したもの
+
+V0 は組めたが `AttributeError: 'MultiStepModelRunner' object has no attribute
+'model'` で落ちた。multi-step が model runner を包み、FSDP → vLLM の重み同期が
+届かなくなる。`unwrap_model_runner()` で解決(`b2adf4d`)。
+
+`VLLM_USE_V1=0` は**要求であって結果ではない**(vLLM は serve できない構成では
+黙って V1 に戻り、`num_scheduler_steps` は受理されて無視される)ので、
+`ROLLOUT_REQUIRE_CORE=v0` で build 時に落とすようにした(`f7198a6`)。
+
+---
+
+## 3. preprocessing の batch 化 —— **保留**
+
+### 事実記述は正しい
+
+`_run_full_preprocess` が行ごとに `preprocess_single_sample` を回している。確認した。
+
+### だが preproc は支配していない
+
+turn table の `preproc` は **turn あたり 0.14〜1.9 秒**、batch 合計 32 秒に対して。
+そして activity census で EMPTY のとき **preproc は 0.2〜0.6**(3 slot 中)。
+**一度も過半を取っていない。**
+
+見積もられた「EMPTY/driver glue の 2〜5 pt」を支持する測定が無い。
+
+**判定: 保留。** BPE 境界問題が無く検証しやすいという理由は正しいので、
+**census が preproc を名指ししたら**着手する。
+
+---
+
+## 4. Search の `step_batch` —— **落とす**
+
+### 事実記述は正しい
+
+252 個の `search()` を投げて `_Coalescer` が 100 ms 待って束ね直している。確認した。
+
+### だが的が消えた
+
+activity census で **`envstep` が 0.05 未満**、つまり出てこない。
+そして DEEP EMPTY の判定は **`EMPTY is the DRIVER RUNNING PYTHON`**
+(driver CPU 80% of one core while EMPTY vs 11% while busy。別 run で 82%/15%)。
+
+**retriever は原因ではない。** 提示された分岐の
+「`EMPTY is a wait OFF the box`」側(retriever replica、IVF/HNSW)は
+**この証拠では正当化されない。**
+
+**判定: 落とす。**
+
+---
+
+## 5. Pump の RPC —— **指摘は正しく、処方が違った**
+
+### 回数の指摘は正しい
+
+request が残る間 20 ms ごとに 3 worker への collective RPC。確認した。
+
+### だが 2 点で処方が誤り
+
+1. **worker 側は既に long-poll である。** `pump_done.get(timeout=timeout_s)` は
+   完了があれば即返る。`round_s` を上げても**待ちは増えない** ——
+   空ポーリングが減るだけで、私が説明した「latency との引き換え」も存在しない。
+2. **空ポーリングは主コストではない。**
+
+### 主コストは `.tolist()` だった
+
+```python
+def _as_id_list(prompt_token_ids):
+    return prompt_token_ids.tolist() if hasattr(...) else list(...)
+```
+
+`raw_prompt_ids` は numpy 配列で来るのに、Ray に渡す前に Python list へ展開して
+いた —— **1 token につき 1 個の Python int オブジェクト**。
+252 request × 約 1,300 token = **1 ターンあたり約 33 万オブジェクト**を
+生成・pickle・送信・unpickle。**driver スレッドで、census が `gen` とタグし
+カードが空と読む窓の中で。**
+
+int32 配列は pickle protocol 5 の 1 バッファ(memcpy)。変換は **worker の
+vLLM 境界**でやる —— list が必要なのはそこだけ。**待ちは増えない。**
+
+戻り側は反転だけでは駄目で、`pad_2d_list_to_length` が `tuple(sub_list)` を
+作るため同じコストが下流に移る。`_pad_rows` に配列専用経路を足し、
+**2 経路が同じテンソルを出すことをテストで固定**した(`1b889d8`)。
+
+**判定: 実装済み。** `round_s=0.1` は無害な追加だが、**単独で測るのは
+`.tolist()` の効果を確定させてから。**
+
+---
+
+## 6. rank 割当を予測 token 時間で —— **保留**
+
+### 事実記述は正しい
+
+`rank = min(range(world_size), key=lambda r: placed[r])` が件数で分けている。確認した。
+
+### だが測定された的が小さい
+
+PARTIAL は pump ON で **6.6%**、per-GPU 平均は **80.2 / 78.6 / 78.2**
+(spread 1〜2 pt)。**特定 rank が遅いのではなく、毎回ちがう rank が
+順番に待っている** —— routing の選択ではなく collective の構造である。
+
+そして pump がその構造の尾を大部分消している(§1)。
+
+**判定: 保留。** LPT と sticky routing の設計自体は妥当なので、
+PARTIAL が再び大きくなったら戻る。
+
+---
+
+## 7. `cpu_pct >= 60` への批判 —— **正しい。撤回して作り直した**
+
+「driver が CPU を使っている」までしか証明できない、という指摘はそのとおり。
+Rust の tokenizer は GIL を離すし、native BLAS は複数コアぶん出る。**撤回した。**
+
+同じ timestamp で phase を記録すべき、という提案も採った。ただし
+`push_phase` のスタックは**スレッドローカルではない**ので slot 3 本では壊れる。
+**数える方式**にした(`activity()` / `activity_snapshot()`)。
+
+そして判定は **2 つの読みが一致したものだけ**にした:
+
+| 計器 | 答えられること |
+| --- | --- |
+| `cpu_pct` | **働いていたか**(ソケット待ちは CPU を焼かない) |
+| activity census | **どこで**(1 phase が **slot 数の**過半を占めるとき) |
+
+食い違えば `these disagree`、CPU が 20〜60% なら `UNRESOLVED`。
+さらに pump ON では **二峰分布**(待ちと実行が混ざる)なので、平均をやめて
+**BLOCKED / RUNNING の割合**で出す。
+
+> **この判定は 2 回振った。** 1 回目は cpu 単独、2 回目は census 単独。
+> **どちらも単独では答えられない質問に、単独で答えさせていた。**
+
+---
+
+## 8. 実験順への回答
+
+| 提示された順 | 判定 |
+| --- | --- |
+| 1. 現コードで 1 本、DEEP EMPTY と version/core を確定 | **完了。** `EMPTY is the DRIVER RUNNING PYTHON`、`vllm 0.8.5, core=v0` |
+| 2. `ROLLOUT_PUMP_ROUND_S=0.1` だけ | **処方が違う。** `.tolist()` を先に直した(実装済み) |
+| 3. `async_scheduling` だけ | **落とす**(的 ~2 pt、スコア基準が全部リセット) |
+| 4. batch tokenizer | **保留**(census が preproc を名指ししていない) |
+| 5. Search `step_batch` | **落とす**(`envstep` が 0.05 未満) |
+| 6. trajectory 単位 scheduler | **不要**(生成側は pump が完了、環境側は塞がれている) |
+
+### 判定に使う計器はすべて実装済み
+
+```bash
+bash examples/sft_trainer/judge_eval.sh <control.log> <candidate.log>
+```
+
+`[rollout-pump]` / `[rollout-engine]` が噛んだか、`[gpu-residency]` の
+EMPTY / PARTIAL / duty、`ms/row all`(batch 構成の違いを割り算で落とした唯一の
+速度軸)、`val/*/test_score`、`[val-hash]` を一度に出す。
+
+**完走が要るのはスコアだけ。** しかも `[val-hash]` が対照と一致していれば
+生成は変わっておらず、スコアは動きようがない。末尾の VERDICT が
+「まだ早い／いま判定可能／スコアのために完走が要る」のどれかを言う。
+
+---
+
+## 9. いまの構成と、いまの数字
+
+```bash
+ray stop --force
+bash examples/sft_trainer/eval_checkpoints.sh <step>
+```
+
+既定で入るもの: **pump + REQUIRE**、`VAL_PIPELINE_DEPTH=3`、
+`ROLLOUT_GPU_MEM_UTIL=0.75`、`val_per_task_batch_size={alfworld:126,search:252,webshop:126}`、
+`SEARCH_URL=:8000`、`SEARCH_TCP_USER_TIMEOUT_S=10`、`GPU_PROFILER`、`ROLLOUT_TURN_TIMING`。
+
+| | wall | node util |
+| --- | ---: | ---: |
+| retriever が壊れていた時 | 2.85 h | 57.9% |
+| retriever 修正(唯一の大きな勝ち) | 1.26 h | 79.0% |
+| **+ depth 3 + KV 0.75 + pump** | **0.96 h** | 79.90% |
+
+**wall は 2.97 倍。util は 79.9%。**
+
+---
+
+## 10. 4 回観測された保存則
+
+| 変更 | 下がったもの | 上がったもの |
+| --- | --- | --- |
+| depth 3 | EMPTY 8.9 → 3.8% | PARTIAL 7.7 → 12.7% |
+| pump | PARTIAL 6.79 → 3.11 pt | EMPTY 3.29 → 8.06 pt |
+| V0 + multi-step | duty 91.07 → 92.55% | wall 0.96 → 1.24 h |
+| pump の tail 解消 | tail 48% → 32% | cpu-glue 6.9 → 15.1% |
+
+**4 回とも、狙った側は機構どおりに動き、総和は動かなかった。**
+
+これが「95〜99% を狙う」に対する最も重要な留保である。**GPU 側の並べ替えでは
+総量が変わらない。** 変わったのは 2 回だけ —— retriever の修正(外部の直列資源を
+消した)と `.tolist()`(driver の Python 仕事そのものを消した)。
+
+**次に効くものがあるとすれば、同じ形をしている:**
+GPU の空きを付け替えるのではなく、**driver の Python 仕事か、外部の待ちを
+実際に消すもの。**

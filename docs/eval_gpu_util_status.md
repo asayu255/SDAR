@@ -1,5 +1,8 @@
 # 評価の GPU 利用率 —— 現状(2026-08-27)
 
+> **6 項目の改良案への判定だけを読みたいなら `docs/eval_plan_verdicts.md`。**
+> 各項目を採否と実測で並べてある。
+
 `docs/eval_gpu_utilization.md` は時系列の実験ノート、
 `docs/eval_performance_summary.md` は打ち手の結論集である。
 **この文書は「いまどこに居るか」だけを、外れた仮説も含めて 1 枚にしたもの。**
