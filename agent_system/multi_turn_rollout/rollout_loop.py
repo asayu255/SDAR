@@ -1303,23 +1303,30 @@ class TrajectoryCollector:
         # empty was all slots in envstep (the retriever) or all slots in
         # preproc (the driver's own Python) -- opposite fixes, identical on the
         # GPU. Cost is one dict update per turn per slot.
-        with gpu_profiler.activity("preproc"):
+        _preproc_activity = gpu_profiler.activity("preproc")
+        _preproc_activity.__enter__()
+        try:
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
 
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-        if "multi_modal_data" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("multi_modal_data")
-        if "raw_prompt" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("raw_prompt")
-        if "tools_kwargs" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("tools_kwargs")
-        batch_input = batch.pop(
-            batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-        )
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            if "multi_modal_data" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("multi_modal_data")
+            if "raw_prompt" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            if "tools_kwargs" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            batch_input = batch.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+            )
 
-        batch_input.meta_info = gen_batch.meta_info
+            batch_input.meta_info = gen_batch.meta_info
+        finally:
+            # The pop and the key bookkeeping above are the same driver Python
+            # as the tokenising, and closing the tag at preprocess_batch left
+            # them in no phase at all.
+            _preproc_activity.__exit__(None, None, None)
         _m_preproc = _now()  # end of CPU preprocess (tokenize/pop)
 
         # Restrict generation to active trajectories only; done rows are filled
@@ -1328,7 +1335,8 @@ class TrajectoryCollector:
         active_batch_input = batch_input if generate_all else batch_input[active_idx]
 
         # pad to be divisible by dp_size
-        batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
+        with gpu_profiler.activity("glue"):
+            batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
         _gw0 = gpu_profiler.now()
         # Counted too, so "every card empty while every slot is in gen" is
         # distinguishable from the others: that one means the engine drained,
@@ -1339,7 +1347,8 @@ class TrajectoryCollector:
         if turn_records is not None:
             _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)
         # # unpad
-        active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+        with gpu_profiler.activity("glue"):
+            active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
         _m_gen = _now()  # end of GPU generation window
 
         # Scatter active outputs back to the full batch size for union/recording.
@@ -1349,7 +1358,8 @@ class TrajectoryCollector:
         batch.non_tensor_batch['uid'] = state["uid_batch"]
         batch.non_tensor_batch['traj_uid'] = state["traj_uid"]
 
-        batch = batch.union(batch_output)
+        with gpu_profiler.activity("glue"):
+            batch = batch.union(batch_output)
 
         with gpu_profiler.activity("decode"):
             if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:

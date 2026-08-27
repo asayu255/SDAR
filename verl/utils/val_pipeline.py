@@ -39,6 +39,7 @@ would score different games and it does not get one. Search has no such state
 matter.
 """
 
+import contextlib
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +90,24 @@ class Slot:
 
     def __repr__(self):
         return f"Slot({self.name}, tasks={'any' if self.tasks is None else sorted(self.tasks)})"
+
+
+@contextlib.contextmanager
+def _activity(name):
+    """Count the CALLING thread in the activity census, if profiling is on.
+
+    The census tagged the slot threads and nothing else, so the thread that
+    loads, prepares and scores -- which holds the GIL for all of it -- showed up
+    nowhere. That is what "0.8 of 3 slots in no tagged phase" was made of, and
+    it was invisible in exactly the samples where every card was empty.
+    """
+    try:
+        from verl.utils import gpu_profiler
+    except Exception:  # pragma: no cover - profiler is optional
+        yield
+        return
+    with gpu_profiler.activity(name):
+        yield
 
 
 def _residency_over(spans):
@@ -171,6 +190,12 @@ def run_pipelined(
         resumed = time.perf_counter()
         return payload, resumed
 
+    @contextlib.contextmanager
+    def _scoring():
+        """The caller's accumulation, which runs on this thread between yields."""
+        with _activity("scoring"):
+            yield
+
     def report(final):
         covered, span = _coverage(spans)
         if span <= 0:
@@ -208,7 +233,8 @@ def run_pipelined(
         while True:
             _t = time.perf_counter()
             try:
-                item = next(iterator)
+                with _activity("dataload"):
+                    item = next(iterator)
             except StopIteration:
                 break
             waited = time.perf_counter() - _t
@@ -216,7 +242,8 @@ def run_pipelined(
             clock["dataload_max"] = max(clock["dataload_max"], waited)
 
             _t = time.perf_counter()
-            prepared = prepare(item)
+            with _activity("prepare"):
+                prepared = prepare(item)
             clock["prepare"] += time.perf_counter() - _t
             task = task_of(prepared)
             # Retire until a slot this batch can use is free. A batch whose task
@@ -229,14 +256,16 @@ def run_pipelined(
                 if not inflight:
                     raise RuntimeError(f"no slot can run task {task!r}: {slots}")
                 payload, resumed = handed_back()
-                yield payload
+                with _scoring():
+                    yield payload
                 clock["consumer"] += time.perf_counter() - resumed
                 maybe_report()
             free.remove(slot)
             inflight.append((prepared, executor.submit(timed_launch, prepared, slot), slot))
         while inflight:
             payload, resumed = handed_back()
-            yield payload
+            with _scoring():
+                yield payload
             clock["consumer"] += time.perf_counter() - resumed
             maybe_report()
     finally:

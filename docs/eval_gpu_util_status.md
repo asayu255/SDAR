@@ -358,6 +358,68 @@ retriever の複製や Flat index の置き換えは、**この証拠からは�
 
 ---
 
+## 7quinquies. multi-step の取り分は出し切った —— そして計画の 1 項が落ちる
+
+| | duty cycle | gap |
+| --- | ---: | ---: |
+| V1 + pump | 91.07% | 8.93 pt |
+| **V0 + multi-step 4** | **92.55%** | **7.45 pt** |
+
+**回収 1.48 pt、gap の 17%。** 隠蔽できていれば duty は 100% 近くになる。
+
+gap を scheduler 由来 S とそれ以外 R に分ける。`num_scheduler_steps=4` は S を 1/4 にする:
+
+```
+S + R    = 8.93     (steps=1)
+S/4 + R  = 7.45     (steps=4)
+------------------------------
+S = 1.97,  R = 6.96
+```
+
+**scheduler は 9 pt のうち 2 pt しかない。** `steps=8` は `S/8 + R = 7.21`、
+**+0.24 pt** —— 走らせる価値はない。
+
+> **これは計画の 1 項を落とす。** `async_scheduling`(vLLM 0.11)が隠すのは
+> **同じ S** である。**したがって 0.11 への更新も ~2 pt** であって、
+> かつて書いた ~8.93 pt ではない。kernel と reduction 順が変わって
+> スコアの基準が全部リセットされる代償に見合わない。**保留。**
+
+**留保 2 つ。** (1) B(V0 単体)が無いので S=1.97 は「V0 == V1」を仮定している。
+(2) NVML の 1 サンプルが turn の境界をまたぐと busy サンプルの読みも下がるので、
+**7.45 pt は engine 内部 gap の上限**である。
+
+`disable_async_output_proc` は既定 False(= async output 処理は既に ON)なので、
+そこは取ってある。残る R は step ごとの output 処理、CUDA graph の replay、
+model forward 内部の隙間 —— **`engine_kwargs` から触れるつまみは無い。**
+
+---
+
+## 7sexies. 「どのタグにも入っていない 0.8」を塞いだ
+
+EMPTY のとき `envstep 1.1, preproc 0.6, gen 0.5` = 2.2、**3 slot に対して 0.8 が
+どこにも計上されていなかった。** batch tokenizer を作る前にここを見ないと、
+preproc(0.6)を最適化してより大きい塊を外す。
+
+**正体は「slot スレッドしかタグしていなかった」こと。** 中身:
+
+| 追加したタグ | どこ |
+| --- | --- |
+| `dataload` / `prepare` / `scoring` | **呼び出しスレッド**(val_pipeline)。ロード・準備・採点の間ずっと GIL を握る |
+| `glue` | pad / unpad / `DataProto.union` —— phase の**あいだ** |
+| `preproc`(範囲拡大) | `batch.pop` と key の帳簿。タグが `preprocess_batch` で閉じていた |
+
+判定行も phase を名前で言うようにした:
+
+```
+-> EMPTY is the DRIVER RUNNING PYTHON: 82% of one core while EMPTY against
+   15% while busy, mostly in reward accumulation on the calling thread
+```
+
+**次の run が 0.8 の中身を名指しする。** そこで初めて 4(batch tokenizer)と
+5(`step_batch`)のどちらが本命か決まる。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**

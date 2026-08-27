@@ -440,3 +440,31 @@ def test_with_no_cpu_sample_a_dominant_phase_is_still_named_but_hedged():
     act = [(ts, {"envstep": 3} if max(v) == 0 else {"gen": 3}) for ts, v in trace]
     line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
     assert "mostly envstep" in line and "no CPU sample to corroborate" in line, line
+
+
+# --------------------------------------------------------------------------- #
+# the phases that were in no phase
+# --------------------------------------------------------------------------- #
+def test_the_calling_threads_phases_are_nameable():
+    """dataload, prepare and scoring run on the thread nobody counted.
+
+    The census tagged the slot threads only, so the thread that loads, prepares
+    and accumulates -- holding the GIL for all of it -- appeared nowhere. That
+    is what "0.8 of 3 slots in no tagged phase" was made of, and it was missing
+    from exactly the samples where every card was empty.
+    """
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"scoring": 2.6}))
+    assert "reward accumulation on the calling thread" in line, line
+
+
+def test_the_between_phases_glue_is_nameable():
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"glue": 2.6}))
+    assert "padding and DataProto union" in line, line
+
+
+def test_envstep_under_a_running_driver_still_says_it_is_not_the_retriever():
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"envstep": 2.6}))
+    assert "not the retriever" in line, line

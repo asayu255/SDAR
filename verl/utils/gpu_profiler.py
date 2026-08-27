@@ -865,12 +865,19 @@ def format_residency(res) -> str:
         if dominates and top_name != "envstep":
             why += f" (though {top_name} was the phase -- these disagree, trust neither yet)"
     elif driver_running:
-        where = f", mostly in {top_name}" if dominates else ", and no single phase dominates"
+        named = {
+            "preproc": "tokenising",
+            "decode": "detokenising",
+            "glue": "padding and DataProto union between the phases",
+            "dataload": "the val loader on the calling thread",
+            "prepare": "batch preparation on the calling thread",
+            "scoring": "reward accumulation on the calling thread",
+            "envstep": "envstep -- the driver's work around the call, not the retriever",
+        }.get(top_name, top_name)
+        where = f", mostly in {named}" if dominates else ", and no single phase dominates"
         why += (f"\n[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: {empty_cpu:.0f}% of one "
                 f"core while EMPTY against {busy_cpu:.0f}% while busy{where}")
-        if dominates and top_name == "envstep":
-            why += (" -- envstep here is the driver's own work around the call, not the "
-                    "retriever, which would show as a blocked process")
+
     elif empty_cpu is not None:
         why += (f"\n[gpu-residency] -> EMPTY is UNRESOLVED: driver CPU {empty_cpu:.0f}% of one core "
                 f"(vs {busy_cpu:.0f}% while busy) is neither blocked nor clearly running")
