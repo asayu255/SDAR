@@ -681,7 +681,7 @@ python3 -m verl.trainer.main_sft_multitask \
     +env.multitask.history_length.alfworld=2 \
     +env.multitask.history_length.search=4 \
     +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size='{alfworld:126,search:378,webshop:126}' \
+    env.multitask.val_per_task_batch_size='{alfworld:126,search:504,webshop:126}' \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.n_gpus_per_node=3 \
     trainer.ray_wait_register_center_timeout=600 \

@@ -22,6 +22,7 @@ The fixtures are long for the same reason as test_judge_eval.py: every check
 here can exit early, and a short log hides SIGPIPE under pipefail.
 """
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -151,3 +152,69 @@ def test_the_cumulative_and_windowed_speed_are_both_shown(logs):
     out = inventory(*logs)
     assert "ALL/LAST" in out
     assert row(out, "eval_pump.log")[-2] == "73/73"
+
+
+# --------------------------------------------------------------------------- #
+# The width and the KV budget are one decision
+# --------------------------------------------------------------------------- #
+EVAL_SH = Path(__file__).resolve().parents[2] / "examples" / "sft_trainer" / "eval_checkpoints.sh"
+RUN_SH = Path(__file__).resolve().parents[2] / "examples" / "sft_trainer" / "run_multitask_sft_qwen3.sh"
+PINNED = Path(__file__).resolve().parents[2] / "examples" / "sft_trainer" / "expected_multitask_sft_config.yaml"
+
+
+def _width_from(path, pattern):
+    """re.MULTILINE, so an anchored pattern cannot match a commented example.
+
+    It already did: the pinned file carries an illustrative
+    "#   "env.multitask.val_per_task_batch_size": {...}" line above the real
+    one, and an unanchored search found the comment's number.
+    """
+    import re
+    m = re.search(pattern, path.read_text(), re.M)
+    assert m, f"{pattern} not in {path}"
+    return int(m.group(1))
+
+
+def test_the_pinned_width_and_the_passed_width_agree():
+    """They are checked against each other at runtime; a mismatch aborts the run.
+
+    Changing one and not the other is the easiest way to lose an hour, and the
+    check that catches it only runs on a GPU box.
+    """
+    passed = _width_from(RUN_SH, r"val_per_task_batch_size='\{[^}]*search:(\d+)")
+    pinned = _width_from(PINNED, r'^"env\.multitask\.val_per_task_batch_size":.*search: (\d+)')
+    assert passed == pinned
+
+
+def test_the_shipped_width_fits_the_shipped_kv_budget():
+    """504 does not fit below 0.85, and a run that starts anyway just preempts.
+
+    Sized on the conservative reading of peak KV per row (468 tokens, linear in
+    the 252 measurement) rather than the optimistic one (414, what the 378
+    estimate implies), because no run so far can tell the two apart -- both fit
+    at 378 -- and the pessimistic one is the side that fails loudly.
+    """
+    import re
+
+    width = _width_from(RUN_SH, r"val_per_task_batch_size='\{[^}]*search:(\d+)")
+    m = re.search(r'ROLLOUT_GPU_MEM_UTIL:-([0-9.]+)', EVAL_SH.read_text())
+    assert m, "eval_checkpoints.sh no longer sets a default budget"
+    util = float(m.group(1))
+
+    budget = (util * 48 - 10.9) * 8920          # KV tokens per GPU
+    needed = width * 468
+    assert needed <= 0.92 * budget, (
+        f"search width {width} needs {needed:,.0f} KV tokens and "
+        f"gpu_memory_utilization={util} gives {budget:,.0f} ({100 * needed / budget:.0f}%)"
+    )
+
+
+def test_the_guard_refuses_a_width_the_budget_cannot_hold():
+    """And it has to actually fire -- 504 at 0.80 is 96%, which preempts."""
+    done = subprocess.run(
+        ["bash", str(EVAL_SH)],
+        capture_output=True, text=True,
+        env={**os.environ, "ROLLOUT_GPU_MEM_UTIL": "0.75", "PATH": os.environ.get("PATH", "")},
+    )
+    assert done.returncode != 0
+    assert "will preempt" in done.stderr, done.stderr[-2000:]

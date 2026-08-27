@@ -68,6 +68,53 @@ SFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="$SFT_DIR/run_multitask_sft_qwen3.sh"
 [ -f "$RUN_SCRIPT" ] || { echo "missing $RUN_SCRIPT" >&2; exit 1; }
 
+# HOW MUCH OF THE CARD vLLM GETS.
+#
+# 0.6 is the training arm's number, and it is right there: that arm keeps FSDP
+# parameters, gradients, optimizer state and a 136.5 GiB teacher pool on the same
+# cards. An eval process holds none of them, so 0.6 leaves about a third of every
+# card idle. Measured non-KV use inside vLLM's own budget is 10.9 GiB, and the
+# two pinned points (0.6 -> 159,600 tokens, 0.75 -> 224,000) give 8,920 KV
+# tokens per GiB, so the budget is (util * 48 - 10.9) * 8920.
+#
+# 0.85 gives vLLM 40.8 GiB of the 48 and 266,700 KV tokens, leaving 7.2 GiB for
+# FSDP, the CUDA context and NCCL. It is here because the search width is 504
+# and 504 does not fit below it -- see the width check immediately below. It is
+# not free headroom to spend on something else.
+#
+# Drop it to 0.75 (and the width back to 378) if vLLM refuses to start -- that is
+# what an over-subscribed card looks like, and it fails at init rather than
+# part-way through, which is the good failure.
+export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.85}"
+
+# THE WIDTH AND THE BUDGET ARE ONE DECISION, so they are checked as one.
+#
+# Peak KV per row of batch width reads 414 tokens (what the 378 estimate
+# implies) to 468 (linear in the 252 measurement), and no run so far can tell
+# them apart because both fit at 378. Sized on the conservative one, 504 needs
+# 235,900 tokens: 105% of what 0.75 gives and 96% of 0.80, against 88% of 0.85.
+#
+# 96% is where vLLM starts preempting, and a preempted sequence is recomputed
+# from scratch -- which would cost more than the 1.4% the width is worth. This
+# refuses at once rather than producing a slow run that looks like a result.
+# Anchored to the setting. A bare "search:[0-9]*" also matches
+# invalid_action_penalty_coef_by_task='{...,search:0.01,...}' further down the
+# same file, and would read a width of 0 the day those lines are reordered.
+_WIDTH=$(grep -o "val_per_task_batch_size='{[^}]*}'" "$RUN_SCRIPT" \
+    | grep -o "search:[0-9]*" | cut -d: -f2)
+if [ -n "$_WIDTH" ]; then
+    _NEEDED=$(awk -v w="$_WIDTH" 'BEGIN{print w * 468}')
+    _BUDGET=$(awk -v u="$ROLLOUT_GPU_MEM_UTIL" 'BEGIN{print (u * 48 - 10.9) * 8920}')
+    if awk -v n="$_NEEDED" -v b="$_BUDGET" 'BEGIN{exit !(n > 0.92 * b)}'; then
+        echo "[eval] search width $_WIDTH needs up to $(printf '%.0f' "$_NEEDED") KV tokens," >&2
+        echo "       and ROLLOUT_GPU_MEM_UTIL=$ROLLOUT_GPU_MEM_UTIL gives $(printf '%.0f' "$_BUDGET")." >&2
+        echo "       That is over 92% and vLLM will preempt, which costs more than the width" >&2
+        echo "       is worth. Raise ROLLOUT_GPU_MEM_UTIL, or lower the width in BOTH" >&2
+        echo "       run_multitask_sft_qwen3.sh and expected_multitask_sft_config.yaml." >&2
+        exit 1
+    fi
+fi
+
 # Read the checkpoint root out of the run script rather than repeating it, so the
 # two cannot disagree about where the checkpoints are.
 CKPT_DIR="${CKPT_DIR:-$(sed -n 's/^[[:space:]]*trainer\.default_local_dir=\([^ \\]*\).*/\1/p' "$RUN_SCRIPT")}"
@@ -230,26 +277,13 @@ if [ "$ROLLOUT_ASYNC_GENERATE" != "0" ]; then
     export ROLLOUT_ASYNC_REQUIRE="${ROLLOUT_ASYNC_REQUIRE:-1}"
 fi
 
-# HOW MUCH OF THE CARD vLLM GETS.
+# SEARCH BATCH WIDTH -- 504, in both this repo's pinned config and the run
+# script. It had been living on a command line behind EXPECTED_CONFIG_WAIVE;
+# every step of it since has been measured before being kept.
 #
-# 0.6 is the training arm's number, and it is right there: that arm keeps FSDP
-# parameters, gradients, optimizer state and a 136.5 GiB teacher pool on the same
-# cards. An eval process holds none of them, so 0.6 leaves about a third of every
-# card idle. 0.75 gives vLLM 36 GiB of the 48, which leaves 12 for FSDP, the CUDA
-# context and NCCL -- measured non-KV use inside the budget is 10.9 GiB, so the
-# KV cache goes from 159,600 tokens per GPU to roughly 224,000.
-#
-# It does NOT speed up the batch that runs today: the heaviest search turn uses
-# 118,000 of the 159,600 it already had. It buys the headroom the NEXT width
-# needs, below.
-#
-# Drop it back to 0.6 if vLLM refuses to start -- that is what an over-subscribed
-# card looks like, and it fails at init rather than part-way through.
-export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.75}"
-
-# SEARCH BATCH WIDTH -- 252 is the default now, in both this repo's pinned config
-# and the run script, because it was measured: 413 batches become 208 and ms/row
-# does not move. It had been living on a command line behind EXPECTED_CONFIG_WAIVE.
+#   126 -> 252   413 batches -> 208, ms/row unchanged
+#   252 -> 378   208 -> 139, ms/row 67 -> 65-66 at the same fraction of rows
+#   378 -> 504   208 -> 105, expected a further ~1.4%; needs the 0.85 budget
 #
 # A search batch's later turns decode for a handful of trajectories in a slot
 # sized for all of them: measured, the last two turns take 46% of a batch's
@@ -262,24 +296,29 @@ export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.75}"
 # rows and their order do not change, only how they are grouped, so its score
 # does not move.
 #
-# search IS NOW 378, in both places. The KV budget above is what made it
-# possible: the heaviest turn at 252 is 64 active at ~1,330 prompt tokens plus
-# 512 of response, about 118,000 of the 159,600 the old budget gave -- 74%, too
-# close to try 378 against. 378 needs about 156,500, 70% of the 224,000 that
-# 0.75 gives.
+# search IS NOW 504, in both places, with the budget above sized for it.
 #
-# WHAT IT IS AIMED AT, so the result can be read: 208 batches become 139, so
-# everything the driver does ONCE PER BATCH is divided by 1.5 and everything it
-# does per row is untouched. It is not aimed at the engine's duty cycle and
-# cannot move it.
+# 252 -> 378 was measured and kept: 208 batches became 139, ms/row read 65-66
+# against 252's 67 AT THE SAME FRACTION OF ROWS, val/success_rate moved by
+# 0.00002, and grep -ci preempt was 0. Predicted 2.7%, measured 1.5-3.0% --
+# the first time the per-batch-cost model called a result before the fact.
 #
-# Compare on ms/row from the WALL lines, NOT on s/batch or batch number --
-# widening turns 208 batches into 139, so neither is the same quantity twice.
-# The two runs also cannot be paired on batch index, so [val-hash] says nothing
-# here: the same rows are grouped differently, which is the change.
+# WHAT IT IS AIMED AT, so the result can be read: 208 batches become 105, so
+# everything the driver does ONCE PER BATCH is divided and everything it does
+# per row is untouched. It is not aimed at the engine duty cycle and cannot
+# move it. Expected: about 1.4% over 378, which is small enough that a single
+# preemption erases it -- hence the check above.
+#
+# Compare on ms/row from the WALL lines at the SAME FRACTION OF ROWS. Not
+# s/batch, not batch number, and not [val-hash]: regrouping the same rows IS
+# the change, so no two batches pair across a width change.
 #
 # Not aimed at, and known not to move: the ~70 s of env-manager construction,
 # which is per SLOT and not per batch.
+#
+# THE NEXT ONE, if this pays: 580 at 0.85 is 59-66% of KV and worth about a
+# further 0.5%. Below the noise of a shared box; stop here unless something
+# else changes.
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it

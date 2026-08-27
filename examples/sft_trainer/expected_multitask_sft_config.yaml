@@ -142,7 +142,7 @@
 "env.multitask.history_length.webshop": 2
 # Accepts one number, as here, or a mapping naming the tasks that differ:
 #
-#   "env.multitask.val_per_task_batch_size": {alfworld: 126, search: 512, webshop: 126}
+#   "env.multitask.val_per_task_batch_size": {alfworld: <n>, search: <n>, webshop: <n>}
 #
 # alfworld and webshop must stay at 126 whatever else changes -- an environment
 # manager is built at this size and alfworld seeds worker i from the game cycle by
@@ -159,17 +159,29 @@
 # behind EXPECTED_CONFIG_WAIVE, which is exactly the arrangement this file
 # exists to prevent, so it is written down here.
 #
-# 252 -> 378 is the same move again, and what makes it possible is
-# gpu_memory_utilization 0.75. The heaviest turn at 252 is 64 active rows at
-# ~1,330 prompt tokens plus 512 of response, about 118,000 of the 159,600 the
-# old budget gave -- 74%, too close to try 378 against. 378 needs about
-# 156,500, which is 70% of the 224,000 that 0.75 gives.
+# 252 -> 378 was measured and kept: 208 batches became 139, ms/row read 65-66
+# against 252's 67 at the same fraction of rows, val/success_rate moved by
+# 0.00002, and nothing preempted.
 #
-# What it is aimed at: everything the driver does ONCE PER BATCH is divided by
-# 1.5, because 208 batches become 139. It does nothing for per-row work. Judge
-# it on ms/row from the WALL lines, NOT on s/batch or batch number -- neither of
-# those is the same quantity before and after.
-"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 378, webshop: 126}
+# 378 -> 504 IS TIED TO gpu_memory_utilization AND CANNOT BE MOVED ALONE.
+# Peak KV per row of batch width reads 414 (what the 378 estimate implies) to
+# 468 (linear in the 252 measurement), and the run cannot tell them apart
+# because both fit at 378. At 504:
+#
+#   0.75 -> 223,900 KV:  93% - 105%   over, or as good as
+#   0.80 -> 245,300 KV:  85% -  96%   the top of that is where preemption starts
+#   0.85 -> 266,700 KV:  78% -  88%   fits on both readings
+#
+# so 504 ships with ROLLOUT_GPU_MEM_UTIL=0.85, and eval_checkpoints.sh refuses
+# to start if the two are set inconsistently. Preemption would cost more than
+# the whole 1.4% this width is worth.
+#
+# What it is aimed at: everything the driver does ONCE PER BATCH is divided,
+# because 208 batches become 105. It does nothing for per-row work and nothing
+# for the engine's duty cycle. Judge it on ms/row from the WALL lines at the
+# same FRACTION OF ROWS -- s/batch, batch number and [val-hash] are all
+# meaningless across a width change, because regrouping the rows IS the change.
+"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 504, webshop: 126}
 
 # The retriever policy decides what enters the validation trajectories, so it is
 # pinned here rather than left with the machine knobs. Running out of retries does
