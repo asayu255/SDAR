@@ -2147,11 +2147,466 @@ def test_the_token_tables_are_driven_from_the_new_arms_own_switches():
 
 def test_the_gradient_metric_is_collected_where_the_ratio_is_one():
     src = _update_policy_source()
-    assert "logit_gradient_terms(" in src
-    block = src[src.index("xt_grad_stats.update("):]
-    block = block[: block.index("response_mask=")]
-    assert "coef=float(self.config.get(" in block, "the real OPD coefficient, not 1"
+    # Anchored on the call, not on the accumulator it feeds: the same columns go
+    # to the task cut and the role cut, so the terms are built once and the
+    # coefficient has to be right at the one place that builds them.
+    call = src[src.index("logit_gradient_terms("):]
+    call = call[: call.index("\n                                )")]
+    assert "coef=float(self.config.get(" in call, "the real OPD coefficient, not 1"
     # Epoch 0 only: a later epoch's clipping makes the closed form for the
     # policy gradient an approximation rather than an identity.
-    guard = src[: src.index("xt_grad_stats.update(")]
+    guard = src[: src.index("logit_gradient_terms(")]
     assert "if xt_built is not None and xt_collect:" in guard
+    # Both cuts read the SAME columns. A second call would be a second closed
+    # form that could drift from the one the task cut reports.
+    assert src.count("logit_gradient_terms(") == 1
+    assert "xt_role_grad_stats.update(" in src
+
+
+# --------------------------------------------------------------------------- #
+# the analysis cuts: role, turn, weight shape, token identity over time
+# --------------------------------------------------------------------------- #
+def test_the_position_scope_accumulator_partitions_by_position_not_by_row():
+    """The whole reason it is a second class. ScopeTermStats files a row's total
+    once, under the row's task; a role changes several times inside one row, and
+    filing the row under its first token's role would report the arm acting on
+    reasoning wherever a response happened to open with <think>."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import PositionScopeTermStats
+
+    bs, resp = 3, 6
+    acc = PositionScopeTermStats(names=("a", "b"), n_scopes=4, device="cpu")
+    a = torch.arange(bs * resp, dtype=torch.float32).reshape(bs, resp)
+    b = torch.ones(bs, resp)
+    mask = torch.ones(bs, resp)
+    mask[1, 4:] = 0.0
+    scope = torch.arange(bs * resp).reshape(bs, resp) % 4
+    acc.update({"a": a, "b": b}, response_mask=mask, scope_ids=scope)
+
+    got = acc.sums(scope_names=("s0", "s1", "s2", "s3"), include_pooled=True)
+    # Pooled equals the masked total, and the four scopes partition it exactly.
+    assert got[None]["a"] == pytest.approx(float((a * mask).sum()))
+    assert got[None]["n"] == pytest.approx(float(mask.sum()))
+    parts = sum(v["a"] for k, v in got.items() if k is not None)
+    assert parts == pytest.approx(got[None]["a"])
+    # And a per-scope sum is what a brute-force selection gives.
+    for s in range(4):
+        want = float((a * mask * (scope == s)).sum())
+        assert got[f"s{s}"]["a"] == pytest.approx(want)
+
+
+def test_the_position_scope_accumulator_files_an_out_of_range_scope_pooled_only():
+    """An untagged position is a real position; inventing a scope for it would
+    put it in a bucket a reader would then attribute to."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import PositionScopeTermStats
+
+    acc = PositionScopeTermStats(names=("a",), n_scopes=2, device="cpu")
+    a = torch.ones(1, 4)
+    scope = torch.tensor([[0, 1, -1, 9]])
+    acc.update({"a": a}, response_mask=torch.ones(1, 4), scope_ids=scope)
+    got = acc.sums(scope_names=("s0", "s1"), include_pooled=True)
+    assert got[None]["a"] == pytest.approx(4.0)
+    assert got["s0"]["a"] == pytest.approx(1.0)
+    assert got["s1"]["a"] == pytest.approx(1.0)
+    assert sum(v["a"] for k, v in got.items() if k is not None) == pytest.approx(2.0)
+
+
+def test_the_role_cut_renders_through_the_same_functions_as_the_task_cut():
+    """A role row and a task row of the same metric have to be the same
+    arithmetic over different positions. Sharing the renderer is how that is
+    guaranteed rather than reviewed."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        PositionScopeTermStats,
+        ROLE_SCOPE_NAMES,
+    )
+
+    got, _ = _built()
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    acc = PositionScopeTermStats(
+        names=POSITION_TERMS, n_scopes=len(ROLE_SCOPE_NAMES), device="cpu"
+    )
+    roles = torch.arange(got["weight"].numel()).reshape(got["weight"].shape) % len(ROLE_SCOPE_NAMES)
+    acc.update(position_terms(got, kl), response_mask=torch.ones_like(kl), scope_ids=roles)
+    out = position_weight_metrics(
+        acc.sums(scope_names=ROLE_SCOPE_NAMES), prefix="kl_weight/role"
+    )
+    assert "kl_weight/role/reasoning/effect/kl_scale" in out
+    assert "kl_weight/role/env_action/position/w_mean" in out
+    # The pooled scope is not published: it would be a second key for the number
+    # the task-scoped accumulator already reports at the top level.
+    assert not any(k.startswith("kl_weight/role/effect") for k in out)
+
+
+def test_the_weight_histogram_thresholds_are_counts_not_interpolations():
+    """Every reported threshold is a bucket edge, so "above t" is a sum of whole
+    buckets and matches a brute-force count exactly. An interpolated share would
+    move with the bucket layout, which is not a property of the run."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        WEIGHT_THRESHOLDS,
+        WeightShiftHistogram,
+    )
+
+    torch.manual_seed(3)
+    bs, resp = 4, 32
+    w = torch.rand(bs, resp) * 3.0
+    kl = torch.rand(bs, resp) + 0.05
+    mask = torch.ones(bs, resp)
+    mask[0, 20:] = 0.0
+    hist = WeightShiftHistogram(n_tasks=3, device="cpu")
+    hist.update(weight=w, teacher_kl=kl, response_mask=mask, task_ids=torch.tensor([0, 1, 2, 0]))
+    out = hist.metrics(task_names=TASKS)
+
+    # In float64, as the accumulator is: a float32 brute force would differ at
+    # 1e-7 and the tolerance would then be hiding an ordering difference rather
+    # than pinning the arithmetic.
+    w64, kl64, m64 = w.double(), kl.double(), mask.double()
+    n = float(m64.sum())
+    shift = (w64 - 1.0).abs() * kl64 * m64
+    for t in WEIGHT_THRESHOLDS:
+        above = (w64 > t).double() * m64
+        tag = f"{int(round(t * 100)):03d}"
+        assert out[f"kl_weight/shape/frac_w_gt_{tag}"] == pytest.approx(float(above.sum()) / n)
+        assert out[f"kl_weight/shape/shift_share_w_gt_{tag}"] == pytest.approx(
+            float((shift * above).sum()) / float(shift.sum()), rel=1e-12
+        )
+    assert out["kl_weight/shape/frac_w_below_one"] == pytest.approx(
+        float(((w64 <= 0.99).double() * m64).sum()) / n
+    )
+
+
+def test_the_weight_histogram_ignores_masked_positions_whatever_their_weight():
+    """A padded position carries an arbitrary W. If it reached a bucket it would
+    show up as a tail the run does not have."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import WeightShiftHistogram
+
+    hist = WeightShiftHistogram(n_tasks=1, device="cpu")
+    w = torch.tensor([[1.0, 1.0, 99.0]])
+    kl = torch.tensor([[1.0, 1.0, 1.0]])
+    hist.update(
+        weight=w, teacher_kl=kl,
+        response_mask=torch.tensor([[1.0, 1.0, 0.0]]), task_ids=torch.tensor([0]),
+    )
+    out = hist.metrics(task_names=["a"])
+    assert out["kl_weight/shape/frac_w_gt_200"] == pytest.approx(0.0)
+    assert out["kl_weight/shape/w_q50"] == pytest.approx(1.0, abs=0.02)
+
+
+def test_the_weight_quantile_lands_inside_the_bucket_the_mass_is_in():
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        WEIGHT_BUCKET_EDGES,
+        WeightShiftHistogram,
+    )
+
+    hist = WeightShiftHistogram(n_tasks=1, device="cpu")
+    # Everything between 1.1 and 1.25, so every quantile must land there.
+    w = torch.full((1, 100), 1.2)
+    hist.update(
+        weight=w, teacher_kl=torch.ones(1, 100),
+        response_mask=torch.ones(1, 100), task_ids=torch.tensor([0]),
+    )
+    out = hist.metrics(task_names=["a"])
+    for q in ("w_q50", "w_q90", "w_q99"):
+        assert 1.1 <= out[f"kl_weight/shape/{q}"] <= 1.25
+    assert 1.25 in WEIGHT_BUCKET_EDGES and 1.1 in WEIGHT_BUCKET_EDGES
+
+
+def test_token_turnover_separates_a_stable_set_from_one_that_is_replaced():
+    """n_distinct and top_share are both within-step: forty tokens replaced
+    wholesale every step reads exactly like a stable forty in both. This is the
+    reading that tells them apart, so it is asserted on both cases."""
+    from verl.trainer.ppo.sign_weights import STATE_AGREE_POS, TokenStateCounts
+
+    def _table(ids):
+        t = TokenStateCounts(vocab_size=32, n_tasks=1, device="cpu", top_n=4, mode="position")
+        k = len(ids)
+        t.update(
+            support_ids=torch.tensor(ids).reshape(1, 1, k),
+            state=torch.full((1, 1, k), STATE_AGREE_POS),
+            weight=torch.full((1, 1, k), 2.0),
+            on_task_logprob=torch.full((1, 1, k), -1.0),
+            response_mask=torch.ones(1, 1),
+            task_ids=torch.tensor([0]),
+            effect=torch.full((1, 1, k), 0.5),
+        )
+        return t
+
+    first = _table([1, 2, 3, 4])
+    _m, state = first.turnover(previous=None, task_names=["a"], prefix="xt")
+    assert _m == {}, "nothing to compare against on the first step"
+
+    same, _ = _table([1, 2, 3, 4]).turnover(previous=state, task_names=["a"], prefix="xt")
+    assert same["xt/token/turnover/top4_jaccard"] == pytest.approx(1.0)
+    assert same["xt/token/turnover/effect_carryover"] == pytest.approx(1.0)
+
+    fresh, _ = _table([9, 10, 11, 12]).turnover(previous=state, task_names=["a"], prefix="xt")
+    assert fresh["xt/token/turnover/top4_jaccard"] == pytest.approx(0.0)
+    assert fresh["xt/token/turnover/effect_carryover"] == pytest.approx(0.0)
+
+    # Half kept: membership halves, and so does the mass, since every token here
+    # carries the same effect.
+    half, _ = _table([1, 2, 30, 31]).turnover(previous=state, task_names=["a"], prefix="xt")
+    assert 0.0 < half["xt/token/turnover/top4_jaccard"] < 1.0
+    assert half["xt/token/turnover/effect_carryover"] == pytest.approx(0.5)
+
+
+def test_the_role_token_table_decomposes_the_same_nats_the_state_table_does():
+    """Three tables off one quantity. If the role table summed to something else
+    the run would have two different answers to "how many nats did the arm
+    move" and no way to tell which was the mechanism."""
+    from verl.trainer.ppo.sign_weights import RoleTokenCounts, ROLE_NAMES
+
+    got, _ = _built()
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    shift = per_candidate_shift(got, kl)
+    bs, resp, k = shift.shape
+    support = torch.arange(bs * resp * k).reshape(bs, resp, k) % 50
+    roles = torch.arange(bs * resp).reshape(bs, resp) % len(ROLE_NAMES)
+    mask = torch.ones(bs, resp)
+    mask[0, -1] = 0.0
+
+    tbl = RoleTokenCounts(vocab_size=64, device="cpu", top_n=4)
+    tbl.update(support_ids=support, roles=roles, effect=shift, response_mask=mask)
+    n, pos, neg = tbl._cpu()
+    assert float((pos + neg).sum()) == pytest.approx(
+        float((shift * mask.unsqueeze(-1)).sum()), abs=1e-6
+    )
+    assert int(n.sum()) == int(mask.sum()) * k
+    # And the shares over roles are a partition of the gross.
+    out = tbl.scalar_metrics(prefix="xt")
+    shares = [v for key, v in out.items() if key.endswith("/token/shift_gross_share")]
+    assert sum(shares) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_the_role_token_rows_carry_the_schema_the_worker_decodes():
+    """The rows are appended to the same report the other tables go to, so they
+    have to carry token_id and say which quantity effect_* is in."""
+    from verl.trainer.ppo.sign_weights import RoleTokenCounts
+
+    tbl = RoleTokenCounts(vocab_size=16, device="cpu", top_n=3)
+    tbl.update(
+        support_ids=torch.tensor([[[1, 2]]]),
+        roles=torch.tensor([[1]]),
+        effect=torch.tensor([[[0.5, -0.25]]]),
+        response_mask=torch.ones(1, 1),
+    )
+    rows = tbl.top_tokens()
+    assert rows and all("token_id" in r for r in rows)
+    assert {r["scope"] for r in rows} == {"role:reasoning"}
+    assert {r["effect_kind"] for r in rows} == {"dkl_nats"}
+    assert {r["ranked_by"] for r in rows} == {"count", "abs_effect"}
+
+
+def test_a_probe_partitions_its_own_shift_not_the_live_arms():
+    """The alpha series only reads as an ablation if each probe's state columns
+    add up to that probe's own ``(W - 1) D``. Built from the live mu and the
+    live evidence they would add up to the shipped arm's shift at every alpha,
+    and the series would be three copies of one number."""
+    from verl.workers.actor.dp_actor import _xt_apply_normalizer, _xt_normalizer_mu
+
+    got, ctx = _built()
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    snap = {"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)}
+    seen = []
+    for name, pre in got["probe_pre_weight"].items():
+        mu = _xt_normalizer_mu(pre, snap, ctx["task_ids"])
+        probe = {
+            "weight": pre / mu, "pre_weight": pre, "mu": mu,
+            "evidence": got["probe_evidence"][name],
+            "state": got["state"], "teacher_prob": got["teacher_prob"],
+        }
+        terms = state_shift_terms(probe, kl)
+        total = sum(terms[t] for t in STATE_TERMS)
+        assert torch.allclose(total, (probe["weight"] - 1.0) * kl, atol=1e-5), name
+        # The helper the training path uses agrees with pre/mu everywhere.
+        assert torch.allclose(_xt_apply_normalizer(pre, snap, ctx["task_ids"]), probe["weight"])
+        seen.append(float(total.abs().sum()))
+    # alpha = 0 is the corroboration channel alone; alpha = 1 adds every
+    # source's own magnitude, so the probes are ordered and genuinely differ.
+    assert seen[0] < seen[-1], seen
+
+
+def test_the_probe_normaliser_is_one_where_the_snapshot_has_no_mean():
+    """Cold start runs at W = 1, so the divisor that reproduces the applied
+    weight is ``pre`` itself. Returning 1 instead would make the probe's state
+    columns sum to ``(pre - 1) D``, which no arm ever paid."""
+    from verl.workers.actor.dp_actor import _xt_apply_normalizer, _xt_normalizer_mu
+
+    got, ctx = _built()
+    pre = got["probe_pre_weight"][probe_name(1.0)]
+    for snap in (None, {"mean": torch.full((3,), 1.2), "valid": torch.zeros(3, dtype=torch.bool)}):
+        mu = _xt_normalizer_mu(pre, snap, ctx["task_ids"])
+        assert torch.allclose(pre / mu, torch.ones_like(pre))
+        assert torch.allclose(_xt_apply_normalizer(pre, snap, ctx["task_ids"]), torch.ones_like(pre))
+
+
+def test_probe_evidence_is_zero_where_the_position_is_unavailable():
+    """It rides beside probe_pre_weight, which is forced to 1 there. Evidence
+    that survived would charge a candidate for a position the arm did not act
+    on."""
+    got, _ = _built(diag_valid=[True, False, True])
+    avail = got["available"]
+    idx = (~avail).nonzero().flatten()
+    assert idx.numel()
+    for name, ev in got["probe_evidence"].items():
+        for i in idx.tolist():
+            assert float(ev[i].abs().max()) == 0.0, name
+
+
+def test_every_new_accumulator_is_reduced_before_it_is_rendered():
+    """A per-rank ratio is not the pooled ratio, and a top-N list has no
+    meaningful per-rank average. Each of these renders from a reduced buffer or
+    reports one rank's shard under a global name."""
+    src = _update_policy_source()
+    for name in (
+        "xt_weight_hist",
+        "xt_turn_stats",
+        "xt_role_position_stats",
+        "xt_role_state_stats",
+        "xt_role_grad_stats",
+        "xt_role_token_stats",
+    ):
+        assert f"{name} = " in src or f"{name} = None" in src, name
+    # The three role accumulators are reduced by the loop that renders them.
+    loop = src[src.index("for _acc, _render in ("):]
+    loop = loop[: loop.index("# The rows are stashed")]
+    for name in ("xt_role_position_stats", "xt_role_state_stats", "xt_role_grad_stats"):
+        assert name in loop, name
+    assert "_acc.all_reduce()" in loop
+    for name in ("xt_weight_hist", "xt_turn_stats", "xt_role_token_stats", "xt_probe_state_stats"):
+        assert f"{name}.all_reduce()" in src or f"{name}[_name]" in src or "_st.all_reduce()" in src
+
+
+def test_the_new_cuts_are_gated_on_config_and_never_on_batch_content():
+    """A collective whose participation depends on what a rank's rows contained
+    hangs the job. Roles come from the worker's tag ids, which is a startup
+    fact; the accumulators are built and reduced on that alone."""
+    src = _update_policy_source()
+    # Built under the arm's own switch.
+    build = src[: src.index("xt_token_cfg = ")]
+    assert "PositionScopeTermStats(names=XT_POSITION_TERMS" in build
+    assert "if xt_on else None" in build
+    # Reduced under `if xt_on:`, not under anything derived from the batch.
+    reduce_block = src[src.index("xt_position_stats.all_reduce()"):]
+    reduce_block = reduce_block[: reduce_block.index("if xt_token_stats is not None:")]
+    for forbidden in ("task_ids is not None", "xt_roles_mb is not None", ".numel()", ".any()"):
+        assert forbidden not in reduce_block, forbidden
+
+
+def test_the_role_columns_are_the_same_ones_the_task_cut_gets():
+    """Computed once and handed to four accumulators. Two calls would be two
+    definitions of one number, and the role rows would stop summing to the task
+    rows the first time either changed."""
+    src = _update_policy_source()
+    # Exactly one call each, and it is the assignment: any second one would be a
+    # second definition of the same columns.
+    assert src.count("xt_position_terms(xt_built, teacher_kld)") == 1, "one call"
+    assert src.count("xt_pos_cols = xt_position_terms(xt_built, teacher_kld)") == 1
+    assert src.count("xt_state_shift_terms(xt_built, teacher_kld)") == 1, "one call"
+    assert src.count("xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)") == 1
+    for user in (
+        "xt_position_stats.update(\n                                xt_pos_cols",
+        "xt_role_position_stats.update(\n                                    xt_pos_cols",
+        "xt_turn_stats.update(\n                                xt_pos_cols",
+    ):
+        assert user in src, user
+
+
+def test_the_turn_scope_is_clamped_so_a_long_episode_cannot_index_past_the_buffer():
+    src = _update_policy_source()
+    call = src[src.index("xt_turn_stats.update("):]
+    call = call[: call.index(")\n")]
+    assert "turn_index(response_mask)" in call
+    assert "clamp(max=XT_TURN_BUCKETS - 1)" in call
+
+
+def test_the_published_cuts_are_curated_and_stay_curated():
+    """The accumulators hold every column position_weight_metrics can render.
+    Publishing all of them for six roles and six turns is three hundred series a
+    step, which is not a richer analysis than the arm already had -- it is one
+    where the five readings that matter are five of three hundred. This pins the
+    selection so re-widening it is a decision rather than a drift."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import (
+        PositionScopeTermStats,
+        ROLE_CUT_SUFFIXES,
+        ROLE_SCOPE_NAMES,
+        TURN_CUT_SUFFIXES,
+        TURN_SCOPE_NAMES,
+        select_metrics,
+    )
+
+    got, _ = _built()
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    shape = got["weight"].shape
+    scope = torch.arange(got["weight"].numel()).reshape(shape) % len(ROLE_SCOPE_NAMES)
+
+    acc = PositionScopeTermStats(names=POSITION_TERMS, n_scopes=len(ROLE_SCOPE_NAMES), device="cpu")
+    acc.update(position_terms(got, kl), response_mask=torch.ones_like(kl), scope_ids=scope)
+    full = position_weight_metrics(acc.sums(scope_names=ROLE_SCOPE_NAMES), prefix="kl_weight/role")
+    kept = select_metrics(full, ROLE_CUT_SUFFIXES)
+    assert len(kept) < len(full), "the point is that it is a subset"
+    # Five per role from the position family; the rest of ROLE_CUT_SUFFIXES is
+    # served by the state and gradient accumulators.
+    assert len(kept) == 5 * len(ROLE_SCOPE_NAMES), sorted(kept)
+    assert all(k.endswith(ROLE_CUT_SUFFIXES) for k in kept)
+
+    state = PositionScopeTermStats(names=STATE_TERMS, n_scopes=len(ROLE_SCOPE_NAMES), device="cpu")
+    state.update(state_shift_terms(got, kl), response_mask=torch.ones_like(kl), scope_ids=scope)
+    st = select_metrics(
+        state_shift_metrics(state.sums(scope_names=ROLE_SCOPE_NAMES), prefix="kl_weight/role"),
+        ROLE_CUT_SUFFIXES,
+    )
+    # Shares, never nats: a per-state net inside one role is a number no reader
+    # has a denominator for.
+    assert all(k.endswith("/gross_share") for k in st)
+    assert len(st) == len(STATE_TERMS) * len(ROLE_SCOPE_NAMES)
+
+    turn = PositionScopeTermStats(names=POSITION_TERMS, n_scopes=len(TURN_SCOPE_NAMES), device="cpu")
+    turn.update(position_terms(got, kl), response_mask=torch.ones_like(kl),
+                scope_ids=torch.zeros(shape, dtype=torch.long))
+    tk = select_metrics(
+        position_weight_metrics(turn.sums(scope_names=TURN_SCOPE_NAMES), prefix="kl_weight/turn"),
+        TURN_CUT_SUFFIXES,
+    )
+    assert len(tk) == len(TURN_CUT_SUFFIXES), "one populated turn scope"
+
+
+def test_the_turn_scope_names_cover_every_bucket_the_clamp_can_produce():
+    from verl.trainer.ppo.cross_teacher_kl_weight import TURN_BUCKETS, TURN_SCOPE_NAMES
+
+    assert len(TURN_SCOPE_NAMES) == TURN_BUCKETS
+    assert TURN_SCOPE_NAMES[-1].endswith("plus"), "the last one is open-ended"
+
+
+def test_the_role_tag_ids_reach_the_actor_on_any_arm():
+    """The role cut is useless without them, and they are tokenised in the
+    worker because the actor has no tokenizer. Gated on the sign arm they would
+    be silently absent here and every role row would read `format`."""
+    import ast
+    import inspect
+
+    from verl.workers import fsdp_workers
+
+    tree = ast.parse(inspect.getsource(fsdp_workers))
+
+    def _blocks(node):
+        """Every statement list in the tree, so 'same block' is checkable."""
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, None)
+            if isinstance(body, list):
+                yield body
+        for child in ast.iter_child_nodes(node):
+            yield from _blocks(child)
+
+    def _is(stmt, text):
+        return isinstance(stmt, ast.Assign) and text in ast.unparse(stmt.targets[0])
+
+    together = [
+        body for body in _blocks(tree)
+        if any(_is(s, "sign_role_tag_ids") for s in body)
+    ]
+    assert together, "the assignment moved"
+    # Siblings of the actor's own construction: no branch of any kind stands
+    # between them, so an arm that never sets sign_weight still gets the ids.
+    for body in together:
+        assert any(_is(s, "self.actor") and not _is(s, "sign_role_tag_ids") for s in body), (
+            "the tag ids are gated on something the actor's construction is not"
+        )

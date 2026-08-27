@@ -112,6 +112,7 @@ from typing import Optional
 
 import torch
 
+from verl.trainer.ppo.sign_weights import ROLE_NAMES as _ROLE_NAMES
 from verl.trainer.ppo.sign_weights import STATE_NAMES as _STATE_NAMES
 
 __all__ = [
@@ -145,6 +146,17 @@ __all__ = [
     "state_shift_terms",
     "position_weight_metrics",
     "state_shift_metrics",
+    "PositionScopeTermStats",
+    "WEIGHT_BUCKET_EDGES",
+    "WEIGHT_THRESHOLDS",
+    "WeightShiftHistogram",
+    "TURN_BUCKETS",
+    "TURN_SCOPE_NAMES",
+    "ROLE_SCOPE_NAMES",
+    "ROLE_CUT_SUFFIXES",
+    "TURN_CUT_SUFFIXES",
+    "select_metrics",
+    "BELOW_ONE_EDGE",
 ]
 
 
@@ -1194,6 +1206,55 @@ STATE_TERMS = tuple(f"shift_{n}" for n in _STATE_NAMES.values()) + ("shift_norm_
 # would say nothing about what the finished mechanism can do.
 PROBE_ALPHAS = (0.0, 0.1, 1.0)
 
+# The per-position scopes. Role comes from the tag scan; turn from the runs of
+# ones in the multi-turn loss mask.
+#
+# The last turn bucket is open-ended because the tail is thin and uneven -- a
+# search episode that needed nine retrieval rounds is one row, and a scope with
+# one row in it publishes a ratio built from one row. Eight is where the
+# multitask rollout's turn counts stop being dense.
+TURN_BUCKETS = 6
+TURN_SCOPE_NAMES = tuple(f"turn{i}" for i in range(TURN_BUCKETS - 1)) + (
+    f"turn{TURN_BUCKETS - 1}plus",
+)
+ROLE_SCOPE_NAMES = tuple(_ROLE_NAMES[i] for i in sorted(_ROLE_NAMES))
+
+# What a per-position cut PUBLISHES, against everything its accumulator holds.
+#
+# position_weight_metrics renders eighteen columns and state_shift_metrics
+# sixteen. Six roles and six turns of all of them is over three hundred series a
+# step, which is not a richer analysis than the arm already had -- it is an
+# unreadable one, and every extra series is another thing a reader has to decide
+# is not the finding. The accumulators keep every column; these are the ones
+# that answer the cut's own question, and the token and event dumps carry the
+# depth that does not fit in a column.
+ROLE_CUT_SUFFIXES = (
+    "/effect/kl_unweighted",        # where this role's OPD budget IS
+    "/effect/kl_shift_gross_frac",  # how much of it the arm moved here
+    "/effect/kl_shift_net",         # and in which direction
+    "/position/w_mean",
+    "/evidence/shared_share",       # which channel carried it here
+    "/grpo/grad_cosine",            # does the budget moved here pull with the reward
+    "/grpo/grad_norm_ratio",
+    "/gross_share",                 # the state composition; shares, never nats
+)
+
+# Turn is the thinner cut: what is wanted is whether the arm is front-loaded,
+# not a second copy of the role analysis indexed differently.
+TURN_CUT_SUFFIXES = (
+    "/effect/kl_unweighted",
+    "/effect/kl_shift_gross_frac",
+    "/position/w_mean",
+    "/position/available_frac",
+)
+
+
+def select_metrics(rendered: dict, suffixes) -> dict:
+    """The published subset of a rendered cut. Suffixes, so a scope name in the
+    middle of the key cannot make a series appear or disappear."""
+    keep = tuple(suffixes)
+    return {k: v for k, v in rendered.items() if k.endswith(keep)}
+
 
 def probe_name(alpha: float) -> str:
     return f"alpha{int(round(float(alpha) * 100)):03d}"
@@ -1256,6 +1317,238 @@ class PairEvidenceStats:
                 head = f"{prefix}/evidence/{name(src)}__on__{name(dst)}"
                 out[f"{head}/source_shift_mean"] = float(buf[dst, src, 0]) / n
                 out[f"{head}/kl_shift_attributed"] = float(buf[dst, src, 1]) / n
+        return out
+
+
+class PositionScopeTermStats:
+    """:class:`ScopeTermStats`, keyed per POSITION instead of per row.
+
+    The task scope is a property of the row, so ``ScopeTermStats`` sums a row's
+    positions first and files the total once. Role is a property of the POSITION
+    -- one response walks through ``<think>``, ``<action>`` and the tag tokens
+    between them -- so the same layout with a per-position index is a different
+    class rather than a flag: filing a whole row under the role of its first
+    token would report the arm acting on reasoning wherever a response happened
+    to open with ``<think>``.
+
+    Layout, all_reduce and float64 are ``ScopeTermStats``'s, and :meth:`sums`
+    returns the same shape, so :func:`position_weight_metrics`,
+    :func:`state_shift_metrics` and :func:`gradient_metrics` render this without
+    knowing which of the two produced it.
+
+    The pooled scope is accumulated but NOT rendered by default: it is the same
+    number the task-scoped accumulator already publishes at the top level, and
+    two keys for one quantity is how two series come to disagree after a
+    refactor. It is kept in the buffer because every ratio here divides by the
+    scope's own count and a reader checking that the parts sum to the whole
+    needs the whole.
+    """
+
+    def __init__(self, *, names, n_scopes: int, device):
+        self.names = list(names)
+        self.n_scopes = 1 + int(n_scopes)
+        self.buf = torch.zeros(
+            (self.n_scopes, len(self.names) + 1), dtype=torch.float64, device=device
+        )
+        self._cpu_cache = None
+
+    def update(self, terms: dict, response_mask: torch.Tensor, scope_ids: torch.Tensor) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            terms: ``{name: (bs, resp) tensor}``; every name given at
+                construction must be present.
+            response_mask: (bs, resp).
+            scope_ids: (bs, resp) int, or None. A negative id, or one past the
+                last scope, reaches the pooled scope only -- the same rule
+                ``ScopeTermStats`` applies to an untagged row.
+        """
+        self._cpu_cache = None
+        m = response_mask.to(torch.float64)
+        cols = [terms[name].detach().to(torch.float64) * m for name in self.names]
+        cols.append(m)
+        vals = torch.stack(cols, dim=-1).reshape(-1, len(self.names) + 1)
+        self.buf[0] += vals.sum(0)
+        if scope_ids is None or self.n_scopes <= 1:
+            return
+        s = scope_ids.reshape(-1).to(torch.long)
+        known = ((s >= 0) & (s < self.n_scopes - 1)).to(torch.float64).unsqueeze(-1)
+        self.buf.index_add_(0, s.clamp(min=0, max=self.n_scopes - 2) + 1, vals * known)
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu")
+        return self._cpu_cache
+
+    def sums(self, scope_names=None, include_pooled: bool = False) -> dict:
+        """``{scope_name_or_None: {term: total, "n": count}}``."""
+        buf = self._cpu()
+        out = {}
+        for scope in range(0 if include_pooled else 1, self.n_scopes):
+            n = float(buf[scope, -1])
+            if n <= 0:
+                continue
+            name = None if scope == 0 else (
+                scope_names[scope - 1]
+                if scope_names and scope - 1 < len(scope_names)
+                else f"scope{scope - 1}"
+            )
+            out[name] = {t: float(buf[scope, i]) for i, t in enumerate(self.names)}
+            out[name]["n"] = n
+        return out
+
+
+# Where the applied weight sits. Chosen so that the two readings a threshold has
+# to answer exactly -- "how often did the arm take budget AWAY" (W < 1, which
+# only the normaliser can produce, since W~ >= 1 by construction) and "how often
+# did it move a position by more than a few percent" -- fall on bucket
+# boundaries rather than inside a bucket, where they would have to be
+# interpolated and would stop being counts.
+WEIGHT_BUCKET_EDGES = (0.5, 0.8, 0.9, 0.95, 0.99, 1.01, 1.05, 1.1, 1.25, 1.5, 2.0, 3.0, 5.0)
+
+# The cut points reported as exact shares. Each is an entry of
+# WEIGHT_BUCKET_EDGES, so "above t" is a sum of whole buckets. 0.99 is not among
+# them because the below-one pair already reports that side, and a series and its
+# complement are one reading in two columns.
+WEIGHT_THRESHOLDS = (1.05, 1.25, 2.0)
+BELOW_ONE_EDGE = 0.99
+
+
+def _threshold_name(t: float) -> str:
+    return f"{int(round(float(t) * 100)):03d}"
+
+
+class WeightShiftHistogram:
+    """How the applied weight is DISTRIBUTED, and where the moved nats sit in it.
+
+    ``w_cv`` is the only shape reading the arm has, and a coefficient of
+    variation cannot tell a weight that is 1.02 nearly everywhere from one that
+    is 1.00 at 99% of positions and 3.0 at the rest. Those are different
+    mechanisms: the first is a slightly larger ``teacher_kl_loss_coef`` wearing
+    a disguise, the second is a genuine redistribution, and an ablation that
+    cannot separate them cannot attribute a gain to either.
+
+    Three columns per bucket, because the question is not only how the weight is
+    spread but whether the KL was where the weight was:
+
+    ``n``          positions in the bucket.
+    ``kl``         the UNWEIGHTED OPD term they carried. A weight of 3.0 at a
+                   position whose KL is zero changes the loss by zero, so a
+                   histogram of ``n`` alone can report a large tail that moved
+                   nothing.
+    ``shift_abs``  ``|W - 1| * D``, the gross nats those positions moved. Its
+                   share above a threshold is what "the mechanism is carried by
+                   the tail" means as a number.
+
+    Cheap by construction: one ``bucketize`` and two ``index_add_`` per
+    micro-batch into a ``(1 + n_tasks, 14, 3)`` buffer, and no host read until
+    the step boundary.
+    """
+
+    TERMS = ("n", "kl", "shift_abs")
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_scopes = 1 + int(n_tasks)
+        self.n_buckets = len(WEIGHT_BUCKET_EDGES) + 1
+        self.edges = torch.tensor(WEIGHT_BUCKET_EDGES, dtype=torch.float64, device=device)
+        self.buf = torch.zeros(
+            (self.n_scopes, self.n_buckets, len(self.TERMS)), dtype=torch.float64, device=device
+        )
+        self._cpu_cache = None
+
+    def update(self, *, weight, teacher_kl, response_mask, task_ids=None) -> None:
+        """``weight`` and ``teacher_kl`` are (bs, resp); ``task_ids`` is (bs,)."""
+        self._cpu_cache = None
+        m = response_mask.to(torch.float64)
+        w = weight.detach().to(torch.float64)
+        kl = teacher_kl.detach().to(torch.float64) * m
+        # right=False makes bucket j the half-open (edges[j-1], edges[j]], so a
+        # position exactly AT a threshold falls below it and "above t" stays a
+        # sum of whole buckets.
+        b = torch.bucketize(w, self.edges).reshape(-1)
+        # Masked positions contribute exactly zero to all three columns -- their
+        # bucket index is arbitrary and harmless, which is why the weight does
+        # not need masking first.
+        vals = torch.stack([m, kl, (w - 1.0).abs() * kl], dim=-1).reshape(-1, len(self.TERMS))
+        flat = self.buf.view(-1, len(self.TERMS))
+        flat.index_add_(0, b, vals)
+        if task_ids is None or self.n_scopes <= 1:
+            return
+        t = task_ids.reshape(-1, 1).expand(-1, w.size(1)).reshape(-1).to(torch.long)
+        known = ((t >= 0) & (t < self.n_scopes - 1)).to(torch.float64).unsqueeze(-1)
+        idx = (t.clamp(min=0, max=self.n_scopes - 2) + 1) * self.n_buckets + b
+        flat.index_add_(0, idx, vals * known)
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu")
+        return self._cpu_cache
+
+    @staticmethod
+    def _quantile(counts, q: float) -> float:
+        """Linear interpolation inside the bucket the quantile lands in.
+
+        The top bucket is unbounded, so a quantile that lands there is reported
+        as its lower edge -- an understatement, and the ``frac_w_gt_*`` series
+        beside it is what says how much mass is out there. Said in the name:
+        nothing here is called a maximum.
+        """
+        total = sum(counts)
+        if total <= 0:
+            return float("nan")
+        target = q * total
+        run = 0.0
+        n_edges = len(WEIGHT_BUCKET_EDGES)
+        for i, c in enumerate(counts):
+            if c > 0 and run + c >= target:
+                lo = 0.0 if i == 0 else WEIGHT_BUCKET_EDGES[i - 1]
+                hi = WEIGHT_BUCKET_EDGES[i] if i < n_edges else WEIGHT_BUCKET_EDGES[-1]
+                return lo + (hi - lo) * ((target - run) / c)
+            run += c
+        return float(WEIGHT_BUCKET_EDGES[-1])
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        buf = self._cpu()
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for scope in range(self.n_scopes):
+            counts = [float(v) for v in buf[scope, :, 0]]
+            total = sum(counts)
+            if total <= 0:
+                continue
+            head = prefix if scope == 0 else f"{prefix}/{name(scope - 1)}"
+            kl = [float(v) for v in buf[scope, :, 1]]
+            shift = [float(v) for v in buf[scope, :, 2]]
+            kl_total, shift_total = sum(kl), sum(shift)
+            for q in (0.5, 0.9, 0.99):
+                out[f"{head}/shape/w_q{int(round(q * 100)):02d}"] = self._quantile(counts, q)
+            for t in WEIGHT_THRESHOLDS:
+                i = WEIGHT_BUCKET_EDGES.index(t)
+                tag = _threshold_name(t)
+                out[f"{head}/shape/frac_w_gt_{tag}"] = sum(counts[i + 1 :]) / total
+                if kl_total > 0:
+                    out[f"{head}/shape/kl_share_w_gt_{tag}"] = sum(kl[i + 1 :]) / kl_total
+                if shift_total > 0:
+                    out[f"{head}/shape/shift_share_w_gt_{tag}"] = sum(shift[i + 1 :]) / shift_total
+            # The one direction W~ cannot reach on its own: below 1 is the
+            # normaliser taking budget away, and how often that happens is what
+            # separates "the arm added distillation" from "the arm moved it".
+            below = WEIGHT_BUCKET_EDGES.index(BELOW_ONE_EDGE) + 1
+            out[f"{head}/shape/frac_w_below_one"] = sum(counts[:below]) / total
+            if shift_total > 0:
+                out[f"{head}/shape/shift_share_w_below_one"] = sum(shift[:below]) / shift_total
         return out
 
 
@@ -1368,6 +1661,7 @@ def build_position_weight(
     )
 
     probes = {}
+    probe_evidence = {}
     for a in probe_alphas:
         e_a = candidate_kl_evidence(
             common=dec["common"], hat_off=hat_off,
@@ -1375,6 +1669,14 @@ def build_position_weight(
         )
         p_a = position_pre_weight(evidence=e_a, on_task_logprob=on_task_logprob)
         probes[probe_name(a)] = torch.where(avail.reshape(-1, 1), p_a, torch.ones_like(p_a))
+        # Kept rather than discarded: without the per-candidate evidence the
+        # probe can only be reported as a size, and a size cannot say WHICH
+        # positions a larger alpha would have moved budget to -- which is the
+        # only thing the series is for. Zeroed where the position is
+        # unavailable, matching the pre-weight beside it.
+        probe_evidence[probe_name(a)] = torch.where(
+            avail.reshape(-1, 1, 1), e_a, torch.zeros_like(e_a)
+        )
 
     p_teacher = on_task_logprob.detach().to(torch.float32).exp()
     return {
@@ -1402,6 +1704,7 @@ def build_position_weight(
         # (bs, resp, n_off): each source's share of the same quantity.
         "evidence_by_source": p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs(),
         "probe_pre_weight": probes,
+        "probe_evidence": probe_evidence,
     }
 
 

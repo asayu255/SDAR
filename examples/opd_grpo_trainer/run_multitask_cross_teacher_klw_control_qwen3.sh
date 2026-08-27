@@ -351,6 +351,66 @@ set -x
 #     reward signal, which is a finding rather than a bug. Collected on the first
 #     PPO epoch, where the ratio is 1 and the closed form is an identity.
 #
+#   THE ANALYSIS CUTS (added for ablations; all curated, none change the loss).
+#   Every one of them is a re-scoping of columns the arm already accumulates, so
+#   a role row and a task row of the same metric are the same arithmetic over
+#   different positions.
+#
+#   kl_weight/role/{format,reasoning,env_action,tool_call,env_obs,tag}/*
+#     WHERE IN THE TEXT the arm acts. "The arm moved 3% of the OPD budget" is
+#     the same number whether it moved it into the tokens the environment
+#     executes or into whitespace, and those are not the same finding. Roles
+#     come from the tag scan in sign_weights.token_roles -- <think>, <action>,
+#     <search>/<answer>, <information>, the tags themselves -- so this is a
+#     property of the POSITION, not of the row. Six series each:
+#       effect/kl_unweighted        where that role's OPD budget IS
+#       effect/kl_shift_gross_frac  how much of it the arm moved there
+#       effect/kl_shift_net         and in which direction
+#       position/w_mean
+#       evidence/shared_share       which channel carried it there
+#       grpo/grad_cosine            does the budget moved there pull WITH the
+#         reward gradient. A pooled cosine of 0.1 is consistent with strong
+#         agreement inside <action> and strong disagreement in the scaffolding;
+#         this is what separates them, and it is the causal reading of the arm.
+#     Plus effect/kl_shift_by_state/*/gross_share per role -- the state
+#     composition inside each kind of text, shares only.
+#
+#   kl_weight/turn/turn{0..4,5plus}/*  WHERE IN THE EPISODE. Four series: is the
+#     arm front-loaded, or does it act on the late turns where the reward is
+#     decided.
+#
+#   kl_weight/shape/*  the DISTRIBUTION of W, pooled and per task. w_cv cannot
+#     tell "1.02 nearly everywhere" from "1.00 at 99% of positions and 3.0 at
+#     the rest", and those are the two mechanisms the arm is being tested for --
+#     the first is a larger teacher_kl_loss_coef in disguise. Quantiles
+#     w_q{50,90,99} (interpolated inside a bucket; the top bucket is unbounded
+#     and saturates at 5.0), then exact whole-bucket shares at 1.05 / 1.25 / 2.0:
+#     frac_w_gt_* (how many positions), kl_share_w_gt_* (how much of the OPD
+#     budget sits up there) and shift_share_w_gt_* (how much of the moved nats
+#     the tail carries). frac_w_below_one is the only direction W~ cannot reach
+#     on its own -- below 1 is the normaliser taking budget AWAY, which is what
+#     separates "the arm added distillation" from "the arm moved it".
+#
+#   kl_weight/*/token/turnover/{top64_jaccard,effect_carryover}  the one reading
+#     that needs two steps. n_distinct and top64_share are both within-step, so
+#     forty tokens replaced wholesale every step reads exactly like a stable
+#     forty in both. Jaccard is membership; effect_carryover is the share of
+#     THIS step's nats that landed on tokens the PREVIOUS step had ranked. High
+#     carryover with a low Jaccard is a stable core with a churning tail.
+#
+#   kl_weight/role/*/token/*  and the role: rows in sign_tokens_step*.jsonl --
+#     the vocabulary cut by what was being written. "The arm reinforced go and
+#     take inside <action>" and "... inside <think>" are the same row in every
+#     other table here. token_stats.roles=False turns off the 22 MB table.
+#
+#   kl_weight/probe/alpha*/effect/kl_shift_by_state/*/gross_share  the alpha
+#     series' own state composition. Until now the probes reported only how BIG
+#     the counterfactual weight would be; this says whether a larger alpha moves
+#     budget TOWARD the corroborated positions or just scales everything, which
+#     is the question the series exists to answer. Each probe uses its own mu
+#     and its own evidence, so its columns sum to that probe's (W-1)D and not to
+#     the shipped arm's.
+#
 # GO/NO-GO BEFORE THE LONG RUN. If probe/alpha100/effect/kl_shift_gross_frac is
 # below 0.05 on every destination, the arm is not redistributing the OPD budget
 # in any measurable way and the three extra forwards -- about 24% of the step --
@@ -699,6 +759,8 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.cross_teacher_kl_weight.max_groups=512 \
     +algorithm.opd.cross_teacher_kl_weight.token_stats.enable=True \
     +algorithm.opd.cross_teacher_kl_weight.token_stats.top_n=64 \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.roles=True \
+    +algorithm.opd.cross_teacher_kl_weight.token_stats.role_top_n=32 \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.enable=True \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.per_step=128 \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.context=16 \

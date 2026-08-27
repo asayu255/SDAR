@@ -51,7 +51,10 @@ from verl.trainer.ppo.sign_weights import (
     POSITION_TERMS,
     position_decomposition_terms,
     position_ratio_metrics,
+    ROLE_NAMES,
+    RoleTokenCounts,
     token_roles,
+    turn_index,
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.cross_teacher_kl_weight import (
@@ -61,7 +64,15 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     AdvantageReliabilityStats,
     CumulativePolicyShiftRMS,
     PairEvidenceStats,
+    PositionScopeTermStats,
     PreviousStepTaskKLWeightedMean,
+    WeightShiftHistogram,
+    ROLE_CUT_SUFFIXES as XT_ROLE_CUT_SUFFIXES,
+    ROLE_SCOPE_NAMES as XT_ROLE_SCOPE_NAMES,
+    TURN_CUT_SUFFIXES as XT_TURN_CUT_SUFFIXES,
+    select_metrics as xt_select_metrics,
+    TURN_BUCKETS as XT_TURN_BUCKETS,
+    TURN_SCOPE_NAMES as XT_TURN_SCOPE_NAMES,
     build_position_weight,
     compute_raw_policy_shifts,
     decompose_common_residual,
@@ -320,6 +331,26 @@ def _supports_logits_to_keep(module) -> bool:
     return "logits_to_keep" in params or "num_logits_to_keep" in params
 
 
+def _xt_normalizer_mu(pre_weight, snapshot, task_ids):
+    """The divisor that reproduces a probe's applied weight, as a tensor.
+
+    Where the snapshot has no valid mean the arm runs at ``W = 1`` rather than
+    at the raw ``W~``, so the divisor that reproduces THAT is ``pre`` itself,
+    not 1. Returning it keeps ``pre / mu`` and :func:`_xt_apply_normalizer` the
+    same number at every position -- which is what lets the probe's state
+    partition, built from this ``mu``, sum to the probe's own ``(W - 1) D``
+    instead of to the live arm's.
+    """
+    floor = pre_weight.clamp(min=1e-12)
+    if snapshot is None or task_ids is None:
+        return floor
+    dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
+    mean = snapshot["mean"].to(pre_weight.device, pre_weight.dtype)
+    valid = snapshot["valid"].to(pre_weight.device)
+    mu = mean[dst].reshape(-1, 1).expand_as(pre_weight)
+    return torch.where(valid[dst].reshape(-1, 1), mu.clamp(min=1e-12), floor)
+
+
 def _xt_apply_normalizer(pre_weight, snapshot, task_ids):
     """A probe's applied weight: the same divisor rule the training path uses.
 
@@ -327,15 +358,7 @@ def _xt_apply_normalizer(pre_weight, snapshot, task_ids):
     way the arm is measured -- a raw W~ has a different spread from a normalised
     one, and the threshold is on the normalised quantity.
     """
-    if snapshot is None or task_ids is None:
-        return torch.ones_like(pre_weight)
-    dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
-    mean = snapshot["mean"].to(pre_weight.device, pre_weight.dtype)
-    valid = snapshot["valid"].to(pre_weight.device)
-    mu = mean[dst].reshape(-1, 1).expand_as(pre_weight)
-    return torch.where(
-        valid[dst].reshape(-1, 1), pre_weight / mu.clamp(min=1e-12), torch.ones_like(pre_weight)
-    )
+    return pre_weight / _xt_normalizer_mu(pre_weight, snapshot, task_ids)
 
 
 def _grad_sync_context(module, active: bool):
@@ -412,6 +435,11 @@ class DataParallelPPOActor(BasePPOActor):
         self._xt_mean_snapshot = None      # {"mean", "valid"} from the previous step
         self._xt_alpha = None              # (T, T) applied reliability
         self._xt_probe_mean = {}           # one normaliser per probe alpha
+        # The previous step's top-N token ids per scope, so turnover has
+        # something to compare against. Not in the sidecar: a resumed run losing
+        # one step of turnover is cheaper than a resume that silently compares
+        # against a table from a different teacher set.
+        self._xt_token_prev = None
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -1712,6 +1740,12 @@ class DataParallelPPOActor(BasePPOActor):
                         self._xt_alpha = restored.to(torch.float32)
                     print(f"[cross_teacher] resumed accumulated state from {pending}", flush=True)
                 self.cross_teacher_sidecar_path = None
+        # {tag: [ids]}, set by the worker at startup -- this process has no
+        # tokenizer. Absent means the role column reports "format" throughout,
+        # which is honest: nothing was classified. Read here rather than beside
+        # the sign arm's tables because the role-keyed accumulators below are
+        # built or skipped on whether it exists.
+        sign_role_tags = getattr(self, "sign_role_tag_ids", None)
         xt_on = xt_cfg_on and self._xt_rms is not None
         xt_position_stats = (
             ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev) if xt_on else None
@@ -1723,6 +1757,40 @@ class DataParallelPPOActor(BasePPOActor):
         xt_grad_stats = (
             ScopeTermStats(names=XT_GRAD_TERMS, n_tasks=n_task, device=sign_dev) if xt_on else None
         )
+        # WHERE in the text the arm acts, and WHERE in the episode. Both axes
+        # vary WITHIN a row -- one response walks through <think>, <action> and
+        # the scaffolding between them, and a multi-turn row spans several turns
+        # -- so they need the per-position accumulator rather than the per-row
+        # one every other table here uses.
+        #
+        # These are the two cuts an ablation cannot reconstruct from what was
+        # already logged. "The arm moved 3% of the OPD budget" is the same
+        # number whether it moved it into the tokens the environment executes or
+        # into whitespace, and those are not the same finding.
+        xt_role_position_stats = (
+            PositionScopeTermStats(names=XT_POSITION_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev)
+            if xt_on else None
+        )
+        xt_role_state_stats = (
+            PositionScopeTermStats(names=XT_STATE_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev)
+            if xt_on else None
+        )
+        # The reading the norm ratio and the pooled cosine cannot give: whether
+        # the budget the arm ADDED at a kind of position pulls with the reward
+        # gradient THERE. A pooled cosine of 0.1 is consistent with strong
+        # agreement inside <action> and strong disagreement in the scaffolding.
+        xt_role_grad_stats = (
+            PositionScopeTermStats(names=XT_GRAD_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev)
+            if xt_on else None
+        )
+        xt_turn_stats = (
+            PositionScopeTermStats(names=XT_POSITION_TERMS, n_scopes=XT_TURN_BUCKETS, device=sign_dev)
+            if xt_on else None
+        )
+        # The shape of W. w_cv cannot tell "1.02 nearly everywhere" from "1.00 at
+        # 99% of positions and 3.0 at the rest", and those are the two mechanisms
+        # the arm is being tested for.
+        xt_weight_hist = WeightShiftHistogram(n_tasks=n_task, device=sign_dev) if xt_on else None
         # The per-token side, on the arm's own switches rather than the sign
         # arm's. Without these the run can say a source raised a task's KL by so
         # many nats and cannot name one token it did it at, which is most of
@@ -1730,6 +1798,7 @@ class DataParallelPPOActor(BasePPOActor):
         xt_token_cfg = (xt_cfg.get("token_stats", None) or {}) if xt_cfg_on else {}
         xt_event_cfg = (xt_cfg.get("event_dump", None) or {}) if xt_cfg_on else {}
         xt_token_stats = xt_pair_token_stats = xt_event_stats = None
+        xt_role_token_stats = None
         if xt_on and (xt_token_cfg.get("enable", False) or xt_event_cfg.get("enable", False)):
             _vocab = model_vocab_size(self.actor_module)
             if _vocab is None:
@@ -1751,6 +1820,16 @@ class DataParallelPPOActor(BasePPOActor):
                     n_tasks=n_task, vocab_size=_vocab, device=sign_dev,
                     top_n=int(xt_token_cfg.get("top_n", 64)),
                 )
+                # The vocabulary cut by what was being WRITTEN. Its own switch
+                # because it is the one table here whose cost is not free --
+                # n_roles * V is 22 MB at Qwen3's vocabulary -- and because it
+                # is useless without the tag ids, which a worker that never set
+                # them does not have.
+                if sign_role_tags and bool(xt_token_cfg.get("roles", True)):
+                    xt_role_token_stats = RoleTokenCounts(
+                        vocab_size=_vocab, device=sign_dev,
+                        top_n=int(xt_token_cfg.get("role_top_n", 32)),
+                    )
         if xt_on and xt_event_cfg.get("enable", False):
             xt_event_stats = SignEventSamples(
                 capacity=int(xt_event_cfg.get("per_step", 128)),
@@ -1760,6 +1839,19 @@ class DataParallelPPOActor(BasePPOActor):
         xt_probe_stats = (
             {
                 probe_name(a): ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev)
+                for a in XT_PROBE_ALPHAS
+            }
+            if xt_on
+            else {}
+        )
+        # The alpha series is the arm's own ablation, run inside the arm. Until
+        # now it reported only how BIG the counterfactual weight would be; the
+        # state table is what says whether raising alpha moves budget toward the
+        # corroborated positions or just scales everything, and that is the
+        # question the series exists to answer.
+        xt_probe_state_stats = (
+            {
+                probe_name(a): ScopeTermStats(names=XT_STATE_TERMS, n_tasks=n_task, device=sign_dev)
                 for a in XT_PROBE_ALPHAS
             }
             if xt_on
@@ -1808,10 +1900,6 @@ class DataParallelPPOActor(BasePPOActor):
             if (sign_cfg_on and bool(event_cfg.get("enable", False)))
             else None
         )
-        # {tag: [ids]}, set by the worker at startup -- this process has no
-        # tokenizer. Absent means the role column reports "format" throughout,
-        # which is honest: nothing was classified.
-        sign_role_tags = getattr(self, "sign_role_tag_ids", None)
         # The observer arm: measure everything, change nothing. NOT the same as
         # setting all three weights to 1.0 -- reweight_teacher_logprobs still
         # subtracts a log z that differs from 0 by float error, and its tail
@@ -2148,6 +2236,9 @@ class DataParallelPPOActor(BasePPOActor):
                                     sign_position_weight = pos_w_norm
                     
                     xt_built = None
+                    # Per micro-batch, so the readers below cannot see a
+                    # previous one's roles when this one produced none.
+                    xt_roles_mb = None
                     if xt_enabled:
                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
                             "cross_teacher_kl_weight needs the student's top-k support and the "
@@ -2495,13 +2586,42 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=response_mask, task_ids=task_ids,
                                 row_weights=task_loss_weight,
                             )
+                            # Computed once and handed to four accumulators:
+                            # the task cut, the role cut, the turn cut and the
+                            # histogram all decompose the SAME columns, and three
+                            # copies of the arithmetic is how three views of one
+                            # number come to disagree.
+                            xt_pos_cols = xt_position_terms(xt_built, teacher_kld)
+                            xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)
                             xt_position_stats.update(
-                                xt_position_terms(xt_built, teacher_kld),
-                                response_mask=response_mask, task_ids=task_ids,
+                                xt_pos_cols, response_mask=response_mask, task_ids=task_ids,
                             )
                             xt_state_stats.update(
-                                xt_state_shift_terms(xt_built, teacher_kld),
+                                xt_state_cols, response_mask=response_mask, task_ids=task_ids,
+                            )
+                            xt_weight_hist.update(
+                                weight=xt_built["weight"], teacher_kl=teacher_kld,
                                 response_mask=response_mask, task_ids=task_ids,
+                            )
+                            # Roles are absent when the worker never handed down
+                            # the tag ids. Filing everything under "format" would
+                            # be a table that looks populated and says nothing, so
+                            # the accumulator is simply not fed.
+                            xt_roles_mb = (
+                                token_roles(data["responses"], sign_role_tags)
+                                if sign_role_tags
+                                else None
+                            )
+                            if xt_roles_mb is not None:
+                                xt_role_position_stats.update(
+                                    xt_pos_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
+                                )
+                                xt_role_state_stats.update(
+                                    xt_state_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
+                                )
+                            xt_turn_stats.update(
+                                xt_pos_cols, response_mask=response_mask,
+                                scope_ids=turn_index(response_mask).clamp(max=XT_TURN_BUCKETS - 1),
                             )
                             # Each source's share of W~ - 1, and of the nats that
                             # share went on to move.
@@ -2520,9 +2640,18 @@ class DataParallelPPOActor(BasePPOActor):
                                     row_weights=task_loss_weight,
                                 )
                                 snap = xt_probe_snapshots.get(name, None)
+                                probe_mu = _xt_normalizer_mu(pre, snap, task_ids)
                                 probe = {
-                                    "weight": _xt_apply_normalizer(pre, snap, task_ids),
+                                    "weight": pre / probe_mu,
                                     "pre_weight": pre,
+                                    "mu": probe_mu,
+                                    # alpha changes the evidence and nothing
+                                    # else: the state labels, the teacher's
+                                    # probability and the availability mask are
+                                    # the live ones by construction.
+                                    "evidence": xt_built["probe_evidence"][name],
+                                    "state": xt_built["state"],
+                                    "teacher_prob": xt_built["teacher_prob"],
                                     "available": xt_built["available"],
                                     "evidence_shared": xt_built["evidence_shared"],
                                     "evidence_shared_offtask_only": xt_built[
@@ -2531,6 +2660,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 }
                                 xt_probe_stats[name].update(
                                     xt_position_terms(probe, teacher_kld),
+                                    response_mask=response_mask, task_ids=task_ids,
+                                )
+                                # The counterfactual's own state partition,
+                                # built from the probe's OWN mu and evidence so
+                                # its columns sum to the probe's (W - 1) D and
+                                # not to the shipped arm's. The state labels and
+                                # the teacher's probability are shared because
+                                # alpha does not move them -- which is what makes
+                                # the series an alpha ablation rather than three
+                                # unrelated weightings.
+                                xt_probe_state_stats[name].update(
+                                    xt_state_shift_terms(probe, teacher_kld),
                                     response_mask=response_mask, task_ids=task_ids,
                                 )
                         if xt_built is not None and xt_collect:
@@ -2544,6 +2685,13 @@ class DataParallelPPOActor(BasePPOActor):
                                 tables=(xt_token_stats, xt_pair_token_stats, xt_event_stats),
                                 roles=sign_role_tags,
                             )
+                            if xt_role_token_stats is not None and xt_roles_mb is not None:
+                                xt_role_token_stats.update(
+                                    support_ids=sign_cand_inputs["support_ids"],
+                                    roles=xt_roles_mb,
+                                    effect=per_candidate_shift(xt_built, teacher_kld),
+                                    response_mask=response_mask,
+                                )
                             xt_row_adv = data.get("adv_row_value", None)
                             if xt_grad_stats is not None and xt_row_adv is not None:
                                 # Analytic, so the diagnostic cannot perturb the
@@ -2551,20 +2699,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 # where the PPO ratio is 1 and the closed form
                                 # for the policy gradient is exact.
                                 y1 = data["responses"].unsqueeze(-1)
-                                xt_grad_stats.update(
-                                    logit_gradient_terms(
-                                        student_logprob=student_topk_logprobs,
-                                        teacher_logprob=sign_cand_inputs["on_task_logprob"],
-                                        weight=xt_built["weight"],
-                                        teacher_kl=teacher_kld,
-                                        advantage=xt_row_adv,
-                                        sampled_onehot=(
-                                            sign_cand_inputs["support_ids"] == y1
-                                        ).to(teacher_kld.dtype),
-                                        coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
-                                    ),
-                                    response_mask=response_mask, task_ids=task_ids,
+                                xt_grad_cols = logit_gradient_terms(
+                                    student_logprob=student_topk_logprobs,
+                                    teacher_logprob=sign_cand_inputs["on_task_logprob"],
+                                    weight=xt_built["weight"],
+                                    teacher_kl=teacher_kld,
+                                    advantage=xt_row_adv,
+                                    sampled_onehot=(
+                                        sign_cand_inputs["support_ids"] == y1
+                                    ).to(teacher_kld.dtype),
+                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
                                 )
+                                xt_grad_stats.update(
+                                    xt_grad_cols, response_mask=response_mask, task_ids=task_ids,
+                                )
+                                if xt_roles_mb is not None:
+                                    xt_role_grad_stats.update(
+                                        xt_grad_cols, response_mask=response_mask,
+                                        scope_ids=xt_roles_mb,
+                                    )
                         if xt_built is not None:
                             # The one line the whole module exists to reach.
                             teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
@@ -2835,23 +2988,95 @@ class DataParallelPPOActor(BasePPOActor):
             if xt_grad_stats is not None:
                 xt_grad_stats.all_reduce()
                 metrics.update(gradient_metrics(xt_grad_stats.sums(task_names=task_id_names)))
+            # The two per-position cuts. Rendered by the SAME functions as the
+            # task cut -- the accumulators return the same shape of sums -- so a
+            # role row and a task row of the same metric are the same
+            # arithmetic over different positions, never two definitions.
+            xt_weight_hist.all_reduce()
+            metrics.update(xt_weight_hist.metrics(task_names=task_id_names))
+            xt_turn_stats.all_reduce()
+            metrics.update(xt_select_metrics(
+                position_weight_metrics(
+                    xt_turn_stats.sums(scope_names=XT_TURN_SCOPE_NAMES), prefix="kl_weight/turn"
+                ),
+                XT_TURN_CUT_SUFFIXES,
+            ))
+            # Curated, not truncated: the accumulators hold every column, and
+            # what a cut publishes is a decision about the dashboard rather than
+            # about the measurement. Six roles of all thirty-four columns is
+            # three hundred series a step, which is a worse analysis than five
+            # that are read.
+            for _acc, _render in (
+                (xt_role_position_stats, position_weight_metrics),
+                (xt_role_state_stats, state_shift_metrics),
+                (xt_role_grad_stats, gradient_metrics),
+            ):
+                _acc.all_reduce()
+                metrics.update(xt_select_metrics(
+                    _render(_acc.sums(scope_names=XT_ROLE_SCOPE_NAMES), prefix="kl_weight/role"),
+                    XT_ROLE_CUT_SUFFIXES,
+                ))
             # The rows are stashed and published below, beside the sign arm's:
             # the reports are reset to None there, so assigning them here would
             # be undone a few lines later by a branch that never runs on this arm.
             if xt_token_stats is not None:
                 xt_token_stats.all_reduce()
                 metrics.update(xt_token_stats.scalar_metrics(task_names=task_id_names))
+                # The one reading that needs two steps: n_distinct and
+                # top_share are both within-step, and a set of forty tokens
+                # replaced wholesale every step reads exactly like a stable
+                # forty in both of them.
+                _turnover, _token_ids = xt_token_stats.turnover(
+                    previous=self._xt_token_prev,
+                    task_names=task_id_names,
+                    prefix="kl_weight",
+                )
+                metrics.update(_turnover)
+                # Only on a step that had tokens: an empty table must not erase
+                # the reference a later step would have compared against.
+                if _token_ids:
+                    self._xt_token_prev = _token_ids
             if xt_pair_token_stats is not None:
                 xt_pair_token_stats.all_reduce()
                 metrics.update(xt_pair_token_stats.scalar_metrics(task_names=task_id_names))
+            if xt_role_token_stats is not None:
+                xt_role_token_stats.all_reduce()
+                metrics.update(xt_role_token_stats.scalar_metrics(prefix="kl_weight"))
             metrics.update(self._xt_rms_metrics(task_id_names))
             metrics.update(self._xt_reliability_metrics(task_id_names))
+            def _publish_probe(name, rendered, suffixes):
+                for key, value in xt_select_metrics(rendered, suffixes).items():
+                    metrics[key.replace("kl_weight/", f"kl_weight/probe/{name}/", 1)] = value
+
             for _name, _st in xt_probe_stats.items():
                 _st.all_reduce()
-                probe = position_weight_metrics(_st.sums(task_names=task_id_names))
-                for key, value in probe.items():
-                    if key.endswith("/w_cv") or key.endswith("/kl_shift_gross_frac"):
-                        metrics[key.replace("kl_weight/", f"kl_weight/probe/{_name}/", 1)] = value
+                _sums = _st.sums(task_names=task_id_names)
+                _publish_probe(
+                    _name, position_weight_metrics(_sums), ("/w_cv", "/kl_shift_gross_frac")
+                )
+                # Pooled only. w_pre_mean and shared_share joined the two size
+                # readings because an alpha series that reports only how big the
+                # weight got cannot say whether the extra size came from the
+                # corroboration channel -- which is the channel alpha scales --
+                # but that is a statement about the mechanism, not about a task,
+                # and three copies of it per probe is three copies.
+                if None in _sums:
+                    _publish_probe(
+                        _name,
+                        position_weight_metrics({None: _sums[None]}),
+                        ("/w_pre_mean", "/shared_share"),
+                    )
+            for _name, _st in xt_probe_state_stats.items():
+                _st.all_reduce()
+                _sums = _st.sums(task_names=task_id_names)
+                if None not in _sums:
+                    continue
+                # gross_share only, pooled only: the per-state net at a
+                # counterfactual alpha is a number of nats no arm ever paid,
+                # while the share is a composition and reads across the series.
+                _publish_probe(
+                    _name, state_shift_metrics({None: _sums[None]}), ("/gross_share",)
+                )
             total = float(xt_outside_topk[1])
             if total > 0:
                 metrics["kl_weight/adv/frac_sampled_outside_topk"] = float(xt_outside_topk[0]) / total
@@ -2893,6 +3118,11 @@ class DataParallelPPOActor(BasePPOActor):
             # Same worker path, same dump file: the two arms never run together,
             # so one channel to the tokenizer serves both.
             self.last_token_report = xt_token_stats.top_tokens(task_names=task_id_names)
+            if xt_role_token_stats is not None:
+                # Appended rather than given a file of its own: the rows carry
+                # scope="role:<name>", which is what already tells the two apart,
+                # and a third file is a third thing a reader has to join.
+                self.last_token_report += xt_role_token_stats.top_tokens()
         # A second file rather than a discriminator column in the first: the two
         # tables are keyed differently (scope/state against dst/src/class) and
         # merging them would make every row carry the other's empty columns.

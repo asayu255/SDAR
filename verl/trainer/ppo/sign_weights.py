@@ -120,6 +120,7 @@ __all__ = [
     "ROLE_NAMES",
     "token_roles",
     "turn_index",
+    "RoleTokenCounts",
     "SignEventSamples",
 ]
 
@@ -1129,6 +1130,58 @@ class TokenStateCounts:
                     break
                 rows.append(_row("abs_effect", None, rank, tok))
         return rows
+
+
+    def turnover(self, previous=None, task_names=None, prefix: str = "sign_weight"):
+        """Is it the SAME tokens each step, or a different set with the same shape?
+
+        The class docstring names two mechanisms -- "the tasks share a small
+        stable set of moves" and "the tasks share a broad statistical tendency"
+        -- and says ``n_distinct`` with ``top_share`` separates them. It does
+        not, quite: both are within-step, so a set of forty tokens that is
+        completely replaced every step reads exactly like a stable forty. Only a
+        comparison ACROSS steps closes that, and this is it.
+
+        Two numbers, because either alone can be gamed by the other:
+
+        ``topN_jaccard``     overlap of the two ranked sets. Set membership only,
+                             so a token that stayed in the list but stopped
+                             carrying anything still counts.
+        ``effect_carryover`` the share of THIS step's gross per-token effect that
+                             landed on tokens the PREVIOUS step had ranked. Mass,
+                             not membership: high with a low Jaccard means a
+                             stable core with a churning tail, which is the
+                             common and benign case.
+
+        Returns ``(metrics, state)``. ``state`` is what the next call passes as
+        ``previous``; the first call returns no metrics, which is honest -- there
+        is nothing to compare against.
+        """
+        _n, _mass, eff_pos, eff_neg = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        out, state = {}, {}
+        for scope in range(self.n_scopes):
+            scope_name = self._scope_name(scope, task_names)
+            key = scope_name or "__pooled__"
+            per_tok = (eff_pos[scope] + eff_neg[scope]).sum(0).abs()
+            tot = float(per_tok.sum())
+            if tot <= 0:
+                continue
+            vals, idx = torch.topk(per_tok, N)
+            cur = [int(t) for v, t in zip(vals.tolist(), idx.tolist()) if v > 0]
+            if not cur:
+                continue
+            state[key] = cur
+            prev = (previous or {}).get(key)
+            if not prev:
+                continue
+            head = prefix if scope_name is None else f"{prefix}/{scope_name}"
+            a, b = set(cur), set(prev)
+            out[f"{head}/token/turnover/top{N}_jaccard"] = len(a & b) / len(a | b)
+            keep = torch.zeros(self.vocab_size, dtype=torch.bool)
+            keep[torch.tensor(sorted(b), dtype=torch.long)] = True
+            out[f"{head}/token/turnover/effect_carryover"] = float(per_tok[keep].sum()) / tot
+        return out, state
 
 
 class ScopeTermStats:
@@ -2528,6 +2581,147 @@ def token_roles(responses: torch.Tensor, tag_ids: dict) -> torch.Tensor:
     )
     role = torch.where(seen, lookup[code], role)
     return torch.where(is_tag, torch.full_like(role, ROLE_TAG), role)
+
+
+class RoleTokenCounts:
+    """Which tokens the weighting moved, cut by WHAT WAS BEING WRITTEN.
+
+    :class:`TokenStateCounts` cuts the vocabulary by task and by agreement
+    state. Neither says whether a token was moved while the model was
+    reasoning, while it was emitting the action the environment executes, or in
+    the scaffolding between them -- and those are different claims about the
+    mechanism. "The arm reinforced ``go`` and ``take`` inside ``<action>``" and
+    "the arm reinforced ``go`` and ``take`` inside ``<think>``" produce the same
+    row in every table this module already has.
+
+    Deliberately thinner than ``TokenStateCounts``: no state axis and no mass
+    column, so the buffer is ``n_roles * V`` rather than
+    ``(1 + n_tasks) * n_states * V``. At Qwen3's 151,936 that is 22 MB against
+    the other table's ~100, and it buys the one axis the aggregates cannot
+    reconstruct.
+
+    ``effect`` is the same ``per_candidate_shift`` the other two tables
+    decompose, so the three sum to the same nats. Split by sign for the reason
+    ``TokenStateCounts`` splits: a token raised in one context and lowered in
+    another nets to nothing and is the most interesting row in the table.
+    """
+
+    def __init__(self, *, vocab_size: int, device, top_n: int = 32):
+        self.vocab_size = int(vocab_size)
+        self.n_roles = len(ROLE_NAMES)
+        self.top_n = int(top_n)
+        cells = self.n_roles * self.vocab_size
+        self.n = torch.zeros(cells, dtype=torch.int64, device=device)
+        # float64 for the reason TokenStateCounts uses it: millions of atomic
+        # adds of ~1e-6 into a few cells lose their tail in float32.
+        self.eff_pos = torch.zeros(cells, dtype=torch.float64, device=device)
+        self.eff_neg = torch.zeros(cells, dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, support_ids, roles, effect, response_mask) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            support_ids: (bs, resp, k) the candidate token ids.
+            roles: (bs, resp) from :func:`token_roles`.
+            effect: (bs, resp, k) the post-normalisation nats each candidate
+                moved -- ``per_candidate_shift``.
+            response_mask: (bs, resp).
+        """
+        self._cpu_cache = None
+        V = self.vocab_size
+        r = roles.clamp(min=0, max=self.n_roles - 1).unsqueeze(-1)
+        idx = (r * V + support_ids.clamp(min=0, max=V - 1)).reshape(-1)
+        m = response_mask.unsqueeze(-1).expand_as(support_ids)
+        e = (effect.detach().to(torch.float64) * m.to(torch.float64)).reshape(-1)
+        self.n.index_add_(0, idx, m.reshape(-1).to(torch.int64))
+        self.eff_pos.index_add_(0, idx, e.clamp(min=0.0))
+        self.eff_neg.index_add_(0, idx, e.clamp(max=0.0))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        for buf in (self.n, self.eff_pos, self.eff_neg):
+            torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = tuple(
+                b.detach().to("cpu").view(self.n_roles, self.vocab_size)
+                for b in (self.n, self.eff_pos, self.eff_neg)
+            )
+        return self._cpu_cache
+
+    def scalar_metrics(self, prefix: str = "kl_weight") -> dict:
+        """Per role: the share of the nats, and how spread over the vocabulary.
+
+        ``shift_gross_share`` is the headline -- it is the same partition the
+        role-scoped position accumulator reports, recomputed here from the token
+        table so a disagreement between the two is visible rather than assumed
+        away.
+        """
+        n, eff_pos, eff_neg = self._cpu()
+        gross_all = float((eff_pos - eff_neg).sum())
+        N = min(self.top_n, self.vocab_size)
+        out = {}
+        for rid in range(self.n_roles):
+            rname = ROLE_NAMES[rid]
+            counts = n[rid]
+            total = int(counts.sum())
+            if total <= 0:
+                continue
+            head = f"{prefix}/role/{rname}"
+            gross = float((eff_pos[rid] - eff_neg[rid]).sum())
+            # Three columns, not six. The signed halves and the count-ranked
+            # share are already answered for this role by the role-scoped
+            # position cut and by the ranked rows below; what only this table
+            # can say is how many DISTINCT tokens the role's nats went to and
+            # how concentrated they were.
+            out[f"{head}/token/n_distinct"] = float((counts > 0).sum())
+            if gross_all > 0:
+                out[f"{head}/token/shift_gross_share"] = gross / gross_all
+            per_tok = (eff_pos[rid] + eff_neg[rid]).abs()
+            tot = float(per_tok.sum())
+            if tot > 0:
+                out[f"{head}/token/dkl_nats_abs_top{N}_share"] = (
+                    float(torch.topk(per_tok, N).values.sum()) / tot
+                )
+        return out
+
+    def top_tokens(self) -> list:
+        """Ranked rows, in the schema the worker's decoder expects.
+
+        Appended to the same report the other tables go to rather than given a
+        file of its own: ``scope`` already distinguishes them, and a third file
+        is a third thing a reader has to join.
+        """
+        n, eff_pos, eff_neg = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        rows = []
+        for rid in range(self.n_roles):
+            rname = ROLE_NAMES[rid]
+            if int(n[rid].sum()) <= 0:
+                continue
+            net = eff_pos[rid] + eff_neg[rid]
+            gross = eff_pos[rid] - eff_neg[rid]
+            for ranked_by, series in (
+                ("count", n[rid].to(torch.float64)),
+                ("abs_effect", net.abs()),
+            ):
+                if float(series.sum()) <= 0:
+                    continue
+                vals, idx = torch.topk(series, N)
+                for rank, (v, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
+                    if v <= 0:
+                        break
+                    rows.append({
+                        "scope": f"role:{rname}", "ranked_by": ranked_by, "state": "__any__",
+                        "rank": rank, "token_id": int(tok), "count": int(n[rid, tok]),
+                        "effect_kind": EFFECT_KIND["position"],
+                        "effect_net": float(net[tok]), "effect_gross": float(gross[tok]),
+                    })
+        return rows
 
 
 def turn_index(response_mask: torch.Tensor) -> torch.Tensor:
