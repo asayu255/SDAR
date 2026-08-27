@@ -237,35 +237,26 @@ def _cpu(trace, pct):
     return [(ts, pct(vals)) for ts, vals in trace]
 
 
-def test_cpu_alone_no_longer_names_a_cause():
-    """WITHDRAWN: this used to read cpu >= 60% as "Python holding the GIL".
+def test_cpu_decides_whether_and_the_census_decides_where():
+    """Two swings, and the rule that survived both.
 
-    It cannot. cpu_pct says the process was running, not that it was running
-    Python under the GIL -- the Rust tokeniser releases it and still reads
-    busy, and native BLAS reads as several cores. The number is still printed,
-    because "blocked" versus "running" is real evidence, but the cause now
-    comes from the activity census (which slots were in which phase), which is
-    a direct observation rather than an inference from a rate.
+    First version: cpu >= 60 meant "Python holding the GIL". Withdrawn -- cpu
+    says the process was running, not that it was running Python under the GIL.
+    Second version: the census alone named the cause. Withdrawn too -- it named
+    the retriever on a run whose driver was burning 82% of a core.
+
+    What each one can actually answer: cpu says WHETHER the driver was working,
+    because a process blocked on a socket burns none; the census says WHERE,
+    when a phase actually dominates the slots. The verdict needs both.
     """
     trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
-    cpu = _cpu(trace, lambda v: 190.0 if max(v) == 0 else 40.0)
-    line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
-    assert "driver CPU 190% of one core while EMPTY" in line, line
-    assert "(running during EMPTY)" in line, line
-    assert "EMPTY is" not in line, "with no census there is no cause to name"
+    running = _cpu(trace, lambda v: 190.0 if max(v) == 0 else 40.0)
+    line = gp.format_residency(_FakeSampler(trace, running).residency_between(0, 1e9))
+    assert "DRIVER RUNNING PYTHON" in line, line
 
-
-def test_a_blocked_process_is_reported_as_blocked():
-    """A process waiting on a socket burns no CPU. That much cpu_pct can say.
-
-    MEASURED on the pump run's deep-idle samples: GPU 1.5%, memory controller
-    0.8%, power 88 W against 288 W, host CPU and thread count indistinguishable
-    from a busy sample, disk at zero. Nothing anywhere was working.
-    """
-    trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
-    cpu = _cpu(trace, lambda v: 3.0 if max(v) == 0 else 150.0)
-    line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
-    assert "(blocked during EMPTY)" in line, line
+    blocked = _cpu(trace, lambda v: 3.0 if max(v) == 0 else 150.0)
+    line = gp.format_residency(_FakeSampler(trace, blocked).residency_between(0, 1e9))
+    assert "WAIT OFF THE BOX" in line, line
 
 
 def test_no_cpu_samples_means_no_verdict_rather_than_a_guess():
@@ -341,46 +332,6 @@ def _act(trace, fn):
     return [(ts, fn(vals)) for ts, vals in trace]
 
 
-def test_all_slots_in_envstep_is_named_the_environment():
-    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
-    act = _act(trace, lambda v: {"envstep": 3} if max(v) == 0 else {"gen": 2, "envstep": 1})
-    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
-    assert "while EMPTY the slots were in: envstep 3.0" in line, line
-    assert "EMPTY is the ENVIRONMENT" in line, line
-
-
-def test_all_slots_in_preproc_is_named_the_driver():
-    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
-    act = _act(trace, lambda v: {"preproc": 3} if max(v) == 0 else {"gen": 3})
-    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
-    assert "EMPTY is the DRIVER's own Python (tokenising)" in line, line
-
-
-def test_a_split_census_refuses_to_name_one():
-    """Half in envstep and half in preproc is not evidence for either."""
-    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
-    act = _act(trace, lambda v: {"envstep": 0.4, "preproc": 0.4} if max(v) == 0 else {"gen": 3})
-    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
-    assert "no single activity dominates" in line, line
-
-
-def test_cpu_is_reported_but_no_longer_used_as_the_verdict():
-    """A driver using CPU is not the same claim as a driver holding the GIL.
-
-    A Rust tokeniser releases it and still reads busy; native BLAS reads as
-    several cores. The number stays, the conclusion moves to the census.
-    """
-    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
-    cpu = [(ts, 4.0 if max(vals) == 0 else 160.0) for ts, vals in trace]
-    line = gp.format_residency(_FakeSampler(trace, cpu=cpu).residency_between(0, 1e9))
-    assert "driver CPU 4% of one core while EMPTY" in line, line
-    assert "(blocked during EMPTY)" in line, line
-    assert "EMPTY is Python on the driver" not in line, "cpu alone must not name a cause"
-
-
-# --------------------------------------------------------------------------- #
-# the duty cycle: the only number an engine setting can move
-# --------------------------------------------------------------------------- #
 def test_the_duty_cycle_is_measured_over_all_cards_busy_only():
     """Node util cannot stand in for it.
 
@@ -414,3 +365,78 @@ def test_no_fully_busy_sample_means_no_duty_cycle_rather_than_zero():
     res = _FakeSampler(trace).residency_between(0, 1e9)
     assert res["util_when_busy"] is None
     assert "reading" not in gp.format_residency(res)
+
+
+# --------------------------------------------------------------------------- #
+# the verdict is what the two readings AGREE on
+# --------------------------------------------------------------------------- #
+def _both(trace, cpu_empty, cpu_busy, act_empty, act_busy=None):
+    cpu = [(ts, cpu_empty if max(v) == 0 else cpu_busy) for ts, v in trace]
+    act = [(ts, dict(act_empty) if max(v) == 0 else dict(act_busy or {"gen": 3})) for ts, v in trace]
+    return _FakeSampler(trace, cpu, act).residency_between(0, 1e9)
+
+
+def test_the_real_run_that_broke_the_old_rule():
+    """MEASURED, V0 + num_scheduler_steps=4, 2026-08-27:
+
+        while EMPTY the slots were in: envstep 1.1, preproc 0.6, gen 0.5
+          -> EMPTY is the ENVIRONMENT (retriever round trip)
+        driver CPU 82% of one core while EMPTY vs 15% while busy
+
+    The two lines contradict each other and the old rule believed the wrong
+    one. A process waiting on a retriever burns no CPU; 82% of a core while the
+    cards are empty, against 15% while they are busy, is the driver working.
+    And 1.1 of three slots is a third, not a majority -- the old threshold
+    compared it against the tagged total instead of the slot count.
+    """
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    res = _both(trace, 82.0, 15.0, {"envstep": 1.1, "preproc": 0.6, "gen": 0.5})
+    line = gp.format_residency(res)
+    assert "DRIVER RUNNING PYTHON" in line, line
+    assert "ENVIRONMENT" not in line, "the old rule named the retriever here"
+    assert "no single phase dominates" in line, line
+    assert "0.8 in no tagged phase" in line, "the unaccounted slots have to be visible"
+
+
+def test_a_blocked_driver_with_envstep_on_top_is_the_environment():
+    """Both readings agreeing is what a retriever verdict needs."""
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 3.0, 150.0, {"envstep": 2.8}))
+    assert "WAIT OFF THE BOX" in line, line
+
+
+def test_a_blocked_driver_whose_top_phase_is_not_envstep_says_they_disagree():
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 3.0, 150.0, {"preproc": 2.8}))
+    assert "WAIT OFF THE BOX" in line and "these disagree" in line, line
+
+
+def test_a_running_driver_dominated_by_envstep_says_it_is_not_the_retriever():
+    """envstep counts the driver's work around the call as well as the wait."""
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 90.0, 20.0, {"envstep": 2.8}))
+    assert "DRIVER RUNNING PYTHON" in line and "mostly in envstep" in line, line
+    assert "not the retriever" in line, line
+
+
+def test_the_ambiguous_band_refuses_to_decide():
+    """Between blocked and running is not evidence for either."""
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    line = gp.format_residency(_both(trace, 40.0, 100.0, {"envstep": 2.8}))
+    assert "UNRESOLVED" in line, line
+
+
+def test_dominance_is_measured_against_the_slot_count():
+    """1.1 of 3 slots is a third even when it is half of what was tagged."""
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    res = _both(trace, 82.0, 15.0, {"envstep": 1.1, "preproc": 0.6, "gen": 0.5},
+                act_busy={"gen": 3})
+    assert res["slots_seen"] == 3
+    assert "no single phase dominates" in gp.format_residency(res)
+
+
+def test_with_no_cpu_sample_a_dominant_phase_is_still_named_but_hedged():
+    trace = _trace([[0, 0, 0]] * 3 + [[92, 92, 92]] * 7)
+    act = [(ts, {"envstep": 3} if max(v) == 0 else {"gen": 3}) for ts, v in trace]
+    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
+    assert "mostly envstep" in line and "no CPU sample to corroborate" in line, line

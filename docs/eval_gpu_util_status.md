@@ -304,6 +304,60 @@ FSDP → vLLM の重み同期がそこで死ぬ。
 
 ---
 
+## 7quater. DEEP EMPTY に名前が付いた —— **driver の Python** だった
+
+V0 + `num_scheduler_steps=4` の run のログ:
+
+```
+[gpu-residency] while EMPTY the slots were in: envstep 1.1, preproc 0.6, gen 0.5
+                -> EMPTY is the ENVIRONMENT (retriever round trip) -- off the box
+[gpu-residency] driver CPU 82% of one core while EMPTY vs 15% while busy
+                (running during EMPTY)
+```
+
+**この 2 行は矛盾していて、判定ロジックのほうが間違っていた。**
+
+- **ソケットを待つプロセスは CPU を焼かない。** EMPTY で 82%、busy で 15% ——
+  **カードが空のときのほうが driver は忙しい。** retriever ではない。
+- `envstep 1.1` は **3 slot 中の 1.1**、つまり 1/3 である。閾値を
+  「タグ済み合計に対する割合」で見ていたので、支配していないものを名指しした。
+- 合計 2.2 なので、**0.8 slot 分がどのタグにも入っていない。**
+
+### 直したもの —— 2 つの読みが一致したものだけを判定にする
+
+| 計器 | 答えられること | 答えられないこと |
+| --- | --- | --- |
+| `cpu_pct` | **働いていたか**(待ちは CPU を焼かない) | どこで |
+| activity census | **どこで**(1 phase が slot の過半を占めるとき) | 待ちか実行か |
+
+```
+[gpu-residency] while EMPTY the slots were in: envstep 1.1, preproc 0.6, gen 0.5
+                (of 3 slots; 0.8 in no tagged phase)
+[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: 82% of one core while
+                EMPTY against 15% while busy, and no single phase dominates
+```
+
+支配の判定は **slot 数に対して**行う。両者が食い違えば **`these disagree`** と言い、
+CPU が 20〜60% の中間帯なら **`UNRESOLVED`** と言って**決めない**。
+
+> **判定ロジックを 2 回振った。** 1 回目は `cpu >= 60` を「GIL を握っている証明」に
+> した(撤回)。2 回目は census だけで原因を名指しした(撤回)。
+> **どちらも単独では答えられない質問に、単独で答えさせていた。**
+
+### だから分岐は「driver の Python」側である
+
+§8 の分岐表のうち、**`EMPTY is the DRIVER's own Python` の側**が現実である:
+
+1. **batch tokenizer**(全 prompt を fast tokenizer へ 1 回)
+2. **Search の `step_batch()`**(252 スレッドへの分解自体をやめる)
+3. **pump coordinator の別プロセス化**
+4. **タグの無い 0.8 slot 分を特定する** —— scatter/union、val-pipeline の
+   採点とデータロード、DataProto の結合。**まだどこにも計上されていない**
+
+retriever の複製や Flat index の置き換えは、**この証拠からは正当化されない。**
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**

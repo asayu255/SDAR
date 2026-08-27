@@ -655,6 +655,10 @@ class _Sampler:
             "util_when_busy": _busy_util(),
             "activity_when_empty": _census(empty_ts, act_at),
             "activity_when_busy": _census(busy_ts, act_at),
+            # The most threads ever counted at once, which is the slot count in
+            # practice. Without it "envstep 1.1" has no denominator and reads as
+            # a majority when it is a third.
+            "slots_seen": max((sum(snap.values()) for snap in act_at.values()), default=0),
         }
 
     def per_gpu_util_between(self, t0, t1):
@@ -823,37 +827,55 @@ def format_residency(res) -> str:
     if len(known) > 1:
         cols = " ".join("--" if v is None else f"{v:.0f}" for v in per_gpu)
         spread = f" | per-gpu {cols} (spread {max(known) - min(known):.0f} pt)"
+    # WHY every card was empty. Two readings, and the verdict is the one they
+    # agree on -- an earlier version took the top activity alone and named the
+    # retriever on a run whose driver was burning 82% of a core, which is the
+    # opposite conclusion and the opposite fix.
+    #
+    #   CPU says WHETHER the driver was working. A process blocked on a socket
+    #   burns no CPU; that part is unambiguous at these extremes.
+    #   The census says WHERE, but only when one phase actually dominates the
+    #   slots -- "envstep 1.1" out of three slots is a third of one, not a
+    #   verdict.
     why = ""
-    # What the slots were DOING when every card was empty. This is the evidence;
-    # CPU is a corroborating number, not a verdict on its own. A driver using
-    # CPU is not the same claim as a driver holding the GIL -- a Rust tokeniser
-    # releases it and still reads as busy, and native BLAS reads as several
-    # cores. Naming the activity says which it was.
-    census = res.get("activity_when_empty")
-    if census:
-        ranked = sorted(census.items(), key=lambda kv: -kv[1])
-        shown = ", ".join(f"{k} {v:.1f}" for k, v in ranked if v >= 0.05) or "nothing recorded"
-        top = ranked[0][0] if ranked and ranked[0][1] >= 0.5 else None
-        verdict = {
-            "envstep": "the ENVIRONMENT (retriever round trip) -- off the box",
-            "preproc": "the DRIVER's own Python (tokenising)",
-            "decode":  "the DRIVER's own Python (detokenising)",
-            "gen":     "inside generate, so the engine is drained rather than idle",
-        }.get(top)
-        why = f"\n[gpu-residency] while EMPTY the slots were in: {shown}"
-        if verdict:
-            why += f" -> EMPTY is {verdict}"
-        else:
-            why += " -> no single activity dominates; EMPTY is between slots, not inside one"
     empty_cpu, busy_cpu = res.get("cpu_when_empty"), res.get("cpu_when_busy")
-    if empty_cpu is not None and busy_cpu is not None:
-        # 100% is one core. Reported, not interpreted: near zero means the
-        # process was blocked on something, and high means it was running --
-        # but "running" does not distinguish GIL-bound Python from native code
-        # that released it, which is what the census above is for.
-        why += (f"\n[gpu-residency] driver CPU {empty_cpu:.0f}% of one core while EMPTY "
-                f"vs {busy_cpu:.0f}% while busy "
-                f"({'blocked' if empty_cpu < 20 else 'running'} during EMPTY)")
+    census = res.get("activity_when_empty") or {}
+    slots = res.get("slots_seen") or 0
+    ranked = sorted(census.items(), key=lambda kv: -kv[1])
+    accounted = sum(census.values())
+    top_name, top_n = (ranked[0] if ranked else (None, 0.0))
+    # Against the slot count, not against the accounted total: a phase can be
+    # most of what was tagged while most of the slots were somewhere untagged.
+    dominates = slots > 0 and top_n >= 0.5 * slots
+
+    driver_running = empty_cpu is not None and empty_cpu >= 60
+    driver_blocked = empty_cpu is not None and empty_cpu < 20
+
+    if ranked:
+        shown = ", ".join(f"{k} {v:.1f}" for k, v in ranked if v >= 0.05) or "nothing recorded"
+        line = f"\n[gpu-residency] while EMPTY the slots were in: {shown}"
+        if slots:
+            untagged = max(0.0, slots - accounted)
+            line += f" (of {slots:.0f} slots; {untagged:.1f} in no tagged phase)"
+        why += line
+
+    if driver_blocked:
+        why += ("\n[gpu-residency] -> EMPTY is a WAIT OFF THE BOX: the driver burned "
+                f"{empty_cpu:.0f}% of one core, and a process waiting on a socket burns none")
+        if dominates and top_name != "envstep":
+            why += f" (though {top_name} was the phase -- these disagree, trust neither yet)"
+    elif driver_running:
+        where = f", mostly in {top_name}" if dominates else ", and no single phase dominates"
+        why += (f"\n[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: {empty_cpu:.0f}% of one "
+                f"core while EMPTY against {busy_cpu:.0f}% while busy{where}")
+        if dominates and top_name == "envstep":
+            why += (" -- envstep here is the driver's own work around the call, not the "
+                    "retriever, which would show as a blocked process")
+    elif empty_cpu is not None:
+        why += (f"\n[gpu-residency] -> EMPTY is UNRESOLVED: driver CPU {empty_cpu:.0f}% of one core "
+                f"(vs {busy_cpu:.0f}% while busy) is neither blocked nor clearly running")
+    elif dominates:
+        why += f"\n[gpu-residency] -> EMPTY is mostly {top_name}, but with no CPU sample to corroborate it"
     return (
         f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
         f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
