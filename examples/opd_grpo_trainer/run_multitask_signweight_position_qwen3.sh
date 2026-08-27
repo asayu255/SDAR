@@ -1,12 +1,13 @@
 set -x
 
-# Pure OPD multitask (alfworld + search + webshop), Qwen3-1.7B,
+# OPD + GRPO multitask (alfworld + search + webshop), Qwen3-1.7B,
 # WITH CROSS-TEACHER SIGN WEIGHTING IN POSITION MODE.
 
 # ---------------------------------------------------------------------------
 # CROSS-TEACHER SIGN WEIGHTING -- POSITION MODE.
 #
-# Identical to run_multitask_qwen3.sh except for algorithm.opd.sign_weight.* and
+# Identical to opd_grpo_trainer/run_multitask_qwen3.sh except for
+# algorithm.opd.sign_weight.* and
 # the run's own identity, so the two differ in the weighting of the teacher KL
 # and in nothing else -- same teachers, same data, same batch sizes, same eval
 # protocol. That is what makes the plain arm the control for this one.
@@ -56,19 +57,38 @@ set -x
 #
 # HOST: 2 GPUs (tamago / 100.86.45.34). The GPU count is not a scientific knob and
 # is not in the intent lock, so a different host overrides it on the command line:
-#   bash examples/opd_trainer/run_multitask_qwen3.sh trainer.n_gpus_per_node=3
+#   bash examples/opd_grpo_trainer/run_multitask_qwen3.sh trainer.n_gpus_per_node=3
 # Teacher and checkpoint paths are written relative to $HOME so the same script
 # resolves correctly on either machine.
 #
-# INTENT LOCK: examples/opd_trainer/expected_multitask_signweight_position_config.yaml pins the
+# INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_signweight_position_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
-# protocol). main_opd validates the composed config against it after its own
+# protocol). main_opd_grpo validates the composed config against it after its own
 # injection and refuses to start on any mismatch. To change such a knob, edit
 # the argument below AND the expectations file in the same commit.
 #
-# Loss: pure per-task teacher-KL distillation on the student's own on-policy
-#   responses. main_opd force-injects pg_loss_coef=0 / entropy_coeff=0 /
-#   use_kl_loss=False, so nothing but the teacher KL enters the loss.
+# Loss: policy_loss = pg_loss * pg_loss_coef + teacher_kl_loss * kl_loss_coef.
+#   The GRPO policy gradient and the per-task teacher KL are both in the loss;
+#   this is the ONE thing that differs from the pure-OPD arm, which is the same
+#   recipe with pg_loss_coef=0. main_opd_grpo shares its config injection and its
+#   whole composition with main_opd (inject_distillation_config / build_and_fit),
+#   so the teacher side cannot drift between the two.
+#   - actor.pg_loss_coef=1.0 keeps the GRPO policy gradient (env-reward
+#     group-relative advantages; algorithm.adv_estimator=grpo). Set it to 0 and
+#     this recipe IS the pure-OPD one. It is not injected from algorithm.opd.*
+#     and it has no default -- main_opd_grpo asserts it is set, because it is the
+#     ratio between the two terms and a default here would train fine while
+#     answering a different question.
+#   - use_kl_loss=False / entropy_coeff=0 keep the other terms off, so the loss
+#     has exactly the two terms named above; use_teacher_kl_loss is
+#     force-injected. algorithm.use_kl_in_reward=False keeps the reference KL out
+#     of the REWARD as well, so the only thing shaping the advantages is the env
+#     score.
+#   - algorithm.opd.normalize_loss_by_task weights the policy gradient and the
+#     teacher KL by the SAME per-task row weights (see
+#     check_task_weighting_supported). That is what keeps pg_loss_coef meaning the
+#     ratio between them: weighting one term and token-meaning the other would
+#     leave the coefficient describing a proportion the loss does not have.
 #   - algorithm.opd.kl_loss_type: low_var_kl (single-token estimator) or
 #     topk_kl (dense top-k+tail reverse KL; support size algorithm.opd.topk).
 #   - algorithm.opd.normalize_loss_by_task: each task contributes 1/3 of the
@@ -139,13 +159,52 @@ set -x
 #   actor.use_kl_loss is set, and this arm pins both False), so changing it moves
 #   no padding and no data -- per-row log probs are independent under rmpad.
 #
-#   rollout.log_prob_micro_batch_size_per_gpu is 10, and it is NOT a throughput
-#   knob here at all: this arm has no old_log_prob phase, so compute_log_prob is
-#   never called and the value's only effect is on adjust_batch's divisor,
-#   lcm(rollout*2, rollout*2, actor*2). At 16 that was lcm(32,32,20)=160 and step
-#   1 discarded 116 rows to reach it; at 10 it is lcm(20,20,20)=20, about 10.
-#   1.6% of the batch, for free. It DOES decide which rows are dropped, so it
-#   changes the data and is pinned.
+#   rollout.log_prob_micro_batch_size_per_gpu is 10, and on THIS arm it is two
+#   things at once. Unlike pure OPD, compute_log_prob does run here (the policy
+#   gradient needs old_log_prob), so the value sizes a real forward pass. It also
+#   still sets adjust_batch's divisor, lcm(rollout*2, rollout*2, actor*2): at 16
+#   that was lcm(32,32,20)=160 and step 1 discarded 116 rows to reach it; at 10 it
+#   is lcm(20,20,20)=20, about 10. That second effect decides which rows are
+#   dropped, i.e. the data, which is why it is pinned even though the first effect
+#   is pure throughput. Keep it equal to the pure-OPD arm's value, or the two arms
+#   train on different rows and the comparison is not one.
+#
+#   THAT FORWARD IS UNBOUNDED IN THE WAY THE TEACHER'S ONCE WAS, and the number
+#   is written down here rather than acted on, because acting on it costs the
+#   comparison. compute_log_prob goes through _forward_micro_batch, so
+#   response_only_logits applies -- but 10 rows x the pinned 512
+#   data.max_response_length is 5,120 response tokens through lm_head:
+#   5,120 * 151,936 * fp32 = 2.90 GiB for the logits, and logsumexp wants a
+#   second buffer the same size, so ~5.8 GiB structurally. For scale, the
+#   teacher's ref.log_prob_micro_batch_size_per_gpu was cut 16 -> 4 after OOMing
+#   twice (the second time asking 3.77 GiB with 3.49 GiB free); 4 bounds that
+#   path at 2,048 tokens = 1.16 GiB, ~2.3 GiB with the temp. This phase's bound
+#   is 2.5x that, in the same regime -- ROLLOUT_KEEP_VLLM_AWAKE=1 means the
+#   engine is awake and holding its KV cache here too.
+#
+#   Not pre-emptively lowered: this key also sets adjust_batch's divisor, so
+#   lowering it changes which rows are dropped and the arm stops training on the
+#   same rows as its pure-OPD control -- and being able to make that comparison
+#   is the whole point of the arm. Left to measurement. IF IT DOES OOM, the fix
+#   that keeps the divisor is rollout.log_prob_use_dynamic_bsz=True (it
+#   interpolates from actor.use_dynamic_bsz, pinned False, so it is off today)
+#   together with rollout.log_prob_max_token_len_per_gpu, which is already passed
+#   below at 18432 and is inert while dynamic bsz is off. That bounds the phase by
+#   TOKENS without touching the divisor, and the pure-OPD control never runs this
+#   phase at all, so it cannot desynchronise the two arms.
+#
+#   Do not price any of this from perf/max_memory_*. Both are torch high-water
+#   marks that span vLLM's allocator pool -- the teacher-indexed arm's 150-step
+#   report logs 115.8 / 145.2 GB against a 94.97 GiB card
+#   (docs/multitask_signweight_teachertopk_150step_report.md section 9) -- so no
+#   headroom can be derived from them. Use nvidia-smi, or the accounting in an
+#   OOM message.
+#
+#   Throughput: expect a new timing_s/old_log_prob column that the pure-OPD arm
+#   does not have. By that report's section 9, three frozen-model forwards over
+#   the batch cost 146.7 s, so one is ~49 s -- roughly +8% on its 618 s step.
+#   That is an order of magnitude, not a prediction: those run at the ref micro
+#   batch of 4, this one at 10, and this one also computes entropy.
 #
 #   actor.ppo_micro_batch_size_per_gpu is 10 for the same reason (it was 5), and
 #   this one is NOT free: it is a different packed GEMM, so gradients differ in
@@ -299,9 +358,13 @@ set -x
 #   ROLLOUT_PREFETCH_TEACHER=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
-#   NOTE: leave ROLLOUT_PREFETCH_LOGPROB off here — pure OPD's thin loop has no
-#   old_log_prob phase, so prefetched values would never be consumed. It is not
-#   exported below for that reason.
+#   PICK ONE of ROLLOUT_PREFETCH_TEACHER / ROLLOUT_PREFETCH_LOGPROB. Unlike pure
+#   OPD, this arm DOES have an old_log_prob phase, so prefetched log probs would
+#   be consumed — but both prefetches fill the same driver-side glue window and
+#   queue on the same colocated WorkerDict, so running both only makes them wait
+#   on each other. ROLLOUT_PREFETCH_TEACHER is the one exported below: the teacher
+#   forward is by far the more expensive of the two, and the log-prob phase is a
+#   single call the trainer makes anyway.
 #
 # ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
 # rollout instead of after it. A turn's row is final the moment it is recorded
@@ -447,12 +510,11 @@ set -x
 #     prefetch runs it while vLLM is awake and holding its KV cache. Same
 #     arithmetic, different GEMM shape — the accuracy class of a micro-batch
 #     change, so it goes into every arm at once.
-#   rollout.return_rollout_log_probs=False — stop asking vLLM for the sampled
-#     token's log-prob. Its only consumer is the rollout-vs-actor drift check in
-#     RayPPOTrainer.fit, and this arm's thin loop has no old_log_prob phase to
-#     compare against, so the column was built (a Python loop over every generated
-#     token, every turn) and never read. Sampled tokens are unaffected. Leave it
-#     True on arms that run the drift check.
+#   rollout.return_rollout_log_probs stays True here, and is the one wasted-work
+#     removal NOT taken from pure OPD. Its consumer is the rollout-vs-actor drift
+#     check in RayPPOTrainer.fit (rollout_probs_diff), which needs an old_log_prob
+#     to compare against: pure OPD has none and so drops the column, this arm has
+#     one and reads it.
 #   rollout.disable_log_stats=False — MEASUREMENT, not a speedup. Turns on vLLM's
 #     own statistics (prefill/decode token counts, preemptions, running batch,
 #     prefix-cache hits). generate_sequences is opaque to both profilers — the
@@ -516,8 +578,8 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size 126 \
     --seed 1
 
-python3 -m verl.trainer.main_opd \
-    +trainer.expected_config=examples/opd_trainer/expected_multitask_signweight_position_config.yaml \
+python3 -m verl.trainer.main_opd_grpo \
+    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_signweight_position_config.yaml \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -552,7 +614,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \
     actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.pg_loss_coef=0 \
+    actor_rollout_ref.actor.pg_loss_coef=1.0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
@@ -563,7 +625,7 @@ python3 -m verl.trainer.main_opd \
     actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.actor.student_indexed_topk=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.rollout.return_rollout_log_probs=False \
+    actor_rollout_ref.rollout.return_rollout_log_probs=True \
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \
@@ -626,14 +688,14 @@ python3 -m verl.trainer.main_opd \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_opd_signweight_multitask' \
-    trainer.experiment_name=opd_multitask_signweight_position_qwen3_1.7b \
+    trainer.project_name='verl_agent_opd_grpo_signweight_multitask' \
+    trainer.experiment_name=opd_grpo_multitask_signweight_position_qwen3_1.7b \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_signweight_position_multitask \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_multitask_signweight_position_qwen3_1.7b \
-    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_multitask_signweight_position_qwen3_1.7b \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_position_multitask \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_signweight_position_qwen3_1.7b \
+    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_signweight_position_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \

@@ -1,7 +1,7 @@
-# Expected effective config for the pure-OPD multitask run WITH
+# Expected effective config for the OPD + GRPO multitask run WITH
 # cross-teacher sign weighting in position mode.
 #
-# This file is the machine-readable INTENT of the experiment. main_opd
+# This file is the machine-readable INTENT of the experiment. main_opd_grpo
 # validates the composed Hydra config against every key below AFTER its own
 # config injection (verl/utils/expected_config.py) and aborts on any mismatch,
 # so a wrong default / typo'd override / shadowed injection fails in seconds
@@ -38,10 +38,21 @@
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 "actor_rollout_ref.actor.normalize_loss_by_task": true
 
-# ---- pure-distillation invariants (no other signal enters the loss) -----------
+# ---- the objective: GRPO policy gradient + per-task teacher KL ----------------
+# policy_loss = pg_loss * pg_loss_coef + teacher_kl_loss * teacher_kl_loss_coef.
+# pg_loss_coef is the single number this arm differs from the pure-OPD one by, so
+# it is the most important line in this file: at 0 the two arms are the same run.
+# main_opd_grpo refuses to start without it set, and this lock is what says which
+# value the run was supposed to have.
+"actor_rollout_ref.actor.pg_loss_coef": 1.0
+# grpo, and required rather than incidental: the policy gradient reads
+# group-relative advantages, so the estimator is part of the objective here. On
+# the pure-OPD arm the same line is inert -- no advantages are ever computed --
+# and is pinned only to keep the two configs comparable.
 "algorithm.adv_estimator": grpo
+# The env score is the only thing shaping the advantages: no reference-KL penalty
+# is mixed into the reward, and no reference-KL term is in the loss either.
 "algorithm.use_kl_in_reward": false
-"actor_rollout_ref.actor.pg_loss_coef": 0
 "actor_rollout_ref.actor.use_kl_loss": false
 "actor_rollout_ref.actor.entropy_coeff": 0
 "actor_rollout_ref.actor.use_sdl_loss": false
@@ -97,17 +108,21 @@
 # than the card, because vLLM's allocator pool is counted by torch while its
 # pages are mapped and unmapped underneath. See the run script.)
 "actor_rollout_ref.model.enable_gradient_checkpointing": true
-# rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that has
-# nothing to do with log probs: this arm never runs compute_log_prob, so the
-# value's only effect is adjust_batch's divisor, lcm(rollout*2, rollout*2,
-# actor*2). At 16 that is 160 and step 1 threw away 116 rows to reach it; at 10
-# it is 20. Which rows get dropped is data, so it belongs here.
+# rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that only
+# half concerns log probs. This arm DOES run compute_log_prob (the policy
+# gradient needs old_log_prob), so the value sizes a real forward -- but that
+# part is throughput and would be exempt. What puts it in this file is its other
+# effect: it sets adjust_batch's divisor, lcm(rollout*2, rollout*2, actor*2). At
+# 16 that is 160 and step 1 threw away 116 rows to reach it; at 10 it is 20.
+# Which rows get dropped is data. It must also match the pure-OPD arm's value,
+# or the two arms are not training on the same rows.
 "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
 #     bit-identical, covered by the exemption above.
-#   rollout.return_rollout_log_probs -- decides whether a column nothing in this
-#     arm reads is built. The sampled tokens are identical either way.
+#   rollout.return_rollout_log_probs -- True on this arm because the drift check
+#     (rollout_probs_diff) reads it, but it is a diagnostic: the sampled tokens
+#     and everything that reaches the loss are identical either way.
 #   rollout.disable_log_stats -- logging volume only.
 #   ROLLOUT_PREFETCH_TEACHER_{CHUNK,CHUNK_MAX,ADAPTIVE} -- these only decide how
 #     many already-final rows one prefetch call scores, so like the chunk size
@@ -176,10 +191,10 @@
 
 # ---- run identity ------------------------------------------------------------------
 "trainer.total_training_steps": 300
-"trainer.project_name": verl_agent_opd_signweight_multitask
+"trainer.project_name": verl_agent_opd_grpo_signweight_multitask
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
 # name for a different config) requires touching this file next to the knobs.
-"trainer.experiment_name": opd_multitask_signweight_position_qwen3_1.7b
+"trainer.experiment_name": opd_grpo_multitask_signweight_position_qwen3_1.7b
 
 # ---- cross-teacher sign agreement --------------------------------------------
 # The mechanism this arm exists to test, so every knob of it is pinned.
@@ -212,7 +227,7 @@
 # three teachers were fine-tuned FROM: the mechanism reads their difference from
 # it, so a different base makes the signs mean something else.
 "algorithm.opd.sign_weight.base_path": Qwen/Qwen3-1.7B
-# effective values after main_opd copies them onto the actor, which is where the
+# effective values after main_opd_grpo copies them onto the actor, which is where the
 # weights are actually built -- the driver only caches the models they read.
 "actor_rollout_ref.actor.sign_weight.enable": true
 "actor_rollout_ref.actor.sign_weight.mode": position

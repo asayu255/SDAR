@@ -50,6 +50,16 @@ PAIRS = [
         "examples/opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh",
         "examples/opd_trainer/run_multitask_signweight_target_qwen3.sh",
     ),
+    # The direct-KL arm: the weight multiplies the per-token KL instead of the
+    # teacher's probabilities. Its pure-OPD half already exists, so this pair
+    # closes the last gap between the two trainers' recipe sets -- without it
+    # "position vs target" could only be asked of pure OPD, and the question of
+    # whether a policy gradient changes which of the two wins had no arm to run.
+    (
+        "signweight_position",
+        "examples/opd_grpo_trainer/run_multitask_signweight_position_qwen3.sh",
+        "examples/opd_trainer/run_multitask_signweight_position_qwen3.sh",
+    ),
     # The teacher-indexed 1.5/0.5 arm, i.e. the one
     # docs/multitask_signweight_teachertopk_150step_report.md is about. Its
     # pure-OPD half is the only arm in this sequence with a completed validation,
@@ -288,6 +298,26 @@ def test_the_two_grpo_target_locks_differ_only_in_the_four_scientific_values():
         "actor_rollout_ref.actor.sign_weight.agree_weight",
         "actor_rollout_ref.actor.sign_weight.agree_neg_weight",
     }, sorted(differing)
+
+
+def test_the_two_grpo_weighted_arms_differ_only_in_the_mode():
+    """position and target are one mechanism spent two ways, here too.
+
+    The pure-OPD pair already has this test. Adding the GRPO position arm without
+    it would leave the only cross-trainer question the recipe set can ask -- does
+    a policy gradient change which of the two modes wins -- resting on two scripts
+    that might also differ somewhere else.
+    """
+    target = _flat(_composed("examples/opd_grpo_trainer/run_multitask_signweight_target_qwen3.sh"))
+    position = _flat(_composed("examples/opd_grpo_trainer/run_multitask_signweight_position_qwen3.sh"))
+    differing = {
+        k for k in set(target) | set(position)
+        if target.get(k, "<absent>") != position.get(k, "<absent>")
+    } - IDENTITY
+    # Composed, not injected: main_opd_grpo copies these onto the actor at
+    # startup, so the actor-side mirror does not exist yet at this point. The
+    # lock is what checks the copy arrived, since it validates AFTER injection.
+    assert differing == {"algorithm.opd.sign_weight.mode"}, sorted(differing)
 
 
 def test_the_arms_do_not_share_a_lock_with_pure_opd():
