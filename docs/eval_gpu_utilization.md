@@ -2182,3 +2182,78 @@ EMPTY と PARTIAL が両方 0 なら node util は duty cycle そのもの、**�
 2. `val/search/test_score` ほか **スコアが動かないか**
 
 2 が動くなら、速くなっても採用できない。
+
+---
+
+## 32. 残ったスパイクの解剖 —— 10 個中 8 個は「1 枚だけ働いている」
+
+`sft-multitask-eval-20260827-085432`(depth 3)、起動後の dip(node util < 60%)を
+1 つずつ並べた:
+
+```
+    min  len   node          per-gpu   power
+    6.2    3   34.2           8 55 39    193W
+    8.0    1   29.3           0 88  0    197W
+   12.2    1   26.3           0 79  0    255W
+   13.0    1   29.3          88  0  0    192W
+   14.5    1    0.0           0  0  0     99W   <- 本当に空
+   15.7    1   29.7           0 89  0    167W
+   16.8    1   27.0          77  4  0    242W
+   17.5    1    0.0           0  0  0    142W   <- 本当に空
+   18.2    1   59.3           0 90 88    251W
+   20.8    1   28.3           0 85  0    171W
+
+busy サンプル: util 89.4%, power 285W
+```
+
+**10 イベント中 8 個は「1 枚が 80〜90% で回り、2 枚が 0」である。**
+node util 29% ≒ (88+0+0)/3。**全カード空は 2 個しかない。**
+
+**そして働いているカードは毎回ちがう**(GPU1、GPU0、GPU1、GPU0…)。
+per-gpu 平均は 83/83/82 で偏りが無いのに、瞬間ごとには偏っている。
+**§30 の PARTIAL が、そのままチャートのスパイクとして見えている。**
+
+> **つまり「まだスパイクが残っている」の正体は EMPTY ではない。**
+> depth はやるべきことをやった(EMPTY 9.3% → 3.9%、残る dip 10 個中 2 個)。
+> 見えているのは **collective の尾**である。
+
+### なぜ collective の尾が 15 秒に見えるのか
+
+生成 1 回の尾はせいぜい数百 ms である。それが 15 秒サンプルに映るのは、
+**wandb が 15 秒ごとの点サンプルだから**で、秒以下で偏っている信号を
+ランダムな位相で切り取れば、丸ごと dip に見える。run 内の 0.3 秒計器では
+**PARTIAL 8.0%** —— こちらが実体で、チャートのスパイクはその別名である。
+
+### pump が本当にこれを消せるか —— 機構を確認した
+
+| 確認したこと | 結果 |
+| --- | --- |
+| client は slot ごとか、プロセスで 1 つか | **1 つ**(`_PUMP_STATE` はモジュール大域)。3 slot が同じプールに投げる |
+| rank の engine は round ごとに止まるか | **止まらない**。`TokenPump` は専用スレッドで `engine.step()` を回し続ける |
+| request の割り当て | `min(range(world_size), key=placed.__getitem__)` —— **最も空いている rank** |
+| barrier の粒度 | generate 1 回ぶん(秒) → **無し**(round は submit/collect だけ) |
+
+**rank が自分の chunk を終えても engine は空にならない。** 次の slot の request が
+20 ms 以内に入る。これが PARTIAL を消す機構である。
+
+### 走らせ方 —— **黙って落ちないようにすること**
+
+```bash
+ROLLOUT_ASYNC_GENERATE=1 ROLLOUT_ASYNC_REQUIRE=1 \
+bash examples/sft_trainer/eval_checkpoints.sh <step>
+```
+
+**`ROLLOUT_ASYNC_REQUIRE=1` は省かないこと。** これが無いと、pool が断ったときに
+黙って blocking path に落ちる —— `eos_token_id` がリストだったせいで
+**1 run まるごと**それが起きたことがある(§22)。REQUIRE なら起動時に落ちる。
+
+### 採否は 2 つ揃って初めて決まる
+
+| 見るもの | 合格 |
+| --- | --- |
+| `[gpu-residency]` の **PARTIAL** | 8.0% から落ちる |
+| `val/*/test_score` と `[val-hash]` | **動かない** |
+
+pump は request を個別に投げるので batch の形が変わり、**生成が変わりうる**
+(merge と同じ判断、§6)。**速くなってもスコアが動いたら採用できない。**
+`[val-hash]` が batch ごとに出るので、行単位で突き合わせられる。
