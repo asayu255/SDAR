@@ -648,13 +648,24 @@ class _Sampler:
                 return None
             names = {k for snap in seen for k in snap}
             return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
+        wall = sum(wall_by_count.values()) or 1.0
         return {
             "n_gpus": n_gpus,
             "samples": total,
-            "wall": sum(wall_by_count.values()),
+            "wall": wall,
             "counts": counts,
             "wall_by_count": wall_by_count,
-            "pct": {k: 100.0 * v / total for k, v in counts.items()},
+            # WALL, not sample count. These print beside wall_by_count and were
+            # a share of samples, which is the same thing only if every sample
+            # covers the same interval -- and the one bucket where it does not
+            # is the one this whole exercise is about. While the GPUs are EMPTY
+            # the driver is running Python holding the GIL, the sampler thread
+            # is starved, and its interval stretches: measured at 3541s / 312s,
+            # EMPTY was 8.8% of the seconds and printed as 6.8% of the samples.
+            # Counting samples therefore UNDER-reports exactly the idle it is
+            # there to find, by about a fifth of it, and does so silently
+            # because the seconds sitting next to it looked consistent.
+            "pct": {k: 100.0 * v / wall for k, v in wall_by_count.items()},
             "per_gpu": per_gpu,
             "cpu_when_empty": _mean(empty_ts),
             "cpu_when_busy": _mean(busy_ts),

@@ -42,7 +42,7 @@ FILLER_PER_BATCH = 60
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
-def write_log(path, *, batches, ms_row, wall_per_batch, report_every, salt, pump=True, final=False):
+def write_log(path, *, batches, ms_row, wall_per_batch, report_every, salt, pump=True, final=False, duty="91.1"):
     prefix = "(SFTMultiTaskTaskRunner pid=689806) "
     lines = []
     if pump:
@@ -59,6 +59,11 @@ def write_log(path, *, batches, ms_row, wall_per_batch, report_every, salt, pump
                 f"{batch * wall_per_batch:.1f}s: at least one slot running"
             )
             lines.append(prefix + f"[gpu-residency] {batch * 15}s sampled: 3gpu 87.0%, 0gpu 7.4%")
+            lines.append(
+                prefix + "[gpu-residency] EMPTY 7.4% (more batches in flight fill this), "
+                f"PARTIAL 5.2% (a rank idle inside a collective call). All 3 cards had work "
+                f"87.4% of the time, reading {duty}% -- THAT is the engine's duty cycle"
+            )
             lines.append(prefix + "[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: 70% of one core")
     if final:
         lines.append(prefix + f"[val-pipeline] final: {batches} batches over {batches * wall_per_batch:.1f}s")
@@ -76,7 +81,7 @@ def judge(*logs):
 @pytest.fixture
 def pair(tmp_path):
     control = write_log(tmp_path / "control.log", batches=209, ms_row=73, wall_per_batch=18.5, report_every=25, salt="a", final=True)
-    candidate = write_log(tmp_path / "candidate.log", batches=152, ms_row=65, wall_per_batch=16.8, report_every=5, salt="b")
+    candidate = write_log(tmp_path / "candidate.log", batches=152, ms_row=65, wall_per_batch=16.8, report_every=5, salt="b", duty="88.4")
     return control, candidate
 
 
@@ -130,3 +135,16 @@ def test_one_log_is_a_reading_not_a_comparison(pair):
     # The advice mentioning the same-prefix line stays; the line itself needs
     # two runs and must not be invented from one.
     assert "same-prefix (" not in out
+
+
+def test_the_duty_cycle_line_is_printed_not_only_the_verdict(pair):
+    """The one number an engine setting can move.
+
+    'gpu-residency.*EMPTY' matches both the duty line and the "-> EMPTY is ..."
+    verdict printed after it, and `tail -1` kept the verdict -- so section 2
+    stated the PASS criterion for engine settings ("the duty cycle rises") and
+    then withheld the duty cycle.
+    """
+    out = judge(*pair)
+    assert "reading 91.1%" in out and "reading 88.4%" in out
+    assert out.count("EMPTY is the DRIVER RUNNING PYTHON") == 2

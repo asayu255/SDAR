@@ -46,7 +46,9 @@ def test_counts_how_many_gpus_were_busy():
     assert res["n_gpus"] == 3
     assert res["samples"] == 4
     assert res["counts"] == {0: 1, 1: 1, 2: 0, 3: 2}
-    assert res["pct"][3] == 50.0 and res["pct"][0] == 25.0
+    # approx, not ==: the shares divide summed float seconds now, not sample
+    # counts, so an exact half arrives as 49.999999999999993.
+    assert res["pct"][3] == pytest.approx(50.0) and res["pct"][0] == pytest.approx(25.0)
 
 
 def test_the_empty_share_is_the_number_that_matters():
@@ -558,3 +560,43 @@ def test_the_bands_are_shares_of_the_empty_samples():
     res = _FakeSampler(trace, cpu).residency_between(0, 1e9)
     assert res["empty_cpu_bands"]["blocked"] == pytest.approx(100.0)
     assert res["empty_cpu_bands"]["running"] == pytest.approx(0.0)
+
+
+def test_the_shares_are_weighted_by_WALL_not_by_sample_count():
+    """The bucket whose samples are stretched is the bucket being measured.
+
+    While every card is EMPTY the driver is running Python holding the GIL, the
+    sampler thread is starved, and the interval between its samples grows. A
+    share computed over sample COUNT therefore under-reports EMPTY by exactly
+    the amount the driver stole from the sampler -- the one direction that
+    flatters the result. Measured on a real run: 312 s of 3541 s is 8.8% of the
+    seconds and printed as 6.8% of the samples.
+
+    Every fixture above spaces its samples evenly, where the two definitions
+    coincide. That is why this was invisible: the instrument agreed with itself
+    on every test and disagreed with itself in every log, where the seconds
+    printed next to the percentage did not divide into it.
+    """
+    interval, cap = gp._INTERVAL, gp._INTERVAL * gp._CONTIGUITY_SLACK
+    trace, t = [], 100.0
+    for _ in range(8):  # eight busy samples, one interval apart
+        t += interval
+        trace.append((t, [90, 90, 90]))
+    for _ in range(2):  # two empty samples, at the widest gap that still counts
+        t += cap
+        trace.append((t, [0, 0, 0]))
+
+    res = _FakeSampler(trace).residency_between(0, 1e9)
+    assert res["counts"] == {0: 2, 1: 0, 2: 0, 3: 8}
+
+    # 2 of 10 samples, but 2*0.6s of 8*0.3s + 2*0.6s = 3.6s of wall.
+    by_samples = 100.0 * 2 / 10
+    by_wall = 100.0 * res["wall_by_count"][0] / res["wall"]
+    assert by_wall == pytest.approx(100.0 * 1.2 / 3.6)
+    assert by_wall > by_samples
+    assert res["pct"][0] == pytest.approx(by_wall)
+
+    # And the printed percentage divides the printed seconds, which is the
+    # property a reader assumes and the old one did not have.
+    for k, seconds in res["wall_by_count"].items():
+        assert res["pct"][k] == pytest.approx(100.0 * seconds / res["wall"])

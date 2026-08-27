@@ -104,13 +104,18 @@ residency() {
     local log="$1"
     local line
     local f; f=$(_clean "$log")
-    line=$(grep 'gpu-residency.*EMPTY' "$f" | tail -1)
-    if [ -z "$line" ]; then
+    if ! grep -q 'gpu-residency' "$f"; then
         echo "  NOT FOUND -- GPU_PROFILER=0, or the run has not reached its first report"
         return
     fi
     grep 'gpu-residency.*sampled' "$f" | tail -1 | sed 's/^/  /'
-    echo "$line" | sed 's/^/  /'
+    # The duty-cycle line, which is the number the PASS criteria below are
+    # written around. It was being dropped: 'gpu-residency.*EMPTY' matches this
+    # line AND the "-> EMPTY is ..." verdict printed after it, and `tail -1`
+    # kept the verdict -- so every reading of an engine setting was made
+    # without the one number an engine setting can move.
+    grep 'gpu-residency\] EMPTY' "$f" | tail -1 | sed 's/^/  /'
+    grep 'gpu-residency\] ->' "$f" | tail -1 | sed 's/^/  /'
 }
 
 # --- 3. the scores, which must NOT move ------------------------------------- #
