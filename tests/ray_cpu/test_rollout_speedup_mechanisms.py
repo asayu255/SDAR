@@ -327,3 +327,62 @@ if __name__ == "__main__":
     test_env_kwargs_equal()
     test_compact_record_equivalence()
     print("\nALL ROLLOUT SPEEDUP MECHANISM TESTS PASSED")
+
+
+# --------------------------------------------------------------------------- #
+# C2: the env reset has to be VISIBLE, not just fast
+# --------------------------------------------------------------------------- #
+def test_the_env_reset_is_counted_in_the_activity_census():
+    """A slot inside reset used to count as "in no tagged phase".
+
+    The reset runs at the head of a batch, before any generate, so on the
+    validation path -- where nothing prefetches it -- every second of it is a
+    second with all three cards empty. The census named preproc, gen, decode,
+    envstep, record and assemble, and this was none of them: it is part of what
+    "1.0 of 3 slots in no tagged phase while EMPTY" was made of.
+    """
+    from verl.utils import gpu_profiler
+
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    collector._env_reset_prefetch = None
+    collector._env_reset_executor = None
+
+    seen = []
+
+    class WatchingEnvs(FakeEnvs):
+        def reset(self, kwargs):
+            seen.append(dict(gpu_profiler._ACTIVITY))
+            return super().reset(kwargs)
+
+    collector._reset_envs(WatchingEnvs(), np.array([{"task_name": "search"}], dtype=object))
+    assert seen and seen[0].get("envreset") == 1
+    # and it is released again, so a later phase is not charged to it.
+    assert "envreset" not in gpu_profiler._ACTIVITY
+
+
+def test_the_reset_cost_is_totalled_without_waiting_for_a_slow_one(capsys):
+    """A threshold answers "was there a bad one", not "what does this cost".
+
+    ENV_RESET_REPORT_S defaults to 2 s and two runs measured EMPTY at 1.50 s
+    and 1.40 s per batch, so a reset costing exactly the thing being looked for
+    would have printed nothing at all.
+    """
+    import agent_system.multi_turn_rollout.rollout_loop as rl
+
+    collector = TrajectoryCollector.__new__(TrajectoryCollector)
+    collector._env_reset_prefetch = None
+    collector._env_reset_executor = None
+    envs, kwargs = FakeEnvs(), np.array([{"task_name": "search"}], dtype=object)
+
+    before = dict(rl._ENV_RESET_TOTAL)
+    try:
+        rl._ENV_RESET_TOTAL.update({"n": 0, "s": 0.0, "prefetched": 0})
+        for _ in range(rl._ENV_RESET_TOTAL_EVERY):
+            collector._reset_envs(envs, kwargs)
+        out = capsys.readouterr().out
+        # No single reset here is anywhere near the 2 s report threshold.
+        assert "SYNCHRONOUS" not in out
+        assert f"[env-reset] cumulative: {rl._ENV_RESET_TOTAL_EVERY} resets" in out
+        assert "0 of them overlapped by a prefetch" in out
+    finally:
+        rl._ENV_RESET_TOTAL.update(before)

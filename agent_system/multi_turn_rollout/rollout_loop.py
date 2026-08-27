@@ -529,7 +529,17 @@ def _generate_sequences(actor_rollout_wg, batch_input_padded):
 # Report an env reset that took at least this long. Small enough to catch the
 # ones worth knowing about, large enough that a search reset does not print
 # 200 lines a run. 0 reports every reset.
+#
+# A THRESHOLD IS NOT AN ACCOUNT. Two runs measured EMPTY -- every card idle --
+# at 1.50 s and 1.40 s per batch, and this default is 2 s, so a reset costing
+# exactly that would never have printed a line. Per-reset reporting answers
+# "was there a bad one"; it cannot answer "what does this cost over 208
+# batches", which is the question. Hence the running total below, which does
+# not depend on any reset being remarkable.
 _ENV_RESET_REPORT_S = float(os.environ.get("ENV_RESET_REPORT_S", "2"))
+_ENV_RESET_TOTAL_EVERY = int(os.environ.get("ENV_RESET_TOTAL_EVERY", "25"))
+_ENV_RESET_TOTAL = {"n": 0, "s": 0.0, "prefetched": 0}
+_ENV_RESET_LOCK = threading.Lock()
 _ROLLOUT_PER_TASK_ADVANCE = os.environ.get("ROLLOUT_PER_TASK_ADVANCE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -1262,6 +1272,9 @@ class TrajectoryCollector:
         """
         started = _now()
         pending = self._env_reset_prefetch
+        # Tagged, because the census could not see this: a slot inside reset
+        # counted as "in no tagged phase", which is what 1.0 of 3 slots was
+        # made of while every card was empty.
         prefetched = pending is not None and pending["envs_id"] == id(envs)
         if prefetched:
             self._env_reset_prefetch = None
@@ -1272,14 +1285,31 @@ class TrajectoryCollector:
                     "Prefetched env reset consumed with mismatched env_kwargs; "
                     "disable ENV_RESET_PREFETCH or fix the trainer-side prefetch."
                 )
-            result = pending["future"].result()
+            with gpu_profiler.activity("envreset"):
+                result = pending["future"].result()
         else:
-            result = envs.reset(kwargs=env_kwargs)
+            with gpu_profiler.activity("envreset"):
+                result = envs.reset(kwargs=env_kwargs)
         elapsed = _now() - started
         if elapsed >= _ENV_RESET_REPORT_S:
             print(
                 f"[env-reset] slot={_current_slot()}  {elapsed:.1f}s  "
                 f"{'consumed a prefetch' if prefetched else 'SYNCHRONOUS (nothing overlapped it)'}",
+                flush=True,
+            )
+        with _ENV_RESET_LOCK:
+            _ENV_RESET_TOTAL["n"] += 1
+            _ENV_RESET_TOTAL["s"] += elapsed
+            _ENV_RESET_TOTAL["prefetched"] += 1 if prefetched else 0
+            due = _ENV_RESET_TOTAL_EVERY > 0 and _ENV_RESET_TOTAL["n"] % _ENV_RESET_TOTAL_EVERY == 0
+            n, total, pre = _ENV_RESET_TOTAL["n"], _ENV_RESET_TOTAL["s"], _ENV_RESET_TOTAL["prefetched"]
+        if due:
+            # This runs before the first generate of a batch, so on the
+            # validation path -- where nothing prefetches -- every second of it
+            # is a second with all cards empty by construction.
+            print(
+                f"[env-reset] cumulative: {n} resets, {total:.1f}s ({total / n:.2f}s each), "
+                f"{pre} of them overlapped by a prefetch",
                 flush=True,
             )
         return result
@@ -1374,8 +1404,15 @@ class TrajectoryCollector:
         _m_gen = _now()  # end of GPU generation window
 
         # Scatter active outputs back to the full batch size for union/recording.
-        batch_output = active_batch_output if generate_all else \
-            self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
+        # Tagged: it sits between two "glue" blocks and is the same kind of work
+        # -- the driver rebuilding a full-width DataProto after generation has
+        # ended, so with the cards already empty -- and being untagged it landed
+        # in "no tagged phase", which is the bucket that has no prescription.
+        if generate_all:
+            batch_output = active_batch_output
+        else:
+            with gpu_profiler.activity("glue"):
+                batch_output = self._scatter_active_to_full(active_batch_output, active_idx, batch_size)
 
         batch.non_tensor_batch['uid'] = state["uid_batch"]
         batch.non_tensor_batch['traj_uid'] = state["traj_uid"]
