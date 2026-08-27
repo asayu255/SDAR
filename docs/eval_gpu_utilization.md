@@ -2257,3 +2257,86 @@ bash examples/sft_trainer/eval_checkpoints.sh <step>
 pump は request を個別に投げるので batch の形が変わり、**生成が変わりうる**
 (merge と同じ判断、§6)。**速くなってもスコアが動いたら採用できない。**
 `[val-hash]` が batch ごとに出るので、行単位で突き合わせられる。
+
+---
+
+## 33. pump は設計どおり動き、そして負けた —— 空きが保存される理由
+
+`ROLLOUT_ASYNC_GENERATE=1` で完走を待たずに判定がついた。
+
+```
+[rollout-pump] driving 3 ranks as a pool; {'eos_token_id': [151645, 151643]}
+```
+
+pool は噛んでいる(§22 で直した eos リストも通っている)。
+
+| | depth 3 | **+ pump** | |
+| --- | ---: | ---: | :---: |
+| **PARTIAL** | 12.7% | **6.7%** | ✅ 狙いどおり半減 |
+| **EMPTY** | 3.8% | **10.0%** | ❌ |
+| **cpu-glue**(`SHARE` 行) | **7.8%** | **11.2%** | ❌ |
+| node util | 80.0% | **79.3%** | **変わらず** |
+
+**pump は設計どおり PARTIAL を消した。そして同じだけ cpu-glue を増やした。**
+
+### 原因 —— round loop が driver の GIL を食う
+
+`PumpClient._run` は **request が残っている間 sleep しない**:
+
+```python
+if idle:
+    self._wake.wait(self._round_s)   # 何も無いときだけ待つ
+    continue
+self._round(outgoing)                # 有るときは連続で回る
+```
+
+`_round` は `self._wg.rollout_pump_step(payloads)` —— **3 worker への Ray
+collective 呼び出し**で、`timeout_s=0.02`。つまり **毎秒 40〜50 回**。
+4500 秒の run なら **約 20 万回の RPC**である。
+
+そしてこれは **driver 上の Python スレッド**で回る。同じプロセスには
+252 env スレッド × 3 slot が居て、preproc / decode / envstep をやっている。
+**GIL を取り合う相手が増えただけ**になった。
+
+### これが「空きが保存される」理由である
+
+| 変更 | 下がったもの | 上がったもの |
+| --- | --- | --- |
+| depth 3 | EMPTY 8.9 → 3.8% | PARTIAL 7.7 → 12.7% |
+| pump | PARTIAL 12.7 → 6.7% | EMPTY 3.8 → 10.0%、glue 7.8 → 11.2% |
+
+**2 回とも、狙った側は予測どおり動き、総和は動かなかった。**
+
+GPU のスケジューリングを並べ替えても総量が変わらないなら、
+**律速は GPU 側の並べ方ではない。** driver の Python スループットである。
+§2.2 で「252 スレッドが GIL の下を 1 本ずつ、約 300 ms かけて通る」ことは
+既に測ってあった —— **同じ壁に別の側から当たっていた。**
+
+### 次の 1 変数 —— round を伸ばす
+
+RPC を 5 分の 1 にする:
+
+```bash
+ROLLOUT_PUMP_ROUND_S=0.1 ROLLOUT_ASYNC_GENERATE=1 ROLLOUT_ASYNC_REQUIRE=1 \
+bash examples/sft_trainer/eval_checkpoints.sh <step>
+```
+
+**代償**: 終わった request を driver が知るのが最大 0.1 秒遅れる。engine は
+その間も回り続けるので生成は止まらないが、**turn の barrier が最大 0.1 秒
+伸びる**。1 batch 4 turn なら 0.4 秒 / 14 秒 = 2.9%。glue が 3.4 pt 戻るなら
+釣り合う。合格条件は **PARTIAL 7% 前後のまま、glue が 8% に戻ること。**
+
+### driver の Python か retriever かを分ける grep
+
+`SHARE` 行は preproc + decode + envstep を合計してしまう。turn table の
+`TOTAL` 行は分かれている:
+
+```bash
+grep 'TOTAL' /tmp/eval_pump.log   | tail -3
+grep 'TOTAL' /tmp/eval_depth3.log | tail -3
+```
+
+- **`preproc` / `decode` が増えて `envstep` が変わらない** → driver の Python(GIL)
+- **`envstep` が増えた** → retriever の取り合い
+
+**打ち手が完全に別なので、これを先に見ること。**
