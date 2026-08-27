@@ -272,6 +272,25 @@ set -x
 #     64% of teacher mass sits on 4.2% of candidates, so a mass-weighted rate
 #     without its effective sample size cannot be told from step noise.
 #
+#   Whose vocabulary?  pair_stats.tokens adds the axis the two tables above
+#     both sum out: SignPairCounts has the sender and not the token,
+#     token_stats has the token and not the sender. Neither can say whether the
+#     tokens one off-task teacher pushes into a task's states are the same ones
+#     the other pushes there -- which is the difference between "the tasks share
+#     a common surface vocabulary" and "each teacher contributes its own", and
+#     that difference is the whole content of a transfer claim.
+#     sign_weight/pair/token_overlap/{cls}/{a}__and__{b}__on__{dst} is the
+#     weighted Jaccard between the two senders' token vectors: near 1 no
+#     individual sender is necessary, near 0 the unanimity gate is passing on
+#     the intersection of two different vocabularies. The ranked rows go to
+#     sign_pair_tokens_step*.jsonl beside the per-state table.
+#     Cost: T*(T-1)*3*V cells = 55 MB at T=3, i.e. LESS than the per-state table
+#     already running -- the naive (dst, src, sign_on, sign_src, V) layout would
+#     be 12.3M cells, and it is affordable only because the nine sign
+#     combinations collapse to the three that carry an opinion from the sender
+#     (agree / conflict / blindspot; a silent sender has nothing to file) and
+#     the structurally empty src == dst diagonal is not allocated.
+#
 #   Specialist knowledge?  The whole specialist population is inside the
 #     on-task-silent state, 64% of teacher mass, never decomposed.
 #     sign_weight/blindspot/* is where src has an opinion and dst's own teacher
@@ -627,6 +646,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.sign_weight.token_stats.enable=True \
     +algorithm.opd.sign_weight.token_stats.top_n=64 \
     +algorithm.opd.sign_weight.pair_stats.enable=True \
+    +algorithm.opd.sign_weight.pair_stats.tokens=True \
     +algorithm.opd.sign_weight.transfer_stats.enable=True \
     env.env_name=multitask \
     env.seed=1 \

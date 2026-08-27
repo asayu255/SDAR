@@ -736,15 +736,24 @@ class OPDRayTrainer(RayPPOTrainer):
         the difference between a reader taking a groupby and a reader having to
         work out which duplicate to trust.
         """
-        rows = actor_output.meta_info.get("sign_token_report", None)
         dump_dir = self.config.trainer.get("sign_token_dump_dir", None)
-        if not rows or not dump_dir:
+        if not dump_dir:
             return
-        os.makedirs(dump_dir, exist_ok=True)
-        path = os.path.join(dump_dir, f"sign_tokens_step{self.global_steps:06d}.jsonl")
-        with open(path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps({"step": self.global_steps, **row}, ensure_ascii=False) + "\n")
+        # One file per table. They are keyed differently -- scope/state against
+        # dst/src/class -- so a merged file would give every row the other
+        # table's empty columns and make a groupby depend on which is which.
+        for key, stem in (
+            ("sign_token_report", "sign_tokens"),
+            ("sign_pair_token_report", "sign_pair_tokens"),
+        ):
+            rows = actor_output.meta_info.get(key, None)
+            if not rows:
+                continue
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(dump_dir, f"{stem}_step{self.global_steps:06d}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps({"step": self.global_steps, **row}, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------ #
     # Thin training loop: rollout -> teacher_log_probs -> update_actor.

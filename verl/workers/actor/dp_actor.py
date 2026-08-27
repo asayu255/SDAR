@@ -37,11 +37,13 @@ from verl.trainer.ppo.sign_weights import (
     REWRITE_TERMS,
     OffTaskLadderStats,
     ScopeTermStats,
+    SignPairTokens,
     SignPairCounts,
     SignWeightStats,
     TokenStateCounts,
     rewrite_decomposition_terms,
     rewrite_ratio_metrics,
+    candidate_effect,
     candidate_weights,
     normalize_per_task,
     position_weights,
@@ -1366,27 +1368,49 @@ class DataParallelPPOActor(BasePPOActor):
         # device-to-host read per call, which is nothing next to the step but is
         # not worth paying on an arm nobody is going to read it for.
         token_stats = None
+        pair_token_stats = None
         token_cfg = (sign_cfg.get("token_stats", None) or {}) if sign_enabled else {}
-        if sign_enabled and bool(token_cfg.get("enable", False)):
+        pair_cfg = (sign_cfg.get("pair_stats", None) or {}) if sign_enabled else {}
+        # Both tables are vocabulary-wide, so they share one lookup and one
+        # refusal. Resolved once whether or not either is on, because asking the
+        # model for its vocab size is free and branching on it twice is how the
+        # two tables end up disagreeing about V.
+        want_tokens = sign_enabled and bool(token_cfg.get("enable", False))
+        want_pair_tokens = sign_enabled and bool(pair_cfg.get("tokens", False)) and n_task >= 2
+        if want_tokens or want_pair_tokens:
             vocab = model_vocab_size(self.actor_module)
             if vocab is None:
                 print(
-                    "[sign_weight] token_stats requested but the model does not report a "
-                    "vocab_size; running without the per-token diagnostic",
+                    "[sign_weight] a per-token table was requested but the model does not "
+                    "report a vocab_size; running without it",
                     flush=True,
                 )
             else:
-                token_stats = TokenStateCounts(
-                    vocab_size=vocab,
-                    n_tasks=len(task_id_names or []),
-                    device=next(self.actor_module.parameters()).device,
-                    top_n=int(token_cfg.get("top_n", 64)),
-                    # The effect column means different things in the two modes
-                    # -- a probability displacement against nats of weighted KL
-                    # -- so the mode is what decides the formula AND the name it
-                    # is reported under.
-                    mode="target" if target_mode else "position",
-                )
+                if want_tokens:
+                    token_stats = TokenStateCounts(
+                        vocab_size=vocab,
+                        n_tasks=len(task_id_names or []),
+                        device=sign_dev,
+                        top_n=int(token_cfg.get("top_n", 64)),
+                        # The effect column means different things in the two
+                        # modes -- a probability displacement against nats of
+                        # weighted KL -- so the mode is what decides the formula
+                        # AND the name it is reported under.
+                        mode="target" if target_mode else "position",
+                    )
+                if want_pair_tokens:
+                    # The vocabulary axis on the pair family: which tokens each
+                    # off-task teacher sends into each other task's states. Costs
+                    # T*(T-1)*3*V cells -- 55 MB at T=3, i.e. less than the table
+                    # above -- because the (on-task sign, src sign) contingency
+                    # is collapsed to the three classes that carry a src opinion
+                    # and the structurally empty src == dst diagonal is skipped.
+                    pair_token_stats = SignPairTokens(
+                        n_tasks=n_task,
+                        vocab_size=vocab,
+                        device=sign_dev,
+                        top_n=int(pair_cfg.get("top_n", int(token_cfg.get("top_n", 64)))),
+                    )
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -1627,9 +1651,15 @@ class DataParallelPPOActor(BasePPOActor):
                             # tensors they read. sign_support_ids is whichever
                             # model nominated the support, i.e. exactly the set
                             # the weights were computed at.
-                            sign_cand_inputs = (
-                                sign_support_ids, sign_state, candidate_weight, sign_on_task_logprobs
-                            )
+                            sign_cand_inputs = {
+                                "support_ids": sign_support_ids,
+                                "state": sign_state,
+                                "weight": candidate_weight,
+                                "on_task_logprob": sign_on_task_logprobs,
+                                "base_logprob": base_logprob,
+                                "off_task_logprobs": off_logprobs,
+                                "off_plane_tasks": data["sign_off_tasks"],
+                            }
                             if sign_mode == "target":
                                 # Keep the original: the diagnostics below measure
                                 # how far the rewrite moved the target, which is a
@@ -1845,16 +1875,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 position_decomposition_terms(
                                     position_weight=pre_w,
                                     applied_weight=applied_w,
-                                    candidate_weight=sign_cand_inputs[2],
-                                    state=sign_cand_inputs[1],
-                                    on_task_logprob=sign_cand_inputs[3],
+                                    candidate_weight=sign_cand_inputs["weight"],
+                                    state=sign_cand_inputs["state"],
+                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
                                     teacher_kl=teacher_kld,
                                     weight_range=sign_weight_range,
                                 ),
                                 response_mask=response_mask,
                                 task_ids=task_ids,
                             )
-                        if token_stats is not None and sign_cand_inputs is not None:
+                        if sign_cand_inputs is not None and (
+                            token_stats is not None or pair_token_stats is not None
+                        ):
                             # The same candidates the stats above summarise, kept
                             # under their vocabulary ids. In position mode the
                             # per-task normaliser is recovered as pre/applied
@@ -1868,15 +1900,40 @@ class DataParallelPPOActor(BasePPOActor):
                                     "position_scale": pre_w / applied_w.clamp(min=1e-8),
                                     "teacher_kl": teacher_kld,
                                 }
-                            token_stats.update(
-                                support_ids=sign_cand_inputs[0],
-                                state=sign_cand_inputs[1],
-                                weight=sign_cand_inputs[2],
-                                on_task_logprob=sign_cand_inputs[3],
-                                response_mask=response_mask,
-                                task_ids=task_ids,
+                            # Once, for both tables. Two calls would let the two
+                            # rankings disagree about what "effect" means.
+                            cand_effect = candidate_effect(
+                                mode="target" if target_mode else "position",
+                                on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                weight=sign_cand_inputs["weight"],
                                 **extra,
                             )
+                            if token_stats is not None:
+                                token_stats.update(
+                                    support_ids=sign_cand_inputs["support_ids"],
+                                    state=sign_cand_inputs["state"],
+                                    weight=sign_cand_inputs["weight"],
+                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    effect=cand_effect,
+                                )
+                            if pair_token_stats is not None and task_ids is not None:
+                                # Which tokens each off-task teacher sends into
+                                # THIS task's states. The counts answer it on
+                                # their own; the effect column says whether the
+                                # weighting acted on what was sent.
+                                pair_token_stats.update(
+                                    support_ids=sign_cand_inputs["support_ids"],
+                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                    off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
+                                    base_logprob=sign_cand_inputs["base_logprob"],
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=sign_cand_inputs["off_plane_tasks"],
+                                    deadzone=sign_deadzone,
+                                    effect=cand_effect,
+                                )
                         if sign_position_weight is not None:
                             # position mode: a positive per-token scalar, computed
                             # from frozen models, so it scales the gradient at this
@@ -2130,6 +2187,14 @@ class DataParallelPPOActor(BasePPOActor):
             token_stats.all_reduce()
             metrics.update(token_stats.scalar_metrics(task_names=task_id_names))
             self.last_token_report = token_stats.top_tokens(task_names=task_id_names)
+        # A second file rather than a discriminator column in the first: the two
+        # tables are keyed differently (scope/state against dst/src/class) and
+        # merging them would make every row carry the other's empty columns.
+        self.last_pair_token_report = None
+        if pair_token_stats is not None:
+            pair_token_stats.all_reduce()
+            metrics.update(pair_token_stats.scalar_metrics(task_names=task_id_names))
+            self.last_pair_token_report = pair_token_stats.top_tokens(task_names=task_id_names)
         # The one read for everything deferred above. torch.stack forces a single
         # host sync here instead of one per micro-batch. Entries carrying a
         # presence weight are summed and divided by how many micro-batches

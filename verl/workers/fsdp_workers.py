@@ -836,11 +836,16 @@ class ActorRolloutRefWorker(Worker):
             # tokenizer. convert_ids_to_tokens, not decode -- the raw piece
             # (with its space marker) is what identifies the vocabulary entry,
             # while decode would strip exactly that and merge distinct tokens.
-            token_report = getattr(self.actor, "last_token_report", None)
-            if token_report:
-                pieces = self.tokenizer.convert_ids_to_tokens([r["token_id"] for r in token_report])
-                output.meta_info["sign_token_report"] = [
-                    {**row, "token": piece} for row, piece in zip(token_report, pieces)
+            for attr, key in (
+                ("last_token_report", "sign_token_report"),
+                ("last_pair_token_report", "sign_pair_token_report"),
+            ):
+                report = getattr(self.actor, attr, None)
+                if not report:
+                    continue
+                pieces = self.tokenizer.convert_ids_to_tokens([r["token_id"] for r in report])
+                output.meta_info[key] = [
+                    {**row, "token": piece} for row, piece in zip(report, pieces)
                 ]
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)

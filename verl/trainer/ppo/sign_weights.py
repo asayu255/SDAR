@@ -113,6 +113,9 @@ __all__ = [
     "POSITION_TERMS",
     "position_decomposition_terms",
     "position_ratio_metrics",
+    "candidate_effect",
+    "PAIR_TOKEN_CLASSES",
+    "SignPairTokens",
 ]
 
 # Column the driver writes and the actor reads in ``position`` mode when the
@@ -714,6 +717,70 @@ class SignWeightStats:
 # corpus and would say nothing about the mechanism.
 ACTED_STATES = (STATE_AGREE_POS, STATE_AGREE_NEG, STATE_CONFLICT_ON_POS, STATE_CONFLICT_ON_NEG)
 
+EFFECT_KIND = {"target": "dq", "position": "dkl_nats"}
+
+
+def candidate_effect(
+    *,
+    mode: str,
+    on_task_logprob: torch.Tensor,
+    weight: torch.Tensor,
+    position_scale: Optional[torch.Tensor] = None,
+    teacher_kl: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """(bs, resp, k) post-normalisation effect of the weighting at each candidate.
+
+    One formula, two normalisers, because the two modes act on different objects
+    and a single column holding both would be nats and probabilities in one
+    series:
+
+    ``target``   ``dq(v) = p_T(v) (w(v)/Z - 1)`` with ``Z = sum_v p_T(v) w(v) +
+                 tail``, the per-position renormaliser the rewrite divides by.
+                 A change to the distribution the student is distilled toward.
+    ``position`` ``dkl(v) = p_T(v) (w(v)/m - 1) * KL``, in nats, with ``m`` the
+                 PER-TASK normalising mean -- nothing is renormalised per
+                 position in this mode -- times the KL the position weight
+                 multiplies. The KL factor is not decoration: a weight of 1.25 at
+                 a position whose KL is zero changes the loss by zero, and the
+                 same table without it would rank that candidate first.
+
+    In both cases the per-candidate values sum, over the support, to the change
+    at that position less the tail's own share, which has no token id to be
+    filed under.
+
+    Lives here rather than inside an accumulator because three of them need the
+    same number and computing it three times would let them disagree.
+
+    Args:
+        position_scale: (bs, resp) ``position`` mode only, REQUIRED there. Not
+            rebuildable from a micro-batch: it is the PREVIOUS step's mean over
+            the whole batch.
+        teacher_kl: (bs, resp) ``position`` mode only, REQUIRED there -- the
+            per-token KL BEFORE the weight multiplied it.
+    """
+    assert mode in EFFECT_KIND, f"mode must be one of {sorted(EFFECT_KIND)}, got {mode!r}"
+    p_k = on_task_logprob.detach().to(torch.float32).exp()
+    w_k = weight.detach().to(torch.float32)
+    if mode == "target":
+        tail = (1.0 - p_k.sum(dim=-1)).clamp(min=eps, max=1.0)
+        z = ((p_k * w_k).sum(dim=-1) + tail).clamp(min=eps)
+        scale = torch.ones_like(z)
+    else:
+        # Refuse rather than substitute: falling back on the target-mode Z here
+        # is exactly the mislabelling this split exists to remove.
+        assert position_scale is not None and teacher_kl is not None, (
+            "position mode needs position_scale and teacher_kl; the target-mode "
+            "normaliser is a different quantity"
+        )
+        z = position_scale.detach().to(torch.float32).clamp(min=eps)
+        scale = teacher_kl.detach().to(torch.float32)
+    return (
+        p_k.to(torch.float64)
+        * (w_k.to(torch.float64) / z.unsqueeze(-1).to(torch.float64) - 1.0)
+        * scale.unsqueeze(-1).to(torch.float64)
+    )
+
 
 class TokenStateCounts:
     """Which vocabulary tokens the sign weighting actually acts on.
@@ -778,7 +845,7 @@ class TokenStateCounts:
 
     # What the effect columns hold, by mode. Carried into the metric names and
     # into every dumped row, so a table can never be read as the other quantity.
-    EFFECT_KIND = {"target": "dq", "position": "dkl_nats"}
+    EFFECT_KIND = EFFECT_KIND
 
     def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64, mode: str = "target"):
         assert mode in self.EFFECT_KIND, f"mode must be one of {sorted(self.EFFECT_KIND)}, got {mode!r}"
@@ -813,6 +880,7 @@ class TokenStateCounts:
         task_ids: Optional[torch.Tensor] = None,
         position_scale: Optional[torch.Tensor] = None,
         teacher_kl: Optional[torch.Tensor] = None,
+        effect: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> None:
         """Fold one micro-batch in.
@@ -832,6 +900,10 @@ class TokenStateCounts:
                 batch, and a micro-batch cannot see it.
             teacher_kl: (bs, resp) ``position`` mode only, REQUIRED there -- the
                 per-token KL BEFORE the weight multiplied it.
+            effect: (bs, resp, k) from :func:`candidate_effect`, when the caller
+                has already built it for another table. Passed rather than
+                recomputed so two rankings cannot disagree about what "effect"
+                means; computed here from the two arguments above when absent.
 
         The validity mask is folded into the VALUES rather than into the indices,
         so every entry is scattered and the invalid ones add zero. Selecting the
@@ -845,29 +917,18 @@ class TokenStateCounts:
         valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(state).reshape(-1)
 
         p_k = on_task_logprob.detach().to(torch.float32).exp()   # (bs, resp, k)
-        w_k = weight.detach().to(torch.float32)
-        if self.mode == "target":
-            # The normaliser the rewrite actually divides by, rebuilt here from
-            # the same inputs update_target uses. Without it this class can only
-            # report the pre-normalisation tilt, which is a different quantity.
-            tail = (1.0 - p_k.sum(dim=-1)).clamp(min=eps, max=1.0)
-            z = ((p_k * w_k).sum(dim=-1) + tail).clamp(min=eps)  # (bs, resp)
-            scale = torch.ones_like(z)
-        else:
-            # position mode: nothing is renormalised per position -- the weight
-            # is divided by ONE number per task -- and the KL is the factor that
-            # decides whether a weight mattered at all. Refuse rather than
-            # substitute: falling back on the target-mode Z here is exactly the
-            # mislabelling this branch exists to remove.
-            assert position_scale is not None and teacher_kl is not None, (
-                "position mode needs position_scale and teacher_kl; the "
-                "target-mode normaliser is a different quantity"
+        eff_k = (
+            effect.detach().to(torch.float64)
+            if effect is not None
+            else candidate_effect(
+                mode=self.mode,
+                on_task_logprob=on_task_logprob,
+                weight=weight,
+                position_scale=position_scale,
+                teacher_kl=teacher_kl,
+                eps=eps,
             )
-            z = position_scale.detach().to(torch.float32).clamp(min=eps)
-            scale = teacher_kl.detach().to(torch.float32)
-        eff_k = p_k.to(torch.float64) * (
-            w_k.to(torch.float64) / z.unsqueeze(-1).to(torch.float64) - 1.0
-        ) * scale.unsqueeze(-1).to(torch.float64)
+        )
 
         p = p_k.reshape(-1)
         dq = eff_k.reshape(-1)
@@ -2063,3 +2124,274 @@ class SignPairCounts:
                     if lead + opp >= min_count:
                         out[f"{prefix}/blindspot/student_follows_{label}/{pair}"] = lead / (lead + opp)
         return out
+
+
+# --------------------------------------------------------------------------- #
+# src -> dst -> token
+# --------------------------------------------------------------------------- #
+# The three classes a candidate can fall into that carry an OPINION FROM src.
+# The full (on-task sign, src sign) contingency has nine cells, but four of them
+# are "src said nothing" and two more are "the on-task teacher said nothing and
+# neither did src" -- none of which has a token identity worth a vocabulary-wide
+# array. Collapsing to these three is what makes the table affordable: at
+# T*T*3*3*V the cells are 12.3M and at T*(T-1)*3*V they are 2.7M.
+PAIR_TOKEN_CLASSES = {
+    0: "agree",       # src moved the token the same way the on-task teacher did
+    1: "conflict",    # src moved it the opposite way
+    2: "blindspot",   # the on-task teacher is silent and src is not
+}
+
+
+class SignPairTokens:
+    """Which vocabulary tokens each teacher sends to each other task's states.
+
+    :class:`SignPairCounts` answers "how often does src agree with dst's teacher"
+    with the vocabulary summed out, and :class:`TokenStateCounts` answers "which
+    tokens" with the SOURCE summed out. Neither can say whether the tokens
+    alfworld's teacher pushes into search's states are the same ones webshop's
+    teacher pushes there -- which is the difference between "the tasks share a
+    common surface vocabulary" and "each teacher contributes its own", and that
+    difference is the whole content of a transfer claim.
+
+    Cell axes: ``(pair, cls, token)``.
+
+    ``pair`` is the ORDERED (dst, src) pair with the diagonal compressed out.
+    ``dst`` is the task of the row -- whose states these are, who receives --
+    and ``src`` is the task of the off-task plane, whose teacher is speaking.
+    ``src == dst`` cannot occur (a teacher is never off-task on its own rows), so
+    a square ``T x T`` layout would spend a third of the array on cells that are
+    structurally zero: at T=3 that is 27 MB of 82. The index is therefore
+    ``dst * (T-1) + src - (src > dst)``, which is exactly invertible.
+
+    ``cls`` is :data:`PAIR_TOKEN_CLASSES`. ``blindspot`` is the population the
+    distillation target structurally cannot carry -- src has an opinion where
+    dst's own teacher has none -- and is the one this table exists for.
+
+    Three arrays over those cells:
+
+    * ``n`` -- how often. The event count.
+    * ``mass`` -- the on-task teacher's probability there. A token src keeps
+      voting on that dst's teacher was never going to say reaches nothing.
+    * ``eff`` -- the post-normalisation effect the weighting actually had at that
+      candidate, signed, in whatever unit the mode measures effects in (see
+      :func:`candidate_effect`). Under the unanimity gate every off-task teacher
+      is one of the voices behind a fired weight, so each src is credited with
+      the whole effect rather than a share of it: the question this answers is
+      "was src one of the voices", not "how much of the vote was src's".
+
+    Sizing, at T=3 and V=151,936: 2.7M cells at int64 + float32 + float64 is
+    54.7 MB, one all-reduce and one device-to-host read of that per
+    ``update_policy``. For scale, :class:`TokenStateCounts` is already 119 MB on
+    the same run and a teacher output projection is 622 MB.
+
+    Dense and sync-free for the reason :class:`TokenStateCounts` is: a
+    ``torch.unique`` per micro-batch would read the device thousands of times a
+    step, which is the run-ahead this actor's design protects.
+    """
+
+    N_CLS = len(PAIR_TOKEN_CLASSES)
+
+    def __init__(self, *, n_tasks: int, vocab_size: int, device, top_n: int = 64):
+        assert n_tasks >= 2, "a pair table needs at least two tasks"
+        self.n_tasks = T = int(n_tasks)
+        self.vocab_size = V = int(vocab_size)
+        self.n_pairs = T * (T - 1)
+        self.top_n = int(top_n)
+        cells = self.n_pairs * self.N_CLS * V
+        self.n = torch.zeros(cells, dtype=torch.int64, device=device)
+        self.mass = torch.zeros(cells, dtype=torch.float32, device=device)
+        self.eff = torch.zeros(cells, dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    # -- accumulation ------------------------------------------------------ #
+
+    def update(
+        self,
+        *,
+        support_ids: torch.Tensor,
+        on_task_logprob: torch.Tensor,
+        off_task_logprobs: torch.Tensor,
+        base_logprob: torch.Tensor,
+        response_mask: torch.Tensor,
+        task_ids: torch.Tensor,
+        off_plane_tasks: torch.Tensor,
+        deadzone: float,
+        effect: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fold one micro-batch in.
+
+        Args:
+            support_ids: (bs, resp, k) vocabulary ids of the support.
+            effect: (bs, resp, k) from :func:`candidate_effect`, or None on an
+                arm that applies no weight -- the counts and the mass are still
+                the answer to "who names what", and ``eff`` simply stays zero.
+
+        The signs are recomputed here rather than taken from
+        :func:`candidate_weights`, for the reason :class:`SignPairCounts` does
+        it: that function is on the loss path and its arity is depended on at
+        eight call sites.
+        """
+        self._cpu_cache = None
+        T = self.n_tasks
+        V = self.vocab_size
+        valid = response_mask.to(torch.bool).unsqueeze(-1).expand_as(on_task_logprob)
+
+        p_on = on_task_logprob.detach().to(torch.float32).exp()
+        sign_on = _deadzoned_sign(on_task_logprob.detach() - base_logprob.detach(), deadzone)
+        sign_off = _deadzoned_sign(
+            off_task_logprobs.detach() - base_logprob.detach().unsqueeze(-1), deadzone
+        )
+        eff = (
+            torch.zeros_like(p_on, dtype=torch.float64)
+            if effect is None
+            else effect.detach().to(torch.float64)
+        )
+        dst = task_ids.reshape(-1).to(torch.long)
+        dst_b = dst.view(-1, 1, 1)
+        on_silent = sign_on == 0
+
+        for c in range(off_task_logprobs.size(-1)):
+            s = sign_off[..., c]
+            speaks = s != 0
+            agree = (~on_silent) & (s == sign_on)
+            conflict = (~on_silent) & speaks & (s != sign_on)
+            blind = on_silent & speaks
+            # -1 for "src had nothing to say here", folded into the mask below
+            # rather than into a fourth class: a class with no opinion in it
+            # would be a vocabulary-wide array of the whole support.
+            cls = torch.full_like(sign_on, -1, dtype=torch.long)
+            cls = torch.where(agree, torch.zeros_like(cls), cls)
+            cls = torch.where(conflict, torch.ones_like(cls), cls)
+            cls = torch.where(blind, torch.full_like(cls, 2), cls)
+
+            src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
+            src_b = src.view(-1, 1, 1)
+            ok = valid & (dst_b >= 0) & (src_b >= 0) & (cls >= 0)
+            # The diagonal is structurally absent, so the pair index skips it.
+            # clamp before the comparison: a -1 src would otherwise decide the
+            # (src > dst) branch on a row that is masked out anyway.
+            d_c, s_c = dst_b.clamp(min=0), src_b.clamp(min=0)
+            pair = d_c * (T - 1) + s_c - (s_c > d_c).long()
+            flat = ((pair * self.N_CLS + cls.clamp(min=0)) * V + support_ids.to(torch.long)).reshape(-1)
+
+            self.n.index_add_(0, flat, ok.reshape(-1).to(torch.int64))
+            self.mass.index_add_(0, flat, (p_on * ok).reshape(-1))
+            self.eff.index_add_(0, flat, (eff * ok).reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        for t in (self.n, self.mass, self.eff):
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+
+    # -- rendering --------------------------------------------------------- #
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            shape = (self.n_pairs, self.N_CLS, self.vocab_size)
+            self._cpu_cache = (
+                self.n.detach().to("cpu").view(shape),
+                self.mass.detach().to("cpu").view(shape),
+                self.eff.detach().to("cpu").view(shape),
+            )
+        return self._cpu_cache
+
+    def _pair_index(self, dst: int, src: int) -> int:
+        return dst * (self.n_tasks - 1) + src - (1 if src > dst else 0)
+
+    def _pairs(self, task_names=None):
+        """``(pair_index, dst_name, src_name)`` for every ordered pair."""
+        def name(t):
+            return task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        for dst in range(self.n_tasks):
+            for src in range(self.n_tasks):
+                if src == dst:
+                    continue
+                yield self._pair_index(dst, src), name(dst), name(src)
+
+    def scalar_metrics(self, task_names=None, prefix: str = "sign_weight") -> dict:
+        """Shape per pair, and the overlap BETWEEN the pairs sharing a receiver.
+
+        ``n_distinct`` and ``top_share`` say whether src's contribution to dst is
+        a small stable vocabulary or a broad one -- the same question
+        :class:`TokenStateCounts` asks, but now attributable to a sender.
+
+        ``token_overlap`` is the reading neither existing accumulator can give:
+        the weighted Jaccard between the two srcs' token vectors at one dst. Near
+        1 the off-task teachers are naming the same tokens, so what crosses is
+        common surface vocabulary and no individual sender is necessary; near 0
+        each sender contributes its own, and the unanimity gate is passing on the
+        intersection of two different vocabularies. Weighted rather than
+        set-valued because a token seen once and a token seen ten thousand times
+        are not the same claim, and a set Jaccard scores them identically.
+        """
+        out = {}
+        n, mass, eff = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        for p, dst, src in self._pairs(task_names):
+            for cid, cname in PAIR_TOKEN_CLASSES.items():
+                counts = n[p, cid]
+                total = int(counts.sum())
+                if total <= 0:
+                    continue
+                head = f"{prefix}/pair/token/{cname}/{src}__on__{dst}"
+                out[f"{head}/n_distinct"] = float((counts > 0).sum())
+                out[f"{head}/top{N}_share"] = float(torch.topk(counts, N).values.sum()) / total
+                out[f"{head}/mass"] = float(mass[p, cid].sum())
+                out[f"{head}/eff_net"] = float(eff[p, cid].sum())
+
+        # One overlap per (dst, class, unordered src pair).
+        for dst in range(self.n_tasks):
+            srcs = [s for s in range(self.n_tasks) if s != dst]
+            dname = task_names[dst] if task_names and dst < len(task_names) else f"task{dst}"
+            for a in range(len(srcs)):
+                for b in range(a + 1, len(srcs)):
+                    pa, pb = self._pair_index(dst, srcs[a]), self._pair_index(dst, srcs[b])
+                    an = task_names[srcs[a]] if task_names and srcs[a] < len(task_names) else f"task{srcs[a]}"
+                    bn = task_names[srcs[b]] if task_names and srcs[b] < len(task_names) else f"task{srcs[b]}"
+                    for cid, cname in PAIR_TOKEN_CLASSES.items():
+                        x = n[pa, cid].to(torch.float64)
+                        y = n[pb, cid].to(torch.float64)
+                        union = float(torch.maximum(x, y).sum())
+                        if union <= 0:
+                            continue
+                        out[f"{prefix}/pair/token_overlap/{cname}/{an}__and__{bn}__on__{dname}"] = (
+                            float(torch.minimum(x, y).sum()) / union
+                        )
+        return out
+
+    def top_tokens(self, task_names=None) -> list:
+        """The ranked rows themselves, ids not strings -- the actor has no tokenizer.
+
+        Three rankings per (pair, class), for the reason
+        :meth:`TokenStateCounts.top_tokens` has three: how often src named it,
+        how much of dst's teacher's mass sits there, and how much the weighting
+        moved because of it. A token can top one and be absent from the others.
+        """
+        rows = []
+        n, mass, eff = self._cpu()
+        N = min(self.top_n, self.vocab_size)
+        for p, dst, src in self._pairs(task_names):
+            for cid, cname in PAIR_TOKEN_CLASSES.items():
+                if int(n[p, cid].sum()) <= 0:
+                    continue
+                series = (
+                    ("count", n[p, cid].to(torch.float64)),
+                    ("mass", mass[p, cid].to(torch.float64)),
+                    ("abs_effect", eff[p, cid].abs()),
+                )
+                for ranked_by, values in series:
+                    vals, idx = torch.topk(values, N)
+                    for rank, (v, tok) in enumerate(zip(vals.tolist(), idx.tolist())):
+                        if v <= 0:
+                            break
+                        rows.append({
+                            "table": "pair_token",
+                            "dst": dst, "src": src, "cls": cname,
+                            "ranked_by": ranked_by, "rank": rank, "token_id": int(tok),
+                            "count": int(n[p, cid, tok]),
+                            "mass": float(mass[p, cid, tok]),
+                            "effect_net": float(eff[p, cid, tok]),
+                        })
+        return rows
