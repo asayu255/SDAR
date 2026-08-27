@@ -200,6 +200,36 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # already.
 export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-3}"
 
+# THE PUMP. Engines as a pool: requests go in individually and each rank's
+# TokenPump keeps its engine stepping, so a rank that finishes its share of a
+# collective generate takes the next slot's work instead of waiting for the
+# slowest rank.
+#
+# ON by default because wall says so, across three completed runs of the same
+# checkpoint on the same three cards:
+#
+#   pump ON   0.96 h   success 0.3875   search 0.3571
+#   pump OFF  1.24 h   success 0.3865   search 0.3560   (V0 + multi-step)
+#   pump OFF  1.26 h   success 0.3869   search 0.3523   (V1, depth 2)
+#
+# 24% shorter with the scores inside 0.001 of each other, and greedy search --
+# the one task that cannot move by sampling -- highest on the pump run.
+#
+# ITS UTILISATION IS THE WORST OF THE THREE (79.90% against 83.21%), which is
+# the point: this arm has chosen on utilisation three times and this is the case
+# where doing so picks the setting that takes 29% longer for the same answers.
+#
+# REQUIRE is on with it, deliberately. Without it a pool that refuses falls back
+# to the blocking path in silence, and the run completes looking ordinary while
+# measuring the thing it was supposed to be compared against -- which cost one
+# entire run when eos_token_id turned out to be a list. Set
+# ROLLOUT_ASYNC_GENERATE=0 to turn the pump off; do not turn REQUIRE off to
+# paper over a refusal.
+export ROLLOUT_ASYNC_GENERATE="${ROLLOUT_ASYNC_GENERATE:-1}"
+if [ "$ROLLOUT_ASYNC_GENERATE" != "0" ]; then
+    export ROLLOUT_ASYNC_REQUIRE="${ROLLOUT_ASYNC_REQUIRE:-1}"
+fi
+
 # HOW MUCH OF THE CARD vLLM GETS.
 #
 # 0.6 is the training arm's number, and it is right there: that arm keeps FSDP

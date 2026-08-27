@@ -547,6 +547,42 @@ batch tokenizer(計画 4)はここには桁が届かない。
 
 ---
 
+## 7decies. pump を既定にした —— 根拠は wall であって util ではない
+
+同じ checkpoint、同じ 3 枚、完走した 3 本:
+
+| | pump | **wall** | success | search(greedy) | node util |
+| --- | :---: | ---: | ---: | ---: | ---: |
+| `...-092241` | **ON** | **0.96 h** | 0.3875 | **0.3571** | 79.90% |
+| `...-124410` | OFF | 1.24 h | 0.3865 | 0.3560 | **83.21%** |
+| `...-201115` | OFF | 1.26 h | 0.3869 | 0.3523 | 81.2% |
+
+**24% 短く、スコアは 3 本とも 0.001 以内。** サンプリングで動きようのない
+greedy の search は pump run が最も高い。
+
+**そして pump の util は 3 本で最も低い。** これがこの決定の意味である ——
+util で選べば **29% 遅い設定**を選ぶ。
+
+`ROLLOUT_ASYNC_REQUIRE` も同時に既定 ON。**断られたときに黙って blocking path
+に落ちる**と、完走して普通に見えるログが**比較対象そのものを測る**からである
+(§22 で 1 run まるごと失った形)。切るときは `ROLLOUT_ASYNC_GENERATE=0`。
+**REQUIRE を切って refusal を覆い隠さないこと。**
+
+### まだ一度も一緒に走っていない組み合わせ
+
+pump(PARTIAL)と multi-step(duty)は**別の層**を触る。次はこれである:
+
+```bash
+VLLM_USE_V1=0 ROLLOUT_REQUIRE_CORE=v0 VAL_PIPELINE_REPORT_EVERY=5 \
+bash examples/sft_trainer/eval_checkpoints.sh <step> -- \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.num_scheduler_steps=4 \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.multi_step_stream_outputs=false
+```
+
+**pump は既定で入るので、環境変数は要らない。判定は wall（0.96 h を切るか）。**
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**
