@@ -101,6 +101,8 @@ from typing import Optional
 
 import torch
 
+from verl.trainer.ppo.sign_weights import STATE_NAMES as _STATE_NAMES
+
 __all__ = [
     "compute_raw_policy_shifts",
     "tail_logprob",
@@ -113,6 +115,16 @@ __all__ = [
     "group_center",
     "ADV_MOMENTS",
     "AdvantageReliabilityStats",
+    "POSITION_TERMS",
+    "STATE_TERMS",
+    "PROBE_ALPHAS",
+    "probe_name",
+    "PairEvidenceStats",
+    "build_position_weight",
+    "position_terms",
+    "state_shift_terms",
+    "position_weight_metrics",
+    "state_shift_metrics",
 ]
 
 
@@ -834,3 +846,339 @@ class AdvantageReliabilityStats:
         )
         self.buf.copy_(state["buf"].to(self.buf.device, self.buf.dtype))
         self._cpu_cache = None
+
+
+# --------------------------------------------------------------------------- #
+# putting it together, and reporting what it did
+# --------------------------------------------------------------------------- #
+# The per-position scalars the effect metrics are formed from. ``available`` is
+# in the list rather than inferred so the cold-start share is a number and not a
+# gap in the series.
+POSITION_TERMS = (
+    "w",
+    "w_sq",
+    "w_pre",
+    "w_pre_sq",
+    "kl",
+    "w_kl",
+    "kl_shift_abs",
+    "evidence",
+    "evidence_shared",
+    "available",
+)
+
+# The exact partition of the KL each position had moved. ``W - 1`` splits into a
+# part proportional to the evidence, which candidates can be charged for, and the
+# normaliser's own offset ``1/mu - 1``, which no candidate caused:
+#
+#     (W - 1) D = [ sum_v p_d(v) e(v) / mu ] D  +  (1/mu - 1) D
+#
+# so the seven state columns plus ``shift_norm_offset`` sum to the total shift
+# with no residual. Reported because the arm's whole effect is WHICH positions
+# it moved budget between, and the states are what distinguishes "it backed the
+# corroborated moves" from "it starved the on-task teacher's own specialism".
+STATE_TERMS = tuple(f"shift_{n}" for n in _STATE_NAMES.values()) + ("shift_norm_offset",)
+
+# What a probe series is for. The training path runs at whatever alpha the
+# reliability statistics produced; these run the same arithmetic at fixed alphas
+# and never touch the loss. Without the top of the bracket a Phase-2 go/no-go
+# would be measuring the corroboration channel alone -- which is structurally the
+# minority one, since the on-task teacher is silent at 64% of teacher mass -- and
+# would say nothing about what the finished mechanism can do.
+PROBE_ALPHAS = (0.0, 0.1, 1.0)
+
+
+def probe_name(alpha: float) -> str:
+    return f"alpha{int(round(float(alpha) * 100)):03d}"
+
+
+class PairEvidenceStats:
+    """Per ordered (destination, source), how much evidence that source supplied.
+
+    ``evidence`` is that source's share of ``W~ - 1``; ``shift`` is its share of
+    the nats the weighting actually moved. Kept apart from the per-state table
+    because they answer different questions -- "who supplied it" against "what
+    kind of position received it" -- and a single table keyed by both would be
+    mostly empty.
+    """
+
+    TERMS = ("evidence", "shift", "n")
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = T = int(n_tasks)
+        self.buf = torch.zeros(T * T * len(self.TERMS), dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, evidence, shift, response_mask, task_ids, off_plane_tasks) -> None:
+        """``evidence`` and ``shift`` are (bs, resp, n_off)."""
+        self._cpu_cache = None
+        T, K = self.n_tasks, len(self.TERMS)
+        m = response_mask.to(torch.float64).unsqueeze(-1)
+        e = evidence.detach().to(torch.float64) * m
+        s = shift.detach().to(torch.float64) * m
+        dst = task_ids.reshape(-1).to(torch.long)
+        for c in range(e.size(-1)):
+            src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
+            ok = ((dst >= 0) & (src >= 0)).to(torch.float64)
+            vals = torch.stack(
+                [e[..., c].sum(dim=1) * ok, s[..., c].sum(dim=1) * ok,
+                 (response_mask.to(torch.float64).sum(dim=1)) * ok],
+                dim=-1,
+            )
+            base = (dst.clamp(min=0) * T + src.clamp(min=0)) * K
+            flat = (base.unsqueeze(-1) + torch.arange(K, device=vals.device)).reshape(-1)
+            self.buf.index_add_(0, flat, vals.reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(self.n_tasks, self.n_tasks, len(self.TERMS))
+        buf = self._cpu_cache
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for dst in range(self.n_tasks):
+            for src in range(self.n_tasks):
+                if src == dst or float(buf[dst, src, 2]) <= 0:
+                    continue
+                n = float(buf[dst, src, 2])
+                head = f"{prefix}/evidence/{name(src)}__on__{name(dst)}"
+                out[f"{head}/source_shift_mean"] = float(buf[dst, src, 0]) / n
+                out[f"{head}/kl_shift_attributed"] = float(buf[dst, src, 1]) / n
+        return out
+
+
+def build_position_weight(
+    *,
+    shifts: dict,
+    on_task_logprob: torch.Tensor,
+    task_ids: torch.Tensor,
+    off_plane_tasks: torch.Tensor,
+    diag: torch.Tensor,
+    diag_valid: torch.Tensor,
+    alpha_table: torch.Tensor,
+    normalizer: Optional[dict] = None,
+    report_epsilon: float = 0.1,
+    probe_alphas=PROBE_ALPHAS,
+) -> dict:
+    """Everything from raw shifts to the scalar that multiplies the KL.
+
+    One function because the pieces have to see the same standardized shifts:
+    the evidence, the reliability's residual, the state labels and the
+    attribution are four readings of one decomposition, and computing them at
+    four call sites is how they start disagreeing.
+
+    Args:
+        normalizer: the mapping :meth:`PreviousStepTaskKLWeightedMean.snapshot`
+            returns, or None before one exists. None means cold start and every
+            weight is exactly 1 -- NOT the raw ``W~``, which would be an
+            unannounced increase in distillation strength on the arm's first
+            steps, and not a within-micro-batch mean, which would make the
+            objective depend on how the batch was split.
+        report_epsilon: in RMS units, and used ONLY to bucket a candidate into a
+            state for the report. It reaches no weight and no loss; the
+            mechanism itself has no deadzone.
+
+    Returns a mapping whose ``weight`` is the only field the loss may read.
+    ``pre_weight`` feeds the next step's normaliser, and everything else is
+    measurement.
+
+    A row whose destination or any of whose sources has no RMS yet is left at
+    ``weight = 1`` and its standardized shifts are zeroed, so no metric reports
+    a number divided by a scale that does not exist. Availability is a property
+    of the task, not of the row, so a whole task cold-starts together and its
+    normaliser comes out at 1 as well.
+    """
+    from verl.trainer.ppo.sign_weights import candidate_weights
+
+    std = standardize_policy_shifts(
+        shifts=shifts, diag=diag, diag_valid=diag_valid,
+        task_ids=task_ids, off_plane_tasks=off_plane_tasks,
+    )
+    avail = std["row_available"]
+    keep = avail.reshape(-1, 1, 1).to(std["on"].dtype)
+    hat_on = std["on"] * keep
+    hat_off = std["off"] * keep.unsqueeze(-1)
+
+    dec = decompose_common_residual(hat_on=hat_on, hat_off=hat_off)
+    alpha = alpha_table.to(hat_off.device)
+    dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
+    src = off_plane_tasks.to(torch.long).clamp(min=0)
+    row_alpha = alpha[dst.unsqueeze(-1), src]                       # (bs, n_off)
+
+    evidence = candidate_kl_evidence(
+        common_ev=dec["common_ev"], hat_off=hat_off, source_alpha=row_alpha
+    )
+    pre = position_pre_weight(evidence=evidence, on_task_logprob=on_task_logprob)
+    pre = torch.where(avail.reshape(-1, 1), pre, torch.ones_like(pre))
+
+    # mu, and the weight. Gathered per row from a per-task snapshot, so a task
+    # whose normaliser is not observed yet keeps weight 1 while the others do not
+    # have to wait for it.
+    if normalizer is None:
+        mu = torch.ones_like(pre)
+        mu_valid = torch.zeros_like(avail)
+    else:
+        mean = normalizer["mean"].to(pre.device, pre.dtype)
+        valid = normalizer["valid"].to(pre.device)
+        mu = mean[dst].reshape(-1, 1).expand_as(pre)
+        mu_valid = valid[dst] & avail
+    weight = torch.where(mu_valid.reshape(-1, 1), pre / mu.clamp(min=1e-12), torch.ones_like(pre))
+
+    # Labels only. candidate_weights is called on the STANDARDIZED shifts with a
+    # zero base, so report_epsilon is in RMS units and comparable across
+    # teachers, and its weight output (all ones) is discarded: reusing the
+    # function is what keeps the state definition from drifting away from the
+    # tables the existing arms are reported with.
+    _ones, state = candidate_weights(
+        hat_on, hat_off, torch.zeros_like(hat_on),
+        mode="position", agree_weight=1.0, agree_neg_weight=1.0,
+        disagree_weight=1.0, deadzone=float(report_epsilon),
+    )
+
+    probes = {}
+    for a in probe_alphas:
+        e_a = candidate_kl_evidence(
+            common_ev=dec["common_ev"], hat_off=hat_off,
+            source_alpha=torch.full_like(row_alpha, float(a)),
+        )
+        p_a = position_pre_weight(evidence=e_a, on_task_logprob=on_task_logprob)
+        probes[probe_name(a)] = torch.where(avail.reshape(-1, 1), p_a, torch.ones_like(p_a))
+
+    p_teacher = on_task_logprob.detach().to(torch.float32).exp()
+    return {
+        "weight": weight,
+        "pre_weight": pre,
+        "mu": mu,
+        "available": avail,
+        "hat_on": hat_on,
+        "hat_off": hat_off,
+        "common": dec["common"],
+        "common_ev": dec["common_ev"],
+        "residual": dec["residual"],
+        "evidence": evidence,
+        "state": state,
+        "teacher_prob": p_teacher,
+        # sum_v p_d(v) |c_ev(v)| -- the corroboration channel's share of W~ - 1.
+        "evidence_shared": (p_teacher * dec["common_ev"].abs()).sum(dim=-1),
+        # (bs, resp, n_off): each source's share of the same quantity.
+        "evidence_by_source": p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs(),
+        "probe_pre_weight": probes,
+    }
+
+
+def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
+    """The (bs, resp) columns :data:`POSITION_TERMS` names."""
+    w = built["weight"].detach().to(torch.float32)
+    pre = built["pre_weight"].detach().to(torch.float32)
+    kl = teacher_kl.detach().to(torch.float32)
+    return {
+        "w": w,
+        "w_sq": w * w,
+        "w_pre": pre,
+        "w_pre_sq": pre * pre,
+        "kl": kl,
+        "w_kl": w * kl,
+        "kl_shift_abs": (w - 1.0).abs() * kl,
+        "evidence": pre - 1.0,
+        "evidence_shared": built["evidence_shared"],
+        "available": built["available"].reshape(-1, 1).expand_as(w).to(torch.float32),
+    }
+
+
+def state_shift_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
+    """The exact partition of ``(W - 1) D`` over the seven states plus the offset.
+
+    The per-candidate part is ``p_d(v) e(v) / mu * D`` and the leftover is the
+    normaliser's ``(1/mu - 1) D``, which belongs to no candidate. Their sum is
+    the position's whole shift, which is what makes the columns a decomposition
+    rather than a set of correlated summaries.
+    """
+    kl = teacher_kl.detach().to(torch.float32)
+    inv_mu = 1.0 / built["mu"].clamp(min=1e-12)
+    per_cand = built["teacher_prob"] * built["evidence"] * inv_mu.unsqueeze(-1) * kl.unsqueeze(-1)
+    state = built["state"]
+    out = {}
+    for sid, name in _STATE_NAMES.items():
+        out[f"shift_{name}"] = (per_cand * (state == sid).to(per_cand.dtype)).sum(dim=-1)
+    out["shift_norm_offset"] = (inv_mu - 1.0) * kl
+    return out
+
+
+def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
+    """The readings, formed from sums rather than from means of ratios.
+
+    ``kl_scale`` is the invariant, not ``w_mean``. What a task's OPD budget IS
+    is ``sum W*D``; the two coincide only when the weight and the KL are
+    uncorrelated, and this arm exists on the bet that they are not. On the
+    snapshot the normaliser was built from ``kl_scale`` is 1 by construction, so
+    what it reports on the live batch is the one-step lag plus the step's own
+    distribution shift.
+
+    ``kl_shift_gross_frac`` is what the Phase-2 go/no-go is judged on: the
+    fraction of the OPD term the arm moved between positions. Dimensionless, so
+    a threshold on it means the same thing at any teacher_kl_loss_coef, and
+    unlike ``w_cv`` it is in the units the objective is actually in.
+    """
+    out = {}
+    for scope, tot in sums.items():
+        head = prefix if scope is None else f"{prefix}/{scope}"
+        n = tot["n"]
+        if n <= 0:
+            continue
+        w_mean = tot["w"] / n
+        w_var = max(tot["w_sq"] / n - w_mean * w_mean, 0.0)
+        pre_mean = tot["w_pre"] / n
+        pre_var = max(tot["w_pre_sq"] / n - pre_mean * pre_mean, 0.0)
+        out[f"{head}/position/w_mean"] = w_mean
+        out[f"{head}/position/w_std"] = math.sqrt(w_var)
+        out[f"{head}/position/w_cv"] = math.sqrt(w_var) / w_mean if abs(w_mean) > 1e-12 else 0.0
+        out[f"{head}/position/w_pre_mean"] = pre_mean
+        out[f"{head}/position/w_pre_std"] = math.sqrt(pre_var)
+        out[f"{head}/position/available_frac"] = tot["available"] / n
+        out[f"{head}/evidence/total_mean"] = tot["evidence"] / n
+        out[f"{head}/evidence/shared_mean"] = tot["evidence_shared"] / n
+        if abs(tot["evidence"]) > 1e-12:
+            # Which channel is carrying the mechanism. Near 1 the corroboration
+            # bonus IS the arm; near 0 it is decoration and what the run tests is
+            # "reliable source activity", not agreement.
+            out[f"{head}/evidence/shared_share"] = tot["evidence_shared"] / tot["evidence"]
+        if abs(tot["kl"]) > 1e-12:
+            out[f"{head}/effect/kl_scale"] = tot["w_kl"] / tot["kl"]
+            out[f"{head}/effect/kl_shift_gross_frac"] = tot["kl_shift_abs"] / tot["kl"]
+            out[f"{head}/effect/kl_scale_lag_error"] = tot["w_kl"] / tot["kl"] - 1.0
+        out[f"{head}/effect/kl_unweighted"] = tot["kl"] / n
+        out[f"{head}/effect/kl_weighted"] = tot["w_kl"] / n
+        out[f"{head}/effect/kl_shift_net"] = (tot["w_kl"] - tot["kl"]) / n
+        gross = tot["kl_shift_abs"] / n
+        out[f"{head}/effect/kl_shift_gross"] = gross
+        if gross > 1e-12:
+            out[f"{head}/effect/redistribution_ratio"] = ((tot["w_kl"] - tot["kl"]) / n) / gross
+    return out
+
+
+def state_shift_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
+    """Which kinds of position the budget moved between.
+
+    THE analysis reading for this arm. The weight scales the whole KL toward the
+    on-task teacher, so the only thing the mechanism can do is decide which
+    states get more of it -- and ``neutral_off_task_silent``, where the on-task
+    teacher is the only one with an opinion, is where it takes the most away.
+    That is the on-task teacher's own specialism, so a gain and a loss have to
+    be read against this table or neither can be attributed.
+    """
+    out = {}
+    for scope, tot in sums.items():
+        head = prefix if scope is None else f"{prefix}/{scope}"
+        total = sum(abs(tot[t]) for t in STATE_TERMS)
+        for term in STATE_TERMS:
+            out[f"{head}/effect/kl_shift_by_state/{term[len('shift_'):]}/net"] = tot[term] / tot["n"]
+            if total > 1e-12:
+                out[f"{head}/effect/kl_shift_by_state/{term[len('shift_'):]}/gross_share"] = (
+                    abs(tot[term]) / total
+                )
+    return out

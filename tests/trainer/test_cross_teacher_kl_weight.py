@@ -774,3 +774,210 @@ def test_the_moment_layout_is_complete_enough_for_the_partials():
     assert ADV_MOMENTS[0] == "n"
     for pair in ("as", "al", "ao", "sl", "so", "lo"):
         assert pair in ADV_MOMENTS, pair
+
+
+# --------------------------------------------------------------------------- #
+# the orchestrator, and the effect metrics
+# --------------------------------------------------------------------------- #
+from verl.trainer.ppo.cross_teacher_kl_weight import (  # noqa: E402
+    POSITION_TERMS,
+    PROBE_ALPHAS,
+    STATE_TERMS,
+    PairEvidenceStats,
+    build_position_weight,
+    position_terms,
+    position_weight_metrics,
+    probe_name,
+    state_shift_metrics,
+    state_shift_terms,
+)
+from verl.trainer.ppo.sign_weights import ScopeTermStats  # noqa: E402
+
+
+def _built(bs=3, resp=4, k=5, n_off=2, seed=40, normalizer="auto", diag_valid=None, alpha=0.5):
+    torch.manual_seed(seed)
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1)
+    shifts = compute_raw_policy_shifts(on_task_logprob=on, off_task_logprobs=off, base_logprob=base)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)[:, :n_off]
+    alpha_table = torch.full((3, 3), float(alpha))
+    alpha_table.fill_diagonal_(0.0)
+    norm = None
+    if normalizer == "auto":
+        norm = {"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)}
+    elif normalizer is not None:
+        norm = normalizer
+    got = build_position_weight(
+        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=alpha_table, normalizer=norm,
+        diag_valid=torch.ones(3, dtype=torch.bool) if diag_valid is None else torch.as_tensor(diag_valid),
+    )
+    return got, {"on": on, "task_ids": task_ids, "planes": planes, "shifts": shifts}
+
+
+def test_the_state_columns_partition_the_whole_kl_shift():
+    """Seven states plus the normaliser's own offset, with no residual. A column
+    that did not add up would make every share below a correlated summary rather
+    than a decomposition."""
+    got, ctx = _built()
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    terms = state_shift_terms(got, kl)
+    total = sum(terms[t] for t in STATE_TERMS)
+    assert torch.allclose(total, (got["weight"] - 1.0) * kl, atol=1e-5)
+    assert set(terms) == set(STATE_TERMS)
+
+
+def test_the_state_labels_are_the_shipped_seven_and_report_epsilon_reaches_no_weight():
+    from verl.trainer.ppo.sign_weights import STATE_NAMES
+
+    got, ctx = _built()
+    assert set(int(x) for x in got["state"].unique().tolist()) <= set(STATE_NAMES)
+    loose = build_position_weight(
+        shifts=ctx["shifts"], on_task_logprob=ctx["on"], task_ids=ctx["task_ids"],
+        off_plane_tasks=ctx["planes"], diag=torch.ones(3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        alpha_table=torch.full((3, 3), 0.5).fill_diagonal_(0.0),
+        normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
+        report_epsilon=5.0,
+    )
+    assert torch.equal(loose["weight"], got["weight"]), "labels only"
+    assert not torch.equal(loose["state"], got["state"]), "but it does move the labels"
+
+
+def test_cold_start_is_exactly_one_and_not_the_unnormalised_weight():
+    """The existing position arm applies the raw W~ on its first step. Inheriting
+    that here would be an unannounced increase in distillation strength for as
+    long as the normaliser takes to exist."""
+    got, _ = _built(normalizer=None)
+    assert torch.allclose(got["weight"], torch.ones_like(got["weight"]))
+    assert float(got["pre_weight"].max()) > 1.0, "the raw weight is still measured"
+
+
+def test_a_task_without_a_scale_stays_at_one_and_reports_nothing_it_cannot_measure():
+    got, _ = _built(diag_valid=[True, False, True])
+    avail = got["available"]
+    assert avail.tolist() == [True, False, True] or not bool(avail[1])
+    idx = (~avail).nonzero().flatten()
+    assert idx.numel()
+    for i in idx.tolist():
+        assert torch.allclose(got["weight"][i], torch.ones_like(got["weight"][i]))
+        assert float(got["hat_on"][i].abs().max()) == 0.0
+        assert float(got["hat_off"][i].abs().max()) == 0.0
+
+
+def test_the_probe_bracket_covers_alpha_zero_and_one_and_never_touches_the_weight():
+    """The Phase-2 go/no-go is judged on the top of this bracket. At alpha=0 the
+    corroboration channel is alone, and it is structurally the minority one --
+    the on-task teacher is silent at 64% of teacher mass -- so a gate read there
+    would be measuring a lower bound and calling it the mechanism."""
+    got, _ = _built(alpha=0.0)
+    assert set(got["probe_pre_weight"]) == {probe_name(a) for a in PROBE_ALPHAS}
+    lo = got["probe_pre_weight"][probe_name(0.0)]
+    hi = got["probe_pre_weight"][probe_name(1.0)]
+    assert torch.all(hi >= lo - 1e-6), "more alpha cannot mean less evidence"
+    assert float((hi - lo).max()) > 0.0
+    # alpha=0 in the TABLE means the training weight equals the alpha=0 probe.
+    assert torch.allclose(got["pre_weight"], lo, atol=1e-6)
+
+
+def test_the_evidence_by_source_columns_add_up_with_the_shared_one():
+    got, _ = _built()
+    total = got["evidence_shared"] + got["evidence_by_source"].sum(dim=(-1, -2))
+    assert torch.allclose(total, got["pre_weight"] - 1.0, atol=1e-5)
+
+
+def _fold_position(got, kl, task_ids, n_tasks=3):
+    stats = ScopeTermStats(names=POSITION_TERMS, n_tasks=n_tasks, device="cpu")
+    stats.update(position_terms(got, kl), response_mask=torch.ones_like(kl), task_ids=task_ids)
+    return position_weight_metrics(stats.sums(task_names=TASKS))
+
+
+def test_kl_scale_is_one_on_the_snapshot_the_normaliser_came_from():
+    """The end-to-end version of the normaliser's invariant: build W~ and D,
+    take the KL-weighted mean, feed it back, and the effective OPD strength is
+    unchanged."""
+    got, ctx = _built(bs=6, resp=8, seed=41, normalizer=None)
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    mean = PreviousStepTaskKLWeightedMean(n_tasks=3, device="cpu")
+    mean.update(
+        pre_weight=got["pre_weight"], teacher_kl=kl,
+        response_mask=torch.ones_like(kl), task_ids=ctx["task_ids"],
+    )
+    again = build_position_weight(
+        shifts=ctx["shifts"], on_task_logprob=ctx["on"], task_ids=ctx["task_ids"],
+        off_plane_tasks=ctx["planes"], diag=torch.ones(3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        alpha_table=torch.full((3, 3), 0.5).fill_diagonal_(0.0),
+        normalizer=mean.snapshot(),
+    )
+    m = _fold_position(again, kl, ctx["task_ids"])
+    for task in TASKS:
+        assert m[f"kl_weight/{task}/effect/kl_scale"] == pytest.approx(1.0, abs=1e-5)
+    assert m["kl_weight/effect/kl_scale"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_both_sides_of_one_are_reached_once_the_normaliser_exists():
+    got, ctx = _built(bs=6, resp=8, seed=42)
+    w = got["weight"]
+    assert float(w.min()) < 1.0 < float(w.max())
+
+
+def test_the_effect_metrics_are_the_ratios_a_reader_needs():
+    got, ctx = _built(bs=4, resp=6, seed=43)
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    m = _fold_position(got, kl, ctx["task_ids"])
+    for key in (
+        "position/w_mean", "position/w_cv", "position/available_frac",
+        "evidence/shared_share", "effect/kl_scale", "effect/kl_shift_gross_frac",
+        "effect/redistribution_ratio",
+    ):
+        assert f"kl_weight/{key}" in m, key
+    # the gate's number is a fraction of the OPD term, so it is unit-free
+    assert 0.0 <= m["kl_weight/effect/kl_shift_gross_frac"] < 10.0
+
+
+def test_no_metric_name_collides_with_the_reducers_max_min_dispatch():
+    got, ctx = _built(bs=2, resp=3, seed=44)
+    kl = torch.rand(*got["weight"].shape) + 0.1
+    m = _fold_position(got, kl, ctx["task_ids"])
+    stats = ScopeTermStats(names=STATE_TERMS, n_tasks=3, device="cpu")
+    stats.update(state_shift_terms(got, kl), response_mask=torch.ones_like(kl), task_ids=ctx["task_ids"])
+    m.update(state_shift_metrics(stats.sums(task_names=TASKS)))
+    pair = PairEvidenceStats(n_tasks=3, device="cpu")
+    pair.update(
+        evidence=got["evidence_by_source"].sum(dim=2),
+        shift=got["evidence_by_source"].sum(dim=2),
+        response_mask=torch.ones_like(kl), task_ids=ctx["task_ids"], off_plane_tasks=ctx["planes"],
+    )
+    m.update(pair.metrics(task_names=TASKS))
+    assert m
+    for name in m:
+        assert "max" not in name and "min" not in name, name
+
+
+def test_the_specialist_state_has_a_column_and_is_where_budget_is_taken_from():
+    """``neutral_off_task_silent`` -- the on-task teacher is the only one with an
+    opinion. The evidence is zero there by construction, so it is what the arm
+    takes budget away from, and the earlier four-value label set had no name for
+    it at all."""
+    assert "shift_neutral_off_task_silent" in STATE_TERMS
+    bs, resp, k = 1, 1, 2
+    on = torch.log(torch.tensor([[[0.6, 0.3]]]))
+    # on-task teacher moved; both sources sit exactly on the base
+    shifts = {
+        "on": torch.tensor([[[1.0, 1.0]]]),
+        "off": torch.zeros(bs, resp, k, 2),
+        "tail_on": torch.zeros(bs, resp),
+        "tail_off": torch.zeros(bs, resp, 2),
+    }
+    got = build_position_weight(
+        shifts=shifts, on_task_logprob=on, task_ids=torch.zeros(1, dtype=torch.long),
+        off_plane_tasks=torch.tensor([[1, 2]]), diag=torch.ones(3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        alpha_table=torch.ones(3, 3).fill_diagonal_(0.0),
+        normalizer={"mean": torch.full((3,), 1.4), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    assert float(got["pre_weight"]) == pytest.approx(1.0), "no off-task evidence at all"
+    assert float(got["weight"]) < 1.0, "so it loses budget to the task's other positions"
+    assert int(got["state"][0, 0, 0]) == 6, "neutral_off_task_silent"
