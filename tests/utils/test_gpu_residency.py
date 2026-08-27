@@ -20,12 +20,13 @@ from verl.utils import gpu_profiler as gp  # noqa: E402
 class _FakeSampler:
     """Just enough of Sampler for residency_between: a lock and a util trace."""
 
-    def __init__(self, trace, cpu=None):
+    def __init__(self, trace, cpu=None, act=None):
         import threading
 
         self._lock = threading.Lock()
         self._util_trace = list(trace)
         self._cpu_trace = list(cpu or [])
+        self._act_trace = list(act or [])
 
     residency_between = gp._Sampler.residency_between
 
@@ -148,10 +149,11 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     class _LiveFakeSampler:
         residency_between = live._Sampler.residency_between
 
-        def __init__(self, trace, cpu=None):
+        def __init__(self, trace, cpu=None, act=None):
             self._lock = threading.Lock()
             self._util_trace = list(trace)
             self._cpu_trace = list(cpu or [])
+            self._act_trace = list(act or [])
 
     start = time.perf_counter()
     end = start + 3.0
@@ -227,17 +229,26 @@ def _cpu(trace, pct):
     return [(ts, pct(vals)) for ts, vals in trace]
 
 
-def test_python_holding_the_gil_is_named_as_python():
-    """cpu_pct is a percentage of ONE core, so Python at the wheel reads high."""
+def test_cpu_alone_no_longer_names_a_cause():
+    """WITHDRAWN: this used to read cpu >= 60% as "Python holding the GIL".
+
+    It cannot. cpu_pct says the process was running, not that it was running
+    Python under the GIL -- the Rust tokeniser releases it and still reads
+    busy, and native BLAS reads as several cores. The number is still printed,
+    because "blocked" versus "running" is real evidence, but the cause now
+    comes from the activity census (which slots were in which phase), which is
+    a direct observation rather than an inference from a rate.
+    """
     trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
     cpu = _cpu(trace, lambda v: 190.0 if max(v) == 0 else 40.0)
     line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
     assert "driver CPU 190% of one core while EMPTY" in line, line
-    assert "EMPTY is Python on the driver" in line, line
+    assert "(running during EMPTY)" in line, line
+    assert "EMPTY is" not in line, "with no census there is no cause to name"
 
 
-def test_a_wait_off_the_box_is_named_as_a_wait():
-    """A process blocked on a socket burns no CPU, which is the whole tell.
+def test_a_blocked_process_is_reported_as_blocked():
+    """A process waiting on a socket burns no CPU. That much cpu_pct can say.
 
     MEASURED on the pump run's deep-idle samples: GPU 1.5%, memory controller
     0.8%, power 88 W against 288 W, host CPU and thread count indistinguishable
@@ -246,7 +257,7 @@ def test_a_wait_off_the_box_is_named_as_a_wait():
     trace = _trace([[0, 0, 0]] * 4 + [[90, 90, 90]] * 6)
     cpu = _cpu(trace, lambda v: 3.0 if max(v) == 0 else 150.0)
     line = gp.format_residency(_FakeSampler(trace, cpu).residency_between(0, 1e9))
-    assert "EMPTY is a wait OFF the box" in line, line
+    assert "(blocked during EMPTY)" in line, line
 
 
 def test_no_cpu_samples_means_no_verdict_rather_than_a_guess():
@@ -264,3 +275,96 @@ def test_partial_samples_are_charged_to_neither_side():
     res = _FakeSampler(trace, cpu).residency_between(0, 1e9)
     assert res["cpu_when_empty"] == pytest.approx(5.0)
     assert res["cpu_when_busy"] == pytest.approx(100.0), "the 1-busy samples must not leak in"
+
+
+# --------------------------------------------------------------------------- #
+# the activity census: what the slots were DOING when the cards were empty
+# --------------------------------------------------------------------------- #
+def test_the_census_counts_threads_not_a_stack():
+    """Three pipeline slots run concurrently; a stack reports the last mover.
+
+    push_phase/pop_phase keep one list, which is right for a single training
+    thread and meaningless here -- and the question that decides the remaining
+    idle is "how many slots were in each activity at once", which a stack
+    cannot answer at all.
+    """
+    with gp.activity("envstep"):
+        with gp.activity("envstep"):
+            with gp.activity("preproc"):
+                assert gp.activity_snapshot() == {"envstep": 2, "preproc": 1}
+        assert gp.activity_snapshot() == {"envstep": 1}
+    assert gp.activity_snapshot() == {}
+
+
+def test_the_census_survives_an_exception():
+    """A leaked count would make every later sample report a phantom slot."""
+    try:
+        with gp.activity("envstep"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert gp.activity_snapshot() == {}
+
+
+def test_concurrent_threads_are_counted_together():
+    import threading
+
+    started, release = threading.Barrier(4), threading.Event()
+    seen = []
+
+    def worker():
+        with gp.activity("envstep"):
+            started.wait(5)
+            release.wait(5)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    started.wait(5)
+    seen.append(gp.activity_snapshot())
+    release.set()
+    for t in threads:
+        t.join(5)
+    assert seen[0] == {"envstep": 3}
+    assert gp.activity_snapshot() == {}
+
+
+def _act(trace, fn):
+    return [(ts, fn(vals)) for ts, vals in trace]
+
+
+def test_all_slots_in_envstep_is_named_the_environment():
+    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
+    act = _act(trace, lambda v: {"envstep": 3} if max(v) == 0 else {"gen": 2, "envstep": 1})
+    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
+    assert "while EMPTY the slots were in: envstep 3.0" in line, line
+    assert "EMPTY is the ENVIRONMENT" in line, line
+
+
+def test_all_slots_in_preproc_is_named_the_driver():
+    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
+    act = _act(trace, lambda v: {"preproc": 3} if max(v) == 0 else {"gen": 3})
+    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
+    assert "EMPTY is the DRIVER's own Python (tokenising)" in line, line
+
+
+def test_a_split_census_refuses_to_name_one():
+    """Half in envstep and half in preproc is not evidence for either."""
+    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
+    act = _act(trace, lambda v: {"envstep": 0.4, "preproc": 0.4} if max(v) == 0 else {"gen": 3})
+    line = gp.format_residency(_FakeSampler(trace, act=act).residency_between(0, 1e9))
+    assert "no single activity dominates" in line, line
+
+
+def test_cpu_is_reported_but_no_longer_used_as_the_verdict():
+    """A driver using CPU is not the same claim as a driver holding the GIL.
+
+    A Rust tokeniser releases it and still reads busy; native BLAS reads as
+    several cores. The number stays, the conclusion moves to the census.
+    """
+    trace = _trace([[0, 0, 0]] * 3 + [[90, 90, 90]] * 7)
+    cpu = [(ts, 4.0 if max(vals) == 0 else 160.0) for ts, vals in trace]
+    line = gp.format_residency(_FakeSampler(trace, cpu=cpu).residency_between(0, 1e9))
+    assert "driver CPU 4% of one core while EMPTY" in line, line
+    assert "(blocked during EMPTY)" in line, line
+    assert "EMPTY is Python on the driver" not in line, "cpu alone must not name a cause"

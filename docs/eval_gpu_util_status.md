@@ -130,6 +130,49 @@ util が +0.32 に見えるのは基準値(3 枚とも忙しいときの util)�
 
 ---
 
+## 7bis. 外部レビューで確認できた 3 点(2026-08-27)
+
+| 主張 | 確認 |
+| --- | :---: |
+| `environment.yml` は **vllm 0.11.0** を固定しているが、動いているのは **0.8.5** | **✅ 事実** |
+| pump も最後に `[future.result(...) for future in futures]` で **batch 全体を待つ** | **✅ 事実**(`rollout_loop.py:440`) |
+| `_run_full_preprocess` は active row を **Python で 1 件ずつ** | **✅ 事実**(dict 内包) |
+
+### 1 つめが今日の話を変える
+
+**`async_scheduling` は「vLLM を更新する計画」ではなく、`environment.yml` が
+既に指している版を入れるだけである。**
+
+```
+environment.yml:250  vllm==0.11.0     ← 固定されている
+実際に import される  vllm 0.8.5       ← ユーザの probe 出力
+```
+
+ただし 0.8.5 → 0.11.0 は kernel も reduction 順も変わるので、
+**過去のスコアは全部比較対象でなくなる。** 単独の実験にすること。
+
+### 私の cpu_pct 判定は弱かった —— レビューの指摘が正しい
+
+`cpu_pct >= 60` が証明するのは「driver が CPU を使っている」までで、
+**GIL を握っていることの証明にはならない**(Rust の tokenizer は GIL を離すし、
+native BLAS は複数コアぶん出る)。**判定を撤回した。**
+
+代わりに **activity census** を入れた。`push_phase` のスタックは
+スレッドローカルでないので slot 3 本では壊れる —— **数える**方式にした:
+
+```
+[gpu-residency] while EMPTY the slots were in: envstep 2.7, preproc 0.2
+                -> EMPTY is the ENVIRONMENT (retriever round trip) -- off the box
+[gpu-residency] driver CPU 4% of one core while EMPTY vs 160% while busy
+                (blocked during EMPTY)
+```
+
+**cpu は報告するが、原因は名指ししない。** 原因は census が言う ——
+推論ではなく直接観測だからである。どれも支配的でなければ
+`no single activity dominates` と言って**名指しを拒む**。
+
+---
+
 ## 8. 次の 1 手 —— これだけ
 
 **残り 5.2% の DEEP EMPTY に名前が付くまで、GPU 側の変更はしない。**
@@ -143,8 +186,12 @@ grep 'EMPTY is' /tmp/<log>
 
 | 出力 | 意味 | 打ち手 |
 | --- | --- | --- |
-| `EMPTY is Python on the driver` | GIL | **GPU 側の変更は全部同じ結果になる。** driver の Python 仕事そのものを減らす |
-| `EMPTY is a wait OFF the box (retriever, RPC)` | retriever | 複製、または Flat index の置き換え —— **どちらもこのリポジトリの外** |
+| `EMPTY is the ENVIRONMENT` | retriever 往復 | server 側の dynamic batching、replica、`step_batch` で 252 スレッドの分解自体をやめる |
+| `EMPTY is the DRIVER's own Python` | tokenize / detokenize | batch tokenizer(全 prompt を fast tokenizer へ 1 回)、pump coordinator の別プロセス化 |
+| `no single activity dominates` | slot の**間**にある | preproc と envstep の境目。turn barrier そのもの |
+
+あわせて `[rollout-engine] vllm ..., core=...` も出る。**0.11.0/V1 なら
+`async_scheduling` がその場で使える**(§7bis)。
 
 **いまの証拠(DEEP EMPTY で host CPU が busy と同じ 0.6%、disk 0、
 メモリコントローラ 0.8%)は後者に傾いている。** もしそうなら、
@@ -176,3 +223,5 @@ grep 'EMPTY is' /tmp/<log>
 | 3 | 「88〜90% が天井」 | 物理ではない。engine のホスト処理で、隠す機構は存在する |
 | 4 | `grep TOTAL \| tail -3` を切り分けの根拠に | 別の batch を比べていた(promptTok が 6 倍違う)。§5 罠 3 と同じ |
 | 5 | util を目的関数に最適化(3 回目) | 効いたかは wall と ms/row でしか言えない |
+| 6 | `cpu_pct >= 60` を「GIL を握っている」の証明に | 証明できるのは「CPU を使っている」まで。Rust tokenizer は GIL を離す。**activity census に置き換えた**(§7bis) |
+| 7 | 動いている vLLM の版を確かめずに「0.8.5 には手が無い」 | `environment.yml` は 0.11.0 を固定している。**入っていないだけだった** |

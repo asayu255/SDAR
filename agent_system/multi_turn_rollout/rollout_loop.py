@@ -1297,7 +1297,14 @@ class TrajectoryCollector:
         _m0 = _now()
 
         _pre_active_mask = active_masks if _ROLLOUT_SKIP_DONE_PREPROC else None
-        batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
+        # Counted, not stacked: three pipeline slots run this concurrently, and
+        # gpu_profiler's phase STACK would report whichever thread moved last.
+        # The census is what lets [gpu-residency] say whether every card being
+        # empty was all slots in envstep (the retriever) or all slots in
+        # preproc (the driver's own Python) -- opposite fixes, identical on the
+        # GPU. Cost is one dict update per turn per slot.
+        with gpu_profiler.activity("preproc"):
+            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, active_mask=_pre_active_mask)
 
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -1323,7 +1330,11 @@ class TrajectoryCollector:
         # pad to be divisible by dp_size
         batch_input_padded, pad_size = pad_dataproto_to_divisor(active_batch_input, actor_rollout_wg.world_size)
         _gw0 = gpu_profiler.now()
-        batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
+        # Counted too, so "every card empty while every slot is in gen" is
+        # distinguishable from the others: that one means the engine drained,
+        # not that the driver went somewhere else.
+        with gpu_profiler.activity("gen"):
+            batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
         _gw1 = gpu_profiler.now()
         if turn_records is not None:
             _prompt_tok, _gen_tok = _token_counts(batch_input_padded, batch_output_padded)
@@ -1340,24 +1351,28 @@ class TrajectoryCollector:
 
         batch = batch.union(batch_output)
 
-        if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:
-            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-        else:
-            # Decode only the generated rows; finished rows' scattered filler
-            # is pad-only, which batch_decode(skip_special_tokens=True) would
-            # render as '' anyway.
-            active_actions = self.tokenizer.batch_decode(
-                active_batch_output.batch['responses'], skip_special_tokens=True
-            )
-            text_actions = [''] * batch_size
-            for pos, idx in enumerate(active_idx):
-                text_actions[idx] = active_actions[pos]
+        with gpu_profiler.activity("decode"):
+            if generate_all or not _ROLLOUT_DECODE_ACTIVE_ONLY:
+                text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+            else:
+                # Decode only the generated rows; finished rows' scattered filler
+                # is pad-only, which batch_decode(skip_special_tokens=True) would
+                # render as '' anyway.
+                active_actions = self.tokenizer.batch_decode(
+                    active_batch_output.batch['responses'], skip_special_tokens=True
+                )
+                text_actions = [''] * batch_size
+                for pos, idx in enumerate(active_idx):
+                    text_actions[idx] = active_actions[pos]
         _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
 
         def _step_envs():
-            if task is None:
-                return envs.step(text_actions)
-            return envs.step(text_actions, tasks=[task])
+            # Tagged inside the callable so the prefetch path, which runs this
+            # on a worker thread, is counted where it actually runs.
+            with gpu_profiler.activity("envstep"):
+                if task is None:
+                    return envs.step(text_actions)
+                return envs.step(text_actions, tasks=[task])
 
         if self._logprob_prefetch_enabled and self._logprob_pending:
             # Overlap: envs.step (CPU/HTTP/IPC, GPU idle) runs in a background

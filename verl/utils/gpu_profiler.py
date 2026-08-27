@@ -94,10 +94,12 @@ Env vars
 """
 
 import atexit
+import contextlib
 import os
 import re
 import threading
 import time
+from typing import Dict
 from collections import defaultdict
 
 # Leading alignment flag + field width of a format spec such as ">9.0f".
@@ -143,6 +145,42 @@ _KIB_TO_MB = 1024.0 / (1000.0 * 1000.0)  # NVML NVLink counters are KiB
 # sample intervals are treated as different blocks of that phase, so an idle
 # stretch is never reported across a busy phase that ran in between.
 _CONTIGUITY_SLACK = 2.0
+
+
+# What the driver's threads are doing, counted rather than stacked.
+#
+# push_phase/pop_phase keep a single list, which is correct for one training
+# thread and meaningless for validation: three pipeline slots push and pop
+# concurrently and the top of the stack becomes whichever thread moved last.
+#
+# The question that decides where the remaining idle comes from is not "which
+# phase" but "how many slots were in each at once" -- every card empty while
+# all three slots sit in envstep is the environment, and the same picture while
+# they sit in preproc is the driver's own Python. A counter answers that; a
+# stack cannot.
+_ACTIVITY_LOCK = threading.Lock()
+_ACTIVITY: Dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def activity(name: str):
+    """Count this thread as being in ``name`` for as long as the block runs."""
+    with _ACTIVITY_LOCK:
+        _ACTIVITY[name] = _ACTIVITY.get(name, 0) + 1
+    try:
+        yield
+    finally:
+        with _ACTIVITY_LOCK:
+            remaining = _ACTIVITY.get(name, 0) - 1
+            if remaining > 0:
+                _ACTIVITY[name] = remaining
+            else:
+                _ACTIVITY.pop(name, None)
+
+
+def activity_snapshot() -> Dict[str, int]:
+    with _ACTIVITY_LOCK:
+        return dict(_ACTIVITY)
 
 
 def now() -> float:
@@ -412,6 +450,7 @@ class _Sampler:
         # lightweight ring of (ts, mean_sm_util) for mean_util_between()
         self._util_trace = []
         self._cpu_trace = []
+        self._act_trace = []
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -472,6 +511,7 @@ class _Sampler:
                 # Kept in its own list rather than widened into the tuple above,
                 # which two other readers unpack by shape.
                 self._cpu_trace.append((t, (host or {}).get("cpu_pct")))
+                self._act_trace.append((t, activity_snapshot()))
             self._write_trace(t, phase, per_gpu, host)
 
     def _write_trace(self, t, phase, per_gpu, host):
@@ -574,9 +614,18 @@ class _Sampler:
         busy_ts = {ts for ts, vals in window if sum(1 for v in vals if v is not None and v >= thresh) == n_gpus}
         with self._lock:
             cpu_at = {ts: pct for ts, pct in self._cpu_trace if pct is not None}
+            act_at = dict(self._act_trace)
         def _mean(stamps):
             vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
             return (sum(vals) / len(vals)) if vals else None
+
+        def _census(stamps, table):
+            """Mean number of threads in each activity, over these samples."""
+            seen = [table[ts] for ts in stamps if ts in table]
+            if not seen:
+                return None
+            names = {k for snap in seen for k in snap}
+            return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
         return {
             "n_gpus": n_gpus,
             "samples": total,
@@ -587,6 +636,8 @@ class _Sampler:
             "per_gpu": per_gpu,
             "cpu_when_empty": _mean(empty_ts),
             "cpu_when_busy": _mean(busy_ts),
+            "activity_when_empty": _census(empty_ts, act_at),
+            "activity_when_busy": _census(busy_ts, act_at),
         }
 
     def per_gpu_util_between(self, t0, t1):
@@ -612,6 +663,7 @@ class _Sampler:
             self._samples = []
             self._util_trace = []
             self._cpu_trace = []
+            self._act_trace = []
         if not samples:
             return
         by_phase = _accumulate(samples, self.n_gpus)
@@ -753,13 +805,36 @@ def format_residency(res) -> str:
         cols = " ".join("--" if v is None else f"{v:.0f}" for v in per_gpu)
         spread = f" | per-gpu {cols} (spread {max(known) - min(known):.0f} pt)"
     why = ""
+    # What the slots were DOING when every card was empty. This is the evidence;
+    # CPU is a corroborating number, not a verdict on its own. A driver using
+    # CPU is not the same claim as a driver holding the GIL -- a Rust tokeniser
+    # releases it and still reads as busy, and native BLAS reads as several
+    # cores. Naming the activity says which it was.
+    census = res.get("activity_when_empty")
+    if census:
+        ranked = sorted(census.items(), key=lambda kv: -kv[1])
+        shown = ", ".join(f"{k} {v:.1f}" for k, v in ranked if v >= 0.05) or "nothing recorded"
+        top = ranked[0][0] if ranked and ranked[0][1] >= 0.5 else None
+        verdict = {
+            "envstep": "the ENVIRONMENT (retriever round trip) -- off the box",
+            "preproc": "the DRIVER's own Python (tokenising)",
+            "decode":  "the DRIVER's own Python (detokenising)",
+            "gen":     "inside generate, so the engine is drained rather than idle",
+        }.get(top)
+        why = f"\n[gpu-residency] while EMPTY the slots were in: {shown}"
+        if verdict:
+            why += f" -> EMPTY is {verdict}"
+        else:
+            why += " -> no single activity dominates; EMPTY is between slots, not inside one"
     empty_cpu, busy_cpu = res.get("cpu_when_empty"), res.get("cpu_when_busy")
     if empty_cpu is not None and busy_cpu is not None:
-        # 100% is one core. Python that is holding the GIL shows up here; a
-        # process waiting on a socket does not.
-        verdict = "Python on the driver" if empty_cpu >= 60 else "a wait OFF the box (retriever, RPC)"
-        why = (f"\n[gpu-residency] driver CPU {empty_cpu:.0f}% of one core while EMPTY "
-               f"vs {busy_cpu:.0f}% while busy -> EMPTY is {verdict}")
+        # 100% is one core. Reported, not interpreted: near zero means the
+        # process was blocked on something, and high means it was running --
+        # but "running" does not distinguish GIL-bound Python from native code
+        # that released it, which is what the census above is for.
+        why += (f"\n[gpu-residency] driver CPU {empty_cpu:.0f}% of one core while EMPTY "
+                f"vs {busy_cpu:.0f}% while busy "
+                f"({'blocked' if empty_cpu < 20 else 'running'} during EMPTY)")
     return (
         f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
         f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
