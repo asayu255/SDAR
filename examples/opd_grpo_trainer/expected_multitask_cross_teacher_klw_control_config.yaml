@@ -196,11 +196,16 @@
 
 # ---- run identity ------------------------------------------------------------------
 "trainer.total_training_steps": 300
-"trainer.project_name": verl_agent_opd_grpo_cross_teacher_klw
+"trainer.project_name": verl_agent_opd_grpo_cross_teacher_klw$RUN_TAG_SUFFIX
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
 # name for a different config) requires touching this file next to the knobs.
-"trainer.experiment_name": opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b
-
+#
+# $RUN_TAG_SUFFIX on both names is the run script's RUN_TAG, resolved out of the
+# environment by load_expectations' os.path.expandvars. It is empty when the tag
+# is unset, so an untagged run pins exactly the name it always did. What the
+# suffix does NOT do is unpin the name: the base is still checked, so a typo
+# fails the run in seconds rather than after two hours in the wrong chart.
+"trainer.experiment_name": opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b$RUN_TAG_SUFFIX
 # ---- cross-teacher sign agreement --------------------------------------------
 # THE CONTROL. Same code path, same seed, same rollouts, same 0.01 coefficient;
 # the weight is off. It is not an ablation -- it is the only run this arm can be

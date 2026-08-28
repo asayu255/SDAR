@@ -79,6 +79,15 @@ def _overrides(path):
     # OmegaConf as an INTERPOLATION, which fails to resolve and takes the whole
     # compose down -- a shell construct read as a config reference.
     cmd = re.sub(r"\$\{(\w+):\+[^}]*\}", "", cmd)
+    # RUN_TAG_SUFFIX is the derived form of that same construct, and the scripts
+    # now put it on the wandb names as well as the paths. Resolved from the
+    # environment with an empty default -- the SAME rule load_expectations uses,
+    # so the value a script passes and the value its lock expects agree by
+    # construction instead of by two tests remembering to set the variable.
+    # expandvars would leave an absent variable in the string verbatim, and the
+    # lock would then be compared against a literal "$RUN_TAG_SUFFIX".
+    cmd = cmd.replace("${RUN_TAG_SUFFIX}", os.environ.get("RUN_TAG_SUFFIX", ""))
+    cmd = cmd.replace("$RUN_TAG_SUFFIX", os.environ.get("RUN_TAG_SUFFIX", ""))
 
     def _unquote(tok):
         # The shell removes a matching pair of surrounding quotes before Hydra
@@ -196,3 +205,44 @@ def test_no_script_exports_expandable_segments():
             if "PYTORCH_CUDA_ALLOC_CONF" in stripped and "expandable_segments:True" in stripped:
                 offenders.append(os.path.relpath(path, REPO))
     assert not offenders, f"expandable_segments is incompatible with vLLM sleep mode: {offenders}"
+
+
+@pytest.mark.parametrize("tag_suffix", ["", "_v2"], ids=["untagged", "tagged"])
+@pytest.mark.parametrize("path", COMPOSED_SCRIPTS)
+def test_the_composed_script_satisfies_its_own_intent_lock(path, tag_suffix, monkeypatch):
+    """Compose the script, then run the lock it names against the result.
+
+    Composing proves Hydra accepts the overrides; it does not prove the run
+    STARTS. main_opd enforces the expectations file after its own injection, and
+    a script whose pinned values drifted from the lock dies there -- seconds in,
+    but only once someone launches it on a cluster.
+
+    Both tag settings, because RUN_TAG now moves the wandb names: the script
+    appends $RUN_TAG_SUFFIX and the lock has to expect the same thing. Get that
+    pair wrong in either direction and every tagged run refuses to start, which
+    is a worse failure than the collision the tag was added to prevent.
+    """
+    from verl.trainer.main_opd import inject_opd_config
+    from verl.trainer.main_opd_grpo import inject_opd_grpo_config
+    from verl.utils.expected_config import enforce_expected_config
+
+    monkeypatch.setenv("RUN_TAG_SUFFIX", tag_suffix)
+    overrides = _overrides(path)
+    assert overrides is not None, path
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        config = compose(config_name=CONFIG_NAME, overrides=overrides)
+    # The lock runs on the EFFECTIVE config, so the entry point's injection has
+    # to happen first -- it is what supplies the keys the lock pins that no
+    # script passes (pg_loss_coef=0 on the pure arm, the cross-teacher block).
+    # Checking the raw composed config instead would fail on every arm and prove
+    # nothing about any of them.
+    inject = inject_opd_grpo_config if "opd_grpo_trainer/" in path else inject_opd_config
+    inject(config)
+    lock = config.trainer.get("expected_config", None)
+    if not lock:
+        pytest.skip(f"{path} pins no expectations file")
+    # The two names are the point of this parametrisation, so read them back
+    # rather than trusting the lock's silence.
+    assert str(config.trainer.project_name).endswith(tag_suffix)
+    assert str(config.trainer.experiment_name).endswith(tag_suffix)
+    assert enforce_expected_config(config, os.path.join(REPO, lock), tag="test:lock") > 0

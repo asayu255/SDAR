@@ -613,13 +613,24 @@ export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 # the final step and exits with nothing done. That is not an error and prints no
 # warning, which is how it is mistaken for a launch failure.
 #
-# The tag deliberately does not touch experiment_name or project_name: those are
-# pinned in the intent lock as the identity of the CONFIG, and a re-run of the
-# same arm is the same experiment. Only the two $HOME-derived paths move, which
-# is why they are the two the lock leaves unpinned.
+# The tag moves FOUR things: the two $HOME-derived directories and the two wandb
+# names. The directories so a re-run does not resume the finished one; the names
+# because a re-run that lands in the finished run's project and under its
+# experiment name is indistinguishable from it in the charts -- the same mistake
+# one layer up, two runs of one arm reported as one.
+#
+# The names stay PINNED even so. The lock expects the base plus this same
+# suffix, which os.path.expandvars resolves out of the environment when the
+# expectations file is read, so a typo in the base still fails the run in
+# seconds. What the tag buys is a separate place to look, not an unchecked name.
 #
 #   RUN_TAG=v2 bash <this script> ...   -> $HOME/checkpoints/<arm>_v2
+#                                          wandb <project>_v2 / <experiment>_v2
+#
+# The suffix is derived once, here, and RUN_TAG_SUFFIX is the only spelling used
+# below -- including by the lock, which cannot read bash's ${VAR:+text}.
 export RUN_TAG=${RUN_TAG:-}
+export RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
 
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
@@ -751,13 +762,13 @@ python3 -m verl.trainer.main_opd_grpo \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_opd_grpo_signweight_multitask' \
-    trainer.experiment_name=opd_grpo_multitask_signweight_position_qwen3_1.7b \
+    trainer.project_name="verl_agent_opd_grpo_signweight_multitask$RUN_TAG_SUFFIX" \
+    trainer.experiment_name="opd_grpo_multitask_signweight_position_qwen3_1.7b$RUN_TAG_SUFFIX" \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_position_multitask${RUN_TAG:+_$RUN_TAG} \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_signweight_position_qwen3_1.7b${RUN_TAG:+_$RUN_TAG} \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_position_multitask$RUN_TAG_SUFFIX \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_signweight_position_qwen3_1.7b$RUN_TAG_SUFFIX \
     trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_signweight_position_qwen3_1.7b \
     trainer.save_freq=25 \
     trainer.test_freq=150 \

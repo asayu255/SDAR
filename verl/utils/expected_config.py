@@ -115,7 +115,23 @@ def load_expectations(expect_file: str) -> Dict[str, Any]:
     # Expectation values may reference the home directory ("$HOME/checkpoints/..."),
     # so one file pins the same teacher on machines whose home is not in the same
     # place. What the lock is asserting is *which* checkpoint, not where $HOME is.
-    return {k: os.path.expandvars(os.path.expanduser(v)) if isinstance(v, str) else v for k, v in flat.items()}
+    #
+    # RUN_TAG_SUFFIX is the same idea for the run's own identity: the run scripts
+    # append it to the wandb project and experiment names so a re-run of an arm
+    # gets its own place in the charts, and the lock has to expect the name the
+    # script actually passes. Substituted here rather than left to expandvars,
+    # which leaves an ABSENT variable in the string verbatim -- an untagged run,
+    # or a direct `python -m verl.trainer.main_opd`, would then be checked against
+    # a literal "$RUN_TAG_SUFFIX" and fail. Empty is what an unset RUN_TAG means,
+    # so the default is said once here instead of in every caller.
+    suffix = os.environ.get("RUN_TAG_SUFFIX", "")
+
+    def _expand(value: str) -> str:
+        for spelling in ("${RUN_TAG_SUFFIX}", "$RUN_TAG_SUFFIX"):
+            value = value.replace(spelling, suffix)
+        return os.path.expandvars(os.path.expanduser(value))
+
+    return {k: _expand(v) if isinstance(v, str) else v for k, v in flat.items()}
 
 
 def waived_keys() -> List[str]:

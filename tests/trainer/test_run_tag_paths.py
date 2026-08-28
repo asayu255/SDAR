@@ -20,8 +20,10 @@ SCRIPTS = sorted(
     p for p in ROOT.glob("examples/opd*_trainer/run_*.sh")
     if "trainer.default_local_dir=" in p.read_text()
 )
-TAGGED = ("trainer.default_local_dir", "trainer.val_instance_log_dir")
-UNTAGGED = ("trainer.experiment_name", "trainer.project_name")
+TAGGED = (
+    "trainer.default_local_dir", "trainer.val_instance_log_dir",
+    "trainer.project_name", "trainer.experiment_name",
+)
 
 
 def _assign(text, key):
@@ -31,9 +33,14 @@ def _assign(text, key):
 
 
 def _expand(value, home, tag):
-    """What the shell would produce for this assignment."""
+    """What the shell would produce for this assignment.
+
+    RUN_TAG_SUFFIX is derived exactly as the scripts derive it, so the test is
+    reading the same definition rather than a second copy of it.
+    """
     out = subprocess.run(
-        ["bash", "-c", f'HOME={home} RUN_TAG={tag!r}; echo "{value}"'],
+        ["bash", "-c",
+         f'HOME={home} RUN_TAG={tag!r}; RUN_TAG_SUFFIX="${{RUN_TAG:+_$RUN_TAG}}"; echo "{value}"'],
         capture_output=True, text=True, check=True,
     )
     return out.stdout.strip()
@@ -45,14 +52,14 @@ def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
     text = script.read_text()
     for key in TAGGED:
         raw = _assign(text, key)
-        assert "${RUN_TAG:+_$RUN_TAG}" in raw, key
-        plain = raw.replace("${RUN_TAG:+_$RUN_TAG}", "")
+        assert "$RUN_TAG_SUFFIX" in raw, key
+        plain = raw.replace("$RUN_TAG_SUFFIX", "")
         assert _expand(raw, "/h", "") == _expand(plain, "/h", "")
         assert not _expand(raw, "/h", "").endswith("_")
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
-def test_a_set_tag_moves_both_directories(script):
+def test_a_set_tag_moves_every_tagged_value(script):
     text = script.read_text()
     for key in TAGGED:
         raw = _assign(text, key)
@@ -60,13 +67,22 @@ def test_a_set_tag_moves_both_directories(script):
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
-def test_the_tag_does_not_touch_the_pinned_run_identity(script):
-    """experiment_name and project_name are pinned in the intent lock as the
-    identity of the CONFIG. Suffixing them would make every tagged run fail the
-    lock, which is the check that catches a mislabelled multi-hour run."""
+def test_the_lock_expects_the_same_suffixed_name_the_script_passes(script):
+    """Suffixing the wandb names without teaching the lock would make every
+    tagged run fail the check that catches a mislabelled multi-hour run. The
+    lock has to carry the suffix too, and against the SAME base."""
+    import re as _re
+
     text = script.read_text()
-    for key in UNTAGGED:
-        assert "RUN_TAG" not in _assign(text, key), key
+    lock = _re.search(r"\+trainer\.expected_config=(\S+)", text)
+    assert lock, "the arm does not pin an expectations file"
+    expected = (ROOT / lock.group(1)).read_text()
+    for key in ("trainer.project_name", "trainer.experiment_name"):
+        passed = _assign(text, key).strip('"')
+        pinned = _re.search(rf'^"{_re.escape(key)}":\s*(\S+)\s*$', expected, _re.M)
+        assert pinned, f"{key} is not pinned in {lock.group(1)}"
+        assert pinned.group(1) == passed, (key, pinned.group(1), passed)
+        assert passed.endswith("$RUN_TAG_SUFFIX"), key
 
 
 def test_every_arm_still_has_its_own_untagged_directory():
