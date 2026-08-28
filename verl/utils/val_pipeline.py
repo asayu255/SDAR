@@ -42,7 +42,7 @@ matter.
 import contextlib
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
 from typing import Any, Callable, Iterable, List, Optional
 
 
@@ -166,8 +166,29 @@ def run_pipelined(
         return
 
     executor = ThreadPoolExecutor(max_workers=len(slots), thread_name_prefix="val-slot")
-    inflight = []  # [(prepared, future, slot)] oldest first -- also the retirement order
+    # A SLOT IS RELEASED WHEN ITS OWN BATCH FINISHES, NOT WHEN ITS TURN COMES.
+    #
+    # This used to be a list retired oldest-first: retire() popped inflight[0]
+    # and blocked on that future, so slots belonging to batches that had already
+    # finished stayed out of `free` until every older batch was collected. Head
+    # of line blocking, and not a small one -- an alfworld batch runs 239.7 s
+    # (126 rows to 50 turns) against a search batch's ~65 s, so while alfworld
+    # sat at the head, three finished search slots were unusable for as much as
+    # 175 s and a four-slot pipeline ran as one. That is the signature the
+    # profiler kept reporting: TAIL_BLOCKS_READY, ready=1, gen_inflight=1..4 --
+    # a handful of requests being alfworld's late turns, with everything else
+    # idle behind it.
+    #
+    # WHAT DOES NOT CHANGE: results are still handed back in submission order,
+    # the caller still accumulates on this thread, and a slot is still released
+    # only after its own future has RESOLVED -- never while its rollout is
+    # running, which would let two batches share one environment manager. The
+    # rows scored, and their order, are identical.
+    inflight = {}     # seq -> (prepared, future, slot); insertion order = submission order
+    finished = {}     # seq -> (prepared, result), resolved but not yet handed back
     free = list(slots)
+    next_seq = 0      # the next batch to submit
+    next_out = 0      # the next batch to hand back
 
     # Where the wall clock goes. The per-batch tables measure inside a rollout
     # and the occupancy ratio averages the slots, so neither can see the state
@@ -185,26 +206,31 @@ def run_pipelined(
         finally:
             spans.append((started, time.perf_counter()))
 
-    def retire():
-        """Finish the oldest batch, hand it back, and free its slot."""
-        prepared, future, slot = inflight.pop(0)
+    def harvest():
+        """Free the slot of every batch whose future has resolved.
+
+        future.result() is called here rather than at hand-back time, so a
+        rollout that raised raises on this thread as it did before -- just
+        earlier, and still before anything after it is yielded.
+        """
+        for seq in [s for s, (_p, fut, _s) in inflight.items() if fut.done()]:
+            prepared, future, slot = inflight.pop(seq)
+            finished[seq] = (prepared, future.result())
+            free.append(slot)
+
+    def wait_for_one():
+        """Block until at least one more batch finishes, then free its slot."""
+        pending = [fut for _p, fut, _s in inflight.values()]
         waited = time.perf_counter()
         try:
-            # Counted, because the stack sampler already found this thread
-            # parked here while every card was idle and the census could not
-            # see it: it is in no tagged phase and burns no CPU.
+            # Counted, because the stack sampler found this thread parked here
+            # while every card was idle and the census could not see it: it is
+            # in no tagged phase and burns no CPU.
             with _gauge("future_wait"):
-                result = future.result()
+                futures_wait(pending, return_when=FIRST_COMPLETED)
         finally:
             clock["retire_wait"] += time.perf_counter() - waited
-            free.append(slot)
-        return prepared, result
-
-    def handed_back():
-        """Yield one retired batch and charge the caller's time to the caller."""
-        payload = retire()
-        resumed = time.perf_counter()
-        return payload, resumed
+        harvest()
 
     @contextlib.contextmanager
     def _scoring():
@@ -262,6 +288,7 @@ def run_pipelined(
                 prepared = prepare(item)
             clock["prepare"] += time.perf_counter() - _t
             task = task_of(prepared)
+
             # THE GAUGE THE CLASSIFIER TURNS ON. From here until the batch is
             # submitted there is a whole batch of work that exists and is not
             # with the engine. If the cards go idle in this window it is not the
@@ -269,32 +296,63 @@ def run_pipelined(
             # that is the difference between RETRIEVER DEPENDENCY and SCHEDULER
             # STARVATION, and the two look identical on the device.
             with _gauge("ready"):
-                # Retire until a slot this batch can use is free. A batch whose
-                # task only one slot serves waits for that slot specifically,
-                # which is why this drains rather than picking any free one.
-                while True:
+                slot = None
+                while slot is None:
+                    harvest()
+                    # A batch whose task only one slot serves waits for that
+                    # slot specifically, which is why this looks for an
+                    # acceptor rather than taking whatever is free.
                     slot = next((candidate for candidate in free if candidate.accepts(task)), None)
                     if slot is not None:
                         break
                     if not inflight:
                         raise RuntimeError(f"no slot can run task {task!r}: {slots}")
-                    payload, resumed = handed_back()
-                    with _scoring():
-                        yield payload
-                    clock["consumer"] += time.perf_counter() - resumed
-                    maybe_report()
+                    # Hand back whatever is already in order before blocking:
+                    # the caller's scoring then runs while the slots are busy
+                    # rather than after they have gone idle.
+                    while next_out in finished:
+                        payload = finished.pop(next_out)
+                        next_out += 1
+                        resumed = time.perf_counter()
+                        with _scoring():
+                            yield payload
+                        clock["consumer"] += time.perf_counter() - resumed
+                        maybe_report()
+                    if free and any(candidate.accepts(task) for candidate in free):
+                        continue
+                    if inflight:
+                        wait_for_one()
             free.remove(slot)
-            inflight.append((prepared, executor.submit(timed_launch, prepared, slot), slot))
-        while inflight:
-            payload, resumed = handed_back()
-            with _scoring():
-                yield payload
-            clock["consumer"] += time.perf_counter() - resumed
-            maybe_report()
+            inflight[next_seq] = (prepared, executor.submit(timed_launch, prepared, slot), slot)
+            next_seq += 1
+
+            # Submitted first, scored second: the new batch is already running
+            # while the caller accumulates the finished ones.
+            while next_out in finished:
+                payload = finished.pop(next_out)
+                next_out += 1
+                resumed = time.perf_counter()
+                with _scoring():
+                    yield payload
+                clock["consumer"] += time.perf_counter() - resumed
+                maybe_report()
+
+        while inflight or finished:
+            harvest()
+            while next_out in finished:
+                payload = finished.pop(next_out)
+                next_out += 1
+                resumed = time.perf_counter()
+                with _scoring():
+                    yield payload
+                clock["consumer"] += time.perf_counter() - resumed
+                maybe_report()
+            if inflight and next_out not in finished:
+                wait_for_one()
     finally:
         report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.
-        for _, future, _ in inflight:
+        for _prepared, future, _slot in inflight.values():
             future.cancel()
         executor.shutdown(wait=True)

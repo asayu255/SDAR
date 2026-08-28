@@ -500,3 +500,142 @@ def test_the_loader_is_not_charged_to_prepare(capsys):
     prepare = float(out.split("prepare ")[1].split("s,")[0])
     assert dataload >= 0.14
     assert prepare < 0.05
+
+
+# --------------------------------------------------------------------------- #
+# A slot is released when ITS OWN batch finishes
+# --------------------------------------------------------------------------- #
+def test_a_finished_batch_frees_its_slot_while_an_older_one_is_still_running():
+    """The head-of-line block, in the shape the real run had it.
+
+    An alfworld batch runs 239.7 s against a search batch's ~65 s. Retiring
+    oldest-first meant that while alfworld sat at the head of the queue, every
+    slot behind it that had already finished stayed unusable -- so a four-slot
+    pipeline ran as one for as long as alfworld took. The profiler reported it
+    as TAIL_BLOCKS_READY with ready=1 and gen_inflight=1..4, those few requests
+    being alfworld's late turns.
+    """
+    import threading
+
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(3)]
+    hold_first = threading.Event()
+    concurrent, lock = [], threading.Lock()
+    running = {"n": 0}
+
+    def launch(item, _slot):
+        with lock:
+            running["n"] += 1
+            concurrent.append(running["n"])
+        try:
+            if item == 0:
+                hold_first.wait(10)      # the long batch, at the head
+            else:
+                time.sleep(0.05)
+            return item
+        finally:
+            with lock:
+                running["n"] -= 1
+
+    out = []
+
+    def consume():
+        for _prepared, result in run_pipelined(range(9), lambda x: x, lambda _p: None, launch, slots):
+            out.append(result)
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    # Give the pipeline time to cycle the two free slots through the short
+    # batches while the long one is still held.
+    time.sleep(1.0)
+    submitted_while_blocked = len(concurrent)
+    hold_first.set()
+    thread.join(20)
+    assert not thread.is_alive()
+
+    # Three slots, one of them stuck: the other two must have run repeatedly.
+    assert submitted_while_blocked >= 5, (
+        f"only {submitted_while_blocked} launches while the head was blocked -- "
+        "the finished slots were not being recycled"
+    )
+    assert out == list(range(9)), out          # still submission order
+    assert max(concurrent) <= len(slots)       # and never more than the slots
+
+
+def test_results_come_back_in_submission_order_even_when_completion_is_reversed():
+    """Out-of-order release must not become out-of-order scoring.
+
+    The rows scored and their order are what the numbers rest on; only the
+    slot's reuse moves.
+    """
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(4)]
+
+    def launch(item, _slot):
+        time.sleep(0.20 - 0.02 * item)   # earlier items finish LAST
+        return item
+
+    out = [result for _prepared, result in
+           run_pipelined(range(8), lambda x: x, lambda _p: None, launch, slots)]
+    assert out == list(range(8)), out
+
+
+def test_a_slot_is_never_reused_before_its_own_batch_returns():
+    """Two batches on one environment manager would interleave their state."""
+    import threading
+
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(3)]
+    lock = threading.Lock()
+    occupied, clashes = set(), []
+
+    def launch(item, slot):
+        with lock:
+            if slot.name in occupied:
+                clashes.append((slot.name, item))
+            occupied.add(slot.name)
+        time.sleep(0.02 + 0.01 * (item % 4))
+        with lock:
+            occupied.discard(slot.name)
+        return item
+
+    out = [r for _p, r in run_pipelined(range(24), lambda x: x, lambda _p: None, launch, slots)]
+    assert not clashes, clashes
+    assert out == list(range(24))
+
+
+def test_a_task_restricted_slot_is_still_waited_for_specifically():
+    """alfworld has one manager; a search slot cannot stand in for it."""
+    slots = [Slot("primary", envs=None, collector=None),
+             Slot("extra-1", envs=None, collector=None, tasks=["search"])]
+    seen = []
+
+    def launch(item, slot):
+        seen.append((item, slot.name))
+        time.sleep(0.02)
+        return item
+
+    items = ["search", "search", "alfworld", "search", "alfworld"]
+    out = [r for _p, r in run_pipelined(items, lambda x: x, lambda x: x, launch, slots)]
+    assert out == items
+    assert all(name == "primary" for task, name in seen if task == "alfworld")
+
+
+def test_an_impossible_task_still_raises_rather_than_hanging():
+    slots = [Slot("extra-1", envs=None, collector=None, tasks=["search"])]
+    two = [Slot("a", envs=None, collector=None, tasks=["search"]),
+           Slot("b", envs=None, collector=None, tasks=["search"])]
+    with pytest.raises(RuntimeError, match="no slot can run task"):
+        list(run_pipelined(["search", "alfworld"], lambda x: x, lambda x: x,
+                              lambda _p, _s: None, two))
+    assert slots  # (the single-slot path is inline and unchanged)
+
+
+def test_a_rollout_that_raises_still_raises_on_the_calling_thread():
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(3)]
+
+    def launch(item, _slot):
+        if item == 3:
+            raise ValueError("rollout blew up")
+        time.sleep(0.01)
+        return item
+
+    with pytest.raises(ValueError, match="rollout blew up"):
+        list(run_pipelined(range(8), lambda x: x, lambda _p: None, launch, slots))

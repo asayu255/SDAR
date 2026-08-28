@@ -673,10 +673,15 @@ def test_a_thread_waiting_inside_repo_code_names_both_frames():
     assert joined, keys
     assert any(k.split(" <- ")[1].startswith("threading.py") for k in joined), keys
     assert any("test_gpu_residency.py" in k.split(" <- ")[0] for k in joined), keys
-    # The calling thread, which the census could never see: parked in retire()
-    # waiting on the future. This is a real finding, not scaffolding -- an
+    # The calling thread, which the census could never see: parked in
+    # val_pipeline waiting on a future. A real finding, not scaffolding -- an
     # untagged thread that is blocked, not running.
-    assert any("val_pipeline.py" in k and "retire" in k for k in keys), keys
+    #
+    # Matched on the FILE, not the function: it used to be retire() and is now
+    # wait_for_one(), because retiring oldest-first was the head-of-line block.
+    # Pinning the function name would make a rename fail a test about the
+    # sampler.
+    assert any("val_pipeline.py" in k and " <- " in k for k in keys), keys
 
 
 def test_the_stacks_are_aggregated_over_the_empty_samples_only():
