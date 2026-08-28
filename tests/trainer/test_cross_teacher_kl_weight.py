@@ -3959,3 +3959,56 @@ def test_the_per_source_push_column_differs_across_the_sources_of_one_candidate(
     for v in shared:
         totals = {round(r["extra_logit_push"], 12) for r in v.values()}
         assert len(totals) == 1, "the TOTAL, by contrast, is a property of the candidate"
+
+
+def _indented_block(src: str, header: str) -> str:
+    """The lines under ``header``, by indentation. Source-level because the real
+    path is GPU-only, and this is the boundary a CPU suite can still police."""
+    lines = src.split("\n")
+    i = next(k for k, l in enumerate(lines) if header in l)
+    indent = len(lines[i]) - len(lines[i].lstrip())
+    j = next(
+        (k for k in range(i + 1, len(lines))
+         if lines[k].strip() and (len(lines[k]) - len(lines[k].lstrip())) <= indent),
+        len(lines),
+    )
+    return "\n".join(lines[i:j])
+
+
+def test_the_cross_teacher_block_never_reads_the_sign_arms_stash():
+    """sign_cand_inputs is built inside `if sign_enabled:` and is None whenever
+    sign_weight.enable is off.
+
+    This arm is a DIFFERENT mechanism and runs with the sign arm off, so every
+    read of that dict here is a crash -- and one that hides until step 2: at step
+    1 no cumulative RMS exists, xt_built stays None, and the block that reads it
+    never opens. The cross-teacher arm therefore died at step 2 on the first real
+    launch, after 13 minutes of rollout, having passed every test in this file.
+
+    The two names it actually needs are the ones the arm already asserts are
+    present at the top of `if xt_enabled:`.
+    """
+    src = _update_policy_source()
+    block = _indented_block(src, "if xt_built is not None and xt_collect:")
+    assert "sign_push" not in block  # sanity: the slice is not empty
+    assert "_xt_token_tables(" in block, "the slice missed the token tables"
+    assert "xt_push_token_stats.update(" in block, "the slice missed the push table"
+    assert "sign_cand_inputs" not in block, (
+        "the cross-teacher block reads the sign arm's stash; it is None when "
+        "sign_weight.enable is off, which is how this arm runs"
+    )
+    for name in ("sign_support_ids", "sign_on_task_logprobs"):
+        assert name in block, name
+
+
+def test_the_names_the_cross_teacher_block_uses_are_asserted_before_it_reads_them():
+    """The assert at the top of the arm's own block is what makes those two names
+    safe to dereference a hundred lines below. Order, not just presence: an
+    assert that ran after the read would document an invariant the code has
+    already violated."""
+    src = _update_policy_source()
+    guard = src.index(
+        "assert sign_support_ids is not None and sign_on_task_logprobs is not None"
+    )
+    reader = src.index("if xt_built is not None and xt_collect:")
+    assert guard < reader

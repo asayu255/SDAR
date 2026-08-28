@@ -3128,6 +3128,14 @@ class DataParallelPPOActor(BasePPOActor):
                                     xt_state_shift_terms(chan, teacher_kld),
                                     response_mask=response_mask, task_ids=task_ids,
                                 )
+                        # sign_support_ids / sign_on_task_logprobs directly, NOT
+                        # sign_cand_inputs: that dict is the SIGN arm's stash and is
+                        # None whenever sign_weight.enable is off. This arm is a
+                        # different mechanism and runs with it off, so reading it here
+                        # crashed the cross-teacher arm at step 2 -- step 1 survives
+                        # only because no RMS exists yet, xt_built is None, and this
+                        # block never opens. The two names it needs are the ones
+                        # xt_enabled already asserts are present, a hundred lines up.
                         if xt_built is not None and xt_collect:
                             # Built once here whether or not the dense push
                             # table is on: the event rows carry the same two
@@ -3135,7 +3143,7 @@ class DataParallelPPOActor(BasePPOActor):
                             _push_for_events = (
                                 opd_logit_push(
                                     student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_cand_inputs["on_task_logprob"],
+                                    teacher_logprob=sign_on_task_logprobs,
                                     teacher_kl=teacher_kld,
                                     coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
                                 )
@@ -3144,9 +3152,9 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             self._xt_token_tables(
                                 built=xt_built, teacher_kl=teacher_kld, data=data,
-                                support_ids=sign_cand_inputs["support_ids"],
+                                support_ids=sign_support_ids,
                                 student_topk_logprob=student_topk_logprobs,
-                                on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                on_task_logprob=sign_on_task_logprobs,
                                 response_mask=response_mask, task_ids=task_ids,
                                 report_epsilon=xt_report_eps,
                                 tables=(
@@ -3163,7 +3171,7 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             if xt_role_token_stats is not None and xt_roles_mb is not None:
                                 xt_role_token_stats.update(
-                                    support_ids=sign_cand_inputs["support_ids"],
+                                    support_ids=sign_support_ids,
                                     roles=xt_roles_mb,
                                     effect=per_candidate_shift(xt_built, teacher_kld),
                                     response_mask=response_mask,
@@ -3180,13 +3188,13 @@ class DataParallelPPOActor(BasePPOActor):
                                 _y1 = data["responses"].unsqueeze(-1)
                                 _push = _push_for_events
                                 xt_push_token_stats.update(
-                                    support_ids=sign_cand_inputs["support_ids"],
+                                    support_ids=sign_support_ids,
                                     g0=_push["g0"],
                                     weight=xt_built["weight"],
                                     coef_applied_weight=xt_built["weight"],
                                     response_mask=response_mask, task_ids=task_ids,
                                     sampled_onehot=(
-                                        sign_cand_inputs["support_ids"] == _y1
+                                        sign_support_ids == _y1
                                     ).to(teacher_kld.dtype),
                                     p_student=_push["p_student"],
                                     # The tail bucket has no token to be filed
@@ -3206,12 +3214,12 @@ class DataParallelPPOActor(BasePPOActor):
                                 y1 = data["responses"].unsqueeze(-1)
                                 xt_grad_cols = logit_gradient_terms(
                                     student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_cand_inputs["on_task_logprob"],
+                                    teacher_logprob=sign_on_task_logprobs,
                                     weight=xt_built["weight"],
                                     teacher_kl=teacher_kld,
                                     pg_grad_coef=xt_pg_grad_coef,
                                     sampled_onehot=(
-                                        sign_cand_inputs["support_ids"] == y1
+                                        sign_support_ids == y1
                                     ).to(teacher_kld.dtype),
                                     coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
                                     pg_coef=float(pg_loss_coef),
