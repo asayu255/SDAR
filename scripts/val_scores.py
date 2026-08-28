@@ -39,26 +39,62 @@ _PAIR = re.compile(r"'(val/[^']+)':\s*([-+0-9.eE]+)")
 
 
 def _joined_blocks(text):
-    """Every pprint block in the log, each rebuilt into one line."""
-    blocks, current = [], None
+    """Every pprint block in the log, each rebuilt into one string.
+
+    INTERLEAVING IS NOT A TERMINATOR. Ray forwards several actors' stdout into
+    one stream, so an unrelated line can land between two fragments of the same
+    pprint block. A reader that treats "not a fragment" as the end of the block
+    stops at the first such line and reports nothing at all -- which is what the
+    first version of this did on a real log while passing on a synthetic one,
+    because the synthetic one had nothing to interleave.
+
+    So: start at "Initial validation metrics", keep every fragment after it,
+    skip anything that is not one, and stop when a fragment closes the dict.
+    """
+    blocks, current, started = [], [], False
     for raw in text.splitlines():
-        line = _RAY_PREFIX.sub("", raw).rstrip()
-        match = _FRAGMENT.match(line.strip())
+        line = _RAY_PREFIX.sub("", raw).strip()
+        match = _FRAGMENT.match(line)
         if match is None:
-            if current is not None:
-                blocks.append(current)
-                current = None
             continue
         body = match.group("body")
-        if current is None:
+        if not started:
             if "Initial validation metrics" not in body:
                 continue
-            current = body
+            started, current = True, [body]
         else:
-            current += body
-    if current is not None:
-        blocks.append(current)
+            current.append(body)
+        if body.rstrip().endswith(("}", '}")', "}'")):
+            blocks.append("".join(current))
+            started, current = False, []
+    if current:
+        blocks.append("".join(current))
     return blocks
+
+
+def _salvage(text, span=400):
+    """Last resort: join the region after the marker and parse whatever is there.
+
+    The block reader above understands the shape pprint produces TODAY. This
+    understands only that a key and its value may be separated by a line break
+    and some quoting -- so it survives a shape neither of us has seen, which is
+    the failure mode that has cost this arm the most: a reader that returns
+    nothing says exactly what a run that scored nothing says.
+
+    Bounded to a few hundred lines after the marker so it cannot fabricate a
+    pair by joining two unrelated parts of a long log.
+    """
+    lines = [_RAY_PREFIX.sub("", l).strip() for l in text.splitlines()]
+    starts = [i for i, l in enumerate(lines) if "Initial validation metrics" in l]
+    found = {}
+    for start in starts:
+        window = lines[start:start + span]
+        # Drop the quoting that pprint puts at the seams, then join: a value on
+        # the line after its key becomes adjacent to it.
+        joined = " ".join(l.strip('()," \'') for l in window)
+        for key, value in _PAIR.findall(joined):
+            found[key] = float(value)
+    return found
 
 
 def scores(path):
@@ -68,7 +104,31 @@ def scores(path):
     for block in _joined_blocks(text):
         for key, value in _PAIR.findall(block):
             found[key] = float(value)   # a later block wins
-    return found
+    return found or _salvage(text)
+
+
+def explain(path, limit=6):
+    """When nothing parsed, show what the file actually looks like there.
+
+    A reader that returns an empty table says "this run did not score" and a
+    broken one says exactly the same thing. This turns the second into
+    something a person can see in one step instead of a round trip.
+    """
+    with open(path, errors="replace") as handle:
+        lines = handle.read().splitlines()
+    hits = [i for i, l in enumerate(lines) if "Initial validation metrics" in l]
+    if not hits:
+        print(f"  no line contains 'Initial validation metrics' -- the run may not have scored")
+        return
+    print(f"  {len(hits)} line(s) mention it; the first block, as this reader sees it:")
+    for offset in range(limit):
+        index = hits[0] + offset
+        if index >= len(lines):
+            break
+        raw = lines[index]
+        stripped = _RAY_PREFIX.sub("", raw).strip()
+        kind = "FRAGMENT" if _FRAGMENT.match(stripped) else "not a fragment"
+        print(f"    [{kind:14s}] {stripped[:110]}")
 
 
 def _print_one(path, table):
@@ -105,6 +165,7 @@ def main(argv=None):
     for path, table in zip(paths, tables):
         if not table:
             print(f"=== {path} : NO validation metrics found ===")
+            explain(path)
     if len(paths) == 1:
         _print_one(paths[0], tables[0])
     else:

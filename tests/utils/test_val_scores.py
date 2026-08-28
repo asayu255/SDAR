@@ -142,3 +142,65 @@ def test_a_diff_of_identical_runs_says_so(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "both runs scored the same" in out
     assert "ONLY IN ONE" not in out
+
+
+def test_a_line_from_another_actor_between_two_fragments_is_not_the_end(tmp_path):
+    """Ray forwards several actors into one stream.
+
+    The first version of this reader treated "not a fragment" as the end of the
+    block, so it stopped at the first interleaved line and reported nothing --
+    on a real log, while passing on a synthetic one that had nothing to
+    interleave.
+    """
+    metrics = _split_metrics()
+    fragments = _pprinted(metrics)
+    lines = []
+    for index, fragment in enumerate(fragments):
+        lines.append(RAY + fragment)
+        if index == 1:
+            lines.append("(WorkerDict pid=99) [rollout-pump] round 4123 done")
+    path = tmp_path / "interleaved.log"
+    path.write_text("\n".join(lines) + "\n")
+    got = val_scores.scores(str(path))
+    assert set(got) == set(metrics)
+    assert got["val/success_rate"] == pytest.approx(0.4012345678901234)
+
+
+def test_metrics_printed_without_pprint_quoting_are_still_read(tmp_path):
+    """A shape neither pprint version here produces, read by the salvage path.
+
+    The failure this guards is not "the format changed" but what it looks like
+    when it does: an empty table, which is exactly what a run that scored
+    nothing produces.
+    """
+    path = tmp_path / "plain.log"
+    path.write_text(
+        "noise\n"
+        + RAY + "Initial validation metrics: {'val/success_rate': 0.4, 'val/search/test_score': 0.35}\n"
+        + RAY + "more output\n"
+    )
+    got = val_scores.scores(str(path))
+    assert got == {"val/success_rate": pytest.approx(0.4),
+                   "val/search/test_score": pytest.approx(0.35)}
+
+
+def test_the_salvage_path_does_not_join_unrelated_parts_of_a_long_log(tmp_path):
+    """Bounded, so it cannot invent a pair out of two distant lines."""
+    path = tmp_path / "far.log"
+    lines = [RAY + "Initial validation metrics: {'val/success_rate': "]
+    lines += [RAY + f"unrelated {i}" for i in range(600)]
+    lines += [RAY + "0.9}"]
+    path.write_text("\n".join(lines) + "\n")
+    assert "val/success_rate" not in val_scores.scores(str(path))
+
+
+def test_an_unreadable_log_says_what_it_saw(tmp_path, capsys):
+    """An empty table from a broken reader and from a run that did not score
+    look identical; this makes the difference visible in one step."""
+    path = tmp_path / "weird.log"
+    path.write_text("noise\n" + RAY + "Initial validation metrics: <repr suppressed>\n")
+    val_scores.main([str(path)])
+    out = capsys.readouterr().out
+    assert "NO validation metrics found" in out
+    assert "as this reader sees it" in out
+    assert "not a fragment" in out
