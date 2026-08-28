@@ -74,6 +74,41 @@ _clean() {
 
 rule() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
+# --- 0. is there a run in this file at all? --------------------------------- #
+# Every check below reports an ABSENCE as a finding -- "pump off", "NOT FOUND",
+# "batches hashed: 0" -- and those readings are only meaningful about a run that
+# got far enough to produce the line. A run killed during startup produces the
+# same absences as a run that measured something and disagreed, and the report
+# read as the second: "pump off", "NOT FOUND", "0 batches", one line each, with
+# nothing saying the process had died forty minutes earlier.
+_reached() {
+    grep -qE '\[rollout-engine\]|\[rollout-pump\]|\[val-pipeline\]|\[val-batching\]|val-hash|\[gpu-residency\]' "$1"
+}
+
+preflight() {
+    local log="$1" label="$2"
+    local f; f=$(_clean "$log")
+    printf '%-28s ' "$label"
+    # The intended configuration is on line two, before Ray, so it survives a
+    # run that died in startup -- which is exactly when you need it.
+    local cfg; cfg=$(grep -m1 -o 'search=[^-]*' "$f" | sed 's/ *$//')
+    if _reached "$f"; then
+        echo "reached validation.  ${cfg:-(no [eval] config line)}"
+    else
+        echo "DID NOT REACH VALIDATION.  ${cfg:-(no [eval] config line)}"
+        printf '%-28s %s, last written %s\n' "  file" \
+            "$(wc -c < "$log" | tr -d ' ') bytes" \
+            "$(date -r "$log" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
+        # The LAST line, `set -x` traces included -- a `+ python3 -c ...` trace
+        # is the command that was running when it died, which is the one fact
+        # worth having. Filtering the traces out reports the last thing that
+        # succeeded instead of the thing that did not.
+        printf '%-28s %s\n' "  stopped at" "$(tail -1 "$log" | cut -c1-90)"
+        printf '%-28s %s\n' "  " \
+            "no traceback means it was killed, not raised -- try: dmesg -T | grep -i 'killed process'"
+    fi
+}
+
 # --- 1. did the path under test actually engage? ---------------------------- #
 # The failure this catches: the pool refuses, the run falls back to the blocking
 # path, and everything downstream measures the control twice. That happened for
@@ -89,6 +124,14 @@ engaged() {
         grep -m1 'rollout-pump.*\(staying on the blocking path\|handshake failed\)' "$f" | sed 's/^/    /'
     elif grep -q 'rollout-pump.*the pool was never used' "$f"; then
         echo "PUMP NEVER USED -- every generate took the blocking path"
+    elif ! _reached "$f"; then
+        # NOT "pump off". A log with no [rollout-pump] line in it because the
+        # run never got as far as the engine is not a log of a run with the
+        # pump off, and this printed the second for the first: a run killed in
+        # startup was reported as "pump off (no [rollout-pump] line)", which
+        # reads as a measured configuration. Same error as naming a slot state
+        # from a trace with no slot column.
+        echo "DID NOT REACH VALIDATION -- nothing here is a measurement"
     else
         echo "pump off (no [rollout-pump] line)"
     fi
@@ -142,6 +185,10 @@ hashes() {
     local log="$1"
     grep -c 'val-hash' "$(_clean "$log")" | sed 's/^/  batches hashed: /'
 }
+
+rule "0. is there a run in these files?"
+preflight "$CONTROL" "control:"
+[ -n "$CANDIDATE" ] && preflight "$CANDIDATE" "candidate:"
 
 rule "1. did the path under test engage?"
 engaged "$CONTROL" "control:"

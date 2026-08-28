@@ -148,3 +148,52 @@ def test_the_duty_cycle_line_is_printed_not_only_the_verdict(pair):
     out = judge(*pair)
     assert "reading 91.1%" in out and "reading 88.4%" in out
     assert out.count("EMPTY is the DRIVER RUNNING PYTHON") == 2
+
+
+def test_a_run_that_died_in_startup_is_not_reported_as_a_configuration(tmp_path):
+    """"pump off (no [rollout-pump] line)" was printed for a killed run.
+
+    Every check in this script reports an ABSENCE as a finding -- "pump off",
+    "NOT FOUND", "batches hashed: 0" -- and those readings only mean anything
+    about a run that got far enough to print the line. A run killed during
+    startup produces exactly the same absences as a run that measured something
+    and disagreed, and the report read as the second: one tidy line each, with
+    nothing saying the process had been dead for forty minutes.
+    """
+    dead = tmp_path / "dead.log"
+    dead.write_text(
+        "[eval] config      : search=252 depth=6 gpu_mem_util=0.85 pump=1 -- name the log\n"
+        "+ python3 -c 'from transformers import AutoConfig'\n"
+    )
+    alive = tmp_path / "alive.log"
+    alive.write_text(
+        "[eval] config      : search=378 depth=4 gpu_mem_util=0.85 pump=1 -- name the log\n"
+        "(pid=1) [rollout-pump] driving 3 ranks as a pool\n"
+        "(pid=1) [val-pipeline] VAL_PIPELINE_DEPTH=4: 4 slot(s), threads\n"
+    )
+    out = judge(alive, dead)
+
+    assert "DID NOT REACH VALIDATION" in out, out
+    # the reading it used to give instead, and must not give for this log
+    candidate = out[out.index("candidate:"):]
+    assert "pump off" not in candidate.split("== 2.")[0], candidate
+
+    # what it stopped at, so the cause is one command away
+    assert "python3 -c" in out, out
+    # and the intended configuration, which survives on line two of a dead log
+    assert "search=252 depth=6" in out, out
+
+
+def test_a_live_run_is_still_reported_as_reaching_validation(tmp_path):
+    """The gate must not turn every log into a corpse: the control in the same
+    comparison had all its lines and has to read as a run."""
+    alive = tmp_path / "alive.log"
+    alive.write_text(
+        "[eval] config      : search=378 depth=4 gpu_mem_util=0.85 pump=1 -- name the log\n"
+        "(pid=1) [rollout-pump] driving 3 ranks as a pool\n"
+        "(pid=1) [val-pipeline] VAL_PIPELINE_DEPTH=4: 4 slot(s), threads\n"
+    )
+    out = judge(alive)
+    assert "reached validation" in out, out
+    assert "DID NOT REACH" not in out, out
+    assert "PUMP ON" in out, out
