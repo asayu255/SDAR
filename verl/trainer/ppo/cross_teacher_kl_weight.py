@@ -3028,8 +3028,19 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     w = built["weight"].detach().to(torch.float32)
     pre = built["pre_weight"].detach().to(torch.float32)
     kl = teacher_kl.detach().to(torch.float32)
-    s_push = built["push_shared"].detach().to(torch.float32)
-    r_push = built["push_by_source"].detach().to(torch.float32).sum(dim=-1)
+    # S and R exist only for the SHIPPED arm. The probe and channel scopes pass
+    # a hand-built mapping -- a counterfactual pre-weight, the live state labels
+    # and evidence -- and have no partition of their own: at another alpha the
+    # split is a different one, and the no_shared channel has no shared term at
+    # all. They are handed zeros rather than a partition borrowed from the live
+    # arm, and position_weight_metrics renders no channel reading from a scope
+    # whose columns are all zero.
+    if "push_shared" in built:
+        s_push = built["push_shared"].detach().to(torch.float32)
+        r_push = built["push_by_source"].detach().to(torch.float32).sum(dim=-1)
+    else:
+        s_push = torch.zeros_like(w)
+        r_push = torch.zeros_like(w)
     return {
         "w": w,
         "w_sq": w * w,
@@ -3391,8 +3402,13 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
         s_mean, r_mean = tot["push_shared"] / n, tot["push_source"] / n
         s_var = max(tot["push_shared_sq"] / n - s_mean * s_mean, 0.0)
         r_var = max(tot["push_source_sq"] / n - r_mean * r_mean, 0.0)
-        out[f"{head}/channel/shared_push_mean"] = s_mean
-        out[f"{head}/channel/source_push_mean"] = r_mean
+        # Gated on there being a partition at all, means included. A scope that
+        # was handed none -- every counterfactual one is -- would otherwise
+        # publish a channel push of exactly 0.0, which reads as "this scope
+        # allocated nothing" rather than "this scope has no channels".
+        if tot["push_shared_sq"] > 0.0 or tot["push_source_sq"] > 0.0:
+            out[f"{head}/channel/shared_push_mean"] = s_mean
+            out[f"{head}/channel/source_push_mean"] = r_mean
         if tot["push_shared_sq"] > 1e-24 and tot["push_source_sq"] > 1e-24:
             # Uncentered: how much the two channels' mass overlaps at all. In
             # [0, 1] because neither channel is ever negative, so a LOW value is

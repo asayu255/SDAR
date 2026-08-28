@@ -281,3 +281,80 @@ def test_the_role_cut_publishes_the_per_channel_cosines():
     reward."""
     assert "/grpo/shared_grad_cosine" in ROLE_CUT_SUFFIXES
     assert "/grpo/source_grad_cosine" in ROLE_CUT_SUFFIXES
+
+
+# --------------------------------------------------------------------------- #
+# the scopes that have no channels
+# --------------------------------------------------------------------------- #
+def _counterfactual_keys():
+    """The keys the probe/channel scopes actually pass, read off the call site.
+
+    Hand-copying them into a fixture is what let the live run find this instead
+    of the tests: a stub written from what position_terms happens to need is
+    updated whenever position_terms changes, so it can never catch a caller that
+    was NOT updated. This reads the caller.
+    """
+    src = open("verl/workers/actor/dp_actor.py").read()
+    block = src[src.index('probe = {'):]
+    block = block[: block.index("}\n")]
+    return {line.split('"')[1] for line in block.splitlines() if line.strip().startswith('"')}
+
+
+def _counterfactual(bs=2, resp=4):
+    """A probe/channel mapping: a counterfactual pre-weight plus the live labels.
+    No channel partition -- at another alpha the split is a different one, and
+    no_shared has no shared term at all."""
+    pre = torch.rand((bs, resp)) + 0.5
+    mu = torch.full_like(pre, 1.1)
+    return {
+        "weight": pre / mu, "pre_weight": pre, "mu": mu,
+        "evidence": torch.rand((bs, resp, 3)),
+        "state": torch.zeros((bs, resp, 3), dtype=torch.long),
+        "teacher_prob": torch.rand((bs, resp, 3)),
+        "available": torch.ones(bs, dtype=torch.bool),
+        "evidence_shared": torch.rand((bs, resp)),
+        "evidence_shared_offtask_only": torch.rand((bs, resp)),
+    }
+
+
+def test_the_probe_scopes_pass_no_channel_partition():
+    """The premise of the two tests below, taken from the call site rather than
+    assumed: if a probe ever starts carrying a partition, these stop being about
+    the absent case and should be rewritten, not silently passed."""
+    keys = _counterfactual_keys()
+    assert "pre_weight" in keys, "the call site moved; this test is reading the wrong block"
+    assert "push_shared" not in keys
+    assert "push_by_source" not in keys
+    # And the fixture below stands in for it faithfully.
+    assert keys <= set(_counterfactual()), keys - set(_counterfactual())
+
+
+def test_a_scope_without_a_partition_still_produces_every_column():
+    """ScopeTermStats sizes its buffer from POSITION_TERMS once and indexes into
+    it positionally, so a caller that produced a short row would write into the
+    wrong cells -- or, as it did on the live run, raise KeyError mid-step after
+    the rollout was already paid for."""
+    cols = position_terms(_counterfactual(), torch.rand((2, 4)) + 0.1)
+    assert set(cols) == set(POSITION_TERMS)
+
+
+def test_a_scope_without_a_partition_reports_no_channel_reading():
+    """Zeros are what the columns hold; they must not be rendered as a channel
+    push of 0.0, which reads as 'this scope allocated nothing to either channel'
+    rather than 'this scope has no channels'."""
+    m = position_weight_metrics(_sums(position_terms(
+        _counterfactual(), torch.rand((2, 4)) + 0.1,
+    )))
+    assert not any("/channel/" in k for k in m), [k for k in m if "/channel/" in k]
+    # The counterfactual's own readings are untouched.
+    assert "kl_weight/position/w_cv" in m
+    assert "kl_weight/effect/kl_shift_gross_frac" in m
+
+
+def test_the_live_arm_still_reports_one():
+    """The gate must not swallow the metric it was added for."""
+    m = position_weight_metrics(_sums(position_terms(
+        _built(shared=[[1.0, 0.0]], source=[[0.0, 1.0]]), torch.ones(1, 2),
+    )))
+    assert m["kl_weight/channel/shared_push_mean"] == pytest.approx(0.5)
+    assert m["kl_weight/channel/allocation_corr"] == pytest.approx(-1.0, abs=1e-6)
