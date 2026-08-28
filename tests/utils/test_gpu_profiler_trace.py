@@ -17,6 +17,33 @@ import time
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _put_the_module_back():
+    """Restore the ORIGINAL module object, not a fresh import of the name.
+
+    These tests re-import gpu_profiler to pick up env vars baked in at import
+    time, and used to leave the replacement in sys.modules. Everything else
+    that reaches the profiler resolves through sys.modules at call time --
+    val_pipeline._gauge, rollout_loop, the other test files' module-level `gp`
+    -- so a later test writes gauges into one _GAUGES dict and reads another.
+    The symptom is a test that passes alone and fails after this file, which is
+    the least useful failure there is: it says nothing about either test.
+    """
+    original = sys.modules.get("verl.utils.gpu_profiler")
+    yield
+    if original is not None:
+        sys.modules["verl.utils.gpu_profiler"] = original
+        # AND the parent package attribute. `from verl.utils import gpu_profiler`
+        # -- which is how val_pipeline, rollout_loop and search.py reach it --
+        # imports the package and then does getattr on it; importlib sets that
+        # attribute to the new module and restoring sys.modules alone leaves it
+        # pointing at the replacement. The gauges then land in one _GAUGES dict
+        # and are read from another, and the whole file's instrumentation reads
+        # as absent.
+        import verl.utils
+        verl.utils.gpu_profiler = original
+
+
 def _fresh(monkeypatch, **env):
     for key in ("GPU_PROFILER", "GPU_PROFILER_TRACE", "GPU_PROFILER_INTERVAL"):
         monkeypatch.delenv(key, raising=False)

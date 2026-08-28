@@ -330,7 +330,13 @@ def test_the_sampler_writes_a_sidecar_the_scanner_can_join(tmp_path, monkeypatch
     monkeypatch.setenv("GPU_PROFILER", "1")
     monkeypatch.setenv("GPU_PROFILER_INTERVAL", "0.02")
     monkeypatch.setenv("GPU_PROFILER_TRACE", str(tmp_path / "trace.csv"))
-    sys.modules.pop("verl.utils.gpu_profiler", None)
+    # The ORIGINAL module object is put back in the finally, not a fresh import
+    # of the same name. Every other test in this file holds `gp`, and callers
+    # like val_pipeline._gauge resolve through sys.modules at call time -- so
+    # leaving a different object there sends their gauges into a second _GAUGES
+    # dict that `gp` cannot see. That is how the ready-gauge test started
+    # failing only when run after this one.
+    original = sys.modules.pop("verl.utils.gpu_profiler", None)
     mod = importlib.import_module("verl.utils.gpu_profiler")
     try:
         # Driven with a stub backend, so this runs on a box with no NVML -- the
@@ -354,8 +360,15 @@ def test_the_sampler_writes_a_sidecar_the_scanner_can_join(tmp_path, monkeypatch
         ids = {int(r[col["stack_id"]]) for r in body if r[col["stack_id"]] not in ("", "-1")}
         assert ids and ids <= table, (ids, table)
     finally:
-        sys.modules.pop("verl.utils.gpu_profiler", None)
-        importlib.import_module("verl.utils.gpu_profiler")
+        if original is not None:
+            sys.modules["verl.utils.gpu_profiler"] = original
+            # And the package attribute, which importlib also rebound; see the
+            # note in test_gpu_profiler_trace.py.
+            import verl.utils
+
+            verl.utils.gpu_profiler = original
+        else:  # pragma: no cover - only if it was never imported
+            sys.modules.pop("verl.utils.gpu_profiler", None)
 
 
 def test_a_trace_whose_sidecar_was_left_behind_still_scans(tmp_path):
