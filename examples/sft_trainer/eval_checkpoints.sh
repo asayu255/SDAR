@@ -161,11 +161,22 @@ export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.85}"
 # same file, and would read a width of 0 the day those lines are reordered.
 _WIDTH=$(grep -o "val_per_task_batch_size='{[^}]*}'" "$RUN_SCRIPT" \
     | grep -o "search:[0-9]*" | cut -d: -f2)
+# DEPTH BELONGS IN THIS SUM AND WAS NOT IN IT. The 468 tokens per row of width
+# is an OBSERVED PEAK measured at VAL_PIPELINE_DEPTH=3 with the pump on, so it
+# already contains three slots' worth of concurrency -- and the pump submits
+# every row as its own request with ROLLOUT_PUMP_MAX_IN_FLIGHT=0, letting vLLM
+# decide what fits, so slots really do stack in the engine. Scaling by width
+# alone is therefore right at depth 3 and wrong at any other depth: 504 x 4
+# would have passed this check while asking for a third more than 504 x 3.
+#
+# In row-slots, which is the quantity that matters:
+#     504 x 3 = 1512      378 x 4 = 1512      504 x 4 = 2016
+_DEPTH="${VAL_PIPELINE_DEPTH:-3}"
 if [ -n "$_WIDTH" ]; then
-    _NEEDED=$(awk -v w="$_WIDTH" 'BEGIN{print w * 468}')
+    _NEEDED=$(awk -v w="$_WIDTH" -v d="$_DEPTH" 'BEGIN{print w * 468 * d / 3}')
     _BUDGET=$(awk -v u="$ROLLOUT_GPU_MEM_UTIL" 'BEGIN{print (u * 48 - 10.9) * 8920}')
     if awk -v n="$_NEEDED" -v b="$_BUDGET" 'BEGIN{exit !(n > 0.92 * b)}'; then
-        echo "[eval] search width $_WIDTH needs up to $(printf '%.0f' "$_NEEDED") KV tokens," >&2
+        echo "[eval] search width $_WIDTH at depth $_DEPTH needs up to $(printf '%.0f' "$_NEEDED") KV tokens," >&2
         echo "       and ROLLOUT_GPU_MEM_UTIL=$ROLLOUT_GPU_MEM_UTIL gives $(printf '%.0f' "$_BUDGET")." >&2
         echo "       That is over 92% and vLLM will preempt, which costs more than the width" >&2
         echo "       is worth. Raise ROLLOUT_GPU_MEM_UTIL, or lower the width in BOTH" >&2

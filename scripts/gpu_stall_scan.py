@@ -211,7 +211,7 @@ def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0, gen_full=1):
                 # Over the window, with a pre-roll. NOT rows[argmin]: NVML
                 # smooths, so the deepest sample is later than the event that
                 # emptied the queue -- often after it has already refilled.
-                **dict(zip(("why", "why_dwell"), why(rows, a, b, gen_full=gen_full))),
+                **dict(zip(("why", "why_lead_in", "why_dwell"), why(rows, a, b, gen_full=gen_full))),
             }
         )
     return out
@@ -279,18 +279,34 @@ def why_one(gauges, cpu=None, gen_full=1):
     return None
 
 
-def gen_full_threshold(rows, floor_frac=0.25, minimum=4):
+def gen_full_threshold(rows, floor_frac=0.25, minimum=4, busy_sm=90.0):
     """How many in-flight requests count as "the engine has work", from the run.
 
-    The median over samples where the engine was demonstrably busy, scaled down.
-    Self-calibrating rather than a constant: the same scanner reads runs whose
-    batches are 126 rows and runs whose batches are 504.
+    From samples where THE CARDS WERE BUSY, not merely where gen_inflight was
+    non-zero. The difference is not cosmetic and the error runs the wrong way:
+    a run full of turn tails has thousands of samples reading gen=1..4, those
+    samples drag the median down, the threshold falls, and the tails stop being
+    classified as tails. The more tail a run has, the less of it this would
+    find -- a bias that hides exactly the thing it is looking for, and grows
+    with the size of the finding.
+
+    Median over the busy samples, scaled down: the threshold is "clearly less
+    than a normal working load", not "a normal working load".
     """
-    busy = sorted(r["gauges"].get("gen_inflight", 0) for r in rows
-                  if r.get("gauges", {}).get("gen_inflight"))
+    busy = sorted(
+        r["gauges"]["gen_inflight"]
+        for r in rows
+        if r.get("gauges", {}).get("gen_inflight")
+        and _mean_sm(r["sm"]) >= busy_sm
+    )
     if not busy:
         return minimum
     return max(minimum, floor_frac * busy[len(busy) // 2])
+
+
+def _mean_sm(sm):
+    vals = [v for v in sm if v is not None]
+    return (sum(vals) / len(vals)) if vals else 0.0
 
 
 # Ranked. When an excursion's window holds more than one state -- and a short
@@ -325,19 +341,47 @@ def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
     cause and then measured it under 0.05 of a slot twice.
     """
     t_from = rows[i0]["ts"] - pre_roll
+    t_start = rows[i0]["ts"]
     dwell = defaultdict(int)
+    lead = defaultdict(int)
     for r in rows[: i1 + 1]:
         if r["ts"] < t_from:
             continue
         reason = why_one(r.get("gauges"), r.get("cpu"), gen_full)
-        if reason:
-            dwell[reason] += 1
+        if not reason:
+            continue
+        dwell[reason] += 1
+        if r["ts"] < t_start:
+            lead[reason] += 1
     if not dwell:
-        return "UNINSTRUMENTED", {}
-    for reason in _REASON_RANK:
-        if reason in dwell:
-            return reason, dict(dwell)
-    return "UNINSTRUMENTED", dict(dwell)
+        return "UNINSTRUMENTED", None, {}
+
+    # GPU_SIDE means THE QUEUE WAS FULL, so it cannot be the cause of an idle
+    # caused by an empty queue -- and after a short stall most of the window is
+    # recovery, where the queue is full again. So it is set aside whenever any
+    # queue-emptying state appears at all, and among those, DWELL decides.
+    #
+    # Both halves are needed. Straight rank precedence let one sample outvote
+    # fifteen ("gpu:15 scheduler:1" read as SCHEDULER_STARVATION -- right by
+    # luck on that run). Straight dwell put a lagged retrieval stall back to
+    # GPU_SIDE, because NVML's smoothing puts most of the window after the
+    # retrieval finished. Neither rule alone survives both cases.
+    starving = {k: n for k, n in dwell.items() if k != "GPU_SIDE"}
+    pool = starving or dwell
+    primary = max(pool, key=lambda k: (pool[k], -_REASON_RANK.index(k)
+                                       if k in _REASON_RANK else -99))
+
+    # The LEAD-IN is separate: what held in the pre-roll, before the cards fell.
+    # That is the causal question, and it is worth reporting even when it lasted
+    # one sample -- but as its own field, not as a verdict that overwrites the
+    # thing the excursion actually consisted of.
+    lead_in = None
+    if lead:
+        lead_in = max(lead, key=lambda k: (lead[k], -_REASON_RANK.index(k)
+                                           if k in _REASON_RANK else -99))
+        if lead_in == primary:
+            lead_in = None
+    return primary, lead_in, dict(dwell)
 
 
 def classify(rows, exc, floor, busy=95.0):
@@ -508,6 +552,8 @@ def analyse(path, floor, busy, top):
             detail.append("at min: " + " ".join(f"{k}={v}" for k, v in e["gauges"].items()))
         if r.get("activity"):
             detail.append(f"in: {r['activity']}")
+        if e.get("why_lead_in"):
+            detail.insert(0, f"lead-in {e['why_lead_in']}")
         if detail:
             print(f"        {e['why']:<22}{'   '.join(detail)}")
         frames = stacks.get(r.get("stack_id"))

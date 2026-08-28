@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from verl.utils import gpu_profiler as gp  # noqa: E402
 
 SCANNER = Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py"
+EVAL_SH = Path(__file__).resolve().parents[2] / "examples" / "sft_trainer" / "eval_checkpoints.sh"
 
 
 @pytest.fixture(autouse=True)
@@ -534,12 +535,13 @@ def test_the_threshold_comes_from_the_run_not_from_a_constant():
     scanner = SourceFileLoader(
         "stall_scan2", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
     ).load_module()
-    wide = [{"gauges": {"gen_inflight": 500}} for _ in range(9)]
-    narrow = [{"gauges": {"gen_inflight": 40}} for _ in range(9)]
+    busy = [98, 97, 98]
+    wide = [{"sm": busy, "gauges": {"gen_inflight": 500}} for _ in range(9)]
+    narrow = [{"sm": busy, "gauges": {"gen_inflight": 40}} for _ in range(9)]
     assert scanner.gen_full_threshold(wide) == 125.0
     assert scanner.gen_full_threshold(narrow) == 10.0
     # A trace with no gen gauge at all falls back rather than dividing by zero.
-    assert scanner.gen_full_threshold([{"gauges": {}}]) == 4
+    assert scanner.gen_full_threshold([{"sm": busy, "gauges": {}}]) == 4
 
 
 def test_a_tail_with_nothing_waiting_behind_it_is_named_differently(tmp_path):
@@ -552,3 +554,83 @@ def test_a_tail_with_nothing_waiting_behind_it_is_named_differently(tmp_path):
     assert scanner.why_one({"gen_inflight": 2, "ready": 1}, gen_full=100) == "TAIL_BLOCKS_READY"
     assert scanner.why_one({"gen_inflight": 2}, gen_full=100) == "TAIL_DRAIN"
     assert scanner.why_one({"gen_inflight": 400}, gen_full=100) == "GPU_SIDE"
+
+
+def _scanner():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader(
+        "stall_scan_cal", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
+    ).load_module()
+
+
+def test_the_tails_do_not_calibrate_the_threshold_that_finds_them():
+    """A bias that hides the finding, and grows with it.
+
+    gen_full was the median over every sample with gen_inflight > 0. A run full
+    of turn tails has thousands of samples reading gen=1..4; those drag the
+    median down, the threshold falls, and the tails stop classifying as tails.
+    The more tail a run has, the less of it this finds.
+
+    The existing tests could not see it: they fed nine identical samples, so
+    tail and busy were never mixed.
+    """
+    scanner = _scanner()
+    busy = [{"sm": [98, 97, 98], "gauges": {"gen_inflight": 500}} for _ in range(20)]
+    tails = [{"sm": [0, 1, 0], "gauges": {"gen_inflight": n}} for n in (1, 2, 3, 4) for _ in range(30)]
+
+    # Over ALL non-zero samples the median is a tail value; over the busy ones
+    # it is a working load.
+    assert scanner.gen_full_threshold(busy + tails) == 125.0
+    naive = sorted(r["gauges"]["gen_inflight"] for r in busy + tails)
+    assert naive[len(naive) // 2] <= 4, "the fixture is not mixed enough to show the bias"
+
+
+def test_the_primary_reason_is_what_the_excursion_was_mostly_made_of():
+    """Fixed rank let one sample outvote fifteen.
+
+    "gpu:15 scheduler:1" came back reading SCHEDULER_STARVATION -- right by
+    luck on that run, and wrong the next time. Dwell decides; the causal
+    lead-in is reported separately rather than as a verdict that overwrites
+    what the excursion consisted of.
+    """
+    scanner = _scanner()
+    rows = []
+    t = 0.0
+    # One sample of a fully-starved queue, then fourteen of a draining tail.
+    rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1}})
+    for _ in range(14):
+        t += 0.1
+        rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"gen_inflight": 2, "ready": 1}})
+    primary, lead_in, dwell = scanner.why(rows, 1, len(rows) - 1, pre_roll=0.4, gen_full=100)
+    assert primary == "TAIL_BLOCKS_READY", (primary, dwell)
+    assert lead_in == "SCHEDULER_STARVATION", (lead_in, dwell)
+    assert dwell["TAIL_BLOCKS_READY"] == 14 and dwell["SCHEDULER_STARVATION"] == 1
+
+
+def test_the_lead_in_is_dropped_when_it_is_the_primary():
+    scanner = _scanner()
+    rows = [{"ts": i * 0.1, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1}} for i in range(10)]
+    primary, lead_in, _ = scanner.why(rows, 1, 9, pre_roll=0.4, gen_full=100)
+    assert primary == "SCHEDULER_STARVATION" and lead_in is None
+
+
+def test_the_kv_guard_counts_depth_not_just_width():
+    """504x3 and 378x4 are the same envelope; 504x4 is a third more.
+
+    The 468 tokens per row of width is an observed peak measured at depth 3, so
+    scaling by width alone passes 504x4 while it asks for 33% more than the
+    number the check was calibrated on.
+    """
+    import re
+    text = EVAL_SH.read_text()
+    assert "VAL_PIPELINE_DEPTH" in text, "the guard still ignores depth"
+    line = next((l for l in text.splitlines() if "_NEEDED=" in l), "")
+    assert "_DEPTH" in line and " d " in line, line
+
+    def needed(w, d):
+        return w * 468 * d / 3
+
+    budget = (0.85 * 48 - 10.9) * 8920
+    assert needed(504, 3) == needed(378, 4)
+    assert needed(504, 3) <= 0.92 * budget
+    assert needed(504, 4) > 0.92 * budget
