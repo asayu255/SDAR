@@ -168,7 +168,7 @@ def sample_dts(rows, gap_factor=3.0):
     return dts, n_gaps, gap_time
 
 
-def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0):
+def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0, gen_full=1):
     """Contiguous windows where card ``gi`` fell away from its own baseline.
 
     Detection uses ``floor`` but the window is then grown outward while the card
@@ -211,7 +211,7 @@ def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0):
                 # Over the window, with a pre-roll. NOT rows[argmin]: NVML
                 # smooths, so the deepest sample is later than the event that
                 # emptied the queue -- often after it has already refilled.
-                **dict(zip(("why", "why_dwell"), why(rows, a, b))),
+                **dict(zip(("why", "why_dwell"), why(rows, a, b, gen_full=gen_full))),
             }
         )
     return out
@@ -237,12 +237,20 @@ except Exception:  # pragma: no cover
 PRE_ROLL_S = float(os.environ.get("GPU_STALL_PRE_ROLL_S", "0.4"))
 
 
-def why_one(gauges, cpu=None):
+def why_one(gauges, cpu=None, gen_full=1):
     """The state at one sample, as a reason. Not a verdict on an excursion.
 
-    ``gen`` is required to be absent for every dependency answer. A retrieval
-    running while a hundred requests are with the engine is not why the cards
-    are idle, however busy the retriever looks.
+    ``gen_full`` is how many requests count as the engine HAVING WORK, and it is
+    the difference between a useful answer and a wrong one. The first version
+    tested ``if gen:`` -- any non-zero count -- and a real run answered GPU_SIDE
+    for fifteen samples out of sixteen at excursions whose gauges read
+    ``gen_inflight=1`` against a batch of 504. One request on three A6000s is
+    not the engine having work; it is the last row of a turn draining while
+    everything else waits. Calibrated from the trace's own busy-time median, so
+    there is no constant here tied to a batch width.
+
+    ``gen`` still outranks the dependency answers: a retrieval running while the
+    engine is full is not why the cards are idle, however busy it looks.
     """
     if not gauges:
         return None
@@ -252,8 +260,12 @@ def why_one(gauges, cpu=None):
     env = gauges.get("env_inflight", 0)
     wait = gauges.get("future_wait", 0)
 
-    if gen:
+    if gen >= gen_full:
         return "GPU_SIDE"
+    if gen:
+        # A handful of requests: the tail of a turn. Whether that costs anything
+        # depends entirely on whether a whole batch was sitting behind it.
+        return "TAIL_BLOCKS_READY" if ready else "TAIL_DRAIN"
     if ready:
         return "SCHEDULER_STARVATION"
     if retr:
@@ -267,6 +279,20 @@ def why_one(gauges, cpu=None):
     return None
 
 
+def gen_full_threshold(rows, floor_frac=0.25, minimum=4):
+    """How many in-flight requests count as "the engine has work", from the run.
+
+    The median over samples where the engine was demonstrably busy, scaled down.
+    Self-calibrating rather than a constant: the same scanner reads runs whose
+    batches are 126 rows and runs whose batches are 504.
+    """
+    busy = sorted(r["gauges"].get("gen_inflight", 0) for r in rows
+                  if r.get("gauges", {}).get("gen_inflight"))
+    if not busy:
+        return minimum
+    return max(minimum, floor_frac * busy[len(busy) // 2])
+
+
 # Ranked. When an excursion's window holds more than one state -- and a short
 # one usually does, because the window straddles the recovery -- the reason is
 # the one that explains an EMPTY QUEUE, not the one that happens to coincide
@@ -275,15 +301,17 @@ def why_one(gauges, cpu=None):
 # window shows a starved queue, that is the finding.
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
+    "TAIL_BLOCKS_READY",
     "RETRIEVER_DEPENDENCY",
     "ENV_DEPENDENCY",
     "FUTURE_RAY_WAIT",
     "DRIVER_CPU",
+    "TAIL_DRAIN",
     "GPU_SIDE",
 )
 
 
-def why(rows, i0, i1, pre_roll=PRE_ROLL_S):
+def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
     """Why an EXCURSION was idle, from the window that could have caused it.
 
     Reading the single deepest sample -- which this did -- attributes a stall to
@@ -301,7 +329,7 @@ def why(rows, i0, i1, pre_roll=PRE_ROLL_S):
     for r in rows[: i1 + 1]:
         if r["ts"] < t_from:
             continue
-        reason = why_one(r.get("gauges"), r.get("cpu"))
+        reason = why_one(r.get("gauges"), r.get("cpu"), gen_full)
         if reason:
             dwell[reason] += 1
     if not dwell:
@@ -334,6 +362,7 @@ def classify(rows, exc, floor, busy=95.0):
 def analyse(path, floor, busy, top):
     rows, skipped = read_trace(path)
     stacks = read_stacks(path)
+    gen_full = gen_full_threshold(rows)
     if not rows:
         print(f"\n=== {path}: no usable rows ===")
         return
@@ -372,7 +401,7 @@ def analyse(path, floor, busy, top):
     # Split that total into "something happened here" and "everywhere, always".
     all_exc = []
     for gi in range(ngpu):
-        for e in excursions(rows, dts, gi, floor, baselines[gi]):
+        for e in excursions(rows, dts, gi, floor, baselines[gi], gen_full=gen_full):
             e["kind"] = classify(rows, e, floor, busy)
             all_exc.append(e)
     all_exc.sort(key=lambda e: -e["lost_s"])
@@ -408,13 +437,18 @@ def analyse(path, floor, busy, top):
         row[1] += e["wall"]
         row[2] += e["lost_s"]
     if by_why:
-        print("\nwhy the cards were idle, by lost GPU-seconds")
+        print(f"\nwhy the cards were idle, by lost GPU-seconds"
+              f"   (the engine counts as having work at >= {gen_full:.0f} requests in flight,"
+              f" calibrated from this run)")
         print(f"    {'reason':<22}{'events':>7}{'wall s':>9}{'lost GPU-s':>12}{'share':>8}")
         for reason, (n, wall, lost) in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
             share = (lost / exc_lost * 100.0) if exc_lost else 0.0
             print(f"    {reason:<22}{n:>7}{wall:>9.1f}{lost:>12.1f}{share:>7.1f}%")
         meaning = {
-            "SCHEDULER_STARVATION": "work was ready and the engine had none of it -- fix the submitting side",
+            "SCHEDULER_STARVATION": "work was ready and the engine had NOTHING -- fix the submitting side",
+            "TAIL_BLOCKS_READY": "the engine was draining a turn's last few rows while a whole batch "
+                                 "waited for a slot -- more slots, or let a slot start before its tail ends",
+            "TAIL_DRAIN": "a turn's last few rows were finishing and nothing else was ready to run",
             "RETRIEVER_DEPENDENCY": "nothing was submittable; the retrieval service was the dependency",
             "ENV_DEPENDENCY": "nothing was submittable; env.step was the dependency",
             "GPU_SIDE": "requests were with the engine -- its own host work, or a sample-window artefact",

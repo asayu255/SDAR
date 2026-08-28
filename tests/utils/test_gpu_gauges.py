@@ -507,3 +507,48 @@ def test_a_genuinely_missing_trace_says_where_to_look(tmp_path):
     assert done.returncode != 0
     assert "X.<pid>.csv" in done.stderr
     assert "ls " in done.stderr
+
+
+def test_one_request_in_flight_is_not_the_engine_having_work(tmp_path):
+    """The defect the first real run exposed.
+
+    Excursions read `ready=1 gen_inflight=1` against a batch of 504, and the
+    classifier answered GPU_SIDE for fifteen samples out of sixteen -- "requests
+    were with the engine". One request on three A6000s is a turn's last row
+    draining, not the engine having work, and the difference decides whether the
+    next fix goes to the engine or to the scheduler.
+    """
+    busy = ([98, 97, 98], 20, {"gen_inflight": 500}, 40)
+    tail = ([0, 1, 0], 15, {"gen_inflight": 2, "ready": 1, "future_wait": 1}, 15)
+    out = _scan(_trace(tmp_path / "tail.csv", [busy, tail, busy, tail, busy]))
+    assert "TAIL_BLOCKS_READY" in out
+    assert "GPU_SIDE" not in out.split("why the cards were idle")[1].split("per phase")[0]
+    # And it says what it calibrated to, so the reader can disagree with it.
+    assert "calibrated from this run" in out
+
+
+def test_the_threshold_comes_from_the_run_not_from_a_constant():
+    """The same scanner reads 126-row batches and 504-row batches."""
+    from importlib.machinery import SourceFileLoader
+
+    scanner = SourceFileLoader(
+        "stall_scan2", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
+    ).load_module()
+    wide = [{"gauges": {"gen_inflight": 500}} for _ in range(9)]
+    narrow = [{"gauges": {"gen_inflight": 40}} for _ in range(9)]
+    assert scanner.gen_full_threshold(wide) == 125.0
+    assert scanner.gen_full_threshold(narrow) == 10.0
+    # A trace with no gen gauge at all falls back rather than dividing by zero.
+    assert scanner.gen_full_threshold([{"gauges": {}}]) == 4
+
+
+def test_a_tail_with_nothing_waiting_behind_it_is_named_differently(tmp_path):
+    """TAIL_DRAIN costs nothing actionable; TAIL_BLOCKS_READY does."""
+    from importlib.machinery import SourceFileLoader
+
+    scanner = SourceFileLoader(
+        "stall_scan3", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
+    ).load_module()
+    assert scanner.why_one({"gen_inflight": 2, "ready": 1}, gen_full=100) == "TAIL_BLOCKS_READY"
+    assert scanner.why_one({"gen_inflight": 2}, gen_full=100) == "TAIL_DRAIN"
+    assert scanner.why_one({"gen_inflight": 400}, gen_full=100) == "GPU_SIDE"
