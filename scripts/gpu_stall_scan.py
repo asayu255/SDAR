@@ -366,13 +366,25 @@ def why_one(gauges, cpu=None, gen_full=1):
             return "SLOT_FREE_UNKNOWN"
         return ("SCHEDULER_STARVATION" if gauges["placeable_ready"]
                 else "SLOT_COMPATIBILITY_BLOCK")
+    # A DEPENDENCY IS ONLY THE CAUSE IF NOTHING ELSE COULD HAVE RUN. With work
+    # queued and no slot gauge, "the retriever was running" is an observation
+    # and not an explanation: a free slot may have been sitting there with a
+    # placeable batch while some other slot happened to be in a retrieval. This
+    # branch ran before the slot check and reported 64.2 GPU-s of one trace as
+    # RETRIEVER_DEPENDENCY on exactly that reasoning.
+    #
+    # With ready == 0 the dependency answers stand on their own: nothing was
+    # submittable, so no slot state could have changed the outcome.
+    if ready and not has_slots:
+        return "READY_BUT_IDLE_UNKNOWN"
     if retr:
         return "RETRIEVER_DEPENDENCY"
     if env:
         return "ENV_DEPENDENCY"
     if ready:
-        # free == 0 is only ESTABLISHED when the column exists to establish it.
-        return "SLOTS_BUSY_NOT_GENERATING" if has_slots else "READY_BUT_IDLE_UNKNOWN"
+        # Reached only with the gauge present and free == 0 -- established, not
+        # assumed, and the dependencies above were checked with a full slot set.
+        return "SLOTS_BUSY_NOT_GENERATING"
     if wait and (cpu is None or cpu < 20):
         return "FUTURE_RAY_WAIT"
     if cpu is not None and cpu >= 60:

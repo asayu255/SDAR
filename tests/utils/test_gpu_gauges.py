@@ -926,9 +926,13 @@ def test_no_leaf_claims_a_slot_fact_from_a_trace_with_no_slot_gauge():
     # A slot free but no placeable_ready column: free is known, fit is not.
     assert scanner.why_one({**empty, "slots_free": 2}, cpu=10,
                            gen_full=100) == "SLOT_FREE_UNKNOWN"
-    # A dependency reads its own gauge and is unaffected by the missing one.
+    # A dependency reads its own gauge -- but with work QUEUED it still cannot
+    # be called the cause without knowing whether a slot was free. This line
+    # asserted RETRIEVER_DEPENDENCY here, which is the error itself written
+    # down as a test. See
+    # test_a_dependency_is_only_a_cause_when_nothing_else_could_have_run.
     assert scanner.why_one({**empty, "retriever_inflight": 3}, cpu=10,
-                           gen_full=100) == "RETRIEVER_DEPENDENCY"
+                           gen_full=100) == "READY_BUT_IDLE_UNKNOWN"
 
 
 def test_the_report_totals_what_it_could_not_attribute(tmp_path):
@@ -953,6 +957,31 @@ def test_the_report_totals_what_it_could_not_attribute(tmp_path):
     line = next(ln for ln in out.splitlines() if "UNATTRIBUTED" in ln)
     assert "100.0%" in line, line
     assert "slots_free" in out
+
+
+def test_a_dependency_is_only_a_cause_when_nothing_else_could_have_run():
+    """"The retriever was running" is an observation, not an explanation.
+
+    With work queued and no slot gauge, a free slot may have been sitting there
+    with a placeable batch while some other slot happened to be in a retrieval.
+    The dependency branch ran before the slot check and reported 64.2 GPU-s of
+    one real trace as RETRIEVER_DEPENDENCY on exactly that reasoning -- the
+    same "name a cause the instrument did not observe" this classifier has now
+    been wrong about four times.
+
+    With ready == 0 the dependency stands on its own: nothing was submittable,
+    so no slot state could have changed the outcome.
+    """
+    scanner = _scanner()
+    why = lambda g: scanner.why_one({"gen_inflight": 0, **g}, cpu=10, gen_full=100)
+
+    assert why({"ready": 4, "retriever_inflight": 3}) == "READY_BUT_IDLE_UNKNOWN"
+    assert why({"ready": 4, "env_inflight": 3}) == "READY_BUT_IDLE_UNKNOWN"
+    # Nothing queued: the dependency IS the answer, gauge or no gauge.
+    assert why({"ready": 0, "retriever_inflight": 3}) == "RETRIEVER_DEPENDENCY"
+    assert why({"ready": 0, "env_inflight": 3}) == "ENV_DEPENDENCY"
+    # With the gauge, a full slot set makes the dependency an explanation again.
+    assert why({"ready": 4, "slots_free": 0, "retriever_inflight": 3}) == "RETRIEVER_DEPENDENCY"
 
 
 def test_every_unknown_leaf_is_named_unknown():
