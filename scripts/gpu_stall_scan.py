@@ -53,6 +53,7 @@ import csv
 import glob
 import os
 import sys
+import time
 from collections import defaultdict
 
 
@@ -574,6 +575,9 @@ def analyse(path, floor, busy, top):
     observed = sum(dts)
 
     print(f"\n=== {os.path.basename(path)} ===")
+    # A trace is only evidence about the run it came from, and nothing else in
+    # this report says which run that was.
+    print(_written(path))
     # WHICH GAUGES THIS TRACE ACTUALLY CARRIES. Several reasons collapse to a
     # coarser name when a gauge is missing, and the coarse name is not
     # distinguishable in the table from the gauge being present and reading
@@ -801,6 +805,17 @@ def analyse(path, floor, busy, top):
             )
 
 
+def _written(path):
+    """When the file was last written, and how long ago, in one string."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return "mtime unavailable"
+    age = time.time() - mtime
+    unit = f"{age / 3600:.1f} h ago" if age >= 3600 else f"{age / 60:.0f} min ago"
+    return time.strftime("last written %Y-%m-%d %H:%M:%S", time.localtime(mtime)) + f" ({unit})"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("traces", nargs="+", help="GPU_PROFILER_TRACE csv files (globs are expanded)")
@@ -823,9 +838,16 @@ def main(argv=None):
             root, ext = os.path.splitext(p)
             hits = sorted(glob.glob(f"{root}.*{ext or '.csv'}"))
             if hits:
+                # WITH EACH FILE'S AGE. The fallback matches on name alone, so
+                # a run whose trace never appeared silently gets the PREVIOUS
+                # run's file under the same base name -- which happened, and a
+                # comparison table was built from a trace written twelve minutes
+                # before the run it was supposed to describe started.
                 print(f"  ({p} does not exist; using the per-process trace"
-                      f"{'s' if len(hits) > 1 else ''} the profiler wrote: "
-                      + ", ".join(os.path.basename(h) for h in hits) + ")")
+                      f"{'s' if len(hits) > 1 else ''} the profiler wrote:")
+                for h in hits:
+                    print(f"     {os.path.basename(h):<40}{_written(h)}")
+                print("   CHECK THE TIMES. These are matched by name, not by run.)")
         paths.extend(hits or [p])
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:

@@ -935,6 +935,32 @@ def test_no_leaf_claims_a_slot_fact_from_a_trace_with_no_slot_gauge():
                            gen_full=100) == "READY_BUT_IDLE_UNKNOWN"
 
 
+def test_a_trace_matched_by_name_is_dated_in_the_report(tmp_path):
+    """The pid fallback matches on NAME, so a run whose trace never appeared
+    silently gets the previous run's file under the same base name.
+
+    That happened: a comparison table was built from a trace last written
+    twelve minutes BEFORE the run it was supposed to describe had started, and
+    nothing in the report said so. The file's write time is the one fact that
+    exposes it.
+    """
+    import os
+    import time as _time
+
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 20)
+    real = _trace(tmp_path / "t.4242.csv", [busy, ([0, 1, 0], 6, {"ready": 4}, 10), busy])
+    old_mtime = _time.time() - 3 * 3600
+    os.utime(real, (old_mtime, old_mtime))
+
+    # asked for the name WITHOUT the pid, which is what the profiler never writes
+    out = _scan(tmp_path / "t.csv")
+    assert "CHECK THE TIMES" in out, out
+    assert "3.0 h ago" in out, out
+    # ...and on the analysed file itself, not only in the fallback notice
+    body = out[out.index("=== t.4242.csv ==="):]
+    assert "last written" in body.splitlines()[1], body[:200]
+
+
 def test_the_report_totals_what_it_could_not_attribute(tmp_path):
     """Summing it off the table by eye is how a structural zero got read as a
     measurement for two turns. On the first real trace read this way, two
