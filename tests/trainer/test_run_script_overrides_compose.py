@@ -246,3 +246,52 @@ def test_the_composed_script_satisfies_its_own_intent_lock(path, tag_suffix, mon
     assert str(config.trainer.project_name).endswith(tag_suffix)
     assert str(config.trainer.experiment_name).endswith(tag_suffix)
     assert enforce_expected_config(config, os.path.join(REPO, lock), tag="test:lock") > 0
+
+
+# (dynamic-bsz switch, its token budget) for every phase that has the pair.
+_TOKEN_BOUNDS = (
+    ("actor_rollout_ref.actor.use_dynamic_bsz",
+     "actor_rollout_ref.actor.ppo_max_token_len_per_gpu"),
+    ("actor_rollout_ref.ref.log_prob_use_dynamic_bsz",
+     "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu"),
+    ("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz",
+     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu"),
+)
+
+
+@pytest.mark.parametrize("path", COMPOSED_SCRIPTS)
+def test_a_token_budget_that_is_on_can_hold_one_padded_sequence(path, monkeypatch):
+    """rearrange_micro_batches opens with
+
+        assert max_token_len >= max_seq_len
+
+    where max_seq_len is the PADDED width, data.max_prompt_length +
+    data.max_response_length. A budget below it aborts the first micro batch of
+    whichever phase switched dynamic bsz on -- seconds into a run, but only on a
+    cluster, because nothing composes the pair and compares them.
+
+    The trap is the unit. max_token_len counts attention_mask.sum(-1), i.e.
+    prompt AND response, while the row bound it replaces (micro_batch_size x
+    max_response_length) is about RESPONSE tokens only, because that is what
+    sizes the fp32 (n_resp, vocab) buffer in lm_head. Reading the row bound as a
+    token budget gives a number four to eight times too small, and it fails this
+    assert rather than silently under-packing.
+    """
+    from omegaconf import OmegaConf
+
+    monkeypatch.setenv("RUN_TAG_SUFFIX", "")
+    overrides = _overrides(path)
+    assert overrides is not None, path
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        config = compose(config_name=CONFIG_NAME, overrides=overrides)
+    padded = int(config.data.max_prompt_length) + int(config.data.max_response_length)
+    for switch, budget in _TOKEN_BOUNDS:
+        on = OmegaConf.select(config, switch, default=False)
+        if not on:
+            continue
+        have = OmegaConf.select(config, budget, default=None)
+        assert have is not None, f"{switch} is on but {budget} is unset"
+        assert int(have) >= padded, (
+            f"{path}: {switch}=True with {budget}={have}, below the padded "
+            f"sequence width {padded}; rearrange_micro_batches asserts on this"
+        )
