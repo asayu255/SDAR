@@ -37,6 +37,7 @@ import time
 
 import pytest
 
+import verl.utils.val_pipeline as vp_module
 from verl.utils.val_pipeline import Slot, run_pipelined
 
 
@@ -639,3 +640,118 @@ def test_a_rollout_that_raises_still_raises_on_the_calling_thread():
 
     with pytest.raises(ValueError, match="rollout blew up"):
         list(run_pipelined(range(8), lambda x: x, lambda _p: None, launch, slots))
+
+
+# --------------------------------------------------------------------------- #
+# The head of the INPUT queue must not hold the whole pipeline
+# --------------------------------------------------------------------------- #
+def test_a_restricted_batch_at_the_head_does_not_block_the_slots_behind_it():
+    """The second head-of-line block, and the larger of the two.
+
+    The extra slots serve search only -- alfworld keeps a single manager
+    because its games are indexed by position within it. Pulling one item at a
+    time meant a webshop or alfworld batch at the head waited for `primary`
+    specifically, the iterator never advanced, and the search batches behind it
+    were not even prepared: three free slots idle for the length of a 240 s
+    alfworld rollout.
+    """
+    import threading
+
+    slots = [Slot("primary", envs=None, collector=None),
+             Slot("extra-1", envs=None, collector=None, tasks=["search"]),
+             Slot("extra-2", envs=None, collector=None, tasks=["search"]),
+             Slot("extra-3", envs=None, collector=None, tasks=["search"])]
+    hold = threading.Event()
+    started, lock = [], threading.Lock()
+
+    def launch(task, slot):
+        with lock:
+            started.append((task, slot.name))
+        if task == "alfworld":
+            hold.wait(10)            # the long one, on primary
+        else:
+            time.sleep(0.03)
+        return task
+
+    items = ["alfworld", "webshop"] + ["search"] * 12
+    out = []
+    thread = threading.Thread(target=lambda: out.extend(
+        r for _p, r in run_pipelined(items, lambda x: x, lambda x: x, launch, slots)))
+    thread.start()
+    time.sleep(0.6)
+    searches_started = sum(1 for task, _n in started if task == "search")
+    hold.set()
+    thread.join(20)
+    assert not thread.is_alive()
+
+    assert searches_started >= 6, (
+        f"only {searches_started} search batches started while alfworld held primary "
+        f"and webshop sat at the head of the queue: {started}"
+    )
+    assert out == items                       # hand-back order is unchanged
+    assert ("webshop", "primary") in started  # and webshop still ran, on primary
+
+
+def test_restricted_batches_reach_their_slot_in_their_own_order():
+    """alfworld's game cycle is positional within its manager.
+
+    Reordering search around them is fine; reordering THEM is not.
+    """
+    slots = [Slot("primary", envs=None, collector=None),
+             Slot("extra-1", envs=None, collector=None, tasks=["search"]),
+             Slot("extra-2", envs=None, collector=None, tasks=["search"])]
+    seen = []
+
+    def launch(item, slot):
+        seen.append((item, slot.name))
+        time.sleep(0.01)
+        return item
+
+    items = [("alfworld", 0), ("search", 1), ("search", 2), ("alfworld", 3),
+             ("search", 4), ("alfworld", 5), ("search", 6)]
+    out = [r for _p, r in run_pipelined(items, lambda x: x, lambda x: x[0], launch, slots)]
+    assert out == items
+    alf = [item for item, _slot in seen if item[0] == "alfworld"]
+    assert alf == [("alfworld", 0), ("alfworld", 3), ("alfworld", 5)], alf
+    assert all(name == "primary" for item, name in seen if item[0] == "alfworld")
+
+
+def test_the_lookahead_is_bounded():
+    """52k rows must not all be prepared and held."""
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(3)]
+    prepared = []
+
+    def prepare(item):
+        prepared.append(item)
+        return item
+
+    gen = run_pipelined(range(500), prepare, lambda _p: None,
+                        lambda _p, _s: time.sleep(0.01), slots)
+    next(gen)   # one batch out
+    assert len(prepared) <= 4 * len(slots), len(prepared)
+    gen.close()
+
+
+def test_the_lookahead_is_configurable(monkeypatch):
+    import importlib
+    monkeypatch.setenv("VAL_PIPELINE_LOOKAHEAD", "3")
+    module = importlib.reload(vp_module)
+    try:
+        slots = [module.Slot(f"s{i}", envs=None, collector=None) for i in range(2)]
+        prepared = []
+        gen = module.run_pipelined(range(100), lambda i: prepared.append(i) or i,
+                                   lambda _p: None, lambda _p, _s: time.sleep(0.01), slots)
+        next(gen)
+        assert len(prepared) <= 5, len(prepared)
+        gen.close()
+    finally:
+        monkeypatch.delenv("VAL_PIPELINE_LOOKAHEAD", raising=False)
+        importlib.reload(module)
+
+
+def test_a_task_no_slot_serves_raises_rather_than_spinning():
+    slots = [Slot("a", envs=None, collector=None, tasks=["search"]),
+             Slot("b", envs=None, collector=None, tasks=["search"])]
+    with pytest.raises(RuntimeError, match="no slot can run task"):
+        list(run_pipelined(["search", "alfworld"], lambda x: x, lambda x: x,
+                           lambda _p, _s: None, slots))

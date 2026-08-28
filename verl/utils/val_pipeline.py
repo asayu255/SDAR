@@ -92,6 +92,15 @@ class Slot:
         return f"Slot({self.name}, tasks={'any' if self.tasks is None else sorted(self.tasks)})"
 
 
+def _gauge_set(name, value):
+    """Publish a gauge's current level, if profiling is on."""
+    try:
+        from verl.utils import gpu_profiler
+    except Exception:  # pragma: no cover - profiler is optional
+        return
+    gpu_profiler.gauge_set(name, value)
+
+
 @contextlib.contextmanager
 def _gauge(name, n=1):
     """Hold n on a profiler gauge, if profiling is on."""
@@ -266,18 +275,48 @@ def run_pipelined(
         if _REPORT_EVERY > 0 and len(spans) and len(spans) % _REPORT_EVERY == 0:
             report(final=False)
 
-    # next(items) is the loader, and it was the one thing on the calling thread
-    # that nothing timed: with num_workers>0 torch hands batches back in strict
-    # worker order, so one slow worker stalls the loop every num_workers
-    # batches -- the shape of the periodic stalls NVML shows.
+    # A BOUNDED LOOKAHEAD, because one item at a time is a second head of line.
+    #
+    # This used to pull ONE item and then block until that item could be placed.
+    # The extra slots serve search only (alfworld's games are indexed by
+    # position within its manager, so it keeps a single one), so a webshop or
+    # alfworld batch at the head waits for `primary` specifically -- and while
+    # it waits, the iterator does not advance, the search batches behind it are
+    # never even prepared, and three free slots sit idle for the length of a
+    # 240 s alfworld rollout. Fixing the slot-release side alone made this
+    # WORSE, not better: releasing slots sooner just means they reach this wall
+    # sooner, which is why scheduler starvation rose 41% when tail stalls fell
+    # 25%.
+    #
+    # So: prepare a few batches ahead into a queue, and give each free slot the
+    # OLDEST batch it can run. Oldest-compatible rather than "whatever fits"
+    # keeps the reordering to the minimum that unblocks the pipeline, and it
+    # cannot starve a restricted batch -- once the batches ahead of it are
+    # taken, it is the oldest and primary takes it next.
+    #
+    # LAUNCH ORDER THEREFORE CHANGES; hand-back order does not. Results are
+    # still yielded by submission sequence, prepare still runs on this thread in
+    # item order, and alfworld batches still reach `primary` in their own order,
+    # so its game cycle advances exactly as before. What does change is which
+    # batches are resident together, which changes batch composition in the
+    # engine and therefore the tokens -- the same effect the pump already has,
+    # and the reason [val-hash] and the scores have to be read after this.
+    _LOOKAHEAD = int(os.environ.get("VAL_PIPELINE_LOOKAHEAD", "0")) or 2 * len(slots)
+
     iterator = iter(items)
-    try:
-        while True:
+    exhausted = False
+    pending = []  # [(seq, prepared, task)] in submission order
+
+    def refill():
+        """Prepare up to the lookahead, on this thread, in item order."""
+        nonlocal exhausted, next_seq
+        while not exhausted and len(pending) < _LOOKAHEAD:
             _t = time.perf_counter()
             try:
                 with _activity("dataload"):
                     item = next(iterator)
             except StopIteration:
+                exhausted = True
                 break
             waited = time.perf_counter() - _t
             clock["dataload"] += waited
@@ -287,58 +326,36 @@ def run_pipelined(
             with _activity("prepare"):
                 prepared = prepare(item)
             clock["prepare"] += time.perf_counter() - _t
-            task = task_of(prepared)
-
-            # THE GAUGE THE CLASSIFIER TURNS ON. From here until the batch is
-            # submitted there is a whole batch of work that exists and is not
-            # with the engine. If the cards go idle in this window it is not the
-            # retriever's fault, however busy the retriever happens to be --
-            # that is the difference between RETRIEVER DEPENDENCY and SCHEDULER
-            # STARVATION, and the two look identical on the device.
-            with _gauge("ready"):
-                slot = None
-                while slot is None:
-                    harvest()
-                    # A batch whose task only one slot serves waits for that
-                    # slot specifically, which is why this looks for an
-                    # acceptor rather than taking whatever is free.
-                    slot = next((candidate for candidate in free if candidate.accepts(task)), None)
-                    if slot is not None:
-                        break
-                    if not inflight:
-                        raise RuntimeError(f"no slot can run task {task!r}: {slots}")
-                    # Hand back whatever is already in order before blocking:
-                    # the caller's scoring then runs while the slots are busy
-                    # rather than after they have gone idle.
-                    while next_out in finished:
-                        payload = finished.pop(next_out)
-                        next_out += 1
-                        resumed = time.perf_counter()
-                        with _scoring():
-                            yield payload
-                        clock["consumer"] += time.perf_counter() - resumed
-                        maybe_report()
-                    if free and any(candidate.accepts(task) for candidate in free):
-                        continue
-                    if inflight:
-                        wait_for_one()
-            free.remove(slot)
-            inflight[next_seq] = (prepared, executor.submit(timed_launch, prepared, slot), slot)
+            pending.append((next_seq, prepared, task_of(prepared)))
             next_seq += 1
+        # THE GAUGE THE CLASSIFIER TURNS ON: how much work exists and is not
+        # with the engine. If the cards go idle while this is non-zero it is not
+        # the retriever's fault, however busy the retriever happens to be.
+        _gauge_set("ready", len(pending))
 
-            # Submitted first, scored second: the new batch is already running
-            # while the caller accumulates the finished ones.
-            while next_out in finished:
-                payload = finished.pop(next_out)
-                next_out += 1
-                resumed = time.perf_counter()
-                with _scoring():
-                    yield payload
-                clock["consumer"] += time.perf_counter() - resumed
-                maybe_report()
+    def dispatch():
+        """Give every free slot the oldest pending batch it can run."""
+        placed = False
+        for slot in list(free):
+            index = next((i for i, (_s, _p, task) in enumerate(pending) if slot.accepts(task)), None)
+            if index is None:
+                continue
+            seq, prepared, _task = pending.pop(index)
+            free.remove(slot)
+            inflight[seq] = (prepared, executor.submit(timed_launch, prepared, slot), slot)
+            placed = True
+        _gauge_set("ready", len(pending))
+        return placed
 
-        while inflight or finished:
+    try:
+        while True:
             harvest()
+            refill()
+            dispatch()
+
+            # Hand back everything that is in order, after dispatching: the
+            # caller then accumulates while the slots are busy rather than after
+            # they have gone idle.
             while next_out in finished:
                 payload = finished.pop(next_out)
                 next_out += 1
@@ -347,8 +364,17 @@ def run_pipelined(
                     yield payload
                 clock["consumer"] += time.perf_counter() - resumed
                 maybe_report()
-            if inflight and next_out not in finished:
+
+            if not pending and not inflight and exhausted and not finished:
+                break
+            if inflight:
                 wait_for_one()
+            elif pending:
+                # Nothing running and nothing placeable: no slot serves this
+                # task at all, which is a configuration error rather than a
+                # wait, and would otherwise spin here forever.
+                stuck = {task for _s, _p, task in pending}
+                raise RuntimeError(f"no slot can run task(s) {sorted(stuck)}: {slots}")
     finally:
         report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
