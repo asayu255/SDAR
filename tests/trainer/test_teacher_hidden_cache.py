@@ -805,31 +805,157 @@ def test_one_call_answers_rows_from_different_teachers():
         torch.testing.assert_close(values[row : row + 1], want, rtol=0, atol=1e-5)
 
 
-def test_the_lookup_makes_no_host_round_trip():
-    """The read runs inside the micro-batch loop, thousands of times a step. A
-    .tolist() or an int(tensor) there is a device-to-host sync, which stalls the
-    very pipeline the rollout overlap exists to keep full."""
-    cache, keys, W, h, lse = _filled_cache(n=6)
-    ids = torch.randint(0, VOCAB, (6, L, K))
-    cache.logprobs_at(keys, ids)  # finalize once, outside the measurement
+def _traced_reads(fn):
+    """Run fn with .tolist()/.item() traced, and return the device of each read.
 
-    calls = []
+    A device-to-host sync is a read off a tensor that is NOT on the host; the
+    same call on a cpu tensor is just a read. Tracing the method name alone
+    conflates the two, which matters here because the offloaded path is supposed
+    to read its plan off the host index.
+    """
+    seen = []
     originals = {name: getattr(torch.Tensor, name) for name in ("tolist", "item")}
     for name, original in originals.items():
         def traced(self, _o=original, _n=name):
-            calls.append(_n)
+            seen.append((_n, self.device.type))
             return _o(self)
 
         setattr(torch.Tensor, name, traced)
     try:
-        cache.logprobs_at(keys, ids)
-        assert calls == [], f"lookup synchronised via {sorted(set(calls))}"
-        # The trace itself has to work, or the assertion above proves nothing.
-        torch.zeros(1).item()
-        assert calls == ["item"]
+        fn()
     finally:
         for name, original in originals.items():
             setattr(torch.Tensor, name, original)
+    return seen
+
+
+def test_the_lookup_makes_no_host_round_trip():
+    """The read runs inside the micro-batch loop, thousands of times a step. A
+    .tolist() or an int(tensor) THERE, off a tensor on the card, is a
+    device-to-host sync, which stalls the very pipeline the rollout overlap
+    exists to keep full.
+
+    Offloaded the lookup does read its ragged plan with .tolist(), and that is
+    not a sync: store_placement puts the index on the host precisely so it is
+    not, and packed_plan is host-only in and out so it cannot become one. This
+    box has no driver, so the device column below cannot discriminate on its own
+    -- test_the_placement_decision_is_what_it_claims_on_a_gpu_box drives that
+    half with the device a real run has.
+    """
+    cache, keys, W, h, lse = _filled_cache(n=6)
+    ids = torch.randint(0, VOCAB, (6, L, K))
+    cache.logprobs_at(keys, ids)  # finalize once, outside the measurement
+
+    seen = _traced_reads(lambda: cache.logprobs_at(keys, ids))
+    off_device = [c for c in seen if c[1] != "cpu"]
+    assert off_device == [], f"lookup synchronised via {off_device}"
+
+    # The trace itself has to work, or the assertion above proves nothing.
+    assert _traced_reads(lambda: torch.zeros(1).item()) == [("item", "cpu")]
+
+
+def test_the_resident_lookup_reads_nothing_back_to_the_host_at_all():
+    """Resident, the index is ON the card, so there is no host copy of the
+    lengths to plan from and any read of them would be the sync. The packed path
+    is therefore offload-only, and this is what pins that: not "the reads are
+    cheap" but "there are none"."""
+    from verl.workers import teacher_cache as tc
+
+    cache, keys, _, _, _ = _cache_with_offload(False, n=6)
+    ids = torch.randint(0, VOCAB, (6, L, K))
+    cache.logprobs_at(keys, ids)
+
+    assert _traced_reads(lambda: cache.logprobs_at(keys, ids)) == []
+
+    called = []
+    original = tc.packed_plan
+    tc.packed_plan = lambda *a, **k: called.append(a) or original(*a, **k)
+    try:
+        cache.logprobs_at(keys, ids)
+    finally:
+        tc.packed_plan = original
+    assert called == [], "the resident path planned a packed read it cannot afford"
+
+
+def test_the_packed_plan_places_every_live_position_and_no_padding():
+    """The plan is the whole correctness of the packed read: `dest` says where a
+    packed row lands in the (n, resp_len) grid and `row` says which entry it came
+    from. Get either wrong and the lookup returns a REAL teacher log-prob for the
+    wrong position, which no value check downstream can see.
+
+    Checked against the brute-force layout rather than against itself.
+    """
+    from verl.workers.teacher_cache import packed_plan
+
+    resp_len = 7
+    lens = torch.tensor([3, 0, 7, 1])
+    offs = torch.tensor([100, 999, 40, 5])
+
+    dest, row, spans, m = packed_plan(lens, offs, resp_len)
+
+    want_dest, want_row = [], []
+    for i, n in enumerate(lens.tolist()):
+        for p in range(n):
+            want_dest.append(i * resp_len + p)
+            want_row.append(i)
+    assert m == len(want_dest) == 11
+    assert dest.tolist() == want_dest
+    assert row.tolist() == want_row
+    # One contiguous span per OWNED row, in row order, skipping the empty one.
+    assert spans == [(100, 3), (40, 7), (5, 1)]
+    assert sum(n for _, n in spans) == m
+    # Host in, host out -- the caller moves the plan, so a device read cannot
+    # sneak in here.
+    assert dest.device.type == "cpu" and row.device.type == "cpu"
+
+    assert packed_plan(torch.zeros(4, dtype=torch.long), offs, resp_len) is None
+
+
+def test_the_packed_read_pulls_only_the_live_positions():
+    """The point of the packing. The padded read asks the store for resp_len
+    positions a row where a turn generates about a quarter of them, and it asks
+    as a scattered gather into a pageable tensor that torch then has to stage --
+    so pinning the store bought nothing. Packed, the pull is one contiguous slice
+    per row and the (rows, k, hidden) projection gather inside the GEMM, the
+    largest tensor the micro-batch loop allocates, shrinks by the same factor.
+    """
+    from verl.workers.teacher_cache import packed_plan
+
+    lengths = [3, 1, PAD_L, 5, 0]
+    cache, keys, _, _, _ = _padded(lengths, seed=11)
+    cache._offload = True
+    ids = torch.randint(0, VOCAB, (len(lengths), PAD_L, K))
+
+    seen = {}
+    original = packed_plan
+
+    def spy(lens, offs, resp_len):
+        out = original(lens, offs, resp_len)
+        seen["m"] = 0 if out is None else out[3]
+        seen["padded"] = lens.numel() * resp_len
+        return out
+
+    from verl.workers import teacher_cache as tc
+
+    tc.packed_plan = spy
+    try:
+        cache.logprobs_at(keys, ids)
+    finally:
+        tc.packed_plan = original
+
+    assert seen["m"] == sum(lengths), "the packed read did not ask for every live position"
+    assert seen["padded"] == len(lengths) * PAD_L
+    assert seen["m"] < seen["padded"] // 2, (
+        f"the packed read pulled {seen['m']} rows against a padded {seen['padded']} -- "
+        "the padding is back, and with it the bytes and the projection gather"
+    )
+
+    # Same values as the padded read would have given, on the same rows.
+    values, found, _ = cache.logprobs_at(keys, ids)
+    resident, keys2, _, _, _ = _padded(lengths, seed=11)
+    resident._offload = False
+    torch.testing.assert_close(values, resident.logprobs_at(keys2, ids)[0], rtol=0, atol=0)
+    assert torch.all(found == 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1244,3 +1370,82 @@ def test_the_exchange_only_copies_keys_to_the_host_when_the_store_is_offloaded()
     off, _, _, _, _ = _cache_with_offload(True, n=4)
     res, _, _, _, _ = _cache_with_offload(False, n=4)
     assert off.offloaded is True and res.offloaded is False
+
+
+# --------------------------------------------------------------------------- #
+# 15. the projection gather's ceiling
+# --------------------------------------------------------------------------- #
+
+
+def test_chunking_the_projection_changes_the_peak_and_not_the_answer():
+    """The gather is row-independent, so splitting it is exact, not approximate.
+    Bit for bit rather than close: the chunks see the same h, the same ids and
+    the same normaliser, and only the peak differs. Anything less than equality
+    would mean the split moved arithmetic, and a distillation loss cannot tell
+    a moved bit from a real one."""
+    W, h, lse = _teacher(seed=4, n=40)
+    ids = torch.randint(0, VOCAB, (40, K), generator=torch.Generator().manual_seed(5))
+
+    whole = teacher_logprobs_from_hidden(h, lse, W, ids, chunk_bytes=0)
+    for mb in (1, 3, 7):
+        split = teacher_logprobs_from_hidden(h, lse, W, ids, chunk_bytes=mb * K * H * W.element_size())
+        assert torch.equal(whole, split), f"chunking at {mb} rows moved the values"
+
+    # And with a per-row temperature, which the split has to carry along.
+    temp = torch.rand(40) + 0.5
+    whole_t = teacher_logprobs_from_hidden(h, lse, W, ids, temperature=temp, chunk_bytes=0)
+    split_t = teacher_logprobs_from_hidden(
+        h, lse, W, ids, temperature=temp, chunk_bytes=3 * K * H * W.element_size()
+    )
+    assert torch.equal(whole_t, split_t), "the chunks were given the wrong rows' temperatures"
+
+
+def test_the_projection_ceiling_is_a_ceiling():
+    """A budget that only bounds the number of CALLS bounds nothing: the whole
+    point is the largest tensor alive at once."""
+    from verl.workers.teacher_cache import _projection_rows
+
+    rows, k, hidden, el = 1270, 20, 2048, 2
+    W = torch.zeros((4, hidden), dtype=torch.bfloat16)
+    per_row = k * hidden * el
+
+    step = _projection_rows(rows, k, W, chunk_bytes=64 << 20)
+    assert step * per_row <= (64 << 20), "a chunk is allowed to exceed the budget"
+    assert step < rows, "a micro batch of 10 has to split at 64 MB, or the ceiling does nothing"
+
+    # The arm's own shape today: a micro batch of 5 packs to ~635 rows, which is
+    # under the budget, so nothing chunks and the call stays single-shot.
+    assert _projection_rows(635, k, W, chunk_bytes=64 << 20) >= 635
+
+    assert _projection_rows(rows, k, W, chunk_bytes=0) == rows, "0 has to mean off"
+    assert _projection_rows(rows, k, W, chunk_bytes=1) == 1, "never zero rows, or it never finishes"
+
+
+def test_the_chunks_really_are_separate_gathers():
+    """Equality alone would also pass an implementation that computed the whole
+    thing and sliced it afterwards, which allocates exactly what the ceiling
+    exists to prevent. This watches the gather itself."""
+    W, h, lse = _teacher(seed=6, n=40)
+    ids = torch.randint(0, VOCAB, (40, K), generator=torch.Generator().manual_seed(7))
+
+    shapes = []
+    original = torch.einsum
+
+    def spy(eq, *ops):
+        if eq == "nh,nkh->nk":
+            shapes.append(tuple(ops[1].shape))
+        return original(eq, *ops)
+
+    torch.einsum = spy
+    try:
+        teacher_logprobs_from_hidden(h, lse, W, ids, chunk_bytes=0)
+        whole = list(shapes)
+        shapes.clear()
+        teacher_logprobs_from_hidden(h, lse, W, ids, chunk_bytes=7 * K * H * W.element_size())
+        split = list(shapes)
+    finally:
+        torch.einsum = original
+
+    assert whole == [(40, K, H)], "the unchunked path stopped being one gather"
+    assert len(split) == 6 and max(s[0] for s in split) == 7, f"gathers were {split}"
+    assert sum(s[0] for s in split) == 40, "the chunks do not cover every row"

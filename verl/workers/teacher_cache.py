@@ -77,6 +77,10 @@ import torch
 # still run on the device on the same values. What changes is only where the
 # bytes wait.
 _OFFLOAD = os.environ.get("TEACHER_CACHE_OFFLOAD", "1").strip().lower() not in ("0", "false", "no", "off")
+# Ceiling on the projection gather inside teacher_logprobs_from_hidden; see
+# _projection_rows. Above what the arm asks for today, so it changes nothing
+# until the micro batch or the support grows.
+_PROJ_CHUNK_BYTES = int(float(os.environ.get("TEACHER_PROJ_CHUNK_MB", "64")) * (1 << 20))
 
 
 def store_placement(offload: bool, read_device, cuda_available: Optional[bool] = None):
@@ -108,6 +112,40 @@ def store_placement(offload: bool, read_device, cuda_available: Optional[bool] =
 _PROCESS_CACHE: Optional["TeacherHiddenCache"] = None
 
 
+def packed_plan(lens: torch.Tensor, offs: torch.Tensor, resp_len: int):
+    """Where each live position goes, for a read that skips the padding.
+
+    HOST ONLY, in and out. ``lens`` and ``offs`` are the micro batch's per-row
+    live length and store offset, and the caller is responsible for handing over
+    the copies that already live on the host -- which offloaded they do, because
+    :func:`store_placement` put the index there. That is what makes the
+    ``.tolist()`` below a host read rather than the device-to-host sync this
+    class's whole layout exists to keep out of the micro-batch loop. Kept pure
+    and CPU-side so the arithmetic can be checked on a box with no driver, the
+    way ``store_placement`` is: a plan that misplaces a row returns a real
+    teacher log-prob for the wrong position, which is silent.
+
+    Returns ``(dest, row, spans, m)`` or None when the batch owns no rows:
+
+    ``dest``   (m,) where packed row j belongs in the flattened (n, resp_len)
+               grid the caller gets back.
+    ``row``    (m,) which of the n entries packed row j came from, for the
+               per-row columns (vocab offset, temperature) the GEMM needs.
+    ``spans``  ``[(store_offset, length)]`` per owned row. An entry's positions
+               are contiguous in the store, so this is the whole pull: one slice
+               copy each, straight out of pinned memory, rather than a gather.
+    ``m``      total live positions.
+    """
+    m = int(lens.sum())
+    if m == 0:
+        return None
+    row = torch.repeat_interleave(torch.arange(lens.numel(), dtype=torch.long), lens)
+    starts = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
+    dest = row * resp_len + (torch.arange(m, dtype=torch.long) - starts[row])
+    spans = [(int(o), int(n)) for o, n in zip(offs.tolist(), lens.tolist()) if n]
+    return dest, row, spans, m
+
+
 def get_teacher_cache() -> "TeacherHiddenCache":
     """The one cache in this worker process.
 
@@ -129,6 +167,7 @@ def teacher_logprobs_from_hidden(
     lm_head_weight: torch.Tensor,
     ids: torch.Tensor,
     temperature=1.0,
+    chunk_bytes: Optional[int] = None,
 ) -> torch.Tensor:
     """``log p_t`` at ``ids``, from the teacher's hidden states and its lse.
 
@@ -157,6 +196,25 @@ def teacher_logprobs_from_hidden(
     """
     if lse.dim() == 1:
         lse = lse.unsqueeze(-1)
+    if isinstance(temperature, torch.Tensor):
+        temperature = temperature.to(h.device).float().reshape(-1, 1)
+
+    rows = ids.shape[0]
+    step = _projection_rows(rows, ids.shape[-1], lm_head_weight, chunk_bytes)
+    if step >= rows:
+        return _project(h, lse, lm_head_weight, ids, temperature)
+    # Row-independent, so the split is exact rather than approximate: each chunk
+    # sees the same h, the same ids and the same normaliser it would have seen
+    # whole. Only the peak differs.
+    out = torch.empty((rows, ids.shape[-1]), dtype=torch.float32, device=h.device)
+    for a in range(0, rows, step):
+        b = min(a + step, rows)
+        t = temperature[a:b] if isinstance(temperature, torch.Tensor) else temperature
+        out[a:b] = _project(h[a:b], lse[a:b], lm_head_weight, ids[a:b], t)
+    return out
+
+
+def _project(h, lse, lm_head_weight, ids, temperature):
     # (n, k, hidden) gathered rows of the projection. Built per micro-batch and
     # dropped: at step scale this would be ~90 GB, at micro-batch scale ~90 MB.
     # Kept in the inputs' own dtype rather than widened to float32 -- it is by far
@@ -167,11 +225,33 @@ def teacher_logprobs_from_hidden(
     dtype = torch.promote_types(h.dtype, w_ids.dtype)
     logits = torch.einsum("nh,nkh->nk", h.to(dtype), w_ids.to(dtype)).float()
     if isinstance(temperature, torch.Tensor):
-        temperature = temperature.to(logits.device).float().reshape(-1, 1)
         logits = logits / temperature
     elif temperature != 1.0:
         logits = logits / float(temperature)
     return logits - lse.float()
+
+
+def _projection_rows(rows: int, k: int, lm_head_weight: torch.Tensor, chunk_bytes=None) -> int:
+    """How many rows to project at once, from a byte budget for the gather.
+
+    ``lm_head_weight[ids]`` is (rows, k, hidden) and is the largest tensor the
+    micro-batch loop allocates -- 52 MB packed at a micro batch of 5, k=20 and a
+    2048-wide teacher, taken and returned eight times a micro batch. It scales
+    with the micro batch while the activations it competes with do too, so it is
+    what makes a larger micro batch cost more than the arithmetic says.
+
+    The budget is a CEILING and the default (64 MB) is above what the arm asks
+    for today: nothing chunks at the current settings, and the loop below stays a
+    single call. It is what lets ppo_micro_batch_size_per_gpu go back up without
+    the transient going up with it -- at 10 the gather would be 104 MB, and this
+    holds it at two passes of 52. Set TEACHER_PROJ_CHUNK_MB=0 to disable.
+    """
+    if chunk_bytes is None:
+        chunk_bytes = _PROJ_CHUNK_BYTES
+    if chunk_bytes <= 0:
+        return rows
+    per_row = max(int(k) * lm_head_weight.shape[-1] * lm_head_weight.element_size(), 1)
+    return max(1, int(chunk_bytes) // per_row)
 
 
 def row_fingerprint(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -576,10 +656,16 @@ class TeacherHiddenCache:
     def logprobs_at(self, cache_ids: torch.Tensor, ids: torch.Tensor, cache_ids_cpu=None):
         """Answer for the rows this cache owns; leave the rest at zero.
 
-        Branch-free and sync-free: a key lookup, a gather of the stored rows, one
-        narrow GEMM, and a mask. No host round-trip, no per-row Python, and no
-        grouping by task -- the ids carry the teacher's offset into the stacked
-        projection instead.
+        Sync-free either way, and no grouping by task -- the ids carry the
+        teacher's offset into the stacked projection instead.
+
+        Resident, it is also branch-free and has no per-row Python: a key lookup,
+        a gather of the stored rows, one narrow GEMM, and a mask. Offloaded it
+        packs first (see :meth:`_read_packed`), which costs a Python loop over
+        the micro batch's rows and buys back the padding -- roughly four fifths
+        of the bytes and of the projection gather. That loop reads lengths the
+        offloaded index already holds on the HOST, so it is not the sync the
+        resident path would pay for the same thing.
 
         Args:
             cache_ids: (n,) int64 keys, one per ROW; -1 means "not scored here".
@@ -630,31 +716,84 @@ class TeacherHiddenCache:
         ok = (slot >= 0) & (final["slot_key"][safe] == cid)
         safe = torch.where(ok, safe, torch.zeros_like(safe))
 
-        pos = torch.arange(resp_len, device=idev)
         lens = torch.where(ok, final["slot_len"][safe], torch.zeros_like(safe))
-        live = pos.unsqueeze(0) < lens.unsqueeze(1)                       # (n, resp_len)
-        src = final["slot_off"][safe].unsqueeze(1) + pos.unsqueeze(0)
-        src = torch.where(live, src, torch.zeros_like(src)).reshape(-1)   # (n * resp_len,)
-
-        # Only the rows this micro batch asked for cross the bus: (n * resp_len,
-        # hidden) bf16, ~10 MB at a micro batch of 5 against a 16.3 GB store.
-        h_rows, lse_rows = final["h"][src], final["lse"][src]
         if final["offloaded"]:
-            h_rows = h_rows.to(dev, non_blocking=True)
-            lse_rows = lse_rows.to(dev, non_blocking=True)
+            # The ragged plan is worked out on the host, where the index already
+            # is, and only then do the row columns move to the device.
+            plan = packed_plan(lens, final["slot_off"][safe], resp_len)
             safe = safe.to(dev)
             ok = ok.to(dev)
-            live = live.to(dev)
-        found = ok.to(torch.int32)
+            values = self._read_packed(final, ids, safe, plan, dev)
+        else:
+            pos = torch.arange(resp_len, device=idev)
+            live = pos.unsqueeze(0) < lens.unsqueeze(1)                   # (n, resp_len)
+            src = final["slot_off"][safe].unsqueeze(1) + pos.unsqueeze(0)
+            src = torch.where(live, src, torch.zeros_like(src)).reshape(-1)   # (n * resp_len,)
+            h_rows, lse_rows = final["h"][src], final["lse"][src]
+            flat_ids = (
+                ids.reshape(-1, k)
+                + final["slot_voff"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1, 1)
+            )
+            out = teacher_logprobs_from_hidden(
+                h_rows, lse_rows, self._stacked, flat_ids,
+                temperature=final["slot_temp"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1),
+            )
+            values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
 
-        flat_ids = ids.reshape(-1, k) + final["slot_voff"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1, 1)
-        out = teacher_logprobs_from_hidden(
-            h_rows, lse_rows, self._stacked, flat_ids,
-            temperature=final["slot_temp"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1),
-        )
-        values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
+        found = ok.to(torch.int32)
         fingerprint = torch.where(ok, final["slot_fp"][safe], torch.zeros_like(safe))
         return values, found, fingerprint
+
+    def _read_packed(self, final, ids, safe, plan, dev):
+        """The offloaded read, over the LIVE positions only. (n, resp_len, k).
+
+        The padded form asks for ``resp_len`` positions a row where a turn
+        generates about a quarter of them, and it asks for them as a scattered
+        gather into a pageable tensor -- which torch then has to stage through its
+        own bounce buffer, so the ``pin_memory`` on the store buys nothing and the
+        copy blocks. Packing first fixes both: an entry's rows are CONTIGUOUS in
+        the store, so the pull becomes one slice copy per row straight out of
+        pinned memory, which is a DMA the copy engine can overlap.
+
+        Three things shrink by ``resp_len / mean_len``, about 4x here: the bytes
+        crossing the bus, the host-side work (measured 1.41 ms -> 0.09 ms for a
+        micro batch of 5), and -- on the device, which is the point -- the
+        projection gather inside :func:`teacher_logprobs_from_hidden`. That
+        ``(rows, k, hidden)`` tensor is by far the largest thing the micro-batch
+        loop allocates, 210 MB padded at k=20 against 52 MB packed, taken and
+        returned eight times a micro batch. It is the churn ``alloc_retries``
+        counts.
+
+        Only available offloaded, and not by accident: the plan needs the lengths
+        as Python ints, and offloaded they are already on the host. Resident they
+        are on the device, where reading them is the device-to-host sync in the
+        micro-batch loop this whole class is laid out to avoid.
+        """
+        n, resp_len, k = ids.shape
+        if plan is None:
+            return torch.zeros((n, resp_len, k), dtype=torch.float32, device=dev)
+        dest, row, spans, m = plan
+        dest = dest.to(dev, non_blocking=True)
+        row = row.to(dev, non_blocking=True)
+
+        h_pack = torch.empty((m, final["h"].shape[-1]), dtype=final["h"].dtype, device=dev)
+        lse_pack = torch.empty((m,), dtype=final["lse"].dtype, device=dev)
+        at = 0
+        for off, length in spans:
+            h_pack[at : at + length].copy_(final["h"][off : off + length], non_blocking=True)
+            lse_pack[at : at + length].copy_(final["lse"][off : off + length], non_blocking=True)
+            at += length
+
+        packed_ids = ids.reshape(-1, k).index_select(0, dest) + final["slot_voff"][safe][row].unsqueeze(1)
+        out = teacher_logprobs_from_hidden(
+            h_pack, lse_pack, self._stacked, packed_ids,
+            temperature=final["slot_temp"][safe][row],
+        )
+        # Padding positions are reconstructed as zeros, which is the value they
+        # had: they were never stored, and the loss masks them anyway.
+        values = torch.zeros((n * resp_len, k), dtype=torch.float32, device=dev)
+        values.index_copy_(0, dest, out)
+        return values.view(n, resp_len, k)
 
     def check_witness(self, atol: float = 1e-3, ulps: float = 8.0) -> float:
         """Recompute at the teacher's own top-k and return the largest deviation.
