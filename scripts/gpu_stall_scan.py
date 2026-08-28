@@ -253,6 +253,54 @@ def _is_gauge(column):
 PRE_ROLL_S = float(os.environ.get("GPU_STALL_PRE_ROLL_S", "0.4"))
 
 
+def _tail_reason(gauges):
+    """A turn tail draining with a batch behind it -- and what to do about it.
+
+    One name covered all of this once, `TAIL_BLOCKS_READY`, from a rule that
+    read gen_inflight and ready and nothing else while its report line said "a
+    whole batch waited FOR A SLOT". On the first run that measured it, that name
+    held 60.8% of the idle loss and pointed at no action, because the states
+    under it want contradictory ones.
+
+    Each leaf below is a different next change. Each one that cannot be reached
+    for want of a gauge says so in its name rather than borrowing the answer of
+    a neighbour: a missing column reads as zero, and zero here would mean "no
+    slot was free", which is a finding and not an absence.
+
+    NOTHING HERE CLAIMS WHAT THE BUSY SLOTS WERE DOING. `slots_free == 0` says
+    there was no free slot; the occupied ones may be in env.step, in prepare, or
+    waiting on a retrieval. An earlier name for this leaf, TAIL_ALL_SLOTS_BUSY,
+    read as "every slot was draining a tail" -- which the gauge does not say.
+    """
+    if "slots_free" not in gauges:
+        return "TAIL_BLOCKS_READY_UNKNOWN"
+
+    if gauges["slots_free"]:
+        # A slot was open while the tail drained. Either the queue could not use
+        # it, or it could and had not been given it yet.
+        if "placeable_ready" not in gauges:
+            return "TAIL_SLOT_FREE_UNKNOWN"
+        if gauges["placeable_ready"]:
+            # Placeable work and a free slot, at a sample: dispatch places
+            # everything placeable each pass, so this is the window between a
+            # slot coming back and the next dispatch -- which contains all of
+            # refill(), including prepare(). Driver latency, not topology.
+            return "TAIL_SLOT_FREE_PLACEABLE"
+        # The extra slots serve `search` only and alfworld cannot have a second
+        # manager, so a free slot the queue cannot use is the shape of the
+        # topology, and more slots of that shape change nothing.
+        return "TAIL_SLOT_FREE_UNUSABLE"
+
+    # No free slot. Whether DEPTH is the answer depends on what was queued: work
+    # that only one slot in the whole topology can run is not helped by adding
+    # copies of the slots that already cannot run it.
+    if "ready_scalable" not in gauges:
+        return "TAIL_NO_FREE_SLOT"
+    if gauges["ready_scalable"]:
+        return "TAIL_NO_FREE_SLOT_SCALABLE"
+    return "TAIL_NO_FREE_SLOT_PINNED"
+
+
 def why_one(gauges, cpu=None, gen_full=1):
     """The state at one sample, as a reason. Not a verdict on an excursion.
 
@@ -283,25 +331,7 @@ def why_one(gauges, cpu=None, gen_full=1):
         # depends entirely on whether a whole batch was sitting behind it.
         if not ready:
             return "TAIL_DRAIN"
-        # AND WHAT TO DO ABOUT IT DEPENDS ON THE SLOTS, which this branch did
-        # not look at while its own report line said "a whole batch waited FOR A
-        # SLOT". Two states, opposite prescriptions, one name:
-        #
-        #   every slot busy on its own tail -> more slots would take the queue,
-        #     if the KV budget has room for them
-        #   a slot free that the queue cannot use -> more slots change nothing.
-        #     The extra slots serve search only and alfworld cannot have a
-        #     second manager (seeded game cycle), so the only lever left is
-        #     inside the batch: stop making every row wait on the turn barrier.
-        #
-        # As with placeable_ready: an absent column reads as zero everywhere, so
-        # a trace without `slots_free` keeps the older, undecided name rather
-        # than being reported as all-slots-busy on the strength of a gauge it
-        # never had.
-        if "slots_free" not in gauges:
-            return "TAIL_BLOCKS_READY"
-        return "TAIL_SLOT_FREE_UNUSABLE" if gauges["slots_free"] else "TAIL_ALL_SLOTS_BUSY"
-    # The engine is empty from here down.
+        return _tail_reason(gauges)    # The engine is empty from here down.
     #
     # STARVATION NEEDS A FREE SLOT, not merely queued work. `ready` used to mean
     # "one batch that cannot be placed" and, once the pipeline grew a lookahead
@@ -380,9 +410,13 @@ def _mean_sm(sm):
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
     "SLOT_COMPATIBILITY_BLOCK",
-    "TAIL_ALL_SLOTS_BUSY",
+    "TAIL_SLOT_FREE_PLACEABLE",
     "TAIL_SLOT_FREE_UNUSABLE",
-    "TAIL_BLOCKS_READY",
+    "TAIL_SLOT_FREE_UNKNOWN",
+    "TAIL_NO_FREE_SLOT_SCALABLE",
+    "TAIL_NO_FREE_SLOT_PINNED",
+    "TAIL_NO_FREE_SLOT",
+    "TAIL_BLOCKS_READY_UNKNOWN",
     "SLOTS_BUSY_NOT_GENERATING",
     "RETRIEVER_DEPENDENCY",
     "ENV_DEPENDENCY",
@@ -400,9 +434,13 @@ _REASON_ABBR = {
     "SCHEDULER_STARVATION": "starved",
     "SLOT_COMPATIBILITY_BLOCK": "mismatch",
     "SLOTS_BUSY_NOT_GENERATING": "allbusy",
-    "TAIL_BLOCKS_READY": "tailblock",
-    "TAIL_ALL_SLOTS_BUSY": "tailfull",
-    "TAIL_SLOT_FREE_UNUSABLE": "tailunfit",
+    "TAIL_BLOCKS_READY_UNKNOWN": "tail?",
+    "TAIL_SLOT_FREE_PLACEABLE": "freeslot+",
+    "TAIL_SLOT_FREE_UNUSABLE": "freeslot-unfit",
+    "TAIL_SLOT_FREE_UNKNOWN": "freeslot?",
+    "TAIL_NO_FREE_SLOT_SCALABLE": "noslot-scalable",
+    "TAIL_NO_FREE_SLOT_PINNED": "noslot-pinned",
+    "TAIL_NO_FREE_SLOT": "noslot?",
     "TAIL_DRAIN": "tail",
     "RETRIEVER_DEPENDENCY": "retriever",
     "ENV_DEPENDENCY": "env",
@@ -602,13 +640,23 @@ def analyse(path, floor, busy, top):
                                         "the free slot -- the queue's task mix, not the dispatcher",
             "SLOTS_BUSY_NOT_GENERATING": "every slot was occupied and none was feeding the engine -- "
                                          "between turns, in the driver, or in the pump round trip",
-            "TAIL_ALL_SLOTS_BUSY": "the engine was draining turn tails and EVERY slot was busy doing it "
-                                   "while a batch waited -- more slots would take the queue, if KV has room",
-            "TAIL_SLOT_FREE_UNUSABLE": "a turn tail was draining, a batch waited, and a slot WAS free that "
-                                       "the batch cannot run -- more slots change nothing; the lever is "
-                                       "inside the batch, at the turn barrier",
-            "TAIL_BLOCKS_READY": "a turn tail was draining while a whole batch waited -- this trace has no "
-                                 "slots_free column, so whether a slot was open is not recorded",
+            "TAIL_NO_FREE_SLOT_SCALABLE": "a turn tail drained, no slot was free, and the queue held work "
+                                          "more than one slot can run -- DEPTH is the candidate, if KV has room",
+            "TAIL_NO_FREE_SLOT_PINNED": "a turn tail drained, no slot was free, and every queued batch can "
+                                        "run on exactly one slot -- more slots cannot take this queue; the "
+                                        "lever is inside the batch, at the turn barrier",
+            "TAIL_NO_FREE_SLOT": "a turn tail drained and no slot was free. What was queued is not recorded "
+                                 "in this trace (no ready_scalable), so whether depth would help is unknown. "
+                                 "Says nothing about what the busy slots were doing",
+            "TAIL_SLOT_FREE_PLACEABLE": "a turn tail drained while a slot sat free with work it COULD run -- "
+                                        "the window between a slot returning and the next dispatch, which "
+                                        "contains prepare(). Driver latency",
+            "TAIL_SLOT_FREE_UNUSABLE": "a turn tail drained, a batch waited, and a slot WAS free that the "
+                                       "batch cannot run -- topology; more slots of that shape change nothing",
+            "TAIL_SLOT_FREE_UNKNOWN": "a turn tail drained with a slot free, but this trace has no "
+                                      "placeable_ready column, so whether the queue could use it is unknown",
+            "TAIL_BLOCKS_READY_UNKNOWN": "a turn tail drained while a whole batch waited -- this trace has no "
+                                         "slots_free column, so whether a slot was open is not recorded",
             "TAIL_DRAIN": "a turn's last few rows were finishing and nothing else was ready to run",
             "RETRIEVER_DEPENDENCY": "nothing was submittable; the retrieval service was the dependency",
             "ENV_DEPENDENCY": "nothing was submittable; env.step was the dependency",

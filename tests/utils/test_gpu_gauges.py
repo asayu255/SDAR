@@ -528,7 +528,7 @@ def test_one_request_in_flight_is_not_the_engine_having_work(tmp_path):
     out = _scan(_trace(tmp_path / "tail.csv", [busy, tail, busy, tail, busy]))
     # A TAIL_ reason, whichever slot state this fixture happens to describe --
     # what this test is about is that it is not GPU_SIDE.
-    assert "TAIL_ALL_SLOTS_BUSY" in out
+    assert "TAIL_NO_FREE_SLOT" in out
     assert "GPU_SIDE" not in out.split("why the cards were idle")[1].split("per phase")[0]
     # And it says what it calibrated to, so the reader can disagree with it.
     assert "calibrated from this run" in out
@@ -551,13 +551,13 @@ def test_the_threshold_comes_from_the_run_not_from_a_constant():
 
 
 def test_a_tail_with_nothing_waiting_behind_it_is_named_differently(tmp_path):
-    """TAIL_DRAIN costs nothing actionable; TAIL_BLOCKS_READY does."""
+    """TAIL_DRAIN costs nothing actionable; a tail with a queue behind it does."""
     from importlib.machinery import SourceFileLoader
 
     scanner = SourceFileLoader(
         "stall_scan3", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
     ).load_module()
-    assert scanner.why_one({"gen_inflight": 2, "ready": 1}, gen_full=100) == "TAIL_BLOCKS_READY"
+    assert scanner.why_one({"gen_inflight": 2, "ready": 1}, gen_full=100) == "TAIL_BLOCKS_READY_UNKNOWN"
     assert scanner.why_one({"gen_inflight": 2}, gen_full=100) == "TAIL_DRAIN"
     assert scanner.why_one({"gen_inflight": 400}, gen_full=100) == "GPU_SIDE"
 
@@ -608,9 +608,9 @@ def test_the_primary_reason_is_what_the_excursion_was_mostly_made_of():
         t += 0.1
         rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"gen_inflight": 2, "ready": 1}})
     primary, lead_in, dwell = scanner.why(rows, 1, len(rows) - 1, pre_roll=0.4, gen_full=100)
-    assert primary == "TAIL_BLOCKS_READY", (primary, dwell)
+    assert primary == "TAIL_BLOCKS_READY_UNKNOWN", (primary, dwell)
     assert lead_in == "SCHEDULER_STARVATION", (lead_in, dwell)
-    assert dwell["TAIL_BLOCKS_READY"] == 14 and dwell["SCHEDULER_STARVATION"] == 1
+    assert dwell["TAIL_BLOCKS_READY_UNKNOWN"] == 14 and dwell["SCHEDULER_STARVATION"] == 1
 
 
 def test_the_lead_in_is_dropped_when_it_is_the_primary():
@@ -848,10 +848,41 @@ def test_a_draining_tail_says_whether_a_slot_was_actually_open():
     """
     scanner = _scanner()
     tail = {"gen_inflight": 3, "ready": 2}
-    assert scanner.why_one({**tail, "slots_free": 0}, gen_full=100) == "TAIL_ALL_SLOTS_BUSY"
-    assert scanner.why_one({**tail, "slots_free": 1}, gen_full=100) == "TAIL_SLOT_FREE_UNUSABLE"
+    why = lambda g: scanner.why_one({**tail, **g}, gen_full=100)
+
+    # No free slot. What to do then depends on WHAT was queued, which is a
+    # second gauge: work only one slot in the topology can run is not helped by
+    # adding copies of the slots that already cannot run it.
+    assert why({"slots_free": 0, "ready_scalable": 1, "ready_pinned": 0}) == "TAIL_NO_FREE_SLOT_SCALABLE"
+    assert why({"slots_free": 0, "ready_scalable": 0, "ready_pinned": 2}) == "TAIL_NO_FREE_SLOT_PINNED"
+
+    # A slot was free. Either the queue could not use it, or it could and the
+    # driver had not got back to dispatch yet.
+    assert why({"slots_free": 1, "placeable_ready": 0}) == "TAIL_SLOT_FREE_UNUSABLE"
+    assert why({"slots_free": 1, "placeable_ready": 2}) == "TAIL_SLOT_FREE_PLACEABLE"
+
     # No queue behind the tail: nothing was blocked, whatever the slots say.
     assert scanner.why_one({"gen_inflight": 3, "ready": 0, "slots_free": 0}, gen_full=100) == "TAIL_DRAIN"
+
+
+def test_no_free_slot_does_not_claim_the_busy_slots_were_generating():
+    """`slots_free == 0` says there was no free slot. Nothing more.
+
+    The occupied slots may be in env.step, in prepare(), or waiting on a
+    retrieval. An earlier name for this leaf, TAIL_ALL_SLOTS_BUSY, read as
+    "every slot was draining a tail" -- a claim about four slots derived from a
+    gauge that counts one number.
+    """
+    scanner = _scanner()
+    for name in scanner._REASON_RANK:
+        assert "ALL_SLOTS_BUSY" not in name, name
+    text = SCANNER.read_text()
+    start = text.index("meaning = {")
+    end = text.index("}", text.index("UNINSTRUMENTED", start))
+    for leaf in ("TAIL_NO_FREE_SLOT_SCALABLE", "TAIL_NO_FREE_SLOT_PINNED", "TAIL_NO_FREE_SLOT"):
+        line = text[text.index(f'"{leaf}":', start):]
+        line = line[:line.index('",\n') + 1] if '",\n' in line else line[:300]
+        assert "no slot was free" in line or "no slot was free" in line.lower(), (leaf, line[:200])
 
 
 def test_a_tail_in_a_trace_without_slots_free_stays_undecided():
@@ -859,7 +890,13 @@ def test_a_tail_in_a_trace_without_slots_free_stays_undecided():
     column reads as zero, and zero here would mean "every slot was busy" -- a
     definite finding manufactured out of an instrument that was not installed."""
     scanner = _scanner()
-    assert scanner.why_one({"gen_inflight": 3, "ready": 2}, gen_full=100) == "TAIL_BLOCKS_READY"
+    assert scanner.why_one({"gen_inflight": 3, "ready": 2}, gen_full=100) == "TAIL_BLOCKS_READY_UNKNOWN"
+    # And one gauge short of the bottom says so too, rather than borrowing the
+    # neighbouring leaf's answer.
+    assert scanner.why_one({"gen_inflight": 3, "ready": 2, "slots_free": 1},
+                           gen_full=100) == "TAIL_SLOT_FREE_UNKNOWN"
+    assert scanner.why_one({"gen_inflight": 3, "ready": 2, "slots_free": 0},
+                           gen_full=100) == "TAIL_NO_FREE_SLOT"
 
 
 def test_the_new_reason_did_not_reshuffle_the_existing_ranks():
@@ -869,7 +906,7 @@ def test_the_new_reason_did_not_reshuffle_the_existing_ranks():
     would change verdicts on traces that have nothing to do with this change.
     """
     scanner = _scanner()
-    before = ("SCHEDULER_STARVATION", "TAIL_BLOCKS_READY", "SLOTS_BUSY_NOT_GENERATING",
+    before = ("SCHEDULER_STARVATION", "SLOTS_BUSY_NOT_GENERATING",
               "RETRIEVER_DEPENDENCY", "ENV_DEPENDENCY", "FUTURE_RAY_WAIT",
               "DRIVER_CPU", "TAIL_DRAIN", "GPU_SIDE")
     kept = [r for r in scanner._REASON_RANK if r in before]

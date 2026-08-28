@@ -232,14 +232,33 @@ def run_pipelined(
         a webshop batch waits for `primary`, which is not a dispatcher failure.
         The dispatcher places everything placeable on every pass; that state is
         a resource-topology block and wants a differently-shaped slot.
+
+        `ready_scalable` and `ready_pinned` answer the question that comes next
+        and that none of the others can: WOULD MORE SLOTS TAKE THIS QUEUE. With
+        no free slot at all, "a batch waited" is equally true whether the
+        waiting batch is one three slots could run or one only `primary` can --
+        and only the first is an argument for depth. Counted over the topology
+        rather than by task name, so it stays right if PIPELINEABLE_VAL_TASKS
+        grows.
         """
-        placeable = sum(
-            1 for _seq, _prepared, task in pending
-            if any(slot.accepts(task) for slot in free)
-        )
+        placeable = scalable = pinned = 0
+        for _seq, _prepared, task in pending:
+            if any(slot.accepts(task) for slot in free):
+                placeable += 1
+            # Over EVERY slot, busy ones included: the question this answers is
+            # not "could it start now" but "would a slot of some kind ever take
+            # it". A batch only one slot in the whole topology can run is not
+            # helped by any number of additional slots, because the ones that
+            # get added are copies of the kind that already cannot run it.
+            if sum(1 for slot in slots if slot.accepts(task)) >= 2:
+                scalable += 1
+            else:
+                pinned += 1
         _gauge_set("ready", len(pending))
         _gauge_set("slots_free", len(free))
         _gauge_set("placeable_ready", placeable)
+        _gauge_set("ready_scalable", scalable)
+        _gauge_set("ready_pinned", pinned)
 
     def harvest():
         """Free the slot of every batch whose future has resolved.
@@ -412,6 +431,8 @@ def run_pipelined(
         _gauge_set("ready", 0)
         _gauge_set("slots_free", 0)
         _gauge_set("placeable_ready", 0)
+        _gauge_set("ready_scalable", 0)
+        _gauge_set("ready_pinned", 0)
         report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.

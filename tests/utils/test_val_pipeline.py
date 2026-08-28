@@ -768,7 +768,7 @@ def _published(monkeypatch, items, tasks_by_slot, task_of, launch=None):
 
     def record(name, value):
         live[name] = value
-        if name == "placeable_ready":   # last of the three _publish writes
+        if name == "ready_pinned":   # the last write _publish makes
             states.append(dict(live))
 
     monkeypatch.setattr(vp_module, "_gauge_set", record)
@@ -829,3 +829,34 @@ def test_a_returned_slot_is_published_before_the_next_prepare(monkeypatch):
     # By the last prepare, batches have finished and their slots come back. The
     # snapshot taken inside prepare must have seen at least one of them free.
     assert any(s.get("slots_free") for s in seen[2:]), seen
+
+
+def test_the_queue_is_counted_by_how_many_slots_could_ever_run_it(monkeypatch):
+    """Whether MORE SLOTS would help is a different question from whether one
+    is free, and no other gauge answers it.
+
+    With no free slot, "a batch waited" is equally true of a batch three slots
+    could run and of one only `primary` can -- and only the first is an argument
+    for depth. The extra slots are copies of a shape that already cannot run the
+    second, so adding them changes nothing about it.
+
+    Counted over the topology, not by task name: it stays right if the set of
+    pipelineable tasks grows.
+    """
+    # primary runs anything; the extra runs search only -- the real topology.
+    pinned = _published(monkeypatch, [0, 1, 2], [None, ["search"]], lambda p: "alfworld")
+    assert all(s["ready_scalable"] == 0 for s in pinned if s["ready"]), pinned
+    assert any(s["ready_pinned"] for s in pinned), pinned
+
+    scalable = _published(monkeypatch, [0, 1, 2], [None, ["search"]], lambda p: "search")
+    assert all(s["ready_pinned"] == 0 for s in scalable if s["ready"]), scalable
+    assert any(s["ready_scalable"] for s in scalable), scalable
+
+
+def test_scalable_and_pinned_account_for_the_whole_queue(monkeypatch):
+    """They partition `ready`; a batch is in exactly one of them. If they ever
+    disagreed with `ready`, a leaf of the classifier would be reachable with no
+    queue behind it at all."""
+    states = _published(monkeypatch, [0, 1, 2, 3], [None, ["search"]],
+                        lambda p: "search" if p % 2 else "alfworld")
+    assert all(s["ready_scalable"] + s["ready_pinned"] == s["ready"] for s in states), states

@@ -216,6 +216,8 @@ GAUGE_NAMES = (
     "future_wait",         # driver threads blocked on a Future
     "slots_free",          # pipeline slots that are idle
     "placeable_ready",     # queued batches a free slot could actually run
+    "ready_scalable",      # queued batches more than one slot could ever run
+    "ready_pinned",        # queued batches only one slot in the topology can run
 )
 
 
