@@ -577,3 +577,64 @@ search の行と順序は変わらず、グループ分けだけが変わる —
 
 一度きりの費用として実測されているのは、依然として §12 の
 **env manager 構築 約 70 秒**だけ。
+
+---
+
+## 15. profiler に gauge を追加 —— 「何が動いていたか」に「何が待っていたか」を並べる
+
+### 直したかった一点
+
+このレビューの中心は正しい。**同じデバイス上の観測から、正反対の処方が導かれる 2 つの状態が区別できていなかった:**
+
+```
+ready=0,  retriever_inflight=10, gen_inflight=0   →  投げられる仕事が無かった
+ready=32, retriever_inflight=10, gen_inflight=0   →  投げられる仕事があったのに投げていない
+```
+
+デバイス側は**どちらも「3枚とも 0%、retriever 稼働中」で同一**。census も frame sampler も区別できない —— どちらも「スレッドが何をしているか」に答える計器で、両方の場合で答えは「10本が search.py で待っている」だから。
+
+分けるのは **投げられていない仕事が存在したかどうか**で、それを数える計器が無かった。
+
+### 追加したもの
+
+| gauge | 意味 | 計測箇所 |
+|---|---|---|
+| `ready` | prepare 済みで未投入のバッチ | `val_pipeline.run_pipelined` |
+| `gen_inflight` | engine に渡して未返却 | `PumpClient.in_flight`(pull 型) |
+| `retriever_inflight` | 未応答のクエリ数 | `search.py` の合体窓 |
+| `env_inflight` | env.step 中の**行数** | `rollout_loop._step_envs` |
+| `future_wait` | Future でブロック中のスレッド | `val_pipeline.retire` |
+
+**`retriever_inflight` は待機スレッド数ではなくクエリ数**である点が重要。§13bis で「10.78 threads in search.py」を「10件のリクエストが飛んでいる」と読んだが、実際は**1件に10本がぶら下がっていた**。gauge は 1 と数える。
+
+**`gen_inflight` は pull 型**にした。`_pending` は 5 箇所で更新され、1 箇所取りこぼすと**永久に高いまま**になり、以後すべての excursion が GPU_SIDE に分類される。所有者が reader を登録し、sampler が引く。
+
+### 出力
+
+in-run(residency 行):
+
+```
+[gpu-residency]    while EMPTY the work outstanding was: ready 32.0, retriever_inflight 10.0
+[gpu-residency]    -> SCHEDULER STARVATION -- work was ready and the engine had none of it.
+```
+
+trace CSV → `gpu_stall_scan.py`:
+
+```
+why the cards were idle, by lost GPU-seconds
+    reason                 events   wall s  lost GPU-s   share
+    RETRIEVER_DEPENDENCY        9      9.9        10.5   50.0%
+    SCHEDULER_STARVATION        9      9.9        10.5   50.0%
+```
+
+### UNINSTRUMENTED を必ず残す
+
+レビューの指摘どおりで、これは装飾ではない。**分類器は、分岐が無ければ必ず何かを名指しする。** この arm では原因を名指しして後から 0.05 スロット未満と測ったことが 2 回ある(record/assemble、env reset)。ルールに当たらない excursion は「当たらない」と言う。
+
+gauge 列を持たない**既存の trace も読める** —— そちらは全部 UNINSTRUMENTED になる。それが事実。
+
+### テストダブルが3回壊れた件
+
+`_cpu_trace` → `_act_trace` → `_stack_trace` → `_gauge_trace` と per-sample バッファが増えるたび、`_FakeSampler` が AttributeError で 40 件落ちた。**バッファ名を `_Sampler.__init__` のソースから発見する**ようにして、4本目が無料になるようにした。加えて、それ自体を検査するテストを置いた。
+
+同じ理由で `test_gpu_profiler_trace.py` の `header[-1] == "driver_cpu_pct"` も直した。**末尾に伸びるスキーマで最終列を固定と見なすと、拡張のたびに拡張と無関係な失敗が出る。**

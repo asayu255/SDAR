@@ -93,6 +93,18 @@ class Slot:
 
 
 @contextlib.contextmanager
+def _gauge(name, n=1):
+    """Hold n on a profiler gauge, if profiling is on."""
+    try:
+        from verl.utils import gpu_profiler
+    except Exception:  # pragma: no cover - profiler is optional
+        yield
+        return
+    with gpu_profiler.inflight(name, n):
+        yield
+
+
+@contextlib.contextmanager
 def _activity(name):
     """Count the CALLING thread in the activity census, if profiling is on.
 
@@ -178,7 +190,11 @@ def run_pipelined(
         prepared, future, slot = inflight.pop(0)
         waited = time.perf_counter()
         try:
-            result = future.result()
+            # Counted, because the stack sampler already found this thread
+            # parked here while every card was idle and the census could not
+            # see it: it is in no tagged phase and burns no CPU.
+            with _gauge("future_wait"):
+                result = future.result()
         finally:
             clock["retire_wait"] += time.perf_counter() - waited
             free.append(slot)
@@ -246,20 +262,27 @@ def run_pipelined(
                 prepared = prepare(item)
             clock["prepare"] += time.perf_counter() - _t
             task = task_of(prepared)
-            # Retire until a slot this batch can use is free. A batch whose task
-            # only one slot serves waits for that slot specifically, which is why
-            # this drains rather than picking any free one.
-            while True:
-                slot = next((candidate for candidate in free if candidate.accepts(task)), None)
-                if slot is not None:
-                    break
-                if not inflight:
-                    raise RuntimeError(f"no slot can run task {task!r}: {slots}")
-                payload, resumed = handed_back()
-                with _scoring():
-                    yield payload
-                clock["consumer"] += time.perf_counter() - resumed
-                maybe_report()
+            # THE GAUGE THE CLASSIFIER TURNS ON. From here until the batch is
+            # submitted there is a whole batch of work that exists and is not
+            # with the engine. If the cards go idle in this window it is not the
+            # retriever's fault, however busy the retriever happens to be --
+            # that is the difference between RETRIEVER DEPENDENCY and SCHEDULER
+            # STARVATION, and the two look identical on the device.
+            with _gauge("ready"):
+                # Retire until a slot this batch can use is free. A batch whose
+                # task only one slot serves waits for that slot specifically,
+                # which is why this drains rather than picking any free one.
+                while True:
+                    slot = next((candidate for candidate in free if candidate.accepts(task)), None)
+                    if slot is not None:
+                        break
+                    if not inflight:
+                        raise RuntimeError(f"no slot can run task {task!r}: {slots}")
+                    payload, resumed = handed_back()
+                    with _scoring():
+                        yield payload
+                    clock["consumer"] += time.perf_counter() - resumed
+                    maybe_report()
             free.remove(slot)
             inflight.append((prepared, executor.submit(timed_launch, prepared, slot), slot))
         while inflight:

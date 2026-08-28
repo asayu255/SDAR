@@ -71,7 +71,12 @@ def test_every_sample_lands_in_the_trace_with_its_phase(monkeypatch, tmp_path):
     rows = written.read_text().strip().splitlines()
     header = rows[0].split(",")
     assert header[:4] == ["ts", "clock", "pid", "phase"]
-    assert header[-1] == "driver_cpu_pct"
+    # By name, not by position. This asserted header[-1] == "driver_cpu_pct" and
+    # broke the day the gauges were appended -- a schema that grows at the end
+    # is the normal case, and a test that treats the last column as fixed turns
+    # every extension into a failure that says nothing about the extension.
+    assert "driver_cpu_pct" in header
+    assert header[-len(mod.GAUGE_NAMES):] == list(mod.GAUGE_NAMES)
     body = [r.split(",") for r in rows[1:]]
     assert len(body) > 5, rows
     assert all(len(r) == len(header) for r in body)

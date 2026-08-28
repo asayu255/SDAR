@@ -90,6 +90,17 @@ mkdir -p "$RAY_TMPDIR" 2>/dev/null || true
 # a quiet machine, and nothing in the log said which had happened -- so a 1.5%
 # difference could be the change or could be the neighbours. One line, so the
 # measurement carries its own context.
+# SAMPLING INTERVAL. 0.3 s is the default and is right for "how much of the run
+# was idle"; 0.1 s is right for "which 1.8-second dip, and what was outstanding
+# during it". Finer than 0.1 buys nothing: NVML's utilization.gpu is a
+# moving-window average over roughly 1/6 s to 1 s depending on the card, so a
+# 10 ms poll returns the same smoothed number several times, not 10 ms detail.
+#
+#   GPU_PROFILER_INTERVAL=0.1 GPU_PROFILER_TRACE=/tmp/trace.csv bash ...
+#   python scripts/gpu_stall_scan.py /tmp/trace.csv
+#
+# gives the per-excursion table with a reason attached to each one.
+
 _CORES=$(nproc 2>/dev/null || echo '?')
 echo "[eval] machine     : $_CORES cores, load$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null | sed 's/^/ /')" \
      "-- a loaded box moves ms/row; compare runs taken under similar load"

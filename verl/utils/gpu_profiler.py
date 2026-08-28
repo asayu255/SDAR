@@ -100,7 +100,7 @@ import re
 import sys
 import threading
 import time
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 from collections import Counter, defaultdict
 
 # Leading alignment flag + field width of a format spec such as ">9.0f".
@@ -182,6 +182,117 @@ def activity(name: str):
 def activity_snapshot() -> Dict[str, int]:
     with _ACTIVITY_LOCK:
         return dict(_ACTIVITY)
+
+
+# --------------------------------------------------------------------------- #
+# Gauges: how much work EXISTS, beside how much is running
+# --------------------------------------------------------------------------- #
+# The census and the frames both answer "what are the threads doing". Neither
+# answers "was there anything else they could have been doing", and without that
+# the two explanations for an idle GPU are indistinguishable:
+#
+#   ready=0,  retriever_inflight=10, gen_inflight=0  -> RETRIEVER_DEPENDENCY
+#   ready=32, retriever_inflight=10, gen_inflight=0  -> SCHEDULER_STARVATION
+#
+# The observable part is identical -- every card idle with the retriever busy --
+# and the prescriptions are opposite: make the retriever faster, or stop
+# lock-stepping and submit the work that was already waiting. This arm has one
+# reading of exactly that shape and cannot yet say which of the two it is.
+#
+# Counts, not durations. A gauge says how many of a thing exist right now, and
+# the sampler records it beside the utilisation, so an excursion can be read as
+# a STATE rather than as a phase name.
+_GAUGE_LOCK = threading.Lock()
+_GAUGES: Dict[str, int] = {}
+
+# The ones the classifier reads. Named here so the trace schema is stable across
+# runs that instrument different amounts, and so a typo at a call site shows up
+# as an unknown gauge rather than as a silently missing one.
+GAUGE_NAMES = (
+    "ready",               # prepared and submittable, but not submitted
+    "gen_inflight",        # handed to the engine, not yet returned
+    "retriever_inflight",  # waiting on the retrieval service
+    "env_inflight",        # inside env.step / a tool
+    "future_wait",         # driver threads blocked on a Future
+)
+
+
+def gauge_set(name: str, value: int) -> None:
+    with _GAUGE_LOCK:
+        if value:
+            _GAUGES[name] = int(value)
+        else:
+            _GAUGES.pop(name, None)
+
+
+def gauge_add(name: str, delta: int) -> None:
+    if not delta:
+        return
+    with _GAUGE_LOCK:
+        total = _GAUGES.get(name, 0) + int(delta)
+        if total > 0:
+            _GAUGES[name] = total
+        else:
+            _GAUGES.pop(name, None)
+
+
+@contextlib.contextmanager
+def inflight(name: str, n: int = 1):
+    """Hold ``n`` on a gauge for the duration of the block.
+
+    Paired in a finally, like activity(), because the interesting blocks are the
+    ones that raise: a retrieval that times out must not leave the gauge reading
+    "10 in flight" for the rest of the run, which would classify every later
+    excursion as RETRIEVER_DEPENDENCY.
+    """
+    gauge_add(name, n)
+    try:
+        yield
+    finally:
+        gauge_add(name, -n)
+
+
+# Some gauges already have an authoritative owner and should not be mirrored.
+# gen_inflight is len(PumpClient._pending), mutated at five places -- submit, the
+# three completion paths and _fail_all -- and a gauge that misses one of them
+# reads high forever, which classifies every later excursion as GPU-SIDE. So the
+# owner registers a reader instead and the sampler pulls it.
+#
+# The callable must not block: it runs on the sampler thread once per interval,
+# and a sampler that stalls stops recording the very excursion it was called
+# during. PumpClient.in_flight takes its lock for a dict length and no more.
+_GAUGE_SOURCES: Dict[str, Any] = {}
+
+
+def register_gauge_source(name: str, read) -> None:
+    with _GAUGE_LOCK:
+        _GAUGE_SOURCES[name] = read
+
+
+def unregister_gauge_source(name: str) -> None:
+    with _GAUGE_LOCK:
+        _GAUGE_SOURCES.pop(name, None)
+
+
+def gauge_snapshot() -> Dict[str, int]:
+    with _GAUGE_LOCK:
+        snap = dict(_GAUGES)
+        sources = dict(_GAUGE_SOURCES)
+    for name, read in sources.items():
+        try:
+            value = int(read())
+        except Exception:  # pragma: no cover - a broken reader is not a run-ender
+            continue
+        if value:
+            snap[name] = value
+    return snap
+
+
+def reset_gauges() -> None:
+    """For tests. A leaked gauge is a wrong classification, not a wrong number."""
+    with _GAUGE_LOCK:
+        _GAUGES.clear()
+        _GAUGE_SOURCES.clear()
 
 
 # Where the threads actually are, asked of the interpreter rather than of a tag.
@@ -513,7 +624,13 @@ _TRACE_PER_GPU = (
     ("pcie_rx_mb_s_per_gpu", "pcie_rx_mb_s", "{:.0f}"),
     ("nvlink_mb_s_per_gpu", "nvlink_mb_s", "{:.0f}"),
 )
-_TRACE_HEADER = "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct\n"
+_TRACE_HEADER = (
+    "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct,"
+    # The gauges, in a fixed order, so a scanner can index them positionally and
+    # a run that instruments nothing still writes the columns (as zeros) rather
+    # than a narrower row that silently changes the schema.
+    + ",".join(GAUGE_NAMES) + "\n"
+)
 
 
 def _trace_path_for_pid(path: str) -> str:
@@ -547,6 +664,7 @@ class _Sampler:
         self._cpu_trace = []
         self._act_trace = []
         self._stack_trace = []
+        self._gauge_trace = []
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -608,10 +726,12 @@ class _Sampler:
                 # which two other readers unpack by shape.
                 self._cpu_trace.append((t, (host or {}).get("cpu_pct")))
                 self._act_trace.append((t, activity_snapshot()))
+                gauges = gauge_snapshot()
+                self._gauge_trace.append((t, gauges))
                 self._stack_trace.append((t, stack_snapshot()))
-            self._write_trace(t, phase, per_gpu, host)
+            self._write_trace(t, phase, per_gpu, host, gauges)
 
-    def _write_trace(self, t, phase, per_gpu, host):
+    def _write_trace(self, t, phase, per_gpu, host, gauges=None):
         """Append one row to GPU_PROFILER_TRACE, if it is set.
 
         The tables are per-step aggregates and are reset at every step boundary,
@@ -632,9 +752,11 @@ class _Sampler:
                 for _, key, fmt in _TRACE_PER_GPU
             ]
             cpu = (host or {}).get("cpu_pct")
+            g = gauges or {}
             self._trace.write(
                 f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{os.getpid()},{phase},"
-                f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'}\n"
+                f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'},"
+                f"{','.join(str(g.get(name, 0)) for name in GAUGE_NAMES)}\n"
             )
             # Flushed every row: the interesting runs are the ones that end in a
             # crash or a Ctrl-C, and a buffered tail would lose exactly those.
@@ -713,6 +835,7 @@ class _Sampler:
             cpu_at = {ts: pct for ts, pct in self._cpu_trace if pct is not None}
             act_at = dict(self._act_trace)
             stack_at = dict(self._stack_trace)
+            gauge_at = dict(self._gauge_trace)
         def _mean(stamps):
             vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
             return (sum(vals) / len(vals)) if vals else None
@@ -746,6 +869,21 @@ class _Sampler:
                 return None
             names = {k for snap in seen for k in snap}
             return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
+
+        def _gauges(stamps):
+            """Mean of each gauge over these samples.
+
+            The mean, not the max: one excursion with 40 ready episodes and
+            ninety with none is not "ready was 40", and the classifier below has
+            to distinguish a standing backlog from a single blip.
+            """
+            seen = [gauge_at[ts] for ts in stamps if ts in gauge_at]
+            if not seen:
+                return None
+            return {
+                name: sum(snap.get(name, 0) for snap in seen) / len(seen)
+                for name in GAUGE_NAMES
+            }
 
         def _stacks(stamps, top=60):
             """The frames the threads were actually on, over these samples.
@@ -805,6 +943,8 @@ class _Sampler:
             "activity_when_empty": _census(empty_ts, act_at),
             # The same question asked of the interpreter instead of the tags,
             # for the part of EMPTY that no tag has ever claimed.
+            "gauges_when_empty": _gauges(empty_ts),
+            "gauges_when_busy": _gauges(busy_ts),
             "stacks_when_empty": _stacks(empty_ts),
             "stacks_when_busy": _stacks(busy_ts),
             "activity_when_busy": _census(busy_ts, act_at),
@@ -839,6 +979,7 @@ class _Sampler:
             self._cpu_trace = []
             self._act_trace = []
             self._stack_trace = []
+            self._gauge_trace = []
         if not samples:
             return
         by_phase = _accumulate(samples, self.n_gpus)
@@ -963,6 +1104,48 @@ def residency_between(t0, t1, busy_thresh=None):
     return _sampler.residency_between(t0, t1, busy_thresh=busy_thresh)
 
 
+def classify_empty(gauges) -> Optional[str]:
+    """Why the cards were empty, from what work existed at the time.
+
+    Rule-based on purpose, and it keeps an UNINSTRUMENTED answer. The failure
+    mode of a classifier like this is that it always names something: every gap
+    gets attributed to whichever gauge happens to be instrumented, and the
+    profiler then argues confidently for a fix aimed at the wrong thing. Twice
+    in this arm a phase was named and then measured at under 0.05 of a slot.
+    So an excursion that matches no rule says so.
+
+    The distinction the whole thing exists for is the first two:
+
+      ready == 0 and the retriever busy   -> nothing COULD be submitted
+      ready >  0 and the retriever busy   -> something could and was not
+
+    Same observable, opposite prescriptions.
+    """
+    if not gauges:
+        return None
+    ready = gauges.get("ready", 0)
+    gen = gauges.get("gen_inflight", 0)
+    retr = gauges.get("retriever_inflight", 0)
+    env = gauges.get("env_inflight", 0)
+    wait = gauges.get("future_wait", 0)
+
+    if ready >= 1 and gen < 0.5:
+        return ("SCHEDULER STARVATION -- work was ready and the engine had none of it. "
+                "The fix is on the submitting side, not the retriever's")
+    if gen >= 0.5:
+        return ("GPU-SIDE -- requests were with the engine while the cards read idle: "
+                "either the engine's own host work, or a sample window artefact")
+    if retr >= 1 and ready < 1:
+        return ("RETRIEVER DEPENDENCY -- nothing was submittable and the retrieval "
+                "service was the thing being waited on")
+    if env >= 1 and ready < 1:
+        return ("ENVIRONMENT DEPENDENCY -- nothing was submittable and env.step was "
+                "the thing being waited on")
+    if wait >= 1:
+        return "DRIVER WAITING ON A FUTURE with no downstream work recorded"
+    return None
+
+
 def format_residency(res) -> str:
     """One line: how much of the window had 0, 1, ... n cards with work."""
     if not res:
@@ -1004,6 +1187,20 @@ def format_residency(res) -> str:
 
     driver_running = empty_cpu is not None and empty_cpu >= 60
     driver_blocked = empty_cpu is not None and empty_cpu < 20
+
+    # What work EXISTED while the cards were empty, and what that implies.
+    # Printed before the census, because "nothing was submittable" and "32 things
+    # were submittable" want different questions asked of the census after them.
+    gauges = res.get("gauges_when_empty") or {}
+    if any(v >= 0.05 for v in gauges.values()):
+        shown = ", ".join(f"{k} {v:.1f}" for k, v in gauges.items() if v >= 0.05)
+        why += f"\n[gpu-residency]    while EMPTY the work outstanding was: {shown}"
+        verdict = classify_empty(gauges)
+        why += (
+            f"\n[gpu-residency]    -> {verdict}" if verdict else
+            "\n[gpu-residency]    -> UNINSTRUMENTED: no rule matches these gauges, which is"
+            " an answer -- the gap is somewhere nothing counts"
+        )
 
     untagged = max(0.0, slots - accounted) if slots else 0.0
     if ranked:

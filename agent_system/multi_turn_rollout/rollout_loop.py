@@ -395,6 +395,11 @@ def _pump_client(actor_rollout_wg):
             return None
         client.start()
         state["client"] = client
+        # Pulled rather than mirrored: _pending is mutated in five places and a
+        # gauge that misses one reads high forever, which would classify every
+        # later idle stretch as GPU-SIDE and send the next fix to the wrong side
+        # of the boundary.
+        gpu_profiler.register_gauge_source("gen_inflight", client.in_flight)
         print(f"[rollout-pump] driving {actor_rollout_wg.world_size} ranks as a pool; {client.handshake_info}", flush=True)
         return client
 
@@ -405,6 +410,7 @@ def close_pump_client():
         client, _PUMP_STATE["client"] = _PUMP_STATE["client"], None
         never_started = client is None and _ROLLOUT_ASYNC_GENERATE
     if client is not None:
+        gpu_profiler.unregister_gauge_source("gen_inflight")
         print(client.line(), flush=True)
         client.close()
     elif never_started:
@@ -1437,8 +1443,11 @@ class TrajectoryCollector:
 
         def _step_envs():
             # Tagged inside the callable so the prefetch path, which runs this
-            # on a worker thread, is counted where it actually runs.
-            with gpu_profiler.activity("envstep"):
+            # on a worker thread, is counted where it actually runs. The gauge
+            # carries the ROW COUNT, not a thread count: "one thread in envstep"
+            # and "378 episodes waiting on their environment" are different
+            # facts and the classifier needs the second one.
+            with gpu_profiler.activity("envstep"), gpu_profiler.inflight("env_inflight", len(rows)):
                 if task is None:
                     return envs.step(text_actions)
                 return envs.step(text_actions, tasks=[task])

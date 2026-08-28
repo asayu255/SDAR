@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -276,6 +277,24 @@ def _search_api_request(
 
 
 
+@contextlib.contextmanager
+def _profiler_inflight(name, n=1):
+    """Hold n on a profiler gauge, if the profiler is importable.
+
+    Guarded because this module runs inside the environment workers, which are
+    started in contexts where verl may not be on the path at all; a retrieval
+    tool that cannot retrieve because a profiler is missing would be an absurd
+    way to lose a run.
+    """
+    try:
+        from verl.utils import gpu_profiler
+    except Exception:  # pragma: no cover - profiler is optional
+        yield
+        return
+    with gpu_profiler.inflight(name, n):
+        yield
+
+
 class _QuerySlot:
     """One caller's place in a coalesced request."""
 
@@ -336,18 +355,26 @@ class _Coalescer:
             window = self._windows.setdefault(key, [])
             window.append(slot)
             leader = len(window) == 1
-        if not leader:
-            # No timeout: the leader fills every slot in a finally, including
-            # when its request raises. A bound here would race a slow retriever
-            # and hand the environment an error it did not have.
-            slot.done.wait()
-            return slot.response, slot.error
+        # ONE query, one count, whether this caller does the HTTP or waits for
+        # the caller that does. The stack sampler reported "10.78 threads in
+        # search.py <- threading wait" and that was read as ten requests in
+        # flight; it is ten waiters behind one. The gauge counts the queries
+        # outstanding, which is the number the classifier needs -- and the
+        # window between them is why a follower's wait is not idle time the
+        # retriever is responsible for.
+        with _profiler_inflight("retriever_inflight"):
+            if not leader:
+                # No timeout: the leader fills every slot in a finally, including
+                # when its request raises. A bound here would race a slow retriever
+                # and hand the environment an error it did not have.
+                slot.done.wait()
+                return slot.response, slot.error
 
-        time.sleep(_BATCH_WINDOW_S)
-        with self._lock:
-            batch = self._windows.pop(key, [])
-        self._flush(url, batch, send)
-        return slot.response, slot.error
+            time.sleep(_BATCH_WINDOW_S)
+            with self._lock:
+                batch = self._windows.pop(key, [])
+            self._flush(url, batch, send)
+            return slot.response, slot.error
 
     def _flush(self, url, batch, send):
         try:

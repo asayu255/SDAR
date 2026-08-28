@@ -17,19 +17,48 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from verl.utils import gpu_profiler as gp  # noqa: E402
 
 
-class _FakeSampler:
-    """Just enough of Sampler for residency_between: a lock and a util trace."""
+def _trace_buffers():
+    """Every ``self._X_trace`` the real sampler creates, read from its source.
 
-    def __init__(self, trace, cpu=None, act=None, stacks=None):
+    Hand-listing them has broken these doubles three times: each new per-sample
+    buffer -- cpu, then activity, then stacks, then gauges -- made forty tests
+    fail with AttributeError on a fake, which is noise standing between the
+    author and whether the change was right. Discovering them means a fourth
+    buffer costs nothing here.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(gp._Sampler.__init__)
+    return re.findall(r"self\.(_\w+_trace)\s*=\s*\[\]", src)
+
+
+class _FakeSampler:
+    """Just enough of Sampler for residency_between: a lock and the buffers."""
+
+    def __init__(self, trace, cpu=None, act=None, stacks=None, gauges=None):
         import threading
 
         self._lock = threading.Lock()
+        # Everything the real sampler has, empty, so a buffer this test does not
+        # care about is present rather than missing.
+        for name in _trace_buffers():
+            setattr(self, name, [])
         self._util_trace = list(trace)
         self._cpu_trace = list(cpu or [])
         self._act_trace = list(act or [])
         self._stack_trace = list(stacks or [])
+        self._gauge_trace = list(gauges or [])
 
     residency_between = gp._Sampler.residency_between
+
+
+def test_the_double_carries_every_buffer_the_real_sampler_has():
+    """The guard that stops this breaking a fourth time."""
+    fake = _FakeSampler(_trace([[0, 0, 0]]))
+    missing = [name for name in _trace_buffers() if not hasattr(fake, name)]
+    assert not missing, f"_FakeSampler is missing {missing}"
+    assert _trace_buffers(), "the discovery regex found nothing -- it has rotted"
 
 
 def _trace(rows, interval=0.3, t0=100.0):
@@ -152,12 +181,15 @@ def test_the_pipeline_reads_residency_over_the_span_its_launches_covered(monkeyp
     class _LiveFakeSampler:
         residency_between = live._Sampler.residency_between
 
-        def __init__(self, trace, cpu=None, act=None, stacks=None):
+        def __init__(self, trace, cpu=None, act=None, stacks=None, gauges=None):
             self._lock = threading.Lock()
+            for name in _trace_buffers():
+                setattr(self, name, [])
             self._util_trace = list(trace)
             self._cpu_trace = list(cpu or [])
             self._act_trace = list(act or [])
             self._stack_trace = list(stacks or [])
+            self._gauge_trace = list(gauges or [])
 
     start = time.perf_counter()
     end = start + 3.0

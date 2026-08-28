@@ -92,6 +92,15 @@ def read_trace(path):
                         "clk": _floats(r.get("smclk_mhz_per_gpu")),
                         "pcie_rx": _floats(r.get("pcie_rx_mb_s_per_gpu")),
                         "cpu": float(r["driver_cpu_pct"]) if (r.get("driver_cpu_pct") or "").strip() else None,
+                        # Absent in traces written before the gauges existed, and
+                        # that has to stay readable: those runs get an empty dict
+                        # and every excursion in them classifies as
+                        # UNINSTRUMENTED, which is the truth about them.
+                        "gauges": {
+                            name: int(float(r[name]))
+                            for name in GAUGE_NAMES
+                            if (r.get(name) or "").strip() not in ("", "0")
+                        },
                     }
                 )
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -172,9 +181,62 @@ def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0):
                 "argmin": argmin,
                 "min_sm": rows[argmin]["sm"][gi],
                 "phases": sorted({rows[k]["phase"] for k in window}),
+                # Read at the deepest sample, not averaged over the window: the
+                # shoulders of an excursion are the GPU draining and refilling,
+                # and the state that explains it is the one at the bottom.
+                "gauges": rows[argmin].get("gauges") or {},
+                "why": why(rows[argmin].get("gauges") or {}, rows[argmin].get("cpu")),
             }
         )
     return out
+
+
+# Kept in step with gpu_profiler.GAUGE_NAMES. Imported when verl is importable,
+# hard-coded when it is not, because this script is run against a CSV on a
+# laptop as often as beside the code that wrote it.
+try:  # pragma: no cover - exercised both ways in the tests
+    from verl.utils.gpu_profiler import GAUGE_NAMES
+except Exception:  # pragma: no cover
+    GAUGE_NAMES = ("ready", "gen_inflight", "retriever_inflight", "env_inflight", "future_wait")
+
+
+def why(gauges, cpu=None):
+    """What the outstanding work says about an idle GPU.
+
+    The two answers this exists to separate look identical on the device:
+
+        ready=0,  retriever_inflight=10  ->  nothing COULD be submitted
+        ready=32, retriever_inflight=10  ->  something could and was not
+
+    and their fixes are opposite -- speed up the retriever, or stop
+    lock-stepping and submit what was already waiting.
+
+    UNINSTRUMENTED is a real answer and must stay reachable. A classifier with
+    no such branch attributes every gap to whichever gauge happens to exist,
+    and then argues confidently for a fix aimed at the wrong thing; this arm has
+    named a cause and then measured it at under 0.05 of a slot twice.
+    """
+    if not gauges:
+        return "UNINSTRUMENTED"
+    ready = gauges.get("ready", 0)
+    gen = gauges.get("gen_inflight", 0)
+    retr = gauges.get("retriever_inflight", 0)
+    env = gauges.get("env_inflight", 0)
+    wait = gauges.get("future_wait", 0)
+
+    if ready and not gen:
+        return "SCHEDULER_STARVATION"
+    if gen:
+        return "GPU_SIDE"
+    if retr and not ready:
+        return "RETRIEVER_DEPENDENCY"
+    if env and not ready:
+        return "ENV_DEPENDENCY"
+    if wait and (cpu is None or cpu < 20):
+        return "FUTURE_RAY_WAIT"
+    if cpu is not None and cpu >= 60:
+        return "DRIVER_CPU"
+    return "UNINSTRUMENTED"
 
 
 def classify(rows, exc, floor, busy=95.0):
@@ -261,6 +323,34 @@ def analyse(path, floor, busy, top):
             "single-gpu": "only one GPU in the trace",
         }[kind]
         print(f"    {kind:<9}{n:>5} excursions {s:>8.1f}s   {what}")
+
+    # WHY, not just where. Ranked by lost GPU-seconds rather than by count or by
+    # wall: an excursion's cost is the integral of the deficit, and thirty short
+    # ones can outweigh a single long one that only took a card to 60%.
+    by_why = defaultdict(lambda: [0, 0.0, 0.0])
+    for e in all_exc:
+        row = by_why[e["why"]]
+        row[0] += 1
+        row[1] += e["wall"]
+        row[2] += e["lost_s"]
+    if by_why:
+        print("\nwhy the cards were idle, by lost GPU-seconds")
+        print(f"    {'reason':<22}{'events':>7}{'wall s':>9}{'lost GPU-s':>12}{'share':>8}")
+        for reason, (n, wall, lost) in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
+            share = (lost / exc_lost * 100.0) if exc_lost else 0.0
+            print(f"    {reason:<22}{n:>7}{wall:>9.1f}{lost:>12.1f}{share:>7.1f}%")
+        meaning = {
+            "SCHEDULER_STARVATION": "work was ready and the engine had none of it -- fix the submitting side",
+            "RETRIEVER_DEPENDENCY": "nothing was submittable; the retrieval service was the dependency",
+            "ENV_DEPENDENCY": "nothing was submittable; env.step was the dependency",
+            "GPU_SIDE": "requests were with the engine -- its own host work, or a sample-window artefact",
+            "FUTURE_RAY_WAIT": "the driver was blocked on a Future with nothing downstream recorded",
+            "DRIVER_CPU": "the driver was running Python and no gauge explains what for",
+            "UNINSTRUMENTED": "NO RULE MATCHED. Either the trace predates the gauges, or the gap is "
+                              "somewhere nothing counts -- do not attribute it to the row above it",
+        }
+        for reason, _ in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
+            print(f"      {reason:<22}{meaning.get(reason, '')}")
 
     print(f"\nper phase: share of wall clock, and the loss attributed to it")
     ph_wall, ph_lost, ph_exc = defaultdict(float), defaultdict(float), defaultdict(float)
