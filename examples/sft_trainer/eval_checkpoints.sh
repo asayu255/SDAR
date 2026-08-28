@@ -176,7 +176,7 @@ _WIDTH=$(grep -o "val_per_task_batch_size='{[^}]*}'" "$RUN_SCRIPT" \
 # and having the check default to 3 while the script exported 4 would mean
 # every default run was validated against two thirds of what it would ask for
 # -- exactly the class of mistake this guard exists to catch.
-export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-4}"
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-6}"
 _DEPTH="$VAL_PIPELINE_DEPTH"
 if [ -n "$_WIDTH" ]; then
     _NEEDED=$(awk -v w="$_WIDTH" -v d="$_DEPTH" 'BEGIN{print w * 468 * d / 3}')
@@ -335,28 +335,50 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # "NOTHING running" for this -- a slot blocked in env.step is running by that
 # measure while every card is idle, which is how depth looked unnecessary once
 # already.
-# WHY 4 NOW, AND WHY THE WIDTH CAME BACK DOWN TO 378 FOR IT.
+# WHY 6 NOW, AND WHY THE WIDTH CAME BACK DOWN TO 252 FOR IT.
 #
-# The p^depth argument above predicted the ordinary body of the idle. The
-# per-excursion profiler measured what is actually left, and it is not that:
+# The earlier reading of this said 95% of the idle was "no slot was free", off
+# a classifier that never looked at a slot. Its two largest rows were named for
+# states their gauges could not observe, and the trace it read had no slot
+# column at all, so SCHEDULER_STARVATION's 13.8% was a structural zero's
+# opposite -- a number produced by a branch that could not fire. None of it
+# supported a depth.
 #
-#   TAIL_BLOCKS_READY      369.1 GPU-s   81.1%
-#   SCHEDULER_STARVATION    62.8 GPU-s   13.8%
-#   GPU_SIDE                23.3 GPU-s    5.1%
+# The run with the full gauge set (trace_v2, two samplers over the same three
+# cards, nothing unattributed in either) says:
 #
-# 95% of it is NO SLOT WAS FREE. A slot is held until every one of its rows has
-# come back -- val_pipeline retires on future.result() and only then appends the
-# slot to `free` -- so a batch whose last four rows are still generating keeps
-# its seat while five hundred finished ones sit idle, and the next batch,
-# already prepared, has nowhere to go. The gauges at those excursions read
-# ready=1 with gen_inflight=1..4 against a batch of 504.
+#                                    driver     rank0
+#   TAIL_NO_FREE_SLOT_SCALABLE        77.7%     63.2%
+#   GPU_SIDE                          10.5%     20.7%
+#   RETRIEVER_DEPENDENCY               9.3%     10.1%
+#   SLOTS_BUSY_NOT_GENERATING          2.5%      3.1%
+#   TAIL_SLOT_FREE_PLACEABLE             --       0.0
 #
-# Another slot is the direct answer and the width pays for it: 504 x 3 and
-# 378 x 4 hold the same 1512 rows in flight, so the KV peak does not move.
+# SCALABLE is the operative word: no slot was free, AND the queue held work
+# that more than one slot in this topology can run. That is search, and search
+# is what the extra slots serve, so another slot takes it. The gauges at those
+# excursions read ready=4 ready_scalable=3 ready_pinned=1 with gen_inflight=1,
+# and the activity census reads envreset:1 gen:1 preproc:2 -- four slots
+# occupied and all of them off the GPU at once. Independent pipelines
+# decorrelate that; a fifth and sixth are the direct answer.
 #
-# If this does not close the gap, the fix is structural -- release a slot
-# before its tail finishes, which means the pipeline stops owning whole batches
-# -- and that is a far larger change than either of these two numbers.
+# TAIL_SLOT_FREE_PLACEABLE is 0.0, which closes the other candidate: no
+# measurable time is lost between a slot coming back and the next dispatch, so
+# refill() and prepare() are not in the way.
+#
+# THE WIDTH PAYS FOR THE SLOTS. `w x 468 x d / 3` must stay inside the budget,
+# and at width 378 depth 5 asks for 294,840 tokens against 266,708 at
+# ROLLOUT_GPU_MEM_UTIL=0.85 -- it does not fit at 0.95 either. 252 x 6 holds
+# the same 1512 rows in flight as 378 x 4 and asks for the same 235,872, so
+# this changes the SLOT COUNT and nothing else.
+#
+# That separation is the point. 378 x 3 -> 378 x 4 took 13.5% off the wall, but
+# it raised the slot count and the total rows together (1134 -> 1512), so which
+# one paid was never established. This run holds the rows fixed.
+#
+# If it does not close the gap, the fix is structural -- release a slot before
+# its tail finishes, which means the pipeline stops owning whole batches -- and
+# that is a far larger change than either of these two numbers.
 #
 # The export itself is at the top, beside the guard that has to read it.
 
@@ -390,48 +412,45 @@ if [ "$ROLLOUT_ASYNC_GENERATE" != "0" ]; then
     export ROLLOUT_ASYNC_REQUIRE="${ROLLOUT_ASYNC_REQUIRE:-1}"
 fi
 
-# SEARCH BATCH WIDTH -- 504, in both this repo's pinned config and the run
+# SEARCH BATCH WIDTH -- 252, in both this repo's pinned config and the run
 # script. It had been living on a command line behind EXPECTED_CONFIG_WAIVE;
 # every step of it since has been measured before being kept.
 #
 #   126 -> 252   413 batches -> 208, ms/row unchanged
 #   252 -> 378   208 -> 139, ms/row 67 -> 65-66 at the same fraction of rows
-#   378 -> 504   208 -> 105, expected a further ~1.4%; needs the 0.85 budget
+#   378 -> 504   105 batches; abandoned, its log was overwritten before it read
+#   504 -> 378   paired with depth 4; 3525 s -> 3050 s, -13.5%
+#   378 -> 252   paired with depth 6, THIS ONE, and it is not a width change:
+#                252 x 6 and 378 x 4 are the same 1512 rows and the same
+#                235,872 KV tokens. Only the slot count moves.
 #
 # A search batch's later turns decode for a handful of trajectories in a slot
 # sized for all of them: measured, the last two turns take 46% of a batch's
 # generation time to carry 14% of its work, and a decode step costs the same
-# whether it carries ten sequences or a hundred. So those turns are nearly free
-# to widen.
+# whether it carries ten sequences or a hundred. That is why widening was ever
+# nearly free -- and why narrowing it to buy a slot costs little either.
 #
 # alfworld and webshop stay at 126: their environment managers are built at this
 # size and alfworld's games are indexed by position within its manager. search's
 # rows and their order do not change, only how they are grouped, so its score
-# does not move.
+# does not move. It is greedy (temperature 0, do_sample false), so it cannot
+# move by sampling.
 #
-# search IS NOW 504, in both places, with the budget above sized for it.
+# WHAT THIS ONE IS AIMED AT, so the result can be read: the 63-78% of idle that
+# trace_v2 puts in TAIL_NO_FREE_SLOT_SCALABLE -- every slot occupied, all of
+# them off the GPU at once, and search work queued that another slot could run.
+# Two more slots decorrelate that. It is NOT aimed at per-batch driver cost,
+# which moves the wrong way here: 139 search batches become 208, so everything
+# done once per batch is multiplied by 1.5. If the wall does not improve, that
+# is the likely reason, and 294 x 5 (1470 rows, 229,320 tokens) is the gentler
+# step that keeps more of the width.
 #
-# 252 -> 378 was measured and kept: 208 batches became 139, ms/row read 65-66
-# against 252's 67 AT THE SAME FRACTION OF ROWS, val/success_rate moved by
-# 0.00002, and grep -ci preempt was 0. Predicted 2.7%, measured 1.5-3.0% --
-# the first time the per-batch-cost model called a result before the fact.
-#
-# WHAT IT IS AIMED AT, so the result can be read: 208 batches become 105, so
-# everything the driver does ONCE PER BATCH is divided and everything it does
-# per row is untouched. It is not aimed at the engine duty cycle and cannot
-# move it. Expected: about 1.4% over 378, which is small enough that a single
-# preemption erases it -- hence the check above.
+# Also not aimed at, and known to move the wrong way: the ~70 s of env-manager
+# construction, which is per SLOT. Six slots pay it three times over four.
 #
 # Compare on ms/row from the WALL lines at the SAME FRACTION OF ROWS. Not
 # s/batch, not batch number, and not [val-hash]: regrouping the same rows IS
 # the change, so no two batches pair across a width change.
-#
-# Not aimed at, and known not to move: the ~70 s of env-manager construction,
-# which is per SLOT and not per batch.
-#
-# THE NEXT ONE, if this pays: 580 at 0.85 is 59-66% of KV and worth about a
-# further 0.5%. Below the noise of a shared box; stop here unless something
-# else changes.
 
 # One wandb run for the whole sweep, so the checkpoints form a curve instead of a
 # scatter of one-point runs. WANDB_RESUME=allow makes the first process create it
