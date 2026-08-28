@@ -528,7 +528,7 @@ def test_one_request_in_flight_is_not_the_engine_having_work(tmp_path):
     out = _scan(_trace(tmp_path / "tail.csv", [busy, tail, busy, tail, busy]))
     # A TAIL_ reason, whichever slot state this fixture happens to describe --
     # what this test is about is that it is not GPU_SIDE.
-    assert "TAIL_NO_FREE_SLOT" in out
+    assert "TAIL_NO_FREE_SLOT_PINNED" in out
     assert "GPU_SIDE" not in out.split("why the cards were idle")[1].split("per phase")[0]
     # And it says what it calibrated to, so the reader can disagree with it.
     assert "calibrated from this run" in out
@@ -609,8 +609,8 @@ def test_the_primary_reason_is_what_the_excursion_was_mostly_made_of():
         rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"gen_inflight": 2, "ready": 1}})
     primary, lead_in, dwell = scanner.why(rows, 1, len(rows) - 1, pre_roll=0.4, gen_full=100)
     assert primary == "TAIL_BLOCKS_READY_UNKNOWN", (primary, dwell)
-    assert lead_in == "SCHEDULER_STARVATION", (lead_in, dwell)
-    assert dwell["TAIL_BLOCKS_READY_UNKNOWN"] == 14 and dwell["SCHEDULER_STARVATION"] == 1
+    assert lead_in == "SLOT_FREE_UNKNOWN", (lead_in, dwell)
+    assert dwell["TAIL_BLOCKS_READY_UNKNOWN"] == 14 and dwell["SLOT_FREE_UNKNOWN"] == 1
 
 
 def test_the_lead_in_is_dropped_when_it_is_the_primary():
@@ -618,7 +618,7 @@ def test_the_lead_in_is_dropped_when_it_is_the_primary():
     rows = [{"ts": i * 0.1, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1, "slots_free": 1}}
             for i in range(10)]
     primary, lead_in, _ = scanner.why(rows, 1, 9, pre_roll=0.4, gen_full=100)
-    assert primary == "SCHEDULER_STARVATION" and lead_in is None
+    assert primary == "SLOT_FREE_UNKNOWN" and lead_in is None
 
 
 def test_the_kv_guard_counts_depth_not_just_width():
@@ -655,14 +655,20 @@ def test_starvation_needs_a_free_slot_not_merely_a_queue():
     scanner = _scanner()
     queued_busy = {"ready": 8, "slots_free": 0}
     queued_free = {"ready": 8, "slots_free": 2}
-    assert scanner.why_one(queued_free, gen_full=100) == "SCHEDULER_STARVATION"
+    # A free slot, but no placeable_ready column to say whether the queue fit
+    # it: known free, unknown usable.
+    assert scanner.why_one(queued_free, gen_full=100) == "SLOT_FREE_UNKNOWN"
+    assert scanner.why_one({**queued_free, "placeable_ready": 3},
+                           gen_full=100) == "SCHEDULER_STARVATION"
     assert scanner.why_one(queued_busy, gen_full=100) == "SLOTS_BUSY_NOT_GENERATING"
     # A dependency still outranks the catch-all when it is present.
     assert scanner.why_one({"ready": 8, "slots_free": 0, "env_inflight": 378},
                            gen_full=100) == "ENV_DEPENDENCY"
-    # And a trace written before slots_free existed reads the catch-all rather
-    # than inventing starvation from a missing gauge.
-    assert scanner.why_one({"ready": 1}, gen_full=100) == "SLOTS_BUSY_NOT_GENERATING"
+    # And a trace written before slots_free existed says so, rather than either
+    # inventing starvation from a missing gauge or -- as it did until a real
+    # trace was read this way -- reporting "every slot was occupied", which is
+    # a claim about four slots from a column that is not in the file.
+    assert scanner.why_one({"ready": 1}, gen_full=100) == "READY_BUT_IDLE_UNKNOWN"
 
 
 def test_slots_free_is_published_by_the_pipeline():
@@ -739,16 +745,18 @@ def test_a_free_slot_that_fits_no_queued_batch_is_not_a_dispatcher_miss():
     assert scanner.why_one(fits_not, cpu=10, gen_full=100) == "SLOT_COMPATIBILITY_BLOCK"
 
 
-def test_a_trace_from_before_the_placeable_gauge_keeps_the_coarser_answer():
+def test_a_trace_from_before_the_placeable_gauge_says_so():
     """The absent column must not turn every starved sample into a block.
 
     A missing gauge reads as zero everywhere, so a classifier that treats zero
     as "nothing fits" relabels every SCHEDULER_STARVATION in every older trace
-    -- inventing a finding out of an instrument that was never installed.
+    -- inventing a finding out of an instrument that was never installed. Nor
+    may it keep the confident older name: the sample is genuinely undecided
+    between the two, and the table has to show that.
     """
     scanner = _scanner()
     old = {"ready": 4, "slots_free": 1, "gen_inflight": 0}
-    assert scanner.why_one(old, cpu=10, gen_full=100) == "SCHEDULER_STARVATION"
+    assert scanner.why_one(old, cpu=10, gen_full=100) == "SLOT_FREE_UNKNOWN"
 
 
 def test_a_placeable_column_reading_zero_is_not_an_absent_column(tmp_path):
@@ -879,7 +887,7 @@ def test_no_free_slot_does_not_claim_the_busy_slots_were_generating():
     text = SCANNER.read_text()
     start = text.index("meaning = {")
     end = text.index("}", text.index("UNINSTRUMENTED", start))
-    for leaf in ("TAIL_NO_FREE_SLOT_SCALABLE", "TAIL_NO_FREE_SLOT_PINNED", "TAIL_NO_FREE_SLOT"):
+    for leaf in ("TAIL_NO_FREE_SLOT_SCALABLE", "TAIL_NO_FREE_SLOT_PINNED", "TAIL_NO_FREE_SLOT_UNKNOWN"):
         line = text[text.index(f'"{leaf}":', start):]
         line = line[:line.index('",\n') + 1] if '",\n' in line else line[:300]
         assert "no slot was free" in line or "no slot was free" in line.lower(), (leaf, line[:200])
@@ -896,7 +904,72 @@ def test_a_tail_in_a_trace_without_slots_free_stays_undecided():
     assert scanner.why_one({"gen_inflight": 3, "ready": 2, "slots_free": 1},
                            gen_full=100) == "TAIL_SLOT_FREE_UNKNOWN"
     assert scanner.why_one({"gen_inflight": 3, "ready": 2, "slots_free": 0},
-                           gen_full=100) == "TAIL_NO_FREE_SLOT"
+                           gen_full=100) == "TAIL_NO_FREE_SLOT_UNKNOWN"
+
+
+def test_no_leaf_claims_a_slot_fact_from_a_trace_with_no_slot_gauge():
+    """The rule the tail branch got, applied to the branch beside it.
+
+    Without `slots_free` the engine-empty path fell through to
+    SLOTS_BUSY_NOT_GENERATING -- "every slot was occupied and none was feeding
+    the engine" -- a claim about four slots read off a column that was not in
+    the file. The first real trace read this way had 22.2 GPU-s reported that
+    way by a run whose profiler never wrote the gauge. Three findings
+    (starvation, shape mismatch, genuinely all busy) were in that one bucket.
+    """
+    scanner = _scanner()
+    empty = {"gen_inflight": 0, "ready": 4}
+    assert scanner.why_one(empty, cpu=10, gen_full=100) == "READY_BUT_IDLE_UNKNOWN"
+    # With the gauge, free == 0 IS established, and the name may say so.
+    assert scanner.why_one({**empty, "slots_free": 0}, cpu=10,
+                           gen_full=100) == "SLOTS_BUSY_NOT_GENERATING"
+    # A slot free but no placeable_ready column: free is known, fit is not.
+    assert scanner.why_one({**empty, "slots_free": 2}, cpu=10,
+                           gen_full=100) == "SLOT_FREE_UNKNOWN"
+    # A dependency reads its own gauge and is unaffected by the missing one.
+    assert scanner.why_one({**empty, "retriever_inflight": 3}, cpu=10,
+                           gen_full=100) == "RETRIEVER_DEPENDENCY"
+
+
+def test_the_report_totals_what_it_could_not_attribute(tmp_path):
+    """Summing it off the table by eye is how a structural zero got read as a
+    measurement for two turns. On the first real trace read this way, two
+    thirds of the loss was in leaves no gauge could resolve."""
+    names = ("ready", "gen_inflight", "retriever_inflight", "env_inflight", "future_wait")
+    head = ("ts,clock,pid,phase,sm_pct_per_gpu,membw_pct_per_gpu,power_w_per_gpu,"
+            "smclk_mhz_per_gpu,pcie_rx_mb_s_per_gpu,nvlink_mb_s_per_gpu,driver_cpu_pct,"
+            + ",".join(names))
+    lines, t = [head], 0.0
+    for sm, gauges, n in ((([98, 97, 98]), {"gen_inflight": 200}, 30),
+                          (([0, 1, 0]), {"gen_inflight": 3, "ready": 2}, 20),
+                          (([98, 97, 98]), {"gen_inflight": 200}, 30)):
+        for _ in range(n):
+            lines.append(f"{t:.3f},00:00:00,1,gen,{';'.join(str(v) for v in sm)},;;,;;,;;,;;,;;,20,"
+                         + ",".join(str(gauges.get(k, 0)) for k in names))
+            t += 0.1
+    path = tmp_path / "old.csv"
+    path.write_text("\n".join(lines) + "\n")
+    out = _scan(path)
+    line = next(ln for ln in out.splitlines() if "UNATTRIBUTED" in ln)
+    assert "100.0%" in line, line
+    assert "slots_free" in out
+
+
+def test_every_unknown_leaf_is_named_unknown():
+    """A reader must be able to total the unattributed share off the names.
+
+    Two thirds of the first trace's loss landed in leaves that could not be
+    resolved for want of a gauge. That is a fact about the instrument, and it
+    has to be legible in the table rather than hidden inside confident names.
+    """
+    scanner = _scanner()
+    bare = {"gen_inflight": 0, "ready": 4}
+    tail = {"gen_inflight": 3, "ready": 4}
+    for gauges in (bare, tail, {**tail, "slots_free": 1}, {**tail, "slots_free": 0},
+                   {**bare, "slots_free": 1}):
+        reason = scanner.why_one(gauges, cpu=10, gen_full=100)
+        resolved = all(k in gauges for k in ("slots_free", "placeable_ready", "ready_scalable"))
+        assert resolved or reason.endswith("UNKNOWN"), (gauges, reason)
 
 
 def test_the_new_reason_did_not_reshuffle_the_existing_ranks():

@@ -295,7 +295,7 @@ def _tail_reason(gauges):
     # that only one slot in the whole topology can run is not helped by adding
     # copies of the slots that already cannot run it.
     if "ready_scalable" not in gauges:
-        return "TAIL_NO_FREE_SLOT"
+        return "TAIL_NO_FREE_SLOT_UNKNOWN"
     if gauges["ready_scalable"]:
         return "TAIL_NO_FREE_SLOT_SCALABLE"
     return "TAIL_NO_FREE_SLOT_PINNED"
@@ -340,8 +340,16 @@ def why_one(gauges, cpu=None, gen_full=1):
     # arrived, which was a change in the instrument and not in the run. Work
     # waiting while every slot is legitimately occupied is a different finding
     # and gets a different name.
+    # THE SAME RULE AS THE TAIL BRANCH: no answer about slots from a trace with
+    # no slot gauge. Without `slots_free` this fell straight through to
+    # SLOTS_BUSY_NOT_GENERATING -- "every slot was occupied and none was feeding
+    # the engine" -- which is a claim about four slots read off a column that
+    # was not in the file. The first real trace to be read this way had exactly
+    # that: 22.2 GPU-s reported as busy slots by a run whose profiler never
+    # wrote the gauge.
+    has_slots = "slots_free" in gauges
     free = gauges.get("slots_free", 0)
-    if ready and free:
+    if has_slots and ready and free:
         # A FREE SLOT IS NOT A PLACEABLE ONE. Slots are task-typed: a free
         # alfworld slot cannot take a queued webshop batch, so "work ready, slot
         # free" covers two findings that want opposite fixes -- dispatch sooner,
@@ -355,7 +363,7 @@ def why_one(gauges, cpu=None, gen_full=1):
         # having every such sample reported as a compatibility block. Zeros are
         # written, so the test is whether the COLUMN is there, not its value.
         if "placeable_ready" not in gauges:
-            return "SCHEDULER_STARVATION"
+            return "SLOT_FREE_UNKNOWN"
         return ("SCHEDULER_STARVATION" if gauges["placeable_ready"]
                 else "SLOT_COMPATIBILITY_BLOCK")
     if retr:
@@ -363,7 +371,8 @@ def why_one(gauges, cpu=None, gen_full=1):
     if env:
         return "ENV_DEPENDENCY"
     if ready:
-        return "SLOTS_BUSY_NOT_GENERATING"
+        # free == 0 is only ESTABLISHED when the column exists to establish it.
+        return "SLOTS_BUSY_NOT_GENERATING" if has_slots else "READY_BUT_IDLE_UNKNOWN"
     if wait and (cpu is None or cpu < 20):
         return "FUTURE_RAY_WAIT"
     if cpu is not None and cpu >= 60:
@@ -410,12 +419,14 @@ def _mean_sm(sm):
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
     "SLOT_COMPATIBILITY_BLOCK",
+    "SLOT_FREE_UNKNOWN",
+    "READY_BUT_IDLE_UNKNOWN",
     "TAIL_SLOT_FREE_PLACEABLE",
     "TAIL_SLOT_FREE_UNUSABLE",
     "TAIL_SLOT_FREE_UNKNOWN",
     "TAIL_NO_FREE_SLOT_SCALABLE",
     "TAIL_NO_FREE_SLOT_PINNED",
-    "TAIL_NO_FREE_SLOT",
+    "TAIL_NO_FREE_SLOT_UNKNOWN",
     "TAIL_BLOCKS_READY_UNKNOWN",
     "SLOTS_BUSY_NOT_GENERATING",
     "RETRIEVER_DEPENDENCY",
@@ -433,6 +444,8 @@ _REASON_RANK = (
 _REASON_ABBR = {
     "SCHEDULER_STARVATION": "starved",
     "SLOT_COMPATIBILITY_BLOCK": "mismatch",
+    "SLOT_FREE_UNKNOWN": "slotfree?",
+    "READY_BUT_IDLE_UNKNOWN": "idle?",
     "SLOTS_BUSY_NOT_GENERATING": "allbusy",
     "TAIL_BLOCKS_READY_UNKNOWN": "tail?",
     "TAIL_SLOT_FREE_PLACEABLE": "freeslot+",
@@ -440,7 +453,7 @@ _REASON_ABBR = {
     "TAIL_SLOT_FREE_UNKNOWN": "freeslot?",
     "TAIL_NO_FREE_SLOT_SCALABLE": "noslot-scalable",
     "TAIL_NO_FREE_SLOT_PINNED": "noslot-pinned",
-    "TAIL_NO_FREE_SLOT": "noslot?",
+    "TAIL_NO_FREE_SLOT_UNKNOWN": "noslot?",
     "TAIL_DRAIN": "tail",
     "RETRIEVER_DEPENDENCY": "retriever",
     "ENV_DEPENDENCY": "env",
@@ -638,6 +651,13 @@ def analyse(path, floor, busy, top):
                                     "the dispatcher missed it",
             "SLOT_COMPATIBILITY_BLOCK": "a slot was FREE and work was ready, but no ready batch fit "
                                         "the free slot -- the queue's task mix, not the dispatcher",
+            "READY_BUT_IDLE_UNKNOWN": "the engine was empty, work was ready, and no dependency was "
+                                      "pending. This trace has no slots_free column, so whether a slot "
+                                      "was open -- starvation, a shape mismatch, or every slot genuinely "
+                                      "busy -- is NOT RECORDED. Three findings, one bucket",
+            "SLOT_FREE_UNKNOWN": "a slot was free and work was ready, but this trace has no "
+                                 "placeable_ready column, so whether the queue could use that slot "
+                                 "is unknown",
             "SLOTS_BUSY_NOT_GENERATING": "every slot was occupied and none was feeding the engine -- "
                                          "between turns, in the driver, or in the pump round trip",
             "TAIL_NO_FREE_SLOT_SCALABLE": "a turn tail drained, no slot was free, and the queue held work "
@@ -645,7 +665,7 @@ def analyse(path, floor, busy, top):
             "TAIL_NO_FREE_SLOT_PINNED": "a turn tail drained, no slot was free, and every queued batch can "
                                         "run on exactly one slot -- more slots cannot take this queue; the "
                                         "lever is inside the batch, at the turn barrier",
-            "TAIL_NO_FREE_SLOT": "a turn tail drained and no slot was free. What was queued is not recorded "
+            "TAIL_NO_FREE_SLOT_UNKNOWN": "a turn tail drained and no slot was free. What was queued is not recorded "
                                  "in this trace (no ready_scalable), so whether depth would help is unknown. "
                                  "Says nothing about what the busy slots were doing",
             "TAIL_SLOT_FREE_PLACEABLE": "a turn tail drained while a slot sat free with work it COULD run -- "
@@ -668,6 +688,19 @@ def analyse(path, floor, busy, top):
         }
         for reason, _ in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
             print(f"      {reason:<{w}}{meaning.get(reason, '')}")
+        # THE UNATTRIBUTED TOTAL, on its own line. On the first trace read with
+        # a gauge-aware classifier, two thirds of the loss landed in leaves that
+        # could not be resolved for want of a column -- and that is a fact about
+        # the instrument, not a finding about the run. Left to be summed off the
+        # table by eye it will be read as attributed, which is how this arm
+        # spent two turns believing a structural zero was a measurement.
+        unknown = sum(lost for reason, (_n, _w, lost) in by_why.items()
+                      if reason.endswith("UNKNOWN") or reason == "UNINSTRUMENTED")
+        if unknown and exc_lost:
+            print(f"\n    UNATTRIBUTED: {unknown:.1f} of {exc_lost:.1f} lost GPU-s "
+                  f"({unknown / exc_lost * 100:.1f}%) is in leaves this trace cannot resolve.")
+            print("    Those rows say which gauge is missing. A run with it "
+                  "installed is the only way to move them.")
 
     print(f"\nper phase: share of wall clock, and the loss attributed to it")
     ph_wall, ph_lost, ph_exc = defaultdict(float), defaultdict(float), defaultdict(float)
