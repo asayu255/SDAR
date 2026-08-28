@@ -295,3 +295,66 @@ def test_a_token_budget_that_is_on_can_hold_one_padded_sequence(path, monkeypatc
             f"{path}: {switch}=True with {budget}={have}, below the padded "
             f"sequence width {padded}; rearrange_micro_batches asserts on this"
         )
+
+
+# Three placement knobs whose default in ppo_trainer.yaml is null or absent, so
+# every arm has to pass them itself. Values, not text: what matters is the
+# EFFECTIVE config the worker builds FSDP from.
+_SPEEDUP_FLAGS = (
+    ("actor_rollout_ref.actor.fsdp_config.sharding_strategy", "shard_grad_op"),
+    ("actor_rollout_ref.actor.fsdp_config.forward_prefetch", True),
+    ("actor_rollout_ref.actor.no_sync_grad_accum", True),
+)
+
+
+@pytest.mark.parametrize(
+    "path", [p for p in COMPOSED_SCRIPTS if "/opd_trainer/" in p or "/opd_grpo_trainer/" in p]
+)
+def test_every_opd_arm_composes_the_placement_speedups(path, monkeypatch):
+    """These are ON in every arm because every arm passes them, not because the
+    config defaults them: ppo_trainer.yaml ships sharding_strategy as null and
+    does not carry the other two at all, which is why the scripts use `+`.
+
+    That works and is deliberate -- ref/critic/reward_model must not inherit an
+    actor-only knob -- but it means the mechanism lives in ten places instead of
+    one. A new arm copied from an old script keeps them; a new arm written from
+    the config does not, and nothing else notices: FULL_SHARD instead of ZeRO-2,
+    a re-all-gather per micro-batch, and a gradient reduce per micro-batch
+    instead of per mini-batch are all silently slower and bit-identical.
+
+    Composed rather than grepped, so a `+key=` that stops taking effect (the
+    trap the top of this file is about) fails here too.
+    """
+    from omegaconf import OmegaConf
+
+    monkeypatch.setenv("RUN_TAG_SUFFIX", "")
+    overrides = _overrides(path)
+    assert overrides is not None, path
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        config = compose(config_name=CONFIG_NAME, overrides=overrides)
+    for key, want in _SPEEDUP_FLAGS:
+        got = OmegaConf.select(config, key, default="<<MISSING>>")
+        assert got == want and type(got) is type(want), f"{path}: {key} composed to {got!r}, want {want!r}"
+
+
+def test_the_placement_speedups_are_actor_only():
+    """ref, critic and reward_model keep the mesh default on purpose -- the ref
+    carries its own sharding_strategy key with its own default, and the other two
+    carry none. An actor-only knob leaking into a shared block is how a teacher
+    silently changes placement."""
+    import os as _os
+
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(_os.path.join(CONFIG_DIR, f"{CONFIG_NAME}.yaml"))
+    for block in ("actor_rollout_ref.ref.fsdp_config", "critic.model.fsdp_config"):
+        node = OmegaConf.select(cfg, block)
+        if node is None:
+            continue
+        assert "forward_prefetch" not in node, block
+        assert "no_sync_grad_accum" not in node, block
+    # The ref DOES carry sharding_strategy, and its default is null: the scripts
+    # turn it on for the resident teachers, the config does not assume it.
+    ref = OmegaConf.select(cfg, "actor_rollout_ref.ref.fsdp_config")
+    assert "sharding_strategy" in ref
+    assert ref.sharding_strategy is None
