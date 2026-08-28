@@ -204,3 +204,50 @@ def test_an_unreadable_log_says_what_it_saw(tmp_path, capsys):
     assert "NO validation metrics found" in out
     assert "as this reader sees it" in out
     assert "not a fragment" in out
+
+
+def test_an_incomplete_block_is_completed_rather_than_believed(tmp_path):
+    """The salvage ran only when the block reader found NOTHING.
+
+    So a block reader that returned something INCOMPLETE was never corrected,
+    and the missing keys came out as "only in one run" -- the exact false
+    signal this script exists to prevent. It produced one: val/success_rate
+    reported as scored by one run and not the other, on two runs that scored
+    both.
+    """
+    metrics = _split_metrics()
+    fragments = _pprinted(metrics)
+    assert len(fragments) >= 4, fragments
+
+    # One fragment carries a prefix shape the reader does not recognise, so the
+    # block reader skips that line and assembles the block WITHOUT it. Nothing
+    # is removed from the file: the keys are still there to be found.
+    lines = []
+    for index, fragment in enumerate(fragments):
+        # A timestamp rather than Ray's parenthesised prefix: not stripped, so
+        # the line does not look like a fragment and the block reader skips it.
+        prefix = "2026-08-28 15:57:01 " if index == 1 else RAY
+        lines.append(prefix + fragment)
+    path = tmp_path / "truncated.log"
+    path.write_text("\n".join(lines) + "\n")
+
+    # The block reader alone loses whatever was on that line.
+    from_blocks = {}
+    with open(path) as handle:
+        for block in val_scores._joined_blocks(handle.read()):
+            for key, value in val_scores._PAIR.findall(block):
+                from_blocks[key] = float(value)
+    assert set(from_blocks) != set(metrics), "the fixture no longer breaks the block reader"
+
+    got = val_scores.scores(str(path))
+    assert set(got) == set(metrics), sorted(set(metrics) - set(got))
+
+
+def test_a_missing_value_is_not_printed_as_a_negative_number(tmp_path, capsys):
+    a = _log(tmp_path / "a.log", BASE)
+    b = _log(tmp_path / "b.log", {k: v for k, v in BASE.items() if k != "val/success_rate"})
+    val_scores.main([str(a), str(b)])
+    line = next(l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("val/success_rate"))
+    assert "ONLY IN ONE" in line
+    assert "-0." not in line, line

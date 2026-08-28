@@ -104,7 +104,18 @@ def scores(path):
     for block in _joined_blocks(text):
         for key, value in _PAIR.findall(block):
             found[key] = float(value)   # a later block wins
-    return found or _salvage(text)
+    # BOTH PATHS, ALWAYS, unioned. The salvage used to run only when the block
+    # reader returned NOTHING -- so a block reader that returned something
+    # INCOMPLETE was never corrected, and the missing keys came out as "only in
+    # one run", which is the exact false signal this script exists to prevent.
+    # It produced one: val/success_rate and val/search_nq_success_rate reported
+    # as scored by one run and not the other, on two runs that scored both.
+    #
+    # Merging is safe because the salvage is bounded to the region after the
+    # marker and the two agree wherever they overlap.
+    for key, value in _salvage(text).items():
+        found.setdefault(key, value)
+    return found
 
 
 def explain(path, limit=6):
@@ -146,8 +157,12 @@ def _print_diff(paths, tables):
         if left is None or right is None:
             # A key present in one run and not the other is worth seeing on its
             # own line: it means the two runs did not score the same things.
-            print(f"{key:56s}{'-' if left is None else left:>14}"
-                  f"{'-' if right is None else right:>14}{'ONLY IN ONE':>12}")
+            # Formatted as strings so a long float cannot run into the next
+            # column -- it printed "-0.36159951159951165" for a missing control
+            # beside a positive candidate, which reads as a negative number.
+            shown_l = "-" if left is None else f"{left:.6f}"
+            shown_r = "-" if right is None else f"{right:.6f}"
+            print(f"{key:56s}{shown_l:>14}{shown_r:>14}{'ONLY IN ONE':>13}")
             continue
         print(f"{key:56s}{left:>14.6f}{right:>14.6f}{right - left:>+12.6f}")
     missing = [k for k in keys if (k in a) != (k in b)]
