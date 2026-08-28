@@ -263,6 +263,41 @@ def inflight(name: str, n: int = 1):
 # during. PumpClient.in_flight takes its lock for a dict length and no more.
 _GAUGE_SOURCES: Dict[str, Any] = {}
 
+# Stack states, interned. The same handful of states repeat thousands of times
+# over a run -- the interesting question is which ones, not how many bytes they
+# take -- so the trace carries an integer and a sidecar carries the text once.
+# Bounded: a run that somehow produces more distinct states than this writes -1
+# rather than growing a dict without limit inside the sampler.
+_STACK_TABLE_MAX = int(os.environ.get("GPU_PROFILER_STACK_TABLE_MAX", "20000"))
+_STACK_IDS: Dict[tuple, int] = {}
+
+
+def stack_state_id(keys):
+    """Intern one sample's stack state, dropping threads outside this repo.
+
+    They are dropped from the KEY, not merely from the display: a hundred-odd
+    parked infrastructure threads drift in and out constantly, and keeping them
+    would make almost every sample a distinct state -- an intern table with no
+    repeats, which is a list. What remains is our frames, which is what anyone
+    reading an excursion wants, plus a count of the rest.
+    """
+    ours = tuple(sorted(k for k in keys if not k.endswith(" -")))
+    outside = len(keys) - len(ours)
+    # KEYED ON OURS ALONE. The parked count drifts by one or two constantly --
+    # Ray reaps and spawns pool workers all run -- and folding it into the key
+    # made "one of our frames, 137 parked" and "the same frame, 138 parked" two
+    # states. That is an intern table with no repeats, which is a list. The
+    # count is still reported, from the first sighting, because "alone" and
+    # "alongside 138 parked threads" are different situations to read.
+    known = _STACK_IDS.get(ours)
+    if known is not None:
+        return known, (ours, outside)
+    if len(_STACK_IDS) >= _STACK_TABLE_MAX:
+        return -1, (ours, outside)
+    ident = len(_STACK_IDS)
+    _STACK_IDS[ours] = ident
+    return ident, (ours, outside)
+
 
 def register_gauge_source(name: str, read) -> None:
     with _GAUGE_LOCK:
@@ -629,7 +664,13 @@ _TRACE_HEADER = (
     # The gauges, in a fixed order, so a scanner can index them positionally and
     # a run that instruments nothing still writes the columns (as zeros) rather
     # than a narrower row that silently changes the schema.
-    + ",".join(GAUGE_NAMES) + "\n"
+    + ",".join(GAUGE_NAMES)
+    # WHERE, per sample. The gauges say which dependency an excursion was on;
+    # these say which of our code was live during it. Without them a dip in the
+    # trace carries a reason and a phase name and nothing that points at a line,
+    # and the frames only existed as an average over a whole reporting window --
+    # which is the wrong shape for "this 1.8 s dip".
+    + ",activity,stack_id\n"
 )
 
 
@@ -665,6 +706,7 @@ class _Sampler:
         self._act_trace = []
         self._stack_trace = []
         self._gauge_trace = []
+        self._stacks_seen = set()
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -673,6 +715,7 @@ class _Sampler:
         self._cum = {}
         self._cum_steps = 0
         self._trace = None
+        self._stacks_file = None
         if _TRACE_PATH:
             path = _trace_path_for_pid(_TRACE_PATH)
             try:
@@ -681,6 +724,13 @@ class _Sampler:
                 print(f"[gpu-profiler] per-sample trace -> {path}", flush=True)
             except OSError as e:
                 print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={path}: {e}", flush=True)
+            try:
+                # Beside the trace, named after it, so a scanner given one path
+                # can find the other without being told.
+                self._stacks_file = open(path + ".stacks", "w", buffering=1)
+                self._stacks_file.write("stack_id\tthreads_outside_repo\tframes\n")
+            except OSError:
+                self._stacks_file = None
         self._thread = threading.Thread(target=self._run, name="gpu-profiler", daemon=True)
         self._thread.start()
 
@@ -728,10 +778,12 @@ class _Sampler:
                 self._act_trace.append((t, activity_snapshot()))
                 gauges = gauge_snapshot()
                 self._gauge_trace.append((t, gauges))
-                self._stack_trace.append((t, stack_snapshot()))
-            self._write_trace(t, phase, per_gpu, host, gauges)
+                stacks = stack_snapshot()
+                self._stack_trace.append((t, stacks))
+                census = activity_snapshot()
+            self._write_trace(t, phase, per_gpu, host, gauges, census, stacks)
 
-    def _write_trace(self, t, phase, per_gpu, host, gauges=None):
+    def _write_trace(self, t, phase, per_gpu, host, gauges=None, census=None, stacks=None):
         """Append one row to GPU_PROFILER_TRACE, if it is set.
 
         The tables are per-step aggregates and are reset at every step boundary,
@@ -753,10 +805,18 @@ class _Sampler:
             ]
             cpu = (host or {}).get("cpu_pct")
             g = gauges or {}
+            # Semicolons inside the field, because the file is comma-separated
+            # and a census is a mapping. Same convention as the per-GPU columns.
+            act = ";".join(f"{k}:{v}" for k, v in sorted((census or {}).items()))
+            sid, key = stack_state_id(stacks or [])
+            if self._stacks_file is not None and sid >= 0 and sid not in self._stacks_seen:
+                self._stacks_seen.add(sid)
+                frames, outside = key
+                self._stacks_file.write(f"{sid}\t{outside}\t{' | '.join(frames)}\n")
             self._trace.write(
                 f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{os.getpid()},{phase},"
                 f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'},"
-                f"{','.join(str(g.get(name, 0)) for name in GAUGE_NAMES)}\n"
+                f"{','.join(str(g.get(name, 0)) for name in GAUGE_NAMES)},{act},{sid}\n"
             )
             # Flushed every row: the interesting runs are the ones that end in a
             # crash or a Ctrl-C, and a buffered tail would lose exactly those.

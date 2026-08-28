@@ -31,9 +31,40 @@ model_path="Qwen/Qwen3-1.7B"
 gen_traj_per_task=${GEN_TRAJ_PER_TASK:-2400}
 teacher_traj_dir=${TEACHER_TRAJ_DIR:-$HOME/data/verl-agent/sdar_multitask/teacher_traj}
 
+# EVERY RANK'S MINI-BATCH THE SAME LENGTH, so they do not wait for each other.
+#
+# _balance_batch makes each RANK's total token count equal -- exact to about a
+# token -- and that says nothing about where the ranks actually meet, which is
+# the gradient reduce that ends every mini-batch. Balanced totals leave
+# mini-batch k unrelated across ranks, so the fast ranks sit at the reduce
+# while the slow one finishes. Measured on the first four steps of the v2 run:
+#
+#   global_seqlen/minibatch_wait_frac        0.197  0.184  0.202  0.154
+#   global_seqlen/minibatch_wait_frac_dealt  0.000  0.000  0.000  0.000
+#
+# The second line is the counterfactual under deal_by_length -- the ordering
+# this switch turns on -- so 15-20% of update_actor is waiting, and all of it
+# is recoverable. That is 40-55 s of a ~270 s update, about 3.4 h over 300
+# steps.
+#
+# IT CHANGES WHICH ROWS SHARE A MINI-BATCH, so the trajectory is not
+# bit-identical to a run without it: ~70 optimizer steps per training step, and
+# the difference compounds. Do not turn it on mid-run; start a fresh run.
+#
+# Check it worked on minibatch_wait_frac itself, which should fall toward
+# _dealt. _dealt is a counterfactual and stays 0.000 either way.
+export BALANCE_MINIBATCH=${BALANCE_MINIBATCH:-1}
+
 # --- Throughput knobs (opt-in; same defaults as the OPD/SDAR multitask scripts) ---
 param_offload=${PARAM_OFFLOAD:-False}
 optimizer_offload=${OPTIMIZER_OFFLOAD:-False}
+# 10, not 5. The v2 run was at 5 -- 682 micro-batches for 6,820 rows over two
+# ranks -- which is twice the per-micro-batch Python and twice the number of
+# gradient-accumulation boundaries for the same work. Raising it costs
+# activation memory; gradient checkpointing is on, so the growth is well under
+# linear, but it is not free. Watch perf/alloc_retries and alloc_ooms (0 on the
+# v2 run) and perf/max_memory_reserved_gb (124.7 GiB there): if retries appear,
+# come back down.
 ppo_micro_per_gpu=${PPO_MICRO_PER_GPU:-10}
 log_prob_micro_per_gpu=${LOG_PROB_MICRO_PER_GPU:-16}
 use_fused_kernels=${USE_FUSED_KERNELS:-False}

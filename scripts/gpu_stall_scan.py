@@ -101,6 +101,8 @@ def read_trace(path):
                             for name in GAUGE_NAMES
                             if (r.get(name) or "").strip() not in ("", "0")
                         },
+                        "activity": (r.get("activity") or "").strip(),
+                        "stack_id": int(r["stack_id"]) if (r.get("stack_id") or "").strip() else None,
                     }
                 )
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -112,6 +114,27 @@ def read_trace(path):
         width = max(len(r["sm"]) for r in rows)
         rows = [r for r in rows if len(r["sm"]) == width]
     return rows, skipped
+
+
+def read_stacks(trace_path):
+    """The interned stack states, if the sampler wrote them.
+
+    Optional on purpose. The sidecar is written beside the trace and named after
+    it, and a trace copied off a box without its sidecar must still scan -- the
+    excursion table simply loses the frame line, not the run.
+    """
+    path = trace_path + ".stacks"
+    table = {}
+    try:
+        with open(path) as f:
+            next(f, None)  # header
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 3:
+                    table[int(parts[0])] = (int(parts[1]), parts[2])
+    except OSError:
+        return {}
+    return table
 
 
 def median(v):
@@ -260,6 +283,7 @@ def classify(rows, exc, floor, busy=95.0):
 
 def analyse(path, floor, busy, top):
     rows, skipped = read_trace(path)
+    stacks = read_stacks(path)
     if not rows:
         print(f"\n=== {path}: no usable rows ===")
         return
@@ -385,6 +409,22 @@ def analyse(path, floor, busy, top):
             f"{e['wall']:>7.2f}{e['lost_s']:>7.2f}{e['min_sm']:>8.0f}{others:>14}{cpu:>6}  "
             f"{','.join(e['phases'])}"
         )
+        # The state at the bottom of THIS excursion, not averaged over the run.
+        # A reason without it says which dependency; with it, which line.
+        detail = []
+        if e["gauges"]:
+            detail.append("  ".join(f"{k}={v}" for k, v in e["gauges"].items()))
+        if r.get("activity"):
+            detail.append(f"in: {r['activity']}")
+        if detail:
+            print(f"        {e['why']:<22}{'   '.join(detail)}")
+        frames = stacks.get(r.get("stack_id"))
+        if frames:
+            outside, text = frames
+            for one in text.split(" | ")[:3]:
+                print(f"        {'':<22}{one}")
+            if outside:
+                print(f"        {'':<22}(+{outside} threads outside this repo)")
 
     # Corroboration. A card that really went idle drops its power and clock; one
     # whose reading fell while power held is more likely a counter artefact than

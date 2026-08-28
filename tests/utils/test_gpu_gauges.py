@@ -181,8 +181,13 @@ def test_the_trace_schema_carries_every_gauge():
     header = gp._TRACE_HEADER.strip().split(",")
     for name in gp.GAUGE_NAMES:
         assert name in header, header
-    # Fixed order, so a scanner may index positionally.
-    assert header[-len(gp.GAUGE_NAMES):] == list(gp.GAUGE_NAMES)
+    # Contiguous and in order, so a scanner may index positionally -- but NOT
+    # pinned to the end: activity and stack_id were appended after them, and a
+    # test that treats the last column as fixed fails on every later extension
+    # while saying nothing about it.
+    first = header.index(gp.GAUGE_NAMES[0])
+    assert header[first:first + len(gp.GAUGE_NAMES)] == list(gp.GAUGE_NAMES)
+    assert header[-2:] == ["activity", "stack_id"]
 
 
 def _trace(path, blocks):
@@ -278,3 +283,85 @@ def test_ready_rises_when_a_batch_is_prepared_and_every_slot_is_busy():
     assert any(s.get("ready", 0) >= 1 for s in seen), seen
     assert any(s.get("future_wait", 0) >= 1 for s in seen), seen
     assert gp.gauge_snapshot() == {}, "a gauge leaked past the end of the pipeline"
+
+
+# --------------------------------------------------------------------------- #
+# and which LINE, per excursion, not averaged over the run
+# --------------------------------------------------------------------------- #
+def test_stack_states_are_interned_and_ignore_threads_outside_the_repo():
+    """The intern table has to have repeats or it is a list.
+
+    A hundred-odd parked infrastructure threads drift in and out constantly, so
+    keying on them would make almost every sample a distinct state. They are
+    dropped from the key and counted instead.
+    """
+    a, _ = gp.stack_state_id(["R rollout_loop.py:1 f", "B -", "B -"])
+    b, _ = gp.stack_state_id(["R rollout_loop.py:1 f", "B -", "B -", "B -", "B -"])
+    c, _ = gp.stack_state_id(["R rollout_loop.py:9 g", "B -"])
+    assert a == b, "the parked count must not split one state into two"
+    assert a != c
+    # ...but the count is kept, because "one of ours and 138 parked" and "one of
+    # ours alone" are different situations.
+    _, key_a = gp.stack_state_id(["R rollout_loop.py:1 f", "B -", "B -"])
+    _, key_b = gp.stack_state_id(["R rollout_loop.py:1 f"])
+    assert key_a[1] == 2 and key_b[1] == 0
+
+
+class _StubBackend:
+    """Three cards that are always busy. No GPU needed."""
+
+    n_gpus = 3
+
+    def sample(self):
+        return [{"sm_util": 90.0} for _ in range(self.n_gpus)]
+
+
+class _StubHost:
+    def sample(self):
+        return {"cpu_pct": 40.0}
+
+
+def test_the_sampler_writes_a_sidecar_the_scanner_can_join(tmp_path, monkeypatch):
+    """End to end: the ids in the trace resolve against the file beside it."""
+    import importlib
+
+    for key in ("GPU_PROFILER", "GPU_PROFILER_INTERVAL", "GPU_PROFILER_TRACE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GPU_PROFILER", "1")
+    monkeypatch.setenv("GPU_PROFILER_INTERVAL", "0.02")
+    monkeypatch.setenv("GPU_PROFILER_TRACE", str(tmp_path / "trace.csv"))
+    sys.modules.pop("verl.utils.gpu_profiler", None)
+    mod = importlib.import_module("verl.utils.gpu_profiler")
+    try:
+        # Driven with a stub backend, so this runs on a box with no NVML -- the
+        # same way test_gpu_profiler_trace does it.
+        sampler = mod._Sampler(_StubBackend(), 0.02, host=_StubHost())
+        with mod.activity("gen"), mod.inflight("ready", 4):
+            time.sleep(0.2)
+        sampler._stop.set()
+
+        written = Path(mod._trace_path_for_pid(str(tmp_path / "trace.csv")))
+        rows = [r.split(",") for r in written.read_text().strip().splitlines()]
+        header, body = rows[0], rows[1:]
+        assert body, written.read_text()
+        col = {name: i for i, name in enumerate(header)}
+        assert any(r[col["ready"]] == "4" for r in body)
+        assert any("gen:1" in r[col["activity"]] for r in body)
+
+        sidecar = Path(str(written) + ".stacks")
+        assert sidecar.exists(), "no stacks file beside the trace"
+        table = {int(l.split("\t")[0]) for l in sidecar.read_text().splitlines()[1:]}
+        ids = {int(r[col["stack_id"]]) for r in body if r[col["stack_id"]] not in ("", "-1")}
+        assert ids and ids <= table, (ids, table)
+    finally:
+        sys.modules.pop("verl.utils.gpu_profiler", None)
+        importlib.import_module("verl.utils.gpu_profiler")
+
+
+def test_a_trace_whose_sidecar_was_left_behind_still_scans(tmp_path):
+    """Copying a CSV off a box without its sidecar must lose the frame line only."""
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 30)
+    path = _trace(tmp_path / "t.csv", [busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12), busy])
+    out = _scan(path)      # _trace writes no sidecar
+    assert "RETRIEVER_DEPENDENCY" in out
+    assert "costliest excursions" in out

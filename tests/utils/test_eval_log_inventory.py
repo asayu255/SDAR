@@ -247,3 +247,45 @@ def test_the_run_records_what_else_was_on_the_machine():
     out = done.stdout + done.stderr
     assert "[eval] machine" in out
     assert "load" in out
+
+
+# --------------------------------------------------------------------------- #
+# The OPD arm's two knobs
+# --------------------------------------------------------------------------- #
+OPD_SH = Path(__file__).resolve().parents[2] / "examples" / "opd_trainer" / "run_multitask_offpolicy_qwen3.sh"
+
+
+def test_the_opd_arm_asks_for_matched_mini_batches():
+    """BALANCE_MINIBATCH must be exported, not just assigned.
+
+    ray_trainer reads it at IMPORT time into a module global, so a plain shell
+    variable -- or one set after the driver starts -- is silently ignored and
+    the run looks identical while doing nothing.
+    """
+    import re
+    text = OPD_SH.read_text()
+    m = re.search(r'^export BALANCE_MINIBATCH=\$\{BALANCE_MINIBATCH:-(\d)\}', text, re.M)
+    assert m, "BALANCE_MINIBATCH is not exported by the off-policy OPD script"
+    assert m.group(1) == "1"
+    # Overridable, so a run that needs the old trajectory can still have it.
+    assert "${BALANCE_MINIBATCH:-" in text
+
+
+def test_the_switch_is_read_at_import_and_defaults_off_in_the_library():
+    """The script opts in; the library must not.
+
+    Turning it on changes which rows share a mini-batch, so it changes the
+    trajectory. That is a per-arm decision recorded in a script, not a default
+    that silently moves every other arm's results.
+    """
+    import re
+    lib = (Path(__file__).resolve().parents[2] / "verl" / "trainer" / "ppo" / "ray_trainer.py").read_text()
+    m = re.search(r'_BALANCE_MINIBATCH = os\.environ\.get\("BALANCE_MINIBATCH", "(\d)"\)', lib)
+    assert m and m.group(1) == "0", "the library default must stay off"
+
+
+def test_the_micro_batch_default_is_ten():
+    """The v2 run ran at 5: 682 micro-batches for 6,820 rows over two ranks."""
+    import re
+    m = re.search(r'ppo_micro_per_gpu=\$\{PPO_MICRO_PER_GPU:-(\d+)\}', OPD_SH.read_text())
+    assert m and m.group(1) == "10"

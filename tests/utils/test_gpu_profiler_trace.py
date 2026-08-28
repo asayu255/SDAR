@@ -76,7 +76,10 @@ def test_every_sample_lands_in_the_trace_with_its_phase(monkeypatch, tmp_path):
     # is the normal case, and a test that treats the last column as fixed turns
     # every extension into a failure that says nothing about the extension.
     assert "driver_cpu_pct" in header
-    assert header[-len(mod.GAUGE_NAMES):] == list(mod.GAUGE_NAMES)
+    # Contiguous and in order, NOT anchored to the end -- which is the mistake
+    # this comment was written about, made again two columns later.
+    first = header.index(mod.GAUGE_NAMES[0])
+    assert header[first:first + len(mod.GAUGE_NAMES)] == list(mod.GAUGE_NAMES)
     body = [r.split(",") for r in rows[1:]]
     assert len(body) > 5, rows
     assert all(len(r) == len(header) for r in body)
