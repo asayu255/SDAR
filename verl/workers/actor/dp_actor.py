@@ -1583,6 +1583,15 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy=False,
                     topk_k=topk_k if want_topk else None,
                     return_lse=return_hidden,
+                    # The teacher's own sampled-token log-prob is a log-softmax and
+                    # a gather over the widest tensor in the step, and this call
+                    # DISCARDS it -- the unpacking above keeps only topk_out. The
+                    # actor path already worked this out for itself
+                    # (need_log_prob above); the teacher path never passed the
+                    # argument, so it defaulted to True and paid for it on every
+                    # micro-batch of every frozen model. On this arm that is four
+                    # models a row.
+                    need_log_prob=False,
                 )
             if return_hidden:
                 tlp, tids, extras = topk_out

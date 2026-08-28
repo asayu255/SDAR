@@ -4012,3 +4012,35 @@ def test_the_names_the_cross_teacher_block_uses_are_asserted_before_it_reads_the
     )
     reader = src.index("if xt_built is not None and xt_collect:")
     assert guard < reader
+
+
+def test_the_teacher_forward_does_not_compute_a_log_prob_it_discards():
+    """compute_topk_log_prob unpacks `_, _, topk_out` -- the entropy and the
+    sampled-token log-prob are thrown away on every micro-batch.
+
+    need_log_prob=True costs a log-softmax and a gather over (n_resp, vocab),
+    the widest tensor in the step. The actor path derives the flag for itself;
+    this one never passed it, so it defaulted to True and paid on every
+    micro-batch of every frozen model -- four models a row on this arm.
+    """
+    import inspect
+
+    from verl.workers.actor import dp_actor
+
+    src = inspect.getsource(dp_actor.DataParallelPPOActor.compute_topk_log_prob)
+    start = src.index("self._forward_micro_batch(")
+    depth, end = 0, None
+    for i in range(start, len(src)):          # to the call's own closing paren
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    assert end is not None
+    call = src[start : end + 1]
+    assert "need_log_prob=False" in call, call
+    # The result really is discarded -- if a later change starts reading it, the
+    # flag above has to be revisited rather than left as a silent None.
+    assert "_, _, topk_out = self._forward_micro_batch(" in src
