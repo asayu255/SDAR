@@ -122,7 +122,24 @@ residency() {
 scores() {
     local log="$1"
     local found
-    found=$(grep -oE "'val/[^']*(test_score|success_rate)': [0-9.]+" "$(_clean "$log")" | tail -40)
+    # UNWRAPPED FIRST. ray_trainer prints the metrics as
+    # pprint(f"Initial validation metrics: {val_metrics}") -- pprint of an
+    # f-string, so the whole dict is ONE string and pprint breaks it at 80
+    # columns, mid-dict, wherever that falls:
+    #
+    #   "...'val/alfworld/test_score': 2.95, 'val/success_rate': "
+    #    "0.38742732589884377, 'val/search/test_score': 0.357}")
+    #
+    # A key can therefore end one line and its value begin the next, with the
+    # continuation's indent between them. Where the break lands depends on the
+    # dict's contents, so a per-line grep reads some runs and not others -- it
+    # read eval_378.log and returned an empty value for eval_378d4.log, which
+    # printed as "unfinished" for a run that had finished and scored. Join the
+    # block, squeeze the indent, then match. From the match to the line that
+    # closes pprint's string, not a fixed -A window: -A12 was a guess and the
+    # dict outgrew it, dropping keys off the end.
+    found=$(awk '/Initial validation metrics/,/}"\)/' "$(_clean "$log")" | tr -d '\n"' | tr -s ' ' \
+        | grep -oE "'val/[^']*(test_score|success_rate)': [0-9.]+" | tail -40)
     if [ -z "$found" ]; then
         echo "  NOT FOUND -- the run has not finished validating"
         return

@@ -358,3 +358,59 @@ def test_the_config_line_and_the_in_run_line_agree_on_depth(logs):
     fields = row(inventory(*logs), "eval_pump.log")
     assert fields["DEPTH"] == "3"      # from [val-pipeline], no config line
     assert fields["WIDTH"] == "?"      # which the old logs never carried
+
+
+def _wrapped_metrics(padding):
+    """The metrics line as ray_trainer prints it: pprint of an f-string.
+
+    pprint treats the whole formatted string as ONE object and breaks it at 80
+    columns wherever that falls -- so a key can end one line and its value
+    begin the next. Where it falls depends on the dict's contents, which is why
+    a per-line grep read one run and not the next.
+    """
+    import contextlib
+    import io
+    from pprint import pprint
+
+    metrics = {f"val/pad{i}": 0.1 for i in range(padding)}
+    metrics.update({
+        "val/2wikimultihopqa/test_score": 0.3026008140172618,
+        "val/alfworld/test_score": 2.9519071310116085,
+        "val/success_rate": 0.38742732589884377,
+        "val/search/test_score": 0.3577398068712026,
+    })
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pprint(f"Initial validation metrics: {metrics}")
+    return buf.getvalue()
+
+
+def test_a_score_split_across_the_pprint_wrap_is_still_read(tmp_path, logs):
+    """It printed "unfinished" for a run that had finished and scored.
+
+    The value is on the line after its key, so a per-line grep matched the key
+    with an empty number. eval_378.log happened to keep them together and
+    eval_378d4.log did not -- the same extractor, right by luck on one run.
+    """
+    text = _wrapped_metrics(1)
+    assert "'val/success_rate': \"\n" in text, "the fixture no longer splits the pair"
+
+    log = write_log(tmp_path / "eval_wrapped.log", pump=True, core="V1", steps="<default>",
+                    depth=4, batches=139, wall=3050.4, ms_row=57, score="0.0")
+    kept = [l for l in log.read_text().splitlines() if "Initial validation metrics" not in l]
+    kept += ["(SFTMultiTaskTaskRunner pid=1) " + l for l in text.splitlines()]
+    log.write_text("\n".join(kept) + "\n")
+
+    assert row(inventory(log, *logs), "eval_wrapped.log")["SCORE"] == "0.38742732589884377"
+
+
+def test_the_unwrapped_case_still_reads(tmp_path, logs):
+    """Where the break does not fall between them, which is the common case."""
+    text = _wrapped_metrics(0)
+    assert "'val/success_rate': \"\n" not in text
+    log = write_log(tmp_path / "eval_plain.log", pump=True, core="V1", steps="<default>",
+                    depth=4, batches=139, wall=3050.4, ms_row=57, score="0.0")
+    kept = [l for l in log.read_text().splitlines() if "Initial validation metrics" not in l]
+    kept += ["(SFTMultiTaskTaskRunner pid=1) " + l for l in text.splitlines()]
+    log.write_text("\n".join(kept) + "\n")
+    assert row(inventory(log, *logs), "eval_plain.log")["SCORE"] == "0.38742732589884377"

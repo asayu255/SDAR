@@ -88,7 +88,24 @@ for log in "$@"; do
     msrow=$(printf '%s' "$msline" | grep -o 'all=[0-9]*' | cut -d= -f2)
     mslast=$(printf '%s' "$msline" | grep -o 'last[0-9]*=[0-9]*' | cut -d= -f2)
     [ -n "$mslast" ] && msrow="${msrow}/${mslast}"
-    score=$(grep -o "'val/success_rate': [0-9.]*" "$f" | tail -1 | grep -o '[0-9.]*$')
+# UNWRAPPED FIRST. ray_trainer prints the metrics as
+# pprint(f"Initial validation metrics: {val_metrics}") -- pprint of an
+# f-string, so the whole dict is ONE string and pprint breaks it at 80
+# columns, mid-dict, wherever that falls:
+#
+#   "...'val/alfworld/test_score': 2.95, 'val/success_rate': "
+#    "0.38742732589884377, 'val/search/test_score': 0.357}")
+#
+# A key can therefore end one line and its value begin the next, with the
+# continuation's indent between them. Where the break lands depends on the
+# dict's contents, so a per-line grep reads some runs and not others -- it
+# read eval_378.log and returned an empty value for eval_378d4.log, which
+# printed as "unfinished" for a run that had finished and scored. Join the
+# block, squeeze the indent, then match. From the match to the line that
+# closes pprint's string, not a fixed -A window: -A12 was a guess and the dict
+# outgrew it, dropping val/success_rate off the end -- the one key this reads.
+    score=$(awk '/Initial validation metrics/,/}"\)/' "$f" | tr -d '\n"' | tr -s ' ' \
+        | grep -oE "'val/success_rate': [0-9.]+" | tail -1 | grep -oE '[0-9.]+$')
 
     printf '%-26s %-6s %-5s %-6s %-6s %-6s %-8s %-9s %-8s %s\n' \
         "$(basename "$log")" "$pump" "${core:-?}" "$steps" "${width:-?}" "${depth:-?}" \
