@@ -130,6 +130,7 @@ __all__ = [
     "SIDECAR_NAME",
     "sidecar_state",
     "load_sidecar_state",
+    "resume_identity",
     "ADV_MOMENTS",
     "AdvantageReliabilityStats",
     "residual_support_score",
@@ -731,6 +732,29 @@ def load_sidecar_state(state: dict, *, rms, mean, adv, identity: dict):
     mean.load_state_dict(state["position_weight"])
     adv.load_state_dict(state["advantage"])
     return state.get("last_alpha", None)
+
+
+def resume_identity(snapshot: Optional[dict], task_order) -> dict:
+    """The identity to check a sidecar against, completed where it can be.
+
+    The worker snapshots what it knows when it loads the checkpoint -- the base,
+    the temperature, the teachers. All three are CONFIG, available before a
+    single batch has been seen. The task order is not: it is whatever the first
+    batch names, and at load time no batch has arrived, so the snapshot recorded
+    an empty list. Compared against a checkpoint written by a run that had
+    completed a step, that could never match, and every resume of this arm died
+    on ``task_order`` after the models were built and the checkpoint located.
+
+    The order is known where the accumulators are built, because it is the axis
+    they are indexed by -- which is also where the restore happens, for the same
+    reason. Filling it in there is what makes the check test THIS RUN against the
+    checkpoint rather than the snapshot's age against it. It does not weaken the
+    check: a resume into a different task set, or the same tasks in a different
+    order, still mismatches and is still refused.
+    """
+    out = dict(snapshot or {})
+    out["task_order"] = list(task_order or [])
+    return out
 
 
 def position_pre_weight(*, evidence: torch.Tensor, on_task_logprob: torch.Tensor) -> torch.Tensor:

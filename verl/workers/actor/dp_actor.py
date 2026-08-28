@@ -86,6 +86,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     compute_raw_policy_shifts,
     decompose_common_residual,
     load_sidecar_state,
+    resume_identity,
     GRAD_TERMS as XT_GRAD_TERMS,
     assert_all_finite,
     gradient_metrics,
@@ -2007,7 +2008,15 @@ class DataParallelPPOActor(BasePPOActor):
                     restored = load_sidecar_state(
                         blob,
                         rms=self._xt_rms, mean=self._xt_mean, adv=self._xt_adv,
-                        identity=getattr(self, "cross_teacher_identity", {}) or {},
+                        # The worker's snapshot is taken at load_checkpoint,
+                        # before any batch has named the tasks, so its
+                        # task_order is empty and no resume could ever match a
+                        # checkpoint that recorded one. The order is known here
+                        # -- it is the axis the accumulators above are indexed
+                        # by, which is why the restore is here at all.
+                        identity=resume_identity(
+                            getattr(self, "cross_teacher_identity", None), task_id_names
+                        ),
                     )
                     self._xt_rms_snapshot = self._xt_rms.diagonal()
                     if restored is not None:
