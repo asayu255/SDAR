@@ -121,6 +121,7 @@ __all__ = [
     "tail_logprob",
     "CumulativePolicyShiftRMS",
     "standardize_policy_shifts",
+    "corroboration_attribution",
     "decompose_common_residual",
     "candidate_kl_evidence",
     "position_pre_weight",
@@ -141,6 +142,7 @@ __all__ = [
     "PAIR_STATES",
     "pair_state_index",
     "PairStateEvidenceStats",
+    "CorroborationAttributionStats",
     "build_position_weight",
     "assert_all_finite",
     "position_terms",
@@ -551,6 +553,82 @@ def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
         common_ev = torch.zeros_like(hat_on)
 
     return {"common": common, "common_ev": common_ev, "residual": hat_off - common.unsqueeze(-1)}
+
+
+def corroboration_attribution(*, hat_on: torch.Tensor, hat_off: torch.Tensor) -> dict:
+    """Which teacher decides ``c``, and how much each one is suppressing.
+
+    ``c = 1[all agree] * sign * min_j |hat_j|`` has two ways for a single
+    teacher to control it, and the shared channel carries ~98% of this arm's
+    evidence, so "the teachers corroborated" is a claim about ONE of them and
+    the logs never said which.
+
+    ``bottleneck``   ``argmin_j |hat_j|`` over ``{on} u off``, so column 0 is the
+                     on-task teacher. Only meaningful where ``c != 0``; the
+                     caller weights by ``p_on |c|``, which is zero elsewhere.
+                     The module docstring already asserts that ``c`` is capped
+                     by ``|hat_on|`` and that the on-task teacher is silent at
+                     ~64% of teacher mass -- this measures how often that cap is
+                     the binding one rather than assuming it.
+    ``without``      ``|c_{-j}|`` for each teacher ``j`` dropped in turn, same
+                     column order. Leave-one-out on the EVIDENCE rather than on
+                     the applied weight: no counterfactual normaliser, no second
+                     pass, and with the shared channel at 98% the two answer the
+                     same question. ``|c_{-j}| - |c| >= 0`` always, because
+                     dropping a teacher can only raise the minimum or restore a
+                     unanimity it was breaking -- so one number covers both ways
+                     a teacher holds the bonus down, and a teacher that is
+                     neither reads as exactly 0.
+    ``margin``       ``second_smallest - smallest`` of ``|hat_j|`` where ``c``
+                     is live. Near zero the argmin is a coin flip between two
+                     teachers and the attribution above is fragile; the caller
+                     reports the fraction under a small threshold rather than
+                     letting a tie read as a decision.
+
+    Dropping the on-task teacher is column 0 and is exactly the ``common_ev``
+    :func:`decompose_common_residual` already returns, recomputed here so the
+    columns come from one expression instead of two.
+    """
+    stack = torch.cat([hat_on.abs().unsqueeze(-1), hat_off.abs()], dim=-1)  # (..., 1+n_off)
+    signs = torch.cat([torch.sign(hat_on).unsqueeze(-1), torch.sign(hat_off)], dim=-1)
+    n_all = stack.size(-1)
+
+    def _common_over(keep_mask):
+        """|c| over the teachers ``keep_mask`` selects. (...,)"""
+        first = signs[..., :1]
+        agree = ((signs == first) | ~keep_mask).all(dim=-1) & (first.squeeze(-1) != 0)
+        big = torch.finfo(stack.dtype).max
+        mag = torch.where(keep_mask, stack, torch.full_like(stack, big)).amin(dim=-1)
+        return torch.where(agree, mag, torch.zeros_like(mag))
+
+    ones = torch.ones_like(stack, dtype=torch.bool)
+    # ``_common_over`` judges unanimity against the ON-TASK sign, which is what
+    # the live rule does and is right for every column but its own. Dropping the
+    # on-task teacher has to switch the reference to the off-task teachers'
+    # own -- otherwise a position where it is SILENT reads as "no unanimity" in
+    # the one column that exists to say what the others agree on without it, and
+    # that is the 64% of teacher mass the column was built for. It is also what
+    # makes column 0 equal common_ev exactly rather than approximately.
+    without = []
+    for j in range(n_all):
+        keep = ones.clone()
+        keep[..., j] = False
+        if j == 0:
+            # Off-task-only unanimity, judged against the first off-task sign.
+            off_first = signs[..., 1:2]
+            agree = (signs[..., 1:] == off_first).all(dim=-1) & (off_first.squeeze(-1) != 0)
+            mag = stack[..., 1:].amin(dim=-1)
+            without.append(torch.where(agree, mag, torch.zeros_like(mag)))
+        else:
+            without.append(_common_over(keep))
+
+    two_smallest = stack.topk(min(2, n_all), dim=-1, largest=False).values
+    margin = (two_smallest[..., -1] - two_smallest[..., 0]) if n_all >= 2 else torch.zeros_like(hat_on)
+    return {
+        "bottleneck": stack.argmin(dim=-1),
+        "without": torch.stack(without, dim=-1),
+        "margin": margin,
+    }
 
 
 def candidate_kl_evidence(
@@ -1584,6 +1662,179 @@ class PairStateEvidenceStats:
         return out
 
 
+class CorroborationAttributionStats:
+    """Per destination, which teacher decided the corroboration and which one capped it.
+
+    The shared channel carries ~98% of this arm's evidence on the live run, and
+    every existing table sums the corroboration into ONE anonymous column --
+    ``evidence_shared``, ``push_shared``. That is not an oversight of the
+    per-source tables: ``c = 1[all agree] * sign * min_j |hat_j|`` is a minimum
+    over a unanimity, so it is NOT additive over sources and there is no share
+    of it to hand to a per-source accumulator. Attribution has to be a
+    counterfactual, which is what :func:`corroboration_attribution` computes and
+    this class accumulates.
+
+    Two readings per (destination, teacher), and they answer opposite questions:
+
+    ``bottleneck_share``   of the corroboration mass ``sum_v p(v)|c(v)|`` that
+                           the arm ACTUALLY applied, how much this teacher was
+                           the binding minimum for. A teacher at 0.8 here is
+                           the one setting the bonus; a teacher at 0.02 agreed
+                           and was never consulted about the size.
+    ``suppression_ratio``  ``sum_v p(v)(|c_-j(v)| - |c(v)|)`` over the SAME
+                           total -- the corroboration that does not exist
+                           because this teacher is in the vote, whether it
+                           capped the minimum or vetoed the unanimity outright.
+                           A teacher can be 0 on the first and dominant on the
+                           second: that is a teacher who never sets the bonus
+                           and frequently cancels it, which no current metric
+                           can express.
+
+    The on-task teacher gets a slot of its own (``on_task``) rather than a task
+    name, because in that cell "destination" and "teacher" are the same task and
+    a ``{src}__on__{dst}`` label would read as a self-pair. It is the cell the
+    module docstring's claim rests on -- ``c`` is capped by ``|hat_on|``, and
+    the on-task teacher is silent at ~64% of teacher mass -- so it is the one
+    that has to be legible.
+
+    ``near_tie_share`` guards the first reading. ``argmin`` names a teacher even
+    when two are within floating-point noise of each other, and a share built
+    out of coin flips looks exactly like a share built out of decisions. Where
+    this is high the bottleneck column is not a finding.
+
+    ``(T, T, 5)`` float64 plus ``(T, 2)``: 51 cells at three tasks, one
+    ``index_add_`` per column per micro-batch.
+    """
+
+    TERMS = ("bottleneck_mass", "tie_mass", "suppression", "n_bottleneck", "n_seen")
+    TOTALS = ("shared_mass", "n_candidates")
+
+    def __init__(self, *, n_tasks: int, device, tie_epsilon: float = 0.05):
+        self.n_tasks = T = int(n_tasks)
+        # ``tie_epsilon`` is in RMS units: the margin is a difference of
+        # standardized |hat|, so one threshold is comparable across teachers and
+        # across steps, which a raw-nats one would not be.
+        self.tie_epsilon = float(tie_epsilon)
+        self.buf = torch.zeros(T * T * len(self.TERMS), dtype=torch.float64, device=device)
+        self.tot = torch.zeros(T * len(self.TOTALS), dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, attribution: dict, common, teacher_prob, response_mask,
+               task_ids, off_plane_tasks) -> None:
+        """``common``/``teacher_prob`` are (bs, resp, k); ``attribution`` is what
+        :func:`corroboration_attribution` returned for the same call.
+
+        Weighted by ``p(v)|c(v)|``, the per-candidate term of ``evidence_shared``
+        -- so a share out of it is a share of the corroboration the objective
+        applied, not of the candidate slots. Weighting by candidate count would
+        let a million near-zero bonuses outvote the ones that moved the loss.
+        """
+        self._cpu_cache = None
+        T, K = self.n_tasks, len(self.TERMS)
+        m = response_mask.to(torch.float64).unsqueeze(-1)              # (bs, resp, 1)
+        p = teacher_prob.detach().to(torch.float64) * m
+        c_abs = common.detach().to(torch.float64).abs()
+        w = p * c_abs                                                  # (bs, resp, k)
+        # Where c is 0 there is no argmin to attribute -- w is already 0 there,
+        # but the COUNT would otherwise credit a teacher for winning a minimum
+        # that was never used.
+        live = common.detach() != 0
+        bott = attribution["bottleneck"]
+        near = (attribution["margin"].detach().to(torch.float64) < self.tie_epsilon)
+        without = attribution["without"].detach().to(torch.float64)
+        n_all = without.size(-1)
+
+        dst = task_ids.reshape(-1).to(torch.long)
+        # Column 0 is the on-task teacher, so its slot IS the destination task.
+        cols = torch.cat([dst.reshape(-1, 1), off_plane_tasks.to(torch.long)], dim=1)
+        dst_e = dst.reshape(-1, 1, 1).expand_as(c_abs)
+        ok_dst = (dst_e >= 0)
+
+        for j in range(n_all):
+            tea = cols[:, j].reshape(-1, 1, 1).expand_as(c_abs)
+            ok = (ok_dst & (tea >= 0)).to(torch.float64)
+            is_bn = ((bott == j) & live).to(torch.float64) * ok
+            vals = torch.stack(
+                [
+                    w * is_bn,
+                    w * is_bn * near.to(torch.float64),
+                    # Over EVERY candidate, not just the live ones: a teacher
+                    # that vetoed the unanimity leaves c = 0, which is exactly
+                    # where its suppression is largest and where the bottleneck
+                    # column above is blind.
+                    p * (without[..., j] - c_abs).clamp(min=0.0) * ok,
+                    m.expand_as(c_abs) * is_bn,
+                    # Candidates where this teacher was one of THIS row's
+                    # planes at all. The gate the metrics use, so a teacher that
+                    # was consulted everywhere and suppressed nothing reports a
+                    # zero -- which is a finding -- instead of vanishing from
+                    # the table the way a task pair that never occurred does.
+                    m.expand_as(c_abs) * ok,
+                ],
+                dim=-1,
+            )
+            cell = (dst_e.clamp(min=0) * T + tea.clamp(min=0)) * K
+            flat = (cell.unsqueeze(-1) + torch.arange(K, device=vals.device)).reshape(-1)
+            self.buf.index_add_(0, flat, vals.reshape(-1))
+
+        ok_d = ok_dst.to(torch.float64)
+        tot_vals = torch.stack([w * ok_d, m.expand_as(c_abs) * ok_d], dim=-1)
+        base = dst_e.clamp(min=0) * len(self.TOTALS)
+        flat_t = (base.unsqueeze(-1) + torch.arange(len(self.TOTALS), device=w.device)).reshape(-1)
+        self.tot.index_add_(0, flat_t, tot_vals.reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(self.tot, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = (
+                self.buf.detach().to("cpu").view(self.n_tasks, self.n_tasks, len(self.TERMS)),
+                self.tot.detach().to("cpu").view(self.n_tasks, len(self.TOTALS)),
+            )
+        return self._cpu_cache
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        buf, tot = self._cpu()
+        i = {t: j for j, t in enumerate(self.TERMS)}
+        g = {t: j for j, t in enumerate(self.TOTALS)}
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for dst in range(self.n_tasks):
+            shared = float(tot[dst, g["shared_mass"]])
+            n_cand = float(tot[dst, g["n_candidates"]])
+            if n_cand <= 0:
+                continue
+            head = f"{prefix}/corroboration/{name(dst)}"
+            out[f"{head}/shared_mass_mean"] = shared / n_cand
+            if shared <= 0:
+                continue
+            for tea in range(self.n_tasks):
+                cells = buf[dst, tea]
+                n_seen = float(cells[i["n_seen"]])
+                if n_seen <= 0:
+                    continue
+                bn = float(cells[i["bottleneck_mass"]])
+                sup = float(cells[i["suppression"]])
+                n_bn = float(cells[i["n_bottleneck"]])
+                slot = "on_task" if tea == dst else name(tea)
+                out[f"{head}/{slot}/bottleneck_share"] = bn / shared
+                out[f"{head}/{slot}/bottleneck_candidate_frac"] = n_bn / n_seen
+                # Of the applied corroboration mass, how much MORE there would
+                # be without this teacher. Above 1 means the teacher is
+                # cancelling more than the arm is applying.
+                out[f"{head}/{slot}/suppression_ratio"] = sup / shared
+                if bn > 0:
+                    out[f"{head}/{slot}/near_tie_share"] = (
+                        float(cells[i["tie_mass"]]) / bn
+                    )
+        return out
+
+
 class PairEvidenceStats:
     """Per ordered (destination, source), how much evidence that source supplied.
 
@@ -1975,6 +2226,11 @@ def build_position_weight(
     hat_off = std["off"] * keep.unsqueeze(-1)
 
     dec = decompose_common_residual(hat_on=hat_on, hat_off=hat_off)
+    # Who decided ``c``, and who is holding it down. Same tensors, no extra
+    # forward: with the shared channel at ~98% of this arm's evidence, an
+    # unattributed ``min`` over a unanimity is most of the mechanism reported
+    # as a single anonymous number.
+    attribution = corroboration_attribution(hat_on=hat_on, hat_off=hat_off)
     # Hoisted above the weight so the W - 1 decomposition and the returned
     # per-candidate evidence are built from ONE tensor. Two exp() calls of the
     # same log-probs agree to the last bit today and are an invitation to
@@ -2126,6 +2382,11 @@ def build_position_weight(
         "hat_off": hat_off,
         "common": dec["common"],
         "common_ev": dec["common_ev"],
+        # (bs, resp, k) long / (bs, resp, k, 1 + n_off) / (bs, resp, k).
+        # Column 0 of ``without`` is the on-task teacher, columns 1.. are the
+        # off-task planes in ``off_plane_tasks`` order -- the same layout
+        # ``hat_off`` and ``evidence_by_source`` already use.
+        "attribution": attribution,
         "residual": dec["residual"],
         "evidence": evidence,
         "state": state,

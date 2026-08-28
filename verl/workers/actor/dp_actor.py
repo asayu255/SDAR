@@ -64,6 +64,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     PROBE_ALPHAS as XT_PROBE_ALPHAS,
     STATE_TERMS as XT_STATE_TERMS,
     AdvantageReliabilityStats,
+    CorroborationAttributionStats,
     CumulativePolicyShiftRMS,
     LogitPushTokens,
     OutcomeEffectStats,
@@ -2069,6 +2070,14 @@ class DataParallelPPOActor(BasePPOActor):
         # states out, so the case the mechanism exists to arbitrate is in
         # neither. 144 cells at three tasks.
         xt_pair_state_stats = PairStateEvidenceStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        # Who decided the corroboration. The shared channel is ~98% of this
+        # arm's evidence and every table above reports it as one anonymous
+        # column -- not an oversight: c is a min over a unanimity, so it has
+        # no additive per-source share and only a counterfactual can
+        # attribute it. 51 cells at three tasks.
+        xt_corr_attr_stats = (
+            CorroborationAttributionStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        )
         # Per TRAJECTORY, not per position: "the arm moved 3% of the budget" and
         # "the arm moved 3% of the budget, almost all of it on rollouts that
         # failed" are the same number and opposite findings.
@@ -3059,6 +3068,16 @@ class DataParallelPPOActor(BasePPOActor):
                                 off_plane_tasks=data["sign_off_tasks"],
                                 activity=xt_built["activity_by_source"],
                             )
+                            # And WHICH teacher set the size of that
+                            # corroboration, or cancelled it. The table
+                            # above is per source and c is not per source.
+                            xt_corr_attr_stats.update(
+                                attribution=xt_built["attribution"],
+                                common=xt_built["common"],
+                                teacher_prob=xt_built["teacher_prob"],
+                                response_mask=response_mask, task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                            )
                             # Per trajectory. The row score is what separates
                             # "spent on rollouts that worked" from "spent on the
                             # ones that did not", which the advantage alone
@@ -3543,6 +3562,8 @@ class DataParallelPPOActor(BasePPOActor):
             metrics.update(xt_pair_stats.metrics(task_names=task_id_names))
             xt_pair_state_stats.all_reduce()
             metrics.update(xt_pair_state_stats.metrics(task_names=task_id_names))
+            xt_corr_attr_stats.all_reduce()
+            metrics.update(xt_corr_attr_stats.metrics(task_names=task_id_names))
             xt_outcome_stats.all_reduce()
             metrics.update(xt_outcome_stats.metrics(task_names=task_id_names))
             xt_source_outcome_stats.all_reduce()
