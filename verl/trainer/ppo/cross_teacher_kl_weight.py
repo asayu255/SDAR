@@ -1395,6 +1395,15 @@ POSITION_TERMS = (
     "evidence",
     "evidence_shared",
     "evidence_shared_offtask_only",
+    # The two channels as APPLIED budget rather than as evidence, plus the three
+    # second moments their co-location needs. evidence/shared_share already says
+    # which channel is larger; these say whether they are aiming at the same
+    # positions, which is the only way two non-negative channels can compete.
+    "push_shared",
+    "push_source",
+    "push_shared_sq",
+    "push_source_sq",
+    "push_cross",
     "available",
 )
 
@@ -1452,6 +1461,8 @@ ROLE_CUT_SUFFIXES = (
     "/position/w_mean",
     "/evidence/shared_share",       # which channel carried it here
     "/grpo/grad_cosine",            # does the budget moved here pull with the reward
+    "/grpo/shared_grad_cosine",     # and which CHANNEL's budget, at this role
+    "/grpo/source_grad_cosine",
     "/grpo/grad_norm_ratio",
     "/gross_share",                 # the state composition; shares, never nats
 )
@@ -2993,6 +3004,8 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     w = built["weight"].detach().to(torch.float32)
     pre = built["pre_weight"].detach().to(torch.float32)
     kl = teacher_kl.detach().to(torch.float32)
+    s_push = built["push_shared"].detach().to(torch.float32)
+    r_push = built["push_by_source"].detach().to(torch.float32).sum(dim=-1)
     return {
         "w": w,
         "w_sq": w * w,
@@ -3005,6 +3018,17 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
         "evidence": pre - 1.0,
         "evidence_shared": built["evidence_shared"],
         "evidence_shared_offtask_only": built["evidence_shared_offtask_only"],
+        # S and R: the corroboration channel's and the source channels' EXACT
+        # shares of W - 1, from the partition build_position_weight already
+        # makes. Both are non-negative by construction -- alpha, |c|, |dhat| and
+        # p are all non-negative -- so no position is ever pushed in opposite
+        # directions by the two, and the "opposition" worth measuring is which
+        # positions each one picks, not which way it pushes.
+        "push_shared": s_push,
+        "push_source": r_push,
+        "push_shared_sq": s_push * s_push,
+        "push_source_sq": r_push * r_push,
+        "push_cross": s_push * r_push,
         "available": built["available"].reshape(-1, 1).expand_as(w).to(torch.float32),
     }
 
@@ -3031,7 +3055,14 @@ def per_candidate_shift(built: dict, teacher_kl: torch.Tensor) -> torch.Tensor:
 # from. Analytic, in LOGIT space, over the top-k plus the tail bucket: the two
 # gradients are known in closed form there, so no second backward is needed and
 # the metric cannot perturb the one the optimizer takes.
-GRAD_TERMS = ("g_opd_sq", "g_grpo_sq", "g_dot")
+GRAD_TERMS = (
+    "g_opd_sq", "g_grpo_sq", "g_dot",
+    # The same three, per CHANNEL. The applied W mixes the corroboration
+    # channel, the source channels and the base OPD direction, so the pooled
+    # cosine above cannot say which of the two the reward signal disagrees with
+    # -- which is the question an arm choice rests on.
+    "g_shared_sq", "g_shared_dot", "g_source_sq", "g_source_dot", "g_cross_dot",
+)
 
 
 def opd_logit_push(
@@ -3103,6 +3134,8 @@ def logit_gradient_terms(
     coef: float,
     pg_coef: float = 1.0,
     row_weight: Optional[torch.Tensor] = None,
+    push_shared: Optional[torch.Tensor] = None,
+    push_source: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
 ) -> dict:
     """How the weighted OPD term and the policy gradient push the same logits.
@@ -3147,6 +3180,20 @@ def logit_gradient_terms(
             change how much each row contributes to the POOLED ones, which is
             what these are. Absent -> every row counts once, which is what an
             unweighted run does.
+        push_shared, push_source: (bs, resp) the corroboration channel's and the
+            source channels' EXACT shares of ``W - 1``. The mechanism's own
+            addition to the logit push is ``(W - 1) g0``, and that partition
+            splits it, so ``S g0`` and ``R g0`` are each channel's added
+            gradient with no counterfactual normaliser and no second pass. Both
+            absent leaves the channel columns at zero and no cosine is rendered.
+
+    ``S g0`` and ``R g0`` scale the SAME direction ``g0``, so their mutual
+    cosine is non-negative for any S, R >= 0 -- the two channels cannot pull
+    against each other at a logit, only allocate to different positions. It is
+    reported because its MAGNITUDE says how redundant they are, and named here
+    so a positive value is not read as evidence that they agree. Their cosines
+    with the policy gradient carry no such constraint: each can take either
+    sign, and their disagreeing is the finding that separates the arms.
     """
     push = opd_logit_push(
         student_logprob=student_logprob, teacher_logprob=teacher_logprob,
@@ -3167,18 +3214,36 @@ def logit_gradient_terms(
     g_grpo = a * (onehot - p_s)
     g_grpo_tail = a.squeeze(-1) * ((1.0 - in_support) - tail_s)
 
+    # Per position, the three reductions every channel column is built from.
+    # (W - 1) g0 is the mechanism's addition; a channel owning share C of W - 1
+    # owns C * g0 of it, so a channel's norm and its dot with the policy
+    # gradient are C^2 |g0|^2 and C (g0 . g_grpo) -- no extra reduction over the
+    # support per channel, and none of the tensors below is new.
+    g0, g0_tail = push["g0"], push["g0_tail"]
+    g0_sq = (g0 * g0).sum(dim=-1) + g0_tail * g0_tail
+    g0_grpo = (g0 * g_grpo).sum(dim=-1) + g0_tail * g_grpo_tail
+    zero = torch.zeros_like(g0_sq)
+    sh = zero if push_shared is None else push_shared.detach().to(torch.float32)
+    sr = zero if push_source is None else push_source.detach().to(torch.float32)
+
     out = {
         "g_opd_sq": (g_opd * g_opd).sum(dim=-1) + g_opd_tail * g_opd_tail,
         "g_grpo_sq": (g_grpo * g_grpo).sum(dim=-1) + g_grpo_tail * g_grpo_tail,
         "g_dot": (g_opd * g_grpo).sum(dim=-1) + g_opd_tail * g_grpo_tail,
+        "g_shared_sq": sh * sh * g0_sq,
+        "g_shared_dot": sh * g0_grpo,
+        "g_source_sq": sr * sr * g0_sq,
+        "g_source_dot": sr * g0_grpo,
+        "g_cross_dot": sh * sr * g0_sq,
     }
     if row_weight is not None:
-        # Squared for the squared terms, so the reported norms are those of the
-        # weighted gradient rather than of the weighted squared gradient.
+        # Squared for the squared terms AND for the cross term, so the reported
+        # norms are those of the weighted gradient rather than of the weighted
+        # squared gradient, and every cosine below stays a ratio of like for
+        # like.
         rw = row_weight.detach().to(torch.float32).reshape(-1, 1)
         rw2 = rw * rw
-        out = {"g_opd_sq": out["g_opd_sq"] * rw2, "g_grpo_sq": out["g_grpo_sq"] * rw2,
-               "g_dot": out["g_dot"] * rw2}
+        out = {name: col * rw2 for name, col in out.items()}
     return out
 
 
@@ -3206,6 +3271,26 @@ def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             out[f"{head}/grpo/grad_norm_ratio"] = opd / grpo
         if opd > 1e-12 and grpo > 1e-12:
             out[f"{head}/grpo/grad_cosine"] = tot["g_dot"] / (opd * grpo)
+
+        # WHICH CHANNEL the reward signal disagrees with. The cosine above is
+        # taken on the applied W, which is the base OPD direction plus both
+        # channels, and it is dominated by the base -- so it stays near whatever
+        # the unweighted term does however the channels are allocated. These two
+        # are on each channel's ADDITION alone.
+        sh = math.sqrt(max(tot["g_shared_sq"], 0.0))
+        src = math.sqrt(max(tot["g_source_sq"], 0.0))
+        out[f"{head}/channel/shared_grad_norm"] = sh
+        out[f"{head}/channel/source_grad_norm"] = src
+        if grpo > 1e-12:
+            if sh > 1e-12:
+                out[f"{head}/grpo/shared_grad_cosine"] = tot["g_shared_dot"] / (sh * grpo)
+            if src > 1e-12:
+                out[f"{head}/grpo/source_grad_cosine"] = tot["g_source_dot"] / (src * grpo)
+        if sh > 1e-12 and src > 1e-12:
+            # >= 0 for any allocation, because both channels scale the SAME g0.
+            # Read it as redundancy -- near 1 the two are the same mechanism
+            # twice -- and never as "the channels agree", which it cannot deny.
+            out[f"{head}/channel/shared_source_grad_cosine"] = tot["g_cross_dot"] / (sh * src)
     return out
 
 
@@ -3275,6 +3360,31 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # bonus IS the arm; near 0 it is decoration and what the run tests is
             # "reliable source activity", not agreement.
             out[f"{head}/evidence/shared_share"] = tot["evidence_shared"] / tot["evidence"]
+        # WHERE EACH CHANNEL PUTS ITS BUDGET, against where the other one does.
+        # Both channels only ever ADD weight, so they cannot fight at a
+        # position; they compete for the fixed per-task mean mu preserves, which
+        # makes "do they pick the same positions" the whole question.
+        s_mean, r_mean = tot["push_shared"] / n, tot["push_source"] / n
+        s_var = max(tot["push_shared_sq"] / n - s_mean * s_mean, 0.0)
+        r_var = max(tot["push_source_sq"] / n - r_mean * r_mean, 0.0)
+        out[f"{head}/channel/shared_push_mean"] = s_mean
+        out[f"{head}/channel/source_push_mean"] = r_mean
+        if tot["push_shared_sq"] > 1e-24 and tot["push_source_sq"] > 1e-24:
+            # Uncentered: how much the two channels' mass overlaps at all. In
+            # [0, 1] because neither channel is ever negative, so a LOW value is
+            # the finding -- it means the arm is running two mechanisms that
+            # touch different text.
+            out[f"{head}/channel/allocation_cosine"] = tot["push_cross"] / math.sqrt(
+                tot["push_shared_sq"] * tot["push_source_sq"]
+            )
+        if s_var > 0 and r_var > 0:
+            # Centered, and the one that can go negative. Below zero the
+            # channels systematically pick different positions RELATIVE to their
+            # own means: given a task budget that mu holds fixed, that is them
+            # taking it from each other, which the uncentered cosine cannot say.
+            out[f"{head}/channel/allocation_corr"] = (
+                tot["push_cross"] / n - s_mean * r_mean
+            ) / math.sqrt(s_var * r_var)
         if abs(tot["kl"]) > 1e-12:
             kl_scale = tot["w_kl"] / tot["kl"]
             out[f"{head}/effect/kl_scale"] = kl_scale

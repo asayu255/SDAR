@@ -3281,6 +3281,14 @@ class DataParallelPPOActor(BasePPOActor):
                                     # norm ratio that omits it is the ratio of a
                                     # different objective's gradients.
                                     row_weight=task_loss_weight,
+                                    # The exact partition of W - 1, so each
+                                    # channel's own addition to the logit push
+                                    # is scored against the policy gradient
+                                    # separately. The pooled cosine cannot: it
+                                    # is taken on W, which carries the base OPD
+                                    # direction and both channels at once.
+                                    push_shared=xt_built["push_shared"],
+                                    push_source=xt_built["push_by_source"].sum(dim=-1),
                                 )
                                 xt_grad_stats.update(
                                     xt_grad_cols, response_mask=response_mask, task_ids=task_ids,

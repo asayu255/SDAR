@@ -2124,13 +2124,19 @@ def test_the_interference_metrics_are_a_ratio_and_a_cosine():
 def test_a_perfectly_aligned_pair_reads_cosine_one():
     stats = ScopeTermStats(names=GRAD_TERMS, n_tasks=0, device="cpu")
     stats.update(
+        # The channel columns are zero here: this pins the POOLED cosine, and a
+        # channel that allocated nothing must render no cosine of its own.
         {"g_opd_sq": torch.tensor([[4.0]]), "g_grpo_sq": torch.tensor([[9.0]]),
-         "g_dot": torch.tensor([[6.0]])},
+         "g_dot": torch.tensor([[6.0]]),
+         **{name: torch.zeros(1, 1) for name in GRAD_TERMS
+            if name not in ("g_opd_sq", "g_grpo_sq", "g_dot")}},
         response_mask=torch.ones(1, 1), task_ids=None,
     )
     m = gradient_metrics(stats.sums())
     assert m["kl_weight/grpo/grad_cosine"] == pytest.approx(1.0)
     assert m["kl_weight/grpo/grad_norm_ratio"] == pytest.approx(2.0 / 3.0)
+    assert "kl_weight/grpo/shared_grad_cosine" not in m
+    assert "kl_weight/grpo/source_grad_cosine" not in m
 
 
 def test_the_token_tables_are_driven_from_the_new_arms_own_switches():
@@ -3110,6 +3116,8 @@ def test_weight_kl_lift_says_whether_the_weight_landed_where_the_kl_was():
             "weight": w, "pre_weight": w, "available": torch.ones(w.size(0), dtype=torch.bool),
             "evidence_shared": torch.zeros_like(w),
             "evidence_shared_offtask_only": torch.zeros_like(w),
+            "push_shared": torch.zeros_like(w),
+            "push_by_source": torch.zeros_like(w).unsqueeze(-1),
         }
         stats.update(position_terms(built, kl), response_mask=torch.ones_like(kl), task_ids=None)
         return position_weight_metrics(stats.sums())
