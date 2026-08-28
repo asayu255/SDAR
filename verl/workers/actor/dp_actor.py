@@ -547,17 +547,21 @@ class DataParallelPPOActor(BasePPOActor):
         Shared by both cross-teacher arms because both need exactly these four
         models on exactly one support; a second copy is how the two would come
         to read different things and still be called the same experiment.
+
+        One exchange for all of them, not one each. They share ``support_ids``,
+        and that is the largest thing the exchange all-gathers -- (n, resp, k)
+        int64 against (n,) keys -- so asking per plane sent it three times and
+        paid three ``all_reduce`` pairs and, offloaded, three device-to-host
+        copies of the gathered keys. See
+        :func:`~verl.workers.teacher_cache.exchange_teacher_logprobs_multi`,
+        which is bit-identical to the per-plane calls.
         """
-        sign_ids = data["sign_cache_ids"]
-        planes = [
-            self._teacher_logprobs_at(
-                cache_ids=sign_ids[:, c],
-                ids=support_ids,
-                input_ids=data["input_ids"],
-                attention_mask=data["attention_mask"],
-            )
-            for c in range(sign_ids.size(1))
-        ]
+        planes = self._teacher_logprobs_at_planes(
+            cache_ids=data["sign_cache_ids"],
+            ids=support_ids,
+            input_ids=data["input_ids"],
+            attention_mask=data["attention_mask"],
+        )
         return planes[0], torch.stack(planes[1:], dim=-1)
 
     def _xt_token_tables(
@@ -1021,20 +1025,42 @@ class DataParallelPPOActor(BasePPOActor):
         Both sides work per ROW: one key locates the row's whole
         (response_length, hidden) block, and ``ids`` stays (bs, response_length, k).
         """
-        from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache, row_fingerprint
-
         if cache_ids is None:
             raise ValueError(
                 "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
                 "teacher hidden states; the batch has none."
             )
+        return self._teacher_logprobs_at_planes(
+            cache_ids=cache_ids.unsqueeze(1), ids=ids,
+            input_ids=input_ids, attention_mask=attention_mask,
+        )[0]
+
+    def _teacher_logprobs_at_planes(self, cache_ids, ids, input_ids=None, attention_mask=None):
+        """The same lookup for several models at once, over one support.
+
+        ``cache_ids`` is (bs, P), one key column per model; the return is a list
+        of P (bs, response_length, k) tensors in that column order. Everything
+        the single-plane form documents applies unchanged -- this is where it is
+        implemented, and the batching is a transport change the values do not
+        see.
+        """
+        from verl.workers.teacher_cache import (
+            exchange_teacher_logprobs_multi,
+            get_teacher_cache,
+            row_fingerprint,
+        )
+
         # Derived from the rows being trained RIGHT HERE, so a key column shifted
         # against its batch is caught. The key alone would resolve cleanly and
-        # return a real teacher log-prob for somebody else's sample.
+        # return a real teacher log-prob for somebody else's sample. One row is
+        # one row whichever model is read off it, so the same column checks every
+        # plane.
         fingerprints = None
         if input_ids is not None and attention_mask is not None:
             fingerprints = row_fingerprint(input_ids, attention_mask)
-        return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints)
+        return exchange_teacher_logprobs_multi(
+            get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints
+        )
 
     def _varlen_kwargs(self, cu_seqlens, max_seqlen_in_batch) -> dict:
         """The packed-sequence boundaries, handed over instead of re-derived.

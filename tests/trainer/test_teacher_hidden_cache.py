@@ -343,6 +343,10 @@ def _worker(rank, world_size, port, mode, out):
         elif mode == "shifted":
             asked = asked.roll(1)  # resolves cleanly, to the wrong rows
 
+        if mode in ("multi", "count"):
+            out.put((rank, *_multi_plane_probe(cache, all_keys, h, lse, W, ids, fp, mine, theirs, mode)))
+            return
+
         try:
             got = exchange_teacher_logprobs(cache, asked, ids, fingerprints=fp)
             # The ownership tally is read once per mini-batch, not inside the
@@ -354,6 +358,82 @@ def _worker(rank, world_size, port, mode, out):
             out.put((rank, "raised", str(exc)))
     finally:
         dist.destroy_process_group()
+
+
+def _multi_plane_probe(cache, all_keys, h, lse, W, ids, fp, mine, theirs, mode):
+    """Three models on the same rows, asked for together and one at a time.
+
+    The cross-teacher arms read four models at ONE support. Batching them is only
+    allowed if it changes nothing, so this asks the same question both ways in
+    the same process group and compares the answers exactly.
+    """
+    import torch.distributed as dist
+
+    from verl.workers.teacher_cache import exchange_teacher_logprobs_multi
+
+    planes = ("base", "off_a", "off_b")
+    # A distinct head per plane, so a plane answered from another plane's entry
+    # comes back with different numbers rather than the same ones.
+    heads, keys = {}, []
+    for j, name in enumerate(planes):
+        Wj = W + (j + 1) * 0.05
+        heads[name] = Wj
+        cache.register_lm_head(name, Wj)
+        kj = all_keys + (j + 1) * 10_000
+        # This head's own normaliser, not the on-task one's. The store keeps h
+        # and lse and finishes log p = h.W[v] - lse, so an lse belonging to a
+        # different head reproduces nothing and the reference below would be
+        # comparing against a distribution that does not exist.
+        lse_j = torch.logsumexp(h.reshape(-1, H) @ Wj.T, dim=-1).view(h.shape[0], L)
+        cache.put(kj[mine], name, h[mine], lse_j[mine])
+        # One row is one row whichever model is read off it, so every plane's
+        # entry carries the SAME fingerprint as the on-task one -- which is why
+        # a single fingerprint column can check all of them. Left at 0 the guard
+        # would fire on every plane, correctly, and the test would be about the
+        # fixture instead.
+        for slot, key in enumerate(kj[mine].tolist()):
+            cache._fingerprint[key] = int(cache._fingerprint[int(all_keys[mine][slot])])
+        keys.append(kj[theirs])
+    cache._final = None
+    asked = torch.stack(keys, dim=1)  # (n, 3)
+
+    if mode == "count":
+        n_calls = {"all_gather": 0, "all_reduce": 0}
+        real_gather, real_reduce = dist.all_gather, dist.all_reduce
+
+        def _g(*a, **kw):
+            n_calls["all_gather"] += 1
+            return real_gather(*a, **kw)
+
+        def _r(*a, **kw):
+            n_calls["all_reduce"] += 1
+            return real_reduce(*a, **kw)
+
+        dist.all_gather, dist.all_reduce = _g, _r
+        try:
+            exchange_teacher_logprobs_multi(cache, asked, ids, fingerprints=fp)
+            fused = dict(n_calls)
+            n_calls.update(all_gather=0, all_reduce=0)
+            for p in range(asked.size(1)):
+                exchange_teacher_logprobs(cache, asked[:, p], ids, fingerprints=fp)
+            apiece = dict(n_calls)
+        finally:
+            dist.all_gather, dist.all_reduce = real_gather, real_reduce
+        assert_rows_were_owned_once()
+        return "counts", (fused, apiece)
+
+    together = exchange_teacher_logprobs_multi(cache, asked, ids, fingerprints=fp)
+    assert_rows_were_owned_once()
+    apart = [exchange_teacher_logprobs(cache, asked[:, p], ids, fingerprints=fp)
+             for p in range(asked.size(1))]
+    assert_rows_were_owned_once()
+
+    identical = all(torch.equal(a, b) for a, b in zip(together, apart))
+    err = max(
+        (together[j] - _reference(h[theirs], heads[name], ids)).abs().max().item()
+        for j, name in enumerate(planes)
+    )
+    return "multi", (identical, err)
 
 
 def _run_two_ranks(mode):
@@ -1449,3 +1529,83 @@ def test_the_chunks_really_are_separate_gathers():
     assert whole == [(40, K, H)], "the unchunked path stopped being one gather"
     assert len(split) == 6 and max(s[0] for s in split) == 7, f"gathers were {split}"
     assert sum(s[0] for s in split) == 40, "the chunks do not cover every row"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="gloo spawn")
+def test_planes_asked_for_together_answer_exactly_what_they_do_one_at_a_time():
+    """Batching the exchange is a transport change, so it has to be bit-identical.
+
+    Three models are cached on the same rows under different keys and read at one
+    support, both ways, in the same process group. ``torch.equal`` rather than a
+    tolerance: ``logprobs_at`` runs per (rank, plane) on the same inputs either
+    way and the reduction is elementwise over the same ranks, so anything but
+    exact equality means the batching moved a value.
+    """
+    res = _run_two_ranks("multi")
+    for rank, (status, payload) in res.items():
+        assert status == "multi", f"rank {rank}: {payload}"
+        identical, err = payload
+        assert identical, f"rank {rank}: batched planes differ from per-plane calls"
+        assert err < 1e-5, f"rank {rank} deviation from the full-vocabulary reference: {err}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="gloo spawn")
+def test_the_planes_cost_one_exchange_between_them_instead_of_one_each():
+    """The saving, counted rather than assumed.
+
+    Four planes a micro-batch used to be four all_gathers of the SUPPORT -- by
+    far the largest thing that crosses -- and four all_reduce pairs, on two cards
+    with no NVLink. Three planes here, so per-plane is 3x(2+2)=12 and fused is
+    2+2=4; the shape of the claim does not depend on the 3.
+    """
+    res = _run_two_ranks("count")
+    for rank, (status, payload) in res.items():
+        assert status == "counts", f"rank {rank}: {payload}"
+        fused, apiece = payload
+        assert fused == {"all_gather": 2, "all_reduce": 2}, f"rank {rank}: {fused}"
+        assert apiece == {"all_gather": 6, "all_reduce": 6}, f"rank {rank}: {apiece}"
+
+
+# --------------------------------------------------------------------------- #
+# 17. the actor asks once, not once per model
+# --------------------------------------------------------------------------- #
+def test_the_actor_reads_all_its_planes_in_one_exchange(monkeypatch):
+    """Where the saving is actually taken.
+
+    The primitive above can batch; this is the wiring that uses it.
+    ``_cross_teacher_planes`` used to loop over the columns of
+    ``sign_cache_ids`` calling the single-plane form, which sent the support --
+    the big tensor -- once per model. The columns must still come back in order,
+    because the actor reads them positionally.
+    """
+    from verl.workers.actor import dp_actor
+
+    calls = []
+
+    def _fake(cache, cache_ids, ids, group=None, world_size=None, fingerprints=None):
+        calls.append((cache_ids.shape, ids.shape))
+        # A different constant per column, so a reordering shows up as a value.
+        return [torch.full(ids.shape, float(c), dtype=torch.float32)
+                for c in range(cache_ids.size(1))]
+
+    monkeypatch.setattr(dp_actor, "get_teacher_cache", lambda: None, raising=False)
+    import verl.workers.teacher_cache as tc
+    monkeypatch.setattr(tc, "exchange_teacher_logprobs_multi", _fake)
+    monkeypatch.setattr(tc, "get_teacher_cache", lambda: None)
+
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    n, planes = 4, 3
+    data = {
+        "sign_cache_ids": torch.arange(n * planes, dtype=torch.long).view(n, planes),
+        "input_ids": torch.ones((n, 8), dtype=torch.long),
+        "attention_mask": torch.ones((n, 8), dtype=torch.long),
+    }
+    support = torch.randint(0, VOCAB, (n, L, K))
+
+    base, off = actor._cross_teacher_planes(data, support)
+
+    assert len(calls) == 1, f"one exchange for all planes, got {len(calls)}"
+    assert calls[0][0] == (n, planes), "every column has to go in the same call"
+    assert torch.all(base == 0.0), "column 0 is the base policy"
+    for c in range(planes - 1):
+        assert torch.all(off[..., c] == float(c + 1)), f"off-task column {c} came back out of order"

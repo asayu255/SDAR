@@ -866,13 +866,10 @@ def exchange_teacher_logprobs(
 ) -> torch.Tensor:
     """Get ``log p_t`` at each rank's ids from whichever rank cached that row.
 
-    Every rank broadcasts what it wants, every rank answers what it owns, and the
-    answers are summed back. Ownership is unique so the sum is exact.
-
-    Shapes must agree across ranks -- they do, because ``adjust_batch`` rounds the
-    batch to a multiple of ``ppo_micro_batch_size_per_gpu * world_size``, so every
-    rank runs the same number of micro-batches of the same size. That is also what
-    makes calling a collective from inside the micro-batch loop safe.
+    One plane. See :func:`exchange_teacher_logprobs_multi`, which this is a
+    single-column call into -- there is one implementation so the two cannot
+    drift, and on the arms that read four models the multi form is what the
+    actor calls.
 
     Args:
         cache_ids: (n,) int64 keys, one per ROW; -1 for rows scored elsewhere.
@@ -889,48 +886,116 @@ def exchange_teacher_logprobs(
     Returns:
         (n, response_length, k) float32 teacher log-probs for this rank's ids.
     """
+    return exchange_teacher_logprobs_multi(
+        cache, cache_ids.unsqueeze(1), ids,
+        group=group, world_size=world_size, fingerprints=fingerprints,
+    )[0]
+
+
+def exchange_teacher_logprobs_multi(
+    cache: TeacherHiddenCache,
+    cache_ids: torch.Tensor,
+    ids: torch.Tensor,
+    group=None,
+    world_size: Optional[int] = None,
+    fingerprints: Optional[torch.Tensor] = None,
+) -> list:
+    """The same exchange for SEVERAL models at once, over one support.
+
+    Every rank broadcasts what it wants, every rank answers what it owns, and the
+    answers are summed back. Ownership is unique so the sum is exact.
+
+    Shapes must agree across ranks -- they do, because ``adjust_batch`` rounds the
+    batch to a multiple of ``ppo_micro_batch_size_per_gpu * world_size``, so every
+    rank runs the same number of micro-batches of the same size. That is also what
+    makes calling a collective from inside the micro-batch loop safe.
+
+    THE PLANES SHARE THEIR IDS, WHICH IS THE WHOLE REASON TO BATCH THEM. The
+    cross-teacher arms read four models -- the on-task teacher, the base policy
+    and two off-task teachers -- at ONE support the student just chose. Run one
+    plane at a time that support is all-gathered four times, and it is by far the
+    largest thing that crosses: (n, response_length, k) int64 against (n,) keys.
+    Four calls also meant four ``all_reduce`` pairs and, offloaded, four
+    device-to-host copies of the gathered keys -- and a sync inside the
+    micro-batch loop drains the CPU's run-ahead every time. Sixteen collectives a
+    micro-batch become four, on a box whose two cards have no NVLink and where
+    the boundary costs more than the bytes.
+
+    Values are bit-identical to calling the single-plane form P times:
+    ``logprobs_at`` is invoked per (rank, plane) on exactly the same inputs, and
+    the reduction is elementwise over the same ranks in the same order.
+
+    Args:
+        cache_ids: (n, P) int64 keys, one per ROW per PLANE; -1 for rows scored
+            elsewhere. Column order is the caller's and is carried through.
+        ids: (n, response_length, k) this rank's student-chosen token ids, shared
+            by every plane.
+        fingerprints: (n,) int64 as in the single-plane form. One row is one row
+            whichever model is being read off it, so the same column checks all
+            P planes.
+
+    Returns:
+        list of P tensors, each (n, response_length, k) float32, in column order.
+    """
     import torch.distributed as dist
 
     if world_size is None:
         world_size = dist.get_world_size(group) if dist.is_initialized() else 1
+    n_planes = cache_ids.size(1)
 
     if world_size == 1:
-        values, found, owner_fp = cache.logprobs_at(cache_ids, ids)
-        _record_ownership(found, cache_ids, owner_fp, fingerprints)
-        return values
+        # One host copy of the keys for all P planes, which is the sync the
+        # per-plane calls were each paying for themselves.
+        cpu = cache_ids.to("cpu", non_blocking=False) if cache.offloaded else None
+        out = []
+        for p in range(n_planes):
+            values, found, owner_fp = cache.logprobs_at(
+                cache_ids[:, p], ids, cache_ids_cpu=None if cpu is None else cpu[:, p]
+            )
+            _record_ownership(found, cache_ids[:, p], owner_fp, fingerprints)
+            out.append(values)
+        return out
 
     n, resp_len, k = ids.shape
     all_cache_ids = [torch.empty_like(cache_ids) for _ in range(world_size)]
     all_ids = [torch.empty_like(ids) for _ in range(world_size)]
     dist.all_gather(all_cache_ids, cache_ids.contiguous(), group=group)
+    # Once, not once per plane: this is the tensor the batching is for.
     dist.all_gather(all_ids, ids.contiguous(), group=group)
 
     # Answer every rank's request from this rank's cache; zeros elsewhere.
-    values = torch.zeros((world_size, n, resp_len, k), dtype=torch.float32, device=ids.device)
+    values = torch.zeros(
+        (world_size, n_planes, n, resp_len, k), dtype=torch.float32, device=ids.device
+    )
     # (found, fingerprint) in one tensor so the identity check rides along on the
     # reduce the count already needed -- no extra collective in the micro-batch loop.
-    meta = torch.zeros((world_size, n, 2), dtype=torch.int64, device=ids.device)
-    # One host copy for the whole gathered set, not one per rank: offloaded, the
-    # slot arithmetic runs on the host, and doing it lazily inside logprobs_at
-    # would be world_size device-to-host syncs per micro batch instead of one.
-    # Skipped entirely when the store is resident, where the index belongs on the
-    # device and no copy is wanted.
+    meta = torch.zeros((world_size, n_planes, n, 2), dtype=torch.int64, device=ids.device)
+    # One host copy for the whole gathered set, not one per rank and not one per
+    # plane: offloaded, the slot arithmetic runs on the host, and doing it lazily
+    # inside logprobs_at would be world_size * P device-to-host syncs per micro
+    # batch instead of world_size. Skipped entirely when the store is resident,
+    # where the index belongs on the device and no copy is wanted.
     gathered_cpu = (
         [t.to("cpu", non_blocking=False) for t in all_cache_ids]
         if cache.offloaded else [None] * world_size
     )
     for r in range(world_size):
-        v, f, fp = cache.logprobs_at(all_cache_ids[r], all_ids[r], cache_ids_cpu=gathered_cpu[r])
-        values[r] = v
-        meta[r, :, 0] = f
-        meta[r, :, 1] = fp
+        for p in range(n_planes):
+            v, f, fp = cache.logprobs_at(
+                all_cache_ids[r][:, p], all_ids[r],
+                cache_ids_cpu=None if gathered_cpu[r] is None else gathered_cpu[r][:, p],
+            )
+            values[r, p] = v
+            meta[r, p, :, 0] = f
+            meta[r, p, :, 1] = fp
 
     dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
     dist.all_reduce(meta, op=dist.ReduceOp.SUM, group=group)
 
     rank = dist.get_rank(group) if dist.is_initialized() else 0
-    _record_ownership(meta[rank, :, 0], cache_ids, meta[rank, :, 1], fingerprints)
-    return values[rank]
+    for p in range(n_planes):
+        _record_ownership(meta[rank, p, :, 0], cache_ids[:, p], meta[rank, p, :, 1], fingerprints)
+    return [values[rank, p] for p in range(n_planes)]
 
 
 _OWNERSHIP: Optional[torch.Tensor] = None
