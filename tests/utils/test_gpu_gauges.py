@@ -526,7 +526,9 @@ def test_one_request_in_flight_is_not_the_engine_having_work(tmp_path):
     busy = ([98, 97, 98], 20, {"gen_inflight": 500}, 40)
     tail = ([0, 1, 0], 15, {"gen_inflight": 2, "ready": 1, "future_wait": 1}, 15)
     out = _scan(_trace(tmp_path / "tail.csv", [busy, tail, busy, tail, busy]))
-    assert "TAIL_BLOCKS_READY" in out
+    # A TAIL_ reason, whichever slot state this fixture happens to describe --
+    # what this test is about is that it is not GPU_SIDE.
+    assert "TAIL_ALL_SLOTS_BUSY" in out
     assert "GPU_SIDE" not in out.split("why the cards were idle")[1].split("per phase")[0]
     # And it says what it calibrated to, so the reader can disagree with it.
     assert "calibrated from this run" in out
@@ -794,6 +796,70 @@ def test_the_reason_table_does_not_run_its_columns_together(tmp_path):
 
 def scanner_abbr(reason):
     return _scanner()._abbr(reason)
+
+
+def test_the_report_names_the_gauges_the_trace_carries(tmp_path):
+    """Without it the table is not readable, and the failure is silent.
+
+    Several reasons fall back to a coarser name when their gauge is missing, so
+    "SCHEDULER_STARVATION 0" means either "no slot was ever free while work
+    waited" or "this trace has no slots_free column" -- indistinguishable in the
+    table, and one of them is a finding while the other is an absent instrument.
+    """
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 20)
+    out = _scan(_trace(tmp_path / "t.csv", [busy, ([0, 1, 0], 6, {"ready": 4}, 10), busy]))
+    line = next(ln for ln in out.splitlines() if ln.startswith("gauges in this trace:"))
+    assert "slots_free" in line and "placeable_ready" in line
+
+    # ...and a trace from before them says so rather than listing nothing.
+    old = tmp_path / "old.csv"
+    old.write_text(
+        "ts,clock,pid,phase,sm_pct_per_gpu,membw_pct_per_gpu,power_w_per_gpu,"
+        "smclk_mhz_per_gpu,pcie_rx_mb_s_per_gpu,nvlink_mb_s_per_gpu,driver_cpu_pct\n"
+        + "".join(f"{i * 0.1:.3f},00:00:00,1,gen,98;97;98,;;,;;,;;,;;,;;,20\n" for i in range(20))
+    )
+    assert "NONE" in next(ln for ln in _scan(old).splitlines()
+                          if ln.startswith("gauges in this trace:"))
+
+
+def test_the_report_survives_being_piped_into_head(tmp_path):
+    """It is long, and reading the top of it is the obvious thing to do.
+
+    Unhandled, the BrokenPipeError prints a traceback over the output it just
+    produced -- and this arm has already lost a day to a SIGPIPE that turned a
+    present line into an absent one.
+    """
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 20)
+    path = _trace(tmp_path / "t.csv", [busy, ([0, 1, 0], 6, {"ready": 4}, 10), busy])
+    done = subprocess.run(f"{sys.executable} {SCANNER} {path} 2>&1 | head -4",
+                          shell=True, capture_output=True, text=True)
+    assert "BrokenPipeError" not in done.stdout, done.stdout
+    assert "Traceback" not in done.stdout, done.stdout
+
+
+def test_a_draining_tail_says_whether_a_slot_was_actually_open():
+    """The branch never read a slot; its report line claimed one was waited for.
+
+    "the engine was draining a turn's last few rows while a whole batch waited
+    FOR A SLOT" was printed for 60% of one run's idle time by a rule that only
+    tested gen_inflight and ready. Every slot busy on its own tail, and a free
+    slot the queued batch cannot run, are opposite findings -- the first wants
+    more slots, the second cannot be helped by any number of them.
+    """
+    scanner = _scanner()
+    tail = {"gen_inflight": 3, "ready": 2}
+    assert scanner.why_one({**tail, "slots_free": 0}, gen_full=100) == "TAIL_ALL_SLOTS_BUSY"
+    assert scanner.why_one({**tail, "slots_free": 1}, gen_full=100) == "TAIL_SLOT_FREE_UNUSABLE"
+    # No queue behind the tail: nothing was blocked, whatever the slots say.
+    assert scanner.why_one({"gen_inflight": 3, "ready": 0, "slots_free": 0}, gen_full=100) == "TAIL_DRAIN"
+
+
+def test_a_tail_in_a_trace_without_slots_free_stays_undecided():
+    """The coarse name has to survive, for the same reason as before: a missing
+    column reads as zero, and zero here would mean "every slot was busy" -- a
+    definite finding manufactured out of an instrument that was not installed."""
+    scanner = _scanner()
+    assert scanner.why_one({"gen_inflight": 3, "ready": 2}, gen_full=100) == "TAIL_BLOCKS_READY"
 
 
 def test_the_new_reason_did_not_reshuffle_the_existing_ranks():

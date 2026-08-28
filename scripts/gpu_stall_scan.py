@@ -281,7 +281,26 @@ def why_one(gauges, cpu=None, gen_full=1):
     if gen:
         # A handful of requests: the tail of a turn. Whether that costs anything
         # depends entirely on whether a whole batch was sitting behind it.
-        return "TAIL_BLOCKS_READY" if ready else "TAIL_DRAIN"
+        if not ready:
+            return "TAIL_DRAIN"
+        # AND WHAT TO DO ABOUT IT DEPENDS ON THE SLOTS, which this branch did
+        # not look at while its own report line said "a whole batch waited FOR A
+        # SLOT". Two states, opposite prescriptions, one name:
+        #
+        #   every slot busy on its own tail -> more slots would take the queue,
+        #     if the KV budget has room for them
+        #   a slot free that the queue cannot use -> more slots change nothing.
+        #     The extra slots serve search only and alfworld cannot have a
+        #     second manager (seeded game cycle), so the only lever left is
+        #     inside the batch: stop making every row wait on the turn barrier.
+        #
+        # As with placeable_ready: an absent column reads as zero everywhere, so
+        # a trace without `slots_free` keeps the older, undecided name rather
+        # than being reported as all-slots-busy on the strength of a gauge it
+        # never had.
+        if "slots_free" not in gauges:
+            return "TAIL_BLOCKS_READY"
+        return "TAIL_SLOT_FREE_UNUSABLE" if gauges["slots_free"] else "TAIL_ALL_SLOTS_BUSY"
     # The engine is empty from here down.
     #
     # STARVATION NEEDS A FREE SLOT, not merely queued work. `ready` used to mean
@@ -361,6 +380,8 @@ def _mean_sm(sm):
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
     "SLOT_COMPATIBILITY_BLOCK",
+    "TAIL_ALL_SLOTS_BUSY",
+    "TAIL_SLOT_FREE_UNUSABLE",
     "TAIL_BLOCKS_READY",
     "SLOTS_BUSY_NOT_GENERATING",
     "RETRIEVER_DEPENDENCY",
@@ -380,6 +401,8 @@ _REASON_ABBR = {
     "SLOT_COMPATIBILITY_BLOCK": "mismatch",
     "SLOTS_BUSY_NOT_GENERATING": "allbusy",
     "TAIL_BLOCKS_READY": "tailblock",
+    "TAIL_ALL_SLOTS_BUSY": "tailfull",
+    "TAIL_SLOT_FREE_UNUSABLE": "tailunfit",
     "TAIL_DRAIN": "tail",
     "RETRIEVER_DEPENDENCY": "retriever",
     "ENV_DEPENDENCY": "env",
@@ -488,6 +511,15 @@ def analyse(path, floor, busy, top):
     observed = sum(dts)
 
     print(f"\n=== {os.path.basename(path)} ===")
+    # WHICH GAUGES THIS TRACE ACTUALLY CARRIES. Several reasons collapse to a
+    # coarser name when a gauge is missing, and the coarse name is not
+    # distinguishable in the table from the gauge being present and reading
+    # zero: a trace with no `slots_free` reports SCHEDULER_STARVATION 0 for the
+    # same reason a trace with plenty of free slots would. Reading the table
+    # without knowing which gauges were installed is guessing.
+    print("gauges in this trace: "
+          + (", ".join(sorted(rows[0]["gauges"])) if rows[0]["gauges"]
+             else "NONE (written before the gauges existed)"))
     print(
         f"{len(rows)} samples over {span / 60:.1f} min, {ngpu} GPUs, "
         f"{median([dts[i] for i in range(1, len(dts))]) * 1000 if len(dts) > 1 else 0:.0f} ms apart"
@@ -570,8 +602,13 @@ def analyse(path, floor, busy, top):
                                         "the free slot -- the queue's task mix, not the dispatcher",
             "SLOTS_BUSY_NOT_GENERATING": "every slot was occupied and none was feeding the engine -- "
                                          "between turns, in the driver, or in the pump round trip",
-            "TAIL_BLOCKS_READY": "the engine was draining a turn's last few rows while a whole batch "
-                                 "waited for a slot -- more slots, or let a slot start before its tail ends",
+            "TAIL_ALL_SLOTS_BUSY": "the engine was draining turn tails and EVERY slot was busy doing it "
+                                   "while a batch waited -- more slots would take the queue, if KV has room",
+            "TAIL_SLOT_FREE_UNUSABLE": "a turn tail was draining, a batch waited, and a slot WAS free that "
+                                       "the batch cannot run -- more slots change nothing; the lever is "
+                                       "inside the batch, at the turn barrier",
+            "TAIL_BLOCKS_READY": "a turn tail was draining while a whole batch waited -- this trace has no "
+                                 "slots_free column, so whether a slot was open is not recorded",
             "TAIL_DRAIN": "a turn's last few rows were finishing and nothing else was ready to run",
             "RETRIEVER_DEPENDENCY": "nothing was submittable; the retrieval service was the dependency",
             "ENV_DEPENDENCY": "nothing was submittable; env.step was the dependency",
@@ -715,4 +752,13 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # `gpu_stall_scan.py trace.csv | head` printed a traceback over the
+        # output it had just produced. The report is long and reading the top of
+        # it through head is the obvious thing to do.
+        try:
+            sys.stdout.close()
+        finally:
+            os._exit(0)
