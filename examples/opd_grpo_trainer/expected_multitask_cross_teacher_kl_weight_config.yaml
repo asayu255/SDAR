@@ -122,6 +122,33 @@
 # Which rows get dropped is data. It must also match the pure-OPD arm's value,
 # or the two arms are not training on the same rows.
 "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
+# ---- what bounds the three frozen forwards -----------------------------------
+# The teacher/base passes are bounded by TOKENS, not rows. ref.log_prob_micro_
+# batch_size_per_gpu=4 was the row form of the same bound: 4 x the pinned
+# data.max_response_length=512 = 2,048 response tokens, which is what the fp32
+# (n_resp, 151936) buffer in lm_head could afford. Measured response_length/mean
+# is 139, so four rows is ~556 tokens -- the row bound pays the worst case on
+# every step, and it stops bounding anything the moment responses grow (that is
+# how the 16-row version OOMed at step 18; docs/speedup_mechanisms.md 7.2).
+#
+# 2048 is the SAME memory ceiling expressed in the unit that actually drives it.
+# Pinned as a pair, because either one alone is a different bound: dynamic_bsz
+# without the token length falls back to an interpolated default, and the token
+# length without dynamic_bsz is inert.
+#
+# NOT bit-identical to the row form -- the micro-batch split moves, and per-row
+# log probs are independent under rmpad but packed GEMMs of different total
+# length differ in their last bits. Both arms of this A/B carry it, which is what
+# keeps the pair comparable to each other.
+"actor_rollout_ref.ref.log_prob_use_dynamic_bsz": true
+"actor_rollout_ref.ref.log_prob_max_token_len_per_gpu": 2048
+# The training forward's own bound, halved from 10 after this arm's first launch:
+# it holds four models per row in the hidden-state cache (teacher_cache/gb 16.3
+# against pure OPD's 4.1) while vLLM is awake and holding its KV cache. Unlike
+# the rollout key below it does NOT enter adjust_batch's divisor, so it moves no
+# data -- only how much is resident at once.
+"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
+
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
 #     bit-identical, covered by the exemption above.
