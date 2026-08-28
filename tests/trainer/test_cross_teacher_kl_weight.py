@@ -3344,11 +3344,12 @@ def test_the_outcome_buckets_separate_where_the_budget_went():
     m = acc.metrics(task_names=TASKS)
     assert m["kl_weight/outcome/adv_positive/gross_effect"] == pytest.approx(1.0)
     assert m["kl_weight/outcome/adv_negative/gross_effect"] == pytest.approx(0.0)
-    assert m["kl_weight/outcome/success/gross_effect"] == pytest.approx(1.0)
-    assert m["kl_weight/outcome/failure/gross_effect"] == pytest.approx(0.0)
+    assert m["kl_weight/outcome/reward_positive/gross_effect"] == pytest.approx(1.0)
+    assert m["kl_weight/outcome/reward_nonpositive/gross_effect"] == pytest.approx(0.0)
     # Both sides have to exist for the ratio, and the zero side is not an
-    # infinity -- a step with no failures is not a step with an infinite ratio.
-    assert "kl_weight/outcome/success_to_failure_effect_ratio" not in m
+    # infinity -- a step with no scoring rows is not a step with an infinite
+    # ratio.
+    assert "kl_weight/outcome/reward_positive_to_nonpositive_effect_ratio" not in m
     assert m["kl_weight/outcome/all/n_rows"] == pytest.approx(2.0)
     assert m["kl_weight/alfworld/outcome/adv_positive/gross_effect"] == pytest.approx(1.0)
 
@@ -3370,9 +3371,9 @@ def test_the_outcome_correlation_is_over_trajectories_not_positions():
     )
     m = acc.metrics(task_names=["a"])
     assert m["kl_weight/outcome/corr_adv_gross_effect"] > 0.9
-    # Success buckets stay empty without a reward: the advantage is
-    # group-relative and says nothing about whether the episode succeeded.
-    assert "kl_weight/outcome/success/gross_effect" not in m
+    # The reward buckets stay empty without a reward: the advantage is
+    # group-relative and says nothing about what the episode scored.
+    assert "kl_weight/outcome/reward_positive/gross_effect" not in m
 
 
 def test_a_row_with_no_kl_contributes_no_ratio():
@@ -3418,8 +3419,16 @@ def test_the_pair_state_table_keeps_both_axes_the_others_collapse():
     )
     m = acc.metrics(task_names=TASKS)
     head = "kl_weight/pair_state/search__on__alfworld"
+    # CANDIDATES, not positions: one position contributed all four states, so
+    # each is a quarter of the candidate slots AND present at 100% of positions.
+    # Reporting the first under the second's name is what this pair of
+    # assertions pins.
     for s in PAIR_STATES:
-        assert m[f"{head}/{s}/position_frac"] == pytest.approx(0.25)
+        assert m[f"{head}/{s}/candidate_frac"] == pytest.approx(0.25)
+        assert m[f"{head}/{s}/position_any_frac"] == pytest.approx(1.0)
+    assert m[f"{head}/candidate_count"] == pytest.approx(4.0)
+    assert m[f"{head}/n_positions"] == pytest.approx(1.0)
+    assert not any(k.endswith("/position_frac") for k in m), "the misnamed key is gone"
     assert m[f"{head}/conflict/kl_shift_net"] == pytest.approx(-5.0)
     shares = [m[f"{head}/{s}/kl_shift_gross_share"] for s in PAIR_STATES]
     assert sum(shares) == pytest.approx(1.0)
@@ -3724,3 +3733,229 @@ def test_the_pair_dump_gathers_every_rank_and_still_caps_each_cell():
         assert isinstance(r["dst"], str) and isinstance(r["src"], str)
         assert r["token_id"] == int(r["token_id"])
         assert 0.0 < r["p_source"] <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# the source-wise decomposition of the added push
+# --------------------------------------------------------------------------- #
+def test_the_logit_push_decomposition_is_exact():
+    """W - 1 = B_shared/mu + sum_m B_m/mu + (1/mu - 1), to float32.
+
+    The whole per-source attribution rests on this being an identity rather than
+    an approximation: if the parts only nearly add up, "Search supplied 30% of
+    the push at this token" is a correlated summary and not a share.
+    """
+    for kwargs in ({}, {"alpha": 0.0}, {"alpha": 1.0}, {"seed": 7}, {"n_off": 1}):
+        got, _ = _built(**kwargs)
+        parts = (
+            got["push_shared"] + got["push_by_source"].sum(dim=-1) + got["push_normalizer"]
+        )
+        assert torch.allclose(parts, got["weight"] - 1.0, atol=1e-6), kwargs
+
+
+def test_the_decomposition_is_zero_wherever_the_weight_was_neutralised():
+    """A cold-start row and a row whose task has no RMS both sit at W = 1, and
+    every share has to be zero there -- otherwise the attribution reports a push
+    at positions the mechanism never touched."""
+    got, _ = _built(normalizer=None)
+    assert torch.equal(got["weight"], torch.ones_like(got["weight"]))
+    for key in ("push_shared", "push_normalizer"):
+        assert torch.count_nonzero(got[key]) == 0, key
+    assert torch.count_nonzero(got["push_by_source"]) == 0
+
+    partial, _ = _built(diag_valid=[True, False, True])
+    parts = (
+        partial["push_shared"] + partial["push_by_source"].sum(dim=-1)
+        + partial["push_normalizer"]
+    )
+    assert torch.allclose(parts, partial["weight"] - 1.0, atol=1e-6)
+
+
+def test_the_normalizer_offset_is_nobody_s_and_is_not_negligible():
+    """With every alpha at zero and no corroboration the sources contribute
+    nothing, yet W is not 1 -- mu is a whole-task divisor. Folding that offset
+    into the sources would credit a teacher for an effect it had no part in."""
+    got, _ = _built(alpha=0.0)
+    assert torch.count_nonzero(got["push_by_source"]) == 0
+    moved = (got["weight"] - 1.0).abs().max()
+    assert moved > 0.01, "the offset alone should move the weight"
+    assert torch.allclose(
+        got["push_normalizer"] + got["push_shared"], got["weight"] - 1.0, atol=1e-6
+    )
+
+
+def test_pre_alpha_activity_separates_a_silent_source_from_a_vetoed_one():
+    """alpha = 0 collapses evidence_by_source to zero for both, and they are
+    opposite findings about the mechanism."""
+    vetoed, _ = _built(alpha=0.0)
+    assert torch.count_nonzero(vetoed["evidence_by_source"]) == 0
+    assert vetoed["activity_by_source"].abs().sum() > 0, "the source did speak"
+
+    trusted, _ = _built(alpha=1.0)
+    # alpha only scales; it cannot move the pre-alpha reading.
+    assert torch.allclose(
+        trusted["activity_by_source"], vetoed["activity_by_source"], atol=1e-6
+    )
+    assert torch.allclose(
+        trusted["evidence_by_source"], trusted["activity_by_source"], atol=1e-6
+    )
+
+
+def test_the_source_outcome_table_splits_one_source_s_effect_by_outcome():
+    from verl.trainer.ppo.cross_teacher_kl_weight import SourceOutcomeStats
+
+    acc = SourceOutcomeStats(n_tasks=3, device="cpu")
+    # Two rows, same destination and sources. Source 0 acts only on the row with
+    # positive advantage, source 1 only on the other.
+    push = torch.tensor([
+        [[0.5, 0.0], [0.5, 0.0]],
+        [[0.0, 0.25], [0.0, 0.25]],
+    ])                                                        # (2, 2, 2)
+    acc.update(
+        push_by_source=push,
+        teacher_kl=torch.ones(2, 2), response_mask=torch.ones(2, 2),
+        advantage=torch.tensor([1.0, -1.0]),
+        task_ids=torch.tensor([0, 0]),
+        off_plane_tasks=torch.tensor([[1, 2], [1, 2]]),
+        reward=torch.tensor([1.0, 0.0]),
+    )
+    m = acc.metrics(task_names=TASKS)
+    a = "kl_weight/source_outcome/search__on__alfworld"
+    b = "kl_weight/source_outcome/webshop__on__alfworld"
+    # Pooled over both rows, so each source's effect is halved by the row it did
+    # nothing on -- which is the point: a source that fires on half the rollouts
+    # has half the budget share of one that fires on all of them.
+    assert m[f"{a}/all/effect"] == pytest.approx(0.25)
+    assert m[f"{a}/adv_positive/effect"] == pytest.approx(0.5)
+    assert m[f"{a}/adv_negative/effect"] == pytest.approx(0.0)
+    assert m[f"{b}/adv_negative/effect"] == pytest.approx(0.25)
+    assert m[f"{b}/adv_positive/effect"] == pytest.approx(0.0)
+    assert m[f"{a}/reward_positive/effect"] == pytest.approx(0.5)
+    assert m[f"{a}/all/n_rows"] == pytest.approx(2.0)
+
+
+def test_the_source_outcome_correlation_is_per_source():
+    """The pooled outcome table sums the sources out, so a source whose spending
+    tracks the advantage and one whose spending opposes it are invisible in it
+    as long as they cancel."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import SourceOutcomeStats
+
+    n = 40
+    a = torch.linspace(-1.0, 1.0, n)
+    with_adv = (a - a.min() + 0.05)
+    against = (a.max() - a + 0.05)
+    push = torch.stack([with_adv, against], dim=-1).reshape(n, 1, 2).expand(n, 3, 2)
+    acc = SourceOutcomeStats(n_tasks=3, device="cpu")
+    acc.update(
+        push_by_source=push.contiguous(), teacher_kl=torch.ones(n, 3),
+        response_mask=torch.ones(n, 3), advantage=a,
+        task_ids=torch.zeros(n, dtype=torch.long),
+        off_plane_tasks=torch.tensor([[1, 2]]).expand(n, 2),
+    )
+    m = acc.metrics(task_names=TASKS)
+    assert m["kl_weight/source_outcome/search__on__alfworld/corr_adv_source_effect"] > 0.99
+    assert m["kl_weight/source_outcome/webshop__on__alfworld/corr_adv_source_effect"] < -0.99
+
+
+def test_the_push_table_reports_how_much_of_the_push_it_can_name():
+    """The rows name student top-k tokens; the OPD term also acts on the tail
+    bucket, which has none. Quoting the ranking without that share states a
+    coverage the table does not have."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import LogitPushTokens
+
+    acc = LogitPushTokens(vocab_size=16, n_tasks=2, device="cpu", top_n=4)
+    acc.update(
+        support_ids=torch.tensor([[[1, 2]]]),
+        g0=torch.tensor([[[3.0, 1.0]]]),
+        g0_tail=torch.tensor([[4.0]]),
+        weight=torch.tensor([[2.0]]),
+        coef_applied_weight=torch.tensor([[2.0]]),
+        response_mask=torch.ones(1, 1),
+        task_ids=torch.tensor([0]),
+    )
+    m = acc.scalar_metrics(task_names=["a", "b"])
+    # |W-1| = 1: support carries 3 + 1 = 4, the tail carries 4.
+    assert m["kl_weight/push/support_extra_abs_share"] == pytest.approx(0.5)
+    assert m["kl_weight/push/tail_extra_abs_share"] == pytest.approx(0.5)
+    assert m["kl_weight/push/tail_weighted_abs_share"] == pytest.approx(0.5)
+    assert m["kl_weight/a/push/support_extra_abs_share"] == pytest.approx(0.5)
+
+
+def test_the_coverage_shares_are_absent_rather_than_wrong_without_the_tail():
+    """Defaulting the tail to zero would report 100% coverage for a table that
+    simply was not told what it was missing."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import LogitPushTokens
+
+    acc = LogitPushTokens(vocab_size=16, n_tasks=2, device="cpu", top_n=4)
+    acc.update(
+        support_ids=torch.tensor([[[1, 2]]]), g0=torch.tensor([[[3.0, 1.0]]]),
+        weight=torch.tensor([[2.0]]), coef_applied_weight=torch.tensor([[2.0]]),
+        response_mask=torch.ones(1, 1), task_ids=torch.tensor([0]),
+    )
+    m = acc.scalar_metrics(task_names=["a", "b"])
+    assert "kl_weight/push/support_extra_abs_share" not in m
+    assert m["kl_weight/push/extra_abs_total"] == pytest.approx(4.0)
+
+
+def test_the_pre_alpha_column_is_not_defaulted_to_the_post_alpha_one():
+    """PairEvidenceStats and PairStateEvidenceStats both take activity as an
+    optional argument. Defaulting it to evidence would make the vetoed case
+    unreadable in exactly the table built to read it."""
+    from verl.trainer.ppo.cross_teacher_kl_weight import PairEvidenceStats
+
+    acc = PairEvidenceStats(n_tasks=3, device="cpu")
+    acc.update(
+        evidence=torch.zeros(1, 2, 1), shift=torch.zeros(1, 2, 1),
+        response_mask=torch.ones(1, 2), task_ids=torch.tensor([0]),
+        off_plane_tasks=torch.tensor([[1]]),
+        activity=torch.full((1, 2, 1), 0.75),
+    )
+    m = acc.metrics(task_names=TASKS)
+    head = "kl_weight/evidence/search__on__alfworld"
+    assert m[f"{head}/source_shift_mean"] == pytest.approx(0.0)
+    assert m[f"{head}/source_activity_pre_alpha_mean"] == pytest.approx(0.75)
+
+    silent = PairEvidenceStats(n_tasks=3, device="cpu")
+    silent.update(
+        evidence=torch.zeros(1, 2, 1), shift=torch.zeros(1, 2, 1),
+        response_mask=torch.ones(1, 2), task_ids=torch.tensor([0]),
+        off_plane_tasks=torch.tensor([[1]]),
+    )
+    ms = silent.metrics(task_names=TASKS)
+    assert ms[f"{head}/source_activity_pre_alpha_mean"] == pytest.approx(0.0)
+
+
+def test_the_event_push_columns_add_to_the_total_on_every_row():
+    """extra_logit_push is the whole mechanism's effect and is IDENTICAL across
+    the source rows of one candidate, which is what made the dump unable to say
+    'Search raised this AlfWorld token'. The split has to be exact, or the
+    per-source column is an apportionment dressed as an attribution."""
+    rows, _built, _stats = _pair_event_rows(per_group=3)
+    assert rows
+    for r in rows:
+        parts = (
+            r["extra_push_sources_all"] + r["extra_push_shared"] + r["extra_push_normalizer"]
+        )
+        assert parts == pytest.approx(r["extra_logit_push"], abs=1e-9, rel=1e-5), r
+        # The per-source column is a share of the all-source one, and with two
+        # off-task planes it is strictly smaller wherever the other one acted.
+        assert abs(r["extra_push_source"]) <= abs(r["extra_push_sources_all"]) + 1e-12
+
+
+def test_the_per_source_push_column_differs_across_the_sources_of_one_candidate():
+    """The failure this column fixes: every source row of a candidate carrying
+    the same total. If they still agree, the attribution is decorative."""
+    rows, _built, _stats = _pair_event_rows(per_group=4)
+    by_candidate = {}
+    for r in rows:
+        by_candidate.setdefault(
+            (r["dst"], r["token_id"], r["position"], r["stratum"]), {}
+        )[r["src"]] = r
+    shared = [v for v in by_candidate.values() if len(v) > 1]
+    assert shared, "no candidate appeared under two sources; widen the fixture"
+    assert any(
+        len({round(r["extra_push_source"], 12) for r in v.values()}) > 1 for v in shared
+    ), "the per-source column is constant across sources -- it is not attributing"
+    for v in shared:
+        totals = {round(r["extra_logit_push"], 12) for r in v.values()}
+        assert len(totals) == 1, "the TOTAL, by contrast, is a property of the candidate"

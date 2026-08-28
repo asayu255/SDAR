@@ -2819,6 +2819,26 @@ PAIR_EVENT_FLOATS = (
     # what it cost and what it moved
     "teacher_kl", "source_attributed_kl_shift",
     "weighted_logit_push", "extra_logit_push",
+    # THE ADDED PUSH, SPLIT BY WHAT CAUSED IT. extra_logit_push is (W - 1) g0,
+    # and W - 1 is B_shared/mu + sum_m B_m/mu + (1/mu - 1) exactly, so the same
+    # split carries through to the logit:
+    #
+    #     extra_push_sources_all + extra_push_shared + extra_push_normalizer
+    #         == extra_logit_push
+    #
+    # holds on every row (test_the_event_push_columns_add_to_the_total). Without
+    # it the dump can say "the arm moved this student token" and "Search
+    # supplied evidence at that position", and cannot join them: extra_logit_push
+    # is the whole mechanism's effect and is identical across the source rows of
+    # one candidate. extra_push_source is THIS source's own share of it, which is
+    # the column the sentence "Search raised this AlfWorld token" needs.
+    #
+    # The normaliser term is nobody's: mu is a whole-task divisor, so a position
+    # with no evidence at all still moves by (1/mu - 1) g0. It gets its own
+    # column rather than being spread over the sources, because attributing it
+    # would credit a source for an effect it had no part in.
+    "extra_push_source", "extra_push_sources_all",
+    "extra_push_shared", "extra_push_normalizer",
     # and what happened to the rollout it sat in
     "advantage", "reward",
 )

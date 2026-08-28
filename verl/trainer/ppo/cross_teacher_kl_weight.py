@@ -152,6 +152,8 @@ __all__ = [
     "LogitPushTokens",
     "OUTCOME_BUCKETS",
     "OutcomeEffectStats",
+    "SourceOutcomeStats",
+    "SOURCE_OUTCOME_TERMS",
     "logit_gradient_terms",
     "gradient_metrics",
     "state_shift_terms",
@@ -1433,20 +1435,44 @@ class PairStateEvidenceStats:
     AlfWorld's own teacher, what did the arm do" -- and arbitrating exactly that
     is what the mechanism is for, so it is the table the write-up is built on.
 
-    ``(T, T, 4, 4)`` float64 -- 144 cells at three tasks. The cost is one
-    ``index_add_`` over the candidate axis per source per micro-batch.
+    ``(T, T, 4, 5)`` float64 for the candidate table plus ``(T, T, 1 + 4)`` for
+    the position one -- 234 cells at three tasks. The cost is one ``index_add_``
+    over the candidate axis per source per micro-batch, and one more over the
+    positions.
+
+    TWO COUNTING UNITS, kept apart because they are routinely confused. The
+    candidate table counts TOP-K CANDIDATES: a position with k = 20 contributes
+    twenty of them, filed under whatever state each one is in, so a share out of
+    it answers "of all the candidate slots, how many were conflicts". The
+    position table counts POSITIONS, filed by whether ANY candidate there was in
+    the state, and answers "at how many positions did this source disagree at
+    all". A position is in exactly one candidate state only by accident; it is
+    routinely in several at once, so the position shares do NOT sum to 1 and are
+    not meant to.
+
+    Naming the first one ``position_frac``, as this class did until the fraction
+    was checked against the code, states the second and reports the first.
     """
 
-    TERMS = ("n", "evidence", "shift", "shift_abs")
+    TERMS = ("n", "evidence", "shift", "shift_abs", "activity")
 
     def __init__(self, *, n_tasks: int, device):
         self.n_tasks = T = int(n_tasks)
         self.n_states = S = len(PAIR_STATES)
         self.buf = torch.zeros(T * T * S * len(self.TERMS), dtype=torch.float64, device=device)
+        # [n_positions, any_state_0 .. any_state_{S-1}] per ordered pair.
+        self.pos_buf = torch.zeros(T * T * (1 + S), dtype=torch.float64, device=device)
         self._cpu_cache = None
 
-    def update(self, *, state, evidence, shift, response_mask, task_ids, off_plane_tasks) -> None:
-        """``state``/``evidence``/``shift`` are (bs, resp, k, n_off)."""
+    def update(self, *, state, evidence, shift, response_mask, task_ids, off_plane_tasks,
+               activity=None) -> None:
+        """``state``/``evidence``/``shift``/``activity`` are (bs, resp, k, n_off).
+
+        ``activity`` is the source's PRE-ALPHA evidence, ``sum_v p(v)|dhat_m(v)|``
+        per candidate. None leaves the column at zero rather than reusing
+        ``evidence``, which would make a vetoed source indistinguishable from a
+        silent one -- the exact reading the column exists to provide.
+        """
         self._cpu_cache = None
         T, S, K = self.n_tasks, self.n_states, len(self.TERMS)
         # (bs, resp, 1): the mask is per position, and every quantity below is
@@ -1454,34 +1480,61 @@ class PairStateEvidenceStats:
         m = response_mask.to(torch.float64).unsqueeze(-1)
         e = evidence.detach().to(torch.float64) * m.unsqueeze(-1)
         s = shift.detach().to(torch.float64) * m.unsqueeze(-1)
+        a = (
+            torch.zeros_like(e) if activity is None
+            else activity.detach().to(torch.float64) * m.unsqueeze(-1)
+        )
         dst = task_ids.reshape(-1, 1, 1).expand_as(state[..., 0])
+        mp = response_mask.to(torch.float64)                       # (bs, resp)
+        dst_p = task_ids.reshape(-1, 1).expand_as(mp)
         for c in range(state.size(-1)):
             src = off_plane_tasks[:, c].reshape(-1, 1, 1).expand_as(state[..., c])
             ok = ((dst >= 0) & (src >= 0)).to(torch.float64)
             cell = ((dst.clamp(min=0) * T + src.clamp(min=0)) * S + state[..., c]) * K
             vals = torch.stack(
                 [m.expand_as(e[..., c]) * ok, e[..., c] * ok, s[..., c] * ok,
-                 s[..., c].abs() * ok],
+                 s[..., c].abs() * ok, a[..., c] * ok],
                 dim=-1,
             )
             flat = (cell.unsqueeze(-1) + torch.arange(K, device=vals.device)).reshape(-1)
             self.buf.index_add_(0, flat, vals.reshape(-1))
+
+            # The position cut. ``any`` over the candidate axis, so a position
+            # where one candidate conflicted and nineteen were silent counts
+            # once for conflict -- which is the sentence the write-up makes and
+            # the candidate table above cannot support.
+            src_p = off_plane_tasks[:, c].reshape(-1, 1).expand_as(mp)
+            ok_p = ((dst_p >= 0) & (src_p >= 0)).to(torch.float64) * mp
+            base_p = (dst_p.clamp(min=0) * T + src_p.clamp(min=0)) * (1 + S)
+            cols = [ok_p] + [
+                ((state[..., c] == st).any(dim=-1).to(torch.float64) * ok_p)
+                for st in range(S)
+            ]
+            vals_p = torch.stack(cols, dim=-1)
+            flat_p = (base_p.unsqueeze(-1) + torch.arange(1 + S, device=vals_p.device)).reshape(-1)
+            self.pos_buf.index_add_(0, flat_p, vals_p.reshape(-1))
 
     def all_reduce(self) -> None:
         self._cpu_cache = None
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
         torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(self.pos_buf, op=torch.distributed.ReduceOp.SUM)
 
     def _cpu(self):
         if self._cpu_cache is None:
-            self._cpu_cache = self.buf.detach().to("cpu").view(
-                self.n_tasks, self.n_tasks, self.n_states, len(self.TERMS)
+            self._cpu_cache = (
+                self.buf.detach().to("cpu").view(
+                    self.n_tasks, self.n_tasks, self.n_states, len(self.TERMS)
+                ),
+                self.pos_buf.detach().to("cpu").view(
+                    self.n_tasks, self.n_tasks, 1 + self.n_states
+                ),
             )
         return self._cpu_cache
 
     def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
-        buf = self._cpu()
+        buf, pos = self._cpu()
         i = {t: j for j, t in enumerate(self.TERMS)}
         name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
         out = {}
@@ -1495,14 +1548,33 @@ class PairStateEvidenceStats:
                 if total_n <= 0:
                     continue
                 head = f"{prefix}/pair_state/{name(src)}__on__{name(dst)}"
+                out[f"{head}/candidate_count"] = total_n
+                n_pos = float(pos[dst, src, 0])
+                if n_pos > 0:
+                    out[f"{head}/n_positions"] = n_pos
                 for st in range(self.n_states):
                     sname = PAIR_STATES[st]
                     n = float(cells[st, i["n"]])
-                    out[f"{head}/{sname}/position_frac"] = n / total_n
+                    # Of the CANDIDATE slots, not of the positions. The two
+                    # differ by a factor of k and answer different questions;
+                    # the position one is the ``position_any_frac`` below.
+                    out[f"{head}/{sname}/candidate_frac"] = n / total_n
+                    if n_pos > 0:
+                        out[f"{head}/{sname}/position_any_frac"] = (
+                            float(pos[dst, src, 1 + st]) / n_pos
+                        )
                     if n <= 0:
                         continue
                     out[f"{head}/{sname}/source_evidence_mean"] = (
                         float(cells[st, i["evidence"]]) / n
+                    )
+                    # The same evidence with alpha divided out. Where this is
+                    # large and source_evidence_mean is near zero, the source
+                    # spoke and the reliability gate refused it -- which is not
+                    # the same finding as the source having said nothing, and is
+                    # invisible in every other column here.
+                    out[f"{head}/{sname}/source_activity_pre_alpha_mean"] = (
+                        float(cells[st, i["activity"]]) / n
                     )
                     out[f"{head}/{sname}/kl_shift_net"] = float(cells[st, i["shift"]]) / n
                     if total_abs > 0:
@@ -1528,7 +1600,13 @@ class PairEvidenceStats:
     # weak, alpha is low, or Search's vocabulary is simply not in the support
     # the whole mechanism is measured on -- and only the third is a measurement
     # artefact rather than a finding. Free: the log-probs are already gathered.
-    TERMS = ("evidence", "shift", "support_mass", "n")
+    # ``activity`` is the SAME evidence with alpha taken out. Its whole purpose
+    # is the case where ``evidence`` is zero: alpha = 0 makes a source that
+    # never spoke and a source whose every word the reliability gate refused
+    # produce the identical column, and those are opposite findings about the
+    # mechanism. Every planned change to how alpha is estimated is an experiment
+    # on the gap between these two numbers.
+    TERMS = ("evidence", "shift", "support_mass", "n", "activity")
 
     def __init__(self, *, n_tasks: int, device):
         self.n_tasks = T = int(n_tasks)
@@ -1536,13 +1614,16 @@ class PairEvidenceStats:
         self._cpu_cache = None
 
     def update(self, *, evidence, shift, response_mask, task_ids, off_plane_tasks,
-               support_mass=None) -> None:
+               support_mass=None, activity=None) -> None:
         """``evidence`` and ``shift`` are (bs, resp, n_off).
 
         Args:
             support_mass: (bs, resp, n_off) the source teacher's probability
                 summed over the student's top-k, or None to leave the column at
                 zero rather than guessing a coverage that was not measured.
+            activity: (bs, resp, n_off) the pre-alpha evidence, or None to leave
+                that column at zero. NOT defaulted to ``evidence``: the column
+                exists precisely to differ from it.
         """
         self._cpu_cache = None
         T, K = self.n_tasks, len(self.TERMS)
@@ -1553,6 +1634,10 @@ class PairEvidenceStats:
             torch.zeros_like(e) if support_mass is None
             else support_mass.detach().to(torch.float64) * m
         )
+        act = (
+            torch.zeros_like(e) if activity is None
+            else activity.detach().to(torch.float64) * m
+        )
         dst = task_ids.reshape(-1).to(torch.long)
         for c in range(e.size(-1)):
             src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
@@ -1560,7 +1645,8 @@ class PairEvidenceStats:
             vals = torch.stack(
                 [e[..., c].sum(dim=1) * ok, s[..., c].sum(dim=1) * ok,
                  cov[..., c].sum(dim=1) * ok,
-                 (response_mask.to(torch.float64).sum(dim=1)) * ok],
+                 (response_mask.to(torch.float64).sum(dim=1)) * ok,
+                 act[..., c].sum(dim=1) * ok],
                 dim=-1,
             )
             base = (dst.clamp(min=0) * T + src.clamp(min=0)) * K
@@ -1588,6 +1674,12 @@ class PairEvidenceStats:
                 head = f"{prefix}/evidence/{name(src)}__on__{name(dst)}"
                 out[f"{head}/source_shift_mean"] = float(buf[dst, src, i["evidence"]]) / n
                 out[f"{head}/kl_shift_attributed"] = float(buf[dst, src, i["shift"]]) / n
+                # Read the two together. Both near zero: this source has nothing
+                # to say to this destination. Activity large, shift near zero:
+                # it had plenty and alpha refused it.
+                out[f"{head}/source_activity_pre_alpha_mean"] = (
+                    float(buf[dst, src, i["activity"]]) / n
+                )
                 mass = float(buf[dst, src, i["support_mass"]]) / n
                 if mass > 0:
                     out[f"{head}/support_mass"] = mass
@@ -1883,6 +1975,11 @@ def build_position_weight(
     hat_off = std["off"] * keep.unsqueeze(-1)
 
     dec = decompose_common_residual(hat_on=hat_on, hat_off=hat_off)
+    # Hoisted above the weight so the W - 1 decomposition and the returned
+    # per-candidate evidence are built from ONE tensor. Two exp() calls of the
+    # same log-probs agree to the last bit today and are an invitation to
+    # diverge the moment one of them grows a mask.
+    p_teacher = on_task_logprob.detach().to(torch.float32).exp()
     alpha = alpha_table.to(hat_off.device)
     dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
     src = off_plane_tasks.to(torch.long).clamp(min=0)
@@ -1926,6 +2023,38 @@ def build_position_weight(
     finite_w = torch.isfinite(weight)
     weight = torch.where(finite_w, weight, torch.ones_like(weight))
     nonfinite = (~finite_pre).sum() + (~finite_w).sum()
+
+    # W - 1 SPLIT EXACTLY THREE WAYS, made here so every reader gets the same
+    # split. W~ = 1 + B_shared + sum_m B_m with
+    #
+    #     B_shared = sum_v p(v) |c(v)|          the corroboration channel
+    #     B_m      = sum_v p(v) alpha_m |dhat_m(v)|   source m's own channel
+    #
+    # and W = W~/mu, so
+    #
+    #     W - 1 = B_shared/mu + sum_m B_m/mu + (1/mu - 1)
+    #
+    # The last term is not a rounding artefact: mu is a whole-task divisor, so a
+    # position with NO evidence at all still moves by (1/mu - 1) and the arm has
+    # to own that. Charging it to a source, or leaving it out so the parts do not
+    # add up, are the two ways this gets misreported.
+    #
+    # The gates make the identity hold in all four states rather than only the
+    # healthy one. Where pre was replaced by 1 the evidence terms are zero and
+    # the normaliser term alone is W - 1; where the weight was replaced by 1 all
+    # three are zero, which is what W - 1 is there.
+    inv_mu = 1.0 / mu.clamp(min=1e-12)
+    ok_evidence = (mu_valid.reshape(-1, 1) & finite_pre & finite_w).to(pre.dtype)
+    ok_normalizer = (mu_valid.reshape(-1, 1) & finite_w).to(pre.dtype)
+    evidence_shared_sum = (p_teacher * dec["common"].abs()).sum(dim=-1)
+    evidence_by_source_cand = (
+        p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs()
+    )
+    push_shared = evidence_shared_sum * inv_mu * ok_evidence
+    push_by_source = (
+        evidence_by_source_cand.sum(dim=2) * inv_mu.unsqueeze(-1) * ok_evidence.unsqueeze(-1)
+    )
+    push_normalizer = (inv_mu - 1.0) * ok_normalizer
 
     # Labels only. candidate_weights is called on the STANDARDIZED shifts with a
     # zero base, so report_epsilon is in RMS units and comparable across
@@ -1986,7 +2115,6 @@ def build_position_weight(
             avail.reshape(-1, 1, 1), e_a, torch.zeros_like(e_a)
         )
 
-    p_teacher = on_task_logprob.detach().to(torch.float32).exp()
     return {
         "weight": weight,
         "pre_weight": pre,
@@ -2003,14 +2131,29 @@ def build_position_weight(
         "state": state,
         "teacher_prob": p_teacher,
         # sum_v p_d(v) |c(v)| -- the corroboration channel's share of W~ - 1.
-        "evidence_shared": (p_teacher * dec["common"].abs()).sum(dim=-1),
+        "evidence_shared": evidence_shared_sum,
         # The same thing the off-task-only rule would have produced. Reported,
         # never applied: the gap between the two IS the price of requiring the
         # on-task teacher to have spoken.
         "evidence_shared_offtask_only": (p_teacher * dec["common_ev"].abs()).sum(dim=-1),
         "evidence_offtask_only": (p_teacher * evidence_offtask_only).sum(dim=-1),
-        # (bs, resp, n_off): each source's share of the same quantity.
-        "evidence_by_source": p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs(),
+        # (bs, resp, k, n_off): each source's share of the same quantity.
+        "evidence_by_source": evidence_by_source_cand,
+        # The SAME quantity with alpha taken out: sum_v p_d(v) |dhat_m(v)|, per
+        # candidate. Reported because alpha = 0 collapses evidence_by_source to
+        # zero, and "the source teacher had nothing to say here" and "the source
+        # teacher spoke loudly and the advantage correlation vetoed it" are then
+        # the same reading. They are opposite findings about the mechanism, and
+        # every future change to how alpha is estimated -- no veto, partial
+        # correlation, a per-source gate -- is an experiment on exactly the
+        # difference between them.
+        "activity_by_source": p_teacher.unsqueeze(-1) * hat_off.abs(),
+        # W - 1, split. The three add to it EXACTLY (test_the_logit_push_
+        # decomposition_is_exact), which is what lets the per-source logit push
+        # be attributed rather than approximated.
+        "push_shared": push_shared,                 # (bs, resp)
+        "push_by_source": push_by_source,           # (bs, resp, n_off)
+        "push_normalizer": push_normalizer,         # (bs, resp)
         "probe_pre_weight": probes,
         "probe_evidence": probe_evidence,
         "channel_pre_weight": channel_pre,
@@ -2072,10 +2215,19 @@ class LogitPushTokens:
         # atomic adds of ~1e-6 lose their tail in float32, and index_add_ does
         # not promise an order.
         self.buf = torch.zeros(S * C * V * len(self.TERMS), dtype=torch.float64, device=device)
+        # HOW MUCH OF THE PUSH THIS TABLE CAN NAME. Every row above is a token in
+        # the student's top-k, but the OPD term also acts on the tail bucket,
+        # which has no token to be filed under. Without these four sums the token
+        # ranking is quoted with an unstated denominator: "the arm amplified
+        # these tokens" reads the same whether the named tokens carry 92% of the
+        # added push or 35% of it, and only the first supports the sentence.
+        # [support_extra_abs, tail_extra_abs, support_weighted_abs,
+        #  tail_weighted_abs] per scope.
+        self.tail_buf = torch.zeros(S * 4, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     def update(self, *, support_ids, g0, weight, coef_applied_weight, response_mask,
-               task_ids=None, sampled_onehot=None, p_student=None) -> None:
+               task_ids=None, sampled_onehot=None, p_student=None, g0_tail=None) -> None:
         """Fold one micro-batch in.
 
         Args:
@@ -2088,6 +2240,9 @@ class LogitPushTokens:
             sampled_onehot: (bs, resp, k) one at the emitted token, or None.
             p_student: (bs, resp, k), or None to take it from nothing -- the mass
                 column then stays zero rather than guessing.
+            g0_tail: (bs, resp) the unweighted push on the TAIL bucket, from
+                :func:`opd_logit_push`. None leaves the coverage shares
+                unreported rather than implying the tail was empty.
         """
         assert weight is coef_applied_weight or torch.equal(weight, coef_applied_weight), (
             "LogitPushTokens takes the APPLIED weight for both the class and the "
@@ -2125,12 +2280,39 @@ class LogitPushTokens:
         known = ((t >= 0) & (t < self.n_scopes - 1)).to(torch.float64).unsqueeze(-1)
         scoped = (t.clamp(min=0, max=self.n_scopes - 2) + 1) * (C * V) * K + base
         self.buf.index_add_(0, (scoped.unsqueeze(-1) + offs).reshape(-1), (vals * known).reshape(-1))
+        self._fold_tail(
+            g0=g0, g0_tail=g0_tail, weight=weight, response_mask=response_mask,
+            task_ids=task_ids,
+        )
+
+    def _fold_tail(self, *, g0, g0_tail, weight, response_mask, task_ids) -> None:
+        """The support/tail coverage sums, per scope. No-op without ``g0_tail``."""
+        if g0_tail is None:
+            return
+        mp = response_mask.to(torch.float64)
+        w = weight.detach().to(torch.float64)
+        gs = g0.detach().to(torch.float64).abs().sum(dim=-1)
+        gt = g0_tail.detach().to(torch.float64).abs()
+        wm1 = (w - 1.0).abs()
+        cols = torch.stack(
+            [wm1 * gs * mp, wm1 * gt * mp, w.abs() * gs * mp, w.abs() * gt * mp], dim=-1
+        )                                                     # (bs, resp, 4)
+        self.tail_buf[:4] += cols.sum(dim=(0, 1))
+        if task_ids is None:
+            return
+        t = task_ids.reshape(-1).to(torch.long)
+        known = ((t >= 0) & (t < self.n_scopes - 1)).to(torch.float64).reshape(-1, 1)
+        per_row = cols.sum(dim=1) * known                     # (bs, 4)
+        base = (t.clamp(min=0, max=max(self.n_scopes - 2, 0)) + 1) * 4
+        flat = (base.unsqueeze(-1) + torch.arange(4, device=per_row.device)).reshape(-1)
+        self.tail_buf.index_add_(0, flat, per_row.reshape(-1))
 
     def all_reduce(self) -> None:
         self._cpu_cache = None
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
         torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(self.tail_buf, op=torch.distributed.ReduceOp.SUM)
 
     def _cpu(self):
         if self._cpu_cache is None:
@@ -2152,6 +2334,7 @@ class LogitPushTokens:
         that cancels itself across contexts is not reported as inactive.
         """
         buf = self._cpu()
+        tail = self.tail_buf.detach().to("cpu").view(self.n_scopes, 4)
         out = {}
         idx = {t: i for i, t in enumerate(self.TERMS)}
         N = min(self.top_n, self.vocab_size)
@@ -2159,6 +2342,15 @@ class LogitPushTokens:
             name = self._scope_name(scope, task_names)
             head = prefix if name is None else f"{prefix}/{name}"
             gross_all = float(buf[scope, :, :, idx["extra_abs"]].sum())
+            # How much of the added push the rows above can NAME. The support
+            # and the tail are the whole of it, so the two extra shares sum to 1
+            # and a token ranking can be quoted with its denominator attached.
+            sup_x, tail_x, sup_w, tail_w = (float(v) for v in tail[scope])
+            if sup_x + tail_x > 0:
+                out[f"{head}/push/support_extra_abs_share"] = sup_x / (sup_x + tail_x)
+                out[f"{head}/push/tail_extra_abs_share"] = tail_x / (sup_x + tail_x)
+            if sup_w + tail_w > 0:
+                out[f"{head}/push/tail_weighted_abs_share"] = tail_w / (sup_w + tail_w)
             if gross_all <= 0:
                 continue
             out[f"{head}/push/extra_abs_total"] = gross_all
@@ -2218,7 +2410,7 @@ class LogitPushTokens:
 # facts about the ROW, not about the position, so a row lands in "all" and in
 # exactly one of each opposed pair -- the pairs are reported as a ratio and the
 # "all" bucket is the denominator that makes each pair's shares add up.
-OUTCOME_BUCKETS = ("all", "adv_positive", "adv_negative", "success", "failure")
+OUTCOME_BUCKETS = ("all", "adv_positive", "adv_negative", "reward_positive", "reward_nonpositive")
 
 # Per-row moments. g is the row's gross effect fraction, a its advantage: the
 # correlation between them is the one number that says whether the mechanism
@@ -2250,9 +2442,15 @@ class OutcomeEffectStats:
     the budget went to, which is a fact about the run rather than an inference
     from it.
 
-    Success is ``row score > 0``. On alfworld and webshop the episode score is
-    binary and this is exactly success; on a graded task it is "scored at all",
-    which is why the bucket is named for the outcome and not for the task.
+    THE REWARD BUCKETS ARE NAMED FOR THE SCORE, NOT FOR SUCCESS, and the
+    distinction is not pedantry here. The split is ``sum(token_level_scores) >
+    0``, and that tensor is where ``apply_invalid_action_penalty`` writes: a
+    solved episode that emitted enough malformed actions sums to zero or below
+    and lands in ``reward_nonpositive``. On search the score is graded as well,
+    so "scored at all" and "solved the task" come apart there for a second,
+    independent reason. Calling the bucket ``success`` -- as this class did --
+    puts a claim in the write-up that the number does not support, and no
+    per-row success flag exists in the batch to support it with.
     """
 
     def __init__(self, *, n_tasks: int, device):
@@ -2270,10 +2468,10 @@ class OutcomeEffectStats:
             weight: (bs, resp) the applied W.
             teacher_kl: (bs, resp) the UNWEIGHTED per-token KL.
             advantage: (bs,) the row's GRPO advantage.
-            reward: (bs,) the row's episode score, or None -- the two success
-                buckets then stay empty rather than being filled from the
-                advantage, which is group-relative and says nothing about
-                whether the episode succeeded.
+            reward: (bs,) the row's episode score INCLUDING any invalid-action
+                penalty, or None -- the two reward buckets then stay empty
+                rather than being filled from the advantage, which is
+                group-relative and says nothing about what the episode scored.
         """
         self._cpu_cache = None
         B, K = self.n_buckets, self.n_terms
@@ -2352,7 +2550,7 @@ class OutcomeEffectStats:
             # a step with no failures is not a step with an infinite ratio.
             for hi, lo, label in (
                 ("adv_positive", "adv_negative", "adv_positive_to_negative"),
-                ("success", "failure", "success_to_failure"),
+                ("reward_positive", "reward_nonpositive", "reward_positive_to_nonpositive"),
             ):
                 if hi in cells and lo in cells and cells[lo] > 1e-12:
                     out[f"{head}/outcome/{label}_effect_ratio"] = cells[hi] / cells[lo]
@@ -2367,6 +2565,141 @@ class OutcomeEffectStats:
                         float(cell[i["g"]]) / n
                     )
                     out[f"{head}/outcome/corr_adv_gross_effect"] = cov / math.sqrt(va * vg)
+        return out
+
+
+# Per row AND per source. OutcomeEffectStats collapses the source axis and the
+# evidence table collapses the outcome axis, so between them "Search moved 4% of
+# AlfWorld's budget" and "the arm spent its budget on the rollouts that scored"
+# are two facts that cannot be joined. This is the join.
+SOURCE_OUTCOME_TERMS = ("n", "effect", "kl", "g", "gg", "a", "aa", "ag")
+
+
+class SourceOutcomeStats:
+    """Which trajectories each SOURCE's own contribution went to.
+
+    For row i and source m,
+
+        G_i^(m) = sum_t push_by_source[i, t, m] * D[i, t]  /  sum_t D[i, t]
+
+    the fraction of the row's OPD budget that this one source's channel moved.
+    ``push_by_source`` is ``B_m/mu`` from :func:`build_position_weight`, so the
+    sources and the corroboration channel and the normaliser offset add up to
+    the row's whole ``(W - 1) D`` -- these numbers are shares of a partition,
+    not correlated summaries of one.
+
+    Non-negative by construction: alpha, the standardized magnitude and the
+    teacher's probability are all non-negative, so a source can only ever ADD
+    weight. Which is why the outcome cut matters -- the question is never
+    whether a source pushed, it is which rollouts it pushed on.
+
+    ``(T, T, 5, 8)`` float64: 360 cells at three tasks, one ``index_add_`` per
+    source per micro-batch over rows rather than positions.
+    """
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = T = int(n_tasks)
+        self.n_buckets = B = len(OUTCOME_BUCKETS)
+        self.n_terms = K = len(SOURCE_OUTCOME_TERMS)
+        self.buf = torch.zeros(T * T * B * K, dtype=torch.float64, device=device)
+        self._cpu_cache = None
+
+    def update(self, *, push_by_source, teacher_kl, response_mask, advantage,
+               task_ids, off_plane_tasks, reward=None) -> None:
+        """Fold one micro-batch of ROWS in.
+
+        Args:
+            push_by_source: (bs, resp, n_off) each source's share of ``W - 1``.
+            teacher_kl: (bs, resp) the UNWEIGHTED per-token KL.
+        """
+        self._cpu_cache = None
+        T, B, K = self.n_tasks, self.n_buckets, self.n_terms
+        m = response_mask.to(torch.float64)
+        d = teacher_kl.detach().to(torch.float64) * m
+        kl_row = d.sum(dim=1)
+        live = kl_row > 0
+        ok_row = live.to(torch.float64)
+        a = advantage.detach().reshape(-1).to(torch.float64)
+        eff = (push_by_source.detach().to(torch.float64) * d.unsqueeze(-1)).sum(dim=1)  # (bs, n_off)
+
+        sel = [torch.ones_like(ok_row), (a > 0).to(torch.float64), (a < 0).to(torch.float64)]
+        if reward is None:
+            sel += [torch.zeros_like(ok_row), torch.zeros_like(ok_row)]
+        else:
+            r = reward.detach().reshape(-1).to(torch.float64)
+            sel += [(r > 0).to(torch.float64), (r <= 0).to(torch.float64)]
+
+        dst = task_ids.reshape(-1).to(torch.long)
+        for c in range(eff.size(-1)):
+            src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
+            ok = ((dst >= 0) & (src >= 0)).to(torch.float64) * ok_row
+            e = eff[:, c]
+            g = torch.where(live, e / kl_row.clamp(min=1e-12), torch.zeros_like(kl_row))
+            vals = torch.stack(
+                [ok, e * ok, kl_row * ok, g * ok, g * g * ok, a * ok, a * a * ok, a * g * ok],
+                dim=-1,
+            )                                                    # (bs, K)
+            pair = (dst.clamp(min=0) * T + src.clamp(min=0)) * B * K
+            for b, pick in enumerate(sel):
+                row = vals * pick.unsqueeze(-1)
+                flat = ((pair + b * K).unsqueeze(-1)
+                        + torch.arange(K, device=row.device)).reshape(-1)
+                self.buf.index_add_(0, flat, row.reshape(-1))
+
+    def all_reduce(self) -> None:
+        self._cpu_cache = None
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.buf, op=torch.distributed.ReduceOp.SUM)
+
+    def _cpu(self):
+        if self._cpu_cache is None:
+            self._cpu_cache = self.buf.detach().to("cpu").view(
+                self.n_tasks, self.n_tasks, self.n_buckets, self.n_terms
+            )
+        return self._cpu_cache
+
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+        buf = self._cpu()
+        i = {t: j for j, t in enumerate(SOURCE_OUTCOME_TERMS)}
+        name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
+        out = {}
+        for dst in range(self.n_tasks):
+            for src in range(self.n_tasks):
+                if src == dst:
+                    continue
+                cells = buf[dst, src]
+                if float(cells[0, i["n"]]) <= 0:
+                    continue
+                head = f"{prefix}/source_outcome/{name(src)}__on__{name(dst)}"
+                shares = {}
+                for b, bucket in enumerate(OUTCOME_BUCKETS):
+                    cell = cells[b]
+                    n = float(cell[i["n"]])
+                    if n <= 0:
+                        continue
+                    kl = float(cell[i["kl"]])
+                    shares[bucket] = e = (float(cell[i["effect"]]) / kl) if kl > 0 else 0.0
+                    out[f"{head}/{bucket}/effect"] = e
+                    out[f"{head}/{bucket}/n_rows"] = n
+                # Ratios, and only where both sides exist -- a step with no
+                # negative-advantage rows is not a step with an infinite ratio.
+                for hi, lo, label in (
+                    ("adv_positive", "adv_negative", "adv_positive_to_negative"),
+                    ("reward_positive", "reward_nonpositive", "reward_positive_to_nonpositive"),
+                ):
+                    if hi in shares and lo in shares and shares[lo] > 1e-12:
+                        out[f"{head}/{label}_effect_ratio"] = shares[hi] / shares[lo]
+                cell = cells[0]
+                n = float(cell[i["n"]])
+                if n >= 3:
+                    va = float(cell[i["aa"]]) / n - (float(cell[i["a"]]) / n) ** 2
+                    vg = float(cell[i["gg"]]) / n - (float(cell[i["g"]]) / n) ** 2
+                    if va > 0 and vg > 0:
+                        cov = float(cell[i["ag"]]) / n - (float(cell[i["a"]]) / n) * (
+                            float(cell[i["g"]]) / n
+                        )
+                        out[f"{head}/corr_adv_source_effect"] = cov / math.sqrt(va * vg)
         return out
 
 

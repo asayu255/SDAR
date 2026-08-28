@@ -71,6 +71,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     PairStateEvidenceStats,
     PositionScopeTermStats,
     PreviousStepTaskKLWeightedMean,
+    SourceOutcomeStats,
     WeightShiftHistogram,
     opd_logit_push,
     pair_state_index,
@@ -690,6 +691,16 @@ class DataParallelPPOActor(BasePPOActor):
         src_shift = built["evidence_by_source"] * (inv_mu * kl32.unsqueeze(-1)).unsqueeze(-1)
         extra = ((built["weight"] - 1.0).unsqueeze(-1) * push["g0"])
         weighted = built["weight"].unsqueeze(-1) * push["g0"]
+        # The same added push, split by what caused it. g0 is a property of the
+        # candidate and the three shares are properties of the position, so the
+        # product is exact rather than apportioned -- and the per-source column
+        # is the one that differs across the source rows of a candidate, which
+        # extra_logit_push does not.
+        g0 = push["g0"]
+        extra_src = built["push_by_source"].unsqueeze(2) * g0.unsqueeze(-1)
+        extra_src_all = (built["push_by_source"].sum(dim=-1)).unsqueeze(-1) * g0
+        extra_shared = built["push_shared"].unsqueeze(-1) * g0
+        extra_norm = built["push_normalizer"].unsqueeze(-1) * g0
         y1 = data["responses"].unsqueeze(-1)
         sampled = (support_ids == y1)
         turn = turn_index(response_mask)
@@ -725,6 +736,10 @@ class DataParallelPPOActor(BasePPOActor):
             "teacher_kl": p4(kl32),
             "source_attributed_kl_shift": src_shift,
             "weighted_logit_push": k4(weighted), "extra_logit_push": k4(extra),
+            "extra_push_source": extra_src,
+            "extra_push_sources_all": k4(extra_src_all),
+            "extra_push_shared": k4(extra_shared),
+            "extra_push_normalizer": k4(extra_norm),
             "advantage": row4(adv), "reward": row4(rew),
         }
         width = stats.context
@@ -1736,10 +1751,10 @@ class DataParallelPPOActor(BasePPOActor):
             # The row's episode score. Two readers now: the event dump, where
             # "the weighting fires here" and "the weighting fires here on rows
             # that went on to score" are different findings, and the outcome
-            # statistics, where it is what separates success from failure -- the
+            # statistics, where it is what splits the reward buckets -- the
             # advantage cannot, being group-relative. Selected whenever the arm
             # is on rather than on the dump's switch, so turning the dump off
-            # does not silently empty the success buckets. Uniform across ranks
+            # does not silently empty those buckets. Uniform across ranks
             # (the driver builds one batch), so it desynchronises nothing.
             if "token_level_scores" in data.batch.keys():
                 select_keys.append("token_level_scores")
@@ -2023,6 +2038,12 @@ class DataParallelPPOActor(BasePPOActor):
         # "the arm moved 3% of the budget, almost all of it on rollouts that
         # failed" are the same number and opposite findings.
         xt_outcome_stats = OutcomeEffectStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        # The same rows keyed by SOURCE as well as by outcome -- the join the two
+        # single-axis tables cannot make between "who supplied the push" and
+        # "which rollouts it went to".
+        xt_source_outcome_stats = (
+            SourceOutcomeStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        )
         # The per-token side, on the arm's own switches rather than the sign
         # arm's. Without these the run can say a source raised a task's KL by so
         # many nats and cannot name one token it did it at, which is most of
@@ -2983,6 +3004,11 @@ class DataParallelPPOActor(BasePPOActor):
                                 support_mass=off_logprobs.detach().to(
                                     torch.float32
                                 ).exp().sum(dim=-2),
+                                # The same evidence with alpha divided out. Both
+                                # near zero means the source had nothing to say;
+                                # this large and the shift near zero means alpha
+                                # refused what it did say.
+                                activity=xt_built["activity_by_source"].sum(dim=2),
                             )
                             # The same nats, cut by what the source was doing
                             # relative to the on-task teacher.
@@ -2996,6 +3022,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 * xt_src_kl.unsqueeze(-1),
                                 response_mask=response_mask, task_ids=task_ids,
                                 off_plane_tasks=data["sign_off_tasks"],
+                                activity=xt_built["activity_by_source"],
                             )
                             # Per trajectory. The row score is what separates
                             # "spent on rollouts that worked" from "spent on the
@@ -3012,6 +3039,25 @@ class DataParallelPPOActor(BasePPOActor):
                                     )
                                 ),
                                 task_ids=task_ids,
+                                reward=(None if _scores is None else _scores.sum(dim=-1)),
+                            )
+                            # The same rows, cut by SOURCE. The table above sums
+                            # the sources out and the evidence table sums the
+                            # outcome out, so "Search moved 4% of AlfWorld's
+                            # budget" and "the budget went to the rollouts that
+                            # scored" cannot be joined without this.
+                            xt_source_outcome_stats.update(
+                                push_by_source=xt_built["push_by_source"],
+                                teacher_kl=teacher_kld, response_mask=response_mask,
+                                advantage=(
+                                    _row_adv
+                                    if _row_adv is not None
+                                    else torch.zeros(
+                                        teacher_kld.size(0), device=teacher_kld.device
+                                    )
+                                ),
+                                task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
                                 reward=(None if _scores is None else _scores.sum(dim=-1)),
                             )
                             for name, pre in xt_built["probe_pre_weight"].items():
@@ -3143,6 +3189,11 @@ class DataParallelPPOActor(BasePPOActor):
                                         sign_cand_inputs["support_ids"] == _y1
                                     ).to(teacher_kld.dtype),
                                     p_student=_push["p_student"],
+                                    # The tail bucket has no token to be filed
+                                    # under, so it never reaches a row above --
+                                    # and without it the token ranking is quoted
+                                    # with an unstated denominator.
+                                    g0_tail=_push["g0_tail"],
                                 )
                             if xt_grad_stats is not None and xt_pg_grad_coef is not None:
                                 # Analytic, so the diagnostic cannot perturb the
@@ -3451,6 +3502,8 @@ class DataParallelPPOActor(BasePPOActor):
             metrics.update(xt_pair_state_stats.metrics(task_names=task_id_names))
             xt_outcome_stats.all_reduce()
             metrics.update(xt_outcome_stats.metrics(task_names=task_id_names))
+            xt_source_outcome_stats.all_reduce()
+            metrics.update(xt_source_outcome_stats.metrics(task_names=task_id_names))
             if xt_grad_stats is not None:
                 xt_grad_stats.all_reduce()
                 metrics.update(gradient_metrics(xt_grad_stats.sums(task_names=task_id_names)))

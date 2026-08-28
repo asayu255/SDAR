@@ -824,6 +824,10 @@ _PHASE_ORDER = [
     # own cost -- about a quarter of the step -- below the stage that follows it.
     "actor.teacher_lookup",
     "actor.sign_weight",
+    # The cross-teacher arm's own planes and weight, in the same position for the
+    # same reason: it is the most expensive thing this arm adds, and unlisted it
+    # sorts alphabetically to the tail, below the backward pass it precedes.
+    "actor.cross_teacher",
     "actor.bwd",
     "actor.task_metrics",
     "actor.optim",
