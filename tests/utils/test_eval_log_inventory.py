@@ -197,12 +197,19 @@ def test_the_shipped_width_fits_the_shipped_kv_budget():
     import re
 
     width = _width_from(RUN_SH, r"val_per_task_batch_size='\{[^}]*search:(\d+)")
-    m = re.search(r'ROLLOUT_GPU_MEM_UTIL:-([0-9.]+)', EVAL_SH.read_text())
+    text = EVAL_SH.read_text()
+    m = re.search(r'ROLLOUT_GPU_MEM_UTIL:-([0-9.]+)', text)
     assert m, "eval_checkpoints.sh no longer sets a default budget"
     util = float(m.group(1))
+    d = re.search(r'VAL_PIPELINE_DEPTH:-(\d+)', text)
+    assert d, "eval_checkpoints.sh no longer sets a default depth"
+    depth = int(d.group(1))
 
     budget = (util * 48 - 10.9) * 8920          # KV tokens per GPU
-    needed = width * 468
+    # DEPTH IS PART OF THE PEAK. 468 tokens per row of width was measured at
+    # depth 3, and the pump submits every row as its own request with no
+    # in-flight cap, so slots stack in the engine.
+    needed = width * 468 * depth / 3
     assert needed <= 0.92 * budget, (
         f"search width {width} needs {needed:,.0f} KV tokens and "
         f"gpu_memory_utilization={util} gives {budget:,.0f} ({100 * needed / budget:.0f}%)"
@@ -289,3 +296,27 @@ def test_the_micro_batch_default_is_ten():
     import re
     m = re.search(r'ppo_micro_per_gpu=\$\{PPO_MICRO_PER_GPU:-(\d+)\}', OPD_SH.read_text())
     assert m and m.group(1) == "10"
+
+
+def test_depth_has_exactly_one_default_and_the_guard_reads_it():
+    """It had two, and they disagreed.
+
+    The guard defaulted VAL_PIPELINE_DEPTH to 3 while the script exported 4, so
+    every default run was validated against two thirds of the KV it would
+    actually ask for -- the class of mistake the guard exists to catch, made by
+    the guard.
+    """
+    import re
+    text = EVAL_SH.read_text()
+    defaults = re.findall(r'VAL_PIPELINE_DEPTH:-(\d+)', text)
+    assert len(defaults) == 1, f"depth has {len(defaults)} defaults: {defaults}"
+    # And the guard's own variable comes from it rather than repeating it.
+    assert '_DEPTH="$VAL_PIPELINE_DEPTH"' in text
+
+
+def test_the_shipped_pair_is_the_same_envelope_as_the_one_it_replaces():
+    """504 x 3 and 378 x 4 hold the same 1512 rows in flight."""
+    import re
+    width = _width_from(RUN_SH, r"val_per_task_batch_size='\{[^}]*search:(\d+)")
+    depth = int(re.search(r'VAL_PIPELINE_DEPTH:-(\d+)', EVAL_SH.read_text()).group(1))
+    assert width * depth == 504 * 3, f"{width} x {depth} = {width * depth}, not 1512"

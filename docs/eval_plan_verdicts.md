@@ -638,3 +638,52 @@ gauge 列を持たない**既存の trace も読める** —— そちらは全�
 `_cpu_trace` → `_act_trace` → `_stack_trace` → `_gauge_trace` と per-sample バッファが増えるたび、`_FakeSampler` が AttributeError で 40 件落ちた。**バッファ名を `_Sampler.__init__` のソースから発見する**ようにして、4本目が無料になるようにした。加えて、それ自体を検査するテストを置いた。
 
 同じ理由で `test_gpu_profiler_trace.py` の `header[-1] == "driver_cpu_pct"` も直した。**末尾に伸びるスキーマで最終列を固定と見なすと、拡張のたびに拡張と無関係な失敗が出る。**
+
+---
+
+## 16. 原因が確定 —— **95% は「空きスロットが無い」**
+
+較正後の分類器で、完走した 504 の trace を読み直した:
+
+```
+why the cards were idle, by lost GPU-seconds
+   (the engine counts as having work at >= 224 requests in flight, calibrated from this run)
+    reason                 events   wall s  lost GPU-s   share
+    TAIL_BLOCKS_READY         660   1892.8       369.1   81.1%
+    SCHEDULER_STARVATION       60    218.3        62.8   13.8%
+    GPU_SIDE                  963    317.5        23.3    5.1%
+```
+
+| | GPU-s | |
+|---|---:|---|
+| 空きスロットが無い(tail + starvation) | **431.9** | **95%** |
+| engine 自身のホスト処理 | 23.3 | 5% |
+
+閾値 224 は run 自身の busy 中央値 ~896 の 25% —— **504 行のバッチが約2つ同時に載っている**のが「満杯」。
+
+### 機構
+
+`val_pipeline` はスロットを **全行が返るまで**解放しない:
+
+```python
+result = future.result()   # 504 行すべて
+...
+free.append(slot)          # ここで初めて
+```
+
+**最後の4行が生成中の間、終わった500行ぶんの席が空かない。** excursion の gauge がまさに `ready=1, gen_inflight=1..4`。
+
+### 処方 —— まず スロット数。同じ KV envelope で払える
+
+```
+504 x 3 slots = 1512 row-slots      <- これまで
+378 x 4 slots = 1512 row-slots      <- 次
+504 x 4 slots = 2016   guard が拒否(118%)
+```
+
+504 は測って良かった(ms/row 75 対 80、スコア差 0.00002、preempt 0)が、**幅はもう損失のある場所ではない。** 塞がらなければ、そのとき初めて構造変更 —— tail 終了前のスロット解放、つまり pipeline がバッチ単位で所有するのをやめる —— に進む。
+
+### 訂正 2 件
+
+- **KV チェックに depth が入っていなかった。** 468 tok/行は depth 3 での実測ピークで、pump は in-flight 上限なしに全行を投入するのでスロットは engine 上で積み上がる。`504 × depth 4` は素通りしていた。
+- **depth の既定値が 2 箇所にあり、食い違っていた。** guard が 3、スクリプトが 4。既定の run すべてが、実際に要求する量の 2/3 に対して検査されていた —— guard が防ぐはずの間違いを guard がしていた。定義は 1 箇所にした。

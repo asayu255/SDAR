@@ -163,7 +163,21 @@
 # against 252's 67 at the same fraction of rows, val/success_rate moved by
 # 0.00002, and nothing preempted.
 #
-# 378 -> 504 IS TIED TO gpu_memory_utilization AND CANNOT BE MOVED ALONE.
+# 504 -> 378 AGAIN, PAIRED WITH VAL_PIPELINE_DEPTH=4. The pair is the change:
+# the two hold the same number of rows in flight.
+#
+#   504 x 3 slots = 1512 row-slots      378 x 4 slots = 1512 row-slots
+#
+# 504 was measured and it worked -- ms/row 75 against 378-at-depth-3's 80 at
+# the same fraction of rows, score within 0.00002, nothing preempted. What the
+# per-excursion profiler then said is that width is no longer where the loss
+# is: 81% of it is a turn's last few rows draining while a whole batch waits
+# for a slot, 14% more is a batch ready with the engine empty, and 5% is the
+# engine itself. 95% of the loss is that no slot was free, and widening batches
+# does not add slots. So the same envelope buys a fourth slot instead.
+#
+# THE WIDTH IS TIED TO gpu_memory_utilization AND TO DEPTH, AND CANNOT MOVE
+# ALONE.
 # Peak KV per row of batch width reads 414 (what the 378 estimate implies) to
 # 468 (linear in the 252 measurement), and the run cannot tell them apart
 # because both fit at 378. At 504:
@@ -172,16 +186,18 @@
 #   0.80 -> 245,300 KV:  85% -  96%   the top of that is where preemption starts
 #   0.85 -> 266,700 KV:  78% -  88%   fits on both readings
 #
-# so 504 ships with ROLLOUT_GPU_MEM_UTIL=0.85, and eval_checkpoints.sh refuses
-# to start if the two are set inconsistently. Preemption would cost more than
-# the whole 1.4% this width is worth.
+# 378 x depth 4 asks for exactly the same peak as 504 x depth 3, so it ships
+# with the same ROLLOUT_GPU_MEM_UTIL=0.85. eval_checkpoints.sh refuses to start
+# if width, depth and budget are inconsistent -- it counts DEPTH now, which it
+# did not when 504 landed, and under which 504 x 4 would have passed while
+# asking for a third more than the figure the check was calibrated on.
 #
 # What it is aimed at: everything the driver does ONCE PER BATCH is divided,
 # because 208 batches become 105. It does nothing for per-row work and nothing
 # for the engine's duty cycle. Judge it on ms/row from the WALL lines at the
 # same FRACTION OF ROWS -- s/batch, batch number and [val-hash] are all
 # meaningless across a width change, because regrouping the rows IS the change.
-"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 504, webshop: 126}
+"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 378, webshop: 126}
 
 # The retriever policy decides what enters the validation trajectories, so it is
 # pinned here rather than left with the machine knobs. Running out of retries does

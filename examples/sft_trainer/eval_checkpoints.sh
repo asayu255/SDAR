@@ -171,7 +171,13 @@ _WIDTH=$(grep -o "val_per_task_batch_size='{[^}]*}'" "$RUN_SCRIPT" \
 #
 # In row-slots, which is the quantity that matters:
 #     504 x 3 = 1512      378 x 4 = 1512      504 x 4 = 2016
-_DEPTH="${VAL_PIPELINE_DEPTH:-3}"
+# DEFINED HERE, above the guard, and nowhere else. The rationale is under
+# "WHY 4" further down; the value has to be set before the check that reads it,
+# and having the check default to 3 while the script exported 4 would mean
+# every default run was validated against two thirds of what it would ask for
+# -- exactly the class of mistake this guard exists to catch.
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-4}"
+_DEPTH="$VAL_PIPELINE_DEPTH"
 if [ -n "$_WIDTH" ]; then
     _NEEDED=$(awk -v w="$_WIDTH" -v d="$_DEPTH" 'BEGIN{print w * 468 * d / 3}')
     _BUDGET=$(awk -v u="$ROLLOUT_GPU_MEM_UTIL" 'BEGIN{print (u * 48 - 10.9) * 8920}')
@@ -315,7 +321,30 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # "NOTHING running" for this -- a slot blocked in env.step is running by that
 # measure while every card is idle, which is how depth looked unnecessary once
 # already.
-export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-3}"
+# WHY 4 NOW, AND WHY THE WIDTH CAME BACK DOWN TO 378 FOR IT.
+#
+# The p^depth argument above predicted the ordinary body of the idle. The
+# per-excursion profiler measured what is actually left, and it is not that:
+#
+#   TAIL_BLOCKS_READY      369.1 GPU-s   81.1%
+#   SCHEDULER_STARVATION    62.8 GPU-s   13.8%
+#   GPU_SIDE                23.3 GPU-s    5.1%
+#
+# 95% of it is NO SLOT WAS FREE. A slot is held until every one of its rows has
+# come back -- val_pipeline retires on future.result() and only then appends the
+# slot to `free` -- so a batch whose last four rows are still generating keeps
+# its seat while five hundred finished ones sit idle, and the next batch,
+# already prepared, has nowhere to go. The gauges at those excursions read
+# ready=1 with gen_inflight=1..4 against a batch of 504.
+#
+# Another slot is the direct answer and the width pays for it: 504 x 3 and
+# 378 x 4 hold the same 1512 rows in flight, so the KV peak does not move.
+#
+# If this does not close the gap, the fix is structural -- release a slot
+# before its tail finishes, which means the pipeline stops owning whole batches
+# -- and that is a far larger change than either of these two numbers.
+#
+# The export itself is at the top, beside the guard that has to read it.
 
 # THE PUMP. Engines as a pool: requests go in individually and each rank's
 # TokenPump keeps its engine stepping, so a rank that finishes its share of a
