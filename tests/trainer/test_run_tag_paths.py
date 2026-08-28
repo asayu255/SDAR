@@ -24,6 +24,11 @@ TAGGED = (
     "trainer.default_local_dir", "trainer.val_instance_log_dir",
     "trainer.project_name", "trainer.experiment_name",
 )
+# Only the arms that dump them have it, so it is checked where it appears rather
+# than required everywhere. It writes one file per STEP with open(..., "w"), so
+# an untagged re-run does not append beside the finished run's dumps -- it
+# overwrites them, step by step, as it reaches each one.
+TAGGED_IF_PRESENT = ("trainer.sign_token_dump_dir",)
 
 
 def _assign(text, key):
@@ -50,7 +55,7 @@ def _expand(value, home, tag):
 def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
     """Byte-for-byte, or an existing run stops resuming the moment this lands."""
     text = script.read_text()
-    for key in TAGGED:
+    for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
         raw = _assign(text, key)
         assert "$RUN_TAG_SUFFIX" in raw, key
         plain = raw.replace("$RUN_TAG_SUFFIX", "")
@@ -61,7 +66,7 @@ def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_a_set_tag_moves_every_tagged_value(script):
     text = script.read_text()
-    for key in TAGGED:
+    for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
         raw = _assign(text, key)
         assert _expand(raw, "/h", "v2") == _expand(raw, "/h", "") + "_v2"
 

@@ -728,7 +728,7 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.nnodes=1 \
     trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_signweight_target_multitask$RUN_TAG_SUFFIX \
     trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_signweight_target_qwen3_1.7b$RUN_TAG_SUFFIX \
-    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_signweight_target_qwen3_1.7b \
+    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_signweight_target_qwen3_1.7b$RUN_TAG_SUFFIX \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
