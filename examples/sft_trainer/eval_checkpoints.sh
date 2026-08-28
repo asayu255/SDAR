@@ -191,6 +191,20 @@ if [ -n "$_WIDTH" ]; then
     fi
 fi
 
+# AND SAY WHAT CONFIGURATION THIS IS, in the log, on line one.
+#
+# Every comparison in this arm has needed the answer and no log carried it.
+# eval_log_inventory.sh reconstructs it from the [rollout-engine] and
+# [val-pipeline] lines, which appear minutes in and only if the run gets that
+# far -- so a run that dies early, or a log overwritten by the next experiment,
+# is unidentifiable. /tmp/eval_504.log was overwritten by a later invocation and
+# its wall, ms/row and score went with it; only the trace survived, and a trace
+# cannot say how long the run took.
+echo "[eval] config      : search=${_WIDTH:-?} depth=$VAL_PIPELINE_DEPTH" \
+     "gpu_mem_util=$ROLLOUT_GPU_MEM_UTIL pump=${ROLLOUT_ASYNC_GENERATE:-1}" \
+     "-- name the log after this, not after what you meant to run"
+
+
 # Read the checkpoint root out of the run script rather than repeating it, so the
 # two cannot disagree about where the checkpoints are.
 CKPT_DIR="${CKPT_DIR:-$(sed -n 's/^[[:space:]]*trainer\.default_local_dir=\([^ \\]*\).*/\1/p' "$RUN_SCRIPT")}"

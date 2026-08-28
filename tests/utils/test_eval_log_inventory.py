@@ -60,9 +60,17 @@ def inventory(*logs):
 
 
 def row(out, name):
-    for line in out.splitlines():
+    """The named row as a dict keyed by the table's own header.
+
+    By name, not by position. These indexed fields[2], fields[5] and so on, and
+    inserting a WIDTH column broke four tests that had nothing to do with the
+    width -- failures that say only "the columns moved".
+    """
+    lines = out.splitlines()
+    header = next(l for l in lines if l.startswith("LOG")).split()
+    for line in lines:
         if line.startswith(name):
-            return line.split()
+            return dict(zip(header, line.split()))
     raise AssertionError(f"{name} not in:\n{out}")
 
 
@@ -78,20 +86,22 @@ def logs(tmp_path):
 def test_it_reads_the_engine_the_run_reported_not_the_filename(logs):
     """The whole point: eval_pump_ms4.log says "pump" and is V0 multi-step."""
     out = inventory(*logs)
-    assert row(out, "eval_pump_ms4.log")[1:5] == ["ON", "V0", "4", "3"]
-    assert row(out, "eval_pump.log")[1:5] == ["ON", "V1", "1", "3"]
+    r = row(out, "eval_pump_ms4.log")
+    assert [r["PUMP"], r["CORE"], r["STEPS"], r["DEPTH"]] == ["ON", "V0", "4", "3"]
+    r = row(out, "eval_pump.log")
+    assert [r["PUMP"], r["CORE"], r["STEPS"], r["DEPTH"]] == ["ON", "V1", "1", "3"]
 
 
 def test_a_default_or_absent_knob_reads_as_one_step(logs):
     """num_scheduler_steps=<default> is not multi-step, and must not print as 0."""
-    assert row(inventory(*logs), "eval_pump.log")[3] == "1"
+    assert row(inventory(*logs), "eval_pump.log")["STEPS"] == "1"
 
 
 def test_an_unfinished_run_is_marked_so_its_wall_is_not_compared(logs):
     out = inventory(*logs)
-    assert row(out, "eval_arraywire.log")[5] == "180*"
-    assert row(out, "eval_arraywire.log")[-1] == "unfinished"
-    assert row(out, "eval_pump.log")[5] == "208"
+    assert row(out, "eval_arraywire.log")["BATCHES"] == "180*"
+    assert row(out, "eval_arraywire.log")["SCORE"] == "unfinished"
+    assert row(out, "eval_pump.log")["BATCHES"] == "208"
 
 
 def test_a_file_that_is_not_an_evaluation_is_skipped(tmp_path, logs):
@@ -119,8 +129,8 @@ def test_a_run_older_than_the_engine_line_reports_no_engine_columns(tmp_path, lo
                     batches=208, wall=4534.0, ms_row=86, score="0.3869")
     old.write_text("\n".join(l for l in old.read_text().splitlines() if "rollout-engine" not in l) + "\n")
     fields = row(inventory(old, *logs), "eval_window.log")
-    assert fields[2] == "?" and fields[3] == "?"
-    assert fields[5] == "208"  # everything not derived from the engine still reads
+    assert fields["CORE"] == "?" and fields["STEPS"] == "?"
+    assert fields["BATCHES"] == "208"  # everything not from the engine still reads
 
 
 def test_a_run_with_no_report_yet_still_says_how_many_batches(tmp_path, logs):
@@ -138,8 +148,8 @@ def test_a_run_with_no_report_yet_still_says_how_many_batches(tmp_path, logs):
     young.write_text("\n".join(kept + [wall_line, wall_line]) + "\n")
 
     fields = row(inventory(young, *logs), "eval_378.log")
-    assert fields[5] == "3*"          # counted from the WALL lines
-    assert fields[6] == "not-yet"     # rather than "?", which reads as unreadable
+    assert fields["BATCHES"] == "3*"      # counted from the WALL lines
+    assert fields["WALL"] == "not-yet"    # rather than "?", which reads as unreadable
 
 
 def test_the_cumulative_and_windowed_speed_are_both_shown(logs):
@@ -151,7 +161,7 @@ def test_the_cumulative_and_windowed_speed_are_both_shown(logs):
     """
     out = inventory(*logs)
     assert "ALL/LAST" in out
-    assert row(out, "eval_pump.log")[-2] == "73/73"
+    assert row(out, "eval_pump.log")["ALL/LAST"] == "73/73"
 
 
 # --------------------------------------------------------------------------- #
@@ -320,3 +330,31 @@ def test_the_shipped_pair_is_the_same_envelope_as_the_one_it_replaces():
     width = _width_from(RUN_SH, r"val_per_task_batch_size='\{[^}]*search:(\d+)")
     depth = int(re.search(r'VAL_PIPELINE_DEPTH:-(\d+)', EVAL_SH.read_text()).group(1))
     assert width * depth == 504 * 3, f"{width} x {depth} = {width * depth}, not 1512"
+
+
+def test_a_log_is_identifiable_from_its_first_lines(tmp_path, logs):
+    """Before Ray starts, and before it can be overwritten by the next run.
+
+    /tmp/eval_504.log was overwritten by a later invocation and its wall,
+    ms/row and score went with it. Only the trace survived, and a trace cannot
+    say how long a run took. The [rollout-engine] and [val-pipeline] lines this
+    table used to depend on appear minutes in, so a run that dies in startup
+    is unidentifiable without this.
+    """
+    early = tmp_path / "eval_mystery.log"
+    early.write_text(
+        "[eval] machine     : 112 cores, load 4.0 3.0 2.0\n"
+        "[eval] config      : search=378 depth=4 gpu_mem_util=0.85 pump=1\n"
+        "(SFTMultiTaskTaskRunner pid=1) [val-pipeline] after 2: 2 batches over 30.0s\n"
+        "(SFTMultiTaskTaskRunner pid=1) [rollout-turn-timing] WALL  ms/row last20=90 all=90\n"
+    )
+    fields = row(inventory(early, *logs), "eval_mystery.log")
+    assert fields["WIDTH"] == "378"
+    assert fields["DEPTH"] == "4"
+
+
+def test_the_config_line_and_the_in_run_line_agree_on_depth(logs):
+    """Older logs have only the in-run line; it must still be read."""
+    fields = row(inventory(*logs), "eval_pump.log")
+    assert fields["DEPTH"] == "3"      # from [val-pipeline], no config line
+    assert fields["WIDTH"] == "?"      # which the old logs never carried

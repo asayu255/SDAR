@@ -29,10 +29,10 @@ _clean() {
 
 _first() { grep -m1 -o "$2" "$1" || true; }
 
-printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
-    LOG PUMP CORE STEPS DEPTH BATCHES WALL ALL/LAST SCORE
-printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
-    -------------------------- ------ ----- ------ ------ -------- --------- -------- -----
+printf '%-26s %-6s %-5s %-6s %-6s %-6s %-8s %-9s %-8s %s\n' \
+    LOG PUMP CORE STEPS WIDTH DEPTH BATCHES WALL ALL/LAST SCORE
+printf '%-26s %-6s %-5s %-6s %-6s %-6s %-8s %-9s %-8s %s\n' \
+    -------------------------- ------ ----- ------ ------ ------ -------- --------- -------- -----
 
 for log in "$@"; do
     [ -r "$log" ] || continue
@@ -48,6 +48,10 @@ for log in "$@"; do
     # that line reports no core, and defaulting its steps to 1 would state as
     # measured the very thing that cannot be read -- which is how a log gets
     # mistaken for a valid control. No engine line, no engine columns.
+    # The [eval] config line, when the run wrote one: it appears on line two,
+    # before Ray starts, so a run that died in startup is still identifiable.
+    # Everything below falls back to the in-run lines for older logs.
+    _cfg=$(_first "$f" '\[eval\] config *:.*')
     core=$(_first "$f" 'core=[A-Za-z0-9]*'); core=${core#core=}
     if [ -n "$core" ]; then
         steps=$(_first "$f" 'num_scheduler_steps=[0-9]*'); steps=${steps#num_scheduler_steps=}
@@ -56,6 +60,10 @@ for log in "$@"; do
         steps="?"
     fi
     depth=$(_first "$f" 'VAL_PIPELINE_DEPTH=[0-9]*'); depth=${depth#VAL_PIPELINE_DEPTH=}
+    if [ -z "$depth" ] && [ -n "$_cfg" ]; then
+        depth=$(printf '%s' "$_cfg" | grep -o 'depth=[0-9]*' | cut -d= -f2)
+    fi
+    width=$(printf '%s' "$_cfg" | grep -o 'search=[0-9]*' | cut -d= -f2)
 
     # The last report, final or periodic -- and whether it was the final one,
     # because a partial run's wall is not comparable to a finished one's.
@@ -82,8 +90,8 @@ for log in "$@"; do
     [ -n "$mslast" ] && msrow="${msrow}/${mslast}"
     score=$(grep -o "'val/success_rate': [0-9.]*" "$f" | tail -1 | grep -o '[0-9.]*$')
 
-    printf '%-26s %-6s %-5s %-6s %-6s %-8s %-9s %-8s %s\n' \
-        "$(basename "$log")" "$pump" "${core:-?}" "$steps" "${depth:-?}" \
+    printf '%-26s %-6s %-5s %-6s %-6s %-6s %-8s %-9s %-8s %s\n' \
+        "$(basename "$log")" "$pump" "${core:-?}" "$steps" "${width:-?}" "${depth:-?}" \
         "${batches:-?}" "${wall:-?}" "${msrow:-?}" "${score:-unfinished}"
 done
 
