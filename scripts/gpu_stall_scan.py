@@ -519,10 +519,28 @@ def main(argv=None):
     paths = []
     for p in args.traces:
         hits = sorted(glob.glob(p))
+        if not hits:
+            # The profiler writes ONE FILE PER PROCESS and puts the pid in the
+            # name -- GPU_PROFILER_TRACE=/tmp/t.csv produces /tmp/t.264168.csv,
+            # because a driver sampler and a worker sampler opening one path "w"
+            # overwrite each other. So the name the user typed is never the name
+            # on disk, and this said "no such trace file" about a trace that was
+            # sitting right beside it. Look for the siblings the profiler
+            # actually writes before giving up.
+            root, ext = os.path.splitext(p)
+            hits = sorted(glob.glob(f"{root}.*{ext or '.csv'}"))
+            if hits:
+                print(f"  ({p} does not exist; using the per-process trace"
+                      f"{'s' if len(hits) > 1 else ''} the profiler wrote: "
+                      + ", ".join(os.path.basename(h) for h in hits) + ")")
         paths.extend(hits or [p])
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
-        sys.exit("no such trace file: " + ", ".join(missing))
+        sys.exit(
+            "no such trace file: " + ", ".join(missing)
+            + "\n  GPU_PROFILER_TRACE=X.csv writes X.<pid>.csv, one per process."
+            + "\n  Try:  ls " + os.path.splitext(missing[0])[0] + ".*"
+        )
 
     print(
         f"scanning {len(paths)} trace file(s). Each file is one sampler process -- the profiler runs one\n"

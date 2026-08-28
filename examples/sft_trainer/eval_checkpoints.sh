@@ -113,6 +113,15 @@ export GPU_PROFILER_INTERVAL="${GPU_PROFILER_INTERVAL:-0.1}"
 #
 #   GPU_PROFILER_TRACE=/tmp/trace.csv bash examples/sft_trainer/eval_checkpoints.sh 300
 #   python scripts/gpu_stall_scan.py /tmp/trace.csv
+#
+# THE FILE ON DISK IS NOT THAT NAME. The profiler writes one trace per process
+# and puts the pid in it -- /tmp/trace.264168.csv -- because a driver sampler
+# and a worker sampler opening one path "w" overwrite each other. The line
+#
+#   [gpu-profiler] per-sample trace -> ...
+#
+# in the log says the real name. The scanner resolves the sibling itself, so
+# the command above works; `ls /tmp/trace.*` is the direct way to see them.
 
 _CORES=$(nproc 2>/dev/null || echo '?')
 echo "[eval] machine     : $_CORES cores, load$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null | sed 's/^/ /')" \

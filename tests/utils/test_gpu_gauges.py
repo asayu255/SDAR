@@ -479,3 +479,31 @@ def test_a_retrieval_alongside_a_busy_engine_is_not_the_reason(tmp_path):
     assert scanner.why_one({"retriever_inflight": 20, "gen_inflight": 100}) == "GPU_SIDE"
     assert scanner.why_one({"retriever_inflight": 20, "gen_inflight": 0}) == "RETRIEVER_DEPENDENCY"
     assert scanner.why_one({}) is None
+
+
+def test_the_scanner_finds_the_trace_the_profiler_actually_wrote(tmp_path):
+    """GPU_PROFILER_TRACE=X.csv writes X.<pid>.csv, one file per process.
+
+    So the name in the run command is never the name on disk, and the scanner
+    answered "no such trace file" about a trace sitting right beside the path it
+    was given -- after an hour-long run, which is the worst moment to discover a
+    naming convention.
+    """
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 30)
+    real = _trace(tmp_path / "t504.31415.csv",
+                  [busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12), busy])
+    assert real.exists()
+
+    out = _scan(tmp_path / "t504.csv")          # the name a person would type
+    assert "t504.31415.csv" in out
+    assert "RETRIEVER_DEPENDENCY" in out
+
+
+def test_a_genuinely_missing_trace_says_where_to_look(tmp_path):
+    done = subprocess.run(
+        [sys.executable, str(SCANNER), str(tmp_path / "nothing.csv")],
+        capture_output=True, text=True,
+    )
+    assert done.returncode != 0
+    assert "X.<pid>.csv" in done.stderr
+    assert "ls " in done.stderr
