@@ -1135,3 +1135,112 @@ def test_nbytes_counts_the_packed_sources_once():
     assert cache.nbytes() == packed
     cache.clear()
     assert cache.nbytes() == 0
+
+
+# --------------------------------------------------------------------------- #
+# where the store lives while the actor trains
+# --------------------------------------------------------------------------- #
+def _cache_with_offload(flag, **kw):
+    """A cache built with TEACHER_CACHE_OFFLOAD forced either way.
+
+    The switch is read at import, so the module-level constant is what a test has
+    to move; the instance copies it in __init__, which is what makes that
+    possible without reloading the module.
+    """
+    from verl.workers import teacher_cache as tc
+
+    cache, keys, W, h, lse = _filled_cache(**kw)
+    cache._offload = flag
+    return cache, keys, W, h, lse
+
+
+@pytest.mark.parametrize("n", [4, 12])
+def test_offloading_the_store_changes_where_the_bytes_wait_and_nothing_else(n):
+    """The cross-teacher arm holds 16.3 GB of hidden states on the card for the
+    whole backward -- four models a row -- and reached 99% of both GPUs during
+    update_actor. Offloaded, a micro batch pulls only the rows it asks for.
+
+    A bf16 copy host-to-device is exact and the GEMM still runs on the device on
+    the same values, so the two paths have to agree BIT FOR BIT, not nearly.
+    """
+    ids = torch.randint(0, VOCAB, (n, L, K))
+
+    resident, keys, W, h, _ = _cache_with_offload(False, n=n)
+    v_res, f_res, fp_res = resident.logprobs_at(keys, ids)
+
+    offloaded, keys2, _, _, _ = _cache_with_offload(True, n=n)
+    v_off, f_off, fp_off = offloaded.logprobs_at(keys2, ids)
+
+    assert torch.equal(v_res, v_off), "the offloaded store returned different values"
+    assert torch.equal(f_res, f_off)
+    assert torch.equal(fp_res, fp_off)
+    torch.testing.assert_close(v_off, _reference(h, W, ids), rtol=0, atol=1e-5)
+
+
+def test_the_placement_decision_is_what_it_claims_on_a_gpu_box():
+    """The decision, not the outcome. A CPU test box cannot tell the two
+    placements apart by looking at the tensors -- with the read device already
+    cpu every branch gives the same answer, and a test that only inspects where
+    things ended up passes just as happily when the offload does nothing.
+
+    So the choice is a pure function and this drives it with the device a real
+    run has.
+    """
+    from verl.workers.teacher_cache import store_placement
+
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=True)
+    assert store.type == "cpu", "offload on, store still on the card -- it frees nothing"
+    assert index.type == "cpu", "the index has to follow the store, or the gather is illegal"
+    assert pin is True, "a device read wants pinned host memory, or the pull is not a DMA"
+
+    store, pin, index = store_placement(False, "cuda:0", cuda_available=True)
+    assert store.type == "cuda" and index.type == "cuda", "resident: nothing moves"
+    assert pin is False
+
+    # No driver: the store still moves off the device, but pinning would raise.
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=False)
+    assert store.type == "cpu" and pin is False
+
+
+def test_the_offloaded_store_really_is_off_the_device():
+    """A flag that silently kept the store where it was would pass every value
+    test above and free nothing, which is the whole point of the change."""
+    off, keys, _, _, _ = _cache_with_offload(True, n=6)
+    off.logprobs_at(keys, torch.randint(0, VOCAB, (6, L, K)))
+    final = off._final
+    assert final["offloaded"] is True
+    assert final["h"].device.type == "cpu" and final["lse"].device.type == "cpu"
+    # The slot arithmetic has to follow the store: indexing a cpu tensor with a
+    # cuda index is not allowed, and sending the index the other way would be a
+    # device-to-host sync per micro batch.
+    assert final["index_dev"].type == "cpu"
+    assert final["key_to_slot"].device.type == "cpu"
+    assert final["slot_off"].device.type == "cpu"
+
+    res, keys2, _, _, _ = _cache_with_offload(False, n=6)
+    res.logprobs_at(keys2, torch.randint(0, VOCAB, (6, L, K)))
+    assert res._final["offloaded"] is False
+
+
+def test_the_witness_still_runs_against_an_offloaded_store():
+    """check_witness reads the entries directly rather than through logprobs_at,
+    and after _finalize they point into the store. Offloaded that is host memory
+    while the projection is on the device -- a mismatch this has to bridge, or
+    the cache's own correctness check is what breaks."""
+    off, keys, _, _, _ = _cache_with_offload(True, n=6)
+    off.logprobs_at(keys, torch.randint(0, VOCAB, (6, L, K)))   # forces _finalize
+    assert off.check_witness() < 1e-2
+
+    caught, keys2, _, _, _ = _cache_with_offload(True, n=6)
+    caught.logprobs_at(keys2, torch.randint(0, VOCAB, (6, L, K)))
+    caught._h[int(keys2[2])] = caught._h[int(keys2[2])] + 1.0    # drift one entry
+    with pytest.raises(RuntimeError, match="witness"):
+        caught.check_witness()
+
+
+def test_the_exchange_only_copies_keys_to_the_host_when_the_store_is_offloaded():
+    """Resident, the index belongs on the device and a host copy would be a sync
+    bought for nothing."""
+    off, _, _, _, _ = _cache_with_offload(True, n=4)
+    res, _, _, _, _ = _cache_with_offload(False, n=4)
+    assert off.offloaded is True and res.offloaded is False

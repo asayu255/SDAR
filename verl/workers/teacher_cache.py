@@ -55,7 +55,54 @@ corrupted entry filed correctly passes the count.
 
 from typing import Dict, Optional, Tuple
 
+import os
 import torch
+
+
+# WHERE THE STEP'S HIDDEN STATES LIVE WHILE THE ACTOR TRAINS.
+#
+# The cache is filled before update_actor and read all the way through it, so on
+# the cross-teacher arm its 16.3 GB (four models a row, measured) sits on the card
+# for the whole backward. That arm reached 99% of both cards during update_actor
+# with ppo_micro_batch_size_per_gpu already halved to 5 -- the store is the single
+# largest thing in the step that is not the model, and none of it is touched
+# between micro batches.
+#
+# Offloaded, the store is pinned host memory and each micro batch pulls only the
+# rows it asks for: (rows x response_length x hidden) bf16, about 10 MB at a
+# micro batch of 5, against 16.3 GB resident. Over a step that is a few GB across
+# PCIe, tenths of a second against update_actor's 261 s.
+#
+# BIT-IDENTICAL. A bf16 copy host-to-device is exact, and the gather and the GEMM
+# still run on the device on the same values. What changes is only where the
+# bytes wait.
+_OFFLOAD = os.environ.get("TEACHER_CACHE_OFFLOAD", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def store_placement(offload: bool, read_device, cuda_available: Optional[bool] = None):
+    """``(store_device, pin_memory, index_device)`` for a finalized store.
+
+    A function, and not three expressions inline in ``_finalize``, because a CPU
+    test box cannot tell the two placements apart any other way: with the read
+    device already ``cpu`` every branch below collapses to the same answer, and a
+    test that only checks where the tensors ended up passes just as happily when
+    the offload does nothing at all.
+
+    The index device follows the STORE, not the read: indexing a host tensor with
+    a cuda index is not allowed, and sending the index the other way would be a
+    device-to-host sync per micro batch -- which is what this class's whole layout
+    exists to avoid.
+
+    Pinning is a property of the READ device: it only buys a DMA, and
+    ``torch.empty(pin_memory=True)`` raises outright with no CUDA driver.
+    """
+    read = torch.device(read_device)
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+    if not offload:
+        return read, False, read
+    host = torch.device("cpu")
+    return host, bool(read.type == "cuda" and cuda_available), host
 
 
 _PROCESS_CACHE: Optional["TeacherHiddenCache"] = None
@@ -150,6 +197,7 @@ class TeacherHiddenCache:
     """
 
     def __init__(self):
+        self._offload = _OFFLOAD
         self._h: Dict[int, torch.Tensor] = {}
         self._lse: Dict[int, torch.Tensor] = {}
         self._len: Dict[int, int] = {}
@@ -460,6 +508,7 @@ class TeacherHiddenCache:
             return self._final
 
         base = keys[0]
+        _store_dev, _pin, index_dev = store_placement(self._offload, device)
         span = keys[-1] - base + 1
         key_to_slot = torch.full((span,), -1, dtype=torch.long)
         key_to_slot[torch.tensor(keys, dtype=torch.long) - base] = torch.arange(len(keys), dtype=torch.long)
@@ -468,8 +517,15 @@ class TeacherHiddenCache:
         offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
         total = int(lens.sum())
         probe = self._h[keys[0]]
-        store_h = torch.empty((total, probe.shape[-1]), dtype=probe.dtype, device=device)
-        store_lse = torch.empty((total,), dtype=self._lse[keys[0]].dtype, device=device)
+        # Pinned host memory when offloading, so the per-micro-batch pull is a DMA
+        # the copy engine can overlap rather than a staged pageable copy.
+        store_dev, pin, _index_dev = store_placement(self._offload, device)
+        store_h = torch.empty(
+            (total, probe.shape[-1]), dtype=probe.dtype, device=store_dev, pin_memory=pin
+        )
+        store_lse = torch.empty(
+            (total,), dtype=self._lse[keys[0]].dtype, device=store_dev, pin_memory=pin
+        )
         off_l = offsets.tolist()
         for i, k in enumerate(keys):
             a, b = off_l[i], off_l[i] + self._len[k]
@@ -489,20 +545,35 @@ class TeacherHiddenCache:
             "device": device,
             "empty": False,
             "base": base,
-            "key_to_slot": key_to_slot.to(device),
-            "slot_key": torch.tensor(keys, dtype=torch.long).to(device),
-            "slot_len": lens.to(device),
-            "slot_off": offsets.to(device),
+            # Offloaded, the row/slot arithmetic runs on the HOST -- indexing a
+            # cpu tensor with a cuda index is not allowed, and moving the index
+            # the other way would be a device-to-host sync per micro batch, which
+            # is exactly what this class's layout exists to avoid. The metadata is
+            # a few kB either way. The per-row columns the CALLER needs on the
+            # device (temp, voff, fp) are kept on both sides.
+            "key_to_slot": key_to_slot.to(index_dev),
+            "slot_key": torch.tensor(keys, dtype=torch.long).to(index_dev),
+            "slot_len": lens.to(index_dev),
+            "slot_off": offsets.to(index_dev),
             "slot_voff": torch.tensor([self._voff[self._task[k]] for k in keys], dtype=torch.long).to(device),
             "slot_temp": torch.tensor([self._temperature[k] for k in keys], dtype=torch.float32).to(device),
             "slot_fp": torch.tensor([self._fingerprint.get(k, 0) for k in keys], dtype=torch.long).to(device),
             "h": store_h,
             "lse": store_lse,
             "max_len": int(lens.max()),
+            "offloaded": bool(self._offload),
+            "index_dev": index_dev,
         }
         return self._final
 
-    def logprobs_at(self, cache_ids: torch.Tensor, ids: torch.Tensor):
+    @property
+    def offloaded(self) -> bool:
+        """Whether the finalized store lives in host memory. Read by
+        ``exchange_teacher_logprobs`` to decide whether a host copy of the keys is
+        worth making -- resident, it would be a sync bought for nothing."""
+        return bool(self._offload)
+
+    def logprobs_at(self, cache_ids: torch.Tensor, ids: torch.Tensor, cache_ids_cpu=None):
         """Answer for the rows this cache owns; leave the rest at zero.
 
         Branch-free and sync-free: a key lookup, a gather of the stored rows, one
@@ -539,7 +610,15 @@ class TeacherHiddenCache:
                 f"{resp_len}; the teacher and the actor disagree on response_length."
             )
 
-        cid = cache_ids.to(dev, torch.long)
+        # The slot arithmetic runs where the store's index has to be: the host
+        # when offloaded, the device otherwise. cache_ids_cpu lets the caller hand
+        # over a copy it already has -- four planes a micro batch share one on the
+        # cross-teacher arm -- instead of each read paying its own sync.
+        idev = final["index_dev"]
+        if final["offloaded"]:
+            cid = (cache_ids_cpu if cache_ids_cpu is not None else cache_ids.cpu()).to(torch.long)
+        else:
+            cid = cache_ids.to(dev, torch.long)
         q = cid - final["base"]
         span = final["key_to_slot"].numel()
         slot = torch.where(
@@ -550,17 +629,27 @@ class TeacherHiddenCache:
         safe = slot.clamp(min=0)
         ok = (slot >= 0) & (final["slot_key"][safe] == cid)
         safe = torch.where(ok, safe, torch.zeros_like(safe))
-        found = ok.to(torch.int32)
 
-        pos = torch.arange(resp_len, device=dev)
+        pos = torch.arange(resp_len, device=idev)
         lens = torch.where(ok, final["slot_len"][safe], torch.zeros_like(safe))
         live = pos.unsqueeze(0) < lens.unsqueeze(1)                       # (n, resp_len)
         src = final["slot_off"][safe].unsqueeze(1) + pos.unsqueeze(0)
         src = torch.where(live, src, torch.zeros_like(src)).reshape(-1)   # (n * resp_len,)
 
+        # Only the rows this micro batch asked for cross the bus: (n * resp_len,
+        # hidden) bf16, ~10 MB at a micro batch of 5 against a 16.3 GB store.
+        h_rows, lse_rows = final["h"][src], final["lse"][src]
+        if final["offloaded"]:
+            h_rows = h_rows.to(dev, non_blocking=True)
+            lse_rows = lse_rows.to(dev, non_blocking=True)
+            safe = safe.to(dev)
+            ok = ok.to(dev)
+            live = live.to(dev)
+        found = ok.to(torch.int32)
+
         flat_ids = ids.reshape(-1, k) + final["slot_voff"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1, 1)
         out = teacher_logprobs_from_hidden(
-            final["h"][src], final["lse"][src], self._stacked, flat_ids,
+            h_rows, lse_rows, self._stacked, flat_ids,
             temperature=final["slot_temp"][safe].unsqueeze(1).expand(n, resp_len).reshape(-1),
         )
         values = torch.where(live.reshape(-1, 1), out, out.new_zeros(())).view(n, resp_len, k)
@@ -599,6 +688,10 @@ class TeacherHiddenCache:
             h, lse = self._h[key], self._lse[key]          # (len, H), (len,)
             if h.shape[0] == 0:
                 continue
+            if h.device.type == "cpu" and self._stacked is not None:
+                # Offloaded store, device projection. One witness row, once a step.
+                h = h.to(self._stacked.device)
+                lse = lse.to(self._stacked.device)
             got = teacher_logprobs_from_hidden(
                 h, lse, self.lm_head(self._task[key]), w_ids.to(h.device),
                 temperature=self._temperature.get(key, 1.0),
@@ -678,8 +771,17 @@ def exchange_teacher_logprobs(
     # (found, fingerprint) in one tensor so the identity check rides along on the
     # reduce the count already needed -- no extra collective in the micro-batch loop.
     meta = torch.zeros((world_size, n, 2), dtype=torch.int64, device=ids.device)
+    # One host copy for the whole gathered set, not one per rank: offloaded, the
+    # slot arithmetic runs on the host, and doing it lazily inside logprobs_at
+    # would be world_size device-to-host syncs per micro batch instead of one.
+    # Skipped entirely when the store is resident, where the index belongs on the
+    # device and no copy is wanted.
+    gathered_cpu = (
+        [t.to("cpu", non_blocking=False) for t in all_cache_ids]
+        if cache.offloaded else [None] * world_size
+    )
     for r in range(world_size):
-        v, f, fp = cache.logprobs_at(all_cache_ids[r], all_ids[r])
+        v, f, fp = cache.logprobs_at(all_cache_ids[r], all_ids[r], cache_ids_cpu=gathered_cpu[r])
         values[r] = v
         meta[r, :, 0] = f
         meta[r, :, 1] = fp
