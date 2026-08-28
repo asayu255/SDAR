@@ -88,24 +88,17 @@ for log in "$@"; do
     msrow=$(printf '%s' "$msline" | grep -o 'all=[0-9]*' | cut -d= -f2)
     mslast=$(printf '%s' "$msline" | grep -o 'last[0-9]*=[0-9]*' | cut -d= -f2)
     [ -n "$mslast" ] && msrow="${msrow}/${mslast}"
-# UNWRAPPED FIRST. ray_trainer prints the metrics as
-# pprint(f"Initial validation metrics: {val_metrics}") -- pprint of an
-# f-string, so the whole dict is ONE string and pprint breaks it at 80
-# columns, mid-dict, wherever that falls:
+# THE SCORES COME FROM scripts/val_scores.py, not from a grep in this file.
 #
-#   "...'val/alfworld/test_score': 2.95, 'val/success_rate': "
-#    "0.38742732589884377, 'val/search/test_score': 0.357}")
-#
-# A key can therefore end one line and its value begin the next, with the
-# continuation's indent between them. Where the break lands depends on the
-# dict's contents, so a per-line grep reads some runs and not others -- it
-# read eval_378.log and returned an empty value for eval_378d4.log, which
-# printed as "unfinished" for a run that had finished and scored. Join the
-# block, squeeze the indent, then match. From the match to the line that
-# closes pprint's string, not a fixed -A window: -A12 was a guess and the dict
-# outgrew it, dropping val/success_rate off the end -- the one key this reads.
-    score=$(awk '/Initial validation metrics/,/}"\)/' "$f" | tr -d '\n"' | tr -s ' ' \
-        | grep -oE "'val/success_rate': [0-9.]+" | tail -1 | grep -oE '[0-9.]+$')
+# ray_trainer prints pprint(f"Initial validation metrics: {val_metrics}") --
+# pprint of an f-STRING, so the dict is one string broken at 80 columns
+# wherever that falls, a key can end one line and its value begin the next, the
+# break moves with the dict's contents, and a log can hold more than one block.
+# Three shell extractions got that wrong in three different ways and each time
+# a key went silently missing, which reads as "the run did not score it".
+_SCORES="$(dirname "$0")/../../scripts/val_scores.py"
+    score=$(python3 "$_SCORES" "$log" 2>/dev/null \
+        | awk '$1 == "val/success_rate" {print $2}' | tail -1)
 
     printf '%-26s %-6s %-5s %-6s %-6s %-6s %-8s %-9s %-8s %s\n' \
         "$(basename "$log")" "$pump" "${core:-?}" "$steps" "${width:-?}" "${depth:-?}" \

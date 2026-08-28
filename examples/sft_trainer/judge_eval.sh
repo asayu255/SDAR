@@ -122,24 +122,12 @@ residency() {
 scores() {
     local log="$1"
     local found
-    # UNWRAPPED FIRST. ray_trainer prints the metrics as
-    # pprint(f"Initial validation metrics: {val_metrics}") -- pprint of an
-    # f-string, so the whole dict is ONE string and pprint breaks it at 80
-    # columns, mid-dict, wherever that falls:
-    #
-    #   "...'val/alfworld/test_score': 2.95, 'val/success_rate': "
-    #    "0.38742732589884377, 'val/search/test_score': 0.357}")
-    #
-    # A key can therefore end one line and its value begin the next, with the
-    # continuation's indent between them. Where the break lands depends on the
-    # dict's contents, so a per-line grep reads some runs and not others -- it
-    # read eval_378.log and returned an empty value for eval_378d4.log, which
-    # printed as "unfinished" for a run that had finished and scored. Join the
-    # block, squeeze the indent, then match. From the match to the line that
-    # closes pprint's string, not a fixed -A window: -A12 was a guess and the
-    # dict outgrew it, dropping keys off the end.
-    found=$(awk '/Initial validation metrics/,/}"\)/' "$(_clean "$log")" | tr -d '\n"' | tr -s ' ' \
-        | grep -oE "'val/[^']*(test_score|success_rate)': [0-9.]+" | tail -40)
+    # THE SCORES COME FROM scripts/val_scores.py; see the note there. pprint of
+    # an f-string wraps the dict at 80 columns mid-pair, the break moves with
+    # the contents, and a log can hold more than one block -- three shell
+    # extractions got it wrong in three different ways.
+    found=$(python3 "$(dirname "$0")/../../scripts/val_scores.py" "$log" 2>/dev/null \
+        | awk '/^  val\// {print $1 ": " $2}' | tail -40)
     if [ -z "$found" ]; then
         echo "  NOT FOUND -- the run has not finished validating"
         return
