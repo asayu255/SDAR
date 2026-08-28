@@ -92,14 +92,22 @@ def read_trace(path):
                         "clk": _floats(r.get("smclk_mhz_per_gpu")),
                         "pcie_rx": _floats(r.get("pcie_rx_mb_s_per_gpu")),
                         "cpu": float(r["driver_cpu_pct"]) if (r.get("driver_cpu_pct") or "").strip() else None,
-                        # Absent in traces written before the gauges existed, and
-                        # that has to stay readable: those runs get an empty dict
-                        # and every excursion in them classifies as
+                        # EVERY GAUGE COLUMN THE HEADER DECLARES, zeros kept.
+                        # Absent in traces written before the gauges existed,
+                        # and that has to stay readable: those runs get an empty
+                        # dict and every excursion in them classifies as
                         # UNINSTRUMENTED, which is the truth about them.
+                        #
+                        # The zeros are what makes that distinction possible.
+                        # Dropping them -- which this did, to keep the "at min:"
+                        # line short -- collapses "the gauge read zero" into
+                        # "this trace has no such gauge", and a classifier that
+                        # asks whether a gauge EXISTS then cannot tell an old
+                        # trace from a live zero. The print filters instead.
                         "gauges": {
-                            name: int(float(value))
+                            name: int(float(value)) if (value or "").strip() else 0
                             for name, value in r.items()
-                            if _is_gauge(name) and (value or "").strip() not in ("", "0")
+                            if _is_gauge(name)
                         },
                         "activity": (r.get("activity") or "").strip(),
                         "stack_id": int(r["stack_id"]) if (r.get("stack_id") or "").strip() else None,
@@ -285,7 +293,22 @@ def why_one(gauges, cpu=None, gen_full=1):
     # and gets a different name.
     free = gauges.get("slots_free", 0)
     if ready and free:
-        return "SCHEDULER_STARVATION"
+        # A FREE SLOT IS NOT A PLACEABLE ONE. Slots are task-typed: a free
+        # alfworld slot cannot take a queued webshop batch, so "work ready, slot
+        # free" covers two findings that want opposite fixes -- dispatch sooner,
+        # versus make the queue's shapes match the slots that keep coming free.
+        # Reported as one, the second reads as a dispatcher bug and sends the
+        # next change at a dispatcher that is behaving correctly.
+        #
+        # `placeable_ready` counts the pending items some free slot would
+        # actually accept, which is the distinction. Traces written before it
+        # existed cannot draw it and keep the older, coarser answer rather than
+        # having every such sample reported as a compatibility block. Zeros are
+        # written, so the test is whether the COLUMN is there, not its value.
+        if "placeable_ready" not in gauges:
+            return "SCHEDULER_STARVATION"
+        return ("SCHEDULER_STARVATION" if gauges["placeable_ready"]
+                else "SLOT_COMPATIBILITY_BLOCK")
     if retr:
         return "RETRIEVER_DEPENDENCY"
     if env:
@@ -337,6 +360,7 @@ def _mean_sm(sm):
 # window shows a starved queue, that is the finding.
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
+    "SLOT_COMPATIBILITY_BLOCK",
     "TAIL_BLOCKS_READY",
     "SLOTS_BUSY_NOT_GENERATING",
     "RETRIEVER_DEPENDENCY",
@@ -346,6 +370,33 @@ _REASON_RANK = (
     "TAIL_DRAIN",
     "GPU_SIDE",
 )
+
+
+# The dwell line was abbreviated by first token, which read "slot:14 slots:2"
+# the moment a second SLOT_ reason existed -- two different findings, one
+# character apart, in the line that exists to make a close call visible.
+_REASON_ABBR = {
+    "SCHEDULER_STARVATION": "starved",
+    "SLOT_COMPATIBILITY_BLOCK": "mismatch",
+    "SLOTS_BUSY_NOT_GENERATING": "allbusy",
+    "TAIL_BLOCKS_READY": "tailblock",
+    "TAIL_DRAIN": "tail",
+    "RETRIEVER_DEPENDENCY": "retriever",
+    "ENV_DEPENDENCY": "env",
+    "FUTURE_RAY_WAIT": "future",
+    "DRIVER_CPU": "cpu",
+    "GPU_SIDE": "gpu",
+    "UNINSTRUMENTED": "unknown",
+}
+
+
+def _abbr(reason):
+    return _REASON_ABBR.get(reason, reason.lower())
+
+
+# Wide enough for every reason this scanner can print, including UNINSTRUMENTED,
+# which is not in the rank tuple.
+_WHY_W = max(len(r) for r in _REASON_ABBR) + 2
 
 
 def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
@@ -505,13 +556,18 @@ def analyse(path, floor, busy, top):
         print(f"\nwhy the cards were idle, by lost GPU-seconds"
               f"   (the engine counts as having work at >= {gen_full:.0f} requests in flight,"
               f" calibrated from this run)")
-        print(f"    {'reason':<22}{'events':>7}{'wall s':>9}{'lost GPU-s':>12}{'share':>8}")
+        # Width from the names themselves: 22 was typed when the longest reason
+        # was 21 characters, and the next one added ran into the events column.
+        w = max(len(r) for r in by_why) + 2
+        print(f"    {'reason':<{w}}{'events':>7}{'wall s':>9}{'lost GPU-s':>12}{'share':>8}")
         for reason, (n, wall, lost) in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
             share = (lost / exc_lost * 100.0) if exc_lost else 0.0
-            print(f"    {reason:<22}{n:>7}{wall:>9.1f}{lost:>12.1f}{share:>7.1f}%")
+            print(f"    {reason:<{w}}{n:>7}{wall:>9.1f}{lost:>12.1f}{share:>7.1f}%")
         meaning = {
             "SCHEDULER_STARVATION": "a slot was FREE, work was ready, and the engine had nothing -- "
                                     "the dispatcher missed it",
+            "SLOT_COMPATIBILITY_BLOCK": "a slot was FREE and work was ready, but no ready batch fit "
+                                        "the free slot -- the queue's task mix, not the dispatcher",
             "SLOTS_BUSY_NOT_GENERATING": "every slot was occupied and none was feeding the engine -- "
                                          "between turns, in the driver, or in the pump round trip",
             "TAIL_BLOCKS_READY": "the engine was draining a turn's last few rows while a whole batch "
@@ -526,7 +582,7 @@ def analyse(path, floor, busy, top):
                               "somewhere nothing counts -- do not attribute it to the row above it",
         }
         for reason, _ in sorted(by_why.items(), key=lambda kv: -kv[1][2]):
-            print(f"      {reason:<22}{meaning.get(reason, '')}")
+            print(f"      {reason:<{w}}{meaning.get(reason, '')}")
 
     print(f"\nper phase: share of wall clock, and the loss attributed to it")
     ph_wall, ph_lost, ph_exc = defaultdict(float), defaultdict(float), defaultdict(float)
@@ -570,23 +626,26 @@ def analyse(path, floor, busy, top):
         # one word standing for a vote it might have narrowly won.
         dwell = e.get("why_dwell") or {}
         if len(dwell) > 1:
-            detail.append("samples " + " ".join(f"{k.split('_')[0].lower()}:{v}" for k, v in
+            detail.append("samples " + " ".join(f"{_abbr(k)}:{v}" for k, v in
                                                 sorted(dwell.items(), key=lambda kv: -kv[1])))
-        if e["gauges"]:
-            detail.append("at min: " + " ".join(f"{k}={v}" for k, v in e["gauges"].items()))
+        # Zeros are carried in the rows (see read_trace) but not worth a line;
+        # what is up at the bottom of the excursion is the readable part.
+        up = {k: v for k, v in e["gauges"].items() if v}
+        if up:
+            detail.append("at min: " + " ".join(f"{k}={v}" for k, v in up.items()))
         if r.get("activity"):
             detail.append(f"in: {r['activity']}")
         if e.get("why_lead_in"):
             detail.insert(0, f"lead-in {e['why_lead_in']}")
         if detail:
-            print(f"        {e['why']:<22}{'   '.join(detail)}")
+            print(f"        {e['why']:<{_WHY_W}}{'   '.join(detail)}")
         frames = stacks.get(r.get("stack_id"))
         if frames:
             outside, text = frames
             for one in text.split(" | ")[:3]:
-                print(f"        {'':<22}{one}")
+                print(f"        {'':<{_WHY_W}}{one}")
             if outside:
-                print(f"        {'':<22}(+{outside} threads outside this repo)")
+                print(f"        {'':<{_WHY_W}}(+{outside} threads outside this repo)")
 
     # Corroboration. A card that really went idle drops its power and clock; one
     # whose reading fell while power held is more likely a counter artefact than

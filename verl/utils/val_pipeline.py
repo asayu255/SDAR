@@ -215,6 +215,32 @@ def run_pipelined(
         finally:
             spans.append((started, time.perf_counter()))
 
+    def _publish():
+        """THE GAUGES THE CLASSIFIER TURNS ON, republished on every state change.
+
+        `ready` is how much work exists and is not with the engine. `slots_free`
+        is how many slots are idle. `placeable_ready` is the load-bearing one:
+        how much of that queue could actually start somewhere right now.
+
+        Two gauges were not enough for either question. `ready` alone stopped
+        meaning what it meant when the lookahead queue arrived -- it used to be
+        "one batch that cannot be placed" and became "the queue is a queue",
+        true nearly all the time, which doubled the starvation number without
+        anything about the run changing. And `slots_free` counts every idle
+        slot, not the idle slots that can take the work in hand: the extra slots
+        serve search only, so "queued work and a free slot" also holds whenever
+        a webshop batch waits for `primary`, which is not a dispatcher failure.
+        The dispatcher places everything placeable on every pass; that state is
+        a resource-topology block and wants a differently-shaped slot.
+        """
+        placeable = sum(
+            1 for _seq, _prepared, task in pending
+            if any(slot.accepts(task) for slot in free)
+        )
+        _gauge_set("ready", len(pending))
+        _gauge_set("slots_free", len(free))
+        _gauge_set("placeable_ready", placeable)
+
     def harvest():
         """Free the slot of every batch whose future has resolved.
 
@@ -226,17 +252,24 @@ def run_pipelined(
             prepared, future, slot = inflight.pop(seq)
             finished[seq] = (prepared, future.result())
             free.append(slot)
+        # Here, not only at the next dispatch: refill() runs in between and can
+        # sit in prepare() for a while, and through that window the gauges would
+        # still say the returned slot was busy -- under-reporting exactly the
+        # state the classifier is looking for.
+        _publish()
 
     def wait_for_one():
         """Block until at least one more batch finishes, then free its slot."""
-        pending = [fut for _p, fut, _s in inflight.values()]
+        # NOT `pending`, which is the name of the queue of prepared batches in
+        # the enclosing scope. These are futures.
+        futures = [fut for _p, fut, _s in inflight.values()]
         waited = time.perf_counter()
         try:
             # Counted, because the stack sampler found this thread parked here
             # while every card was idle and the census could not see it: it is
             # in no tagged phase and burns no CPU.
             with _gauge("future_wait"):
-                futures_wait(pending, return_when=FIRST_COMPLETED)
+                futures_wait(futures, return_when=FIRST_COMPLETED)
         finally:
             clock["retire_wait"] += time.perf_counter() - waited
         harvest()
@@ -328,15 +361,7 @@ def run_pipelined(
             clock["prepare"] += time.perf_counter() - _t
             pending.append((next_seq, prepared, task_of(prepared)))
             next_seq += 1
-        # THE GAUGES THE CLASSIFIER TURNS ON. `ready` is how much work exists
-        # and is not with the engine; `slots_free` is whether any of it COULD
-        # have been started. Both, because with a lookahead queue `ready` alone
-        # stopped meaning what it meant: it used to be "one batch that cannot be
-        # placed" and is now "the queue is a queue", true nearly all the time.
-        # Reading starvation off `ready` alone doubled it the moment the queue
-        # arrived, which is a change in the instrument, not in the run.
-        _gauge_set("ready", len(pending))
-        _gauge_set("slots_free", len(free))
+        _publish()
 
     def dispatch():
         """Give every free slot the oldest pending batch it can run."""
@@ -349,8 +374,7 @@ def run_pipelined(
             free.remove(slot)
             inflight[seq] = (prepared, executor.submit(timed_launch, prepared, slot), slot)
             placed = True
-        _gauge_set("ready", len(pending))
-        _gauge_set("slots_free", len(free))
+        _publish()
         return placed
 
     try:
@@ -387,6 +411,7 @@ def run_pipelined(
         # excursion in the process read as SCHEDULER_STARVATION.
         _gauge_set("ready", 0)
         _gauge_set("slots_free", 0)
+        _gauge_set("placeable_ready", 0)
         report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.

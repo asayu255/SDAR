@@ -755,3 +755,77 @@ def test_a_task_no_slot_serves_raises_rather_than_spinning():
     with pytest.raises(RuntimeError, match="no slot can run task"):
         list(run_pipelined(["search", "alfworld"], lambda x: x, lambda x: x,
                            lambda _p, _s: None, slots))
+
+
+def _published(monkeypatch, items, tasks_by_slot, task_of, launch=None):
+    """Every complete gauge state the pipeline published, in order.
+
+    Recorded at the source rather than sampled from a thread: the states worth
+    asserting on last only until the next dispatch, so a sampling test would be
+    a race with a plausible-looking green.
+    """
+    states, live = [], {}
+
+    def record(name, value):
+        live[name] = value
+        if name == "placeable_ready":   # last of the three _publish writes
+            states.append(dict(live))
+
+    monkeypatch.setattr(vp_module, "_gauge_set", record)
+    slots = [Slot(f"s{i}", envs=None, collector=None, tasks=t)
+             for i, t in enumerate(tasks_by_slot)]
+    list(run_pipelined(items, lambda i: i, task_of, launch or (lambda p, s: p), slots))
+    return states
+
+
+def test_a_free_slot_that_fits_nothing_is_published_as_such(monkeypatch):
+    """The state the classifier used to read as a dispatcher failure.
+
+    An alfworld batch waits while the only free slot serves search. `ready` and
+    `slots_free` are both non-zero and nothing is with the engine -- which is
+    the signature of starvation, and this is not starvation: the dispatcher
+    placed everything it could. Only a count of the queue a free slot would
+    ACCEPT separates the two, and they want opposite fixes.
+    """
+    states = _published(monkeypatch, [0, 1, 2], [["alfworld"], ["search"]],
+                        lambda p: "alfworld")
+    blocked = [s for s in states if s["ready"] and s["slots_free"] and not s["placeable_ready"]]
+    assert blocked, states
+    # ...and it is never mistaken for the queue being empty.
+    assert all(s["ready"] >= 1 for s in blocked)
+
+
+def test_untyped_slots_never_publish_a_block(monkeypatch):
+    """The control: with every slot able to run everything, the state cannot
+    arise -- dispatch leaves either no free slot or no pending batch. A gauge
+    that reported blocks here would be counting something else."""
+    states = _published(monkeypatch, [0, 1, 2, 3], [None, None], lambda p: "alfworld")
+    assert not [s for s in states if s["ready"] and s["slots_free"] and not s["placeable_ready"]]
+
+
+def test_a_returned_slot_is_published_before_the_next_prepare(monkeypatch):
+    """harvest() publishes, so the window inside prepare() reads honestly.
+
+    Publishing only from dispatch left the returned slot recorded as busy for
+    the whole of the next refill -- and refill can sit in prepare() -- so the
+    gauges under-reported free slots in precisely the window a stall would be
+    attributed from.
+    """
+    seen = []
+
+    def prepare(i):
+        seen.append(vp_module._gauge_set.snapshot())
+        return i
+
+    states, live = [], {}
+
+    def record(name, value):
+        live[name] = value
+
+    record.snapshot = lambda: dict(live)
+    monkeypatch.setattr(vp_module, "_gauge_set", record)
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(2)]
+    list(run_pipelined(range(6), prepare, lambda p: None, lambda p, s: p, slots))
+    # By the last prepare, batches have finished and their slots come back. The
+    # snapshot taken inside prepare must have seen at least one of them free.
+    assert any(s.get("slots_free") for s in seen[2:]), seen

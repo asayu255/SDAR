@@ -218,7 +218,11 @@ def test_the_scanner_separates_the_same_two_cases_from_a_trace(tmp_path):
     busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 30)
     path = _trace(tmp_path / "t.csv", [
         busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12),
-        busy, ([0, 1, 0], 6, {"retriever_inflight": 10, "ready": 32, "slots_free": 1}, 12),
+        # placeable_ready as well as slots_free: once slots became task-typed,
+        # "a slot was free" stopped being enough to mean the dispatcher missed
+        # something -- the free slot also has to be one a ready batch fits.
+        busy, ([0, 1, 0], 6, {"retriever_inflight": 10, "ready": 32,
+                              "slots_free": 1, "placeable_ready": 1}, 12),
         busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12),
         busy,
     ])
@@ -708,7 +712,100 @@ def test_a_gauge_column_the_scanner_has_never_heard_of_is_still_read():
         "0.000,00:00:00,1,gen,0;1;0,;;,;;,;;,;;,;;,6,32,0,1,7,gen:1,0\n"
     )
     rows, _skipped = scanner.read_trace(str(tmp))
-    assert rows[0]["gauges"] == {"ready": 32, "slots_free": 1, "a_gauge_invented_tomorrow": 7}
+    # Zeros included: a declared column that read zero is a reading, and telling
+    # it apart from a column the trace never had is what lets the classifier
+    # know which questions this trace can answer.
+    assert rows[0]["gauges"] == {"ready": 32, "gen_inflight": 0, "slots_free": 1,
+                                 "a_gauge_invented_tomorrow": 7}
     # and the per-GPU series are not mistaken for gauges
     assert not any(k.endswith("_per_gpu") for k in rows[0]["gauges"])
     assert _csv  # (the import is what read_trace uses)
+
+
+def test_a_free_slot_that_fits_no_queued_batch_is_not_a_dispatcher_miss():
+    """Slots are task-typed; "free" and "usable" are different questions.
+
+    A free alfworld slot cannot take a queued webshop batch. Both states read
+    ready>0, slots_free>0, gen_inflight=0 -- and they want opposite fixes:
+    dispatch sooner, versus change what the queue is holding. Reported as one
+    reason, the second sends the next change at a dispatcher doing its job.
+    """
+    scanner = _scanner()
+    fits = {"ready": 4, "slots_free": 1, "placeable_ready": 2, "gen_inflight": 0}
+    fits_not = {"ready": 4, "slots_free": 1, "placeable_ready": 0, "gen_inflight": 0}
+    assert scanner.why_one(fits, cpu=10, gen_full=100) == "SCHEDULER_STARVATION"
+    assert scanner.why_one(fits_not, cpu=10, gen_full=100) == "SLOT_COMPATIBILITY_BLOCK"
+
+
+def test_a_trace_from_before_the_placeable_gauge_keeps_the_coarser_answer():
+    """The absent column must not turn every starved sample into a block.
+
+    A missing gauge reads as zero everywhere, so a classifier that treats zero
+    as "nothing fits" relabels every SCHEDULER_STARVATION in every older trace
+    -- inventing a finding out of an instrument that was never installed.
+    """
+    scanner = _scanner()
+    old = {"ready": 4, "slots_free": 1, "gen_inflight": 0}
+    assert scanner.why_one(old, cpu=10, gen_full=100) == "SCHEDULER_STARVATION"
+
+
+def test_a_placeable_column_reading_zero_is_not_an_absent_column(tmp_path):
+    """End to end, through the CSV, which is where the two could be confused.
+
+    The reader used to drop zero-valued gauges to keep one printed line short.
+    That collapsed "the gauge said nothing fits" into "there is no such gauge",
+    which is exactly the pair this classifier has to separate -- and it would
+    have done so silently, answering SCHEDULER_STARVATION for every block.
+    """
+    scanner = _scanner()
+    tmp = tmp_path / "t.csv"
+    tmp.write_text(
+        "ts,clock,pid,phase,sm_pct_per_gpu,membw_pct_per_gpu,power_w_per_gpu,"
+        "smclk_mhz_per_gpu,pcie_rx_mb_s_per_gpu,nvlink_mb_s_per_gpu,driver_cpu_pct,"
+        "ready,gen_inflight,slots_free,placeable_ready,activity,stack_id\n"
+        "0.000,00:00:00,1,gen,0;0;0,;;,;;,;;,;;,;;,6,4,0,1,0,gen:0,0\n"
+    )
+    rows, _skipped = scanner.read_trace(str(tmp))
+    assert "placeable_ready" in rows[0]["gauges"]
+    assert scanner.why_one(rows[0]["gauges"], cpu=10, gen_full=100) == "SLOT_COMPATIBILITY_BLOCK"
+
+
+def test_the_reason_table_does_not_run_its_columns_together(tmp_path):
+    """The column width was a literal, sized to the longest reason of the day.
+
+    Adding SLOT_COMPATIBILITY_BLOCK, at 24 characters, printed it flush against
+    the events count -- a table that reads as one token. The width comes from
+    the names now, so the next reason added cannot do it again.
+    """
+    busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 30)
+    path = _trace(tmp_path / "t.csv", [
+        busy,
+        ([0, 1, 0], 6, {"ready": 4, "slots_free": 1, "placeable_ready": 0}, 14),
+        busy,
+    ])
+    out = _scan(path)
+    line = next(ln for ln in out.splitlines() if "SLOT_COMPATIBILITY_BLOCK" in ln
+                and ln.strip().startswith("SLOT_COMPATIBILITY_BLOCK"))
+    rest = line.strip()[len("SLOT_COMPATIBILITY_BLOCK"):]
+    assert rest.startswith(" "), line
+    # and the dwell abbreviation separates it from the other SLOT reason
+    assert scanner_abbr("SLOT_COMPATIBILITY_BLOCK") != scanner_abbr("SLOTS_BUSY_NOT_GENERATING")
+
+
+def scanner_abbr(reason):
+    return _scanner()._abbr(reason)
+
+
+def test_the_new_reason_did_not_reshuffle_the_existing_ranks():
+    """Inserting a name into the rank tuple must not reorder what was there.
+
+    The rank breaks dwell ties, so moving two existing reasons past each other
+    would change verdicts on traces that have nothing to do with this change.
+    """
+    scanner = _scanner()
+    before = ("SCHEDULER_STARVATION", "TAIL_BLOCKS_READY", "SLOTS_BUSY_NOT_GENERATING",
+              "RETRIEVER_DEPENDENCY", "ENV_DEPENDENCY", "FUTURE_RAY_WAIT",
+              "DRIVER_CPU", "TAIL_DRAIN", "GPU_SIDE")
+    kept = [r for r in scanner._REASON_RANK if r in before]
+    assert tuple(kept) == before
+    assert "SLOT_COMPATIBILITY_BLOCK" in scanner._REASON_RANK

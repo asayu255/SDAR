@@ -214,7 +214,8 @@ GAUGE_NAMES = (
     "retriever_inflight",  # waiting on the retrieval service
     "env_inflight",        # inside env.step / a tool
     "future_wait",         # driver threads blocked on a Future
-    "slots_free",          # pipeline slots that could take work right now
+    "slots_free",          # pipeline slots that are idle
+    "placeable_ready",     # queued batches a free slot could actually run
 )
 
 
