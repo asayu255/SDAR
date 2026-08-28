@@ -95,6 +95,11 @@ def _make_trainer(teacher_wg, topk=None, student_indexed=False):
     trainer.teacher_kl_topk = topk or 0
     trainer.student_indexed_topk = bool(topk is not None and student_indexed)
     trainer._teacher_cache_counter = 0
+    # This file is about the ROUTING, which is the same on every arm; the
+    # cross-teacher planes have their own file. __init__ always sets the flag,
+    # so False here is the plain-OPD trainer rather than a hole in the stub.
+    trainer.cross_teacher_enabled = False
+    trainer.base_wg = None
     return trainer
 
 

@@ -808,6 +808,12 @@ export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
 export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
 export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
+# The base policy and the off-task teachers ride in the same rollout window
+# as the on-task teacher above. All four are frozen, so only the window
+# changes; sign_weight_forward then scores what the window missed. 0 puts
+# all three back after the rollout. No-op on the control arm, which has no
+# planes to cache.
+export ROLLOUT_PREFETCH_SIGN=${ROLLOUT_PREFETCH_SIGN:-1}
 # WHERE THIS RUN'S CHECKPOINTS GO. Empty by default, so the paths below are
 # byte-for-byte what they were and an existing run resumes exactly as before.
 #

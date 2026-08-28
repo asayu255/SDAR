@@ -16,6 +16,7 @@ so the teachers live on CPU and only ride to GPU during log-prob computation.
 import copy
 import json
 import os
+from collections import namedtuple
 from pprint import pprint
 
 import numpy as np
@@ -54,6 +55,17 @@ from agent_system.multi_turn_rollout import adjust_batch
 # its concatenation make -- the standing cost is the cache, which is the same
 # either way. 512 matches the ceiling the rollout prefetch already runs at.
 _SIGN_WEIGHT_FORWARD_CHUNK = max(1, int(os.environ.get("SIGN_WEIGHT_FORWARD_CHUNK", "512")))
+
+# Score the base policy and the off-task teachers inside the rollout window too,
+# instead of only the on-task one. Set to 0 to go back to running all three in
+# sign_weight_forward after the rollout. See _teacher_prefetch_chunk.
+_ROLLOUT_PREFETCH_SIGN = os.environ.get("ROLLOUT_PREFETCH_SIGN", "1") not in ("0", "false", "False")
+
+# What a prefetched row carries on a cross-teacher arm. Wrapped in a named pair
+# rather than appended to the on-task value because that value is already three
+# different shapes depending on the mode (an id, a triple, a tensor), and a
+# fourth "sometimes one longer" is how a tuple gets unpacked wrong somewhere.
+PrefetchedRow = namedtuple("PrefetchedRow", ("on_task", "sign_ids"))
 
 # Overlap envs.reset() for the next rollout with this step's GPU training phases.
 # The reset is pure CPU / subprocess / HTTP work and the env managers are idle
@@ -431,15 +443,34 @@ class OPDRayTrainer(RayPPOTrainer):
         only the micro-batch it lands in differs from the post-rollout path, which
         moves the last bits of a packed GEMM and nothing else.
 
+        THE BASE POLICY AND THE OFF-TASK TEACHERS RIDE ALONG. That sentence about
+        frozen weights is not about the on-task teacher: it is about every model
+        this arm reads, and the other three are frozen in exactly the same sense.
+        Scoring only the on-task one here left :meth:`compute_sign_weight_cache`
+        running three more forwards AFTER the rollout, in a phase of its own --
+        measured at 169.5 s a step against 4.5 s for the prefetched on-task pass,
+        which is the same work per row done in the window instead of outside it.
+        The window has room: the rollout's glue was measured ~34% busy at
+        hit_rate 0.99, with 21.6 s/step of tchWait spill.
+
+        Four calls per chunk instead of one, in the same background thread and
+        therefore one at a time -- the peak is one chunk's activations either way,
+        which is the bound _SIGN_WEIGHT_FORWARD_CHUNK exists to hold on the serial
+        path. The adaptive sizer needs no change: it measures rows/second from
+        completed chunks, so four models per row simply reads as a slower rate and
+        the next chunk comes out smaller.
+
         Args:
             chunk: list of ``((traj_uid, turn_step), row_dict)`` as queued by the
                 rollout loop. Rows carry the four model-input tensors and their
                 ``task_name``.
 
         Returns:
-            ``{(traj_uid, turn_step): tensor-or-tuple}`` in the same form
-            ``compute_teacher_log_probs`` writes: a ``(resp, k)`` log-prob/id pair
-            under top-k, else a ``(resp,)`` log-prob row.
+            ``{(traj_uid, turn_step): value}``. ``value`` is what
+            ``compute_teacher_log_probs`` writes -- a ``(resp, k)`` log-prob/id
+            pair under top-k, else a ``(resp,)`` log-prob row -- wrapped in a
+            :data:`PrefetchedRow` beside the sign-plane keys when this arm caches
+            them, which :meth:`compute_sign_weight_cache` unwraps.
         """
         by_task = {}
         for key, row in chunk:
@@ -496,7 +527,90 @@ class OPDRayTrainer(RayPPOTrainer):
                 lp = scored.batch["ref_log_prob"]
                 for j, (key, _) in enumerate(entries):
                     out[key] = lp[j]
+
+        sign_ids = self._prefetch_sign_planes(chunk)
+        if sign_ids is not None:
+            for key in list(out):
+                out[key] = PrefetchedRow(on_task=out[key], sign_ids=sign_ids.get(key))
         return out
+
+    def _prefetch_sign_planes(self, chunk):
+        """Cache the base policy and each row's off-task teachers on this chunk.
+
+        The three passes :meth:`compute_sign_weight_cache` would otherwise run
+        after the rollout, run here instead. Same models, same rows, same
+        per-row keys; only the window changes, and the models are frozen, so the
+        values cannot.
+
+        Returns ``{key: [base_id, off_id_0, ...]}`` in the SAME column order
+        :meth:`compute_sign_weight_cache` uses -- column 0 the base policy, then
+        the row's off-task teachers in sorted task order. That layout is a
+        function of the row's own task and nothing else, which is what lets the
+        actor read the columns positionally; deriving it twice from one rule is
+        cheaper than shipping it, but only while the two rules stay one
+        expression. Both call :meth:`_sign_off_tasks_for`.
+
+        ``None`` when this arm does not cache the planes at all, which leaves the
+        returned rows exactly as they were before this path existed.
+        """
+        if not (self.cross_teacher_enabled and _ROLLOUT_PREFETCH_SIGN):
+            return None
+        task_order = sorted(self.teacher_wg.keys())
+        rows = [(key, row, self._normalize_task_name(row.get("task_name"))) for key, row in chunk]
+        # A row whose task has no teacher is left for the serial path, which
+        # raises on it by name rather than from a background thread.
+        rows = [r for r in rows if r[2] in self.teacher_wg]
+        if not rows:
+            return None
+
+        out = {key: [-1] * (1 + max(0, len(task_order) - 1)) for key, _, _ in rows}
+
+        def _cache(wg, entries, column_for):
+            if not entries:
+                return
+            sub = DataProto.from_dict(
+                tensors={
+                    name: torch.stack([row[name] for _, row, _ in entries])
+                    for name in ("input_ids", "attention_mask", "position_ids", "responses")
+                }
+            )
+            ids = torch.empty(len(entries), dtype=torch.long)
+            for j, (key, _, own) in enumerate(entries):
+                self._teacher_cache_counter += 1
+                ids[j] = self._teacher_cache_counter
+                out[key][column_for(own)] = self._teacher_cache_counter
+            self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+
+        gpu_profiler.push_phase("sign_weight_prefetch/base")
+        try:
+            _cache(self.base_wg, rows, lambda own: 0)
+        finally:
+            gpu_profiler.pop_phase("sign_weight_prefetch/base")
+
+        for model in task_order:
+            # Every row the model is NOT the on-task teacher for, which is what
+            # "off-task" means and the only rows its plane is read on.
+            entries = [r for r in rows if r[2] != model]
+            gpu_profiler.push_phase(f"sign_weight_prefetch/{model}")
+            try:
+                _cache(
+                    self.teacher_wg[model],
+                    entries,
+                    lambda own, m=model: 1 + self._sign_off_tasks_for(own, task_order).index(m),
+                )
+            finally:
+                gpu_profiler.pop_phase(f"sign_weight_prefetch/{model}")
+        return out
+
+    @staticmethod
+    def _sign_off_tasks_for(own, task_order):
+        """The off-task teachers of a row whose own task is ``own``, in column order.
+
+        One expression, read by both the prefetch and the post-rollout pass, so
+        the columns they write cannot drift apart. The actor reads them
+        positionally and has no way to notice if they did.
+        """
+        return [t for t in task_order if t != own]
 
     def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None):
         """One teacher call, with the DP padding marked so it is never cached.
@@ -593,6 +707,10 @@ class OPDRayTrainer(RayPPOTrainer):
                 hit = prefetched.get(key)
                 if hit is None:
                     continue
+                # The sign planes ride in the same entry; this path wants only
+                # the on-task half. compute_sign_weight_cache reads the other.
+                if isinstance(hit, PrefetchedRow):
+                    hit = hit.on_task
                 if self.student_indexed_topk:
                     cache_ids[i] = hit
                 elif self.teacher_topk_kl:
@@ -668,7 +786,7 @@ class OPDRayTrainer(RayPPOTrainer):
     # ------------------------------------------------------------------ #
     # Cross-teacher sign agreement (optional; see sign_weights.py).
     # ------------------------------------------------------------------ #
-    def compute_sign_weight_cache(self, batch: DataProto) -> None:
+    def compute_sign_weight_cache(self, batch: DataProto, prefetched=None, metrics=None) -> None:
         """Cache the base policy and every off-task teacher on the rows they have
         to speak for, so the actor can read them at ids the student picks.
 
@@ -682,6 +800,13 @@ class OPDRayTrainer(RayPPOTrainer):
         each teacher over the 2/3 of rows that are NOT its own task. The on-task
         pass already ran in :meth:`compute_teacher_log_probs` and is reused
         through the same cache rather than repeated.
+
+        ``prefetched`` holds rows whose three planes were already cached inside
+        the rollout window (see :meth:`_prefetch_sign_planes`); those columns are
+        filled in from it and excluded from the passes below, so each row is
+        scored exactly once by each model either way -- the same arrangement the
+        on-task teacher has had. What is left here is the misses, which at the
+        hit rates the on-task path sees is a small tail rather than the batch.
 
         Writes two columns:
 
@@ -715,14 +840,34 @@ class OPDRayTrainer(RayPPOTrainer):
 
         column_of = {}
         for own in task_order:
-            for c, other in enumerate([t for t in task_order if t != own]):
+            for c, other in enumerate(self._sign_off_tasks_for(own, task_order)):
                 column_of[(own, other)] = 1 + c
 
         sign_cache_ids = torch.full((bs, 1 + n_off), -1, dtype=torch.long)
         off_tasks = torch.full((bs, n_off), -1, dtype=torch.long)
         for i, own in enumerate(normalized):
-            for c, other in enumerate([t for t in task_order if t != own]):
+            for c, other in enumerate(self._sign_off_tasks_for(own, task_order)):
                 off_tasks[i, c] = task_id_of.get(other, -1)
+
+        # Rows the rollout window already covered. A row is filled by all four
+        # models in one chunk or by none of them, but the columns are checked
+        # one at a time anyway: the passes below select on the column they are
+        # about to write, so a half-filled row would still come out complete
+        # rather than silently keep a -1 the actor would read as an unanswered
+        # key.
+        keys = self._prefetched_teacher_rows(batch) if prefetched else None
+        for i, key in (keys or {}).items():
+            hit = prefetched.get(key)
+            ids = hit.sign_ids if isinstance(hit, PrefetchedRow) else None
+            if not ids:
+                continue
+            for c, cid in enumerate(ids[: 1 + n_off]):
+                if cid >= 0:
+                    sign_cache_ids[i, c] = cid
+        if metrics is not None and bs:
+            n_hit = int((sign_cache_ids >= 0).all(dim=1).sum())
+            metrics["sign_prefetch/rows"] = n_hit
+            metrics["sign_prefetch/hit_rate"] = n_hit / bs
 
         # Only what the forward reads. The batch at this point also carries the
         # rollout's own columns, and every one of them would be shipped to the
@@ -757,12 +902,20 @@ class OPDRayTrainer(RayPPOTrainer):
 
         gpu_profiler.push_phase("sign_weight_forward/base")
         try:
-            _cache(self.base_wg, list(range(bs)), lambda i: 0)
+            _cache(self.base_wg, [i for i in range(bs) if sign_cache_ids[i, 0] < 0], lambda i: 0)
         finally:
             gpu_profiler.pop_phase("sign_weight_forward/base")
 
         for task in task_order:
-            idxs = [i for i, t in enumerate(normalized) if t != task]
+            # Off-task rows this model has not already answered for. Selecting on
+            # the column rather than on a "was this row prefetched" flag keeps the
+            # two paths independent: a chunk that failed on the driver and was
+            # dropped leaves its rows here, exactly as the on-task path handles
+            # the same failure.
+            idxs = [
+                i for i, t in enumerate(normalized)
+                if t != task and sign_cache_ids[i, column_of[(t, task)]] < 0
+            ]
             if not idxs:
                 continue
             gpu_profiler.push_phase(f"sign_weight_forward/{task}")
@@ -1027,14 +1180,18 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch, metrics, timing_raw
                     )
 
+                    # Taken once and read by both passes below. The collector
+                    # clears it on the way out, so asking twice would hand the
+                    # second caller an empty dict and quietly rescore every row
+                    # it was supposed to skip.
+                    prefetched = self.traj_collector.take_prefetched_teacher()
+
                     # ---- Per-task teacher forward pass (the distillation signal;
                     # on pure OPD the ONLY training signal, on OPD+GRPO one of two) ----
                     with _timer("teacher_forward", timing_raw):
                         # writes teacher_log_probs OR teacher_topk_{logprobs,ids} into batch
                         self.compute_teacher_log_probs(
-                            batch,
-                            prefetched=self.traj_collector.take_prefetched_teacher(),
-                            metrics=metrics,
+                            batch, prefetched=prefetched, metrics=metrics
                         )
 
                     # tag rows with their task so the actor can split its metrics.
@@ -1049,7 +1206,9 @@ class OPDRayTrainer(RayPPOTrainer):
                     # into the same cache the on-task teacher is already in.
                     if self.cross_teacher_enabled:
                         with _timer("sign_weight_forward", timing_raw):
-                            self.compute_sign_weight_cache(batch)
+                            self.compute_sign_weight_cache(
+                                batch, prefetched=prefetched, metrics=metrics
+                            )
 
                     if self.need_hidden_cache:
                         # After the misses are scored, not before: the cache is only
