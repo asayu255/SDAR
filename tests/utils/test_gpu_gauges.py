@@ -218,7 +218,7 @@ def test_the_scanner_separates_the_same_two_cases_from_a_trace(tmp_path):
     busy = ([98, 97, 98], 20, {"gen_inflight": 200}, 30)
     path = _trace(tmp_path / "t.csv", [
         busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12),
-        busy, ([0, 1, 0], 6, {"retriever_inflight": 10, "ready": 32}, 12),
+        busy, ([0, 1, 0], 6, {"retriever_inflight": 10, "ready": 32, "slots_free": 1}, 12),
         busy, ([0, 1, 0], 6, {"retriever_inflight": 10}, 12),
         busy,
     ])
@@ -597,7 +597,7 @@ def test_the_primary_reason_is_what_the_excursion_was_mostly_made_of():
     rows = []
     t = 0.0
     # One sample of a fully-starved queue, then fourteen of a draining tail.
-    rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1}})
+    rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1, "slots_free": 1}})
     for _ in range(14):
         t += 0.1
         rows.append({"ts": t, "sm": [0, 0, 0], "cpu": 10, "gauges": {"gen_inflight": 2, "ready": 1}})
@@ -609,7 +609,8 @@ def test_the_primary_reason_is_what_the_excursion_was_mostly_made_of():
 
 def test_the_lead_in_is_dropped_when_it_is_the_primary():
     scanner = _scanner()
-    rows = [{"ts": i * 0.1, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1}} for i in range(10)]
+    rows = [{"ts": i * 0.1, "sm": [0, 0, 0], "cpu": 10, "gauges": {"ready": 1, "slots_free": 1}}
+            for i in range(10)]
     primary, lead_in, _ = scanner.why(rows, 1, 9, pre_roll=0.4, gen_full=100)
     assert primary == "SCHEDULER_STARVATION" and lead_in is None
 
@@ -634,3 +635,80 @@ def test_the_kv_guard_counts_depth_not_just_width():
     assert needed(504, 3) == needed(378, 4)
     assert needed(504, 3) <= 0.92 * budget
     assert needed(504, 4) > 0.92 * budget
+
+
+def test_starvation_needs_a_free_slot_not_merely_a_queue():
+    """`ready` changed meaning underneath the classifier.
+
+    It used to be "one batch that cannot be placed"; once the pipeline grew a
+    lookahead queue it means "the queue is a queue", true nearly all the time.
+    Reading starvation off it alone took SCHEDULER_STARVATION from 49.9 to
+    109.0 GPU-s in the same commit that added the queue -- a change in the
+    instrument, reported as a change in the run.
+    """
+    scanner = _scanner()
+    queued_busy = {"ready": 8, "slots_free": 0}
+    queued_free = {"ready": 8, "slots_free": 2}
+    assert scanner.why_one(queued_free, gen_full=100) == "SCHEDULER_STARVATION"
+    assert scanner.why_one(queued_busy, gen_full=100) == "SLOTS_BUSY_NOT_GENERATING"
+    # A dependency still outranks the catch-all when it is present.
+    assert scanner.why_one({"ready": 8, "slots_free": 0, "env_inflight": 378},
+                           gen_full=100) == "ENV_DEPENDENCY"
+    # And a trace written before slots_free existed reads the catch-all rather
+    # than inventing starvation from a missing gauge.
+    assert scanner.why_one({"ready": 1}, gen_full=100) == "SLOTS_BUSY_NOT_GENERATING"
+
+
+def test_slots_free_is_published_by_the_pipeline():
+    """The gauge has to actually move, or the branch above is unreachable."""
+    import threading
+
+    from verl.utils.val_pipeline import Slot, run_pipelined
+
+    gp.reset_gauges()
+    seen = []
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            seen.append(gp.gauge_snapshot())
+            time.sleep(0.01)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    slots = [Slot(f"s{i}", envs=None, collector=None) for i in range(3)]
+    list(run_pipelined(range(8), lambda x: x, lambda _p: None,
+                       lambda _p, _s: time.sleep(0.05), slots))
+    stop.set()
+    watcher.join()
+    assert any("slots_free" in s for s in seen), seen
+    assert any(s.get("slots_free", 0) == 0 for s in seen), "never fully occupied"
+    assert gp.gauge_snapshot().get("slots_free", 0) in (0, 3)
+
+
+def test_a_gauge_column_the_scanner_has_never_heard_of_is_still_read():
+    """The gauge list was duplicated and the copy went stale.
+
+    scripts/gpu_stall_scan.py kept its own tuple of gauge names, imported from
+    verl when importable and hard-coded when not. `slots_free` was added to the
+    profiler, written into every row of the trace -- and dropped by the scanner,
+    which classified every excursion as though the gauge did not exist. The
+    columns are the file's own header now; anything not fixed and not a per-GPU
+    series is a gauge.
+    """
+    import csv as _csv
+    import tempfile
+
+    scanner = _scanner()
+    tmp = Path(tempfile.mkdtemp()) / "t.csv"
+    tmp.write_text(
+        "ts,clock,pid,phase,sm_pct_per_gpu,membw_pct_per_gpu,power_w_per_gpu,"
+        "smclk_mhz_per_gpu,pcie_rx_mb_s_per_gpu,nvlink_mb_s_per_gpu,driver_cpu_pct,"
+        "ready,gen_inflight,slots_free,a_gauge_invented_tomorrow,activity,stack_id\n"
+        "0.000,00:00:00,1,gen,0;1;0,;;,;;,;;,;;,;;,6,32,0,1,7,gen:1,0\n"
+    )
+    rows, _skipped = scanner.read_trace(str(tmp))
+    assert rows[0]["gauges"] == {"ready": 32, "slots_free": 1, "a_gauge_invented_tomorrow": 7}
+    # and the per-GPU series are not mistaken for gauges
+    assert not any(k.endswith("_per_gpu") for k in rows[0]["gauges"])
+    assert _csv  # (the import is what read_trace uses)

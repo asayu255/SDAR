@@ -328,10 +328,15 @@ def run_pipelined(
             clock["prepare"] += time.perf_counter() - _t
             pending.append((next_seq, prepared, task_of(prepared)))
             next_seq += 1
-        # THE GAUGE THE CLASSIFIER TURNS ON: how much work exists and is not
-        # with the engine. If the cards go idle while this is non-zero it is not
-        # the retriever's fault, however busy the retriever happens to be.
+        # THE GAUGES THE CLASSIFIER TURNS ON. `ready` is how much work exists
+        # and is not with the engine; `slots_free` is whether any of it COULD
+        # have been started. Both, because with a lookahead queue `ready` alone
+        # stopped meaning what it meant: it used to be "one batch that cannot be
+        # placed" and is now "the queue is a queue", true nearly all the time.
+        # Reading starvation off `ready` alone doubled it the moment the queue
+        # arrived, which is a change in the instrument, not in the run.
         _gauge_set("ready", len(pending))
+        _gauge_set("slots_free", len(free))
 
     def dispatch():
         """Give every free slot the oldest pending batch it can run."""
@@ -345,6 +350,7 @@ def run_pipelined(
             inflight[seq] = (prepared, executor.submit(timed_launch, prepared, slot), slot)
             placed = True
         _gauge_set("ready", len(pending))
+        _gauge_set("slots_free", len(free))
         return placed
 
     try:
@@ -376,6 +382,11 @@ def run_pipelined(
                 stuck = {task for _s, _p, task in pending}
                 raise RuntimeError(f"no slot can run task(s) {sorted(stuck)}: {slots}")
     finally:
+        # Cleared, because a gauge that outlives the pipeline is a wrong answer
+        # rather than a stale one: `slots_free` left at 2 makes every later
+        # excursion in the process read as SCHEDULER_STARVATION.
+        _gauge_set("ready", 0)
+        _gauge_set("slots_free", 0)
         report(final=True)
         # Never leave a rollout running into the caller's next phase; a batch
         # still generating would be holding the worker group and the engine.

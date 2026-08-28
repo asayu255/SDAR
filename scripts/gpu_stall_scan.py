@@ -97,9 +97,9 @@ def read_trace(path):
                         # and every excursion in them classifies as
                         # UNINSTRUMENTED, which is the truth about them.
                         "gauges": {
-                            name: int(float(r[name]))
-                            for name in GAUGE_NAMES
-                            if (r.get(name) or "").strip() not in ("", "0")
+                            name: int(float(value))
+                            for name, value in r.items()
+                            if _is_gauge(name) and (value or "").strip() not in ("", "0")
                         },
                         "activity": (r.get("activity") or "").strip(),
                         "stack_id": int(r["stack_id"]) if (r.get("stack_id") or "").strip() else None,
@@ -217,13 +217,21 @@ def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0, gen_full=1):
     return out
 
 
-# Kept in step with gpu_profiler.GAUGE_NAMES. Imported when verl is importable,
-# hard-coded when it is not, because this script is run against a CSV on a
-# laptop as often as beside the code that wrote it.
-try:  # pragma: no cover - exercised both ways in the tests
-    from verl.utils.gpu_profiler import GAUGE_NAMES
-except Exception:  # pragma: no cover
-    GAUGE_NAMES = ("ready", "gen_inflight", "retriever_inflight", "env_inflight", "future_wait")
+# THE GAUGE COLUMNS COME FROM THE FILE'S OWN HEADER, not from a list kept in
+# step with the profiler's. It was a list, imported from verl when importable
+# and hard-coded when not -- and the hard-coded copy went stale the day a gauge
+# was added: `slots_free` was written into every row of the trace, read out of
+# the header, and then dropped, so every excursion classified as though the
+# gauge did not exist. A duplicated constant is the wrong shape for this;
+# every column that is not one of the known fixed ones IS a gauge.
+_NON_GAUGE_COLUMNS = frozenset(
+    ["ts", "clock", "pid", "phase", "driver_cpu_pct", "activity", "stack_id"]
+)
+
+
+def _is_gauge(column):
+    """Every column that is not fixed, and not one of the per-GPU series."""
+    return column not in _NON_GAUGE_COLUMNS and not column.endswith("_per_gpu")
 
 
 # How far back of an excursion's start to look for its cause.
@@ -266,12 +274,24 @@ def why_one(gauges, cpu=None, gen_full=1):
         # A handful of requests: the tail of a turn. Whether that costs anything
         # depends entirely on whether a whole batch was sitting behind it.
         return "TAIL_BLOCKS_READY" if ready else "TAIL_DRAIN"
-    if ready:
+    # The engine is empty from here down.
+    #
+    # STARVATION NEEDS A FREE SLOT, not merely queued work. `ready` used to mean
+    # "one batch that cannot be placed" and, once the pipeline grew a lookahead
+    # queue, means "the queue is a queue" -- true nearly all the time. Reading
+    # starvation off it alone more than doubled the number the moment the queue
+    # arrived, which was a change in the instrument and not in the run. Work
+    # waiting while every slot is legitimately occupied is a different finding
+    # and gets a different name.
+    free = gauges.get("slots_free", 0)
+    if ready and free:
         return "SCHEDULER_STARVATION"
     if retr:
         return "RETRIEVER_DEPENDENCY"
     if env:
         return "ENV_DEPENDENCY"
+    if ready:
+        return "SLOTS_BUSY_NOT_GENERATING"
     if wait and (cpu is None or cpu < 20):
         return "FUTURE_RAY_WAIT"
     if cpu is not None and cpu >= 60:
@@ -318,6 +338,7 @@ def _mean_sm(sm):
 _REASON_RANK = (
     "SCHEDULER_STARVATION",
     "TAIL_BLOCKS_READY",
+    "SLOTS_BUSY_NOT_GENERATING",
     "RETRIEVER_DEPENDENCY",
     "ENV_DEPENDENCY",
     "FUTURE_RAY_WAIT",
@@ -489,7 +510,10 @@ def analyse(path, floor, busy, top):
             share = (lost / exc_lost * 100.0) if exc_lost else 0.0
             print(f"    {reason:<22}{n:>7}{wall:>9.1f}{lost:>12.1f}{share:>7.1f}%")
         meaning = {
-            "SCHEDULER_STARVATION": "work was ready and the engine had NOTHING -- fix the submitting side",
+            "SCHEDULER_STARVATION": "a slot was FREE, work was ready, and the engine had nothing -- "
+                                    "the dispatcher missed it",
+            "SLOTS_BUSY_NOT_GENERATING": "every slot was occupied and none was feeding the engine -- "
+                                         "between turns, in the driver, or in the pump round trip",
             "TAIL_BLOCKS_READY": "the engine was draining a turn's last few rows while a whole batch "
                                  "waited for a slot -- more slots, or let a slot start before its tail ends",
             "TAIL_DRAIN": "a turn's last few rows were finishing and nothing else was ready to run",
