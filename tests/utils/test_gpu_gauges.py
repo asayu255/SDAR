@@ -378,3 +378,104 @@ def test_a_trace_whose_sidecar_was_left_behind_still_scans(tmp_path):
     out = _scan(path)      # _trace writes no sidecar
     assert "RETRIEVER_DEPENDENCY" in out
     assert "costliest excursions" in out
+
+
+# --------------------------------------------------------------------------- #
+# NVML smooths, so the deepest sample is not the causing sample
+# --------------------------------------------------------------------------- #
+def _lagged_trace(path, *, stall_samples=3, window=3, lag=2):
+    """A retrieval stall whose SM minimum lands AFTER the retrieval finished.
+
+    utilization.gpu is a moving-window average. The true sequence is
+
+        retriever busy, queue empty      SM falls
+        retriever done, generate resumes SM keeps falling for a window, then rises
+
+    so the sample where SM bottoms out has retriever_inflight=0 and
+    gen_inflight>0 -- and a classifier reading that one sample calls a retrieval
+    stall GPU_SIDE. Every synthetic trace in this file until now flipped the
+    gauges and the SM on the same row, which is the one shape that cannot catch
+    this.
+    """
+    names = ",".join(gp.GAUGE_NAMES)
+    lines = ["ts,clock,pid,phase,sm_pct_per_gpu,membw_pct_per_gpu,power_w_per_gpu,"
+             "smclk_mhz_per_gpu,pcie_rx_mb_s_per_gpu,nvlink_mb_s_per_gpu,driver_cpu_pct,"
+             + names + ",activity,stack_id"]
+    true_sm, gauges = [], []
+
+    def add(sm_true, g):
+        true_sm.append(sm_true)
+        gauges.append(g)
+
+    for _ in range(40):
+        add(100, {"gen_inflight": 200})
+    for _ in range(stall_samples):          # queue empty, retriever running
+        add(0, {"retriever_inflight": 8})
+    for _ in range(40):                     # recovered
+        add(100, {"gen_inflight": 200})
+
+    t = 0.0
+    for i, g in enumerate(gauges):
+        # TWO effects, and only the second one moves the minimum past the event.
+        # A trailing mean alone bottoms out on the LAST stall sample, where the
+        # gauges still say retriever -- so a mean-only fixture cannot express
+        # this bug, which is how the first attempt at this test passed against
+        # the broken scanner. NVML also recomputes on its own cadence, so a poll
+        # returns a value already up to one update period old; that staleness is
+        # what carries the minimum into the recovery, where the gauges have
+        # flipped to gen_inflight.
+        end = i - lag
+        lo = max(0, end - window + 1)
+        smoothed = sum(true_sm[lo:end + 1]) / (end - lo + 1) if end >= 0 else 100
+        cpu = 6 if g.get("retriever_inflight") else 20
+        lines.append(
+            f"{t:.3f},00:00:00,1,gen,{';'.join([f'{smoothed:.0f}'] * 3)},;;,;;,;;,;;,;;,{cpu},"
+            + ",".join(str(g.get(n, 0)) for n in gp.GAUGE_NAMES) + ",gen:1,0"
+        )
+        t += 0.1
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_a_short_retrieval_stall_is_not_called_gpu_side(tmp_path):
+    """The regression the previous synthetic traces could not express.
+
+    At the SM minimum the retriever has finished and the engine is busy again,
+    so a single-sample classifier reads gen_inflight>0 and answers GPU_SIDE --
+    pointing the next fix at the engine for a stall the engine did not cause.
+    """
+    out = _scan(_lagged_trace(tmp_path / "lag.csv"))
+    assert "RETRIEVER_DEPENDENCY" in out, out
+    assert "GPU_SIDE" not in out.split("why the cards were idle")[1], out
+
+
+def test_the_deepest_sample_really_does_say_gpu_side(tmp_path):
+    """Guard on the fixture: if it stops lagging, the test above proves nothing.
+
+    A regression test for smoothing has to actually contain smoothing, and the
+    only way to be sure is to check that the naive reading still gets it wrong.
+    """
+    import csv as _csv
+
+    path = _lagged_trace(tmp_path / "lag.csv")
+    with open(path) as f:
+        rows = list(_csv.DictReader(f))
+    deepest = min(rows, key=lambda r: float(r["sm_pct_per_gpu"].split(";")[0]))
+    assert int(deepest["retriever_inflight"]) == 0, "the fixture is not lagged"
+    assert int(deepest["gen_inflight"]) > 0, "the fixture is not lagged"
+
+
+def test_a_retrieval_alongside_a_busy_engine_is_not_the_reason(tmp_path):
+    """gen_inflight is required to be absent for every dependency answer.
+
+    Twenty retrievals running while a hundred requests are with the engine is
+    not why a card went idle, however busy the retriever looks.
+    """
+    from importlib.machinery import SourceFileLoader
+
+    scanner = SourceFileLoader(
+        "stall_scan", str(Path(__file__).resolve().parents[2] / "scripts" / "gpu_stall_scan.py")
+    ).load_module()
+    assert scanner.why_one({"retriever_inflight": 20, "gen_inflight": 100}) == "GPU_SIDE"
+    assert scanner.why_one({"retriever_inflight": 20, "gen_inflight": 0}) == "RETRIEVER_DEPENDENCY"
+    assert scanner.why_one({}) is None

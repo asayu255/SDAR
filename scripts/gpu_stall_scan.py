@@ -208,7 +208,10 @@ def excursions(rows, dts, gi, floor, baseline, edge_margin=1.0):
                 # shoulders of an excursion are the GPU draining and refilling,
                 # and the state that explains it is the one at the bottom.
                 "gauges": rows[argmin].get("gauges") or {},
-                "why": why(rows[argmin].get("gauges") or {}, rows[argmin].get("cpu")),
+                # Over the window, with a pre-roll. NOT rows[argmin]: NVML
+                # smooths, so the deepest sample is later than the event that
+                # emptied the queue -- often after it has already refilled.
+                **dict(zip(("why", "why_dwell"), why(rows, a, b))),
             }
         )
     return out
@@ -223,43 +226,90 @@ except Exception:  # pragma: no cover
     GAUGE_NAMES = ("ready", "gen_inflight", "retriever_inflight", "env_inflight", "future_wait")
 
 
-def why(gauges, cpu=None):
-    """What the outstanding work says about an idle GPU.
+# How far back of an excursion's start to look for its cause.
+#
+# NVML's utilization.gpu is a moving-window average, not an instantaneous
+# reading, so the sample where SM bottoms out is LATER than the event that
+# emptied the queue -- by roughly the width of that window. On a 300 ms
+# retrieval stall the sequence is: retriever finishes, generation restarts, and
+# only then does the smoothed SM reach its minimum. At that sample
+# retriever_inflight is already 0 and gen_inflight is already 1.
+PRE_ROLL_S = float(os.environ.get("GPU_STALL_PRE_ROLL_S", "0.4"))
 
-    The two answers this exists to separate look identical on the device:
 
-        ready=0,  retriever_inflight=10  ->  nothing COULD be submitted
-        ready=32, retriever_inflight=10  ->  something could and was not
+def why_one(gauges, cpu=None):
+    """The state at one sample, as a reason. Not a verdict on an excursion.
 
-    and their fixes are opposite -- speed up the retriever, or stop
-    lock-stepping and submit what was already waiting.
-
-    UNINSTRUMENTED is a real answer and must stay reachable. A classifier with
-    no such branch attributes every gap to whichever gauge happens to exist,
-    and then argues confidently for a fix aimed at the wrong thing; this arm has
-    named a cause and then measured it at under 0.05 of a slot twice.
+    ``gen`` is required to be absent for every dependency answer. A retrieval
+    running while a hundred requests are with the engine is not why the cards
+    are idle, however busy the retriever looks.
     """
     if not gauges:
-        return "UNINSTRUMENTED"
+        return None
     ready = gauges.get("ready", 0)
     gen = gauges.get("gen_inflight", 0)
     retr = gauges.get("retriever_inflight", 0)
     env = gauges.get("env_inflight", 0)
     wait = gauges.get("future_wait", 0)
 
-    if ready and not gen:
-        return "SCHEDULER_STARVATION"
     if gen:
         return "GPU_SIDE"
-    if retr and not ready:
+    if ready:
+        return "SCHEDULER_STARVATION"
+    if retr:
         return "RETRIEVER_DEPENDENCY"
-    if env and not ready:
+    if env:
         return "ENV_DEPENDENCY"
     if wait and (cpu is None or cpu < 20):
         return "FUTURE_RAY_WAIT"
     if cpu is not None and cpu >= 60:
         return "DRIVER_CPU"
-    return "UNINSTRUMENTED"
+    return None
+
+
+# Ranked. When an excursion's window holds more than one state -- and a short
+# one usually does, because the window straddles the recovery -- the reason is
+# the one that explains an EMPTY QUEUE, not the one that happens to coincide
+# with the deepest sample. GPU_SIDE loses to all of them: it is the answer for
+# an excursion that was never queue-starved at all, so if any sample in the
+# window shows a starved queue, that is the finding.
+_REASON_RANK = (
+    "SCHEDULER_STARVATION",
+    "RETRIEVER_DEPENDENCY",
+    "ENV_DEPENDENCY",
+    "FUTURE_RAY_WAIT",
+    "DRIVER_CPU",
+    "GPU_SIDE",
+)
+
+
+def why(rows, i0, i1, pre_roll=PRE_ROLL_S):
+    """Why an EXCURSION was idle, from the window that could have caused it.
+
+    Reading the single deepest sample -- which this did -- attributes a stall to
+    whatever was true after it had already recovered. The window runs from
+    pre_roll seconds before the excursion starts to its end, and every sample in
+    it votes; the highest-ranked reason present wins, with the dwell time on
+    each kept so a marginal call is visible rather than silent.
+
+    UNINSTRUMENTED stays reachable: a classifier with no such branch attributes
+    every gap to whichever gauge happens to exist, and this arm has named a
+    cause and then measured it under 0.05 of a slot twice.
+    """
+    t_from = rows[i0]["ts"] - pre_roll
+    dwell = defaultdict(int)
+    for r in rows[: i1 + 1]:
+        if r["ts"] < t_from:
+            continue
+        reason = why_one(r.get("gauges"), r.get("cpu"))
+        if reason:
+            dwell[reason] += 1
+    if not dwell:
+        return "UNINSTRUMENTED", {}
+    for reason in _REASON_RANK:
+        if reason in dwell:
+            return reason, dict(dwell)
+    return "UNINSTRUMENTED", dict(dwell)
 
 
 def classify(rows, exc, floor, busy=95.0):
@@ -412,8 +462,16 @@ def analyse(path, floor, busy, top):
         # The state at the bottom of THIS excursion, not averaged over the run.
         # A reason without it says which dependency; with it, which line.
         detail = []
+        # The dwell, whenever the window held more than one state -- which a
+        # short excursion usually does, because the window straddles the
+        # recovery. Printing it makes a close call visible instead of leaving
+        # one word standing for a vote it might have narrowly won.
+        dwell = e.get("why_dwell") or {}
+        if len(dwell) > 1:
+            detail.append("samples " + " ".join(f"{k.split('_')[0].lower()}:{v}" for k, v in
+                                                sorted(dwell.items(), key=lambda kv: -kv[1])))
         if e["gauges"]:
-            detail.append("  ".join(f"{k}={v}" for k, v in e["gauges"].items()))
+            detail.append("at min: " + " ".join(f"{k}={v}" for k, v in e["gauges"].items()))
         if r.get("activity"):
             detail.append(f"in: {r['activity']}")
         if detail:

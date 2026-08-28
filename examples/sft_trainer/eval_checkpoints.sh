@@ -90,16 +90,29 @@ mkdir -p "$RAY_TMPDIR" 2>/dev/null || true
 # a quiet machine, and nothing in the log said which had happened -- so a 1.5%
 # difference could be the change or could be the neighbours. One line, so the
 # measurement carries its own context.
-# SAMPLING INTERVAL. 0.3 s is the default and is right for "how much of the run
-# was idle"; 0.1 s is right for "which 1.8-second dip, and what was outstanding
-# during it". Finer than 0.1 buys nothing: NVML's utilization.gpu is a
-# moving-window average over roughly 1/6 s to 1 s depending on the card, so a
-# 10 ms poll returns the same smoothed number several times, not 10 ms detail.
+# SAMPLING INTERVAL -- 0.1 s here, against the library default of 0.3 s.
 #
-#   GPU_PROFILER_INTERVAL=0.1 GPU_PROFILER_TRACE=/tmp/trace.csv bash ...
+# 0.3 s is right for "how much of the run was idle". It is not enough for "which
+# 300 ms dip, and what was outstanding during it": a 300 ms stall gets zero or
+# one sample inside it, so the gauges that would explain it are as likely to be
+# missed as caught. At 0.1 s a 300 ms stall gets about three and a 500 ms one
+# about five.
+#
+# Finer than 0.1 buys little: NVML's utilization.gpu is a moving-window average
+# over roughly 1/6 s to 1 s depending on the card, so a 10 ms poll returns the
+# same smoothed number several times rather than 10 ms of detail. It would still
+# raise the chance of catching a gauge transition -- that is the only reason to
+# go lower, and it costs proportionally more memory and CPU for it.
+#
+# Costed before being turned on: the per-sample stack state is stored as an
+# interned id rather than one string per thread, which is about 1 MB over a
+# 3800 s run against about 0.3 GB if the strings were kept.
+export GPU_PROFILER_INTERVAL="${GPU_PROFILER_INTERVAL:-0.1}"
+
+# Set GPU_PROFILER_TRACE to get the per-excursion table:
+#
+#   GPU_PROFILER_TRACE=/tmp/trace.csv bash examples/sft_trainer/eval_checkpoints.sh 300
 #   python scripts/gpu_stall_scan.py /tmp/trace.csv
-#
-# gives the per-excursion table with a reason attached to each one.
 
 _CORES=$(nproc 2>/dev/null || echo '?')
 echo "[eval] machine     : $_CORES cores, load$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null | sed 's/^/ /')" \

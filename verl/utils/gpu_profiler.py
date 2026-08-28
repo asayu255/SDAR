@@ -270,6 +270,7 @@ _GAUGE_SOURCES: Dict[str, Any] = {}
 # rather than growing a dict without limit inside the sampler.
 _STACK_TABLE_MAX = int(os.environ.get("GPU_PROFILER_STACK_TABLE_MAX", "20000"))
 _STACK_IDS: Dict[tuple, int] = {}
+_STACK_BY_ID: Dict[int, tuple] = {}
 
 
 def stack_state_id(keys):
@@ -296,6 +297,7 @@ def stack_state_id(keys):
         return -1, (ours, outside)
     ident = len(_STACK_IDS)
     _STACK_IDS[ours] = ident
+    _STACK_BY_ID[ident] = (ours, outside)
     return ident, (ours, outside)
 
 
@@ -779,9 +781,16 @@ class _Sampler:
                 gauges = gauge_snapshot()
                 self._gauge_trace.append((t, gauges))
                 stacks = stack_snapshot()
-                self._stack_trace.append((t, stacks))
+                stack_id, _key = stack_state_id(stacks)
+                # The ID, not the strings. stack_snapshot builds a new string per
+                # thread per sample and they are not interned, so at a 0.1 s
+                # interval over a 3800 s run keeping them costs about 0.3 GB
+                # against about 1 MB for the ids. Sub-second excursions are what
+                # 0.1 s sampling is for, so this is what makes that interval
+                # affordable rather than a memory bomb an hour in.
+                self._stack_trace.append((t, stack_id))
                 census = activity_snapshot()
-            self._write_trace(t, phase, per_gpu, host, gauges, census, stacks)
+            self._write_trace(t, phase, per_gpu, host, gauges, census, stack_id)
 
     def _write_trace(self, t, phase, per_gpu, host, gauges=None, census=None, stacks=None):
         """Append one row to GPU_PROFILER_TRACE, if it is set.
@@ -808,7 +817,8 @@ class _Sampler:
             # Semicolons inside the field, because the file is comma-separated
             # and a census is a mapping. Same convention as the per-GPU columns.
             act = ";".join(f"{k}:{v}" for k, v in sorted((census or {}).items()))
-            sid, key = stack_state_id(stacks or [])
+            sid, key = ((stacks, _STACK_BY_ID.get(stacks, ((), 0))) if isinstance(stacks, int)
+                        else stack_state_id(stacks or []))
             if self._stacks_file is not None and sid >= 0 and sid not in self._stacks_seen:
                 self._stacks_seen.add(sid)
                 frames, outside = key
@@ -956,7 +966,20 @@ class _Sampler:
             seen = [stack_at[ts] for ts in stamps if ts in stack_at]
             if not seen:
                 return None
-            counted = Counter(key for keys in seen for key in keys)
+            counted = Counter()
+            for entry in seen:
+                # An interned id from the sampler, or a literal list of keys from
+                # a test double. Both, because the doubles are far more readable
+                # written out.
+                if isinstance(entry, int):
+                    ours, outside = _STACK_BY_ID.get(entry, ((), 0))
+                    counted.update(ours)
+                    if outside:
+                        # Weighted, not expanded: expanding is a 140-element list
+                        # per sample, the allocation the ids exist to avoid.
+                        counted["B -"] += outside
+                else:
+                    counted.update(entry)
             # Deep, and truncated by the FORMATTER after it has split running
             # from parked. Truncating here ranks by raw count, and the raw count
             # is led by a hundred-odd parked infrastructure threads -- which is
