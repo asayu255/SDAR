@@ -18,6 +18,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import uuid
@@ -60,13 +61,19 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
 )
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    deal_by_length,
+    get_seqlen_balanced_partitions,
+    log_minibatch_unbalance,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
+from agent_system.multi_turn_rollout.rollout_loop import rollout_session
 from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 WorkerType = Type[Worker]
@@ -495,6 +502,18 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] += timer.last
 
 
+# Deal each rank's rows length-first into its mini-batches so mini-batch k holds
+# the same token count on every rank. OFF by default, and deliberately: it
+# changes which rows share a mini-batch, and with many optimizer steps per
+# training step the trajectory is not bit-identical -- turning it on would make
+# a new arm non-comparable with the ones already run. The measurement in
+# _balance_batch runs either way, so the size of the prize is visible before
+# anyone spends it. Turn on with BALANCE_MINIBATCH=1 and compare
+# perf/mfu/actor, which is data-independent.
+_BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
 class RayPPOTrainer:
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -889,6 +908,31 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
+    @staticmethod
+    def _decode_for_val_table(tokenizer, ids_rows, limit):
+        """Decode rows for the logged sample table, or nothing when it is off.
+
+        The table is capped at ``trainer.log_val_generations`` samples and this
+        repo runs it at 0 -- yet every validation row's prompt AND response were
+        decoded on the calling thread to feed it. The reward manager had the same
+        bug on the same thread (fixed there by gating on ``num_examine``).
+        """
+        if not limit:
+            return []
+        return [tokenizer.decode(ids, skip_special_tokens=True) for ids in ids_rows]
+
+    @staticmethod
+    def _response_digest(responses):
+        """A short fingerprint of a batch's generated token ids.
+
+        Any change that claims to leave generation alone -- a session hoist, a
+        reused tokenisation, a merged generate call -- has to be shown to produce
+        the same TOKENS, not only the same scores. Batches are consumed in
+        dataloader order, so equal digests at the same batch index mean equal
+        generations, row for row.
+        """
+        return hashlib.sha1(responses.cpu().numpy().tobytes()).hexdigest()[:12]
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -902,95 +946,109 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        # One vLLM session for the WHOLE validation, not one per batch. Without
+        # the hoist the sharding manager unmaps and remaps ~21 GB between every
+        # batch; on the arm this came from that was 10.4% of the evaluation wall
+        # clock, and the search batches are far too short to amortise it. The
+        # worker counts scopes by depth, so the inner per-rollout sessions that
+        # multi_turn_loop still opens become no-ops.
+        val_batch_index = 0
+        with rollout_session(self.actor_rollout_wg):
+            for test_data in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(test_data)
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+                # repeat test batch
+                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+                # we only do validation on rule-based rm
+                if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                    return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+                # Store original inputs
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = self._decode_for_val_table(self.tokenizer, input_ids, self.config.trainer.log_val_generations)
+                sample_inputs.extend(input_texts)
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "env_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("env_kwargs")
-            if "task_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("task_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+                if "multi_modal_data" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "tools_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "env_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("env_kwargs")
+                if "task_name" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("task_name")
+                test_gen_batch = test_batch.pop(
+                    batch_keys=batch_keys_to_pop,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                )
 
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "validate": True,
-            }
-            test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "validate": True,
+                }
+                test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # # pad to be divisible by dp_size
+                # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
 
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                # # unpad
+                # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
-            ################ agent-environment loop ###############
-            test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                    gen_batch=test_gen_batch,
-                                                    actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
-                                                    is_train=False,
-                                                    )
-            print('validation generation end')
-            del test_batch
-            test_batch = test_output_gen_batch
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                ################ agent-environment loop ###############
+                test_output_gen_batch = self.traj_collector.multi_turn_loop(
+                                                        gen_batch=test_gen_batch,
+                                                        actor_rollout_wg=self.actor_rollout_wg,
+                                                        envs=self.val_envs,
+                                                        is_train=False,
+                                                        )
+                print('validation generation end')
+                del test_batch
+                test_batch = test_output_gen_batch
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                print(
+                    f"[val-hash] batch#{val_batch_index} rows={output_ids.shape[0]} "
+                    f"responses sha1 {self._response_digest(output_ids)}",
+                    flush=True,
+                )
+                val_batch_index += 1
+                output_texts = self._decode_for_val_table(self.tokenizer, output_ids, self.config.trainer.log_val_generations)
+                sample_outputs.extend(output_texts)
 
-            # test_batch = test_batch.union(test_output_gen_batch)
+                # test_batch = test_batch.union(test_output_gen_batch)
 
-            # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                # evaluate using reward_function
+                result = self.val_reward_fn(test_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_scores.extend(scores)
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-            batch_task_names = get_task_names(test_batch)
-            if batch_task_names is None:
-                batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
-            task_name_lst.append(batch_task_names)
-            tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
-            traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
-            # success rate
-            for k in test_batch.non_tensor_batch.keys():
-                if 'success_rate' in k:
-                    if k not in success_rate_dict:
-                        success_rate_dict[k] = []
-                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
-                    # all success_rate should be the same
-                    for i in range(1, len(test_batch.non_tensor_batch[k])):
-                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+                reward_tensor_lst.append(reward_tensor)
+                data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                batch_task_names = get_task_names(test_batch)
+                if batch_task_names is None:
+                    batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
+                task_name_lst.append(batch_task_names)
+                tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
+                traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                # success rate
+                for k in test_batch.non_tensor_batch.keys():
+                    if 'success_rate' in k:
+                        if k not in success_rate_dict:
+                            success_rate_dict[k] = []
+                        success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
+                        # all success_rate should be the same
+                        for i in range(1, len(test_batch.non_tensor_batch[k])):
+                            assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1290,11 +1348,49 @@ class RayPPOTrainer:
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst, k_partitions=world_size, equal_size=True)
+        minibatch_rows = self._minibatch_rows_per_rank(world_size)
+        ordered = global_partition_lst
+        if _BALANCE_MINIBATCH and minibatch_rows:
+            # Balancing the rank totals leaves mini-batch k unrelated across
+            # ranks, and the ranks meet at the gradient reduce that ends every
+            # one of them. deal_by_length gives each rank the same length-ordered
+            # deal, so the columns match by construction.
+            ordered = [deal_by_length(global_seqlen_lst, p, minibatch_rows)
+                       for p in global_partition_lst]
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        global_idx = torch.tensor([j for partition in ordered for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        # The whole-batch balance above is exact to about a token, and says
+        # nothing about where the ranks actually meet: at the gradient reduce and
+        # optimizer step that end every mini-batch, of which there are
+        # train_rows / ppo_mini_batch_size per step. Each is a contiguous slice
+        # of the rank's rows, and the partitioner's length ordering is discarded
+        # by _check_and_sort_partitions, so slice k can hold very different token
+        # counts on different ranks while the totals still match. That difference
+        # is a wait on every rank but the slowest, and it is invisible to
+        # utilization.gpu, which counts a spinning collective as busy. Measured
+        # rather than inferred, because it is free to do so.
+        if minibatch_rows:
+            # Measured on what was actually dispatched, so with BALANCE_MINIBATCH
+            # on the wait it reports is the one the run really paid.
+            metrics.update(log_minibatch_unbalance(
+                seqlen_list=global_seqlen_lst, partitions=ordered,
+                minibatch_rows=minibatch_rows, prefix=logging_prefix))
+
+    def _minibatch_rows_per_rank(self, world_size: int) -> int:
+        """Rows in one rank's mini-batch, or 0 if this arm has no actor to ask.
+
+        ppo_mini_batch_size is a global row count in the driver's config and is
+        divided by world_size inside the worker (fsdp_workers), so the division
+        has to be repeated here rather than read off.
+        """
+        try:
+            mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        except Exception:  # noqa: BLE001 - a metric must never break a step
+            return 0
+        return int(mini) // world_size if mini else 0
 
     def fit(self):
         """

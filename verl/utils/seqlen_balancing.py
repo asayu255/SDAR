@@ -218,6 +218,112 @@ def log_seqlen_unbalance(seqlen_list: List[int], partitions: List[List[int]], pr
     }
 
 
+def deal_by_length(seqlen_list: List[int], partition: List[int], minibatch_rows: int) -> List[int]:
+    """Reorder one rank's rows so its mini-batches match the other ranks'.
+
+    ``get_seqlen_balanced_partitions`` equalises the rank totals and then
+    ``_check_and_sort_partitions`` sorts each partition by original index,
+    discarding the length ordering it worked in. What survives is a rank total;
+    what does not is any relationship between rank A's k-th mini-batch and rank
+    B's. Since the ranks meet at the gradient reduce that ends every mini-batch,
+    that difference is a wait -- measured at 12.7% of a rank's tokens in a real
+    step, and invisible to utilization.gpu because a spinning collective is busy
+    to it.
+
+    Longest-first, dealt round-robin. Every rank runs the same rule over the same
+    number of rows, so mini-batch k holds each rank's k-th, (k+M)-th, (k+2M)-th
+    ... longest row and the columns match by construction.
+
+    The capacities are exactly what ``batch.split(minibatch_rows)`` will later
+    cut -- ``[C] * (n // C)`` plus a short tail. Dealing into ``ceil(n / C)``
+    equal-count buckets instead gives sizes C-1 and C, which split() then cuts
+    across, and the careful ordering is lost at the first boundary.
+
+    Sorting the rows and chunking them contiguously would also match the columns,
+    and is the wrong fix: it puts every long row in the first mini-batches, which
+    on a real step makes the largest mini-batch 6.6x the smallest and 42% larger
+    than anything the run sees today. Dealing makes each mini-batch a stratified
+    sample instead -- on that same step the largest is 1.17x the smallest, and
+    47% BELOW today's largest, so the peak activation footprint falls rather than
+    rises.
+
+    Returns the partition's indices in the new order. Same indices, same count.
+    """
+    n = len(partition)
+    if minibatch_rows <= 0 or n <= minibatch_rows:
+        return list(partition)
+    caps = [minibatch_rows] * (n // minibatch_rows)
+    if n % minibatch_rows:
+        caps.append(n % minibatch_rows)
+    buckets = [[] for _ in caps]
+    at = 0
+    for idx in sorted(partition, key=lambda i: -seqlen_list[i]):
+        while len(buckets[at]) >= caps[at]:
+            at = (at + 1) % len(caps)
+        buckets[at].append(idx)
+        at = (at + 1) % len(caps)
+    return [i for bucket in buckets for i in bucket]
+
+
+def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]], minibatch_rows: int, prefix):
+    """How balanced the MINI-BATCHES are across ranks, which is a different
+    question from how balanced the ranks are.
+
+    ``get_seqlen_balanced_partitions`` equalises each rank's total over the whole
+    batch, and ``log_seqlen_unbalance`` reports that it succeeded -- typically to
+    within a single token. But the ranks do not meet once per batch. They meet at
+    the gradient reduce and optimizer step that end every mini-batch, and each
+    mini-batch is a contiguous slice of the rank's rows: ``dataloader =
+    batch.split(ppo_mini_batch_size)``. Whether slice k holds the same number of
+    tokens on every rank is not something the whole-batch balance constrains, and
+    ``_check_and_sort_partitions`` sorts each partition by original index, which
+    discards the length ordering the partitioner worked in.
+
+    Every rank waits for the slowest one at each of those meetings, so the loss is
+    the sum over mini-batches of (slowest - mean), not (whole-batch max - min).
+    That is what ``wait_frac`` reports, as a fraction of one rank's tokens. It
+    assumes the time a mini-batch takes is proportional to its tokens, which is
+    close enough for the packed forward this arm runs, and it is an upper bound
+    on what any per-mini-batch rebalancing could recover -- NOT a measured stall.
+
+    ``wait_frac_dealt`` is the same number under ``deal_by_length``, which is the
+    ordering a fix would actually use. The gap between the two is the headroom,
+    measured rather than assumed.
+    """
+    if minibatch_rows <= 0:
+        return {}
+    per_rank = [[seqlen_list[i] for i in partition] for partition in partitions]
+
+    def _chunk_sums(rows):
+        return [sum(rows[i : i + minibatch_rows]) for i in range(0, len(rows), minibatch_rows)]
+
+    def _wait(ordered):
+        chunks = [_chunk_sums(rows) for rows in ordered]
+        n = min(len(c) for c in chunks)
+        waited = total = 0.0
+        spreads = []
+        for k in range(n):
+            column = [c[k] for c in chunks]
+            mean = sum(column) / len(column)
+            waited += max(column) - mean
+            total += mean
+            spreads.append(max(column) - min(column))
+        return waited, total, spreads
+
+    waited, total, spreads = _wait(per_rank)
+    dealt = [[seqlen_list[i] for i in deal_by_length(seqlen_list, partition, minibatch_rows)]
+             for partition in partitions]
+    sorted_waited, sorted_total, _ = _wait(dealt)
+    if not total:
+        return {}
+    return {
+        f"{prefix}/minibatch_spread_mean": sum(spreads) / len(spreads),
+        f"{prefix}/minibatch_spread_max": max(spreads),
+        f"{prefix}/minibatch_wait_frac": waited / total,
+        f"{prefix}/minibatch_wait_frac_dealt": (sorted_waited / sorted_total) if sorted_total else 0.0,
+    }
+
+
 def ceildiv(a, b):
     return -(a // -b)
 

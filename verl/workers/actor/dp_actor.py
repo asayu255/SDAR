@@ -20,6 +20,7 @@ Single Process Actor
 import itertools
 import time
 import logging
+import functools
 import os
 from contextlib import contextmanager
 from typing import Tuple
@@ -109,6 +110,29 @@ def _actor_phase(name: str):
         if _SYNC_PHASES:
             get_torch_device().synchronize()
         gpu_profiler.pop_phase(name)
+
+
+_VARLEN_KWARGS = os.environ.get("ACTOR_PASS_CU_SEQLENS", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_attention_takes_varlen_kwargs() -> bool:
+    """Does this transformers accept cu_seqlens at the flash-attention entry?
+
+    Checked once, by signature, because the alternative is a silent wrong
+    answer: an older ``_flash_attention_forward`` swallows unknown keywords into
+    **kwargs and passes them to flash-attn, which does not know them either.
+    """
+    try:
+        import inspect
+
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except Exception:  # noqa: BLE001 - any import shape means "do not risk it"
+        return False
+    params = inspect.signature(_flash_attention_forward).parameters
+    return all(name in params for name in
+               ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"))
 
 
 def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: int):
@@ -393,6 +417,44 @@ class DataParallelPPOActor(BasePPOActor):
             fingerprints = row_fingerprint(input_ids, attention_mask)
         return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints)
 
+    def _varlen_kwargs(self, cu_seqlens, max_seqlen_in_batch) -> dict:
+        """The packed-sequence boundaries, handed over instead of re-derived.
+
+        With ``use_remove_padding`` the model is given ``position_ids`` and HF's
+        flash-attention path works the boundaries out itself: whether the
+        sequences are packed at all, and how long the longest is. Both decisions
+        are made on the device and read on the host -- flash-attn needs Python
+        ints -- so each is a device-to-host sync, ONCE PER LAYER PER FORWARD.
+        Twenty-eight layers, doubled because gradient checkpointing recomputes
+        the forward inside the backward.
+
+        ``unpad_input`` has already computed both, once, for the whole
+        micro-batch. Passing them makes _flash_attention_forward skip the
+        position_ids path entirely, and the values are the same ones it would
+        have derived -- both come from the same attention_mask.
+
+        Off in two cases:
+
+        * Ulysses SP > 1. The sequence is split across ranks after this point,
+          so boundaries computed on the unsplit batch describe a different
+          tensor than the attention sees. verl's monkey_patch all-gathers
+          position_ids for exactly that reason; handing it stale cu_seqlens
+          would be wrong rather than merely slower.
+        * A transformers whose entry point does not name the kwargs. It would
+          take them into **kwargs and pass them to flash-attn, which does not
+          know them either -- so the check is by signature, not by version.
+        """
+        if cu_seqlens is None or not _VARLEN_KWARGS or self.use_ulysses_sp:
+            return {}
+        if not _flash_attention_takes_varlen_kwargs():
+            return {}
+        return {
+            "cu_seq_lens_q": cu_seqlens,
+            "cu_seq_lens_k": cu_seqlens,
+            "max_length_q": max_seqlen_in_batch,
+            "max_length_k": max_seqlen_in_batch,
+        }
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None,
         need_log_prob=True, return_lse=False,
@@ -440,7 +502,15 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                # cu_seqlens and max_seqlen are kept, not discarded: handing them
+                # to the attention entry saves a device-to-host sync per layer per
+                # forward (see _varlen_kwargs). Older flash_attn returns fewer
+                # values, so the unpack is by length rather than by position.
+                unpadded = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad, indices = unpadded[0], unpadded[1]  # input_ids_rmpad (total_nnz, ...)
+                cu_seqlens, max_seqlen_in_batch = (
+                    (unpadded[2], unpadded[3]) if len(unpadded) >= 4 else (None, None)
+                )
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -490,6 +560,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if resp_only:
                     sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
                     extra_args["logits_to_keep"] = sel
+
+                extra_args.update(self._varlen_kwargs(cu_seqlens, max_seqlen_in_batch))
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -1056,8 +1128,52 @@ class DataParallelPPOActor(BasePPOActor):
         # reduce_metrics would have.
         deferred_metrics = {}
 
-        def _defer(name, value):
-            deferred_metrics.setdefault(name, []).append(value.detach())
+        def _defer(name, value, weight=None):
+            deferred_metrics.setdefault(name, []).append(
+                (value.detach(), None if weight is None else weight.detach())
+            )
+
+        def _defer_task(name, loss_mat, mask):
+            """A task's token-mean for this micro-batch, deferred with its presence.
+
+            Written out rather than calling agg_loss so an absent task yields 0
+            instead of 0/0: the read at the end divides the sum of the values by
+            the number of micro-batches the task appeared in, which is the same
+            average the per-task metric has always reported -- it just no longer
+            needs the device to tell the host which micro-batches those were.
+
+            The formula is token-mean, which is why sync_free_task_metrics below
+            also requires loss_agg_mode to be token-mean. Under seq-mean-* this
+            would be a different quantity reported under the same name, and
+            nothing would say so.
+            """
+            den = mask.sum()
+            value = (loss_mat * mask).sum() / den.clamp(min=1)
+            _defer(name, value, weight=(den > 0).to(value.dtype))
+
+        # Whether the per-task metric loop can run over ALL tasks, including the
+        # ones with no rows in this micro-batch, and so skip the device read that
+        # would say which those are -- torch.unique(...).tolist(), one host sync
+        # per micro-batch. It can exactly when every metric the loop computes is
+        # deferred: a branch that calls .item() inside the loop would turn an
+        # absent task into a NaN, and would be paying a sync each anyway.
+        #
+        # The policy-gradient metrics are deferred below whenever the loss
+        # aggregation is token-mean, so an arm with pg_loss_coef != 0 -- this one --
+        # still qualifies. entropy, reference-KL and the SD terms are not
+        # deferred, so any of them switched on takes the loop back to the
+        # present-tasks-only path.
+        #
+        # loss_agg_mode is in the condition because _defer_task hard-codes the
+        # token-mean formula; the aggregation is not a term that can be switched
+        # off, so it has to be checked rather than assumed.
+        sync_free_task_metrics = (
+            self.config.entropy_coeff == 0
+            and not self.config.use_kl_loss
+            and not self.config.get("use_sdl_loss", False)
+            and not self.config.get("use_sdar_loss", False)
+            and self.config.loss_agg_mode == "token-mean"
+        )
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -1395,7 +1511,9 @@ class DataParallelPPOActor(BasePPOActor):
                         # separately anyway: this phase is where the backward's
                         # queued reduce-scatter tail drains.
                         with _actor_phase("actor.task_metrics"), torch.no_grad():
-                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                            for task, rows in iter_task_row_masks(
+                                task_ids, task_id_names, include_absent=sync_free_task_metrics
+                            ):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
 
@@ -1411,10 +1529,30 @@ class DataParallelPPOActor(BasePPOActor):
                                         clip_ratio_c=clip_ratio_c,
                                         loss_agg_mode=loss_agg_mode,
                                     )
-                                    task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
-                                    task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
-                                    task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
-                                    task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
+                                    # Four device reads per task per micro-batch --
+                                    # twelve host syncs a micro-batch on this
+                                    # three-task mixture, and the largest remaining
+                                    # drain of the CPU run-ahead in this phase. They
+                                    # are logger-only scalars, so they defer like
+                                    # teacher_kl_loss does and are read once at the
+                                    # end. policy_loss_fn already returns each as a
+                                    # token-mean over the task's rows, so what is
+                                    # carried alongside is only whether the task was
+                                    # present -- under include_absent it may not be,
+                                    # and an absent task must contribute nothing
+                                    # rather than a 0/0.
+                                    present = task_response_mask.sum() > 0
+                                    for _name, _value in (
+                                        ("pg_loss", task_pg_loss),
+                                        ("pg_clipfrac", task_pg_clipfrac),
+                                        ("ppo_kl", task_ppo_kl),
+                                        ("pg_clipfrac_lower", task_pg_clipfrac_lower),
+                                    ):
+                                        _defer(
+                                            f"actor/{_name}/{task}",
+                                            torch.nan_to_num(_value, nan=0.0, posinf=0.0, neginf=0.0),
+                                            weight=present.to(_value.dtype),
+                                        )
                                 else:
                                     # Reading four device-side constants back per task
                                     # per micro-batch costs a stream sync each; the
@@ -1457,10 +1595,20 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    _defer(
-                                        f"actor/teacher_kl_loss/{task}",
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
-                                    )
+                                    if sync_free_task_metrics:
+                                        # rows may select nothing here; _defer_task
+                                        # carries the presence so an absent task
+                                        # contributes 0 rather than NaN.
+                                        _defer_task(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            teacher_kld[rows],
+                                            task_response_mask,
+                                        )
+                                    else:
+                                        _defer(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        )
 
                                 append_to_dict(metrics, task_metrics)
 
@@ -1490,10 +1638,35 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
-        # The one read for everything deferred above. torch.stack forces a single
-        # host sync here instead of one per micro-batch.
-        for name, values in deferred_metrics.items():
-            metrics[name] = torch.stack(values).mean().item()
+        # The one read for everything deferred above: every metric is reduced on
+        # the device and the whole set comes back in a single .tolist(), so the
+        # call pays one host sync here instead of one per micro-batch per metric.
+        # Entries carrying a presence weight are summed and divided by how many
+        # micro-batches actually held the task, which is the mean the unweighted
+        # path took over exactly those.
+        if deferred_metrics:
+            names = list(deferred_metrics)
+            reduced = []
+            for name in names:
+                entries = deferred_metrics[name]
+                values = torch.stack([value.float() for value, _ in entries])
+                if entries[0][1] is None:
+                    # How many micro-batches contributed is known on the host: the
+                    # present-tasks-only loop appended one entry per micro-batch
+                    # that held the task.
+                    reduced.append(torch.stack([values.mean(), values.new_ones(())]))
+                else:
+                    present = torch.stack([weight.float() for _, weight in entries])
+                    n = present.sum()
+                    reduced.append(torch.stack([values.sum() / n.clamp(min=1), n]))
+            # A task that appeared in no micro-batch of this call is dropped rather
+            # than reported as 0: under include_absent the loop yields it anyway,
+            # and a logged 0 would read as "this task's KL was zero" instead of
+            # "this task was not trained here". Decided on the host, from the same
+            # single read.
+            for name, (value, n_present) in zip(names, torch.stack(reduced).tolist()):
+                if n_present > 0:
+                    metrics[name] = value
         if _PROFILE_STAGES:
             # One table per update_policy call. The driver's boundary phase
             # ("step") never pops in this process, so the report is asked for

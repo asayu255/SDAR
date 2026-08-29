@@ -39,6 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -687,8 +688,49 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
+        # Everything alive at this point -- the module tree, the sharded
+        # parameters and optimizer state, the tokenizer, Ray's plumbing -- lives
+        # for the whole run, and gen-2 collections walk all of it without ever
+        # being able to free any of it. Freezing it here takes those objects out
+        # of the sweep's reach. See verl/utils/host_gc.py for why a host-side
+        # sweep shows up as a GPU dip.
+        report = freeze_permanent_heap()
+        if report["enabled"]:
+            print(
+                f"[host-gc] rank {self.rank}: froze {report['frozen']} objects "
+                f"({report['collected']} collected, manual={report['manual']}) "
+                f"in {report['seconds']:.2f} s",
+                flush=True,
+            )
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        # Step boundary: the device is idle here by construction, so host-side
+        # GC work is free. Freeze once more to capture what the warm-up step
+        # created and keeps -- Dynamo caches, Adam's lazily allocated state,
+        # FSDP's deferred structures, none of it visible to the init-time freeze
+        # -- then the per-step sweep, which after the freezes costs milliseconds
+        # and drains the survivor count that would otherwise trip a full
+        # collection mid-forward, where it lands on the device.
+        #
+        # This arm's step order is clear cache / rollout / teacher forwards /
+        # update_actor, so the second freeze fires with the teacher hidden cache
+        # FULL and puts a step of bf16 hidden states in the permanent generation.
+        # Safe because gc.freeze() exempts objects from CYCLE collection only --
+        # clear() empties the dicts in place and refcounting returns the memory --
+        # and the teacher forwards run under no_grad, so no autograd graph makes a
+        # cycle out of an entry. Pinned by
+        # test_a_frozen_teacher_cache_still_releases_its_entries_on_clear.
+        refrozen = refreeze_if_due()
+        if refrozen is not None:
+            print(
+                f"[host-gc] rank {self.rank}: re-froze +{refrozen['frozen_delta']} warm-up objects "
+                f"(total {refrozen['frozen_total']}, {refrozen['collected']} collected) "
+                f"in {refrozen['seconds']:.2f} s",
+                flush=True,
+            )
+        collect_at_step_boundary()
+
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
@@ -760,6 +802,10 @@ class ActorRolloutRefWorker(Worker):
         # produces the identical weights for every turn -> generation is unchanged.
         # Only the per-turn data sharding (preprocess/postprocess) still runs.
         if getattr(self, "_rollout_session_active", False):
+            # Counted so end_rollout_session can say how many generates one wake
+            # served. A session that served 1 bought nothing, and that is the
+            # symptom of a hoist that silently did not take.
+            self._rollout_session_generates = getattr(self, "_rollout_session_generates", 0) + 1
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
             output = self.rollout_sharding_manager.postprocess_data(output)
@@ -802,24 +848,89 @@ class ActorRolloutRefWorker(Worker):
         is in use. Paired with end_rollout_session() in a finally block.
         """
         assert self._is_rollout
+        # Before the import, deliberately: with SKIP_ROLLOUT_BUILD there is no
+        # manager at all, and pulling in the vLLM machinery just to conclude
+        # "not a vLLM manager" would make this hook the one place a skipped
+        # build still pays for -- or crashes on -- vLLM.
+        if getattr(self, "rollout_sharding_manager", None) is None:
+            self._say_session("no rollout sharding manager (SKIP_ROLLOUT_BUILD)")
+            return
         from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
         if not isinstance(self.rollout_sharding_manager, FSDPVLLMShardingManager):
+            self._say_session(f"manager is {type(self.rollout_sharding_manager).__name__}, not vLLM's")
             return
-        if getattr(self, "_rollout_session_active", False):
+        # Nesting, by depth rather than by a bool. The rollout loop opens a
+        # session per multi_turn_loop; _validate opens one around the whole
+        # validation, which is many of those. With a bool the inner scope's
+        # end_rollout_session would close the outer one on the first batch and
+        # every batch after it would wake and sleep vLLM again -- the hoist would
+        # silently do nothing. Only the outermost scope enters and exits; the
+        # inner ones just count.
+        self._rollout_session_depth = getattr(self, "_rollout_session_depth", 0) + 1
+        if self._rollout_session_depth > 1:
             return
         self.rollout_sharding_manager.__enter__()
         self._rollout_session_active = True
+        self._rollout_session_generates = 0
+        self._say_session("opened -- vLLM stays awake until the outermost scope closes")
+
+    def _say_session(self, message: str):
+        """One line per distinct session outcome, from rank 0.
+
+        Every early return above is a silent downgrade to per-turn wake/sleep, and
+        each has a different cause and a different fix. Printing the reason is what
+        makes the two states tellable apart at all -- the manager's own enter/exit
+        logging is DEBUG under a WARN logger, so it never reaches a log file.
+        Deduplicated because these run once per rollout, not once per run.
+        """
+        # Defensively, because this is a print: `rank` is a property over
+        # `self._rank`, which is set by the worker's distributed init. A hook
+        # that used to be a silent no-op must not start raising AttributeError
+        # on a worker that has not reached that point -- observing something is
+        # not a licence to break it.
+        if getattr(self, "_rank", None) != 0:
+            return
+        seen = getattr(self, "_rollout_session_said", None)
+        if seen is None:
+            seen = self._rollout_session_said = set()
+        if message in seen:
+            return
+        seen.add(message)
+        print(f"[rollout-session] rank 0: {message}", flush=True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def end_rollout_session(self):
-        """Close the sharding manager opened by begin_rollout_session(), restoring
-        exactly the post-generation state of the non-session path (sleep/offload
-        vLLM, restore RNG + train mode, empty cache)."""
+        """Close the session opened by begin_rollout_session(), restoring exactly
+        the post-generation state of the non-session path (sleep/offload vLLM,
+        restore RNG + train mode, empty cache).
+
+        Reference-counted: only the call that balances the OUTERMOST
+        begin_rollout_session actually exits the manager."""
+        depth = getattr(self, "_rollout_session_depth", 0)
+        if depth <= 0:
+            # begin_rollout_session declined (no manager, or not vLLM's), or this
+            # is an unpaired call. Either way there is nothing open to close.
+            return
+        self._rollout_session_depth = depth - 1
+        if self._rollout_session_depth > 0:
+            # An outer scope still holds it. Sleeping vLLM here is exactly the
+            # bug the depth counter exists to prevent.
+            return
         if not getattr(self, "_rollout_session_active", False):
             return
         self._rollout_session_active = False
         self.rollout_sharding_manager.__exit__(None, None, None)
+        # The count is the whole point: one session covering N generate calls is
+        # the working state, and N wake/sleep cycles is the broken one. A session
+        # that served 1 generate is a session that bought nothing.
+        served = getattr(self, "_rollout_session_generates", 0)
+        if getattr(self, "_rank", None) == 0:
+            print(
+                f"[rollout-session] rank 0: closed after {served} generate call"
+                f"{'' if served == 1 else 's'} on one wake",
+                flush=True,
+            )
 
 
 

@@ -291,6 +291,66 @@ export WANDB_API_KEY=${WANDB_API_KEY:-your_key_here}
 export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
 export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
+#
+# Four more mechanisms default ON in the code that reads them, so they need no
+# export here; the flags exist to turn each OFF as its own A/B.
+#
+#   ACTOR_PASS_CU_SEQLENS=0 -- stop handing the packed-sequence boundaries to
+#     attention. With use_remove_padding the model gets position_ids and HF's
+#     flash-attention path derives cu_seqlens and max_seqlen itself, on the
+#     device and read back on the host because flash-attn needs Python ints:
+#     two syncs per LAYER per forward, 28 layers, doubled by gradient
+#     checkpointing recomputing the forward inside the backward. unpad_input
+#     already computed both once for the whole micro-batch. Bit-identical --
+#     both derive from the same attention_mask -- and skipped under Ulysses SP
+#     or a transformers whose entry point does not name the kwargs (checked by
+#     signature, because it would otherwise swallow them into **kwargs and hand
+#     them to flash-attn, which does not know them either).
+#
+#   ACTOR_GC_FREEZE=0 -- stop moving the resident heap into Python's permanent
+#     generation. A gen-2 collection walks every tracked container, which on a
+#     rank holding a sharded 1.7B model is dominated by things that live for the
+#     whole run and can never be garbage: the module tree, the parameters and
+#     optimizer state, FSDP's flat-parameter bookkeeping, the tokenizer, Ray's
+#     plumbing. Measured on the source branch at 1.09M objects and 0.42 s per
+#     collection; the interpreter freezes, the launch queue drains at the
+#     forward's sync points, and the card falls to sm 0 while the others spin in
+#     the collective. Frozen at init and once more after the warm-up step, with a
+#     per-step collect at the boundary where the device is idle anyway. Judge it
+#     by the solo GPU excursions, not by collection counts -- freezing does not
+#     stop collections, it empties what they walk.
+#     NOTE for this arm: the second freeze fires with the teacher hidden cache
+#     FULL (step order is clear cache / rollout / teacher forwards /
+#     update_actor). Safe because gc.freeze() exempts objects from CYCLE
+#     collection only; clear() empties the dicts in place and refcounting returns
+#     the memory. Pinned by test_a_frozen_teacher_cache_still_releases_its_entries_on_clear.
+#
+#   The validation vLLM session is hoisted over the WHOLE validation, not opened
+#     per batch, and the worker counts session scopes by DEPTH so the per-rollout
+#     ones nested inside become no-ops. Without the hoist the sharding manager
+#     unmaps and remaps ~21 GB between every batch, which a short search batch
+#     cannot amortise -- 10.4% of the evaluation wall on the arm this came from.
+#     Generation is unchanged: nobody trains during a validation, so one weight
+#     sync at the top produces the identical weights for every batch, and
+#     _response_digest prints a sha1 of each batch's response token ids so that
+#     claim is checkable rather than asserted. Turning it off is
+#     ROLLOUT_KEEP_VLLM_AWAKE=0, which also turns off the per-rollout session.
+#     Alongside it, the per-row prompt/response detokenisation that fed the
+#     logged sample table now runs only when trainer.log_val_generations > 0,
+#     which it is not here.
+#
+#   BALANCE_MINIBATCH=1 -- the one that is OFF, and must stay off for this arm.
+#     _balance_batch equalises each rank's token total over the whole batch, but
+#     the ranks meet at the gradient reduce that ends every MINI-batch, and
+#     nothing constrains mini-batch k to hold the same tokens on every rank.
+#     perf/.../minibatch_wait_frac reports what that costs and
+#     minibatch_wait_frac_dealt what dealing the rows length-first would leave,
+#     so the headroom is measured rather than assumed -- both always, since they
+#     are arithmetic over token counts and reorder nothing. Turning the fix on
+#     changes which rows share a mini-batch, and with ~70 optimizer steps per
+#     training step that is a different trajectory: an arm run with it on is not
+#     comparable with the arms already finished. Decide from the metric, not
+#     here.
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"

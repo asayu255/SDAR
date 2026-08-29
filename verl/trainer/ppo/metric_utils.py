@@ -109,15 +109,30 @@ def task_row_indices(batch: DataProto) -> Dict[str, np.ndarray]:
     return {task: np.array(rows, dtype=np.int64) for task, rows in sorted(indices.items())}
 
 
-def iter_task_row_masks(task_ids: "torch.Tensor", task_id_names: List[str]):
-    """Yield ``(task, row_mask)`` for every task present in a worker micro-batch.
+def iter_task_row_masks(task_ids: "torch.Tensor", task_id_names: List[str], include_absent: bool = False):
+    """Yield ``(task, row_mask)`` for every task in a worker micro-batch.
 
     The workers only see the integer ``task_ids`` column attached by
     ``RayPPOTrainer._attach_task_ids``; ``task_id_names`` maps it back to the task
     name. Ids outside that mapping (``-1`` for rows whose task name was missing)
     are skipped.
+
+    By default only the tasks actually present are yielded, which costs a
+    ``torch.unique(...).tolist()`` -- a device read, and therefore a host sync,
+    once per micro-batch. ``include_absent=True`` walks the names instead and
+    yields every one of them, so nothing is read back from the device; a task
+    with no rows in this micro-batch comes out with an all-False mask.
+
+    Only pass it where the loop body can take an empty mask. A masked mean over
+    one is 0/0, so a consumer that reads the result with ``.item()`` gets NaN --
+    and would have paid a sync of its own anyway. The deferred-metric consumers
+    in ``dp_actor`` handle it by carrying a presence weight alongside the value.
     """
     if task_ids is None or not task_id_names:
+        return
+    if include_absent:
+        for task_id, name in enumerate(task_id_names):
+            yield name, task_ids == task_id
         return
     for task_id in torch.unique(task_ids).tolist():
         if task_id < 0 or task_id >= len(task_id_names):
