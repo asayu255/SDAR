@@ -159,12 +159,10 @@
 # behind EXPECTED_CONFIG_WAIVE, which is exactly the arrangement this file
 # exists to prevent, so it is written down here.
 #
-# 252 -> 378 -> 504 -> 378 -> 252 AGAIN, and the last step is not a retreat.
-# The width buys nothing on its own; it is the currency the KV budget is paid
-# in, and what is being bought now is SLOTS. `w x 468 x d / 3` has to stay
-# inside the budget, so at depth 6 the width has to come back to 252 -- which
-# holds the same 1512 rows in flight as 378 x 4 and asks for the same 235,872
-# KV tokens. See "WHY 6" in eval_checkpoints.sh for the measurement.
+# 252 -> 378 -> 504 -> 378. It went to 252 once more, to pay for a sixth slot
+# at the same KV, and came back: 252 x 6 and 378 x 4 measured 2845.3 s and
+# 2868.6 s, which is inside the 6.3% this configuration varies by between runs.
+# See "WHY 4, AND WHY NOT 6" in eval_checkpoints.sh.
 #
 # 252 -> 378 was measured and kept: 208 batches became 139, ms/row read 65-66
 # against 252's 67 at the same fraction of rows, val/success_rate moved by
@@ -204,7 +202,7 @@
 # for the engine's duty cycle. Judge it on ms/row from the WALL lines at the
 # same FRACTION OF ROWS -- s/batch, batch number and [val-hash] are all
 # meaningless across a width change, because regrouping the rows IS the change.
-"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 252, webshop: 126}
+"env.multitask.val_per_task_batch_size": {alfworld: 126, search: 378, webshop: 126}
 
 # The retriever policy decides what enters the validation trajectories, so it is
 # pinned here rather than left with the machine knobs. Running out of retries does

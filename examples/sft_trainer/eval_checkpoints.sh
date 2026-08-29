@@ -176,7 +176,7 @@ _WIDTH=$(grep -o "val_per_task_batch_size='{[^}]*}'" "$RUN_SCRIPT" \
 # and having the check default to 3 while the script exported 4 would mean
 # every default run was validated against two thirds of what it would ask for
 # -- exactly the class of mistake this guard exists to catch.
-export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-6}"
+export VAL_PIPELINE_DEPTH="${VAL_PIPELINE_DEPTH:-4}"
 _DEPTH="$VAL_PIPELINE_DEPTH"
 if [ -n "$_WIDTH" ]; then
     _NEEDED=$(awk -v w="$_WIDTH" -v d="$_DEPTH" 'BEGIN{print w * 468 * d / 3}')
@@ -335,50 +335,41 @@ export GPU_PROFILER="${GPU_PROFILER:-1}"
 # "NOTHING running" for this -- a slot blocked in env.step is running by that
 # measure while every card is idle, which is how depth looked unnecessary once
 # already.
-# WHY 6 NOW, AND WHY THE WIDTH CAME BACK DOWN TO 252 FOR IT.
+# WHY 4, AND WHY NOT 6 -- THE MEASUREMENT THAT CLOSED THIS LINE.
 #
-# The earlier reading of this said 95% of the idle was "no slot was free", off
-# a classifier that never looked at a slot. Its two largest rows were named for
-# states their gauges could not observe, and the trace it read had no slot
-# column at all, so SCHEDULER_STARVATION's 13.8% was a structural zero's
-# opposite -- a number produced by a branch that could not fire. None of it
-# supported a depth.
+# The run with the full gauge set said 63-78% of the remaining idle was
+# TAIL_NO_FREE_SLOT_SCALABLE: no slot free, and queued work more than one slot
+# in this topology can run. The prescription was more slots. 252 x 6 holds the
+# same 1512 rows and asks the same 235,872 KV tokens as 378 x 4, so it changes
+# the slot count and nothing else, and it was run:
 #
-# The run with the full gauge set (trace_v2, two samplers over the same three
-# cards, nothing unattributed in either) says:
+#   378 x 4   2868.6 s   ms/row 55   (load 10.3)
+#   252 x 6   2845.3 s   ms/row 55   (load 66.7)
+#   252 x 4   3098.8 s   ms/row 60   (load 43.1)
 #
-#                                    driver     rank0
-#   TAIL_NO_FREE_SLOT_SCALABLE        77.7%     63.2%
-#   GPU_SIDE                          10.5%     20.7%
-#   RETRIEVER_DEPENDENCY               9.3%     10.1%
-#   SLOTS_BUSY_NOT_GENERATING          2.5%      3.1%
-#   TAIL_SLOT_FREE_PLACEABLE             --       0.0
+# -0.8% against a configuration that varies by 6.3% between runs of itself
+# (3050.4 s and 2868.6 s). Nothing. The 8.2% over 252 x 4 is not evidence for
+# depth: that pair changes the row count too (1008 -> 1512), the same confound
+# as 378 x 3 -> 378 x 4, whose 13.5% has never been attributed either.
 #
-# SCALABLE is the operative word: no slot was free, AND the queue held work
-# that more than one slot in this topology can run. That is search, and search
-# is what the extra slots serve, so another slot takes it. The gauges at those
-# excursions read ready=4 ready_scalable=3 ready_pinned=1 with gen_inflight=1,
-# and the activity census reads envreset:1 gen:1 preproc:2 -- four slots
-# occupied and all of them off the GPU at once. Independent pipelines
-# decorrelate that; a fifth and sixth are the direct answer.
+# THE ARITHMETIC THAT SHOULD HAVE COME FIRST. The share in that table is a
+# share OF THE REMAINING IDLE, not of the run:
 #
-# TAIL_SLOT_FREE_PLACEABLE is 0.0, which closes the other candidate: no
-# measurable time is lost between a slot coming back and the next dispatch, so
-# refill() and prepare() are not in the way.
+#   capacity                        2868.6 s x 3 = 8606 GPU-s
+#   all excursion loss                              405.5 = 4.7%
+#   TAIL_NO_FREE_SLOT_SCALABLE                      256.1 = 3.0%
+#   run-to-run spread of one configuration                  6.3%
 #
-# THE WIDTH PAYS FOR THE SLOTS. `w x 468 x d / 3` must stay inside the budget,
-# and at width 378 depth 5 asks for 294,840 tokens against 266,708 at
-# ROLLOUT_GPU_MEM_UTIL=0.85 -- it does not fit at 0.95 either. 252 x 6 holds
-# the same 1512 rows in flight as 378 x 4 and asks for the same 235,872, so
-# this changes the SLOT COUNT and nothing else.
+# The largest prize on the board is half the noise floor. No scheduling change
+# can be measured here, whatever the profiler ranks first -- and the residency
+# line says the same thing from the other side: of the 12 points between 88%
+# per-card utilisation and 100, EMPTY (1.5) and PARTIAL (2.6) are the only ones
+# a scheduler owns. The other ~8 are the engine's own duty cycle, 95.9% of the
+# time with work on all three cards reading 90.7%.
 #
-# That separation is the point. 378 x 3 -> 378 x 4 took 13.5% off the wall, but
-# it raised the slot count and the total rows together (1134 -> 1512), so which
-# one paid was never established. This run holds the rows fixed.
-#
-# If it does not close the gap, the fix is structural -- release a slot before
-# its tail finishes, which means the pipeline stops owning whole batches -- and
-# that is a far larger change than either of these two numbers.
+# So the width and the depth stay where two measurements each put them. A
+# sixth slot is not refused on principle -- it is refused because it cannot be
+# shown to do anything, and this arm keeps what it can show.
 #
 # The export itself is at the top, beside the guard that has to read it.
 
@@ -420,9 +411,9 @@ fi
 #   252 -> 378   208 -> 139, ms/row 67 -> 65-66 at the same fraction of rows
 #   378 -> 504   105 batches; abandoned, its log was overwritten before it read
 #   504 -> 378   paired with depth 4; 3525 s -> 3050 s, -13.5%
-#   378 -> 252   paired with depth 6, THIS ONE, and it is not a width change:
-#                252 x 6 and 378 x 4 are the same 1512 rows and the same
-#                235,872 KV tokens. Only the slot count moves.
+#   378 -> 252   paired with depth 6 to buy two slots at the same KV; measured
+#                2845.3 s against 378 x 4's 2868.6 s and REVERTED. See
+#                "WHY 4, AND WHY NOT 6" above.
 #
 # A search batch's later turns decode for a handful of trajectories in a slot
 # sized for all of them: measured, the last two turns take 46% of a batch's
@@ -436,17 +427,11 @@ fi
 # does not move. It is greedy (temperature 0, do_sample false), so it cannot
 # move by sampling.
 #
-# WHAT THIS ONE IS AIMED AT, so the result can be read: the 63-78% of idle that
-# trace_v2 puts in TAIL_NO_FREE_SLOT_SCALABLE -- every slot occupied, all of
-# them off the GPU at once, and search work queued that another slot could run.
-# Two more slots decorrelate that. It is NOT aimed at per-batch driver cost,
-# which moves the wrong way here: 139 search batches become 208, so everything
-# done once per batch is multiplied by 1.5. If the wall does not improve, that
-# is the likely reason, and 294 x 5 (1470 rows, 229,320 tokens) is the gentler
-# step that keeps more of the width.
-#
-# Also not aimed at, and known to move the wrong way: the ~70 s of env-manager
-# construction, which is per SLOT. Six slots pay it three times over four.
+# 208 batches against 139 is what the narrower width costs: everything the
+# driver does once per batch is multiplied by 1.5, and env-manager construction
+# (~70 s) is per SLOT. Those are why 252 x 6 was not free even though its KV
+# and its rows matched -- but they are not why it failed to win. It did not
+# win because there was nothing to win; see the arithmetic above.
 #
 # Compare on ms/row from the WALL lines at the SAME FRACTION OF ROWS. Not
 # s/batch, not batch number, and not [val-hash]: regrouping the same rows IS
