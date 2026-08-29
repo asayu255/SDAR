@@ -92,6 +92,12 @@ def read_trace(path):
                         "power": _floats(r.get("power_w_per_gpu")),
                         "clk": _floats(r.get("smclk_mhz_per_gpu")),
                         "pcie_rx": _floats(r.get("pcie_rx_mb_s_per_gpu")),
+                        # Written by the profiler since the beginning and never
+                        # read here, because the only question asked so far was
+                        # "was the card idle". Telling a memory-bound decode
+                        # from a host gap needs the other counters.
+                        "membw": _floats(r.get("membw_pct_per_gpu")),
+                        "nvlink": _floats(r.get("nvlink_mb_s_per_gpu")),
                         "cpu": float(r["driver_cpu_pct"]) if (r.get("driver_cpu_pct") or "").strip() else None,
                         # EVERY GAUGE COLUMN THE HEADER DECLARES, zeros kept.
                         # Absent in traces written before the gauges existed,
@@ -543,6 +549,181 @@ def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
     return primary, lead_in, dict(dwell)
 
 
+# EVERY ENGINE-ACTIVE SAMPLE, not the excursions. The excursion table answers
+# "what happened when a card fell away from its baseline", and 252 x 6 was run
+# on the strength of its biggest row: 63-78% of the excursion loss, which was
+# 3.0% of the run against a 6.3% run-to-run spread. The share was of the wrong
+# denominator, and nothing in that table said so.
+#
+# This one is the other question: while the engine HAD work, how much of the
+# card was it using, and does that change as the queue deepens. Every number is
+# in GPU-seconds and in points of whole-run utilisation, because the share is
+# what misled once already.
+_PRESSURE_BINS = ((1.0, 1.5), (1.5, 2.0), (2.0, 4.0), (4.0, float("inf")))
+
+
+def _wmean(pairs):
+    """Time-weighted mean of (value, dt). Samples with no reading are skipped.
+
+    Wall-weighted, not sample-weighted: the sampler is a Python thread and the
+    intervals it loses are not random -- they are the intervals when the driver
+    is busiest, which is when the interesting samples are. Counting samples
+    under-reported one bucket by 20% the last time it was done here.
+    """
+    num = den = 0.0
+    for value, dt in pairs:
+        if value is None:
+            continue
+        num += value * dt
+        den += dt
+    return (num / den) if den else None
+
+
+def _node_sm(row):
+    seen = [v for v in row["sm"] if v is not None]
+    return (sum(seen) / len(seen)) if seen else None
+
+
+def _across_gpus(row, key):
+    seen = [v for v in (row.get(key) or []) if v is not None]
+    return (sum(seen) / len(seen)) if seen else None
+
+
+def _deficit(row, dt):
+    """GPU-seconds of card left unused at this sample, summed over cards."""
+    return sum((100.0 - v) / 100.0 * dt for v in row["sm"] if v is not None)
+
+
+def engine_duty(rows, dts, gen_full, busy=95.0):
+    """The deficit while the engine held work, binned by how much it held.
+
+    Returns None when the trace has no gen_inflight column -- the whole table is
+    about that gauge, and a version computed from a missing column would be a
+    page of zeros that reads like a finding.
+    """
+    if not rows or not any("gen_inflight" in (r.get("gauges") or {}) for r in rows):
+        return None
+    ngpu = len(rows[0]["sm"])
+    observed = sum(dts)
+    series = (("sm", None), ("membw", "membw"), ("power", "power"),
+              ("clk", "clk"), ("pcie", "pcie_rx"), ("nvlink", "nvlink"))
+
+    def _blank(label):
+        return {"label": label, "n": 0, "wall": 0.0, "lost": 0.0,
+                **{k: [] for k, _ in series}, "cpu": []}
+
+    queue = _blank("< 1.0 x  (queue-side)")
+    bins = [_blank(f"{lo:.1f} - {hi:.1f} x" if hi != float("inf") else f"{lo:.1f} x +")
+            for lo, hi in _PRESSURE_BINS]
+    below = {k: [0.0, 0.0] for k in range(ngpu + 1)}
+    lowsm = {95.0: 0.0, 90.0: 0.0, 80.0: 0.0}
+    high = [0.0, 0.0]
+
+    for row, dt in zip(rows, dts):
+        if dt <= 0:
+            continue
+        gen = (row.get("gauges") or {}).get("gen_inflight", 0)
+        ratio = gen / gen_full if gen_full else 0.0
+        target = queue
+        for spec, (lo, hi) in zip(bins, _PRESSURE_BINS):
+            if lo <= ratio < hi:
+                target = spec
+                break
+        lost = _deficit(row, dt)
+        target["n"] += 1
+        target["wall"] += dt
+        target["lost"] += lost
+        for key, column in series:
+            value = _node_sm(row) if column is None else _across_gpus(row, column)
+            target[key].append((value, dt))
+        target["cpu"].append((row.get("cpu"), dt))
+
+        if target is queue or ratio < 2.0:
+            continue
+        # High pressure: the engine is demonstrably not short of work, so a
+        # deficit here cannot be answered by giving it more.
+        high[0] += dt
+        high[1] += lost
+        node = _node_sm(row)
+        for edge in lowsm:
+            if node is not None and node < edge:
+                lowsm[edge] += dt
+        n_low = sum(1 for v in row["sm"] if v is not None and v < busy)
+        below[n_low][0] += dt
+        below[n_low][1] += lost
+
+    for spec in [queue] + bins:
+        for key in [k for k, _ in series] + ["cpu"]:
+            spec[key] = _wmean(spec[key])
+    return {
+        "bins": bins, "queue": queue, "ngpu": ngpu, "observed": observed,
+        "gen_full": gen_full, "busy": busy,
+        "high_wall": high[0], "high_lost": high[1],
+        "points": (high[1] / (observed * ngpu) * 100.0) if observed and ngpu else 0.0,
+        "below": below, "lowsm": lowsm,
+    }
+
+
+def print_engine_duty(duty):
+    if duty is None:
+        print("\nengine-active duty: NOT AVAILABLE -- this trace has no gen_inflight column,"
+              "\n  and every row of that table is about it.")
+        return
+    ngpu, observed = duty["ngpu"], duty["observed"]
+    print(f"\nengine-active duty -- every sample, not only the excursions"
+          f"   (engine-active means gen_inflight >= {duty['gen_full']:.0f})")
+    print(f"    {'gen pressure':<22}{'samples':>8}{'wall s':>9}{'lost GPU-s':>12}"
+          f"{'util pt':>9}{'SM%':>7}{'memBW%':>8}{'power W':>9}{'clock':>7}"
+          f"{'PCIeRX':>9}{'NVLink':>8}{'drvCPU%':>9}")
+
+    def _row(spec):
+        def f(key, width, fmt=".0f"):
+            v = spec[key]
+            return f"{'-':>{width}}" if v is None else f"{v:>{width}{fmt}}"
+        # POINTS OF THE WHOLE RUN, on every row. The one number the excursion
+        # table never printed, and its absence is what let a row worth 3.0% of
+        # the capacity be read as 63% of the problem and cost a run.
+        pts = (spec["lost"] / (observed * ngpu) * 100.0) if observed and ngpu else 0.0
+        print(f"    {spec['label']:<22}{spec['n']:>8}{spec['wall']:>9.1f}{spec['lost']:>12.1f}"
+              + f"{pts:>9.2f}"
+              + f("sm", 7, ".1f") + f("membw", 8) + f("power", 9) + f("clk", 7)
+              + f("pcie", 9) + f("nvlink", 8) + f("cpu", 9))
+
+    _row(duty["queue"])
+    for spec in duty["bins"]:
+        _row(spec)
+    total_wall = duty["queue"]["wall"] + sum(b["wall"] for b in duty["bins"])
+    total_lost = duty["queue"]["lost"] + sum(b["lost"] for b in duty["bins"])
+    total_pts = (total_lost / (observed * ngpu) * 100.0) if observed and ngpu else 0.0
+    print(f"    {'TOTAL observed':<22}{'':>8}{total_wall:>9.1f}{total_lost:>12.1f}{total_pts:>9.2f}")
+    print(f"      capacity over this trace: {observed * ngpu:.0f} GPU-s "
+          f"({observed:.0f} s x {ngpu} cards). READ THE GPU-s, NOT THE SHARE: a row that is"
+          f"\n      most of the deficit and 3% of the capacity is not worth a run.")
+
+    print(f"\n  high-pressure deficit  (gen >= 2 x {duty['gen_full']:.0f}: the engine is NOT short of"
+          f" work, so more requests cannot answer it)")
+    print(f"    wall                    {duty['high_wall']:>9.1f} s")
+    print(f"    lost                    {duty['high_lost']:>9.1f} GPU-s")
+    print(f"    = {duty['points']:.2f} points of whole-run utilisation")
+
+    print(f"\n  where that deficit sat, by cards below {duty['busy']:.0f}% at the same sample")
+    for n in sorted(duty["below"], reverse=True):
+        wall, lost = duty["below"][n]
+        if not wall:
+            continue
+        note = ("all cards together -- a host gap, a collective, or a step boundary"
+                if n == ngpu else
+                "one card alone -- rank-local; the others were still running"
+                if n == 1 else "")
+        print(f"    {n} of {ngpu} cards low   {wall:>9.1f} s{lost:>12.1f} GPU-s   {note}")
+
+    print("\n  how deep it went -- CUMULATIVE, so each line contains the one below it")
+    for edge in sorted(duty["lowsm"], reverse=True):
+        wall = duty["lowsm"][edge]
+        share = (wall / duty["high_wall"] * 100.0) if duty["high_wall"] else 0.0
+        print(f"    node SM < {edge:.0f}%      {wall:>9.1f} s  ({share:>5.1f}% of high-pressure wall)")
+
+
 def classify(rows, exc, floor, busy=95.0):
     """Was this one card, or the whole node?
 
@@ -717,6 +898,8 @@ def analyse(path, floor, busy, top):
                   f"({unknown / exc_lost * 100:.1f}%) is in leaves this trace cannot resolve.")
             print("    Those rows say which gauge is missing. A run with it "
                   "installed is the only way to move them.")
+
+    print_engine_duty(engine_duty(rows, dts, gen_full, busy))
 
     print(f"\nper phase: share of wall clock, and the loss attributed to it")
     ph_wall, ph_lost, ph_exc = defaultdict(float), defaultdict(float), defaultdict(float)

@@ -1040,3 +1040,97 @@ def test_the_new_reason_did_not_reshuffle_the_existing_ranks():
     kept = [r for r in scanner._REASON_RANK if r in before]
     assert tuple(kept) == before
     assert "SLOT_COMPATIBILITY_BLOCK" in scanner._REASON_RANK
+
+
+def _duty_rows(blocks, step=0.1):
+    """blocks: (sm_per_gpu, gen_inflight, n_samples) -> rows + dts for engine_duty."""
+    rows, t = [], 0.0
+    for sm, gen, n in blocks:
+        for _ in range(n):
+            rows.append({"ts": t, "sm": list(sm), "cpu": 20.0,
+                         "membw": [50.0] * len(sm), "power": [200.0] * len(sm),
+                         "clk": [1600.0] * len(sm), "pcie_rx": [100.0] * len(sm),
+                         "nvlink": [0.0] * len(sm),
+                         "gauges": {"gen_inflight": gen}})
+            t += step
+    return rows, [step] * len(rows)
+
+
+def test_the_duty_table_reports_gpu_seconds_and_points_not_only_a_share():
+    """The share is what sent a run. 63-78% of the excursion loss was 3.0% of
+    the capacity, and no column in that table said so."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([90, 90, 90], 400, 100)])
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    high = [b for b in duty["bins"] if b["n"]][0]
+    # 100 samples x 0.1 s x 3 cards x 10% idle
+    assert high["lost"] == pytest.approx(3.0, abs=0.05), duty
+    assert duty["points"] == pytest.approx(10.0, abs=0.2), duty
+    assert duty["observed"] * duty["ngpu"] == pytest.approx(30.0, abs=0.5)
+
+
+def test_the_duty_table_bins_by_pressure_so_underfill_is_separable():
+    """A deficit at 1.2x the busy median and one at 5x want opposite answers --
+    more requests, versus something inside the engine. One mean over both says
+    neither."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([86, 86, 86], 120, 100), ([97, 97, 97], 500, 100)])
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    named = {b["label"]: b for b in duty["bins"] if b["n"]}
+    low = named["1.0 - 1.5 x"]
+    high = named["4.0 x +"]
+    assert low["sm"] == pytest.approx(86.0, abs=0.1)
+    assert high["sm"] == pytest.approx(97.0, abs=0.1)
+    # and the deficit is where the pressure is NOT
+    assert low["lost"] > high["lost"] * 3
+
+
+def test_the_duty_table_separates_all_cards_low_from_one_card_low():
+    """Three cards down together is a host gap or a step boundary; one card
+    down while the others run is rank-local. They are different investigations
+    and the node mean hides both."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([80, 80, 80], 400, 50), ([30, 99, 99], 400, 50)])
+    duty = scanner.engine_duty(rows, dts, gen_full=100, busy=95.0)
+    assert duty["below"][3][0] == pytest.approx(5.0, abs=0.2), duty["below"]
+    assert duty["below"][1][0] == pytest.approx(5.0, abs=0.2), duty["below"]
+    # the single low card carries the larger deficit here
+    assert duty["below"][1][1] > duty["below"][3][1]
+
+
+def test_the_duty_table_is_wall_weighted_not_sample_weighted():
+    """The sampler loses intervals exactly when the driver is busiest, so the
+    stretched samples are the interesting ones. Counting samples under-reported
+    one bucket by 20% the last time it was done here."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([90, 90, 90], 400, 1), ([50, 50, 50], 400, 1)])
+    dts = [0.1, 0.9]          # the low sample lasted nine times as long
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    spec = [b for b in duty["bins"] if b["n"]][0]
+    assert spec["sm"] == pytest.approx(0.1 * 90 + 0.9 * 50, abs=0.5), spec["sm"]
+
+
+def test_a_trace_without_gen_inflight_gets_no_duty_table_at_all():
+    """A table about a gauge, computed without it, is a page of zeros that
+    reads as a finding -- which is the error this whole report keeps making."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([90, 90, 90], 400, 10)])
+    for r in rows:
+        r["gauges"] = {}
+    assert scanner.engine_duty(rows, dts, gen_full=100) is None
+
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        scanner.print_engine_duty(None)
+    assert "NOT AVAILABLE" in buf.getvalue() and "gen_inflight" in buf.getvalue()
+
+
+def test_the_duty_table_reads_membw_and_nvlink_from_the_trace(tmp_path):
+    """Both have been written since the profiler's first version and neither was
+    ever parsed, because the only question asked was "was the card idle"."""
+    scanner = _scanner()
+    busy = ([98, 97, 98], 20, {"gen_inflight": 400}, 20)
+    rows, _ = scanner.read_trace(str(_trace(tmp_path / "t.csv", [busy])))
+    assert "membw" in rows[0] and "nvlink" in rows[0], sorted(rows[0])
