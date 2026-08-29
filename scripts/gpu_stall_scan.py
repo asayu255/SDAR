@@ -847,10 +847,32 @@ def print_engine_duty(duty, exc_lost=None):
         print(f"\n  SM clock against power, per card-sample  (peak observed"
               f" {duty['peak_power']:.0f} W, {duty['peak_clk']:.0f} MHz"
               + (f"; enforced limit {limit:.0f} W" if limit else "") + ")")
-        print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}{'GPUact%':>9}")
+        # WHAT A POINT OF GPU-ACTIVE IS ACTUALLY WORTH. Active time and clock are
+        # independent -- one is "was a kernel resident", the other is how fast
+        # it ran -- and the whole question about closing a gap is whether the
+        # product moves. A card that answers more active time by clocking down
+        # produces exactly the conservation this arm has watched hold nine
+        # times, and no column here showed the product.
+        #
+        # CRUDE, and labelled so: work per clock differs between prefill and
+        # decode, and these bins are samples grouped after the fact, not an
+        # intervention. It bounds the prize; it does not measure the trade.
+        best = max((sp["sm"] / 100.0 * sp["clk"] for sp in duty["power_bins"]
+                    if sp["sm"] is not None and sp["clk"]), default=None)
+        print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}"
+              f"{'GPUact%':>9}{'act x clk':>11}{'vs best':>9}")
         for spec in duty["power_bins"]:
+            proxy = (spec["sm"] / 100.0 * spec["clk"]) if (spec["sm"] is not None and spec["clk"]) else None
+            rel = f"{proxy / best * 100:>8.0f}%" if (proxy and best) else f"{'-':>9}"
             print(f"    {spec['label']:<20}{spec['wall']:>13.1f}{spec['power']:>9.0f}"
-                  f"{spec['clk']:>11.0f}{spec['sm']:>9.1f}")
+                  f"{spec['clk']:>11.0f}{spec['sm']:>9.1f}"
+                  + (f"{proxy:>11.0f}" if proxy else f"{'-':>11}") + rel)
+        print("      act x clk is a CRUDE throughput proxy: GPU-active x SM clock. Work per"
+              "\n      clock differs between prefill and decode and these are samples grouped"
+              "\n      after the fact, not an intervention -- it bounds the prize, it does not"
+              "\n      measure the trade. If it is FLAT across the top power bins, the extra"
+              "\n      active time in them was paid for entirely in clock, and closing a gap"
+              "\n      by scheduling would buy nothing.")
         print("      A clock that FALLS as power rises is a CANDIDATE for power or thermal"
               "\n      throttling, NOT proof of it. Several things produce the same shape, and"
               "\n      these bins are relative to the highest READING in this trace: \"98% of"

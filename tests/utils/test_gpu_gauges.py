@@ -1188,10 +1188,13 @@ def test_the_duty_table_does_not_claim_to_know_the_power_limit():
     second is what this can support."""
     scanner = _scanner()
     text = SCANNER.read_text()
+    # The region, not a byte window: a fixed offset breaks whenever a line is
+    # added above the thing being asserted, which is not what the test is about.
     start = text.index("SM clock against power")
-    assert "peak observed" in text[start:start + 400]
-    assert "different statement from" in text[start:start + 1500]
-    assert "power.limit" in text[start:start + 2500]
+    note = text[start:text.index("def classify", start)]
+    assert "peak observed" in note
+    assert "different statement from" in note
+    assert "power.limit" in note
     assert scanner  # (loads)
 
 
@@ -1253,7 +1256,7 @@ def test_the_clock_note_does_not_assert_what_the_reading_cannot_show():
     measurement that could not distinguish it."""
     text = SCANNER.read_text()
     start = text.index("SM clock against power")
-    note = text[start:start + 2500]
+    note = text[start:text.index("def classify", start)]
     assert "means the card is already" not in note
     assert "CANDIDATE" in note and "NOT proof of it" in note
     assert "SW Power Cap" in note and "thermal" in note
@@ -1284,3 +1287,34 @@ def test_the_new_per_gpu_columns_are_appended_not_inserted():
     assert order[:6] == ["sm_pct_per_gpu", "membw_pct_per_gpu", "power_w_per_gpu",
                          "smclk_mhz_per_gpu", "pcie_rx_mb_s_per_gpu", "nvlink_mb_s_per_gpu"]
     assert order[6:] == ["throttle_bits_per_gpu", "temp_c_per_gpu", "power_limit_w_per_gpu"]
+
+
+def test_the_power_table_shows_the_product_not_only_the_two_factors():
+    """GPU-active and clock are independent, and the question about closing a
+    gap is whether their PRODUCT moves. On the first real trace read this way
+    the top two power bins came out at 1503 and 1502 -- five more points of
+    active time, bought entirely with clock, worth nothing. No column showed
+    that, which is how nine changes in a row moved a number and not the wall.
+    """
+    scanner = _scanner()
+    rows, dts = _duty_rows([([85, 85, 85], 800, 50), ([94, 94, 94], 800, 50)])
+    for r in rows[:50]:
+        r["power"], r["clk"] = [282.0] * 3, [1712.0] * 3
+    for r in rows[50:]:
+        r["power"], r["clk"] = [298.0] * 3, [1595.0] * 3
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    proxies = [(b["sm"] / 100.0 * b["clk"]) for b in duty["power_bins"]]
+    assert len(proxies) == 2, duty["power_bins"]
+    # 0.85 x 1712 = 1455 against 0.94 x 1595 = 1499: nine points of active time
+    # for three percent of throughput
+    assert proxies[1] / proxies[0] == pytest.approx(1.03, abs=0.02), proxies
+
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        scanner.print_engine_duty(duty)
+    out = buf.getvalue()
+    assert "act x clk" in out and "vs best" in out, out
+    assert "CRUDE throughput proxy" in out, out
+    assert "does not" in out and "measure the trade" in out, out
