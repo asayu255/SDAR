@@ -559,7 +559,12 @@ def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
 # card was it using, and does that change as the queue deepens. Every number is
 # in GPU-seconds and in points of whole-run utilisation, because the share is
 # what misled once already.
-_PRESSURE_BINS = ((1.0, 1.5), (1.5, 2.0), (2.0, 4.0), (4.0, float("inf")))
+# 4.0x+ used to be one bin, and on a 378 x 4 run that is gen 664 to 1512 -- the
+# whole question of whether SM is still climbing or has flattened, inside a
+# single number. Split, because "more requests would help" and "more requests
+# would not" are the two answers this table exists to separate.
+_PRESSURE_BINS = ((1.0, 1.5), (1.5, 2.0), (2.0, 4.0),
+                  (4.0, 8.0), (8.0, 16.0), (16.0, float("inf")))
 
 
 def _wmean(pairs):
@@ -613,8 +618,10 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
                 **{k: [] for k, _ in series}, "cpu": []}
 
     queue = _blank("< 1.0 x  (queue-side)")
-    bins = [_blank(f"{lo:.1f} - {hi:.1f} x" if hi != float("inf") else f"{lo:.1f} x +")
+    bins = [_blank(f"{lo:.0f} - {hi:.0f} x" if hi != float("inf") else f"{lo:.0f} x +")
             for lo, hi in _PRESSURE_BINS]
+    bins[0]["label"] = "1.0 - 1.5 x"
+    bins[1]["label"] = "1.5 - 2.0 x"
     below = {k: [0.0, 0.0] for k in range(ngpu + 1)}
     lowsm = {95.0: 0.0, 90.0: 0.0, 80.0: 0.0}
     high = [0.0, 0.0]
@@ -652,10 +659,44 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
         below[n_low][0] += dt
         below[n_low][1] += lost
 
+    # CLOCK AGAINST POWER, per card-sample. If the SM clock falls as the card
+    # approaches its power limit, the deficit at high pressure is not a gap the
+    # host can close: the card is already spending everything it is allowed to,
+    # and packing the kernels tighter is paid back in clock. Nothing else in
+    # this report would show that, and it explains a conservation law this arm
+    # has now watched hold nine times.
+    watts, clocks = [], []
+    for row, dt in zip(rows, dts):
+        if dt <= 0:
+            continue
+        for gi, power in enumerate(row.get("power") or []):
+            clk = (row.get("clk") or [None] * (gi + 1))[gi] if gi < len(row.get("clk") or []) else None
+            if power is None or clk is None:
+                continue
+            watts.append((power, clk, row["sm"][gi] if gi < len(row["sm"]) else None, dt))
+    power_bins = []
+    if watts:
+        top = max(w for w, _c, _s, _d in watts)
+        edges = [(0.00, 0.80), (0.80, 0.90), (0.90, 0.95), (0.95, 0.98), (0.98, 1.01)]
+        for lo, hi in edges:
+            inside = [(w, c, sm, dt) for w, c, sm, dt in watts if lo <= w / top < hi]
+            if not inside:
+                continue
+            power_bins.append({
+                "label": f"{lo * 100:.0f} - {hi * 100:.0f}% of peak",
+                "wall": sum(dt for *_x, dt in inside) / ngpu,
+                "power": _wmean([(w, dt) for w, _c, _s, dt in inside]),
+                "clk": _wmean([(c, dt) for _w, c, _s, dt in inside]),
+                "sm": _wmean([(sm, dt) for _w, _c, sm, dt in inside]),
+            })
+
     for spec in [queue] + bins:
         for key in [k for k, _ in series] + ["cpu"]:
             spec[key] = _wmean(spec[key])
     return {
+        "power_bins": power_bins,
+        "peak_power": max((w for w, _c, _s, _d in watts), default=None),
+        "peak_clk": max((c for _w, c, _s, _d in watts), default=None),
         "bins": bins, "queue": queue, "ngpu": ngpu, "observed": observed,
         "gen_full": gen_full, "busy": busy,
         "high_wall": high[0], "high_lost": high[1],
@@ -664,7 +705,7 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
     }
 
 
-def print_engine_duty(duty):
+def print_engine_duty(duty, exc_lost=None):
     if duty is None:
         print("\nengine-active duty: NOT AVAILABLE -- this trace has no gen_inflight column,"
               "\n  and every row of that table is about it.")
@@ -699,6 +740,18 @@ def print_engine_duty(duty):
     print(f"      capacity over this trace: {observed * ngpu:.0f} GPU-s "
           f"({observed:.0f} s x {ngpu} cards). READ THE GPU-s, NOT THE SHARE: a row that is"
           f"\n      most of the deficit and 3% of the capacity is not worth a run.")
+    # HOW MUCH OF IT THE EXCURSION TABLE EVER SAW. An excursion needs a card to
+    # fall away from its own baseline; a deficit spread evenly over every sample
+    # never starts one. Every ranking in this report above this line is a
+    # ranking of that fraction, and on the first trace read this way it was 41%.
+    if exc_lost is not None and total_lost > 0:
+        share = exc_lost / total_lost * 100.0
+        print(f"      of which the excursion table above accounts for {exc_lost:.1f} GPU-s "
+              f"({share:.0f}%);"
+              f"\n      the other {total_lost - exc_lost:.1f} GPU-s "
+              f"({(total_lost - exc_lost) / (observed * ngpu) * 100.0:.2f} points) is AMBIENT -- "
+              f"no card ever left"
+              f"\n      its baseline, so no excursion exists to explain it and nothing above ranks it.")
 
     print(f"\n  high-pressure deficit  (gen >= 2 x {duty['gen_full']:.0f}: the engine is NOT short of"
           f" work, so more requests cannot answer it)")
@@ -722,6 +775,19 @@ def print_engine_duty(duty):
         wall = duty["lowsm"][edge]
         share = (wall / duty["high_wall"] * 100.0) if duty["high_wall"] else 0.0
         print(f"    node SM < {edge:.0f}%      {wall:>9.1f} s  ({share:>5.1f}% of high-pressure wall)")
+
+    if duty["power_bins"]:
+        print(f"\n  SM clock against power, per card-sample  (peak observed"
+              f" {duty['peak_power']:.0f} W, {duty['peak_clk']:.0f} MHz)")
+        print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}{'SM%':>7}")
+        for spec in duty["power_bins"]:
+            print(f"    {spec['label']:<20}{spec['wall']:>13.1f}{spec['power']:>9.0f}"
+                  f"{spec['clk']:>11.0f}{spec['sm']:>7.1f}")
+        print("      A clock that FALLS as power rises to the peak means the card is already"
+              "\n      spending its whole allowance: the deficit beside it is not a gap the host"
+              "\n      can close, and packing the kernels tighter is paid back in clock. This"
+              "\n      report cannot see the power LIMIT, only what was drawn -- compare the peak"
+              "\n      above with `nvidia-smi --query-gpu=power.limit --format=csv`.")
 
 
 def classify(rows, exc, floor, busy=95.0):
@@ -899,7 +965,7 @@ def analyse(path, floor, busy, top):
             print("    Those rows say which gauge is missing. A run with it "
                   "installed is the only way to move them.")
 
-    print_engine_duty(engine_duty(rows, dts, gen_full, busy))
+    print_engine_duty(engine_duty(rows, dts, gen_full, busy), exc_lost)
 
     print(f"\nper phase: share of wall clock, and the loss attributed to it")
     ph_wall, ph_lost, ph_exc = defaultdict(float), defaultdict(float), defaultdict(float)

@@ -1078,7 +1078,7 @@ def test_the_duty_table_bins_by_pressure_so_underfill_is_separable():
     duty = scanner.engine_duty(rows, dts, gen_full=100)
     named = {b["label"]: b for b in duty["bins"] if b["n"]}
     low = named["1.0 - 1.5 x"]
-    high = named["4.0 x +"]
+    high = named["4 - 8 x"]
     assert low["sm"] == pytest.approx(86.0, abs=0.1)
     assert high["sm"] == pytest.approx(97.0, abs=0.1)
     # and the deficit is where the pressure is NOT
@@ -1134,3 +1134,62 @@ def test_the_duty_table_reads_membw_and_nvlink_from_the_trace(tmp_path):
     busy = ([98, 97, 98], 20, {"gen_inflight": 400}, 20)
     rows, _ = scanner.read_trace(str(_trace(tmp_path / "t.csv", [busy])))
     assert "membw" in rows[0] and "nvlink" in rows[0], sorted(rows[0])
+
+
+def test_the_top_pressure_bin_is_split_because_it_spanned_four_to_nine_x():
+    """"4.0x+" on a 378 x 4 run is gen 664 to 1512 -- the entire question of
+    whether SM is still climbing or has flattened, inside one number."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([88, 88, 88], 500, 50), ([96, 96, 96], 2000, 50)])
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    named = {b["label"]: b for b in duty["bins"] if b["n"]}
+    assert "4 - 8 x" in named and "16 x +" in named, sorted(named)
+    # and they are not the same reading, which is the point of splitting
+    assert named["16 x +"]["sm"] > named["4 - 8 x"]["sm"] + 5
+
+
+def test_a_clock_that_falls_as_power_rises_is_reported():
+    """Neither the deficit nor the queue explains a card that is choosing to
+    run slower. Nothing else in this report reads the clock against the power,
+    and a power-limited card produces exactly the conservation this arm has
+    watched hold nine times: pack the kernels tighter, pay it back in clock."""
+    scanner = _scanner()
+    rows, dts = _duty_rows([([90, 90, 90], 500, 50), ([90, 90, 90], 500, 50)])
+    for r in rows[:50]:
+        r["power"], r["clk"] = [200.0] * 3, [1800.0] * 3      # light
+    for r in rows[50:]:
+        r["power"], r["clk"] = [299.0] * 3, [1500.0] * 3      # at the wall
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    by_label = {b["label"]: b for b in duty["power_bins"]}
+    assert duty["peak_power"] == pytest.approx(299.0)
+    top = max(duty["power_bins"], key=lambda b: b["power"])
+    bottom = min(duty["power_bins"], key=lambda b: b["power"])
+    assert top["clk"] < bottom["clk"] - 200, duty["power_bins"]
+    assert by_label  # the labels are relative to the peak, not to an assumed cap
+
+
+def test_the_report_says_how_much_of_the_deficit_the_excursions_ever_saw(tmp_path):
+    """An excursion needs a card to LEAVE its baseline. A deficit spread evenly
+    over every sample never starts one, so every ranking above that line ranks
+    a fraction -- 41% on the first trace read this way -- and nothing said so.
+    """
+    busy = ([97, 97, 97], 20, {"gen_inflight": 800}, 40)
+    dip = ([40, 40, 40], 20, {"gen_inflight": 800}, 6)
+    out = _scan(_trace(tmp_path / "t.csv", [busy, dip, busy, dip, busy]))
+    line = next(ln for ln in out.splitlines() if "AMBIENT" in ln or "excursion table above" in ln)
+    assert "excursion table above accounts for" in out, out
+    assert "AMBIENT" in out, out
+    assert line  # and it is printed with the capacity, not buried
+
+
+def test_the_duty_table_does_not_claim_to_know_the_power_limit():
+    """It reads what was DRAWN. The cap is not in the trace, and "97.7% of the
+    limit" is a different statement from "97.7% of the highest reading" -- the
+    second is what this can support."""
+    scanner = _scanner()
+    text = SCANNER.read_text()
+    start = text.index("SM clock against power")
+    assert "peak observed" in text[start:start + 400]
+    assert "cannot see the power LIMIT" in text[start:start + 1500]
+    assert "power.limit" in text[start:start + 1500]
+    assert scanner  # (loads)
