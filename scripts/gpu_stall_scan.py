@@ -728,21 +728,24 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
             clk = (row.get("clk") or [None] * (gi + 1))[gi] if gi < len(row.get("clk") or []) else None
             if power is None or clk is None:
                 continue
-            watts.append((power, clk, row["sm"][gi] if gi < len(row["sm"]) else None, dt))
+            temps = row.get("temp") or []
+            watts.append((power, clk, row["sm"][gi] if gi < len(row["sm"]) else None, dt,
+                          temps[gi] if gi < len(temps) else None))
     power_bins = []
     if watts:
-        top = max(w for w, _c, _s, _d in watts)
+        top = max(w for w, _c, _s, _d, _t in watts)
         edges = [(0.00, 0.80), (0.80, 0.90), (0.90, 0.95), (0.95, 0.98), (0.98, 1.01)]
         for lo, hi in edges:
-            inside = [(w, c, sm, dt) for w, c, sm, dt in watts if lo <= w / top < hi]
+            inside = [row for row in watts if lo <= row[0] / top < hi]
             if not inside:
                 continue
             power_bins.append({
                 "label": f"{lo * 100:.0f} - {hi * 100:.0f}% of peak",
-                "wall": sum(dt for *_x, dt in inside) / ngpu,
-                "power": _wmean([(w, dt) for w, _c, _s, dt in inside]),
-                "clk": _wmean([(c, dt) for _w, c, _s, dt in inside]),
-                "sm": _wmean([(sm, dt) for _w, _c, sm, dt in inside]),
+                "wall": sum(dt for _w, _c, _s, dt, _t in inside) / ngpu,
+                "power": _wmean([(w, dt) for w, _c, _s, dt, _t in inside]),
+                "clk": _wmean([(c, dt) for _w, c, _s, dt, _t in inside]),
+                "sm": _wmean([(sm, dt) for _w, _c, sm, dt, _t in inside]),
+                "temp": _wmean([(t, dt) for _w, _c, _s, dt, t in inside]),
             })
 
     for spec in [queue] + bins:
@@ -752,8 +755,9 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
         "throttle": throttle_wall(rows, dts),
         "power_bins": power_bins,
         "power_limit": _wmean([(v, 1.0) for r in rows for v in (r.get("plimit") or []) if v]),
-        "peak_power": max((w for w, _c, _s, _d in watts), default=None),
-        "peak_clk": max((c for _w, c, _s, _d in watts), default=None),
+        "peak_power": max((w for w, _c, _s, _d, _t in watts), default=None),
+        "peak_clk": max((c for _w, c, _s, _d, _t in watts), default=None),
+        "peak_temp": max((t for _w, _c, _s, _d, t in watts if t is not None), default=None),
         "bins": bins, "queue": queue, "ngpu": ngpu, "observed": observed,
         "gen_full": gen_full, "busy": busy,
         "high_wall": high[0], "high_lost": high[1],
@@ -860,12 +864,13 @@ def print_engine_duty(duty, exc_lost=None):
         best = max((sp["sm"] / 100.0 * sp["clk"] for sp in duty["power_bins"]
                     if sp["sm"] is not None and sp["clk"]), default=None)
         print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}"
-              f"{'GPUact%':>9}{'act x clk':>11}{'vs best':>9}")
+              f"{'temp C':>8}{'GPUact%':>9}{'act x clk':>11}{'vs best':>9}")
         for spec in duty["power_bins"]:
             proxy = (spec["sm"] / 100.0 * spec["clk"]) if (spec["sm"] is not None and spec["clk"]) else None
             rel = f"{proxy / best * 100:>8.0f}%" if (proxy and best) else f"{'-':>9}"
+            temp = f"{spec['temp']:>8.0f}" if spec.get("temp") is not None else f"{'-':>8}"
             print(f"    {spec['label']:<20}{spec['wall']:>13.1f}{spec['power']:>9.0f}"
-                  f"{spec['clk']:>11.0f}{spec['sm']:>9.1f}"
+                  f"{spec['clk']:>11.0f}" + temp + f"{spec['sm']:>9.1f}"
                   + (f"{proxy:>11.0f}" if proxy else f"{'-':>11}") + rel)
         print("      act x clk is a CRUDE throughput proxy: GPU-active x SM clock. Work per"
               "\n      clock differs between prefill and decode and these are samples grouped"
@@ -899,6 +904,19 @@ def print_engine_duty(duty, exc_lost=None):
         if thr["limited_wall"]:
             print(f"    {'draw >= 97% of limit':<24}{thr['at_limit']:>10.1f} s  "
                   f"({thr['at_limit'] / thr['limited_wall'] * 100:>5.1f}%)")
+        if duty.get("peak_temp") is not None:
+            print(f"    {'peak card temperature':<24}{duty['peak_temp']:>10.0f} C")
+        thermal = sum(w for name, w in thr["reasons"].items() if "Thermal" in name)
+        power = sum(w for name, w in thr["reasons"].items() if "Power" in name)
+        if thermal and power:
+            print("      BOTH a power reason and a thermal reason. They are not the same finding:"
+                  "\n      the power limit is fixed in the card (compare power.limit with"
+                  " power.max_limit --"
+                  "\n      if they are equal there is nothing to raise), while a thermal reason is"
+                  " about"
+                  "\n      airflow, ambient and fan curve, and is the one of the two that a"
+                  " machine room"
+                  "\n      can change. Neither is answered by anything in this repository.")
 
 
 def classify(rows, exc, floor, busy=95.0):

@@ -1318,3 +1318,46 @@ def test_the_power_table_shows_the_product_not_only_the_two_factors():
     assert "act x clk" in out and "vs best" in out, out
     assert "CRUDE throughput proxy" in out, out
     assert "does not" in out and "measure the trade" in out, out
+
+
+def test_a_thermal_reason_is_reported_with_a_temperature():
+    """A thermal slowdown with no temperature beside it is unreadable, and a
+    real run set one for 36% of its card-seconds while the report showed no
+    temperature at all -- the column was in the trace and not in the table."""
+    scanner = _scanner()
+    rows, dts = _throttle_rows([(280.0, 1680, 0x0, 50), (298.0, 1500, 0x20, 50)])
+    for i, r in enumerate(rows):
+        r["temp"] = [72.0] * 3 if i < 50 else [89.0] * 3
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+    assert duty["peak_temp"] == pytest.approx(89.0)
+    assert any(b.get("temp") for b in duty["power_bins"]), duty["power_bins"]
+
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        scanner.print_engine_duty(duty)
+    out = buf.getvalue()
+    assert "temp C" in out and "peak card temperature" in out, out
+
+
+def test_power_and_thermal_reasons_together_are_not_reported_as_one_finding():
+    """They want different people. The power limit is fixed in the card; a
+    thermal reason is airflow, ambient and fan curve. A run set both, and
+    reading them as one would send the next question to the wrong place."""
+    scanner = _scanner()
+    rows, dts = _throttle_rows([(298.0, 1600, 0x4, 40), (295.0, 1500, 0x20, 40)])
+    for r in rows:
+        r["temp"] = [85.0] * 3
+    duty = scanner.engine_duty(rows, dts, gen_full=100)
+
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        scanner.print_engine_duty(duty)
+    out = buf.getvalue()
+    assert "BOTH a power reason and a thermal reason" in out, out
+    assert "power.max_limit" in out and "airflow" in out, out
+    # and neither is claimed to be fixable here
+    assert "Neither is answered by anything in this repository" in out, out
