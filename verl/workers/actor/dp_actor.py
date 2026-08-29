@@ -76,6 +76,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     WeightShiftHistogram,
     opd_logit_push,
     pair_state_index,
+    OPD_ROLE_CUT_SUFFIXES as XT_OPD_ROLE_CUT_SUFFIXES,
     ROLE_CUT_SUFFIXES as XT_ROLE_CUT_SUFFIXES,
     ROLE_SCOPE_NAMES as XT_ROLE_SCOPE_NAMES,
     TURN_CUT_SUFFIXES as XT_TURN_CUT_SUFFIXES,
@@ -88,9 +89,12 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     load_sidecar_state,
     resume_identity,
     GRAD_TERMS as XT_GRAD_TERMS,
+    OPD_TERMS as XT_OPD_TERMS,
     assert_all_finite,
     gradient_metrics,
     logit_gradient_terms,
+    opd_attribution_metrics,
+    opd_attribution_terms,
     per_candidate_shift,
     position_terms as xt_position_terms,
     position_weight_metrics,
@@ -455,6 +459,11 @@ class DataParallelPPOActor(BasePPOActor):
         # Counts update_policy calls, so the dense-token stride is a function of
         # something every rank shares. Incremented once per call, at the end.
         self._xt_step_index = 0
+        # The arm-independent attribution's own stride counter. Not the one
+        # above: that one advances inside `if xt_on`, so in a control run --
+        # the run this family exists for -- it would sit at 0 forever and
+        # every step would look due.
+        self._opd_step_index = 0
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -1772,6 +1781,42 @@ class DataParallelPPOActor(BasePPOActor):
         )
         xt_enabled = xt_cfg_on and "sign_cache_ids" in data.batch.keys()
         xt_report_eps = float((xt_cfg or {}).get("report_epsilon", 0.1))
+        # THE ARM-INDEPENDENT CUT. Everything above this line needs the base
+        # policy and the off-task teachers, which only cross_teacher_enabled
+        # makes the driver load: a control run has no sign_cache_ids column at
+        # all, so its corroboration, its pair evidence and its channel partition
+        # are not weight-free quantities that happen to be one -- their INPUTS
+        # do not exist, and computing them would mean the control paying for the
+        # three extra frozen forwards it exists to do without.
+        #
+        # What a control does have is the student's own top-k, the on-task
+        # teacher's log-probs at it, and the policy-gradient coefficient. That
+        # is exactly the input set of opd_logit_push, so the unweighted OPD
+        # term's per-token push, its per-candidate KL mass and its geometry
+        # against the policy gradient are measurable in BOTH arms, under one
+        # definition, and are what "which tokens rank top without the weighting"
+        # is a question about.
+        #
+        # It runs in the weighted arm too, deliberately: there the same columns
+        # are the counterfactual taken on the SAME policy, which is a stronger
+        # comparison than the same numbers from a run whose policy has diverged.
+        opd_attr_cfg = self.config.get("opd_attribution", None) or {}
+        opd_attr_on = (
+            bool(opd_attr_cfg.get("enable", False))
+            and teacher_topk_kl
+            and use_teacher_kl_loss
+            and student_indexed_topk
+        )
+        if bool(opd_attr_cfg.get("enable", False)) and not opd_attr_on:
+            # Refuse quietly rather than run empty: every column below is built
+            # from the student's top-k and the on-task teacher's values at it,
+            # and a teacher-indexed or non-topk arm has neither under these names.
+            print(
+                "[opd_attribution] switched on but the run does not produce a student-indexed "
+                "top-k teacher KL (needs use_teacher_kl_loss, kl_loss_type=topk_kl and "
+                "student_indexed_topk); no attribution will be reported",
+                flush=True,
+            )
         if xt_enabled:
             assert teacher_topk_kl and use_teacher_kl_loss, (
                 "cross_teacher_kl_weight scales the teacher KL over a shared top-k "
@@ -2252,6 +2297,48 @@ class DataParallelPPOActor(BasePPOActor):
                 _snap = _st.snapshot()
                 xt_channel_snapshots[_name] = _snap if bool(_snap["valid"].any()) else None
                 _st.reset()
+
+        # ---- the arm-independent OPD attribution ------------------------- #
+        # Same stride discipline as the dense tables above and the same reason
+        # for it: the buffer is ~194 MB of vocabulary-wide cells, and which
+        # tokens the distillation term pushes hardest is a slow quantity. Gated
+        # on a STEP COUNT every rank shares, never on batch content, because the
+        # accumulators run collectives.
+        opd_grad_stats = opd_role_grad_stats = opd_push_tokens = None
+        if opd_attr_on:
+            opd_every = max(1, int(opd_attr_cfg.get("every", 1)))
+            opd_due = (self._opd_step_index % opd_every) == 0
+            # The geometry columns are two float64 rows; they run every step.
+            opd_grad_stats = ScopeTermStats(
+                names=XT_OPD_TERMS, n_tasks=n_task, device=sign_dev
+            )
+            if sign_role_tags and bool(opd_attr_cfg.get("roles", True)):
+                # WHERE the unweighted term pushes, and whether it pulls with the
+                # reward THERE. The weighted arm publishes this cut for the
+                # weighted gradient; without the same cut on the unweighted one
+                # there is no denominator to read the weighted one against.
+                opd_role_grad_stats = PositionScopeTermStats(
+                    names=XT_OPD_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev
+                )
+            if opd_due and bool(opd_attr_cfg.get("tokens", True)):
+                _opd_vocab = model_vocab_size(self.actor_module)
+                if _opd_vocab is None:
+                    print(
+                        "[opd_attribution] the per-token table was requested but the model "
+                        "does not report a vocab_size; running without it",
+                        flush=True,
+                    )
+                else:
+                    # The SAME class as the weighted arm's push table, fed a
+                    # weight of exactly one. Not a thinner copy: the three
+                    # weight-free columns are defined identically whichever
+                    # weight goes in, so one class is what makes the two arms'
+                    # rankings the same measurement rather than two tables with
+                    # matching column names.
+                    opd_push_tokens = LogitPushTokens(
+                        vocab_size=_opd_vocab, n_tasks=n_task, device=sign_dev,
+                        top_n=int(opd_attr_cfg.get("top_n", 32)),
+                    )
 
         # Individual candidates, with the tokens around them. Every other table
         # here is an aggregate, and an aggregate cannot be read for a mechanism:
@@ -2742,7 +2829,7 @@ class DataParallelPPOActor(BasePPOActor):
                             # deferred separately below.
                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                             _defer("actor/pg_loss_weighted", pg_term)
-                        if xt_grad_stats is not None:
+                        if xt_grad_stats is not None or opd_grad_stats is not None:
                             # d(pg_losses)/d(log_prob), from the SAME inputs the
                             # loss above was built from rather than from a copy
                             # reconstructed in the diagnostic. Outside the
@@ -2751,6 +2838,12 @@ class DataParallelPPOActor(BasePPOActor):
                             # they aggregate it. Read in the cross-teacher block
                             # below, which is a sibling and cannot see these
                             # names.
+                            #
+                            # ONE coefficient for both geometries. Two would
+                            # make kl_weight/grpo/grad_cosine and
+                            # opd/grpo/grad_cosine comparisons against different
+                            # policy gradients, which is the one thing the pair
+                            # exists to hold fixed.
                             xt_pg_grad_coef = policy_loss_gradient_coef(
                                 old_log_prob=old_log_prob,
                                 log_prob=log_prob,
@@ -3307,6 +3400,71 @@ class DataParallelPPOActor(BasePPOActor):
                                         xt_grad_cols, response_mask=response_mask,
                                         scope_ids=xt_roles_mb,
                                     )
+                        # ---- the arm-independent attribution ------------- #
+                        # HERE, and not one line later. Everything below this
+                        # block multiplies teacher_kld by a weight; these columns
+                        # are the unweighted term's, so they have to be taken
+                        # while teacher_kld still is one. Outside every xt_built
+                        # guard as well: a control run reaches this line with
+                        # xt_built None on every step of the run, and that is the
+                        # run these columns exist for.
+                        if opd_attr_on and epoch == 0 and (
+                            opd_grad_stats is not None or opd_push_tokens is not None
+                        ):
+                            # The row's emitted token, and g0 -- built once here
+                            # and handed to both readers below. A second copy of
+                            # opd_logit_push is how "the arm amplified this
+                            # token" and "the arm's gradient norm" come to
+                            # describe different quantities under one name.
+                            _oy1 = data["responses"].unsqueeze(-1)
+                            _opd_sampled = (sign_support_ids == _oy1).to(teacher_kld.dtype)
+                            opd_push = (
+                                opd_logit_push(
+                                    student_logprob=student_topk_logprobs,
+                                    teacher_logprob=sign_on_task_logprobs,
+                                    teacher_kl=teacher_kld,
+                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                )
+                                if opd_push_tokens is not None
+                                else None
+                            )
+                            if opd_push_tokens is not None:
+                                # Ones, in the shape the class expects, passed to
+                                # both weight arguments because they ARE the same
+                                # weight -- the assertion in update() is checking
+                                # that a caller has not handed it two.
+                                _ones = torch.ones_like(teacher_kld)
+                                opd_push_tokens.update(
+                                    support_ids=sign_support_ids,
+                                    g0=opd_push["g0"],
+                                    weight=_ones, coef_applied_weight=_ones,
+                                    response_mask=response_mask, task_ids=task_ids,
+                                    sampled_onehot=_opd_sampled,
+                                    p_student=opd_push["p_student"],
+                                    g0_tail=opd_push["g0_tail"],
+                                    gap=opd_push["gap"],
+                                )
+                            if opd_grad_stats is not None and xt_pg_grad_coef is not None:
+                                opd_cols = opd_attribution_terms(
+                                    student_logprob=student_topk_logprobs,
+                                    teacher_logprob=sign_on_task_logprobs,
+                                    teacher_kl=teacher_kld,
+                                    pg_grad_coef=xt_pg_grad_coef,
+                                    sampled_onehot=_opd_sampled,
+                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                    pg_coef=float(pg_loss_coef),
+                                    row_weight=task_loss_weight,
+                                    push=opd_push,
+                                )
+                                opd_grad_stats.update(
+                                    opd_cols, response_mask=response_mask, task_ids=task_ids,
+                                )
+                                if opd_role_grad_stats is not None:
+                                    _opd_roles = token_roles(data["responses"], sign_role_tags)
+                                    opd_role_grad_stats.update(
+                                        opd_cols, response_mask=response_mask,
+                                        scope_ids=_opd_roles,
+                                    )
                         if xt_built is not None:
                             # The one line the whole module exists to reach.
                             teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
@@ -3654,7 +3812,14 @@ class DataParallelPPOActor(BasePPOActor):
                 metrics.update(xt_role_token_stats.scalar_metrics(prefix="kl_weight"))
             if xt_push_token_stats is not None:
                 xt_push_token_stats.all_reduce()
-                metrics.update(xt_push_token_stats.scalar_metrics(task_names=task_id_names))
+                # weight_free=False: the base and kl_mass columns are published
+                # by the unweighted instance, under `opd/`, so the key is the
+                # same one a control run writes. Publishing them here too would
+                # be the same series under two names in the arm and one name in
+                # the control, which is the opposite of comparable.
+                metrics.update(xt_push_token_stats.scalar_metrics(
+                    task_names=task_id_names, weight_free=False,
+                ))
             metrics.update(self._xt_rms_metrics(task_id_names))
             metrics.update(self._xt_reliability_metrics(task_id_names))
             def _publish_probe(name, rendered, suffixes):
@@ -3728,6 +3893,47 @@ class DataParallelPPOActor(BasePPOActor):
             # every rank, incremented in lockstep, so the dense-token stride
             # cannot make two ranks disagree about whether a table exists.
             self._xt_step_index += 1
+        # ---- the arm-independent OPD attribution, rendered ------------------ #
+        # OUTSIDE the block above, which is the whole point: `if xt_on` is false
+        # for every step of a control run, and these are the keys that make the
+        # two arms comparable. Under its own `opd/` prefix so a reader diffing
+        # the runs is diffing the same key, and so nothing here can be mistaken
+        # for a weighted quantity.
+        if opd_grad_stats is not None:
+            opd_grad_stats.all_reduce()
+            metrics.update(
+                opd_attribution_metrics(opd_grad_stats.sums(task_names=task_id_names))
+            )
+        if opd_role_grad_stats is not None:
+            opd_role_grad_stats.all_reduce()
+            # Same prefix shape and same curation as the weighted role cut, so
+            # opd/role/env_action/... sits beside kl_weight/role/env_action/...
+            # and the pair is one chart. include_pooled stays off for the reason
+            # it is off there: the pooled row is the number the task accumulator
+            # already publishes, and two keys for one quantity is how two series
+            # come to disagree. The shares then divide by the sum of the roles,
+            # which is what a role cut is a cut of.
+            metrics.update(xt_select_metrics(
+                opd_attribution_metrics(
+                    opd_role_grad_stats.sums(scope_names=XT_ROLE_SCOPE_NAMES),
+                    prefix="opd/role",
+                ),
+                XT_OPD_ROLE_CUT_SUFFIXES,
+            ))
+        if opd_push_tokens is not None:
+            opd_push_tokens.all_reduce()
+            # Only the weight-free half survives the render: with W == 1 the
+            # `extra` columns are identically zero and scalar_metrics returns
+            # early on them, so what lands here is base_*, kl_mass_* and the
+            # coverage share -- by construction, not by filtering.
+            metrics.update(
+                opd_push_tokens.scalar_metrics(task_names=task_id_names, prefix="opd")
+            )
+        if opd_attr_on:
+            # One per call, on every rank, for the same reason the weighted
+            # arm's counter is: the dense-token stride must not let two ranks
+            # disagree about whether a table exists to all-reduce.
+            self._opd_step_index += 1
         if position_stats is not None:
             # Only the ratios: the raw per-position means would put w_sq and
             # kl_sq in the log, which are not quantities anyone reads. The
@@ -3765,8 +3971,17 @@ class DataParallelPPOActor(BasePPOActor):
                 # the direction_class column no other row carries. A reader
                 # filtering on either gets exactly the affected-logit table.
                 self.last_token_report += xt_push_token_stats.top_tokens(
-                    task_names=task_id_names
+                    task_names=task_id_names, weight_free=False,
                 )
+        if opd_push_tokens is not None:
+            # Appended after whichever arm's tables ran, and to the same file:
+            # the rows are told apart by ranked_by in {base_logit_push, kl_mass},
+            # which no weighted row carries, and a reader filtering on either
+            # gets the unweighted table whichever arm produced it. This is the
+            # branch that puts a per-token ranking in a CONTROL run's dump,
+            # where the two branches above never open.
+            rows = opd_push_tokens.top_tokens(task_names=task_id_names)
+            self.last_token_report = (self.last_token_report or []) + rows
         # A second file rather than a discriminator column in the first: the two
         # tables are keyed differently (scope/state against dst/src/class) and
         # merging them would make every row carry the other's empty columns.

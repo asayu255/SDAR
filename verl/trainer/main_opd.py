@@ -73,6 +73,15 @@ def inject_distillation_config(config) -> None:
                 config.actor_rollout_ref.actor.cross_teacher_kl_weight.teacher_paths = (
                     opd_cfg.get("teacher_paths", None)
                 )
+        # The arm-independent attribution. Same journey and the same reason --
+        # it is built where the student's top-k exists -- but NO prerequisite
+        # block below, deliberately: it reads only the student's own support and
+        # the on-task teacher's values at it, both of which every OPD run
+        # already has. That is what lets it run in the control, which loads
+        # neither the base policy nor the off-task teachers.
+        opd_attr_cfg = opd_cfg.get("opd_attribution", None)
+        if opd_attr_cfg is not None:
+            config.actor_rollout_ref.actor.opd_attribution = opd_attr_cfg
         if (sign_cfg is not None and bool(sign_cfg.get("enable", False))) or (
             xt_cfg is not None and bool(xt_cfg.get("enable", False))
         ):

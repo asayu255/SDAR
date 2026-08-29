@@ -339,6 +339,44 @@ set -x
 #     whole KL toward AlfWorld's own teacher at this position". NOT "a Search
 #     token was injected into AlfWorld" -- a position scalar cannot do that.
 #
+#   opd_attribution/* IS THE ARM-INDEPENDENT HALF, and it is the only family in
+#     this script that also runs in the control. Everything above it needs the
+#     base policy and the off-task teachers, which only
+#     cross_teacher_kl_weight.enable=True makes the driver load: a control run
+#     has no sign_cache_ids column at all, so its corroboration, its pair
+#     evidence and its channel partition are not weight-free quantities that
+#     happen to be missing -- their INPUTS do not exist, and computing them would
+#     mean the control paying for the three extra frozen forwards it exists to do
+#     without. What a control does have is the student's own top-20, the on-task
+#     teacher's log-probs at it, and the policy-gradient coefficient, which is
+#     exactly what opd_logit_push reads.
+#     Under opd/ it publishes, in BOTH runs and under the same keys:
+#       opd/push/base_*        the per-token push of the UNWEIGHTED OPD term,
+#         Sum g0 and Sum |g0|, with the support/tail coverage share the ranking
+#         is quoted against. "Which tokens does distillation push hardest, before
+#         any weighting" -- and its top-N ranking lands in the same
+#         sign_tokens_step*.jsonl file under ranked_by="base_logit_push".
+#       opd/push/kl_mass_*     each candidate's own share of the position's D,
+#         p_student(u) * (log p_student - log p_on). Nats of evidence, not of
+#         push, and signed: only the position's whole D is bounded below.
+#         ranked_by="kl_mass" in the same file.
+#       opd/grpo/grad_{cosine,norm_ratio}   the unweighted OPD gradient against
+#         the policy gradient. Beside kl_weight/grpo/grad_cosine on the weighted
+#         arm this is the weighting's effect on the gradient geometry with the
+#         POLICY HELD FIXED, which is a stronger comparison than the same two
+#         numbers taken from two runs whose policies have diverged by the step
+#         you read them.
+#       opd/{task}/{kl,push_abs}_{mean,share} and the same four columns cut by
+#         role -- where the unweighted budget sits, which is the denominator
+#         every claim about where the WEIGHT moved budget is quoted against.
+#     It runs in the weighted arm too, deliberately: there the columns are the
+#     counterfactual on the SAME policy. The weighted push table then withholds
+#     them (LogitPushTokens.scalar_metrics(weight_free=False)) so the series has
+#     exactly one owner and one key in both runs.
+#     Cost: one ~194 MB vocabulary-wide buffer on the stride step (every=5, the
+#     same discipline as token_stats) and two float64 rows every step. No extra
+#     forward, no extra backward -- g0 is closed-form on tensors already resident.
+#
 #   grpo/grad_norm_ratio and grpo/grad_cosine are analytic, in logit space, over
 #     the top-k plus the tail: the descent direction for the weighted OPD term
 #     is coef*W*p_s*(D - f) and for the policy gradient A*(1[v=y] - p_s), both
@@ -954,6 +992,11 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.context=16 \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.pair_strata=True \
     +algorithm.opd.cross_teacher_kl_weight.event_dump.per_group=4 \
+    +algorithm.opd.opd_attribution.enable=True \
+    +algorithm.opd.opd_attribution.every=5 \
+    +algorithm.opd.opd_attribution.top_n=64 \
+    +algorithm.opd.opd_attribution.tokens=True \
+    +algorithm.opd.opd_attribution.roles=True \
     env.env_name=multitask \
     env.seed=1 \
     env.max_steps=50 \

@@ -2494,13 +2494,38 @@ class LogitPushTokens:
                    token" can be read against whether the student was ever going
                    to say it.
     ``sampled``    how often it was the token actually emitted.
+    ``base``       sum of ``g0``, signed -- the push the UNWEIGHTED OPD term
+                   would have applied at the same positions.
+    ``base_abs``   the same in absolute value.
+    ``kl_mass``    sum of ``p_student(u) * f(u)``, the candidate's own share of
+                   the position's ``D``. Nats of evidence, not of push. Signed,
+                   and genuinely negative at candidates the teacher is more
+                   confident about than the student -- only the position's whole
+                   ``D`` is bounded below, not each candidate's share of it.
+    ``kl_mass_abs``the same in absolute value, for the same reason ``extra_abs``
+                   exists: a token that carries the KL one way in one context and
+                   the other way in another nets to nothing and is the most
+                   interesting row in the table.
 
-    Memory is ``(1 + n_tasks) * 4 * V`` cells. At Qwen3's vocabulary and three
-    tasks that is 2.4M cells and about 97 MB, which is why the whole dense-token
-    family is stride-gated: see ``token_stats.every``.
+    THE LAST THREE COLUMNS CONTAIN NO ``W``. That is their point. They are the
+    same quantity whether this table runs inside the weighted arm or inside a
+    control that never builds a weight, so "which tokens does the plain OPD term
+    push hardest" is one ranking with one definition across both arms -- and,
+    inside the weighted arm, a counterfactual taken on the SAME policy, which is
+    stronger than the same question asked of a different run.
+
+    They are summed over the class axis when ranked, deliberately: the four
+    classes are a fact about ``W``, and splitting an unweighted series by them
+    would put a control's whole vocabulary in the two ``_damped`` cells (``W = 1``
+    is not ``> 1``) and make the two arms' tables incomparable by construction.
+
+    Memory is ``(1 + n_tasks) * 4 * V * len(TERMS)`` cells. At Qwen3's vocabulary
+    and three tasks that is 24.3M cells and about 194 MB, which is why the whole
+    dense-token family is stride-gated: see ``token_stats.every``.
     """
 
-    TERMS = ("n", "extra", "extra_abs", "weighted", "mass", "sampled")
+    TERMS = ("n", "extra", "extra_abs", "weighted", "mass", "sampled",
+             "base", "base_abs", "kl_mass", "kl_mass_abs")
 
     def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 32):
         self.vocab_size = V = int(vocab_size)
@@ -2518,18 +2543,25 @@ class LogitPushTokens:
         # these tokens" reads the same whether the named tokens carry 92% of the
         # added push or 35% of it, and only the first supports the sentence.
         # [support_extra_abs, tail_extra_abs, support_weighted_abs,
-        #  tail_weighted_abs] per scope.
-        self.tail_buf = torch.zeros(S * 4, dtype=torch.float64, device=device)
+        #  tail_weighted_abs, support_base_abs, tail_base_abs] per scope. The
+        # last two carry no W, so the base ranking below is quoted against its
+        # own denominator rather than against the weighted one -- which in the
+        # arm is a different number and in a control is the same number by
+        # accident, and an accident is not a definition.
+        self.tail_buf = torch.zeros(S * 6, dtype=torch.float64, device=device)
         self._cpu_cache = None
 
     def update(self, *, support_ids, g0, weight, coef_applied_weight, response_mask,
-               task_ids=None, sampled_onehot=None, p_student=None, g0_tail=None) -> None:
+               task_ids=None, sampled_onehot=None, p_student=None, g0_tail=None,
+               gap=None) -> None:
         """Fold one micro-batch in.
 
         Args:
             g0: (bs, resp, k) the UNWEIGHTED descent direction, from
                 :func:`opd_logit_push`.
-            weight: (bs, resp) the applied W.
+            weight: (bs, resp) the applied W. Pass ones on an arm that builds no
+                weight: ``extra`` is then identically zero and the three
+                weight-free columns carry the whole table.
             coef_applied_weight: (bs, resp) the same W -- passed separately only
                 so a caller cannot silently hand the pre-normalisation weight to
                 one argument and the applied one to the other.
@@ -2539,6 +2571,10 @@ class LogitPushTokens:
             g0_tail: (bs, resp) the unweighted push on the TAIL bucket, from
                 :func:`opd_logit_push`. None leaves the coverage shares
                 unreported rather than implying the tail was empty.
+            gap: (bs, resp, k) ``f = log p_student - log p_on``, from
+                :func:`opd_logit_push`. Needed for ``kl_mass`` and for nothing
+                else; None leaves that column at zero rather than deriving it
+                from ``g0``, which would divide by a probability.
         """
         assert weight is coef_applied_weight or torch.equal(weight, coef_applied_weight), (
             "LogitPushTokens takes the APPLIED weight for both the class and the "
@@ -2554,14 +2590,22 @@ class LogitPushTokens:
         cls = push_direction_class(g0, weight)
         tok = support_ids.clamp(min=0, max=V - 1).to(torch.long)
 
+        ps = torch.zeros_like(g) if p_student is None else p_student.detach().to(torch.float64)
+        klm = (torch.zeros_like(g) if gap is None
+               else ps * gap.detach().to(torch.float64)) * m
         cols = [
             m.expand_as(g),
             extra * m,
             extra.abs() * m,
             w * g * m,
-            (torch.zeros_like(g) if p_student is None else p_student.detach().to(torch.float64)) * m,
+            ps * m,
             (torch.zeros_like(g) if sampled_onehot is None
              else sampled_onehot.detach().to(torch.float64)) * m,
+            # No W below this line. See the class docstring.
+            g * m,
+            g.abs() * m,
+            klm,
+            klm.abs(),
         ]
         vals = torch.stack(cols, dim=-1).reshape(-1, K)
         base = (cls * V + tok).reshape(-1) * K
@@ -2591,16 +2635,17 @@ class LogitPushTokens:
         gt = g0_tail.detach().to(torch.float64).abs()
         wm1 = (w - 1.0).abs()
         cols = torch.stack(
-            [wm1 * gs * mp, wm1 * gt * mp, w.abs() * gs * mp, w.abs() * gt * mp], dim=-1
-        )                                                     # (bs, resp, 4)
-        self.tail_buf[:4] += cols.sum(dim=(0, 1))
+            [wm1 * gs * mp, wm1 * gt * mp, w.abs() * gs * mp, w.abs() * gt * mp,
+             gs * mp, gt * mp], dim=-1
+        )                                                     # (bs, resp, 6)
+        self.tail_buf[:6] += cols.sum(dim=(0, 1))
         if task_ids is None:
             return
         t = task_ids.reshape(-1).to(torch.long)
         known = ((t >= 0) & (t < self.n_scopes - 1)).to(torch.float64).reshape(-1, 1)
-        per_row = cols.sum(dim=1) * known                     # (bs, 4)
-        base = (t.clamp(min=0, max=max(self.n_scopes - 2, 0)) + 1) * 4
-        flat = (base.unsqueeze(-1) + torch.arange(4, device=per_row.device)).reshape(-1)
+        per_row = cols.sum(dim=1) * known                     # (bs, 6)
+        base = (t.clamp(min=0, max=max(self.n_scopes - 2, 0)) + 1) * 6
+        flat = (base.unsqueeze(-1) + torch.arange(6, device=per_row.device)).reshape(-1)
         self.tail_buf.index_add_(0, flat, per_row.reshape(-1))
 
     def all_reduce(self) -> None:
@@ -2623,14 +2668,22 @@ class LogitPushTokens:
         t = scope - 1
         return task_names[t] if task_names and t < len(task_names) else f"task{t}"
 
-    def scalar_metrics(self, task_names=None, prefix: str = "kl_weight") -> dict:
+    def scalar_metrics(self, task_names=None, prefix: str = "kl_weight",
+                       weight_free: bool = True) -> dict:
         """How the added push splits over the four directions, and how spread.
 
         ``share`` is of the GROSS added push, so the four sum to 1 and a class
         that cancels itself across contexts is not reported as inactive.
+
+        ``weight_free`` publishes the columns that contain no ``W``. It is a
+        rendering choice, not a measurement one -- the buffer holds them either
+        way -- and it exists because a weighted arm runs a SECOND instance of
+        this class at ``W = 1`` to own exactly those columns. Two instances
+        publishing them would be two identical series under one key, which is
+        the same as one series that a reader has to double-count.
         """
         buf = self._cpu()
-        tail = self.tail_buf.detach().to("cpu").view(self.n_scopes, 4)
+        tail = self.tail_buf.detach().to("cpu").view(self.n_scopes, 6)
         out = {}
         idx = {t: i for i, t in enumerate(self.TERMS)}
         N = min(self.top_n, self.vocab_size)
@@ -2641,12 +2694,42 @@ class LogitPushTokens:
             # How much of the added push the rows above can NAME. The support
             # and the tail are the whole of it, so the two extra shares sum to 1
             # and a token ranking can be quoted with its denominator attached.
-            sup_x, tail_x, sup_w, tail_w = (float(v) for v in tail[scope])
+            sup_x, tail_x, sup_w, tail_w, sup_b, tail_b = (float(v) for v in tail[scope])
             if sup_x + tail_x > 0:
                 out[f"{head}/push/support_extra_abs_share"] = sup_x / (sup_x + tail_x)
                 out[f"{head}/push/tail_extra_abs_share"] = tail_x / (sup_x + tail_x)
             if sup_w + tail_w > 0:
                 out[f"{head}/push/tail_weighted_abs_share"] = tail_w / (sup_w + tail_w)
+            # THE WEIGHT-FREE HALF, emitted before the early return below rather
+            # than after it. That return is taken on the added push being zero,
+            # which is exactly the case an arm with no weight is in -- putting
+            # these keys after it would mean the control, the one run they exist
+            # for, is the one run that never publishes them.
+            if weight_free and sup_b + tail_b > 0:
+                out[f"{head}/push/tail_base_abs_share"] = tail_b / (sup_b + tail_b)
+            base_cell = buf[scope].sum(dim=0)         # summed over the four W classes
+            base_abs = base_cell[:, idx["base_abs"]]
+            base_gross = float(base_abs.sum()) if weight_free else 0.0
+            if base_gross > 0:
+                out[f"{head}/push/base_abs_total"] = base_gross
+                out[f"{head}/push/base_net_total"] = float(base_cell[:, idx["base"]].sum())
+                out[f"{head}/push/base_n_distinct"] = float((base_cell[:, idx["n"]] > 0).sum())
+                out[f"{head}/push/base_top{N}_share"] = (
+                    float(torch.topk(base_abs, N).values.sum()) / base_gross
+                )
+            kl_gross = float(base_cell[:, idx["kl_mass_abs"]].sum()) if weight_free else 0.0
+            if kl_gross > 0:
+                # Nats of the position's own D, filed by candidate. Its top-N
+                # share answers the question the push ranking cannot: whether
+                # the distillation signal itself is concentrated, independently
+                # of what any weight did with it. Concentration is quoted on the
+                # GROSS, because the signed sum has cancellation in it and a
+                # share of a cancelled total is not a share of anything.
+                out[f"{head}/push/kl_mass_total"] = float(base_cell[:, idx["kl_mass"]].sum())
+                out[f"{head}/push/kl_mass_abs_total"] = kl_gross
+                out[f"{head}/push/kl_mass_abs_top{N}_share"] = (
+                    float(torch.topk(base_cell[:, idx["kl_mass_abs"]], N).values.sum()) / kl_gross
+                )
             if gross_all <= 0:
                 continue
             out[f"{head}/push/extra_abs_total"] = gross_all
@@ -2671,14 +2754,29 @@ class LogitPushTokens:
                     out[f"{h}/sampled_frac"] = float(cell[:, idx["sampled"]].sum()) / n_cell
         return out
 
-    def top_tokens(self, task_names=None) -> list:
-        """Ranked rows in the shared dump schema, one ranking per class."""
+    def top_tokens(self, task_names=None, weight_free: bool = True) -> list:
+        """Ranked rows in the shared dump schema, one ranking per class.
+
+        Plus two rankings that carry no ``W``: ``base_logit_push`` (the plain
+        OPD term's push) and ``kl_mass`` (the candidate's own share of ``D``).
+        Both are taken on the class-SUMMED cell, so they mean the same thing in
+        an arm that builds a weight and in one that does not -- which is what
+        makes "these tokens rank top without weighting" a comparison rather than
+        two tables with the same column names. ``weight_free=False`` withholds
+        them; see :meth:`scalar_metrics` for when that is the right call.
+
+        The weighted rows carry ``base_logit_push`` as a column regardless, so
+        "the arm amplified this token" is always readable against how hard the
+        unweighted term was pushing it in the first place.
+        """
         buf = self._cpu()
         idx = {t: i for i, t in enumerate(self.TERMS)}
         N = min(self.top_n, self.vocab_size)
         rows = []
         for scope in range(self.n_scopes):
             name = self._scope_name(scope, task_names) or "__pooled__"
+            if weight_free:
+                rows += self._base_rows(buf[scope].sum(dim=0), idx, N, name)
             for c, cname in enumerate(PUSH_CLASSES):
                 cell = buf[scope, c]
                 series = cell[:, idx["extra_abs"]]
@@ -2696,9 +2794,57 @@ class LogitPushTokens:
                         "extra_logit_push": float(cell[tok, idx["extra"]]),
                         "extra_logit_push_abs": v,
                         "weighted_logit_push": float(cell[tok, idx["weighted"]]),
+                        # In THIS class cell, so it is the unweighted push at the
+                        # subset of occurrences that landed in this direction
+                        # class -- not the token's whole base push, which the
+                        # base ranking reports. Carried so a row saying "the arm
+                        # amplified this token" is readable against how hard the
+                        # plain term was already pushing it.
+                        "base_logit_push": float(cell[tok, idx["base"]]),
+                        "kl_mass": float(cell[tok, idx["kl_mass"]]),
                         "p_student_mean": (float(cell[tok, idx["mass"]]) / n_tok) if n_tok else 0.0,
                         "sampled_count": int(cell[tok, idx["sampled"]]),
                     })
+        return rows
+
+    def _base_rows(self, cell, idx, N, scope_name) -> list:
+        """The two weight-free rankings for one scope, class axis already summed.
+
+        ``direction`` is the sign of the token's NET unweighted push, not a
+        :data:`PUSH_CLASSES` label: those four are a fact about ``W``, and at
+        ``W = 1`` every token in the vocabulary falls in the two ``_damped``
+        cells, which would read as a finding and is an artefact of ``1 > 1``
+        being false.
+        """
+        rows = []
+        for ranked_by, series in (
+            ("base_logit_push", cell[:, idx["base_abs"]]),
+            ("kl_mass", cell[:, idx["kl_mass_abs"]]),
+        ):
+            if float(series.sum()) <= 0:
+                continue
+            vals, ids = torch.topk(series, N)
+            for rank, (v, tok) in enumerate(zip(vals.tolist(), ids.tolist())):
+                if v <= 0:
+                    break
+                n_tok = float(cell[tok, idx["n"]])
+                net = float(cell[tok, idx["base"]])
+                rows.append({
+                    "scope": scope_name, "ranked_by": ranked_by,
+                    "direction_class": "base_up" if net > 0 else "base_down",
+                    "rank": rank, "token_id": int(tok), "count": int(n_tok),
+                    "base_logit_push": net,
+                    "base_logit_push_abs": float(cell[tok, idx["base_abs"]]),
+                    "kl_mass": float(cell[tok, idx["kl_mass"]]),
+                    "kl_mass_abs": float(cell[tok, idx["kl_mass_abs"]]),
+                    # Carried on these rows too so a reader comparing the two
+                    # arms never has to join back to the weighted ranking, whose
+                    # top-N is a different set of tokens.
+                    "extra_logit_push": float(cell[tok, idx["extra"]]),
+                    "weighted_logit_push": float(cell[tok, idx["weighted"]]),
+                    "p_student_mean": (float(cell[tok, idx["mass"]]) / n_tok) if n_tok else 0.0,
+                    "sampled_count": int(cell[tok, idx["sampled"]]),
+                })
         return rows
 
 
@@ -3171,6 +3317,7 @@ def logit_gradient_terms(
     row_weight: Optional[torch.Tensor] = None,
     push_shared: Optional[torch.Tensor] = None,
     push_source: Optional[torch.Tensor] = None,
+    push: Optional[dict] = None,
     eps: float = 1e-8,
 ) -> dict:
     """How the weighted OPD term and the policy gradient push the same logits.
@@ -3229,11 +3376,17 @@ def logit_gradient_terms(
     so a positive value is not read as evidence that they agree. Their cosines
     with the policy gradient carry no such constraint: each can take either
     sign, and their disagreeing is the finding that separates the arms.
+
+    ``push`` is an already-built :func:`opd_logit_push` on the SAME arguments,
+    for a caller that needs it for something else too. It is an optimisation
+    only -- the values are identical -- and it exists so the one definition of
+    ``g0`` is computed once per micro-batch rather than once per reader.
     """
-    push = opd_logit_push(
-        student_logprob=student_logprob, teacher_logprob=teacher_logprob,
-        teacher_kl=teacher_kl, coef=coef, eps=eps,
-    )
+    if push is None:
+        push = opd_logit_push(
+            student_logprob=student_logprob, teacher_logprob=teacher_logprob,
+            teacher_kl=teacher_kl, coef=coef, eps=eps,
+        )
     p_s, tail_s = push["p_student"], push["tail_student"]
     w = weight.detach().to(torch.float32).unsqueeze(-1)
     g_opd = w * push["g0"]
@@ -3312,8 +3465,14 @@ def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
         # channels, and it is dominated by the base -- so it stays near whatever
         # the unweighted term does however the channels are allocated. These two
         # are on each channel's ADDITION alone.
-        sh = math.sqrt(max(tot["g_shared_sq"], 0.0))
-        src = math.sqrt(max(tot["g_source_sq"], 0.0))
+        sh = math.sqrt(max(tot.get("g_shared_sq", 0.0), 0.0))
+        src = math.sqrt(max(tot.get("g_source_sq", 0.0), 0.0))
+        if sh <= 0.0 and src <= 0.0:
+            # No partition was supplied -- an unweighted caller, where W - 1 is
+            # identically zero and there is no addition to split. Two keys
+            # pinned at 0.0 forever would read as "the channels did nothing",
+            # which is a finding this caller is in no position to make.
+            continue
         out[f"{head}/channel/shared_grad_norm"] = sh
         out[f"{head}/channel/source_grad_norm"] = src
         if grpo > 1e-12:
@@ -3326,6 +3485,120 @@ def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # Read it as redundancy -- near 1 the two are the same mechanism
             # twice -- and never as "the channels agree", which it cannot deny.
             out[f"{head}/channel/shared_source_grad_cosine"] = tot["g_cross_dot"] / (sh * src)
+    return out
+
+
+# The arm-independent cut. Every other terms tuple in this module names a
+# quantity built out of W; these are the columns that exist whether or not a
+# weight was ever computed, so one accumulator with one definition runs in the
+# weighted arm and in the control that has no off-task teachers at all.
+#
+# GRAD_TERMS' channel columns come along and stay at zero: the partition of
+# W - 1 is empty when W is 1. gradient_metrics declines to render them rather
+# than publishing two series pinned at 0.0, which would read as a measurement.
+OPD_TERMS = GRAD_TERMS + ("d_kl", "push_abs")
+
+# The role cut of the unweighted term, curated for the same reason
+# ROLE_CUT_SUFFIXES is: six roles times every column opd_attribution_metrics can
+# render is a hundred series a step, which is a worse analysis than four that
+# are read. These four are the ones the weighted role cut has no answer for --
+# where the plain OPD term pushes, how much of the KL sits there, and whether it
+# pulls with the reward THERE rather than pooled.
+OPD_ROLE_CUT_SUFFIXES = (
+    "/kl_share", "/push_abs_share", "/grpo/grad_cosine", "/grpo/grad_norm_ratio",
+)
+
+
+def opd_attribution_terms(
+    *,
+    student_logprob: torch.Tensor,
+    teacher_logprob: torch.Tensor,
+    teacher_kl: torch.Tensor,
+    pg_grad_coef: torch.Tensor,
+    sampled_onehot: torch.Tensor,
+    coef: float,
+    pg_coef: float = 1.0,
+    row_weight: Optional[torch.Tensor] = None,
+    push: Optional[dict] = None,
+    eps: float = 1e-8,
+) -> dict:
+    """:func:`logit_gradient_terms` at ``W = 1``, plus the two size columns.
+
+    WHAT THE UNWEIGHTED OPD TERM DOES, measured on inputs a run needs no
+    cross-teacher machinery to have: the student's own top-k, the on-task
+    teacher's log-probs at it, and the policy-gradient coefficient. A control
+    arm has all three and has none of the rest, which is why this is a separate
+    entry point rather than a flag on the weighted one -- ``build_position_weight``
+    would have nothing to read.
+
+    In the weighted arm it is the SAME positions the weighted terms are taken
+    on, so ``opd/grpo/grad_cosine`` beside ``kl_weight/grpo/grad_cosine`` is the
+    weighting's effect on the gradient geometry with the policy held fixed. That
+    is a stronger comparison than the same two numbers from two runs, whose
+    policies have diverged by the step you read them.
+
+    The two extra columns are LINEAR in the row weight where the gradient
+    columns are quadratic (they are norms of a weighted gradient), so the
+    scaling is applied to each half separately. One dict, two scalings, said
+    here because a reader summing them would otherwise be right to expect one.
+
+    ``d_kl``      the position's OPD KL, exactly what the loss carries there.
+    ``push_abs``  ``sum_v |g0(v)| + |g0_tail|``, the gross size of the descent
+                  direction. Its cut by role answers "where does the plain OPD
+                  term push hardest", which is the denominator every claim about
+                  where the WEIGHT moved budget is quoted against.
+
+    ``push`` is the caller's already-built :func:`opd_logit_push`, when the
+    per-token table has one; passing it is what keeps ``g0`` computed once per
+    micro-batch and, more to the point, defined once.
+    """
+    if push is None:
+        push = opd_logit_push(
+            student_logprob=student_logprob, teacher_logprob=teacher_logprob,
+            teacher_kl=teacher_kl, coef=coef, eps=eps,
+        )
+    ones = torch.ones_like(teacher_kl, dtype=torch.float32)
+    out = logit_gradient_terms(
+        student_logprob=student_logprob, teacher_logprob=teacher_logprob,
+        weight=ones, teacher_kl=teacher_kl, pg_grad_coef=pg_grad_coef,
+        sampled_onehot=sampled_onehot, coef=coef, pg_coef=pg_coef,
+        row_weight=row_weight, push=push, eps=eps,
+    )
+    lin = {
+        "d_kl": teacher_kl.detach().to(torch.float32),
+        "push_abs": push["g0"].abs().sum(dim=-1) + push["g0_tail"].abs(),
+    }
+    if row_weight is not None:
+        rw = row_weight.detach().to(torch.float32).reshape(-1, 1)
+        lin = {name: col * rw for name, col in lin.items()}
+    out.update(lin)
+    return out
+
+
+def opd_attribution_metrics(sums: dict, prefix: str = "opd") -> dict:
+    """:func:`gradient_metrics` plus where the unweighted OPD budget sits.
+
+    The share is over the scopes the accumulator actually holds, taken against
+    the pooled row when it is present and against the sum of the parts when it
+    is not -- which is the difference between the task cut (whose scopes are the
+    whole batch) and the role cut (whose scopes are positions, and whose pooled
+    row a caller may or may not have asked for).
+    """
+    out = gradient_metrics(sums, prefix=prefix)
+    pooled = sums.get(None, None)
+    parts = {k: v for k, v in sums.items() if k is not None}
+    for term, label in (("d_kl", "kl"), ("push_abs", "push_abs")):
+        total = (
+            float(pooled[term]) if pooled is not None and term in pooled
+            else sum(float(v[term]) for v in parts.values() if term in v)
+        )
+        for scope, tot in sums.items():
+            if term not in tot or tot["n"] <= 0:
+                continue
+            head = prefix if scope is None else f"{prefix}/{scope}"
+            out[f"{head}/{label}_mean"] = float(tot[term]) / tot["n"]
+            if scope is not None and total > 0:
+                out[f"{head}/{label}_share"] = float(tot[term]) / total
     return out
 
 

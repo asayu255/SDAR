@@ -1542,6 +1542,29 @@ def test_the_injection_carries_the_block_onto_the_actor(script):
 
 
 @pytest.mark.parametrize("script", [TREATMENT, CONTROL])
+def test_the_arm_independent_attribution_is_on_in_both_runs(script):
+    """The one family that runs in the control. Off in either script and there
+    is no per-token comparison to make: the control publishes no kl_weight/*
+    series at all, so opd/* is the entire overlap between the two runs' token
+    tables."""
+    from verl.trainer.main_opd_grpo import inject_opd_grpo_config
+
+    cfg = _composed(script)
+    inject_opd_grpo_config(cfg)
+    assert bool(cfg.algorithm.opd.opd_attribution.enable) is True
+    # It is built where the student's top-k exists, which is the actor's
+    # forward, so a block that stayed under algorithm.opd would reach nothing.
+    assert bool(cfg.actor_rollout_ref.actor.opd_attribution.enable) is True
+    # Its own prerequisites, which are the whole of what it needs -- no base
+    # policy and no off-task teachers, which is why the control can run it.
+    assert bool(cfg.actor_rollout_ref.actor.student_indexed_topk) is True
+    assert cfg.actor_rollout_ref.actor.teacher_kl_loss_type == "topk_kl"
+    assert bool(cfg.actor_rollout_ref.actor.use_teacher_kl_loss) is True
+    # And somewhere for the ranked rows to land.
+    assert cfg.trainer.sign_token_dump_dir
+
+
+@pytest.mark.parametrize("script", [TREATMENT, CONTROL])
 def test_the_coefficient_is_pinned_at_the_value_that_rules_out_the_old_baselines(script):
     cfg = _effective(script)
     # Authored under algorithm.opd with the other scientific knobs; main_opd
