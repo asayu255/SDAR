@@ -98,6 +98,9 @@ def read_trace(path):
                         # from a host gap needs the other counters.
                         "membw": _floats(r.get("membw_pct_per_gpu")),
                         "nvlink": _floats(r.get("nvlink_mb_s_per_gpu")),
+                        "throttle": _floats(r.get("throttle_bits_per_gpu")),
+                        "temp": _floats(r.get("temp_c_per_gpu")),
+                        "plimit": _floats(r.get("power_limit_w_per_gpu")),
                         "cpu": float(r["driver_cpu_pct"]) if (r.get("driver_cpu_pct") or "").strip() else None,
                         # EVERY GAUGE COLUMN THE HEADER DECLARES, zeros kept.
                         # Absent in traces written before the gauges existed,
@@ -563,6 +566,58 @@ def why(rows, i0, i1, pre_roll=PRE_ROLL_S, gen_full=1):
 # whole question of whether SM is still climbing or has flattened, inside a
 # single number. Split, because "more requests would help" and "more requests
 # would not" are the two answers this table exists to separate.
+# NVML's clocks-event bitmask, spelled out here rather than imported: the reader
+# runs on traces from machines that have no pynvml, and the constants have been
+# stable across every NVML version that defines them.
+_THROTTLE_BITS = (
+    (0x0000000000000001, "GpuIdle"),
+    (0x0000000000000002, "AppClocksSetting"),
+    (0x0000000000000004, "SwPowerCap"),
+    (0x0000000000000008, "HwSlowdown"),
+    (0x0000000000000010, "SyncBoost"),
+    (0x0000000000000020, "SwThermalSlowdown"),
+    (0x0000000000000040, "HwThermalSlowdown"),
+    (0x0000000000000080, "HwPowerBrakeSlowdown"),
+    (0x0000000000000100, "DisplayClockSetting"),
+)
+# The ones that mean "the card wanted to go faster and was not allowed to".
+# GpuIdle and AppClocksSetting are not throttling: the first says there was
+# nothing to run, the second says an operator pinned the clock.
+_THROTTLE_REAL = {"SwPowerCap", "HwSlowdown", "SwThermalSlowdown",
+                  "HwThermalSlowdown", "HwPowerBrakeSlowdown"}
+
+
+def throttle_wall(rows, dts):
+    """Card-seconds under each clocks-event reason, or None if not recorded.
+
+    This is the observation that separates "power drawn rose while the clock
+    fell" -- which is a correlation, and several things produce it -- from "the
+    driver says it capped the clock to stay inside the power limit".
+    """
+    if not any(r.get("throttle") for r in rows):
+        return None
+    out = defaultdict(float)
+    at_limit, limited_wall, total = 0.0, 0.0, 0.0
+    for row, dt in zip(rows, dts):
+        if dt <= 0:
+            continue
+        for gi, bits in enumerate(row.get("throttle") or []):
+            if bits is None:
+                continue
+            total += dt
+            for mask, name in _THROTTLE_BITS:
+                if int(bits) & mask:
+                    out[name] += dt
+            draw = (row.get("power") or [None])[gi] if gi < len(row.get("power") or []) else None
+            limit = (row.get("plimit") or [None])[gi] if gi < len(row.get("plimit") or []) else None
+            if draw is not None and limit:
+                limited_wall += dt
+                if draw >= 0.97 * limit:
+                    at_limit += dt
+    return {"reasons": dict(out), "total": total,
+            "at_limit": at_limit, "limited_wall": limited_wall}
+
+
 _PRESSURE_BINS = ((1.0, 1.5), (1.5, 2.0), (2.0, 4.0),
                   (4.0, 8.0), (8.0, 16.0), (16.0, float("inf")))
 
@@ -694,7 +749,9 @@ def engine_duty(rows, dts, gen_full, busy=95.0):
         for key in [k for k, _ in series] + ["cpu"]:
             spec[key] = _wmean(spec[key])
     return {
+        "throttle": throttle_wall(rows, dts),
         "power_bins": power_bins,
+        "power_limit": _wmean([(v, 1.0) for r in rows for v in (r.get("plimit") or []) if v]),
         "peak_power": max((w for w, _c, _s, _d in watts), default=None),
         "peak_clk": max((c for _w, c, _s, _d in watts), default=None),
         "bins": bins, "queue": queue, "ngpu": ngpu, "observed": observed,
@@ -713,8 +770,17 @@ def print_engine_duty(duty, exc_lost=None):
     ngpu, observed = duty["ngpu"], duty["observed"]
     print(f"\nengine-active duty -- every sample, not only the excursions"
           f"   (engine-active means gen_inflight >= {duty['gen_full']:.0f})")
+    # GPUact IS NOT SM OCCUPANCY. NVML's utilization.gpu is the fraction of the
+    # sampling window in which at least one kernel was resident -- it says
+    # nothing about how full the SMs were during it. Called SM%, it invites the
+    # reading "the SMs were 92% busy", and then a clock drop beside it looks
+    # like the same phenomenon measured twice. They are two independent things:
+    # 8% of the time carried no kernel at all, and the other 92% ran at a clock
+    # of its own.
+    print("    GPUact% = NVML utilization.gpu: the share of time with A KERNEL"
+          " RESIDENT, not SM occupancy.")
     print(f"    {'gen pressure':<22}{'samples':>8}{'wall s':>9}{'lost GPU-s':>12}"
-          f"{'util pt':>9}{'SM%':>7}{'memBW%':>8}{'power W':>9}{'clock':>7}"
+          f"{'util pt':>9}{'GPUact%':>9}{'memBW%':>8}{'power W':>9}{'clock':>7}"
           f"{'PCIeRX':>9}{'NVLink':>8}{'drvCPU%':>9}")
 
     def _row(spec):
@@ -727,7 +793,7 @@ def print_engine_duty(duty, exc_lost=None):
         pts = (spec["lost"] / (observed * ngpu) * 100.0) if observed and ngpu else 0.0
         print(f"    {spec['label']:<22}{spec['n']:>8}{spec['wall']:>9.1f}{spec['lost']:>12.1f}"
               + f"{pts:>9.2f}"
-              + f("sm", 7, ".1f") + f("membw", 8) + f("power", 9) + f("clk", 7)
+              + f("sm", 9, ".1f") + f("membw", 8) + f("power", 9) + f("clk", 7)
               + f("pcie", 9) + f("nvlink", 8) + f("cpu", 9))
 
     _row(duty["queue"])
@@ -774,20 +840,43 @@ def print_engine_duty(duty, exc_lost=None):
     for edge in sorted(duty["lowsm"], reverse=True):
         wall = duty["lowsm"][edge]
         share = (wall / duty["high_wall"] * 100.0) if duty["high_wall"] else 0.0
-        print(f"    node SM < {edge:.0f}%      {wall:>9.1f} s  ({share:>5.1f}% of high-pressure wall)")
+        print(f"    GPU-active < {edge:.0f}%   {wall:>9.1f} s  ({share:>5.1f}% of high-pressure wall)")
 
     if duty["power_bins"]:
+        limit = duty.get("power_limit")
         print(f"\n  SM clock against power, per card-sample  (peak observed"
-              f" {duty['peak_power']:.0f} W, {duty['peak_clk']:.0f} MHz)")
-        print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}{'SM%':>7}")
+              f" {duty['peak_power']:.0f} W, {duty['peak_clk']:.0f} MHz"
+              + (f"; enforced limit {limit:.0f} W" if limit else "") + ")")
+        print(f"    {'power':<20}{'card-wall s':>13}{'power W':>9}{'clock MHz':>11}{'GPUact%':>9}")
         for spec in duty["power_bins"]:
             print(f"    {spec['label']:<20}{spec['wall']:>13.1f}{spec['power']:>9.0f}"
-                  f"{spec['clk']:>11.0f}{spec['sm']:>7.1f}")
-        print("      A clock that FALLS as power rises to the peak means the card is already"
-              "\n      spending its whole allowance: the deficit beside it is not a gap the host"
-              "\n      can close, and packing the kernels tighter is paid back in clock. This"
-              "\n      report cannot see the power LIMIT, only what was drawn -- compare the peak"
-              "\n      above with `nvidia-smi --query-gpu=power.limit --format=csv`.")
+                  f"{spec['clk']:>11.0f}{spec['sm']:>9.1f}")
+        print("      A clock that FALLS as power rises is a CANDIDATE for power or thermal"
+              "\n      throttling, NOT proof of it. Several things produce the same shape, and"
+              "\n      these bins are relative to the highest READING in this trace: \"98% of"
+              "\n      the peak reading\" is a different statement from \"98% of the limit\".")
+        if duty.get("throttle") is None:
+            print("      This trace predates the clocks-event columns, so it cannot settle it."
+                  "\n      On the machine itself, all three together decide:"
+                  "\n        nvidia-smi -q -d PERFORMANCE            SW Power Cap: Active"
+                  "\n                                                thermal reasons: Not Active"
+                  "\n        nvidia-smi --query-gpu=power.draw,power.limit,power.max_limit --format=csv"
+                  "\n      draw ~= limit AND SW Power Cap active AND thermal inactive -> capped."
+                  "\n      Any two of the three is still a correlation. Traces taken from here on"
+                  "\n      record the reasons and answer it without a second tool run.")
+
+    thr = duty.get("throttle")
+    if thr and thr["total"]:
+        print(f"\n  what the DRIVER says about the clock, over {thr['total']:.0f} card-seconds")
+        if not thr["reasons"]:
+            print("    no reason ever set -- the clock was never held down by the driver;"
+                  " whatever moved it, it was not a cap")
+        for name, wall in sorted(thr["reasons"].items(), key=lambda kv: -kv[1]):
+            mark = "  <-- throttling" if name in _THROTTLE_REAL else ""
+            print(f"    {name:<24}{wall:>10.1f} s  ({wall / thr['total'] * 100:>5.1f}%){mark}")
+        if thr["limited_wall"]:
+            print(f"    {'draw >= 97% of limit':<24}{thr['at_limit']:>10.1f} s  "
+                  f"({thr['at_limit'] / thr['limited_wall'] * 100:>5.1f}%)")
 
 
 def classify(rows, exc, floor, busy=95.0):
@@ -848,8 +937,8 @@ def analyse(path, floor, busy, top):
         )
 
     baselines = []
-    print("\nper card: mean sm, and total time with no kernel resident")
-    print(f"  {'gpu':<5}{'mean sm':>9}{'baseline':>10}{'no-kernel s':>13}{'% of card':>11}")
+    print("\nper card: mean GPU-active, and total time with no kernel resident")
+    print(f"  {'gpu':<5}{'GPUact%':>9}{'baseline':>10}{'no-kernel s':>13}{'% of card':>11}")
     total_lost = 0.0
     for gi in range(ngpu):
         v = [r["sm"][gi] for r in rows if r["sm"][gi] is not None]
@@ -976,7 +1065,7 @@ def analyse(path, floor, busy, top):
                 ph_lost[r["phase"]] += (100.0 - r["sm"][gi]) / 100.0 * dts[k]
     for e in all_exc:
         ph_exc[rows[e["argmin"]]["phase"]] += e["lost_s"]
-    print(f"  {'phase':<20}{'wall%':>8}{'mean sm':>9}{'lost s':>9}{'in excursions':>15}")
+    print(f"  {'phase':<20}{'wall%':>8}{'GPUact%':>9}{'lost s':>9}{'in excursions':>15}")
     for ph, w in sorted(ph_wall.items(), key=lambda kv: -kv[1]):
         mean_sm = 100.0 - (ph_lost[ph] / (w * ngpu) * 100.0 if w else 0.0)
         print(f"  {ph:<20}{w / observed * 100:>7.1f}%{mean_sm:>9.1f}{ph_lost[ph]:>9.1f}{ph_exc[ph]:>15.1f}")
@@ -985,7 +1074,7 @@ def analyse(path, floor, busy, top):
         return
     print(f"\nthe {min(top, len(all_exc))} costliest excursions")
     print(
-        f"  {'t+s':>8}{'clock':>10}{'gpu':>5}{'kind':>9}{'wall':>7}{'lost':>7}{'min sm':>8}"
+        f"  {'t+s':>8}{'clock':>10}{'gpu':>5}{'kind':>9}{'wall':>7}{'lost':>7}{'min act':>8}"
         f"{'others':>14}{'cpu%':>6}  phase"
     )
     t_origin = rows[0]["ts"]

@@ -1190,6 +1190,97 @@ def test_the_duty_table_does_not_claim_to_know_the_power_limit():
     text = SCANNER.read_text()
     start = text.index("SM clock against power")
     assert "peak observed" in text[start:start + 400]
-    assert "cannot see the power LIMIT" in text[start:start + 1500]
-    assert "power.limit" in text[start:start + 1500]
+    assert "different statement from" in text[start:start + 1500]
+    assert "power.limit" in text[start:start + 2500]
     assert scanner  # (loads)
+
+
+def _throttle_rows(blocks, step=0.1):
+    """blocks: (power, clock, throttle_bits, n) on three cards."""
+    rows, t = [], 0.0
+    for power, clk, bits, n in blocks:
+        for _ in range(n):
+            rows.append({"ts": t, "sm": [92.0] * 3, "cpu": 20.0,
+                         "power": [power] * 3, "clk": [clk] * 3,
+                         "plimit": [300.0] * 3, "throttle": [float(bits)] * 3,
+                         "membw": [70.0] * 3, "pcie_rx": [100.0] * 3, "nvlink": [0.0] * 3,
+                         "gauges": {"gen_inflight": 800}})
+            t += step
+    return rows, [step] * len(rows)
+
+
+def test_the_driver_is_asked_why_the_clock_is_low_not_only_the_power():
+    """"Power rose to 293 W while the clock fell 9%" is a correlation, and
+    several things produce it. NVML answers the question directly, and the
+    difference decides whether the next work is in the engine or is impossible.
+    """
+    scanner = _scanner()
+    rows, dts = _throttle_rows([(200.0, 1800, 0x0, 50), (297.0, 1600, 0x4, 50)])
+    thr = scanner.throttle_wall(rows, dts)
+    assert thr["reasons"]["SwPowerCap"] == pytest.approx(15.0, abs=0.5), thr
+    assert "SwThermalSlowdown" not in thr["reasons"], thr
+    # and how long the draw actually sat against the limit, which is separate
+    assert thr["at_limit"] == pytest.approx(15.0, abs=0.5), thr
+
+
+def test_gpu_idle_and_a_pinned_clock_are_not_counted_as_throttling():
+    """Two of the nine bits mean the card was not TRYING to go faster: nothing
+    to run, and an operator-pinned clock. Counting them as throttling would
+    report a quiet machine as power-limited."""
+    scanner = _scanner()
+    assert "GpuIdle" not in scanner._THROTTLE_REAL
+    assert "AppClocksSetting" not in scanner._THROTTLE_REAL
+    assert "SwPowerCap" in scanner._THROTTLE_REAL
+    rows, dts = _throttle_rows([(50.0, 1800, 0x1 | 0x2, 20)])
+    thr = scanner.throttle_wall(rows, dts)
+    assert set(thr["reasons"]) == {"GpuIdle", "AppClocksSetting"}, thr
+
+
+def test_a_trace_without_the_event_columns_says_so_instead_of_concluding():
+    """The columns are new. An older trace must not be read as "no reason ever
+    set", which is a finding, when the truth is that nothing was recorded."""
+    scanner = _scanner()
+    rows, dts = _throttle_rows([(297.0, 1600, 0x4, 10)])
+    for r in rows:
+        r["throttle"] = []
+    assert scanner.throttle_wall(rows, dts) is None
+
+
+def test_the_clock_note_does_not_assert_what_the_reading_cannot_show():
+    """It said a falling clock "means the card is already spending its whole
+    allowance". The bins are relative to the highest READING, not to the limit,
+    and this report has already been wrong twice by naming a cause from a
+    measurement that could not distinguish it."""
+    text = SCANNER.read_text()
+    start = text.index("SM clock against power")
+    note = text[start:start + 2500]
+    assert "means the card is already" not in note
+    assert "CANDIDATE" in note and "NOT proof of it" in note
+    assert "SW Power Cap" in note and "thermal" in note
+
+
+def test_the_report_says_gpu_active_not_sm_occupancy(tmp_path):
+    """NVML utilization.gpu is the share of the window with a kernel resident.
+    Labelled SM%, it invites "the SMs were 92% busy", and then a clock drop
+    beside it reads as the same phenomenon measured twice -- when the two are
+    independent: 8% of the time carried no kernel, and the other 92% ran at a
+    clock of its own.
+
+    Asserted on the RENDERED report, not on the source: what misleads a reader
+    is the column header they see.
+    """
+    busy = ([97, 97, 98], 20, {"gen_inflight": 800}, 30)
+    out = _scan(_trace(tmp_path / "t.csv", [busy, ([0, 1, 0], 6, {"ready": 4}, 8), busy]))
+    assert "GPUact%" in out, out
+    assert "KERNEL RESIDENT" in out and "not SM occupancy" in out, out
+    header = next(ln for ln in out.splitlines() if "gen pressure" in ln)
+    assert "SM%" not in header, header
+
+
+def test_the_new_per_gpu_columns_are_appended_not_inserted():
+    """Both directions have broken once: a scanner indexing the older columns
+    positionally on a new trace, and an old trace parsed against a new header."""
+    order = [c for c, _f, _fmt in gp._TRACE_PER_GPU]
+    assert order[:6] == ["sm_pct_per_gpu", "membw_pct_per_gpu", "power_w_per_gpu",
+                         "smclk_mhz_per_gpu", "pcie_rx_mb_s_per_gpu", "nvlink_mb_s_per_gpu"]
+    assert order[6:] == ["throttle_bits_per_gpu", "temp_c_per_gpu", "power_limit_w_per_gpu"]

@@ -529,6 +529,33 @@ class _NvmlBackend(_Backend):
             rec["pcie_tx_mb_s"] = (tx / 1024.0) if tx is not None else None  # KB/s -> MB/s
             rec["pcie_rx_mb_s"] = (rx / 1024.0) if rx is not None else None
             rec["nvlink_mb_s"] = self._nvlink_rate_mb_s(gi, h, t)
+            # WHY THE CLOCK IS WHERE IT IS, asked of the driver instead of
+            # inferred. A trace showed power climbing to 293 W while the SM
+            # clock fell 9%, which is the signature of a power cap and also the
+            # signature of several other things; NVML answers it directly and
+            # nothing in the trace could. Recorded as the raw bitmask so the
+            # schema does not need a column per reason, and decoded by the
+            # reader.
+            #
+            # The call was renamed (ThrottleReasons -> EventReasons) and both
+            # spellings are in the wild, so try each; _safe swallows the rest.
+            reasons = None
+            for name in ("nvmlDeviceGetCurrentClocksEventReasons",
+                         "nvmlDeviceGetCurrentClocksThrottleReasons"):
+                fn = getattr(nv, name, None)
+                if fn is not None:
+                    reasons = self._safe(fn, h)
+                    if reasons is not None:
+                        break
+            rec["throttle_bits"] = float(reasons) if reasons is not None else None
+            temp = self._safe(nv.nvmlDeviceGetTemperature, h, nv.NVML_TEMPERATURE_GPU)
+            rec["temp_c"] = float(temp) if temp is not None else None
+            # The LIMIT, not the draw. Constant unless someone runs nvidia-smi
+            # -pl mid-run, and one column makes the trace answer "was it at the
+            # cap" without a second tool run days later, on a machine whose
+            # state has moved on.
+            limit = self._safe(nv.nvmlDeviceGetPowerManagementLimit, h)
+            rec["power_limit_w"] = (limit / 1000.0) if limit is not None else None
             out.append(rec)
         return out
 
@@ -536,7 +563,8 @@ class _NvmlBackend(_Backend):
 class _SmiBackend(_Backend):
     """Fallback that shells out to nvidia-smi (no PCIe/NVLink throughput)."""
 
-    _QUERY = "utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm"
+    _QUERY = ("utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm,"
+              "temperature.gpu,power.limit,clocks_throttle_reasons.active")
 
     def __init__(self):
         import shutil
@@ -564,6 +592,13 @@ class _SmiBackend(_Backend):
         except ValueError:
             return None
 
+    @staticmethod
+    def _hex(tok):
+        try:
+            return float(int(tok.strip(), 16))
+        except (ValueError, AttributeError):
+            return None
+
     def sample(self):
         rows = []
         for line in self._raw():
@@ -571,6 +606,8 @@ class _SmiBackend(_Backend):
             if len(parts) < 5:
                 continue
             sm, membw, mem_used_mib, power, clk = (self._f(p) for p in parts[:5])
+            temp = self._f(parts[5]) if len(parts) > 5 else None
+            limit = self._f(parts[6]) if len(parts) > 6 else None
             rows.append(
                 {
                     "sm_util": sm,
@@ -581,6 +618,12 @@ class _SmiBackend(_Backend):
                     "pcie_tx_mb_s": None,
                     "pcie_rx_mb_s": None,
                     "nvlink_mb_s": None,
+                    # nvidia-smi prints this one as hex ("0x0000000000000004"),
+                    # which _f cannot read -- and returning None here would look
+                    # exactly like a driver that does not report it.
+                    "throttle_bits": self._hex(parts[7]) if len(parts) > 7 else None,
+                    "temp_c": temp,
+                    "power_limit_w": limit,
                 }
             )
         return rows
@@ -653,6 +696,9 @@ _METRICS = (
     "pcie_tx_mb_s",
     "pcie_rx_mb_s",
     "nvlink_mb_s",
+    "throttle_bits",
+    "temp_c",
+    "power_limit_w",
 )
 
 # Per-GPU columns of the trace, in file order. sm/memBW came first and stay
@@ -664,6 +710,12 @@ _TRACE_PER_GPU = (
     ("smclk_mhz_per_gpu", "sm_clock_mhz", "{:.0f}"),
     ("pcie_rx_mb_s_per_gpu", "pcie_rx_mb_s", "{:.0f}"),
     ("nvlink_mb_s_per_gpu", "nvlink_mb_s", "{:.0f}"),
+    # APPENDED, never inserted: a scanner that indexes the older columns
+    # positionally must keep working on a new trace, and an old trace must keep
+    # parsing against the new header. Both directions have already broken once.
+    ("throttle_bits_per_gpu", "throttle_bits", "{:.0f}"),
+    ("temp_c_per_gpu", "temp_c", "{:.0f}"),
+    ("power_limit_w_per_gpu", "power_limit_w", "{:.0f}"),
 )
 _TRACE_HEADER = (
     "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct,"
