@@ -94,22 +94,27 @@ Env vars
 """
 
 import atexit
+import contextlib
 import os
 import re
+import sys
 import threading
 import time
-from collections import defaultdict
+from typing import Any, Dict, List, Optional
+from collections import Counter, defaultdict
 
 # Leading alignment flag + field width of a format spec such as ">9.0f".
 _WIDTH_RE = re.compile(r"([<>^]?)(\d+)")
 
 __all__ = [
     "enabled",
+    "ensure_started",
     "push_phase",
     "pop_phase",
-    "ensure_started",
     "mean_util_between",
     "per_gpu_util_between",
+    "residency_between",
+    "format_residency",
     "now",
     "report_and_reset",
     "report_cumulative",
@@ -142,6 +147,288 @@ _KIB_TO_MB = 1024.0 / (1000.0 * 1000.0)  # NVML NVLink counters are KiB
 # sample intervals are treated as different blocks of that phase, so an idle
 # stretch is never reported across a busy phase that ran in between.
 _CONTIGUITY_SLACK = 2.0
+
+
+# What the driver's threads are doing, counted rather than stacked.
+#
+# push_phase/pop_phase keep a single list, which is correct for one training
+# thread and meaningless for validation: three pipeline slots push and pop
+# concurrently and the top of the stack becomes whichever thread moved last.
+#
+# The question that decides where the remaining idle comes from is not "which
+# phase" but "how many slots were in each at once" -- every card empty while
+# all three slots sit in envstep is the environment, and the same picture while
+# they sit in preproc is the driver's own Python. A counter answers that; a
+# stack cannot.
+_ACTIVITY_LOCK = threading.Lock()
+_ACTIVITY: Dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def activity(name: str):
+    """Count this thread as being in ``name`` for as long as the block runs."""
+    with _ACTIVITY_LOCK:
+        _ACTIVITY[name] = _ACTIVITY.get(name, 0) + 1
+    try:
+        yield
+    finally:
+        with _ACTIVITY_LOCK:
+            remaining = _ACTIVITY.get(name, 0) - 1
+            if remaining > 0:
+                _ACTIVITY[name] = remaining
+            else:
+                _ACTIVITY.pop(name, None)
+
+
+def activity_snapshot() -> Dict[str, int]:
+    with _ACTIVITY_LOCK:
+        return dict(_ACTIVITY)
+
+
+# --------------------------------------------------------------------------- #
+# Gauges: how much work EXISTS, beside how much is running
+# --------------------------------------------------------------------------- #
+# The census and the frames both answer "what are the threads doing". Neither
+# answers "was there anything else they could have been doing", and without that
+# the two explanations for an idle GPU are indistinguishable:
+#
+#   ready=0,  retriever_inflight=10, gen_inflight=0  -> RETRIEVER_DEPENDENCY
+#   ready=32, retriever_inflight=10, gen_inflight=0  -> SCHEDULER_STARVATION
+#
+# The observable part is identical -- every card idle with the retriever busy --
+# and the prescriptions are opposite: make the retriever faster, or stop
+# lock-stepping and submit the work that was already waiting. This arm has one
+# reading of exactly that shape and cannot yet say which of the two it is.
+#
+# Counts, not durations. A gauge says how many of a thing exist right now, and
+# the sampler records it beside the utilisation, so an excursion can be read as
+# a STATE rather than as a phase name.
+_GAUGE_LOCK = threading.Lock()
+_GAUGES: Dict[str, int] = {}
+
+# The ones the classifier reads. Named here so the trace schema is stable across
+# runs that instrument different amounts, and so a typo at a call site shows up
+# as an unknown gauge rather than as a silently missing one.
+GAUGE_NAMES = (
+    "ready",               # prepared and submittable, but not submitted
+    "gen_inflight",        # handed to the engine, not yet returned
+    "retriever_inflight",  # waiting on the retrieval service
+    "env_inflight",        # inside env.step / a tool
+    "future_wait",         # driver threads blocked on a Future
+    "slots_free",          # pipeline slots that are idle
+    "placeable_ready",     # queued batches a free slot could actually run
+    "ready_scalable",      # queued batches more than one slot could ever run
+    "ready_pinned",        # queued batches only one slot in the topology can run
+)
+
+
+def gauge_set(name: str, value: int) -> None:
+    with _GAUGE_LOCK:
+        if value:
+            _GAUGES[name] = int(value)
+        else:
+            _GAUGES.pop(name, None)
+
+
+def gauge_add(name: str, delta: int) -> None:
+    if not delta:
+        return
+    with _GAUGE_LOCK:
+        total = _GAUGES.get(name, 0) + int(delta)
+        if total > 0:
+            _GAUGES[name] = total
+        else:
+            _GAUGES.pop(name, None)
+
+
+@contextlib.contextmanager
+def inflight(name: str, n: int = 1):
+    """Hold ``n`` on a gauge for the duration of the block.
+
+    Paired in a finally, like activity(), because the interesting blocks are the
+    ones that raise: a retrieval that times out must not leave the gauge reading
+    "10 in flight" for the rest of the run, which would classify every later
+    excursion as RETRIEVER_DEPENDENCY.
+    """
+    gauge_add(name, n)
+    try:
+        yield
+    finally:
+        gauge_add(name, -n)
+
+
+# Some gauges already have an authoritative owner and should not be mirrored.
+# gen_inflight is len(PumpClient._pending), mutated at five places -- submit, the
+# three completion paths and _fail_all -- and a gauge that misses one of them
+# reads high forever, which classifies every later excursion as GPU-SIDE. So the
+# owner registers a reader instead and the sampler pulls it.
+#
+# The callable must not block: it runs on the sampler thread once per interval,
+# and a sampler that stalls stops recording the very excursion it was called
+# during. PumpClient.in_flight takes its lock for a dict length and no more.
+_GAUGE_SOURCES: Dict[str, Any] = {}
+
+# Stack states, interned. The same handful of states repeat thousands of times
+# over a run -- the interesting question is which ones, not how many bytes they
+# take -- so the trace carries an integer and a sidecar carries the text once.
+# Bounded: a run that somehow produces more distinct states than this writes -1
+# rather than growing a dict without limit inside the sampler.
+_STACK_TABLE_MAX = int(os.environ.get("GPU_PROFILER_STACK_TABLE_MAX", "20000"))
+_STACK_IDS: Dict[tuple, int] = {}
+_STACK_BY_ID: Dict[int, tuple] = {}
+
+
+def stack_state_id(keys):
+    """Intern one sample's stack state, dropping threads outside this repo.
+
+    They are dropped from the KEY, not merely from the display: a hundred-odd
+    parked infrastructure threads drift in and out constantly, and keeping them
+    would make almost every sample a distinct state -- an intern table with no
+    repeats, which is a list. What remains is our frames, which is what anyone
+    reading an excursion wants, plus a count of the rest.
+    """
+    ours = tuple(sorted(k for k in keys if not k.endswith(" -")))
+    outside = len(keys) - len(ours)
+    # KEYED ON OURS ALONE. The parked count drifts by one or two constantly --
+    # Ray reaps and spawns pool workers all run -- and folding it into the key
+    # made "one of our frames, 137 parked" and "the same frame, 138 parked" two
+    # states. That is an intern table with no repeats, which is a list. The
+    # count is still reported, from the first sighting, because "alone" and
+    # "alongside 138 parked threads" are different situations to read.
+    known = _STACK_IDS.get(ours)
+    if known is not None:
+        return known, (ours, outside)
+    if len(_STACK_IDS) >= _STACK_TABLE_MAX:
+        return -1, (ours, outside)
+    ident = len(_STACK_IDS)
+    _STACK_IDS[ours] = ident
+    _STACK_BY_ID[ident] = (ours, outside)
+    return ident, (ours, outside)
+
+
+def register_gauge_source(name: str, read) -> None:
+    with _GAUGE_LOCK:
+        _GAUGE_SOURCES[name] = read
+
+
+def unregister_gauge_source(name: str) -> None:
+    with _GAUGE_LOCK:
+        _GAUGE_SOURCES.pop(name, None)
+
+
+def gauge_snapshot() -> Dict[str, int]:
+    with _GAUGE_LOCK:
+        snap = dict(_GAUGES)
+        sources = dict(_GAUGE_SOURCES)
+    for name, read in sources.items():
+        try:
+            value = int(read())
+        except Exception:  # pragma: no cover - a broken reader is not a run-ender
+            continue
+        if value:
+            snap[name] = value
+    return snap
+
+
+def reset_gauges() -> None:
+    """For tests. A leaked gauge is a wrong classification, not a wrong number."""
+    with _GAUGE_LOCK:
+        _GAUGES.clear()
+        _GAUGE_SOURCES.clear()
+
+
+# Where the threads actually are, asked of the interpreter rather than of a tag.
+#
+# The census answers "which tagged phase", and twice now the answer has been
+# "none of them": 1.0 of 3 slots, then 2.1 of 4, in no tagged phase while every
+# card was idle. Both times the response was to guess at a region and tag it --
+# record/assemble, then the env reset -- and both guesses measured below 0.05 of
+# a slot. A residual that survives two prescriptions is not going to be named by
+# a third guess.
+#
+# sys._current_frames() does not guess. It returns the frame every live thread
+# is executing right now, so a thread blocked in a socket read says socket.py
+# and a thread rebuilding tensors says the line it is on. Two frames are kept
+# per thread: the deepest one inside this repository, which says WHICH of our
+# code is responsible, and the innermost frame of all, which says what it is
+# doing there -- and those differ precisely in the interesting cases, where our
+# code is waiting inside somebody else's.
+# Measured at 49.8 us per snapshot with 14 live threads, which at the 0.3 s
+# sampling cadence is 0.63 s over a 3800 s run -- and it is spent on the
+# profiler thread, not on a slot. Off by env var anyway, because an instrument
+# that cannot be turned off cannot be ruled out as the cause of what it sees.
+_STACKS = os.environ.get("GPU_PROFILER_STACKS", "1").strip().lower() not in ("0", "false", "no", "off")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _frame_key(frame) -> str:
+    code = frame.f_code
+    return f"{os.path.basename(code.co_filename)}:{frame.f_lineno} {code.co_name}"
+
+
+# Innermost frames that mean "parked", by (file, function). A thread here is
+# waiting and burning no CPU, which is a different finding from a thread
+# running Python -- they need opposite fixes and the list must not merge them.
+# The set is not exhaustive and cannot be: an unlisted blocking primitive reads
+# as RUNNING, which is why the cpu_pct band, not this, decides the verdict.
+_PARKED_FRAMES = frozenset({
+    ("threading.py", "wait"), ("threading.py", "acquire"),
+    ("threading.py", "_wait_for_tstate_lock"), ("threading.py", "join"),
+    ("thread.py", "_worker"),                      # idle concurrent.futures worker
+    ("queue.py", "get"), ("queue.py", "put"),
+    ("_base.py", "wait"), ("_base.py", "result"),  # concurrent.futures
+    ("selectors.py", "select"), ("selectors.py", "poll"),
+    ("socket.py", "readinto"), ("socket.py", "accept"),
+    ("ssl.py", "read"), ("ssl.py", "recv_into"),
+    ("connection.py", "_recv"), ("connection.py", "_recv_bytes"),
+    ("subprocess.py", "_try_wait"), ("subprocess.py", "wait"),
+})
+
+
+def _is_parked(frame) -> bool:
+    code = frame.f_code
+    return (os.path.basename(code.co_filename), code.co_name) in _PARKED_FRAMES
+
+
+def stack_snapshot() -> List[str]:
+    """One key per live thread: our deepest frame, and the innermost frame.
+
+    Prefixed "R " when the innermost frame is running and "B " when it is a
+    known wait, and "-" instead of a repo frame when the thread is not in this
+    repository's code at all. The first reading of this printed 126.58 threads
+    on concurrent.futures' idle _worker, above every frame that meant anything:
+    a machine running 140 threads has ~135 parked ones, and a top-N list that
+    ranks by count is a list of them.
+    """
+    if not _STACKS:
+        return []
+    out = []
+    me = threading.get_ident()
+    for ident, frame in sys._current_frames().items():
+        if ident == me:
+            continue
+        innermost, repo, walk, depth = frame, None, frame, 0
+        while walk is not None and depth < 200:
+            name = walk.f_code.co_filename
+            if "gpu_profiler" in name:
+                repo = None
+                innermost = None
+                break
+            if repo is None and name.startswith(_REPO_ROOT):
+                repo = walk
+            walk = walk.f_back
+            depth += 1
+        if innermost is None:
+            continue  # this thread is inside the profiler; it is not the subject
+        state = "B" if _is_parked(innermost) else "R"
+        inner_key = _frame_key(innermost)
+        if repo is None:
+            out.append(f"{state} -")
+        elif repo is innermost:
+            out.append(f"{state} {inner_key}")
+        else:
+            out.append(f"{state} {_frame_key(repo)} <- {inner_key}")
+    return out
 
 
 def now() -> float:
@@ -243,6 +530,33 @@ class _NvmlBackend(_Backend):
             rec["pcie_tx_mb_s"] = (tx / 1024.0) if tx is not None else None  # KB/s -> MB/s
             rec["pcie_rx_mb_s"] = (rx / 1024.0) if rx is not None else None
             rec["nvlink_mb_s"] = self._nvlink_rate_mb_s(gi, h, t)
+            # WHY THE CLOCK IS WHERE IT IS, asked of the driver instead of
+            # inferred. A trace showed power climbing to 293 W while the SM
+            # clock fell 9%, which is the signature of a power cap and also the
+            # signature of several other things; NVML answers it directly and
+            # nothing in the trace could. Recorded as the raw bitmask so the
+            # schema does not need a column per reason, and decoded by the
+            # reader.
+            #
+            # The call was renamed (ThrottleReasons -> EventReasons) and both
+            # spellings are in the wild, so try each; _safe swallows the rest.
+            reasons = None
+            for name in ("nvmlDeviceGetCurrentClocksEventReasons",
+                         "nvmlDeviceGetCurrentClocksThrottleReasons"):
+                fn = getattr(nv, name, None)
+                if fn is not None:
+                    reasons = self._safe(fn, h)
+                    if reasons is not None:
+                        break
+            rec["throttle_bits"] = float(reasons) if reasons is not None else None
+            temp = self._safe(nv.nvmlDeviceGetTemperature, h, nv.NVML_TEMPERATURE_GPU)
+            rec["temp_c"] = float(temp) if temp is not None else None
+            # The LIMIT, not the draw. Constant unless someone runs nvidia-smi
+            # -pl mid-run, and one column makes the trace answer "was it at the
+            # cap" without a second tool run days later, on a machine whose
+            # state has moved on.
+            limit = self._safe(nv.nvmlDeviceGetPowerManagementLimit, h)
+            rec["power_limit_w"] = (limit / 1000.0) if limit is not None else None
             out.append(rec)
         return out
 
@@ -250,7 +564,8 @@ class _NvmlBackend(_Backend):
 class _SmiBackend(_Backend):
     """Fallback that shells out to nvidia-smi (no PCIe/NVLink throughput)."""
 
-    _QUERY = "utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm"
+    _QUERY = ("utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm,"
+              "temperature.gpu,power.limit,clocks_throttle_reasons.active")
 
     def __init__(self):
         import shutil
@@ -278,6 +593,13 @@ class _SmiBackend(_Backend):
         except ValueError:
             return None
 
+    @staticmethod
+    def _hex(tok):
+        try:
+            return float(int(tok.strip(), 16))
+        except (ValueError, AttributeError):
+            return None
+
     def sample(self):
         rows = []
         for line in self._raw():
@@ -285,6 +607,8 @@ class _SmiBackend(_Backend):
             if len(parts) < 5:
                 continue
             sm, membw, mem_used_mib, power, clk = (self._f(p) for p in parts[:5])
+            temp = self._f(parts[5]) if len(parts) > 5 else None
+            limit = self._f(parts[6]) if len(parts) > 6 else None
             rows.append(
                 {
                     "sm_util": sm,
@@ -295,6 +619,12 @@ class _SmiBackend(_Backend):
                     "pcie_tx_mb_s": None,
                     "pcie_rx_mb_s": None,
                     "nvlink_mb_s": None,
+                    # nvidia-smi prints this one as hex ("0x0000000000000004"),
+                    # which _f cannot read -- and returning None here would look
+                    # exactly like a driver that does not report it.
+                    "throttle_bits": self._hex(parts[7]) if len(parts) > 7 else None,
+                    "temp_c": temp,
+                    "power_limit_w": limit,
                 }
             )
         return rows
@@ -367,8 +697,10 @@ _METRICS = (
     "pcie_tx_mb_s",
     "pcie_rx_mb_s",
     "nvlink_mb_s",
+    "throttle_bits",
+    "temp_c",
+    "power_limit_w",
 )
-
 
 # Per-GPU columns of the trace, in file order. sm/memBW came first and stay
 # first so traces written before the others existed still parse.
@@ -379,8 +711,26 @@ _TRACE_PER_GPU = (
     ("smclk_mhz_per_gpu", "sm_clock_mhz", "{:.0f}"),
     ("pcie_rx_mb_s_per_gpu", "pcie_rx_mb_s", "{:.0f}"),
     ("nvlink_mb_s_per_gpu", "nvlink_mb_s", "{:.0f}"),
+    # APPENDED, never inserted: a scanner that indexes the older columns
+    # positionally must keep working on a new trace, and an old trace must keep
+    # parsing against the new header. Both directions have already broken once.
+    ("throttle_bits_per_gpu", "throttle_bits", "{:.0f}"),
+    ("temp_c_per_gpu", "temp_c", "{:.0f}"),
+    ("power_limit_w_per_gpu", "power_limit_w", "{:.0f}"),
 )
-_TRACE_HEADER = "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct\n"
+_TRACE_HEADER = (
+    "ts,clock,pid,phase," + ",".join(c for c, _, _ in _TRACE_PER_GPU) + ",driver_cpu_pct,"
+    # The gauges, in a fixed order, so a scanner can index them positionally and
+    # a run that instruments nothing still writes the columns (as zeros) rather
+    # than a narrower row that silently changes the schema.
+    + ",".join(GAUGE_NAMES)
+    # WHERE, per sample. The gauges say which dependency an excursion was on;
+    # these say which of our code was live during it. Without them a dip in the
+    # trace carries a reason and a phase name and nothing that points at a line,
+    # and the frames only existed as an average over a whole reporting window --
+    # which is the wrong shape for "this 1.8 s dip".
+    + ",activity,stack_id\n"
+)
 
 
 def _trace_path_for_pid(path: str) -> str:
@@ -411,6 +761,11 @@ class _Sampler:
         self._samples = []
         # lightweight ring of (ts, mean_sm_util) for mean_util_between()
         self._util_trace = []
+        self._cpu_trace = []
+        self._act_trace = []
+        self._stack_trace = []
+        self._gauge_trace = []
+        self._stacks_seen = set()
         self._stop = threading.Event()
         self._step_idx = 0
         # Cumulative per-phase accumulators across every step so far. Aggregated
@@ -419,6 +774,7 @@ class _Sampler:
         self._cum = {}
         self._cum_steps = 0
         self._trace = None
+        self._stacks_file = None
         if _TRACE_PATH:
             path = _trace_path_for_pid(_TRACE_PATH)
             try:
@@ -427,6 +783,13 @@ class _Sampler:
                 print(f"[gpu-profiler] per-sample trace -> {path}", flush=True)
             except OSError as e:
                 print(f"[gpu-profiler] could not open GPU_PROFILER_TRACE={path}: {e}", flush=True)
+            try:
+                # Beside the trace, named after it, so a scanner given one path
+                # can find the other without being told.
+                self._stacks_file = open(path + ".stacks", "w", buffering=1)
+                self._stacks_file.write("stack_id\tthreads_outside_repo\tframes\n")
+            except OSError:
+                self._stacks_file = None
         self._thread = threading.Thread(target=self._run, name="gpu-profiler", daemon=True)
         self._thread.start()
 
@@ -468,9 +831,25 @@ class _Sampler:
                 # store per-GPU sm so callers can see data-parallel imbalance
                 per_gpu_sm = [g.get("sm_util") for g in per_gpu]
                 self._util_trace.append((t, per_gpu_sm))
-            self._write_trace(t, phase, per_gpu, host)
+                # Kept in its own list rather than widened into the tuple above,
+                # which two other readers unpack by shape.
+                self._cpu_trace.append((t, (host or {}).get("cpu_pct")))
+                self._act_trace.append((t, activity_snapshot()))
+                gauges = gauge_snapshot()
+                self._gauge_trace.append((t, gauges))
+                stacks = stack_snapshot()
+                stack_id, _key = stack_state_id(stacks)
+                # The ID, not the strings. stack_snapshot builds a new string per
+                # thread per sample and they are not interned, so at a 0.1 s
+                # interval over a 3800 s run keeping them costs about 0.3 GB
+                # against about 1 MB for the ids. Sub-second excursions are what
+                # 0.1 s sampling is for, so this is what makes that interval
+                # affordable rather than a memory bomb an hour in.
+                self._stack_trace.append((t, stack_id))
+                census = activity_snapshot()
+            self._write_trace(t, phase, per_gpu, host, gauges, census, stack_id)
 
-    def _write_trace(self, t, phase, per_gpu, host):
+    def _write_trace(self, t, phase, per_gpu, host, gauges=None, census=None, stacks=None):
         """Append one row to GPU_PROFILER_TRACE, if it is set.
 
         The tables are per-step aggregates and are reset at every step boundary,
@@ -491,9 +870,20 @@ class _Sampler:
                 for _, key, fmt in _TRACE_PER_GPU
             ]
             cpu = (host or {}).get("cpu_pct")
+            g = gauges or {}
+            # Semicolons inside the field, because the file is comma-separated
+            # and a census is a mapping. Same convention as the per-GPU columns.
+            act = ";".join(f"{k}:{v}" for k, v in sorted((census or {}).items()))
+            sid, key = ((stacks, _STACK_BY_ID.get(stacks, ((), 0))) if isinstance(stacks, int)
+                        else stack_state_id(stacks or []))
+            if self._stacks_file is not None and sid >= 0 and sid not in self._stacks_seen:
+                self._stacks_seen.add(sid)
+                frames, outside = key
+                self._stacks_file.write(f"{sid}\t{outside}\t{' | '.join(frames)}\n")
             self._trace.write(
                 f"{t:.3f},{time.strftime('%H:%M:%S', time.localtime())},{os.getpid()},{phase},"
-                f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'}\n"
+                f"{','.join(cols)},{'' if cpu is None else f'{cpu:.0f}'},"
+                f"{','.join(str(g.get(name, 0)) for name in GAUGE_NAMES)},{act},{sid}\n"
             )
             # Flushed every row: the interesting runs are the ones that end in a
             # crash or a Ctrl-C, and a buffered tail would lose exactly those.
@@ -509,6 +899,200 @@ class _Sampler:
         if not flat:
             return None
         return sum(flat) / len(flat)
+
+    def residency_between(self, t0, t1, busy_thresh=None):
+        """How MANY GPUs were busy at once, over [t0, t1].
+
+        The two instruments that already exist both miss this, in opposite
+        directions, and between them they cost two wrong conclusions:
+
+        * ``[val-pipeline]`` counts a slot as running whenever it is inside a
+          batch. A slot blocked in ``env.step`` is running by that measure while
+          every GPU is empty -- it reported "NOTHING running 0.1%" for a run in
+          which NVML saw 285 s of node-wide idle.
+        * ``genGPU%`` measures only the window inside ``generate``, so it cannot
+          see a gap that happens between generates at all.
+
+        This one asks the only question that decides whether more work in flight
+        would help: at this instant, how many cards had something to do? Zero is
+        recoverable by overlapping another batch; three-at-87% is the decode
+        step's duty cycle and is not.
+
+        Returns ``None`` if the window holds no samples, else a dict:
+        ``n_gpus``, ``samples``, ``wall``, ``counts`` (busy-count -> samples),
+        ``wall_by_count``, and ``pct`` (busy-count -> % of samples).
+        """
+        thresh = _IDLE_THRESH if busy_thresh is None else busy_thresh
+        with self._lock:
+            window = [(ts, vals) for (ts, vals) in self._util_trace if t0 <= ts <= t1]
+        if not window:
+            return None
+        n_gpus = max(len(vals) for _ts, vals in window)
+        counts = {k: 0 for k in range(n_gpus + 1)}
+        wall_by_count = {k: 0.0 for k in range(n_gpus + 1)}
+        # A gap far larger than the sample interval is the sampler having been
+        # stopped, not the GPU having been idle for that long -- charge one
+        # interval for it rather than the whole gap.
+        cap = _INTERVAL * _CONTIGUITY_SLACK
+        previous = None
+        for ts, vals in window:
+            busy = sum(1 for v in vals if v is not None and v >= thresh)
+            dt = _INTERVAL if previous is None else min(ts - previous, cap)
+            counts[busy] += 1
+            wall_by_count[busy] += dt
+            previous = ts
+        total = sum(counts.values())
+        # Per-GPU means over the same window. Whether the partly-busy time is one
+        # rank always waiting or all three taking turns decides the prescription:
+        # a lopsided column is a rank finishing its chunk of a collective call
+        # early and idling until the slowest one returns, which more batches in
+        # flight cannot fix because the worker group runs one call at a time.
+        per_gpu = []
+        for gi in range(n_gpus):
+            col = [vals[gi] for _ts, vals in window if gi < len(vals) and vals[gi] is not None]
+            per_gpu.append((sum(col) / len(col)) if col else None)
+        # The driver's own CPU, split the same way. This is what separates the
+        # two reasons every card can be empty at once, which look identical on
+        # the GPU and need opposite fixes: Python holding the GIL (cpu near or
+        # above one core) against the whole process waiting on something off the
+        # box (cpu at idle, which is what a retriever round trip looks like).
+        empty_ts = {ts for ts, vals in window if not any(v is not None and v >= thresh for v in vals)}
+        busy_ts = {ts for ts, vals in window if sum(1 for v in vals if v is not None and v >= thresh) == n_gpus}
+        with self._lock:
+            cpu_at = {ts: pct for ts, pct in self._cpu_trace if pct is not None}
+            act_at = dict(self._act_trace)
+            stack_at = dict(self._stack_trace)
+            gauge_at = dict(self._gauge_trace)
+        def _mean(stamps):
+            vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
+            return (sum(vals) / len(vals)) if vals else None
+
+        def _busy_util():
+            vals = [
+                v
+                for _ts, per in window
+                if sum(1 for g in per if g is not None and g >= thresh) == n_gpus
+                for v in per
+                if v is not None
+            ]
+            return (sum(vals) / len(vals)) if vals else None
+
+        def _bands(stamps):
+            """Share of these samples with the driver blocked / between / running."""
+            vals = [cpu_at[ts] for ts in stamps if ts in cpu_at]
+            if not vals:
+                return None
+            n = len(vals)
+            return {
+                "blocked": 100.0 * sum(1 for v in vals if v < 20) / n,
+                "between": 100.0 * sum(1 for v in vals if 20 <= v < 60) / n,
+                "running": 100.0 * sum(1 for v in vals if v >= 60) / n,
+            }
+
+        def _census(stamps, table):
+            """Mean number of threads in each activity, over these samples."""
+            seen = [table[ts] for ts in stamps if ts in table]
+            if not seen:
+                return None
+            names = {k for snap in seen for k in snap}
+            return {k: sum(snap.get(k, 0) for snap in seen) / len(seen) for k in names}
+
+        def _gauges(stamps):
+            """Mean of each gauge over these samples.
+
+            The mean, not the max: one excursion with 40 ready episodes and
+            ninety with none is not "ready was 40", and the classifier below has
+            to distinguish a standing backlog from a single blip.
+            """
+            seen = [gauge_at[ts] for ts in stamps if ts in gauge_at]
+            if not seen:
+                return None
+            return {
+                name: sum(snap.get(name, 0) for snap in seen) / len(seen)
+                for name in GAUGE_NAMES
+            }
+
+        def _stacks(stamps, top=60):
+            """The frames the threads were actually on, over these samples.
+
+            Mean threads per sample on each frame, so it reads in the same unit
+            as the census beside it -- "1.2 of 3 slots were here" -- and the two
+            can be compared directly instead of one being a share and the other
+            a count.
+            """
+            seen = [stack_at[ts] for ts in stamps if ts in stack_at]
+            if not seen:
+                return None
+            counted = Counter()
+            for entry in seen:
+                # An interned id from the sampler, or a literal list of keys from
+                # a test double. Both, because the doubles are far more readable
+                # written out.
+                if isinstance(entry, int):
+                    ours, outside = _STACK_BY_ID.get(entry, ((), 0))
+                    counted.update(ours)
+                    if outside:
+                        # Weighted, not expanded: expanding is a 140-element list
+                        # per sample, the allocation the ids exist to avoid.
+                        counted["B -"] += outside
+                else:
+                    counted.update(entry)
+            # Deep, and truncated by the FORMATTER after it has split running
+            # from parked. Truncating here ranks by raw count, and the raw count
+            # is led by a hundred-odd parked infrastructure threads -- which is
+            # how a six-entry list came back holding nothing but them.
+            return [(key, n / len(seen)) for key, n in counted.most_common(top)]
+        wall = sum(wall_by_count.values()) or 1.0
+        return {
+            "n_gpus": n_gpus,
+            "samples": total,
+            "wall": wall,
+            "counts": counts,
+            "wall_by_count": wall_by_count,
+            # WALL, not sample count. These print beside wall_by_count and were
+            # a share of samples, which is the same thing only if every sample
+            # covers the same interval -- and the one bucket where it does not
+            # is the one this whole exercise is about. While the GPUs are EMPTY
+            # the driver is running Python holding the GIL, the sampler thread
+            # is starved, and its interval stretches: measured at 3541s / 312s,
+            # EMPTY was 8.8% of the seconds and printed as 6.8% of the samples.
+            # Counting samples therefore UNDER-reports exactly the idle it is
+            # there to find, by about a fifth of it, and does so silently
+            # because the seconds sitting next to it looked consistent.
+            "pct": {k: 100.0 * v / wall for k, v in wall_by_count.items()},
+            "per_gpu": per_gpu,
+            "cpu_when_empty": _mean(empty_ts),
+            "cpu_when_busy": _mean(busy_ts),
+            # The mean names neither mode of a two-mode distribution. A run
+            # whose EMPTY samples are half at 5% (blocked on a future) and half
+            # at 100% (working) reads 52%, which the verdict then calls
+            # UNRESOLVED -- true of the mean and true of nothing that happened.
+            "empty_cpu_bands": _bands(empty_ts),
+            # And the census restricted to the samples where the driver WAS
+            # working, which is the only place "where" is a meaningful question.
+            "activity_when_empty_running": _census(
+                {ts for ts in empty_ts if cpu_at.get(ts, 0.0) >= 60}, act_at
+            ),
+            # Mean util across the cards over the samples where ALL of them had
+            # work. This is the duty cycle -- the engine's own per-step host
+            # processing showing between kernel launches -- and it is the number
+            # an engine setting is aimed at. Node util cannot stand in for it:
+            # node util moves when EMPTY or PARTIAL move, and multi-step
+            # scheduling or async scheduling touch neither.
+            "util_when_busy": _busy_util(),
+            "activity_when_empty": _census(empty_ts, act_at),
+            # The same question asked of the interpreter instead of the tags,
+            # for the part of EMPTY that no tag has ever claimed.
+            "gauges_when_empty": _gauges(empty_ts),
+            "gauges_when_busy": _gauges(busy_ts),
+            "stacks_when_empty": _stacks(empty_ts),
+            "stacks_when_busy": _stacks(busy_ts),
+            "activity_when_busy": _census(busy_ts, act_at),
+            # The most threads ever counted at once, which is the slot count in
+            # practice. Without it "envstep 1.1" has no denominator and reads as
+            # a majority when it is a third.
+            "slots_seen": max((sum(snap.values()) for snap in act_at.values()), default=0),
+        }
 
     def per_gpu_util_between(self, t0, t1):
         """Per-GPU mean SM util in [t0, t1] as a list (one entry per GPU).
@@ -532,6 +1116,10 @@ class _Sampler:
             samples = self._samples
             self._samples = []
             self._util_trace = []
+            self._cpu_trace = []
+            self._act_trace = []
+            self._stack_trace = []
+            self._gauge_trace = []
         if not samples:
             return
         by_phase = _accumulate(samples, self.n_gpus)
@@ -648,6 +1236,219 @@ def per_gpu_util_between(t0, t1):
     if not enabled() or _sampler is None:
         return None
     return _sampler.per_gpu_util_between(t0, t1)
+
+
+def residency_between(t0, t1, busy_thresh=None):
+    if not enabled() or _sampler is None:
+        return None
+    return _sampler.residency_between(t0, t1, busy_thresh=busy_thresh)
+
+
+def classify_empty(gauges) -> Optional[str]:
+    """Why the cards were empty, from what work existed at the time.
+
+    Rule-based on purpose, and it keeps an UNINSTRUMENTED answer. The failure
+    mode of a classifier like this is that it always names something: every gap
+    gets attributed to whichever gauge happens to be instrumented, and the
+    profiler then argues confidently for a fix aimed at the wrong thing. Twice
+    in this arm a phase was named and then measured at under 0.05 of a slot.
+    So an excursion that matches no rule says so.
+
+    The distinction the whole thing exists for is the first two:
+
+      ready == 0 and the retriever busy   -> nothing COULD be submitted
+      ready >  0 and the retriever busy   -> something could and was not
+
+    Same observable, opposite prescriptions.
+    """
+    if not gauges:
+        return None
+    ready = gauges.get("ready", 0)
+    gen = gauges.get("gen_inflight", 0)
+    retr = gauges.get("retriever_inflight", 0)
+    env = gauges.get("env_inflight", 0)
+    wait = gauges.get("future_wait", 0)
+
+    if ready >= 1 and gen < 0.5:
+        return ("SCHEDULER STARVATION -- work was ready and the engine had none of it. "
+                "The fix is on the submitting side, not the retriever's")
+    if gen >= 0.5:
+        return ("GPU-SIDE -- requests were with the engine while the cards read idle: "
+                "either the engine's own host work, or a sample window artefact")
+    if retr >= 1 and ready < 1:
+        return ("RETRIEVER DEPENDENCY -- nothing was submittable and the retrieval "
+                "service was the thing being waited on")
+    if env >= 1 and ready < 1:
+        return ("ENVIRONMENT DEPENDENCY -- nothing was submittable and env.step was "
+                "the thing being waited on")
+    if wait >= 1:
+        return "DRIVER WAITING ON A FUTURE with no downstream work recorded"
+    return None
+
+
+def format_residency(res) -> str:
+    """One line: how much of the window had 0, 1, ... n cards with work."""
+    if not res:
+        return ""
+    n = res["n_gpus"]
+    parts = []
+    for k in range(n, -1, -1):
+        parts.append(f"{k}gpu {res['pct'][k]:.1f}% ({res['wall_by_count'][k]:.0f}s)")
+    empty = res["pct"][0]
+    partial = sum(res["pct"][k] for k in range(1, n))
+    busy_util = res.get("util_when_busy")
+    duty = f", reading {busy_util:.1f}%" if busy_util is not None else ""
+    per_gpu = res.get("per_gpu") or []
+    spread = ""
+    known = [v for v in per_gpu if v is not None]
+    if len(known) > 1:
+        cols = " ".join("--" if v is None else f"{v:.0f}" for v in per_gpu)
+        spread = f" | per-gpu {cols} (spread {max(known) - min(known):.0f} pt)"
+    # WHY every card was empty. Two readings, and the verdict is the one they
+    # agree on -- an earlier version took the top activity alone and named the
+    # retriever on a run whose driver was burning 82% of a core, which is the
+    # opposite conclusion and the opposite fix.
+    #
+    #   CPU says WHETHER the driver was working. A process blocked on a socket
+    #   burns no CPU; that part is unambiguous at these extremes.
+    #   The census says WHERE, but only when one phase actually dominates the
+    #   slots -- "envstep 1.1" out of three slots is a third of one, not a
+    #   verdict.
+    why = ""
+    empty_cpu, busy_cpu = res.get("cpu_when_empty"), res.get("cpu_when_busy")
+    census = res.get("activity_when_empty") or {}
+    slots = res.get("slots_seen") or 0
+    ranked = sorted(census.items(), key=lambda kv: -kv[1])
+    accounted = sum(census.values())
+    top_name, top_n = (ranked[0] if ranked else (None, 0.0))
+    # Against the slot count, not against the accounted total: a phase can be
+    # most of what was tagged while most of the slots were somewhere untagged.
+    dominates = slots > 0 and top_n >= 0.5 * slots
+
+    driver_running = empty_cpu is not None and empty_cpu >= 60
+    driver_blocked = empty_cpu is not None and empty_cpu < 20
+
+    # What work EXISTED while the cards were empty, and what that implies.
+    # Printed before the census, because "nothing was submittable" and "32 things
+    # were submittable" want different questions asked of the census after them.
+    gauges = res.get("gauges_when_empty") or {}
+    if any(v >= 0.05 for v in gauges.values()):
+        shown = ", ".join(f"{k} {v:.1f}" for k, v in gauges.items() if v >= 0.05)
+        why += f"\n[gpu-residency]    while EMPTY the work outstanding was: {shown}"
+        verdict = classify_empty(gauges)
+        why += (
+            f"\n[gpu-residency]    -> {verdict}" if verdict else
+            "\n[gpu-residency]    -> UNINSTRUMENTED: no rule matches these gauges, which is"
+            " an answer -- the gap is somewhere nothing counts"
+        )
+
+    untagged = max(0.0, slots - accounted) if slots else 0.0
+    if ranked:
+        shown = ", ".join(f"{k} {v:.1f}" for k, v in ranked if v >= 0.05) or "nothing recorded"
+        line = f"\n[gpu-residency] while EMPTY the slots were in: {shown}"
+        if slots:
+            line += f" (of {slots:.0f} slots; {untagged:.1f} in no tagged phase)"
+        why += line
+
+    # The frames, whenever the tags leave a third of a thread or more
+    # unaccounted for.
+    #
+    # THESE TWO LINES ARE NOT IN THE SAME UNIT and saying so is the whole of
+    # this comment. The census counts threads that entered a tagged phase --
+    # four of them on this run. The frames count every live thread in the
+    # process, and a machine running the pump, Ray, a retriever pool and three
+    # slots has well over a hundred, nearly all parked. The first reading put
+    # "126.58 (no repo frame) <- thread.py:81 _worker" at the top, which is
+    # concurrent.futures' idle workers waiting for work that is not coming, and
+    # pushed the one thread burning 65% of a core off the end of the list.
+    #
+    # So: threads outside this repository collapse to a count, because nothing
+    # here can act on them; threads inside it are listed and split by whether
+    # they are running Python or parked, because those need opposite fixes.
+    stacks = res.get("stacks_when_empty") or []
+    if stacks and untagged >= 0.33:
+        outside = sum(mean for key, mean in stacks if key.endswith(" -"))
+        ours = [(key[2:], key[0], mean) for key, mean in stacks if not key.endswith(" -")]
+        running = [(k, m) for k, state, m in ours if state == "R" and m >= 0.05]
+        parked = [(k, m) for k, state, m in ours if state == "B" and m >= 0.05]
+        why += (
+            f"\n[gpu-residency]    {untagged:.1f} of the tagged slots are in NO tagged phase. "
+            f"Mean live threads per EMPTY sample, from the interpreter "
+            f"({outside:.0f} outside this repo, parked or otherwise):"
+        )
+        for label, rows in (("RUNNING Python", running), ("PARKED, burning nothing", parked)):
+            if rows:
+                why += f"\n[gpu-residency]      -- {label} --"
+                for key, mean in rows[:8]:
+                    why += f"\n[gpu-residency]      {mean:5.2f}  {key}"
+                if len(rows) > 8:
+                    why += f"\n[gpu-residency]      ... and {len(rows) - 8} more below {rows[8][1]:.2f}"
+        if not running:
+            why += (
+                "\n[gpu-residency]      -- nothing of ours was RUNNING; the CPU above is being "
+                "burned outside this repo, or by a wait this list does not know is one --"
+            )
+
+    if driver_blocked:
+        why += ("\n[gpu-residency] -> EMPTY is a WAIT OFF THE BOX: the driver burned "
+                f"{empty_cpu:.0f}% of one core, and a process waiting on a socket burns none")
+        if dominates and top_name != "envstep":
+            why += f" (though {top_name} was the phase -- these disagree, trust neither yet)"
+    elif driver_running:
+        named = {
+            "preproc": "tokenising",
+            "decode": "detokenising",
+            "glue": "padding and DataProto union between the phases",
+            "dataload": "the val loader on the calling thread",
+            "prepare": "batch preparation on the calling thread",
+            "scoring": "reward accumulation on the calling thread",
+            "envstep": "envstep -- the driver's work around the call, not the retriever",
+            "record": "per-turn bookkeeping (to_list_of_dict expands the whole batch every turn)",
+            "assemble": "gather_rollout_data, padding every turn of every trajectory",
+        }.get(top_name, top_name)
+        where = f", mostly in {named}" if dominates else ", and no single phase dominates"
+        why += (f"\n[gpu-residency] -> EMPTY is the DRIVER RUNNING PYTHON: {empty_cpu:.0f}% of one "
+                f"core while EMPTY against {busy_cpu:.0f}% while busy{where}")
+
+    elif empty_cpu is not None:
+        bands = res.get("empty_cpu_bands") or {}
+        if bands and max(bands.get("blocked", 0), bands.get("running", 0)) >= 25:
+            # Two modes, not one middling state. Say how EMPTY splits between
+            # them and what the working half was doing -- the mean was hiding
+            # both answers behind a number that described neither.
+            running_census = res.get("activity_when_empty_running") or {}
+            top = max(running_census.items(), key=lambda kv: -(-kv[1]), default=(None, 0.0))
+            where = f", mostly in {top[0]}" if top[0] and top[1] >= 0.5 * max(slots, 1) else ""
+            why += (
+                f"\n[gpu-residency] -> EMPTY SPLITS: driver BLOCKED (cpu<20%) for "
+                f"{bands.get('blocked', 0):.0f}% of it, RUNNING (cpu>=60%) for "
+                f"{bands.get('running', 0):.0f}%, between for {bands.get('between', 0):.0f}%"
+                f" (mean {empty_cpu:.0f}% of one core against {busy_cpu:.0f}% while busy)."
+            )
+            if running_census:
+                shown = ", ".join(
+                    f"{k} {v:.1f}" for k, v in sorted(running_census.items(), key=lambda kv: -kv[1])
+                    if v >= 0.05
+                )
+                why += f"\n[gpu-residency]    while RUNNING-and-empty the slots were in: {shown}{where}"
+            why += (
+                "\n[gpu-residency]    BLOCKED is work the GPU does not have yet -- the tail of a "
+                "turn, or a slot waiting on another. RUNNING is driver Python. They need "
+                "different fixes and the mean names neither."
+            )
+        else:
+            why += (f"\n[gpu-residency] -> EMPTY is UNRESOLVED: driver CPU {empty_cpu:.0f}% of one core "
+                    f"(vs {busy_cpu:.0f}% while busy) is neither blocked nor clearly running")
+    elif dominates:
+        why += f"\n[gpu-residency] -> EMPTY is mostly {top_name}, but with no CPU sample to corroborate it"
+    return (
+        f"[gpu-residency] {res['wall']:.0f}s sampled: " + ", ".join(parts) + spread +
+        f"\n[gpu-residency] EMPTY {empty:.1f}% (more batches in flight fill this), "
+        f"PARTIAL {partial:.1f}% (a rank idle inside a collective call -- only the "
+        f"pump fills this). All {n} cards had work {res['pct'][n]:.1f}% of the time"
+        + duty + " -- THAT is the engine's duty cycle, and the only number an "
+        "engine setting (multi-step, async scheduling) can move." + why
+    )
 
 
 def report_and_reset(label=""):
