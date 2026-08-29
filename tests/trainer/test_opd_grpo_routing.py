@@ -67,6 +67,11 @@ def _make_trainer(teacher_wg, topk=None):
     trainer.teacher_wg = teacher_wg
     trainer.teacher_topk_kl = topk is not None
     trainer.teacher_kl_topk = topk or 0
+    # This arm trains against the student's top-k, but the routing under test is
+    # the same either way; the student-indexed path is covered in
+    # test_opd_routing.py against the base trainer that defines it.
+    trainer.student_indexed_topk = False
+    trainer._teacher_cache_counter = 0
     return trainer
 
 

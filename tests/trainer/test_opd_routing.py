@@ -35,9 +35,12 @@ class _FakeTeacherWG:
     original position.
     """
 
-    def __init__(self, code):
+    def __init__(self, code, world_size=1):
         self.code = code
         self.calls = []
+        # student_indexed_topk pads explicitly to this instead of letting the DP
+        # dispatch do it, so that padding rows can carry a -1 cache id.
+        self.world_size = world_size
 
     def compute_ref_log_prob(self, sub):
         first_tok = sub.batch["responses"][:, 0].float()
@@ -57,6 +60,11 @@ class _FakeTeacherWG:
         ids = torch.zeros((bs, resp_len, k), dtype=torch.long)
         logprobs[:, 0, 0] = self.code * 1000.0 + first_tok
         ids[:, 0, 0] = self.code * 1000 + first_tok.long()
+        if "teacher_cache_ids" in sub.batch.keys():
+            # The real worker caches the hidden states here and hands back only
+            # the row count; the values are resolved later in the actor.
+            self.cached = sub.batch["teacher_cache_ids"].tolist()
+            return DataProto.from_dict(tensors={"teacher_scored": torch.ones(bs, 1, dtype=torch.bool)})
         return DataProto.from_dict(
             tensors={"teacher_topk_logprobs": logprobs, "teacher_topk_ids": ids}
         )
@@ -73,16 +81,20 @@ def _make_batch(task_names, resp_len=4):
     )
 
 
-def _make_trainer(teacher_wg, topk=None):
+def _make_trainer(teacher_wg, topk=None, student_indexed=False):
     from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 
     # Bypass the heavy __init__; we only exercise compute_teacher_log_probs. The
     # attributes it would have set and this method reads have to be set by hand --
-    # teacher_topk_kl selects the single-token or the dense top-k branch.
+    # teacher_topk_kl selects the single-token or the dense top-k branch, and
+    # student_indexed_topk decides whether the teacher's own top-k comes back at
+    # all or only a cache key does.
     trainer = object.__new__(OPDRayTrainer)
     trainer.teacher_wg = teacher_wg
     trainer.teacher_topk_kl = topk is not None
     trainer.teacher_kl_topk = topk or 0
+    trainer.student_indexed_topk = bool(topk is not None and student_indexed)
+    trainer._teacher_cache_counter = 0
     return trainer
 
 
@@ -283,6 +295,68 @@ def test_prefetch_chunk_routes_each_row_to_its_task_teacher():
     assert teachers["alfworld"].calls == [[1.0, 2.0]]
     assert teachers["search"].calls == [[3.0]]
     assert teachers["webshop"].calls == [[0.0]]
+
+
+def test_the_student_indexed_prefetch_brings_back_only_a_cache_key():
+    """The support is the student's, so the teacher's own top-k is read nowhere
+    downstream. Shipping (rows, response_length, k) log-probs plus the same again
+    in int64 ids was ~860 MB a step of pure transport."""
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20, student_indexed=True)
+
+    chunk = [
+        (("t0", 0), _make_row(0, "webshop")),
+        (("t1", 0), _make_row(1, "alfworld")),
+        (("t1", 1), _make_row(2, "alfworld_easy")),
+    ]
+    out = trainer._teacher_prefetch_chunk(chunk)
+
+    assert set(out) == {("t0", 0), ("t1", 0), ("t1", 1)}
+    # Plain ints, and distinct: the key is what locates the row's hidden states.
+    assert all(isinstance(v, int) for v in out.values())
+    assert len(set(out.values())) == 3
+    # The teachers still ran -- this removes the return trip, not the forward.
+    assert teachers["alfworld"].calls == [[1.0, 2.0]]
+    assert teachers["webshop"].calls == [[0.0]]
+    # ...and each row was cached under the key it was handed back.
+    assert sorted(teachers["alfworld"].cached) == sorted([out[("t1", 0)], out[("t1", 1)]])
+
+
+def test_the_student_indexed_batch_carries_keys_instead_of_the_top_k_columns():
+    """Merged into the batch: one int64 per row, not two (bs, response_length, k)
+    tensors -- and every row gets one, prefetch hit or miss. A miss left at -1
+    would not be a missing target but a WRONG one: the exchange returns zero,
+    exp(0)=1 at every id, and the tail mass goes negative."""
+    teachers = {"alfworld": _FakeTeacherWG(1), "search": _FakeTeacherWG(2), "webshop": _FakeTeacherWG(3)}
+    trainer = _make_trainer(teachers, topk=20, student_indexed=True)
+
+    batch = _make_batch_with_ids(
+        ["alfworld", "alfworld", "search"], traj_uids=["a", "a", "b"], turn_steps=[0, 1, 0]
+    )
+    trainer.compute_teacher_log_probs(batch, prefetched={("a", 0): 11})
+
+    assert "teacher_topk_logprobs" not in batch.batch.keys()
+    assert "teacher_topk_ids" not in batch.batch.keys()
+    keys = batch.batch["teacher_cache_ids"]
+    assert keys[0].item() == 11                       # the prefetched row kept its key
+    assert (keys > 0).all()                           # ...and the misses got fresh ones
+    assert len(set(keys.tolist())) == 3
+
+
+def test_a_padded_teacher_call_marks_its_copies_unscored():
+    """auto_padding repeats whole rows to reach a multiple of world_size, cache id
+    included, and two ranks would then claim one key. The explicit padding lets
+    the copies carry -1: still scored, never cached."""
+    teachers = {"alfworld": _FakeTeacherWG(1, world_size=4)}
+    trainer = _make_trainer(teachers, topk=20, student_indexed=True)
+
+    batch = _make_batch_with_ids(["alfworld"] * 3, traj_uids=["a", "a", "a"], turn_steps=[0, 1, 2])
+    trainer.compute_teacher_log_probs(batch)
+
+    cached = teachers["alfworld"].cached
+    assert len(cached) == 4                      # 3 real rows padded up to world_size
+    assert cached[-1] == -1                      # the copy is not filed under a key
+    assert sorted(cached[:3]) == sorted(batch.batch["teacher_cache_ids"].tolist())
 
 
 def test_prefetched_rows_are_not_rescored():

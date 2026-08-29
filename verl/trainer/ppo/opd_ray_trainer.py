@@ -23,7 +23,7 @@ from omegaconf import open_dict
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.protocol import DataProtoConfig
+from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import (
@@ -133,6 +133,12 @@ class OPDRayTrainer(RayPPOTrainer):
         actor_cfg = self.config.actor_rollout_ref.actor
         self.teacher_topk_kl = actor_cfg.get("teacher_kl_loss_type", "low_var_kl") == "topk_kl"
         self.teacher_kl_topk = int(actor_cfg.get("teacher_kl_topk", 20))
+        # Support of the distillation KL: the teacher's top-k (default) or the
+        # student's. See actor.student_indexed_topk in ppo_trainer.yaml.
+        self.student_indexed_topk = self.teacher_topk_kl and bool(actor_cfg.get("student_indexed_topk", False))
+        # Monotone across the run so a stale entry can never be mistaken for a live
+        # one; the cache is cleared each step regardless.
+        self._teacher_cache_counter = 0
 
     # ------------------------------------------------------------------ #
     # Worker setup: actor_rollout (+ optional critic/rm) + N teachers.
@@ -198,10 +204,26 @@ class OPDRayTrainer(RayPPOTrainer):
             self.critic_wg.init_model()
 
         # Initialize teachers before the rollout engine (matches actor-last ordering).
-        for task, key in self._teacher_keys.items():
+        n_teachers = len(self._teacher_keys)
+        for slot, (task, key) in enumerate(self._teacher_keys.items()):
             wg = all_wg[key]
             wg.init_model()
             self.teacher_wg[task] = wg
+            if self.student_indexed_topk and not bool(self.config.trainer.get("val_only", False)):
+                # The actor resolves this teacher at ids nobody has picked yet --
+                # the student's top-k -- so it needs the teacher's output
+                # projection at update time, by which point the ref path has
+                # resharded it. One unsharded copy per teacher, taken once here,
+                # labelled with the task the cache will file it under. Not in a
+                # val_only run: nothing scores a teacher there, and this is 1.9 GB
+                # a rank held for the life of the process, next to a vLLM engine
+                # already sized to 0.6 of the card.
+                #
+                # The slot is passed so the copy lands directly in its slice of the
+                # stacked projection the lookup reads, instead of being cloned on
+                # its own and stacked later -- that held both layouts at once, and
+                # peaked here, before vLLM measures free memory.
+                wg.register_teacher_lm_head(task, slot=slot, n_tasks=n_teachers)
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
@@ -249,6 +271,17 @@ class OPDRayTrainer(RayPPOTrainer):
             task = self._normalize_task_name(row.get("task_name"))
             by_task.setdefault(task, []).append((key, row))
 
+        # student_indexed_topk resolves this teacher at ids the student has not
+        # chosen yet, from hidden states the teacher keeps on whichever rank scored
+        # the row. That rank is never the one that later trains the row -- the batch
+        # is regrouped by task, padded and then reordered by _balance_batch -- so the
+        # cache is addressed by an id assigned here and carried on the row.
+        cache_id_for = {}
+        if self.student_indexed_topk:
+            for key, _ in chunk:
+                self._teacher_cache_counter += 1
+                cache_id_for[key] = self._teacher_cache_counter
+
         out = {}
         for task, entries in by_task.items():
             wg = self.teacher_wg.get(task)
@@ -263,21 +296,62 @@ class OPDRayTrainer(RayPPOTrainer):
                     for name in ("input_ids", "attention_mask", "position_ids", "responses")
                 },
             )
-            # Same dispatch as the post-rollout path: chunks are not divisible by
-            # the teacher group's world size, so let DP_COMPUTE_PROTO pad and unpad.
-            sub.meta_info = {DataProtoConfig.auto_padding_key: True}
-            if self.teacher_topk_kl:
-                sub.meta_info["topk_k"] = self.teacher_kl_topk
-                scored = wg.compute_ref_topk_log_prob(sub)
+            ids = (
+                torch.tensor([cache_id_for[key] for key, _ in entries], dtype=torch.long)
+                if self.student_indexed_topk
+                else None
+            )
+            if self.teacher_topk_kl and self.student_indexed_topk:
+                # Nothing comes back but the row count: the support is the
+                # student's, so the values are resolved in the actor from the
+                # hidden states this call just cached. What used to travel here
+                # was (rows, 512, 20) log-probs plus the same in int64 ids --
+                # ~860 MB a step, merged into the batch and never read.
+                self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+                for key, _ in entries:
+                    out[key] = cache_id_for[key]
+            elif self.teacher_topk_kl:
+                scored = self._teacher_call(wg, sub, topk=True, cache_ids=ids)
                 tlp = scored.batch["teacher_topk_logprobs"]
                 tid = scored.batch["teacher_topk_ids"]
                 for j, (key, _) in enumerate(entries):
                     out[key] = (tlp[j], tid[j])
             else:
-                scored = wg.compute_ref_log_prob(sub)
+                scored = self._teacher_call(wg, sub, topk=False, cache_ids=ids)
                 lp = scored.batch["ref_log_prob"]
                 for j, (key, _) in enumerate(entries):
                     out[key] = lp[j]
+        return out
+
+    def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None):
+        """One teacher call, with the DP padding marked so it is never cached.
+
+        ``auto_padding`` repeats rows to reach a multiple of the group's world
+        size, and it repeats the whole row -- ``teacher_cache_ids`` included. Two
+        ranks would then cache the same id and the exchange would see a row
+        answered twice. Padding explicitly instead lets the copies carry -1: they
+        are still scored (the shapes have to match) and still discarded on the way
+        out, they just do not enter any cache.
+        """
+        pad_size = 0
+        if cache_ids is not None:
+            sub = sub.__class__.from_dict(
+                tensors={**{k: v for k, v in sub.batch.items()}, "teacher_cache_ids": cache_ids}
+            )
+            sub, pad_size = pad_dataproto_to_divisor(sub, wg.world_size)
+            if pad_size:
+                sub.batch["teacher_cache_ids"][-pad_size:] = -1
+        else:
+            sub.meta_info = dict(sub.meta_info)
+            sub.meta_info[DataProtoConfig.auto_padding_key] = True
+        if topk:
+            sub.meta_info = dict(sub.meta_info)
+            sub.meta_info["topk_k"] = self.teacher_kl_topk
+            out = wg.compute_ref_topk_log_prob(sub)
+        else:
+            out = wg.compute_ref_log_prob(sub)
+        if pad_size:
+            out = unpad_dataproto(out, pad_size=pad_size)
         return out
 
     def _prefetched_teacher_rows(self, batch: DataProto):
@@ -293,6 +367,45 @@ class OPDRayTrainer(RayPPOTrainer):
         # adjust_batch's duplicates share their original's key, so two rows can map
         # to the same entry -- reading it twice is what makes them duplicates.
         return {i: (str(traj_uid[i]), int(turn_step[i])) for i in range(len(batch))}
+
+    def clear_teacher_hidden_cache(self) -> None:
+        """Drop last step's hidden states before the teachers start filling the
+        cache again.
+
+        Ids are monotone across the run, so a leftover entry could never be
+        mistaken for a live one -- this is about memory, not correctness. One
+        call: the cache is per PROCESS and the teachers are colocated, so they
+        all share it. A no-op unless the student picks the support.
+        """
+        if not self.student_indexed_topk or not self.teacher_wg:
+            return
+        next(iter(self.teacher_wg.values())).clear_teacher_hidden_cache()
+
+    def check_teacher_hidden_cache(self, metrics=None) -> None:
+        """Run the witness over everything cached this step, and report the size.
+
+        Call it after the prefetch MISSES have been scored, not before: the cache
+        is only complete then. The witness confirms every entry still reproduces
+        the log-probs its teacher returned, i.e. that none has drifted onto
+        another row. One call -- the cache is per process, so asking every teacher
+        would check the same entries once each.
+        """
+        if not self.student_indexed_topk or not self.teacher_wg:
+            return
+        cache_stats = next(iter(self.teacher_wg.values())).check_teacher_hidden_cache()
+        if metrics is None:
+            return
+        # What the cache is holding, summed over ranks: a row's hidden states are
+        # (response_length, hidden) held for the whole step, next to a vLLM engine
+        # already sized to 0.6 of the card, so this is the first number to read
+        # when a step dies on memory -- and the one that says whether the headroom
+        # is there before it does.
+        per_rank = cache_stats if isinstance(cache_stats, list) else [cache_stats]
+        per_rank = [r for r in per_rank if isinstance(r, dict)]
+        if per_rank:
+            metrics["teacher_cache/rows"] = sum(r["rows"] for r in per_rank)
+            metrics["teacher_cache/gb"] = sum(r["bytes"] for r in per_rank) / 1e9
+            metrics["teacher_cache/witness_max_err"] = max(r["witness_max_err"] for r in per_rank)
 
     def compute_teacher_log_probs(self, batch: DataProto, prefetched=None, metrics=None) -> None:
         """Route each sample to its task's teacher and write the distillation
@@ -318,20 +431,35 @@ class OPDRayTrainer(RayPPOTrainer):
         resp_len = batch.batch["responses"].size(1)
         seen = [False] * bs
 
-        if self.teacher_topk_kl:
+        # Under student_indexed_topk the teacher's own top-k is not part of the
+        # answer -- the support comes from the student and the values are resolved
+        # in the actor -- so these two (bs, response_length, k) columns are not
+        # built, not merged and not shipped. At this batch size they were ~860 MB
+        # a step of pure transport.
+        merge_topk = self.teacher_topk_kl and not self.student_indexed_topk
+        if merge_topk:
             k = self.teacher_kl_topk
             teacher_topk_logprobs = torch.zeros((bs, resp_len, k), dtype=torch.float32)
             teacher_topk_ids = torch.zeros((bs, resp_len, k), dtype=torch.long)
-        else:
+        elif not self.teacher_topk_kl:
             teacher_log_probs = torch.zeros((bs, resp_len), dtype=torch.float32)
 
+        # Every row gets a key, not just the prefetched ones. The rows the prefetch
+        # missed -- the final turns -- are scored below, and they need their hidden
+        # states cached exactly like the rest. Leaving them at -1 makes the exchange
+        # return a zero teacher log-prob, which is not a missing target but a WRONG
+        # one: exp(0)=1 at every id drives the tail mass negative and the KL through
+        # the clamp.
+        cache_ids = torch.full((bs,), -1, dtype=torch.long)
         keys = self._prefetched_teacher_rows(batch) if prefetched else None
         if keys is not None:
             for i, key in keys.items():
                 hit = prefetched.get(key)
                 if hit is None:
                     continue
-                if self.teacher_topk_kl:
+                if self.student_indexed_topk:
+                    cache_ids[i] = hit
+                elif self.teacher_topk_kl:
                     teacher_topk_logprobs[i], teacher_topk_ids[i] = hit
                 else:
                     teacher_log_probs[i] = hit
@@ -346,13 +474,19 @@ class OPDRayTrainer(RayPPOTrainer):
             if not idxs:
                 continue
             sub = batch.select_idxs(idxs)
-            # Task slices are not generally divisible by the teacher group's world
-            # size, so enable auto-padding: the DP dispatch pads the input to a
-            # multiple of world_size and unpads the output back to len(idxs). Copy
-            # meta_info first so we don't mutate the parent batch (select_idxs
-            # shares the parent's meta_info dict by reference).
+            # Copy meta_info first so we don't mutate the parent batch (select_idxs
+            # shares the parent's meta_info dict by reference). _teacher_call then
+            # decides how the slice is padded to the teacher group's world size:
+            # auto-padding normally, explicitly when a cache-id column rides along
+            # (a repeated row would file two ranks under one key).
             sub.meta_info = dict(sub.meta_info)
-            sub.meta_info[DataProtoConfig.auto_padding_key] = True
+            miss_ids = None
+            if self.student_indexed_topk:
+                miss_ids = torch.empty(len(idxs), dtype=torch.long)
+                for j, i in enumerate(idxs):
+                    self._teacher_cache_counter += 1
+                    miss_ids[j] = self._teacher_cache_counter
+                    cache_ids[i] = self._teacher_cache_counter
             # The teachers run one after another in this loop, so "teacher_forward"
             # as a single phase says how long all three took together but not which
             # one dominates -- and they are not interchangeable: the tasks differ in
@@ -362,9 +496,12 @@ class OPDRayTrainer(RayPPOTrainer):
             # compute and that transfer out by teacher.
             gpu_profiler.push_phase(f"teacher_forward/{task}")
             try:
-                if self.teacher_topk_kl:
-                    sub.meta_info["topk_k"] = k
-                    out = wg.compute_ref_topk_log_prob(sub)
+                if self.teacher_topk_kl and self.student_indexed_topk:
+                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
+                    for i in idxs:
+                        seen[i] = True
+                elif self.teacher_topk_kl:
+                    out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
                     tlp = out.batch["teacher_topk_logprobs"]
                     tid = out.batch["teacher_topk_ids"]
                     for j, i in enumerate(idxs):
@@ -372,7 +509,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         teacher_topk_ids[i] = tid[j]
                         seen[i] = True
                 else:
-                    out = wg.compute_ref_log_prob(sub)
+                    out = self._teacher_call(wg, sub, topk=False, cache_ids=miss_ids)
                     lp = out.batch["ref_log_prob"]
                     for j, i in enumerate(idxs):
                         teacher_log_probs[i] = lp[j]
@@ -387,9 +524,11 @@ class OPDRayTrainer(RayPPOTrainer):
                 f"available teachers: {sorted(self.teacher_wg.keys())}"
             )
 
-        if self.teacher_topk_kl:
+        if merge_topk:
             batch.batch["teacher_topk_logprobs"] = teacher_topk_logprobs
             batch.batch["teacher_topk_ids"] = teacher_topk_ids
+        elif self.student_indexed_topk:
+            batch.batch["teacher_cache_ids"] = cache_ids
         else:
             batch.batch["teacher_log_probs"] = teacher_log_probs
 
@@ -459,6 +598,7 @@ class OPDRayTrainer(RayPPOTrainer):
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
+                    self.clear_teacher_hidden_cache()
                     with _timer("gen", timing_raw):
                         gen_batch_output = self.traj_collector.multi_turn_loop(
                             gen_batch=gen_batch,
@@ -527,6 +667,8 @@ class OPDRayTrainer(RayPPOTrainer):
                             prefetched=self.traj_collector.take_prefetched_teacher(),
                             metrics=metrics,
                         )
+
+                    self.check_teacher_hidden_cache(metrics)
 
                     # tag rows with their task so the actor can split its metrics
                     self._attach_task_ids(batch)

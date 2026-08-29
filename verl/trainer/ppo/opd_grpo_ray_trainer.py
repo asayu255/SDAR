@@ -159,6 +159,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
+                    self.clear_teacher_hidden_cache()
                     with _timer("gen", timing_raw):
                         gen_batch_output = self.traj_collector.multi_turn_loop(
                             gen_batch=gen_batch,
@@ -307,6 +308,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                             prefetched=self.traj_collector.take_prefetched_teacher(),
                             metrics=metrics,
                         )
+
+                    self.check_teacher_hidden_cache(metrics)
 
                     # tag rows with their task so the actor can split its metrics
                     self._attach_task_ids(batch)

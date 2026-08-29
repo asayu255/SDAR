@@ -197,6 +197,57 @@ set -x
 # logger-only scalars stay as 0-d GPU tensors until the end of update_policy
 # instead of being read back per micro-batch (~450 forced host syncs a step).
 #
+# actor.student_indexed_topk=True — NOT a speedup. It changes what the top-k KL
+# is computed over, so it belongs to the science, is pinned in
+# expected_multitask_config.yaml, and has to be identical across every arm being
+# compared. This arm trains against the STUDENT's top-20; a run made before this
+# flag existed used the teacher's, and the two are not comparable.
+#   The loss is a coarse-grained reverse KL: exact on a support set A, with
+#   everything outside A folded into one tail bucket. Reverse KL weights by the
+#   STUDENT's mass, and the error it drops is exactly
+#   tail_s * KL(p_s|Ā ‖ p_t|Ā) — a student-mass-weighted term. Taking A from the
+#   teacher's top-20 therefore leaves the student's own mass uncovered exactly
+#   where the student has drifted off the teacher, which is the regime the term
+#   exists to penalise; taking A from the student's top-20 covers it. Both are
+#   valid lower bounds on the same full KL (data processing), so this is a
+#   tighter bound, not a different objective. On this arm the student is also
+#   being pushed by a policy gradient, so it has a second reason to move off the
+#   teacher's support that pure OPD does not have.
+#   It costs no extra forward. The teacher's output splits as
+#   log p_t(v) = h·W_t[v] - lse_t, and only the last gather depends on the ids —
+#   ~1/42,000 of the teacher forward. So the teacher keeps running inside the
+#   rollout's CPU glue where it runs today, caching h and lse; the student's
+#   single training forward picks the ids; the teacher is resolved at them for
+#   2·H·k. What it does introduce is rank ownership: rows are regrouped by task,
+#   padded and reordered by _balance_batch between the two calls, so the rank
+#   that cached a row is not the rank that trains it. verl/workers/teacher_cache.py
+#   handles that with an all-gather exchange, a per-row answer count that must be
+#   exactly 1 (0 = a zero target nobody noticed, 2 = two ranks claiming one key),
+#   a fingerprint of the row's own tokens (so a key column shifted against its
+#   batch cannot resolve cleanly to somebody else's sample), and a numerical
+#   witness that re-derives the teacher's own top-k from the cached h/lse.
+#   Requires response_only_logits on both sides (the row map comes from there)
+#   and holds one unsharded 622 MB copy of each teacher's output projection for
+#   the run — 1.9 GB across the three, laid end to end as one (3*V, H) tensor so a
+#   mixed micro-batch needs no grouping by task. It is affordable here and would
+#   not be on a larger teacher. teacher_cache/gb reports what it actually holds.
+#   Three things it deletes, none of which changes a value:
+#     - the teacher's own top-k. Under student indexing nothing downstream reads
+#       it, so it is built for TEACHER_WITNESS_MICRO_BATCHES (2) micro-batches a
+#       step as a spot check and for nothing else. It was a selection over the
+#       whole vocabulary plus two scatters per row, and then ~860 MB/step of it
+#       travelled to the driver to be ignored.
+#     - the second logsumexp. The forward needed the normaliser for the top-k and
+#       again for the cache; it is one reduction over the widest tensor in the
+#       step, now computed once. topk(sorted=False) for the same reason the order
+#       is never read: the KL sums over the support.
+#     - the host round-trips in the lookup. It runs inside the micro-batch loop,
+#       thousands of times a step, and a .tolist() or an int(tensor) there is a
+#       device-to-host sync that drains the CPU run-ahead this whole effort exists
+#       to protect. The ownership guard is tallied on the device and read once per
+#       mini-batch instead — still before the optimizer step, so an unresolved row
+#       cannot reach the weights.
+#
 # Wasted-work removals. Each deletes computation whose result was already being
 # thrown away, so none of them changes a value that reaches the loss.
 #   actor.response_only_logits=True / ref.response_only_logits=True — run lm_head
@@ -301,6 +352,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
+    actor_rollout_ref.actor.student_indexed_topk=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \

@@ -760,6 +760,12 @@ _PHASE_ORDER = [
     # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
     # execution order so the interior of a step reads top to bottom.
     "actor.fwd",
+    # Between the forward and the backward under student_indexed_topk: the
+    # all-gather exchange that resolves the teacher at the ids the forward just
+    # picked, plus the narrow GEMM against the cached hidden states. It is a
+    # collective inside the micro-batch loop, so it belongs in the reading of a
+    # step's interior rather than in the alphabetical tail.
+    "actor.teacher_lookup",
     "actor.bwd",
     "actor.task_metrics",
     "actor.optim",

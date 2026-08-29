@@ -138,6 +138,27 @@ def get_sharding_strategy(device_mesh, fsdp_config=None):
     return alternatives[requested]
 
 
+def _fsdp_param_dtype(module, default):
+    """The dtype FSDP casts parameters to for the forward.
+
+    ``summon_full_params`` returns the float32 masters, but the projection that
+    produced the log-probs ran at ``MixedPrecision.param_dtype``. Anything
+    recomputing that projection has to use the same one or it is doing different
+    arithmetic. Walks the wrapper chain because only the FSDP module carries it.
+    """
+    seen = module
+    for _ in range(8):
+        mp = getattr(seen, "mixed_precision", None)
+        dtype = getattr(mp, "param_dtype", None)
+        if dtype is not None:
+            return dtype
+        nxt = getattr(seen, "_fsdp_wrapped_module", None) or getattr(seen, "_orig_mod", None)
+        if nxt is None or nxt is seen:
+            break
+        seen = nxt
+    return default
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -649,6 +670,12 @@ class ActorRolloutRefWorker(Worker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            # Set by register_teacher_lm_head when student_indexed_topk is on; the
+            # cache needs to know which teacher an entry belongs to.
+            self._teacher_lm_head_task = None
+            # Micro-batches per step that also build the teacher's own top-k,
+            # purely as a witness. Reset in clear_teacher_hidden_cache.
+            self._teacher_witness_budget = int(os.environ.get("TEACHER_WITNESS_MICRO_BATCHES", "2"))
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -886,12 +913,41 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        # student_indexed_topk resolves this teacher at ids the student picks during
+        # its own training forward, which has not happened yet. Only the final gather
+        # depends on those ids, so keep what does not: the body's hidden states and
+        # the full-vocabulary normaliser.
+        #
+        # In that mode the teacher's OWN top-k is not part of the answer -- nothing
+        # downstream reads it -- so it is built for a couple of micro-batches per
+        # step as a witness and for nothing else. It was a selection over the whole
+        # vocabulary plus two scatters back to (bs, response_length, k) for every
+        # row, and then ~860 MB/step of it travelled to the driver to be ignored.
+        cache_ids = data.batch.get("teacher_cache_ids", None) if "teacher_cache_ids" in data.batch.keys() else None
+        want_hidden = cache_ids is not None and bool(self.config.ref.get("student_indexed_topk", False))
+
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            topk_logprob, topk_ids = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k)
-            output = DataProto.from_dict(
-                tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
-            )
+            if want_hidden:
+                hidden, lse, w_rows, w_ids, w_lp = self.ref_policy.compute_topk_log_prob(
+                    data=data, topk_k=topk_k, return_hidden=True,
+                    witness_micro_batches=self._take_witness_budget(),
+                )
+                self._cache_teacher_hidden(
+                    cache_ids, hidden, lse, w_rows, w_ids, w_lp,
+                    attention_mask=data.batch["attention_mask"],
+                    input_ids=data.batch["input_ids"],
+                )
+                # The driver only needs the row count back (it unpads by it); the
+                # values it used to merge here are now resolved in the actor.
+                output = DataProto.from_dict(
+                    tensors={"teacher_scored": torch.ones(len(data), 1, dtype=torch.bool)},
+                )
+            else:
+                topk_logprob, topk_ids = self.ref_policy.compute_topk_log_prob(data=data, topk_k=topk_k)
+                output = DataProto.from_dict(
+                    tensors={"teacher_topk_logprobs": topk_logprob, "teacher_topk_ids": topk_ids},
+                )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -900,6 +956,139 @@ class ActorRolloutRefWorker(Worker):
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
+
+    def _take_witness_budget(self) -> int:
+        """How many of this call's micro-batches also build the teacher's own top-k.
+
+        A budget rather than a rate: the witness catches an entry filed under the
+        wrong row, which is a systematic failure of the routing, so any handful of
+        rows shows it. Spending it on the step's first calls keeps the check
+        cheap and keeps it running every step. Reset by
+        ``clear_teacher_hidden_cache``.
+        """
+        take = min(self._teacher_witness_budget, 1)
+        self._teacher_witness_budget -= take
+        return take
+
+    def _cache_teacher_hidden(self, cache_ids, hidden, lse, witness_rows, witness_ids, witness_lp,
+                              attention_mask=None, input_ids=None):
+        """Keep this call's hidden states so the actor can score arbitrary ids later.
+
+        One entry per ROW, holding every response position that carries signal,
+        because that is the granularity the student picks its top-k at: a row is
+        scored once but every position gets its own support set.
+
+        The teacher's own top-k goes in as the witness on the sampled rows:
+        recomputing it from ``hidden`` and ``lse`` must reproduce ``witness_lp``,
+        and does not if the entry is ever paired with the wrong row.
+        """
+        from verl.workers.teacher_cache import get_teacher_cache, row_fingerprint
+
+        cache = get_teacher_cache()
+        if self._teacher_lm_head_task is None:
+            raise RuntimeError("teacher lm_head was never registered; see _register_teacher_lm_head")
+        task = self._teacher_lm_head_task
+
+        # Keying per position instead -- repeating the row's id across its
+        # positions -- would leave each row with whichever position was written
+        # last, and silently: the witness stored under the same key collapses with
+        # it and stays self-consistent.
+        #
+        # Only the response positions that are actually trained are kept.
+        # response_length is the cap, not the length: the mask over the same
+        # window the forward scored, [-response_length-1:-1], says which slots are
+        # real, and the rest is padding the loss never reads. At 512 cap against
+        # ~127 generated tokens, storing it padded costs about 4x.
+        #
+        # The temperature travels with the entry: ``lse`` normalises logits the
+        # forward already divided, while ``hidden`` is raw, so the read side has to
+        # redo the division. Same value this call passed in meta_info.
+        live_mask = fingerprints = None
+        if attention_mask is not None:
+            resp_len = lse.shape[1]
+            live_mask = attention_mask[:, -resp_len - 1 : -1].bool()
+            # What this row IS, so the actor can check that the key it holds names
+            # the row it is training. The key alone is taken on trust otherwise.
+            fingerprints = row_fingerprint(input_ids, attention_mask).to("cpu")
+        cache.put(
+            cache_ids.to("cpu"),
+            task,
+            hidden.detach(),
+            lse.detach(),
+            witness_rows=witness_rows,
+            witness_ids=None if witness_ids is None else witness_ids.detach(),
+            witness_lp=None if witness_lp is None else witness_lp.detach(),
+            temperature=self.config.rollout.temperature,
+            live_mask=live_mask,
+            fingerprints=fingerprints,
+        )
+
+    def _register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):
+        """Hand the process cache an unsharded copy of this teacher's projection.
+
+        The ref path reshards after every call, so by the time the actor update runs
+        the parameter cannot be indexed at arbitrary ids. One 622 MB copy per teacher
+        for a 1.7B model, held for the run -- the alternative is an all-gather of the
+        whole teacher inside every micro-batch.
+
+        ``slot``/``n_tasks`` put the copy straight into its slice of the stacked
+        projection the lookup reads. Cloning first and stacking later would hold
+        both layouts at once -- another ~1.9 GB, peaking before vLLM has sized its
+        KV cache, which is exactly when free memory is being measured.
+        """
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        module = self.ref_policy.actor_module
+        with FSDP.summon_full_params(module, writeback=False, offload_to_cpu=False):
+            inner = module
+            for _ in range(8):
+                nxt = getattr(inner, "_fsdp_wrapped_module", None) or getattr(inner, "_orig_mod", None)
+                if nxt is None or nxt is inner:
+                    break
+                inner = nxt
+            head = getattr(inner, "lm_head", None)
+            if head is None:
+                raise RuntimeError("teacher has no lm_head; student_indexed_topk cannot resolve its log-probs")
+            # Kept at the dtype the FORWARD projected in, not the dtype
+            # summon_full_params hands back. FSDP keeps float32 masters and casts
+            # to param_dtype for the forward, so the summoned weight is float32
+            # while lm_head actually ran in bfloat16. Recomputing from the float32
+            # copy is a different projection: the difference is ~eps_bf16 * |logit|,
+            # about 0.25 nats at the logit magnitudes this model reaches, which is
+            # what the witness caught on the first real run. Casting also halves
+            # what is held -- 1.9 GB across three teachers rather than 3.7.
+            weight = head.weight.detach().to(_fsdp_param_dtype(module, head.weight.dtype))
+            if n_tasks is None:
+                get_teacher_cache().register_lm_head(task, weight.clone())
+            else:
+                get_teacher_cache().register_lm_head(task, weight, slot=slot, n_tasks=n_tasks)
+        self._teacher_lm_head_task = task
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):
+        assert self._is_ref
+        self._register_teacher_lm_head(task, slot=slot, n_tasks=n_tasks)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_teacher_hidden_cache(self):
+        """Drop the previous step's entries. Called once per step by the trainer."""
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        get_teacher_cache().clear()
+        self._teacher_witness_budget = int(os.environ.get("TEACHER_WITNESS_MICRO_BATCHES", "2"))
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def check_teacher_hidden_cache(self, atol: float = 1e-3):
+        """Run the witness over everything cached this step. Raises on failure.
+
+        Returns the witness's worst error alongside what the cache is holding, so
+        the size is on the same call rather than a second round trip.
+        """
+        from verl.workers.teacher_cache import get_teacher_cache
+
+        cache = get_teacher_cache()
+        worst = cache.check_witness(atol=atol)
+        return {"witness_max_err": worst, "rows": len(cache), "bytes": cache.nbytes()}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
