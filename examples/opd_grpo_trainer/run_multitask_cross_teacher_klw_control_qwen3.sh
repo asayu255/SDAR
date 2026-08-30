@@ -856,6 +856,19 @@ export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
 # Costs 2 extra search managers (126 envs each) at depth 3. 1 restores the old
 # path exactly.
 export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
+# Drive the engine as a pool instead of one blocking generate per batch, so a
+# batch's decode-step seats can be filled from another batch instead of running
+# the tail of every call on a mostly idle GPU. Pairs with VAL_PIPELINE_DEPTH:
+# with one slot there is no second caller to fill from.
+#
+# NOT accuracy-preserving, unlike the four above, and it is on anyway because
+# nothing in TRAINING can reach it: the pool serves only calls that pin n=1
+# (do_sample=False or validate=True), and a training rollout sets neither, so it
+# is refused and takes the blocking path. What it does change is VALIDATION --
+# which requests share a decode step moves floating-point reduction order, so
+# [val-hash] will not match a pumped run against an unpumped one. Compare
+# scores, not tokens. 0 restores the blocking path.
+export ROLLOUT_ASYNC_GENERATE=${ROLLOUT_ASYNC_GENERATE:-1}
 # The base policy and the off-task teachers ride in the same rollout window
 # as the on-task teacher above. All four are frozen, so only the window
 # changes; sign_weight_forward then scores what the window missed. 0 puts
