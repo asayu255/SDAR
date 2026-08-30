@@ -176,7 +176,12 @@
 "env.multitask.history_length.alfworld": 2
 "env.multitask.history_length.search": 4
 "env.multitask.history_length.webshop": 2
-"env.multitask.val_per_task_batch_size": 126
+# search only. Every search row carries its own question and ground_truth, so a
+# wider batch scores the same episodes; alfworld must NOT be widened -- its
+# games are drawn from a seeded cycle indexed by a row's position within its
+# manager, so changing its size plays different games, silently. Tasks not
+# named here keep data.val_batch_size, which is pinned at 126 above.
+"env.multitask.val_per_task_batch_size.search": 252
 # On an exhausted retry budget the client does NOT fail the run: the error text is
 # substituted for the retrieved document and becomes the <information> block the
 # model sees, with nothing in the metrics to say so. That makes the retry policy a

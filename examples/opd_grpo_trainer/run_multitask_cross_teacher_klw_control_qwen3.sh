@@ -1035,7 +1035,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +env.multitask.history_length.alfworld=2 \
     +env.multitask.history_length.search=4 \
     +env.multitask.history_length.webshop=2 \
-    env.multitask.val_per_task_batch_size=126 \
+    "env.multitask.val_per_task_batch_size={search: 252}" \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
