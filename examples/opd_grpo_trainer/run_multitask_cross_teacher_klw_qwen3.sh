@@ -846,6 +846,16 @@ export ROLLOUT_KEEP_VLLM_AWAKE=${ROLLOUT_KEEP_VLLM_AWAKE:-1}
 export ENV_RESET_PREFETCH=${ENV_RESET_PREFETCH:-1}
 export TASK_BALANCE_INTERLEAVE=${TASK_BALANCE_INTERLEAVE:-1}
 export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
+# Overlap the validation batches. Depth 1 is the old sequential loop; above it,
+# the extra slots are restricted to search (PIPELINEABLE_VAL_TASKS) because
+# alfworld's games are seeded by a row's position WITHIN its manager and would
+# silently change if split across two. Accuracy-preserving: run_pipelined hands
+# results back in submission order, each batch still holds the rows it always
+# did, and with the pump off each generate is the same call on the same rows --
+# so the [val-hash] digests match a depth-1 run, which is the check to run.
+# Costs 2 extra search managers (126 envs each) at depth 3. 1 restores the old
+# path exactly.
+export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
 # The base policy and the off-task teachers ride in the same rollout window
 # as the on-task teacher above. All four are frozen, so only the window
 # changes; sign_weight_forward then scores what the window missed. 0 puts

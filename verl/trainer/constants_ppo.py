@@ -19,6 +19,13 @@ from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
+        # The trainer runs as a Ray actor, so its stdout is a PIPE, and CPython
+        # block-buffers a pipe rather than line-buffering a tty. Every print
+        # without flush=True -- which is most of them, including the rollout's
+        # own progress -- then sits in an 8 KB buffer instead of reaching the
+        # console, and a validation that takes hours looks like a hung process.
+        # Popped below if the operator already set it, like every key here.
+        "PYTHONUNBUFFERED": "1",
         "TOKENIZERS_PARALLELISM": "true",
         "NCCL_DEBUG": "WARN",
         "VLLM_LOGGING_LEVEL": "WARN",

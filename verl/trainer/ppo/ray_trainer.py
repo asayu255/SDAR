@@ -1124,7 +1124,7 @@ class RayPPOTrainer:
             "validate": True,
         }
         test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
-        print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+        print(f"test_gen_batch meta info: {test_gen_batch.meta_info}", flush=True)
         return _PreparedValidationBatch(
             test_batch, input_texts, self._validation_task_name(test_gen_batch), test_gen_batch
         )
@@ -1172,11 +1172,22 @@ class RayPPOTrainer:
         # multi_turn_loop still opens become no-ops.
         reset_batch_wall()
         val_batch_index = 0
+        try:
+            val_total = len(self.val_dataloader)
+        except TypeError:
+            val_total = "?"
+        val_started = 0
         with rollout_session(self.actor_rollout_wg):
             slots = self._validation_slots()
+            def _prepare_and_announce(test_data):
+                nonlocal val_started
+                val_started += 1
+                print(f"[val] starting batch {val_started}/{val_total}", flush=True)
+                return self._prepare_validation_batch(test_data)
+
             for prepared, test_output_gen_batch in run_pipelined(
                 self.val_dataloader,
-                prepare=self._prepare_validation_batch,
+                prepare=_prepare_and_announce,
                 task_of=lambda prepared: prepared.task,
                 launch=self._rollout_validation_batch,
                 slots=slots,
@@ -1188,7 +1199,7 @@ class RayPPOTrainer:
                 test_batch = prepared.batch
                 sample_inputs.extend(prepared.input_texts)
 
-                print('validation generation end')
+                print('validation generation end', flush=True)
                 test_batch = test_output_gen_batch
                 # Store generated outputs
                 output_ids = test_output_gen_batch.batch["responses"]
