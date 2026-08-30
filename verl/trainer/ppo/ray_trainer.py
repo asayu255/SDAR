@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type
+from typing import Dict, NamedTuple, Optional, Type
 
 import numpy as np
 import ray
@@ -67,6 +67,9 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
+from agent_system.multi_turn_rollout.rollout_loop import reset_batch_wall, rollout_session, slot_label
+from verl.utils.val_pipeline import Slot, run_pipelined
+from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 WorkerType = Type[Worker]
 
@@ -428,6 +431,32 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] += timer.last
 
 
+# Deal each rank's rows length-first into its mini-batches so mini-batch k holds
+# the same token count on every rank. OFF by default, and deliberately: it
+# changes which rows share a mini-batch, and with ~70 optimizer steps per
+# training step the trajectory is not bit-identical -- turning it on would make
+# a new arm non-comparable with the ones already run. The measurement in
+# _balance_batch runs either way, so the size of the prize is visible before
+# anyone spends it. Turn on with BALANCE_MINIBATCH=1 and compare
+# perf/mfu/actor, which is data-independent.
+_BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+class _PreparedValidationBatch(NamedTuple):
+    """What one validation batch needs before it can be rolled out.
+
+    ``batch`` is None for the reward-model-only case the sequential loop returned
+    ``{}`` on; ``task`` is what the pipeline routes by, and is resolved here
+    because _validation_kwargs_for_batch has to see the batch anyway.
+    """
+
+    batch: object
+    input_texts: object
+    task: object
+    gen_batch: object
+
+
 class RayPPOTrainer:
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -661,14 +690,19 @@ class RayPPOTrainer:
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
+        val_loader_kwargs = dict(
             dataset=self.val_dataset,
-            batch_size=val_batch_size,
             num_workers=self.config.data.get("dataloader_num_workers", 8),
-            shuffle=False,
-            drop_last=False,
             collate_fn=collate_fn,
         )
+        batch_sampler = self._validation_batch_sampler()
+        if batch_sampler is None:
+            val_loader_kwargs.update(batch_size=val_batch_size, shuffle=False, drop_last=False)
+        else:
+            # batch_size/shuffle/drop_last are not accepted alongside a
+            # batch_sampler: it decides all three.
+            val_loader_kwargs.update(batch_sampler=batch_sampler)
+        self.val_dataloader = StatefulDataLoader(**val_loader_kwargs)
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
@@ -822,6 +856,229 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
+    def _dump_val_instances(self, *, scores, task_names, data_sources, traj_uids, tool_callings):
+        """One line per validation instance, so a later comparison can be PAIRED.
+
+        The aggregate this function sits next to -- a mean per task -- is the only
+        thing the run has ever recorded, and it is not enough to compare two arms
+        with. Two failures came out of that directly: a continuous score
+        (webshop's) has no variance stored, so no interval and no z can be
+        computed for it afterwards at all; and two arms evaluate the SAME 126
+        instances in the same order, which a paired test (McNemar on the successes,
+        a paired t on the scores) can exploit for a large gain in power, but only
+        if which instance was which is still on disk.
+
+        The pairing key is ``val_index``, the row's position in the validation
+        pass. It is stable because the validation loader is built with
+        ``shuffle=False`` over a fixed file, and the file, its size and the seed
+        are all pinned in the intent lock -- so index i is the same problem in
+        every arm and at every step. ``traj_uid`` is written too but is NOT that
+        key: it identifies one rollout, not the instance behind it.
+
+        Off unless ``trainer.val_instance_log_dir`` is set. Roughly 380 lines of a
+        few hundred bytes per validation pass.
+        """
+        out_dir = self.config.trainer.get("val_instance_log_dir", None)
+        if not out_dir:
+            return
+        out_dir = os.path.expanduser(str(out_dir))
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"val_step{self.global_steps}.jsonl")
+        n = len(scores)
+        with open(path, "w") as f:
+            for i in range(n):
+                f.write(
+                    json.dumps(
+                        {
+                            "val_index": i,
+                            "step": self.global_steps,
+                            "experiment": self.config.trainer.get("experiment_name", None),
+                            "task": None if task_names[i] is None else str(task_names[i]),
+                            "data_source": str(data_sources[i]),
+                            "traj_uid": str(traj_uids[i]),
+                            # The episode return. Success is deliberately NOT
+                            # derived here: it is 1.0 == score on alfworld and
+                            # search but a threshold on webshop's continuous score,
+                            # and baking that choice into the log would make the
+                            # file only as good as the guess.
+                            "score": float(scores[i]),
+                            "tool_calling": float(tool_callings[i]),
+                        }
+                    )
+                    + "\n"
+                )
+        print(f"[val] wrote {n} instance rows to {path}")
+
+    @staticmethod
+    def _decode_for_val_table(tokenizer, ids_rows, limit):
+        """Decode rows for the logged sample table, or nothing when it is off.
+
+        The table is capped at ``trainer.log_val_generations`` samples and this
+        repo runs it at 0 -- yet every validation row's prompt AND response were
+        decoded on the calling thread to feed it. The reward manager had the same
+        bug on the same thread (fixed there by gating on ``num_examine``).
+        """
+        if not limit:
+            return []
+        return [tokenizer.decode(ids, skip_special_tokens=True) for ids in ids_rows]
+
+    @staticmethod
+    def _response_digest(responses):
+        """A short fingerprint of a batch's generated token ids.
+
+        Any change that claims to leave generation alone -- a session hoist, a
+        reused tokenisation, a merged generate call -- has to be shown to produce
+        the same TOKENS, not only the same scores. Batches are consumed in
+        dataloader order, so equal digests at the same batch index mean equal
+        generations, row for row.
+        """
+        return hashlib.sha1(responses.cpu().numpy().tobytes()).hexdigest()[:12]
+
+    def _validation_batch_sampler(self):
+        """Group validation rows by task, at each task's own batch size.
+
+        Returns None when every task takes the same size -- then the plain
+        loader already produces exactly these batches, and the old path is kept
+        so that runs which change nothing behave identically.
+
+        A batch holding two tasks is not a slow path, it is an exception:
+        get_task_names refuses a mixed validation batch. Today's single-task
+        batches come from alfworld and webshop happening to hold exactly
+        val_batch_size rows, which stops being true the moment one task's size
+        moves. This sampler makes it a rule instead of an alignment.
+        """
+        from agent_system.environments.env_manager import get_val_batch_sizes
+        from verl.utils.val_batching import TaskBatchSampler, task_names_of
+
+        resolved = get_val_batch_sizes(self.config)
+        if resolved is None:
+            return None
+        sizes, default = resolved
+        if len(set(sizes.values())) <= 1:
+            return None
+
+        task_names = task_names_of(self.val_dataset)
+        if task_names is None:
+            raise ValueError(
+                "val_per_task_batch_size names different sizes per task, but the validation "
+                "rows carry no task_name column to group them by"
+            )
+        sampler = TaskBatchSampler(task_names, sizes, default)
+        print(
+            f"[val-batching] per-task validation batch sizes {sizes} (default {default}): "
+            f"{len(sampler)} batches, each holding one task.",
+            flush=True,
+        )
+        return sampler
+
+    def _validation_slots(self):
+        """One slot per validation batch that may be in flight at once.
+
+        A slot owns an environment manager and a trajectory collector outright,
+        because both hold per-rollout state -- observation history, per-env step
+        counters, the pending-reset handle. Sharing either between two concurrent
+        rollouts would interleave one batch's history into the other's.
+
+        Depth 1 (the default) is a single slot on the manager this trainer was
+        built with, which is exactly the sequential loop. Above that, the extra
+        slots are restricted to the tasks a second manager can serve without
+        changing which episodes are scored -- see PIPELINEABLE_VAL_TASKS.
+        Cached, so the extra managers are built at most once per process.
+        """
+        if getattr(self, "_val_slots", None) is not None:
+            return self._val_slots
+
+        depth = int(os.environ.get("VAL_PIPELINE_DEPTH", "1"))
+        slots = [Slot("primary", self.val_envs, self.traj_collector, tasks=None)]
+        if depth > 1:
+            from agent_system.environments.env_manager import PIPELINEABLE_VAL_TASKS, build_val_env_manager
+            from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+
+            tasks = list(PIPELINEABLE_VAL_TASKS)
+            for index in range(1, depth):
+                slots.append(
+                    Slot(
+                        f"extra-{index}",
+                        build_val_env_manager(self.config, tasks),
+                        TrajectoryCollector(config=self.config, tokenizer=self.tokenizer, processor=self.processor),
+                        tasks=tasks,
+                    )
+                )
+            detail = f"the extra ones restricted to {tasks}. Batches retire in order; only the rollouts overlap."
+        else:
+            detail = "the sequential loop, run inline with no threads. Set VAL_PIPELINE_DEPTH=2 to overlap."
+        # Printed at every depth, including 1. Silence would mean both "depth is
+        # 1" and "this build has no pipeline at all", which is the same pair of
+        # indistinguishable states that cost this arm 13% of the evaluation once
+        # already.
+        print(f"[val-pipeline] VAL_PIPELINE_DEPTH={depth}: {len(slots)} slot(s), {detail}", flush=True)
+        self._val_slots = slots
+        return slots
+
+    def _prepare_validation_batch(self, test_data):
+        """Everything before the rollout: repeat, decode the prompts, split off
+        the generation batch, resolve the task's sampling kwargs.
+
+        Runs on the calling thread and in order -- it touches the tokeniser and
+        the trainer's own config, and it is where the batch's task is decided,
+        which the pipeline needs before it can pick a slot.
+        """
+        test_batch = DataProto.from_single_dict(test_data)
+        test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+
+        # we only do validation on rule-based rm
+        if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            return _PreparedValidationBatch(None, None, None, None)
+
+        # Store original inputs
+        input_ids = test_batch.batch["input_ids"]
+        # TODO: Can we keep special tokens except for padding tokens?
+        input_texts = self._decode_for_val_table(self.tokenizer, input_ids, self.config.trainer.log_val_generations)
+
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+        for optional in ("multi_modal_data", "raw_prompt", "tools_kwargs", "env_kwargs", "task_name"):
+            if optional in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append(optional)
+        test_gen_batch = test_batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+
+        test_gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "validate": True,
+        }
+        test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
+        print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+        return _PreparedValidationBatch(
+            test_batch, input_texts, self._validation_task_name(test_gen_batch), test_gen_batch
+        )
+
+    def _rollout_validation_batch(self, prepared, slot):
+        """The agent-environment loop for one batch, on its own slot.
+
+        This is the part that runs concurrently when the pipeline is deeper than
+        one, and the only part that does: everything it touches -- the gen batch,
+        the slot's envs, the slot's collector -- belongs to this batch alone. The
+        worker group is shared, but it is a Ray actor and serialises its own
+        calls, which is what makes one batch's environment overlap another's
+        generation rather than contend with it.
+        """
+        if prepared.batch is None:
+            return None
+        # the label rides on the thread, so the batch's WALL line says which slot
+        # ran it -- with the pipeline deeper than one, two tables interleave.
+        with slot_label(slot.name):
+            return slot.collector.multi_turn_loop(
+                gen_batch=prepared.gen_batch,
+                actor_rollout_wg=self.actor_rollout_wg,
+                envs=slot.envs,
+                is_train=False,
+            )
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -835,83 +1092,54 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        # EVERY VALIDATION SCORES THE SAME PROBLEMS. The env managers are built
-        # once per process and each reset() takes the next game of the cycle, so
-        # the second validation inside one run scored a DIFFERENT 126-game set
-        # than the first -- with test_freq=150 over 300 steps, @150 and @300 were
-        # not comparable and the difference between them mixed a policy change
-        # with a change of test set. Rewinding here puts the cycle where a
-        # freshly started val_only process would have it, which is the state the
-        # repeated val-only runs of one checkpoint agreed on.
-        if getattr(self, "val_envs", None) is not None:
-            _rewind = getattr(self.val_envs, "rewind_games", None)
-            if _rewind is not None:
-                _rewound = _rewind()
-                if _rewound:
-                    print(f"[val-games] rewound to the start of the cycle: {_rewound}", flush=True)
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        # One vLLM session for the WHOLE validation, not one per batch. Without
+        # the hoist the sharding manager unmaps and remaps ~21 GB between every
+        # batch; on the arm this came from that was 10.4% of the evaluation wall
+        # clock, and the search batches are far too short to amortise it. The
+        # worker counts scopes by depth, so the inner per-rollout sessions that
+        # multi_turn_loop still opens become no-ops.
+        reset_batch_wall()
+        val_batch_index = 0
+        with rollout_session(self.actor_rollout_wg):
+            slots = self._validation_slots()
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+            # EVERY VALIDATION SCORES THE SAME PROBLEMS (see 2185b44). Each reset()
+            # takes the next game of the cycle, so a second validation in one process
+            # scored a different set. Rewinding puts the cycle where a freshly started
+            # val-only process would have it. The extra pipeline slots serve search
+            # only, which draws its problems from the dataloader.
+            if getattr(self, "val_envs", None) is not None:
+                _rewind = getattr(self.val_envs, "rewind_games", None)
+                if _rewind is not None:
+                        _rewound = _rewind()
+                        if _rewound:
+                            print(f"[val-games] rewound to the start of the cycle: {_rewound}", flush=True)
+            for prepared, test_output_gen_batch in run_pipelined(
+                self.val_dataloader,
+                prepare=self._prepare_validation_batch,
+                task_of=lambda prepared: prepared.task,
+                launch=self._rollout_validation_batch,
+                slots=slots,
+            ):
+                if prepared.batch is None:
+                    # reward_model.enable with a model-style rm: the sequential
+                    # loop returned {} on the first such batch, and so does this.
+                    return {}
+                test_batch = prepared.batch
+                sample_inputs.extend(prepared.input_texts)
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
-
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "env_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("env_kwargs")
-            if "task_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("task_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "validate": True,
-            }
-            test_gen_batch.meta_info.update(self._validation_kwargs_for_batch(test_gen_batch))
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
-            ################ agent-environment loop ###############
-            test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                    gen_batch=test_gen_batch,
-                                                    actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
-                                                    is_train=False,
-                                                    )
-            print('validation generation end')
-            del test_batch
-            test_batch = test_output_gen_batch
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                print('validation generation end')
+                test_batch = test_output_gen_batch
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                print(
+                    f"[val-hash] batch#{val_batch_index} rows={output_ids.shape[0]} "
+                    f"responses sha1 {self._response_digest(output_ids)}",
+                    flush=True,
+                )
+                val_batch_index += 1
+                output_texts = self._decode_for_val_table(self.tokenizer, output_ids, self.config.trainer.log_val_generations)
+                sample_outputs.extend(output_texts)
 
             # test_batch = test_batch.union(test_output_gen_batch)
 
