@@ -65,7 +65,13 @@ def _coverage(intervals):
         else:
             cur_end = max(cur_end, end)
     covered += cur_end - cur_start
-    return covered, ordered[-1][1] - ordered[0][0]
+    # The span ends at the LAST END, which is not ordered[-1][1]: these are
+    # sorted by start, so ordered[-1] is the latest-STARTING interval, and a
+    # long batch that began earlier can still be running after it. That is the
+    # normal shape here -- alfworld runs 239.7s against a search batch's ~65s --
+    # and using its end made span smaller than covered, so the report read
+    # "146.2% running / NOTHING running -46.2%".
+    return covered, max(end for _, end in ordered) - ordered[0][0]
 
 
 class Slot:

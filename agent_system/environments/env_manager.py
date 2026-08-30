@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple, Dict, Union, Any
+from typing import List, Optional, Sequence, Tuple, Dict, Union, Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
@@ -688,9 +688,42 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         infos = self._merge_infos(task_infos, len(kwargs))
         return observations, infos
 
-    def step(self, text_actions: List[str]):
+    def task_row_indices(self) -> Dict[str, List[int]]:
+        """Which batch rows belong to which task, as decided by the last reset.
+
+        The rollout loop needs this to advance one task at a time: the row sets
+        are disjoint, so two callers holding different tasks write to different
+        rows of every shared array.
+        """
+        return {task: list(indices) for task, indices in self._task_indices.items()}
+
+    def step(self, text_actions: List[str], tasks: Optional[Sequence[str]] = None):
+        """Step the environments.
+
+        ``tasks`` restricts the step to those tasks. The returned arrays are
+        still batch-shaped, but **only the selected tasks' rows carry meaning**
+        -- the rest hold the neutral fill of the merge helpers (None obs, 0
+        reward, False done, None info), not that task's real state. A caller
+        that passes ``tasks`` must therefore read only the rows it asked for.
+        This is what lets each task advance on its own turn counter: alfworld
+        runs to 50 turns without dragging search's finished rows behind it, and
+        one task's env.step overlaps another's generate instead of the whole
+        batch standing still together.
+
+        Per-task state (``_task_steps`` / ``_task_done`` / ``_last_obs_by_task``)
+        is keyed by task and each key is touched by one caller, so concurrent
+        calls for different tasks do not race. Two concurrent calls naming the
+        SAME task would, and nothing here defends against that.
+        """
         if not self._task_indices:
             raise RuntimeError("MultiTaskEnvironmentManager.step called before reset.")
+        if tasks is not None:
+            unknown = [task for task in tasks if task not in self._task_indices]
+            if unknown:
+                raise ValueError(f"step() asked for tasks not in this batch: {unknown}")
+            wanted = set(tasks)
+        else:
+            wanted = None
 
         task_obs = {}
         task_rewards = {}
@@ -700,6 +733,8 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         # Tasks that still need a real environment step (others are short-circuited).
         active_tasks = {}
         for task, indices in self._task_indices.items():
+            if wanted is not None and task not in wanted:
+                continue
             if self._task_done[task].all() or self._task_steps[task] >= self.task_max_steps[task]:
                 task_obs[task] = self._last_obs_by_task[task]
                 task_rewards[task] = np.zeros(len(indices), dtype=np.float32)
@@ -872,6 +907,42 @@ def _get_multitask_per_task_batch_size(config, tasks: List[str], is_train: bool)
     return int(per_task_batch_size)
 
 
+def _get_multitask_val_batch_sizes(config, tasks: List[str]):
+    """``(sizes, default)`` for validation: how many rows each task's batch holds.
+
+    ``val_per_task_batch_size`` may be one number, as it always was, or a mapping
+    naming the tasks that differ -- the same shape ``max_steps`` and
+    ``history_length`` already take. Anything unnamed keeps ``data.val_batch_size``,
+    so adding an entry for one task cannot silently resize another.
+
+    A task's size is not free of its scoring. alfworld draws its episodes from a
+    seeded game cycle indexed by position within its environment manager, and the
+    manager is built at this size: change it and the run plays different games.
+    search does not care -- every row carries its own question and ground truth --
+    which is the task the size is worth changing for.
+    """
+    multitask_cfg = config.env.get("multitask", {})
+    configured = _plain_container(multitask_cfg.get("val_per_task_batch_size", None))
+    if isinstance(configured, dict):
+        unknown = [task for task in configured if task not in tasks]
+        if unknown:
+            raise ValueError(f"val_per_task_batch_size names tasks not in this run: {unknown} (configured: {tasks})")
+        sizes = {task: int(size) for task, size in configured.items()}
+        for task, size in sizes.items():
+            if size <= 0:
+                raise ValueError(f"val_per_task_batch_size[{task!r}] must be positive, got {size}")
+        default = int(config.data.val_batch_size)
+        return {task: sizes.get(task, default) for task in tasks}, default
+    uniform = _get_multitask_per_task_batch_size(config, tasks, is_train=False)
+    return {task: uniform for task in tasks}, uniform
+
+
+def _size_for(per_task_batch_size, task: str) -> int:
+    if isinstance(per_task_batch_size, dict):
+        return int(per_task_batch_size[task])
+    return int(per_task_batch_size)
+
+
 def _get_multitask_task_history_length(config, task: str):
     multitask_cfg = config.env.get("multitask", {})
     configured = _plain_container(multitask_cfg.get("history_length", {}))
@@ -889,10 +960,12 @@ def _copy_config_for_task(config, env_name: str, max_steps: int, task: str = Non
     return task_config
 
 
-def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str, int], per_task_batch_size: int, group_n: int, is_train: bool, seed: int, resources_per_worker: Dict):
+def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str, int], per_task_batch_size, group_n: int, is_train: bool, seed: int, resources_per_worker: Dict):
+    """``per_task_batch_size`` is one number for every task, or a mapping."""
     managers = {}
 
     for task in tasks:
+        env_num = _size_for(per_task_batch_size, task)
         if task == "alfworld":
             from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
 
@@ -902,7 +975,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             _envs = build_alfworld_envs(
                 alf_config_path,
                 seed,
-                per_task_batch_size,
+                env_num,
                 group_n,
                 resources_per_worker=resources_per_worker,
                 is_train=is_train,
@@ -915,7 +988,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             task_config = _copy_config_for_task(config, "search", task_max_steps[task], task=task)
             _envs = build_search_envs(
                 seed=seed,
-                env_num=per_task_batch_size,
+                env_num=env_num,
                 group_n=group_n,
                 is_train=is_train,
                 env_config=task_config.env,
@@ -940,7 +1013,7 @@ def _build_multitask_manager(config, tasks: List[str], task_max_steps: Dict[str,
             task_config = _copy_config_for_task(config, "Webshop", task_max_steps[task], task=task)
             _envs = build_webshop_envs(
                 seed=seed,
-                env_num=per_task_batch_size,
+                env_num=env_num,
                 group_n=group_n,
                 is_train=is_train,
                 env_kwargs=env_kwargs,
@@ -982,6 +1055,71 @@ class LazyEnvManager:
         return getattr(self.materialize(), name)
 
 
+# Tasks a second validation manager may be built for. A second manager scores the
+# same episodes only when a row's episode comes entirely from that row -- search
+# passes each env its own question and ground_truth at reset, and its `_rng` is
+# constructed and never used, so two managers are interchangeable.
+#
+# alfworld is not on this list and must not be: AlfworldEnvs seeds worker i with
+# `seed + i // group_n`, so which game a row plays is a function of its position
+# *within its manager*. Split across two and every row plays a different game --
+# which is the one thing the per-checkpoint-process design exists to prevent, and
+# it would not raise.
+#
+# webshop is left off for the same reason until someone checks it: its envs are
+# Ray actors handed goals at construction, and "probably fine" is not the standard
+# for a scoring path.
+PIPELINEABLE_VAL_TASKS = ("search",)
+
+
+def get_val_batch_sizes(config):
+    """``(sizes, default)`` for validation batching, or ``None`` for a non-multitask run.
+
+    The trainer's loader needs the same numbers the environment managers are
+    built with -- a batch of 252 rows handed to a manager holding 126
+    environments would index past the end -- so both read them from here.
+    """
+    if config.env.env_name.lower() != "multitask":
+        return None
+    tasks = _get_multitask_tasks(config)
+    return _get_multitask_val_batch_sizes(config, tasks)
+
+
+def build_val_env_manager(config, tasks: List[str]):
+    """A second validation env manager, restricted to `tasks`.
+
+    Same arguments as the one make_envs builds, so the environments are the ones
+    that batch would have seen anyway -- only fewer tasks, because a manager for
+    tasks it will never be handed costs 126 Ray actors each.
+
+    Lazy, like the primary: a run that never routes a batch here never builds it.
+    """
+    for task in tasks:
+        if task not in PIPELINEABLE_VAL_TASKS:
+            raise ValueError(
+                f"{task!r} cannot have a second validation manager (see PIPELINEABLE_VAL_TASKS); "
+                f"allowed: {list(PIPELINEABLE_VAL_TASKS)}"
+            )
+    all_tasks = _get_multitask_tasks(config)
+    unknown = [task for task in tasks if task not in all_tasks]
+    if unknown:
+        raise ValueError(f"tasks not configured for this run: {unknown} (configured: {all_tasks})")
+
+    def _build():
+        return _build_multitask_manager(
+            config=config,
+            tasks=list(tasks),
+            task_max_steps=_get_multitask_task_max_steps(config, all_tasks),
+            per_task_batch_size=_get_multitask_val_batch_sizes(config, all_tasks)[0],
+            group_n=1,
+            is_train=False,
+            seed=config.env.seed + 1000,
+            resources_per_worker=OmegaConf.to_container(config.env.resources_per_worker, resolve=True),
+        )
+
+    return LazyEnvManager(_build)
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -996,7 +1134,7 @@ def make_envs(config):
         tasks = _get_multitask_tasks(config)
         task_max_steps = _get_multitask_task_max_steps(config, tasks)
         train_per_task_batch_size = _get_multitask_per_task_batch_size(config, tasks, is_train=True)
-        val_per_task_batch_size = _get_multitask_per_task_batch_size(config, tasks, is_train=False)
+        val_batch_sizes = _get_multitask_val_batch_sizes(config, tasks)[0]
         if train_per_task_batch_size * len(tasks) != int(config.data.train_batch_size):
             raise ValueError(
                 "multitask train batch mismatch: "
@@ -1007,13 +1145,21 @@ def make_envs(config):
         #     test parquet yields one single-task batch per task (each task is evaluated
         #     in its own rollout pass)
         #   - mixed batch: val_batch_size == val_per_task_batch_size * len(tasks)
+        #
+        # Neither is checked once the sizes differ by task: the batches then come
+        # from TaskBatchSampler, which groups by task by construction rather than
+        # by the sizes lining up, and val_batch_size is only the default for the
+        # tasks the config does not name.
         val_batch_size = int(config.data.val_batch_size)
-        if val_batch_size not in (val_per_task_batch_size, val_per_task_batch_size * len(tasks)):
-            raise ValueError(
-                "multitask val batch mismatch: val_batch_size must be "
-                f"{val_per_task_batch_size} (per-task validation batches) or "
-                f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
-            )
+        uniform = set(val_batch_sizes.values())
+        if len(uniform) == 1:
+            val_per_task_batch_size = uniform.pop()
+            if val_batch_size not in (val_per_task_batch_size, val_per_task_batch_size * len(tasks)):
+                raise ValueError(
+                    "multitask val batch mismatch: val_batch_size must be "
+                    f"{val_per_task_batch_size} (per-task validation batches) or "
+                    f"{val_per_task_batch_size * len(tasks)} (single mixed batch), got {val_batch_size}"
+                )
 
         def _build_train_envs():
             managers = _build_multitask_manager(
@@ -1037,7 +1183,7 @@ def make_envs(config):
                 config=config,
                 tasks=tasks,
                 task_max_steps=task_max_steps,
-                per_task_batch_size=val_per_task_batch_size,
+                per_task_batch_size=val_batch_sizes,
                 group_n=1,
                 is_train=False,
                 seed=config.env.seed + 1000,
@@ -1046,7 +1192,7 @@ def make_envs(config):
             if "webshop" in tasks:
                 import time
 
-                time.sleep(val_per_task_batch_size * 0.1)
+                time.sleep(val_batch_sizes["webshop"] * 0.1)
             return managers
 
         return LazyEnvManager(_build_train_envs), LazyEnvManager(_build_val_envs)
