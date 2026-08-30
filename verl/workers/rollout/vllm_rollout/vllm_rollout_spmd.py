@@ -28,16 +28,16 @@ When working with Megatron:
 
 import logging
 import os
+import queue
 import time
 from contextlib import contextmanager
-from copy import deepcopy
-from typing import Any, Dict, List, Union
+from copy import copy, deepcopy
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
 import torch.distributed
 from omegaconf import DictConfig, OmegaConf, ListConfig
-from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 
@@ -45,8 +45,14 @@ from verl import DataProto
 from verl.utils.phase_timing import PhaseTimer
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.generation_output import assemble_generation_output, sampling_kwargs_for, seed_for_prompt
+from verl.workers.rollout.token_pump import TokenPump
+
+# Seeding each pumped request from its own prompt. Default on: it can only make
+# the pumped path LESS run-to-run variable, and the pumped path is opt-in
+# already. ROLLOUT_PUMP_SEED=0 restores vllm's shared generator.
+_PUMP_SEED = os.environ.get("ROLLOUT_PUMP_SEED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 from vllm.config import CompilationConfig, LoRAConfig
 from vllm.lora.request import LoRARequest
@@ -86,11 +92,22 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     return token_ids
 
 
-def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
-    if isinstance(value, torch.Tensor):
-        return value.repeat_interleave(repeats, dim=0)
-    else:
-        return np.repeat(value, repeats, axis=0)
+def _ask_for_the_final_output_only(sampling_params) -> None:
+    """One RequestOutput per request when it finishes, not one per step.
+
+    Cumulative output -- the default when SamplingParams is built directly -- has
+    step() return a fresh RequestOutput carrying the whole token list so far, for
+    every resident request, on every step. The answer is the same either way; the
+    allocation is not, and it lands on the thread that owns the engine.
+
+    Guarded, because the enum has moved between vllm versions and a pump that
+    allocates more is better than a rollout that cannot import.
+    """
+    try:
+        from vllm.sampling_params import RequestOutputKind
+    except ImportError:
+        return
+    sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
 
 
 # Where a generate_sequences call's seconds go, split at the engine boundary.
@@ -233,6 +250,18 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
+        from verl.utils.engine_overlap import report_engine_overlap
+
+        report_engine_overlap(
+            engine_kwargs,
+            explicit={
+                "enable_chunked_prefill": config.enable_chunked_prefill,
+                "max_num_seqs": config.max_num_seqs,
+                "enforce_eager": config.enforce_eager,
+            },
+            engine=self.inference_engine,
+        )
+
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
@@ -262,6 +291,12 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+
+        # Pumped path (see pump_step); nothing is created until it is used.
+        self._pump = None
+        self._pump_done: "queue.Queue" = queue.Queue()
+        self._pump_sampling_cache: Dict[Any, SamplingParams] = {}
+        self._pump_name = str(torch.distributed.get_rank()) if torch.distributed.is_initialized() else "0"
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -329,24 +364,12 @@ class vLLMRollout(BaseRollout):
                 raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
 
         do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
-            kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": prompts.meta_info.get("temperature", self.config.val_kwargs.temperature),
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
+        sampling_override = sampling_kwargs_for(prompts.meta_info, self.config.val_kwargs)
+        if sampling_override:
+            # Empty means "leave the configured sampling params alone", which is
+            # not the same as "override them with nothing" -- the caller's own
+            # kwargs have to survive that case.
+            kwargs = sampling_override
 
         lora_requests = None
         if self.lora_kwargs:
@@ -387,49 +410,23 @@ class vLLMRollout(BaseRollout):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            if rollout_log_probs is not None:
-                rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
+            n = self.sampling_params.n if do_sample else 1
 
-            if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
-                # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-                if "tools_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
-
-            seq = torch.cat([idx, response], dim=-1)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
-
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        tensors = {
-            "prompts": idx,
-            "responses": response,
-            "input_ids": seq,  # here input_ids become the whole sentences
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-        if rollout_log_probs is not None:
-            # we will recompute old log prob with actor
-            tensors["rollout_log_probs"] = rollout_log_probs
-        batch = TensorDict(tensors, batch_size=batch_size)
+        # Outside the sampling-params context on purpose: everything left is
+        # arithmetic on the ids the engine already returned, and the pumped
+        # path runs the identical arithmetic on the driver.
+        output = assemble_generation_output(
+            idx=idx,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            response_token_ids=response,
+            non_tensor_batch=non_tensor_batch,
+            eos_token_id=eos_token_id,
+            pad_token_id=self.pad_token_id,
+            response_length=self.config.response_length,
+            n=n,
+            rollout_log_probs=rollout_log_probs,
+        )
 
         # free vllm cache engine
         if (
@@ -446,7 +443,174 @@ class vLLMRollout(BaseRollout):
             _phase_marks["assemble"] = time.perf_counter() - _phase_t
             _ROLLOUT_PHASES.record(_phase_marks)
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return output
+
+    # -- pumped path -------------------------------------------------------
+    #
+    # generate_sequences above is one blocking call per batch: every row is
+    # added, the engine is stepped until the last of them finishes, and only
+    # then does the caller get anything back. The rows of a *different* batch
+    # cannot join in the middle, so on the evaluation arm the engine spends the
+    # tail of every call decoding a handful of stragglers on a mostly idle GPU.
+    #
+    # Below, the same engine is driven a step at a time by a thread that owns
+    # it, and rows are handed in one at a time from whichever caller has them
+    # ready. What is generated does not change -- same weights, same sampling
+    # params, same prompt token ids -- but which requests share a decode step
+    # does, and that moves reduction order. See token_pump.py.
+
+    def _pump_sampling_params(self, override: Dict[str, Any]) -> SamplingParams:
+        """The params generate_sequences would have used, for the same meta_info.
+
+        Built through update_sampling_params so the pumped path cannot drift from
+        the blocking one: same context manager, same configured defaults
+        underneath, just captured instead of used in place.
+        """
+        key = tuple(sorted(override.items()))
+        cached = self._pump_sampling_cache.get(key)
+        if cached is None:
+            with self.update_sampling_params(**override):
+                cached = deepcopy(self.sampling_params)
+            _ask_for_the_final_output_only(cached)
+            self._pump_sampling_cache[key] = cached
+        return cached
+
+    def _pump_seeded(self, params: SamplingParams, prompt_token_ids: Sequence[int], row: int = 0) -> SamplingParams:
+        """Pin this request's sampling to its prompt, not to its arrival order.
+
+        Without a seed, vllm draws from one generator shared by whatever is
+        resident, so the same prompt sampled in a different decode step draws
+        differently -- and under the pump, which requests share a step is decided
+        by arrival timing. Seeding from the prompt's own token ids and the row
+        makes that one source of run-to-run drift go away. The row is required,
+        not decorative -- see seed_for_prompt, where n-sample validation sends
+        byte-identical prompts that a prompt-only seed would collapse.
+
+        It does NOT make the pumped path reproducible. The logits still move with
+        batch composition (the same reason merging changed generation), and this
+        cannot touch that. It removes a second, avoidable source on top of it.
+
+        Greedy needs no generator, so it is left alone -- as is n > 1, which the
+        pump refuses anyway and which a shared seed would collapse into n copies
+        of one sample.
+        """
+        if not _PUMP_SEED or params.n != 1:
+            return params
+        if not getattr(params, "temperature", 0):
+            return params
+        seeded = copy(params)
+        seeded.seed = seed_for_prompt(prompt_token_ids, row)
+        return seeded
+
+    def _pump_refuse(self) -> Optional[str]:
+        """Why this rollout cannot be pumped, or None if it can.
+
+        Each reason is a case where a request is not independent of the others
+        in its call, so handing them to the engine separately would not be the
+        same computation:
+          * tp > 1 -- the ranks of a tensor-parallel group must add the same
+            requests in the same order or they deadlock on the next collective;
+          * LoRA -- generate_sequences picks the adapter per call;
+          * rollout log-probs -- the pump returns token ids, not logprobs.
+        Multimodal is refused per submission, not here: the same rollout serves
+        text-only rows fine.
+        """
+        if self.config.get("tensor_model_parallel_size", 1) != 1:
+            return "tensor_model_parallel_size > 1"
+        if self.lora_kwargs:
+            return "LoRA adapters are configured"
+        if self.return_rollout_log_probs:
+            return "rollout log-probs are requested"
+        return None
+
+    def pump_step(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Take new requests, return whatever has finished. One RPC per round.
+
+        Submitting and collecting share a call because a Ray actor runs its
+        methods one at a time: two separate calls would take turns, and the
+        collect would sit in front of the submit it was waiting for.
+        """
+        refusal = self._pump_refuse()
+        if payload.get("handshake"):
+            return {
+                "refused": refusal,
+                "pad_token_id": self.pad_token_id,
+                "response_length": self.config.response_length,
+                "finished": [],
+                "failed": [],
+                "in_flight": 0,
+            }
+        if refusal is not None:
+            raise RuntimeError(f"pump_step called on a rollout that cannot be pumped: {refusal}")
+
+        if payload.get("stop"):
+            pump, self._pump = self._pump, None
+            if pump is not None:
+                pump.stop()
+            # Drain what stopping just produced. Left in the queue, a completion
+            # from this session would be handed to whoever asks next -- and the
+            # next session's driver starts a fresh client, so nothing about the
+            # id it is keyed by makes that impossible on its own.
+            dropped = 0
+            while True:
+                try:
+                    self._pump_done.get_nowait()
+                except queue.Empty:
+                    break
+                dropped += 1
+            return {"finished": [], "failed": [], "in_flight": 0, "stopped": True, "dropped": dropped}
+
+        if self._pump is None:
+            self._pump = TokenPump(self.inference_engine.llm_engine, name=f"token-pump-{self._pump_name}").start()
+
+        finished: List[Any] = []
+        failed: List[Any] = []
+
+        for request_id, prompt_token_ids, meta_info in payload.get("submit", ()):
+            # The worker derives the sampling params, not the driver: they come
+            # from the same meta_info and the same config the blocking path reads,
+            # through the same context manager, so the two paths cannot drift.
+            params = self._pump_sampling_params(sampling_kwargs_for(dict(meta_info), self.config.val_kwargs))
+            if params.n != 1:
+                # The driver only offers calls whose meta_info pins n=1. Reaching
+                # here means it stopped doing that, and quietly keeping sample 0
+                # of n would be a scoring change nobody asked for.
+                failed.append((request_id, f"pumped path cannot serve n={params.n}; it returns one sequence per request"))
+                continue
+            row = int(dict(meta_info).get("row", 0))
+            future = self._pump.submit(prompt_token_ids,
+                                       self._pump_seeded(params, prompt_token_ids, row),
+                                       request_id=request_id)
+            future.add_done_callback(lambda f, rid=request_id: self._pump_done.put((rid, f)))
+
+        timeout_s = float(payload.get("timeout_s", 0.02))
+        try:
+            # Block for the first completion so an idle round costs one wait
+            # rather than a spin, then take everything else already sitting there.
+            item = self._pump_done.get(timeout=timeout_s)
+        except queue.Empty:
+            item = None
+        while item is not None:
+            request_id, future = item
+            error = future.exception()
+            if error is None:
+                # Same reason as the prompt ids on the way in: an int32 array
+                # is one buffer, a list of ints is one object per token, and
+                # the driver unpickles it on the thread the census reads.
+                finished.append((request_id, np.asarray(future.result(), dtype=np.int32)))
+            else:
+                failed.append((request_id, f"{type(error).__name__}: {error}"))
+            try:
+                item = self._pump_done.get_nowait()
+            except queue.Empty:
+                item = None
+
+        return {
+            "finished": finished,
+            "failed": failed,
+            "in_flight": self._pump.in_flight(),
+            "steps": self._pump.steps,
+        }
 
 
 class vLLMAsyncRollout:

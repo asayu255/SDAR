@@ -30,7 +30,7 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
+from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 # Opt-in per-turn rollout timing. When off (default) the loop is unchanged and
@@ -84,6 +84,255 @@ _ROLLOUT_SKIP_DONE_PREPROC = os.environ.get("ROLLOUT_SKIP_DONE_PREPROC", "1").st
 # generated tokens are unchanged; only the per-turn weight-sync / wake / sleep
 # overhead is removed (and vLLM's prefix cache can persist across turns). Opt-in;
 # OFF reproduces the current per-turn behavior exactly.
+_ROLLOUT_MERGE_GENERATES = os.environ.get("ROLLOUT_MERGE_GENERATES", "0").strip().lower() in ("1", "true", "yes", "on")
+_GENERATE_MERGER = None
+
+
+def _merge_key(batch):
+    """Calls sharing this may be merged; calls that do not, may never be.
+
+    Everything that makes two calls differ apart from their rows: the sampling
+    parameters, and the tensor widths a concatenation would have to agree on.
+    """
+    widths = tuple(sorted((name, tuple(tensor.shape[1:])) for name, tensor in batch.batch.items()))
+    return (repr(sorted((str(k), repr(v)) for k, v in (batch.meta_info or {}).items())), widths)
+
+
+def _split_by_rows(output, sizes):
+    start, parts = 0, []
+    for size in sizes:
+        parts.append(output.slice(start, start + size))
+        start += size
+    return parts
+
+
+# Drive the engine as a pool instead of one blocking call per batch.
+#
+# Merging above only catches calls that happen to be queued together -- measured,
+# 21.5% of them. This is the same idea without the "happen to": every slot's rows
+# go into one engine that is stepped continuously, so they are resident together
+# whether or not their calls lined up. A slot still waits for its own rows and
+# still steps its own environments in lockstep, so nothing about which
+# trajectories are collected changes.
+#
+# Off by default, and for the same reason merging is: it changes which requests
+# share a decode step, which moves floating-point reduction order, so results are
+# neither bit-identical to the blocking path nor reproducible run to run.
+_ROLLOUT_ASYNC_GENERATE = os.environ.get("ROLLOUT_ASYNC_GENERATE", "0").strip().lower() in ("1", "true", "yes", "on")
+# For measurement runs: refuse to fall back. Without it a config the pool cannot
+# serve (rollout log-probs on, LoRA, tp>1, a multimodal or n>1 call) silently
+# hands the batch to the blocking path, and the run reports a number for a
+# mechanism it never used. This is the same trap merging fell into, where
+# "never merged once" was read as "merging did not help".
+_ROLLOUT_ASYNC_REQUIRE = os.environ.get("ROLLOUT_ASYNC_REQUIRE", "0").strip().lower() in ("1", "true", "yes", "on")
+if _ROLLOUT_ASYNC_REQUIRE and not _ROLLOUT_ASYNC_GENERATE:
+    # Otherwise the flag whose whole job is to stop a silent blocking-path
+    # measurement would itself produce one: nothing enables the pool, nothing
+    # refuses, and the run reports the blocking path's number under a strict
+    # heading. Fail at import, where it is one line to fix.
+    raise RuntimeError(
+        "ROLLOUT_ASYNC_REQUIRE=1 needs ROLLOUT_ASYNC_GENERATE=1; on its own it "
+        "would let the run quietly measure the blocking path, which is the one "
+        "thing it exists to prevent"
+    )
+# A driver-side bound on one request, as a second line after the client's own
+# watchdog: if the round thread dies in a way that leaves a waiter behind, this
+# is what turns a hung rollout into a failed one.
+_PUMP_RESULT_TIMEOUT_S = float(os.environ.get("ROLLOUT_PUMP_RESULT_TIMEOUT_S", "1800"))
+_PUMP_STATE = {"client": None, "off": not _ROLLOUT_ASYNC_GENERATE, "lock": threading.Lock()}
+_SESSION_DEPTH = {"depth": 0, "lock": threading.Lock()}
+
+# meta_info keys the rank needs to derive the same sampling params the blocking
+# path would have used. Nothing else crosses: the rest of meta_info carries
+# tokenizer ids and other values that have no business keying a params cache.
+_PUMP_META_KEYS = ("do_sample", "validate", "temperature")
+
+
+def _pump_pins_one_sample(meta_info) -> bool:
+    """Whether this call asks the engine for exactly one sequence per prompt.
+
+    Both branches that override sampling -- greedy and validation -- set n=1, and
+    a request out of the pool returns one sequence. A training call that leaves
+    the configured n alone may want several, and quietly keeping the first would
+    be a scoring change, so the whole call goes back to the blocking path.
+    """
+    meta_info = meta_info or {}
+    return (not meta_info.get("do_sample", True)) or bool(meta_info.get("validate", False))
+
+
+def _pump_client(actor_rollout_wg):
+    """The one client this process talks to the ranks through, or None.
+
+    A rank that cannot be pumped says why, once, and the path stays off for the
+    rest of the process -- retrying every call would print the same refusal a
+    few thousand times and pay a round trip for each.
+    """
+    state = _PUMP_STATE
+    with state["lock"]:
+        if state["off"]:
+            return None
+        if state["client"] is not None:
+            return state["client"]
+        from verl.workers.rollout.pump_client import PumpClient, PumpUnavailable
+
+        client = PumpClient(actor_rollout_wg)
+        try:
+            client.handshake()
+        except PumpUnavailable as refusal:
+            state["off"] = True
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError(
+                    f"ROLLOUT_ASYNC_REQUIRE=1 and the pool refused: {refusal}"
+                ) from refusal
+            print(f"[rollout-pump] staying on the blocking path: {refusal}", flush=True)
+            return None
+        except Exception as exc:  # noqa: BLE001 - a broken handshake is not worth a dead run
+            state["off"] = True
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError(
+                    f"ROLLOUT_ASYNC_REQUIRE=1 and the handshake failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            print(f"[rollout-pump] handshake failed, staying on the blocking path: {type(exc).__name__}: {exc}", flush=True)
+            return None
+        client.start()
+        state["client"] = client
+        # Pulled rather than mirrored: _pending is mutated in five places and a
+        # gauge that misses one reads high forever, which would classify every
+        # later idle stretch as GPU-SIDE and send the next fix to the wrong side
+        # of the boundary.
+        gpu_profiler.register_gauge_source("gen_inflight", client.in_flight)
+        print(f"[rollout-pump] driving {actor_rollout_wg.world_size} ranks as a pool; {client.handshake_info}", flush=True)
+        return client
+
+
+def close_pump_client():
+    """Put the pool down. Safe to call when it was never started."""
+    with _PUMP_STATE["lock"]:
+        client, _PUMP_STATE["client"] = _PUMP_STATE["client"], None
+        never_started = client is None and _ROLLOUT_ASYNC_GENERATE
+    if client is not None:
+        gpu_profiler.unregister_gauge_source("gen_inflight")
+        print(client.line(), flush=True)
+        client.close()
+    elif never_started:
+        # Say it out loud. A run asked for the pool and used the blocking path
+        # end to end; without this line the only evidence is one refusal printed
+        # hours earlier, and the number gets written down as the pool's.
+        print("[rollout-pump] the pool was never used; every generate took the "
+              "blocking path (ROLLOUT_ASYNC_REQUIRE=1 would have made this an error)",
+              flush=True)
+
+
+def _generate_via_pump(client, batch_input_padded):
+    """Generate this call's rows through the pool and assemble them here.
+
+    The tensors are built by the same function the worker builds them with, from
+    the prompt tensors this call already holds -- the only thing that came back
+    over the wire is token ids.
+    """
+    from verl.workers.rollout.generation_output import assemble_generation_output
+
+    meta_info = batch_input_padded.meta_info or {}
+    carried = {k: meta_info[k] for k in _PUMP_META_KEYS if k in meta_info}
+    prompts = batch_input_padded.non_tensor_batch["raw_prompt_ids"]
+    # The row ordinal travels with the prompt because the rank seeds sampling
+    # from both. Validation with val_kwargs.n > 1 repeats a row n times in the
+    # DataProto, so n of these prompts are byte-identical; without the ordinal
+    # they would all draw the same sample. See seed_for_prompt.
+    futures = [
+        client.submit(_as_id_list(prompt), dict(carried, row=row))
+        for row, prompt in enumerate(prompts)
+    ]
+    timeout = _PUMP_RESULT_TIMEOUT_S if _PUMP_RESULT_TIMEOUT_S > 0 else None
+    responses = [future.result(timeout=timeout) for future in futures]
+
+    non_tensor_batch = {k: v for k, v in batch_input_padded.non_tensor_batch.items() if k != "raw_prompt_ids"}
+    info = client.handshake_info
+    return assemble_generation_output(
+        idx=batch_input_padded.batch["input_ids"],
+        attention_mask=batch_input_padded.batch["attention_mask"],
+        position_ids=batch_input_padded.batch["position_ids"],
+        response_token_ids=responses,
+        non_tensor_batch=non_tensor_batch,
+        eos_token_id=info["eos_token_id"],
+        pad_token_id=info["pad_token_id"],
+        response_length=info["response_length"],
+    )
+
+
+def _as_id_list(prompt_token_ids):
+    """Token ids in the cheapest shape Ray can carry them in.
+
+    raw_prompt_ids arrives as a numpy array, and this used to call .tolist() on
+    it before handing it to the pump -- which builds one Python int object per
+    token, to be pickled, sent, and unpickled one at a time. At 252 requests of
+    roughly 1,300 prompt tokens that is about 330,000 objects per turn, on the
+    driver thread, in the window the census tags as `gen` and the cards read
+    empty.
+
+    An int32 array is a buffer: pickle protocol 5 sends it as one memcpy. The
+    worker converts to a list at the vLLM boundary, where a list is actually
+    required, and pays for one request rather than for the whole turn's worth
+    on the driver.
+
+    A plain sequence that is not already an array still becomes one -- the cost
+    of the conversion is the same either way, and doing it here keeps one shape
+    on the wire.
+    """
+    import numpy as np
+
+    if isinstance(prompt_token_ids, np.ndarray):
+        return prompt_token_ids.astype(np.int32, copy=False)
+    return np.fromiter(prompt_token_ids, dtype=np.int32)
+
+
+def _why_the_pump_cannot_serve(batch_input_padded) -> Optional[str]:
+    """Why this particular call is not one the pool can serve identically."""
+    if "multi_modal_data" in batch_input_padded.non_tensor_batch:
+        return "the call carries multi_modal_data"
+    if "raw_prompt_ids" not in batch_input_padded.non_tensor_batch:
+        # generate_sequences rebuilds these from the padded input_ids when they
+        # are missing; rather than keep a second copy of that, let it.
+        return "the call has no raw_prompt_ids"
+    if not _pump_pins_one_sample(batch_input_padded.meta_info):
+        return "the call does not pin n=1 (neither do_sample=False nor validate=True)"
+    return None
+
+
+def _pump_can_serve(batch_input_padded) -> bool:
+    return _why_the_pump_cannot_serve(batch_input_padded) is None
+
+
+def _generate_sequences(actor_rollout_wg, batch_input_padded):
+    """One generate call, merged with whatever is queued when merging is on."""
+    if _ROLLOUT_ASYNC_GENERATE:
+        servable = _pump_can_serve(batch_input_padded)
+        if servable:
+            client = _pump_client(actor_rollout_wg)
+            if client is not None:
+                return _generate_via_pump(client, batch_input_padded)
+            if _ROLLOUT_ASYNC_REQUIRE:
+                raise RuntimeError("ROLLOUT_ASYNC_REQUIRE=1 but the pool is unavailable")
+        elif _ROLLOUT_ASYNC_REQUIRE:
+            raise RuntimeError(
+                "ROLLOUT_ASYNC_REQUIRE=1 but this call cannot go through the pool: "
+                f"{_why_the_pump_cannot_serve(batch_input_padded)}"
+            )
+    if not _ROLLOUT_MERGE_GENERATES:
+        return actor_rollout_wg.generate_sequences(batch_input_padded)
+    global _GENERATE_MERGER
+    if _GENERATE_MERGER is None:
+        from verl.utils.generate_merge import GenerateMerger
+
+        _GENERATE_MERGER = GenerateMerger(concat=DataProto.concat, split=_split_by_rows)
+    return _GENERATE_MERGER.call(
+        _merge_key(batch_input_padded),
+        batch_input_padded,
+        len(batch_input_padded),
+        actor_rollout_wg.generate_sequences,
+    )
+
+
 _ROLLOUT_KEEP_VLLM_AWAKE = os.environ.get("ROLLOUT_KEEP_VLLM_AWAKE", "0").strip().lower() in ("1", "true", "yes", "on")
 _SAID_ROLLOUT_ENV = False
 
@@ -104,6 +353,19 @@ def _say_rollout_env():
     if _SAID_ROLLOUT_ENV:
         return
     _SAID_ROLLOUT_ENV = True
+    print(
+        f"[rollout-merge] driver: ROLLOUT_MERGE_GENERATES="
+        f"{os.environ.get('ROLLOUT_MERGE_GENERATES', '<unset>')!r} -> queued generate calls "
+        f"{'ARE merged into one' if _ROLLOUT_MERGE_GENERATES else 'run one after another'}",
+        flush=True,
+    )
+    print(
+        f"[rollout-pump] driver: ROLLOUT_ASYNC_GENERATE="
+        f"{os.environ.get('ROLLOUT_ASYNC_GENERATE', '<unset>')!r} -> generate calls "
+        f"{'go through one continuously stepped engine per rank' if _ROLLOUT_ASYNC_GENERATE else 'each block on their own batch'}"
+        f"{'; this supersedes merging' if _ROLLOUT_ASYNC_GENERATE and _ROLLOUT_MERGE_GENERATES else ''}",
+        flush=True,
+    )
     print(
         f"[rollout-session] driver: ROLLOUT_KEEP_VLLM_AWAKE="
         f"{os.environ.get('ROLLOUT_KEEP_VLLM_AWAKE', '<unset>')!r} -> session mode "
@@ -439,10 +701,24 @@ def rollout_session(actor_rollout_wg):
     if not _ROLLOUT_KEEP_VLLM_AWAKE:
         yield
         return
+    with _SESSION_DEPTH["lock"]:
+        _SESSION_DEPTH["depth"] += 1
     actor_rollout_wg.begin_rollout_session()
     try:
         yield
     finally:
+        # The pool lives exactly as long as the outermost session does. Held
+        # past it, its thread would be stepping an engine the sharding manager
+        # has put to sleep and whose weights the next training step replaces.
+        # Counted rather than flagged because the slots of the validation
+        # pipeline each open one of these, concurrently, inside _validate's.
+        # Closed before the session ends, not after, so the ranks are still
+        # awake when they are told to drop anything they are holding.
+        with _SESSION_DEPTH["lock"]:
+            _SESSION_DEPTH["depth"] -= 1
+            outermost = _SESSION_DEPTH["depth"] == 0
+        if outermost:
+            close_pump_client()
         actor_rollout_wg.end_rollout_session()
 
 
@@ -1286,7 +1562,7 @@ class TrajectoryCollector:
                 self._teacher_glue_mark = None
             _teacher_wait = self._join_teacher_prefetch()
             _gw0 = gpu_profiler.now()
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+            batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
             _gw1 = gpu_profiler.now()
             # # unpad
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)

@@ -987,6 +987,52 @@ class ActorRolloutRefWorker(Worker):
             get_torch_device().empty_cache()
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE)
+    def rollout_pump_step(self, payload: dict) -> dict:
+        """One round of the pumped rollout path: hand in requests, take answers back.
+
+        DP_COMPUTE rather than DP_COMPUTE_PROTO because the payload is already
+        per-rank. Under tensor_model_parallel_size=1 every rank holds a whole
+        model, so any rank can serve any request and the driver -- which is the
+        only place that knows how loaded each rank is -- decides where each one
+        goes. Re-sharding here would undo that.
+
+        Returns whatever finished in this round, which is generally not what was
+        submitted in it. The driver matches them up by request id.
+        """
+        assert self._is_rollout
+        if self.rollout is None:
+            raise RuntimeError(
+                "rollout_pump_step called but the rollout was never built "
+                "(SKIP_ROLLOUT_BUILD=1)."
+            )
+
+        in_session = bool(getattr(self, "_rollout_session_active", False))
+        if payload.get("stop"):
+            # Allowed with no session open. Putting the pump down does not step
+            # the engine, and refusing here would leave a teardown that arrives
+            # after the session closed with nothing it can do.
+            return self.rollout.pump_step(payload)
+        if payload.get("handshake"):
+            reply = self.rollout.pump_step(payload)
+            # What the driver needs to assemble the same tensors this worker
+            # would have assembled, and enough to decide not to try.
+            reply["in_session"] = in_session
+            reply["eos_token_id"] = (
+                self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id
+            )
+            return reply
+
+        if not in_session:
+            # The pump steps the engine between RPCs. Outside a session the
+            # sharding manager sleeps vLLM at the end of every call, so those
+            # steps would run against an engine whose weights are unmapped.
+            raise RuntimeError(
+                "rollout_pump_step requires an open rollout session; set "
+                "ROLLOUT_KEEP_VLLM_AWAKE=1 in the process running the rollout loop."
+            )
+        return self.rollout.pump_step(payload)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def begin_rollout_session(self):
         """Open the rollout sharding manager once for an entire multi-turn rollout.
