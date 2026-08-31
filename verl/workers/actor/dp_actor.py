@@ -806,9 +806,15 @@ class DataParallelPPOActor(BasePPOActor):
         actually emitted, measured against what that opinion was worth on
         average under the student's own distribution. The residual rather than
         the full shift so that the part every teacher shares -- generically good
-        tokens -- cannot inflate one source's credit; the FULL shift is what the
-        alpha this produces then gates, and keeping the two apart is the whole
-        reason the evidence function does not take a residual.
+        tokens -- cannot inflate one source's credit.
+
+        A DIAGNOSTIC NOW, not a gate. The alpha this produces reaches no weight:
+        the source channel's reliability is ``teacher_similarity``, computed at
+        the candidate from the teachers themselves. What the statistic still
+        answers is whether the reward-free rule happened to land where the
+        reward would have, which is a question about the mechanism and is worth
+        keeping. It stays out of the evidence function's signature for the same
+        reason it always did.
 
         The emitted token is usually in the support but need not be, so it is
         looked up on its own: one extra id per model, resolved from the same

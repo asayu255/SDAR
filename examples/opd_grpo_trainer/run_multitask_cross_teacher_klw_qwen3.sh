@@ -38,16 +38,22 @@ set -x
 #              teacher that barely moves out of domain up to a full unit, which
 #              is what the deadzone used to suppress. The off-diagonal is still
 #              recorded, as off_to_in_domain_ratio.
-#   c          the minimum EVERY teacher in the run guarantees, the on-task one
-#              included. A continuous min, not a sign test, so a near-zero shift
-#              contributes near zero and no deadzone is needed.
-#   alpha      per ordered task pair, the correlation between that source's
-#              RESIDUAL support for the tokens the student actually emitted and
-#              the GRPO advantage of the trajectory it emitted them in.
-#              Rectified at zero: an anti-correlated source is vetoed, never
-#              inverted -- nothing says a reversed policy shift points anywhere
-#              useful. This is the ONE thing GRPO contributes to the mechanism.
-#   e          |c| + sum_m alpha_m |delta_hat_m|, per candidate.
+#   c          delta_hat_d * f: the ON-TASK teacher's own shift, graded by f,
+#              the fraction of off-task mass moving the same way. The on-task
+#              teacher is the direction and the ceiling; the others vote on how
+#              much of it to believe. A continuous vote, not a unanimity, and a
+#              ceiling, not a minimum over the teachers -- so one quiet source
+#              can no longer hold the corroboration down to its own volume.
+#   x_m        relu(|delta_hat_m| - |delta_hat_d|): what source m says BEYOND
+#              what the on-task teacher already says. The boundary between the
+#              two channels, so each teacher's volume is spent exactly once.
+#   q          2 sum_{m<m'} dh_m dh_m' / [(M-1) sum_m dh_m^2], clamped at zero.
+#              One minus the share of the off-task teachers' energy that is
+#              disagreement. THE SOURCE CHANNEL'S RELIABILITY -- computed at the
+#              candidate it is applied at, from the teachers alone. It reads
+#              magnitude agreement and not only sign, and a silent teacher
+#              scores it zero rather than a full 1.
+#   e          |c| + q * sum_m x_m, per candidate.
 #   W~         1 + sum_v p_teacher(v) e(v), per position.
 #   W          W~ / mu_d, the PREVIOUS step's KL-weighted per-task mean.
 #
@@ -303,12 +309,16 @@ set -x
 #     divisor exists to preserve, and which a destination-conditioned divisor
 #     would force to 1 by construction.
 #   adv/{src}__on__{dst}/alpha_applied, with rho, rho_lcb95 and the two partials
-#     beside it. Only alpha reaches the loss. max(0, rho) carries a small
-#     positive bias under the null -- roughly 0.4/sqrt(N) -- so while rho_lcb95
-#     straddles zero a positive alpha is not distinguishable from that bias, and
-#     that is exactly the cold-start window where the student is most plastic.
-#     rho_length_controlled and rho_length_on_controlled are reported and never
-#     applied: a confidence level is a knob, and so is a choice of confound.
+#     beside it. NONE OF THEM REACHES THE LOSS ANY MORE -- the source channel is
+#     gated by evidence/gate_mean, computed at the candidate. They are kept
+#     because "did the reward-free rule land where the reward would have" is a
+#     question about the mechanism worth a number. The reasons they stopped
+#     being the gate are in the same series: max(0, rho) carries a positive bias
+#     under the null of roughly 0.4/sqrt(N); rho_current has a larger standard
+#     deviation than its own mean at every pair and flips sign between adjacent
+#     steps 33-51% of the time at four of the six; rho_length_controlled keeps
+#     only a third of the two largest values; and alpha_applied was identically
+#     zero for two of the six pairs across the entire window that has a control.
 #   adv/frac_sampled_outside_topk is the coverage of one approximation: the
 #     support score's baseline runs over the top-k with a zero tail residual, so
 #     an emitted token outside the top-k is not in its own baseline. The KL's
@@ -441,13 +451,14 @@ set -x
 #     take inside <action>" and "... inside <think>" are the same row in every
 #     other table here. token_stats.roles=False turns off the 22 MB table.
 #
-#   kl_weight/probe/alpha*/effect/kl_shift_by_state/*/gross_share  the alpha
-#     series' own state composition. Until now the probes reported only how BIG
-#     the counterfactual weight would be; this says whether a larger alpha moves
-#     budget TOWARD the corroborated positions or just scales everything, which
-#     is the question the series exists to answer. Each probe uses its own mu
-#     and its own evidence, so its columns sum to that probe's (W-1)D and not to
-#     the shipped arm's.
+#   kl_weight/probe/alpha*/effect/kl_shift_by_state/*/gross_share  the source
+#     series' own state composition -- whether a larger source term moves budget
+#     TOWARD the corroborated positions or just scales everything. The names are
+#     unchanged and alpha000 still means "corroboration alone", which is what a
+#     control arm reproduces; the number is now a plain multiplier on the GATED
+#     source, so alpha100 is the shipped weight rather than an upper bracket.
+#     Each probe uses its own mu and its own evidence, so its columns sum to
+#     that probe's (W-1)D and not to the shipped arm's.
 #
 #   THE THREE ANALYSIS CORRECTIONS (2026-08). Each was a diagnostic reporting
 #   something other than what its name said, and none touched the loss.
@@ -577,13 +588,34 @@ set -x
 #     the support the whole mechanism is measured on -- and only the third is a
 #     measurement artefact rather than a finding.
 #
-#   CHANNEL COUNTERFACTUALS (against the alpha series' MAGNITUDE ones):
-#     kl_weight/channel/no_shared/*        the advantage channel alone -- is the
-#       corroboration term carrying the mechanism, or decoration on top of
-#       "reliable source activity"?
+#   CHANNEL COUNTERFACTUALS (against the source series' MAGNITUDE ones):
+#     kl_weight/channel/no_shared/*        the source channel alone -- is the
+#       corroboration term carrying the mechanism, or decoration on top of it?
 #     kl_weight/channel/offtask_shared/*   the off-task-only agreement rule, the
-#       option this arm chose against. Each has its own lagged normaliser, so the
-#       comparison is like for like, and neither touches the loss.
+#       option this arm chose against.
+#     kl_weight/channel/ungated_source/*   q forced to 1. What the similarity
+#       gate COSTS, which is what says whether it is selecting or attenuating.
+#     kl_weight/channel/shuffled_gate/*    q recomputed on the off-task planes
+#       slid past each other along the response. Every teacher here is the same
+#       base after RL on a different task with the SAME recipe, so two of them
+#       agreeing can be one shared generation grammar answering twice. Where
+#       this matches the live gate, the independence q assumes does not hold --
+#       and a structural-token mask, if one is wanted, comes out of that ratio
+#       rather than being written by hand.
+#     Each has its own lagged normaliser, so the comparison is like for like,
+#     and none of them touches the loss.
+#
+#   THE SOURCE CHANNEL'S TWO GATES, as the share each let through:
+#     kl_weight/evidence/exclusive_pass_rate  of everything the off-task
+#       teachers said, how much survived the on-task teacher's ceiling. Low
+#       means the sources are REDUNDANT here, not gated.
+#     kl_weight/evidence/gate_pass_rate       of what survived the ceiling, how
+#       much the similarity gate kept. Low means the sources disagree with each
+#       other, which is the gate working.
+#     kl_weight/evidence/gate_mean            the gate's own p-weighted level,
+#       independent of how much the sources happened to say.
+#     The two fail differently and the fix is not the same fix, which is why
+#     they are a chain and not one number.
 #
 #   PER-PAIR TOKEN TURNOVER:
 #     kl_weight/pair_token/{src}__on__{dst}/turnover/* -- the pooled turnover

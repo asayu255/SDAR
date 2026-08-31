@@ -39,10 +39,13 @@ try:
         candidate_kl_evidence,
         compute_raw_policy_shifts,
         decompose_common_residual,
+        decorrelated_off_shifts,
         group_center,
         position_pre_weight,
+        source_exclusive_shift,
         standardize_policy_shifts,
         tail_logprob,
+        teacher_similarity,
     )
 except Exception as e:  # pragma: no cover - environment without full deps
     pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
@@ -368,15 +371,28 @@ def test_common_ev_is_the_off_task_only_counterfactual_and_reaches_no_weight():
 
 
 def test_the_counterfactual_is_reported_beside_the_applied_share():
-    """A number in the logs rather than an assumption in a docstring: the gap
-    between them IS the price of requiring the on-task teacher to have spoken."""
+    """Both in the logs, and NOT ordered any more -- which is the change.
+
+    While the applied rule was ``1[unanimous] min_j |hat_j|`` the off-task-only
+    variant was the same rule with one teacher removed, so it could only be
+    larger and a run could read the gap as "what the on-task teacher's silence
+    costs". ``common_soft`` is a different rule -- a ceiling at ``|hat_on|``
+    and a graded vote, neither of which is a minimum over a unanimity -- so the
+    two are no longer nested and the ratio is a comparison, not a bound. What
+    replaces the bound is the invariant below: the applied corroboration cannot
+    exceed the on-task teacher's own shift.
+    """
     got, ctx = _built(bs=4, resp=6, seed=45)
     kl = torch.rand(*got["weight"].shape) + 0.1
     m = _fold_position(got, kl, ctx["task_ids"])
     assert "kl_weight/evidence/shared_mean" in m
     assert "kl_weight/evidence/shared_offtask_only_mean" in m
-    assert m["kl_weight/evidence/shared_offtask_only_mean"] >= m["kl_weight/evidence/shared_mean"] - 1e-9, (
-        "leaving a teacher out of a minimum cannot lower it"
+    assert m["kl_weight/evidence/shared_mean"] >= 0.0
+    ceiling = float(
+        (got["teacher_prob"] * got["hat_on"].abs()).sum(dim=-1).mean()
+    )
+    assert m["kl_weight/evidence/shared_mean"] <= ceiling + 1e-6, (
+        "the corroboration is capped by the on-task teacher at every candidate"
     )
 
 
@@ -393,44 +409,146 @@ def test_a_near_zero_shift_attenuates_itself_without_a_deadzone():
 
 
 # --------------------------------------------------------------------------- #
-# candidate evidence -- the monotonicity that the design turns on
+# candidate evidence -- the two factors, and the separation they buy
 # --------------------------------------------------------------------------- #
-def _evidence(on_v, off_v, alpha):
-    d = _one(on_v, off_v)
-    a = torch.full((1, len(off_v)), float(alpha))
-    return float(candidate_kl_evidence(common=d["common"], hat_off=torch.tensor(
-        [[[[float(x) for x in off_v]]]]), source_alpha=a))
+def _gate(off_v):
+    return teacher_similarity(torch.tensor([[[[float(x) for x in off_v]]]]))
 
 
-@pytest.mark.parametrize("alpha", [0.0, 0.2, 0.5, 0.75, 1.0])
-def test_corroboration_never_scores_below_conflict_at_any_alpha(alpha):
-    """The defect this formula exists to avoid.
-
-    ``|c| + sum alpha|delta_hat - c|`` subtracts the shared part from every
-    source, crediting agreement once and debiting it n_off times, so past
-    ``alpha = 1/n_off`` a split scores HIGHER. Here the gap is ``|c|``,
-    independent of alpha -- and, since the corroboration is all-teacher, it
-    holds for a sign flipped on ANY teacher and not only on a source.
-    """
-    unanimous = _evidence(1.0, [3.0, 2.0], alpha)
-    assert unanimous - _evidence(1.0, [3.0, -2.0], alpha) == pytest.approx(1.0, abs=1e-5)
-    assert unanimous - _evidence(-1.0, [3.0, 2.0], alpha) == pytest.approx(1.0, abs=1e-5)
+def _excl(on_v, off_v):
+    return source_exclusive_shift(
+        hat_on=torch.tensor([[[float(on_v)]]]),
+        hat_off=torch.tensor([[[[float(x) for x in off_v]]]]),
+    )
 
 
-@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
-def test_sources_that_contradict_the_on_task_teacher_earn_no_corroboration(alpha):
-    """The reason the bonus is all-teacher and not off-task-only.
+def _evidence(on_v, off_v, source_scale=1.0):
+    return float(
+        candidate_kl_evidence(
+            common=_one(on_v, off_v)["common_soft"],
+            source_gate=_gate(off_v),
+            exclusive=_excl(on_v, off_v),
+            source_scale=source_scale,
+        )
+    )
 
-    Off-task unanimity alone credits a position where the other two tasks
-    DECISIVELY OPPOSE the on-task teacher exactly as it credits one where they
-    agree with it -- and the KL that then gets strengthened points at the very
-    opinion they contradicted, with no advantage-side evidence behind it. At
-    alpha = 0 that candidate would score 2 instead of 0.
-    """
-    assert _evidence(-1.0, [3.0, 2.0], alpha) == pytest.approx(alpha * 5.0, abs=1e-5)
-    d = _one(-1.0, [3.0, 2.0])
-    assert float(d["common"]) == 0.0
-    assert float(d["common_ev"]) == pytest.approx(2.0), "still measured, never applied"
+
+# --- the graded corroboration -------------------------------------------------
+def test_the_applied_corroboration_is_the_on_task_shift_under_unanimity():
+    """Not ``min_j |hat_j|``: the quiet teacher agreed, it did not set the size."""
+    assert float(_one(1.0, [3.0, 2.0])["common_soft"]) == pytest.approx(1.0)
+    assert float(_one(-1.0, [-3.0, -0.01])["common_soft"]) == pytest.approx(-1.0)
+
+
+def test_one_dissenting_teacher_grades_the_corroboration_instead_of_zeroing_it():
+    """The veto measured at ``suppression_ratio`` 1.5-4.7x on the live run stops
+    being a counterfactual: the dissenter costs its share of the off-task mass."""
+    assert float(_one(1.0, [3.0, 2.0])["common"]) == pytest.approx(1.0)
+    assert float(_one(1.0, [3.0, -2.0])["common"]) == 0.0, "the old rule vetoed"
+    assert float(_one(1.0, [3.0, -2.0])["common_soft"]) == pytest.approx(0.6), "3/(3+2)"
+    assert float(_one(1.0, [-3.0, -2.0])["common_soft"]) == 0.0, "all of them dissent"
+
+
+def test_the_corroboration_is_still_capped_by_the_on_task_teacher():
+    for on_v in (0.2, 1.0, 5.0):
+        assert abs(float(_one(on_v, [9.0, 9.0])["common_soft"]) ) <= on_v + 1e-6
+
+
+def test_a_silent_on_task_teacher_zeroes_the_corroboration_twice_over():
+    """``sign(hat_on) = 0`` drives the vote to zero AND ``hat_on`` multiplies
+    through, so the vote's numerical noise at a silent teacher multiplies
+    something that is already zero."""
+    assert float(_one(0.0, [3.0, 2.0])["common_soft"]) == 0.0
+    assert float(_one(1e-12, [3.0, 2.0])["common_soft"]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_corroboration_keeps_the_on_task_teachers_sign():
+    assert float(_one(-2.0, [-3.0, -4.0])["common_soft"]) == pytest.approx(-2.0)
+
+
+# --- the similarity gate ------------------------------------------------------
+def test_identical_teachers_score_one_and_opposite_ones_score_zero():
+    assert float(_gate([2.0, 2.0])) == pytest.approx(1.0)
+    assert float(_gate([-3.0, -3.0])) == pytest.approx(1.0), "agreement, not positivity"
+    assert float(_gate([2.0, -2.0])) == 0.0, "clamped, not negative"
+
+
+def test_a_silent_teacher_scores_zero_and_not_full_agreement():
+    """The failure that rules out the sign-agreement ratio. ``|sum| / sum |.|``
+    is ``|h|/|h| = 1`` with one teacher silent -- one teacher agreeing with
+    itself, credited as corroboration. A product over PAIRS cannot do that."""
+    assert float(_gate([3.0, 0.0])) == 0.0
+    assert float(_gate([0.0, 0.0])) == 0.0
+    ratio = abs(3.0 + 0.0) / (abs(3.0) + abs(0.0))
+    assert ratio == pytest.approx(1.0), "which is exactly what the ratio would have said"
+
+
+def test_the_gate_reads_magnitude_agreement_and_not_only_sign():
+    """``2r/(1+r^2)``. The lopsided off-task pair is the measured case: two of
+    the three destinations run at ``bottleneck_share`` near 0.7/0.1."""
+    for r, want in ((1.0, 1.0), (2.0, 0.8), (3.0, 0.6), (10.0, 2 * 10 / 101)):
+        assert float(_gate([r, 1.0])) == pytest.approx(want, abs=1e-5)
+        assert abs(1.0 + r) / (1.0 + r) == pytest.approx(1.0), "the ratio calls them all 1"
+
+
+def test_the_gate_is_scale_free_and_bounded_by_one():
+    assert float(_gate([6.0, 4.0])) == pytest.approx(float(_gate([3.0, 2.0])))
+    g = torch.rand(4, 5, 7, 3) * 8.0 - 4.0
+    q = teacher_similarity(g)
+    assert float(q.max()) <= 1.0 + 1e-6 and float(q.min()) >= 0.0
+
+
+def test_one_teacher_leaves_the_gate_shut_without_a_branch():
+    """The ``n_off < 2`` special case ``common_ev`` has to write out falls out of
+    the algebra here: with no pairs there is no cross term."""
+    assert float(teacher_similarity(torch.tensor([[[[5.0]]]]))) == 0.0
+
+
+def test_the_gate_generalises_past_two_teachers():
+    assert float(_gate([2.0, 2.0, 2.0])) == pytest.approx(1.0)
+    assert float(_gate([2.0, 2.0, 0.0])) == pytest.approx(0.5), "8 / (2 * 8)"
+
+
+# --- the exclusive shift ------------------------------------------------------
+def test_the_source_only_gets_what_the_on_task_teacher_does_not_already_say():
+    assert _excl(1.0, [3.0, 2.0]).reshape(-1).tolist() == pytest.approx([2.0, 1.0])
+    assert _excl(5.0, [3.0, 2.0]).reshape(-1).tolist() == pytest.approx([0.0, 0.0])
+
+
+def test_the_two_channels_partition_the_source_shift_exactly():
+    """``|h_m| = min(|h_m|, |h_on|) + relu(|h_m| - |h_on|)``: the ceiling the
+    corroboration is capped at, plus the excess the source takes. Nothing is
+    counted twice and nothing is dropped."""
+    on = torch.rand(3, 4, 5) * 6.0 - 3.0
+    off = torch.rand(3, 4, 5, 2) * 6.0 - 3.0
+    capped = torch.minimum(off.abs(), on.abs().unsqueeze(-1))
+    assert torch.allclose(capped + source_exclusive_shift(hat_on=on, hat_off=off), off.abs())
+
+
+def test_the_excess_survives_a_conflict_because_the_split_is_by_magnitude():
+    """The specification is "the on-task shift is small and the off-task one is
+    large", which does not become "the signs agree" without a threshold."""
+    assert _excl(1.0, [-3.0]).reshape(-1).tolist() == pytest.approx([2.0])
+
+
+# --- the evidence -------------------------------------------------------------
+def test_corroboration_still_scores_above_conflict():
+    """The defect the formula exists to avoid, restated for the graded rule: a
+    split still cannot outscore a unanimity, at any source strength."""
+    for scale in (0.0, 0.2, 0.5, 0.75, 1.0):
+        assert _evidence(1.0, [3.0, 2.0], scale) > _evidence(1.0, [3.0, -2.0], scale)
+
+
+def test_flipping_the_on_task_sign_costs_exactly_the_corroboration():
+    """Neither source factor reads the on-task SIGN -- the gate is off-task only
+    and the excess is magnitudes -- so the whole difference is ``|c|``."""
+    on_agrees = _evidence(1.0, [3.0, 2.0])
+    on_opposes = _evidence(-1.0, [3.0, 2.0])
+    assert on_agrees - on_opposes == pytest.approx(1.0, abs=1e-5)
+    assert float(_one(-1.0, [3.0, 2.0])["common_soft"]) == 0.0
+    assert float(_one(-1.0, [3.0, 2.0])["common_ev"]) == pytest.approx(2.0), (
+        "still measured, never applied"
+    )
 
 
 def test_the_broken_alternative_would_have_failed_that():
@@ -444,44 +562,75 @@ def test_the_broken_alternative_would_have_failed_that():
 
 
 def test_evidence_is_non_negative_and_zero_only_with_no_signal():
-    assert _evidence(0.0, [0.0, 0.0], 1.0) == pytest.approx(0.0)
-    for on_v, off_v, a in ((1.0, [3.0, -2.0], 0.3), (-1.0, [-1.0, -1.0], 1.0), (0.0, [2.0, 2.0], 0.0)):
-        assert _evidence(on_v, off_v, a) >= 0.0
+    assert _evidence(0.0, [0.0, 0.0]) == pytest.approx(0.0)
+    for on_v, off_v, sc in ((1.0, [3.0, -2.0], 0.3), (-1.0, [-1.0, -1.0], 1.0), (0.0, [2.0, 2.0], 0.0)):
+        assert _evidence(on_v, off_v, sc) >= 0.0
 
 
-def test_alpha_zero_leaves_only_the_corroboration_bonus():
-    # min over {on, off1, off2} = min(1, 3, 2) = 1
+def test_the_evidence_is_the_two_channels_added():
+    """1 for the corroboration, and 12/13 of the 2 + 1 the sources add on top."""
+    assert _evidence(1.0, [3.0, 2.0]) == pytest.approx(1.0 + (12 / 13) * 3.0, abs=1e-5)
+
+
+def test_the_source_scale_is_a_probe_knob_and_zero_leaves_the_corroboration():
     assert _evidence(1.0, [3.0, 2.0], 0.0) == pytest.approx(1.0)
-
-
-def test_alpha_one_admits_the_full_standardized_source_shift():
-    """The full shift, not the residual: alpha is estimated on the residual and
-    applied to the whole thing, and mixing those is the reversal above."""
-    assert _evidence(1.0, [3.0, 2.0], 1.0) == pytest.approx(1.0 + 3.0 + 2.0)
+    half = _evidence(1.0, [3.0, 2.0], 0.5) - 1.0
+    assert half == pytest.approx(0.5 * (_evidence(1.0, [3.0, 2.0]) - 1.0), abs=1e-5)
 
 
 def test_sources_are_summed_not_averaged():
-    one = _evidence(3.0, [3.0, 3.0], 1.0)
-    assert one == pytest.approx(3.0 + 3.0 + 3.0), "min is 3, both sources add 3"
+    """Both sources clear the ceiling by 3, and the gate is 1 at parity."""
+    assert _evidence(3.0, [6.0, 6.0]) == pytest.approx(3.0 + 3.0 + 3.0)
 
 
-def test_alpha_is_per_source():
-    d = _one(1.0, [3.0, 2.0])
-    e = candidate_kl_evidence(
-        common=d["common"],
-        hat_off=torch.tensor([[[[3.0, 2.0]]]]),
-        source_alpha=torch.tensor([[1.0, 0.0]]),
-    )
-    assert float(e) == pytest.approx(1.0 + 3.0)
+def test_a_second_teacher_that_says_nothing_new_adds_nothing():
+    """The separation, as one number. With the off-task teachers at the on-task
+    teacher's own volume the source channel is empty -- which is the 53.3% of
+    source mass the advantage rule was spending inside the ``agree`` state."""
+    assert _evidence(3.0, [3.0, 3.0]) == pytest.approx(3.0)
+    assert _evidence(3.0, [3.0, 3.0], 0.0) == pytest.approx(3.0)
 
 
-def test_the_evidence_signature_cannot_be_handed_a_residual():
-    """Structural: alpha gates the full shift, and the residual belongs to the
-    reliability and attribution paths only."""
+def test_the_evidence_signature_takes_no_advantage_and_no_residual():
+    """Structural. The reliability is the gate, computed at the candidate; the
+    residual and the row's reward belong to the diagnostics only."""
     import inspect
 
     params = set(inspect.signature(candidate_kl_evidence).parameters)
-    assert params == {"common", "hat_off", "source_alpha"}
+    assert params == {"common", "source_gate", "exclusive", "source_scale"}
+
+
+# --- the placebo --------------------------------------------------------------
+def test_the_shuffle_keeps_every_teachers_own_shifts_and_breaks_the_pairing():
+    off = torch.rand(2, 9, 4, 2) * 6.0 - 3.0
+    rolled = decorrelated_off_shifts(off)
+    for m in range(2):
+        assert torch.allclose(
+            rolled[..., m].reshape(2, -1).sort(dim=-1).values,
+            off[..., m].reshape(2, -1).sort(dim=-1).values,
+        ), "a roll is a permutation of the same row's own shifts"
+    assert not torch.allclose(rolled, off), "and it moves them past each other"
+
+
+def test_the_shuffle_leaves_a_gate_that_needed_the_pairing_with_nothing():
+    """Teachers that agree only where they are looking at the same candidate
+    lose the agreement; a constant offset -- grammar, not content -- keeps it.
+    The ratio between the two is what a structural mask would be derived from."""
+    resp = 8
+    alternating = torch.tensor([2.0, -2.0]).repeat(resp // 2)
+    paired = alternating.reshape(1, resp, 1, 1).expand(1, resp, 1, 2).contiguous()
+    assert float(teacher_similarity(paired).mean()) == pytest.approx(1.0)
+    assert float(teacher_similarity(decorrelated_off_shifts(paired)).mean()) == pytest.approx(0.0)
+
+    grammar = torch.full((1, resp, 1, 2), 2.0)
+    assert float(teacher_similarity(grammar).mean()) == pytest.approx(1.0)
+    assert float(teacher_similarity(decorrelated_off_shifts(grammar)).mean()) == pytest.approx(1.0)
+
+
+def test_the_shuffle_is_deterministic_and_reaches_no_weight():
+    off = torch.rand(2, 8, 3, 2)
+    assert torch.equal(decorrelated_off_shifts(off), decorrelated_off_shifts(off))
+    assert torch.equal(decorrelated_off_shifts(off[:, :1]), off[:, :1]), "nothing to roll"
 
 
 # --------------------------------------------------------------------------- #
@@ -813,6 +962,7 @@ def test_the_moment_layout_is_complete_enough_for_the_partials():
 # the orchestrator, and the effect metrics
 # --------------------------------------------------------------------------- #
 from verl.trainer.ppo.cross_teacher_kl_weight import (  # noqa: E402
+    CHANNEL_PROBES,
     POSITION_TERMS,
     PROBE_ALPHAS,
     STATE_TERMS,
@@ -899,19 +1049,45 @@ def test_a_task_without_a_scale_stays_at_one_and_reports_nothing_it_cannot_measu
         assert float(got["hat_off"][i].abs().max()) == 0.0
 
 
-def test_the_probe_bracket_covers_alpha_zero_and_one_and_never_touches_the_weight():
-    """The Phase-2 go/no-go is judged on the top of this bracket. At alpha=0 the
-    corroboration channel is alone, and it is structurally the minority one --
-    the on-task teacher is silent at 64% of teacher mass -- so a gate read there
-    would be measuring a lower bound and calling it the mechanism."""
-    got, _ = _built(alpha=0.0)
+def test_the_probe_series_scales_the_source_and_its_top_is_the_shipped_weight():
+    """The names are unchanged and one of the two readings is: ``alpha000`` is
+    still the corroboration channel alone, which is what a control arm
+    reproduces. The other has moved. The number is a plain multiplier on the
+    gated source now, not a reliability, so the top of the series is the arm
+    itself rather than an upper bracket -- what the bracket used to say is the
+    ``ungated_source`` channel's job."""
+    got, _ = _built()
     assert set(got["probe_pre_weight"]) == {probe_name(a) for a in PROBE_ALPHAS}
     lo = got["probe_pre_weight"][probe_name(0.0)]
     hi = got["probe_pre_weight"][probe_name(1.0)]
-    assert torch.all(hi >= lo - 1e-6), "more alpha cannot mean less evidence"
+    assert torch.all(hi >= lo - 1e-6), "more source cannot mean less evidence"
     assert float((hi - lo).max()) > 0.0
-    # alpha=0 in the TABLE means the training weight equals the alpha=0 probe.
-    assert torch.allclose(got["pre_weight"], lo, atol=1e-6)
+    assert torch.allclose(got["pre_weight"], hi, atol=1e-6), "scale 1.0 IS the arm"
+
+
+def test_the_advantage_table_no_longer_reaches_the_weight():
+    """The demotion, as a test rather than as a comment. Two runs that differ
+    only in the reliability table have to produce the same weight; the table is
+    still carried, for the diagnostics that ask whether the reward-free gate
+    landed where the reward would have."""
+    off_gate, _ = _built(alpha=0.0)
+    full_gate, _ = _built(alpha=1.0)
+    assert torch.allclose(off_gate["weight"], full_gate["weight"], atol=1e-7)
+    assert torch.allclose(off_gate["evidence"], full_gate["evidence"], atol=1e-7)
+    assert float(off_gate["row_alpha"].max()) == 0.0
+    assert float(full_gate["row_alpha"].max()) == 1.0
+
+
+def test_the_gate_channel_counterfactuals_bracket_the_shipped_gate():
+    """``ungated_source`` is q = 1 and can only be larger; ``shuffled_gate`` is
+    the same arithmetic on teachers that were never looking at the same
+    candidate, and is the null the shared base can produce on its own."""
+    got, _ = _built()
+    assert set(got["channel_pre_weight"]) == set(CHANNEL_PROBES)
+    ungated = got["channel_pre_weight"]["ungated_source"]
+    assert torch.all(ungated >= got["pre_weight"] - 1e-6)
+    assert float((ungated - got["pre_weight"]).max()) > 0.0, "the gate is closing something"
+    assert got["channel_pre_weight"]["shuffled_gate"].shape == got["pre_weight"].shape
 
 
 def test_the_evidence_by_source_columns_add_up_with_the_shared_one():
@@ -2771,36 +2947,39 @@ def test_the_gradient_metric_reads_the_real_coefficient_and_both_coefficients():
 # --------------------------------------------------------------------------- #
 # who actually caused the nats a source is charged with
 # --------------------------------------------------------------------------- #
-def test_a_silent_source_is_charged_no_effect():
-    """alpha = 0 for one teacher and non-zero for the other: only the second
-    raised the weight, so only the second may appear in the table. Filing the
-    position's whole shift against every source that spoke reports the opposite
-    -- and it is the table 'what did Search bring to AlfWorld' is read from."""
+def test_a_source_with_nothing_to_add_is_charged_no_effect():
+    """One teacher exceeds the on-task ceiling and one sits exactly on it, so
+    only the first raised the weight and only the first may appear in the table.
+    Filing the position's whole shift against every source that SPOKE reports
+    the opposite -- and it is the table 'what did Search bring to AlfWorld' is
+    read from. Under the exclusive split, speaking and adding are different
+    things, which is the whole point of the split."""
     from verl.trainer.ppo.sign_weights import SignPairTokens
 
     torch.manual_seed(90)
-    bs, resp, k, n_off = 4, 3, 5, 2
+    bs, resp, k = 4, 3, 5
     on, base = _lp(bs, resp, k), _lp(bs, resp, k)
-    off = torch.stack([_lp(bs, resp, k) for _ in range(n_off)], dim=-1)
+    # Column 0 moves twice as far as the on-task teacher; column 1 moves exactly
+    # as far, so its excess is identically zero while its shift is not.
+    off = torch.stack([base + 2.0 * (on - base), on.clone()], dim=-1)
     shifts = compute_raw_policy_shifts(
         on_task_logprob=on, off_task_logprobs=off, base_logprob=base
     )
     task_ids = torch.arange(bs) % 3
     planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
-    # Column 0's source is trusted, column 1's is not.
     alpha = torch.zeros(3, 3)
-    for row in range(bs):
-        alpha[int(task_ids[row]), int(planes[row, 0])] = 1.0
     got = build_position_weight(
         shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=alpha,
         diag_valid=torch.ones(3, dtype=torch.bool),
         normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
     )
+    assert float(got["source_exclusive"][..., 1].abs().max()) == pytest.approx(0.0)
+    assert float(got["q_sim"].max()) > 0.0, "the two teachers still agree"
     kl = torch.rand(bs, resp) + 0.1
     inv_mu = (1.0 / got["mu"].clamp(min=1e-12)).unsqueeze(-1)
     source_shift = got["evidence_by_source"] * (inv_mu * kl.unsqueeze(-1)).unsqueeze(-1)
-    assert float(source_shift[..., 1].abs().sum()) == pytest.approx(0.0), "alpha = 0"
+    assert float(source_shift[..., 1].abs().sum()) == pytest.approx(0.0), "no excess"
     assert float(source_shift[..., 0].abs().sum()) > 0
 
     tbl = SignPairTokens(n_tasks=3, vocab_size=64, device="cpu", top_n=4)
@@ -2823,10 +3002,13 @@ def test_a_silent_source_is_charged_no_effect():
     for (d, s) in charged:
         pair = d * 2 + s - (1 if s > d else 0)
         charged[(d, s)] = float(eff[pair].abs().sum())
-    trusted = [v for (d, s), v in charged.items() if float(alpha[d, s]) > 0]
-    silent = [v for (d, s), v in charged.items() if float(alpha[d, s]) == 0]
-    assert sum(trusted) > 0
-    assert sum(silent) == pytest.approx(0.0), "a source with alpha = 0 moved nothing"
+    exceeding, matching = [], []
+    for row in range(bs):
+        d = int(task_ids[row])
+        exceeding.append(charged[(d, int(planes[row, 0]))])
+        matching.append(charged[(d, int(planes[row, 1]))])
+    assert sum(exceeding) > 0
+    assert sum(matching) == pytest.approx(0.0), "a source at the ceiling moved nothing"
 
 
 def test_the_pair_table_still_takes_one_effect_column_for_the_sign_arm():
@@ -3802,11 +3984,32 @@ def test_the_decomposition_is_zero_wherever_the_weight_was_neutralised():
     assert torch.allclose(parts, partial["weight"] - 1.0, atol=1e-6)
 
 
+def _no_excess(seed=90, bs=4, resp=3, k=5):
+    """Every off-task teacher exactly on the on-task teacher's ceiling: the
+    sources speak, agree, and add nothing. The source channel is empty for a
+    reason that is a property of the evidence rather than of a gate."""
+    torch.manual_seed(seed)
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([on.clone(), on.clone()], dim=-1)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    return build_position_weight(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+        ),
+        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+
+
 def test_the_normalizer_offset_is_nobody_s_and_is_not_negligible():
-    """With every alpha at zero and no corroboration the sources contribute
-    nothing, yet W is not 1 -- mu is a whole-task divisor. Folding that offset
-    into the sources would credit a teacher for an effect it had no part in."""
-    got, _ = _built(alpha=0.0)
+    """With the sources adding nothing beyond the on-task teacher they
+    contribute nothing, yet W is not 1 -- mu is a whole-task divisor. Folding
+    that offset into the sources would credit a teacher for an effect it had no
+    part in."""
+    got = _no_excess()
     assert torch.count_nonzero(got["push_by_source"]) == 0
     moved = (got["weight"] - 1.0).abs().max()
     assert moved > 0.01, "the offset alone should move the weight"
@@ -3815,21 +4018,42 @@ def test_the_normalizer_offset_is_nobody_s_and_is_not_negligible():
     )
 
 
-def test_pre_alpha_activity_separates_a_silent_source_from_a_vetoed_one():
-    """alpha = 0 collapses evidence_by_source to zero for both, and they are
-    opposite findings about the mechanism."""
-    vetoed, _ = _built(alpha=0.0)
-    assert torch.count_nonzero(vetoed["evidence_by_source"]) == 0
-    assert vetoed["activity_by_source"].abs().sum() > 0, "the source did speak"
+def test_activity_separates_a_source_with_nothing_to_add_from_a_gated_one():
+    """``evidence_by_source`` is zero for two opposite reasons and the
+    pre-gate activity is what tells them apart:
 
-    trusted, _ = _built(alpha=1.0)
-    # alpha only scales; it cannot move the pre-alpha reading.
-    assert torch.allclose(
-        trusted["activity_by_source"], vetoed["activity_by_source"], atol=1e-6
+      the sources SPOKE and the on-task teacher already covered it -- the
+      channel is redundant here, and the corroboration is carrying the position;
+      the sources spoke and DISAGREED with each other -- the gate closed, and
+      the position has excess evidence nobody is willing to vouch for.
+
+    Reporting only the applied column makes those the same finding."""
+    covered = _no_excess()
+    assert torch.count_nonzero(covered["evidence_by_source"]) == 0
+    assert covered["activity_by_source"].abs().sum() > 0, "the sources did speak"
+    assert float(covered["q_sim"].max()) == pytest.approx(1.0), "and agreed perfectly"
+    assert float(covered["evidence_shared"].abs().sum()) > 0, "corroboration took it"
+
+    torch.manual_seed(91)
+    bs, resp, k = 4, 3, 5
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    # Loud and exactly opposed: excess on both columns, gate shut on all of it.
+    off = torch.stack([base + 4.0 * (on - base), base - 4.0 * (on - base)], dim=-1)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    split = build_position_weight(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+        ),
+        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
     )
-    assert torch.allclose(
-        trusted["evidence_by_source"], trusted["activity_by_source"], atol=1e-6
-    )
+    assert float(split["q_sim"].max()) == pytest.approx(0.0), "the teachers oppose"
+    assert float(split["source_exclusive"].max()) > 0.0, "there WAS excess to take"
+    assert torch.count_nonzero(split["evidence_by_source"]) == 0
+    assert split["activity_by_source"].abs().sum() > 0
 
 
 def test_the_source_outcome_table_splits_one_source_s_effect_by_outcome():

@@ -50,58 +50,109 @@ The chain, and where each link's scale comes from rather than from a config:
                Dividing by the destination-conditioned RMS would stretch the
                noise of a teacher that barely moves out of domain up to one full
                unit, which is the very thing the deadzone used to suppress.
-``c``          corroboration: the minimum every teacher IN THE RUN guarantees,
-               the on-task one included in both the unanimity test and the
-               minimum. A continuous min rather than a sign test, so a shift
-               that is nearly zero contributes nearly nothing and no deadzone is
-               needed.
-``alpha``      per ordered task pair, the correlation between that source's
-               RESIDUAL support for the tokens the student actually generated
-               and the GRPO advantage of the trajectory it generated them in.
-               Rectified at zero: a source that anti-correlates is vetoed, not
-               inverted.
-``e``          ``|c| + sum_m alpha_m |delta_hat_m|``, the candidate evidence.
+``c``          corroboration: ``delta_hat_d * f``, the on-task teacher's own
+               shift graded by ``f``, the fraction of off-task mass moving the
+               same way. The on-task teacher is the DIRECTION and the CEILING;
+               the other teachers vote on how much of it to believe. A
+               continuous vote rather than a unanimity, and a ceiling rather
+               than a minimum -- see below for what the hard forms cost.
+``x_m``        ``relu(|delta_hat_m| - |delta_hat_d|)``: what source ``m`` says
+               BEYOND what the on-task teacher already says. The boundary
+               between the two channels.
+``q``          ``2 sum_{m<m'} delta_hat_m delta_hat_m' / [(M-1) sum_m
+               delta_hat_m^2]``, clamped at zero: one minus the share of the
+               off-task teachers' energy that is disagreement. The source
+               channel's reliability, computed at the candidate it is applied
+               at.
+``e``          ``|c| + q * sum_m x_m``, the candidate evidence.
 ``W~``         ``1 + sum_v p_teacher(v) e(v)``, the position's raw weight.
 ``W``          ``W~ / mu_d``, where ``mu_d`` is the PREVIOUS step's KL-weighted
                per-task mean. That divisor is what keeps this a redistribution
                instead of a larger ``teacher_kl_loss_coef``.
 
-Two properties of ``e`` are load-bearing and both are pinned by tests.
+Three properties of ``e`` are load-bearing and all three are pinned by tests.
 
 **It is monotone in corroboration.** An earlier draft used
 ``|c| + sum_m alpha_m |delta_hat_m - c|``, subtracting the common part from each
 source. That is right for a target rewrite, where double-adding a shift in log
 space really would double-count probability mass, and wrong here: agreement is
-credited once and debited ``n_off`` times, so for ``alpha > 1/n_off`` a
-CONFLICTING position scores HIGHER than an agreeing one with the same shift
-magnitudes. At ``alpha=1`` the whole thing collapses to
-``sum|delta_hat| - (n_off-1)|c|``, i.e. corroboration is penalised. ``W`` is a
+credited once and debited ``n_off`` times, so a CONFLICTING position scores
+HIGHER than an agreeing one with the same shift magnitudes. ``W`` is a
 dimensionless effort scalar with no conservation law to respect, so the
-subtraction buys nothing; dropping it makes
-``e(unanimous) - e(split) = |c| >= 0`` hold for every ``alpha`` in [0, 1] and
-for a sign flipped on ANY teacher, the on-task one included.
+subtraction buys nothing; without it a unanimity always outscores a split, and
+flipping the ON-TASK teacher's sign costs exactly ``|c|`` -- neither source
+factor reads that sign.
 
-**Corroboration requires every teacher, not just the off-task ones.** ``c`` is
-``1[all teachers share a sign] * sign(d) * min_j |delta_hat_j|`` over
-``{d} u off``, so a candidate earns the bonus only where the whole run moved it
-the same way. The alternative -- unanimity among the off-task teachers alone --
-was tried and is not what this arm runs, because it credits a position where the
-other two tasks decisively OPPOSE the on-task teacher exactly as it credits one
-where they agree with it. The KL that then gets strengthened points at the
-on-task teacher, i.e. at the very opinion the sources contradicted, and it does
-so with no advantage-side evidence behind it: at ``alpha = 0`` a
-``(-1, +3, +2)`` candidate would score 2 instead of 0.
+**The two channels partition the source shift rather than sharing it.** The
+identity is
 
-The price of requiring the on-task teacher to have spoken is real and is
-measured rather than assumed. ``c`` is capped by ``|delta_hat_d|`` and the
-on-task teacher is silent at about 64% of teacher mass (the shipped run's
-``neutral_on_task_silent`` state), so the corroboration channel is quiet across
-most of the support and the ``alpha``-gated source term carries the arm there.
-:func:`decompose_common_residual` therefore also returns the off-task-only
-``common_ev`` and the metrics report what it WOULD have contributed --
-``evidence/shared_offtask_only_*`` beside the applied ``evidence/shared_*`` --
-so the size of the quiet region is a number in the logs. Nothing in the loss
-reads it.
+    |delta_hat_m| = min(|delta_hat_m|, |delta_hat_d|) + relu(|delta_hat_m| - |delta_hat_d|)
+                    \____ what ``c`` is capped at ____/   \_________ ``x_m`` _________/
+
+so each teacher's volume is spent once. This is the correction the shipped run
+forced. There, ``e`` was ``|c| + sum_m alpha_m |delta_hat_m|`` -- the source term
+took the FULL shift at every candidate, with no condition on the on-task teacher
+at all -- and the measurement said what that meant: **53.3% of the source
+channel's mass sat in the ``agree`` state**, the corroboration's own territory,
+against 13.3% in ``on_silent_source_active``, the state the channel was designed
+for. A second copy of the channel beside it, by mass. The split is by MAGNITUDE
+and not by agreement: a candidate where the teachers conflict and the off-task
+one is louder still has an excess and still gets it, because "the on-task shift
+is small and the off-task shift is large" cannot be narrowed to on-task silence
+without a threshold, and ``|delta_hat_d|`` as a continuous ceiling is what
+avoids one.
+
+**The reliability is measured where it is applied.** ``q`` replaces ``alpha``,
+which was the correlation between a source's residual support for the sampled
+tokens and the GRPO advantage of the trajectory they came from -- estimated over
+ROWS, accumulated over the RUN, and applied per TOKEN. Three granularities, and
+the run showed the cost of all three: per-step ``rho`` had a larger standard
+deviation than its own mean at every pair and flipped sign between adjacent
+steps 33-51% of the time at four of the six; two thirds of the two largest
+values survived a length control; ``alpha`` was identically zero for two of the
+six pairs across the entire 131-step window that has a control arm, and reached
+0.24% of its own headroom over that window. An estimator that needs 130 steps to
+leave zero cannot be evaluated in a 300-step run. ``q`` carries no state, needs
+no warm-up, and is a function of this candidate's shifts alone.
+
+``q`` is a normalized inner product and NOT the sign-agreement ratio
+``|sum_m delta_hat_m| / sum_m |delta_hat_m|``, for two reasons the ratio cannot
+fix. A silent teacher scores the ratio a full 1 -- one teacher agreeing with
+itself, credited as corroboration, the exact case :func:`decompose_common_residual`
+has to special-case away for ``common_ev``; here the numerator is a product over
+PAIRS, so silence sends it to zero and the ``n_off < 2`` branch falls out of the
+algebra. And the ratio ignores magnitude entirely, scoring 1 whenever the signs
+agree however lopsided the two shifts are, while ``q`` is ``2r/(1+r^2)`` in
+their size ratio -- 0.60 at 3x, 0.20 at 10x. That matters on this run because
+the off-task pair is systematically lopsided at two of the three destinations
+(``bottleneck_share`` 0.66/0.11 and 0.80/0.15).
+
+**THE ADVANTAGE REACHES NO WEIGHT.** ``alpha_table`` is still threaded through
+:func:`build_position_weight` and the reliability accumulator still runs, so
+``corr_adv_source_effect`` and the GRPO gradient cosines still report whether the
+reward-free rule happened to land where the reward would have. That is now a
+measurement of the mechanism rather than an input to it -- and it buys a source
+channel that is live from step 1 at every destination, where the correlation
+would still be off for the ~70% of ``search`` groups whose rollouts all score
+the same (``informative_group_frac`` 0.302, against 0.937 on ``alfworld``).
+
+Both channels are counterfactualled rather than argued. ``no_shared`` is the
+source alone and ``offtask_shared`` the off-task-only corroboration; the two the
+new form adds are ``ungated_source`` (``q`` forced to 1, so the gate's cost is a
+number) and ``shuffled_gate`` (``q`` recomputed on
+:func:`decorrelated_off_shifts`, the teachers slid past each other). The last is
+the one the design most needs: every teacher here is the same base after RL on a
+different task with the same recipe, so two of them agreeing can be one shared
+generation grammar answering twice rather than two independent findings. Where
+the shuffled gate matches the live one, the independence ``q`` assumes does not
+hold -- and a structural-token mask, if one is wanted, comes out of that ratio
+instead of being written by hand.
+
+The old hard forms are kept as measurement. ``common`` (the all-teacher
+unanimity over a minimum) still feeds the attribution tables and the residual;
+``common_ev`` (the off-task-only version) is still reported beside the applied
+share. Neither reaches the loss. The two are no longer nested, so
+``shared_offtask_only_ratio`` is a comparison rather than a bound.
 
 The signed ``c`` is also what the residual, the reliability estimate and the
 attribution tables are built from, so one decomposition serves all four.
@@ -134,6 +185,9 @@ __all__ = [
     "ADV_MOMENTS",
     "AdvantageReliabilityStats",
     "residual_support_score",
+    "teacher_similarity",
+    "source_exclusive_shift",
+    "decorrelated_off_shifts",
     "POSITION_TERMS",
     "STATE_TERMS",
     "PROBE_ALPHAS",
@@ -508,10 +562,12 @@ def standardize_policy_shifts(
     }
 
 
-def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) -> dict:
+def decompose_common_residual(
+    *, hat_on: torch.Tensor, hat_off: torch.Tensor, eps: float = 1e-12
+) -> dict:
     """Corroboration and residual, from the standardized shifts.
 
-    Returns three things, and they are NOT interchangeable:
+    Returns four things, and they are NOT interchangeable:
 
     ``common``     ``1[all teachers incl. the on-task one share a sign] *
                    sign(hat_on) * min_j |hat_j|``. Signed, on-task inclusive,
@@ -531,6 +587,32 @@ def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
                    part every teacher shares is taken out; the reliability
                    correlation is measured on THIS so that generally-good
                    tokens cannot inflate a single source's credit.
+    ``common_soft`` ``hat_on * f``, ``f = sum_m relu(sign(hat_on) hat_m) /
+                   sum_m |hat_m|``. THE CORROBORATION THE EVIDENCE USES. Same
+                   two properties as ``common`` -- signed with the on-task
+                   teacher, bounded by ``|hat_on|`` -- reached without either of
+                   the two hard gates ``common`` is built from:
+
+                   the UNANIMITY becomes a fraction. One dissenting teacher
+                   lowers ``f`` by its share of the off-task mass instead of
+                   zeroing the candidate, so the run's own measurement of what
+                   the veto costs (``suppression_ratio`` 1.5-4.7x, one teacher
+                   at a time) stops being a counterfactual.
+
+                   the MINIMUM becomes a ceiling. ``|hat_on|`` caps ``c``, not
+                   ``min_j |hat_j|``, so a quiet off-task teacher can no longer
+                   hold the corroboration down to its own volume. What it
+                   exceeds the ceiling by is not discarded either: it is exactly
+                   :func:`source_exclusive_shift`, which the source channel
+                   picks up, so the two channels partition
+                   ``|hat_m| = min(|hat_m|, |hat_on|) + relu(|hat_m| - |hat_on|)``
+                   between them rather than competing for the same mass.
+
+                   Silence still zeroes it, twice over: ``sign(hat_on) = 0``
+                   drives ``f`` to 0 AND ``hat_on`` multiplies through. That is
+                   what keeps ``f``'s numerical noise at a silent on-task
+                   teacher from reaching the weight -- it multiplies something
+                   that is already zero.
 
     No deadzone. The minimum self-attenuates -- a shift near zero drags the
     whole corroboration to near zero whatever its sign does -- so noise costs a
@@ -553,7 +635,130 @@ def decompose_common_residual(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
     else:
         common_ev = torch.zeros_like(hat_on)
 
-    return {"common": common, "common_ev": common_ev, "residual": hat_off - common.unsqueeze(-1)}
+    # The graded rule. ``agree_mass`` is the off-task mass moving the on-task
+    # teacher's way; over the total off-task mass it is the fraction of the
+    # other teachers that corroborate, which is 1 under unanimity and falls
+    # smoothly rather than to zero under partial dissent.
+    off_mass = hat_off.abs().sum(dim=-1)
+    agree_mass = (sign_on.unsqueeze(-1) * hat_off).clamp(min=0.0).sum(dim=-1)
+    frac = torch.where(
+        off_mass > eps, agree_mass / off_mass.clamp(min=eps), torch.zeros_like(agree_mass)
+    )
+    return {
+        "common": common,
+        "common_ev": common_ev,
+        "common_soft": hat_on * frac,
+        "residual": hat_off - common.unsqueeze(-1),
+    }
+
+
+def teacher_similarity(hat_off: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """How alike the OFF-TASK teachers' shifts are here. (bs, resp, k) in [0, 1].
+
+        q = 1 - sum_{m<m'} (hat_m - hat_m')^2 / [ (M-1) sum_m hat_m^2 ]
+          = 2 sum_{m<m'} hat_m hat_m'  / [ (M-1) sum_m hat_m^2 ]
+
+    "One minus the share of the teachers' total energy that is disagreement",
+    clamped at zero. Both forms are the same expression; the second is what is
+    computed, from ``(sum hat)^2 - sum hat^2``, in one pass.
+
+    It replaces the reliability the advantage used to supply, and it is chosen
+    over the obvious sign-agreement ratio ``|sum hat| / sum |hat|`` because that
+    ratio has two failures this one does not:
+
+    a SILENT teacher scores full agreement. With ``hat_2 = 0`` the ratio is
+    ``|hat_1| / |hat_1| = 1``: one teacher agreeing with itself is credited as
+    corroboration, which is the exact case :func:`decompose_common_residual`
+    has to special-case away for ``common_ev``. Here the numerator is a product
+    over PAIRS, so a silent teacher sends it to 0 and the ``n_off < 2`` branch
+    falls out of the algebra instead of being written.
+
+    MAGNITUDE is ignored. The ratio is 1 whenever the signs agree, however
+    lopsided the two shifts are; this one is ``2r/(1+r^2)`` in the ratio ``r`` of
+    their sizes -- 1.0 at parity, 0.60 at 3x, 0.20 at 10x. That matters on this
+    run because the off-task pair is systematically lopsided at two of the three
+    destinations (``bottleneck_share`` 0.66/0.11 and 0.80/0.15), and a rule that
+    calls those full agreement is not measuring agreement.
+
+    ``q <= 1`` is exact, by AM-GM on each pair; the clamp is float hygiene, not
+    a rule. The floor at 0 is the rule: a negative ``q`` is teachers pointing
+    opposite ways, and the source channel has nothing to weight there.
+
+    Not a correlation over rows or over history. It is computed at the candidate
+    it is applied at, from the same tensors the weight is built from, which is
+    the property the advantage-based reliability could not have.
+    """
+    n_off = hat_off.size(-1)
+    if n_off < 2:
+        return torch.zeros(hat_off.shape[:-1], dtype=hat_off.dtype, device=hat_off.device)
+    total = hat_off.sum(dim=-1)
+    energy = (hat_off * hat_off).sum(dim=-1)
+    cross = total * total - energy
+    q = cross / (float(n_off - 1) * energy).clamp(min=eps)
+    return torch.where(energy > eps, q, torch.zeros_like(q)).clamp(min=0.0, max=1.0)
+
+
+def source_exclusive_shift(*, hat_on: torch.Tensor, hat_off: torch.Tensor) -> torch.Tensor:
+    """``relu(|hat_m| - |hat_on|)``. (bs, resp, k, n_off), non-negative.
+
+    What source ``m`` says here BEYOND what the on-task teacher already says.
+    The boundary between the two channels, and the reason they can be added
+    without counting the same evidence twice:
+
+        |hat_m| = min(|hat_m|, |hat_on|) + relu(|hat_m| - |hat_on|)
+                  \_ the corroboration's _/   \_ the source channel's _/
+
+    The left part is what ``common_soft`` is already capped at; only the right
+    part reaches the source term. On the measured state distribution that is the
+    difference between a source channel with 53.3% of its mass sitting in
+    ``agree`` -- a second copy of the corroboration -- and one that keeps the
+    mass the on-task teacher is not covering.
+
+    A magnitude split, not an agreement split: a candidate where the teachers
+    CONFLICT and the off-task one is louder still has an excess, and still gets
+    it. That is the specification -- "the on-task shift is small and the
+    off-task shift is large" -- and it cannot be narrowed to on-task silence
+    without a threshold, which is what ``|hat_on|`` as a continuous ceiling
+    exists to avoid.
+    """
+    return (hat_off.abs() - hat_on.abs().unsqueeze(-1)).clamp(min=0.0)
+
+
+def decorrelated_off_shifts(hat_off: torch.Tensor) -> torch.Tensor:
+    """The off-task planes slid past each other along the response axis.
+
+    The placebo for :func:`teacher_similarity`. Every teacher here is the same
+    base model after RL on a different task with the same recipe, so two of them
+    agreeing is not evidence of two independent findings -- it can be the shared
+    generation grammar answering twice. Rolling each plane by a different offset
+    destroys the position-to-position correspondence while leaving each
+    teacher's own distribution of shifts untouched, so:
+
+        q_sim(rolled) / q_sim  ~ 0   agreement that needed the two teachers to
+                                     be looking at the SAME candidate
+        q_sim(rolled) / q_sim  ~ 1   agreement that survives being paired with
+                                     an arbitrary other position -- grammar, not
+                                     content
+
+    The second is the region where the independence the gate assumes does not
+    hold, and it is measured rather than assumed: a structural-token mask, if
+    one is wanted later, comes out of this ratio instead of being written by
+    hand.
+
+    A within-row roll, not a permutation: deterministic, no generator to thread
+    through, no extra forward. It rolls over padded positions too, which is why
+    this is a diagnostic and never a weight.
+    """
+    n_off, resp = hat_off.size(-1), hat_off.size(1)
+    if n_off < 2 or resp < 2:
+        return hat_off
+    return torch.stack(
+        [
+            torch.roll(hat_off[..., m], shifts=int(((m + 1) * resp) // (n_off + 1)), dims=1)
+            for m in range(n_off)
+        ],
+        dim=-1,
+    )
 
 
 def corroboration_attribution(*, hat_on: torch.Tensor, hat_off: torch.Tensor) -> dict:
@@ -635,45 +840,53 @@ def corroboration_attribution(*, hat_on: torch.Tensor, hat_off: torch.Tensor) ->
 def candidate_kl_evidence(
     *,
     common: torch.Tensor,
-    hat_off: torch.Tensor,
-    source_alpha: torch.Tensor,
+    source_gate: torch.Tensor,
+    exclusive: torch.Tensor,
+    source_scale: float = 1.0,
 ) -> torch.Tensor:
-    """``e = |c| + sum_m alpha_m |hat_delta_m|``. (bs, resp, k), non-negative.
+    """``e = |c| + q * sum_m relu(|hat_m| - |hat_on|)``. (bs, resp, k), non-negative.
 
-    ``c`` is the ALL-TEACHER corroboration -- the on-task teacher included in
-    both the unanimity test and the minimum. A candidate earns the bonus only
-    where every teacher in the run moved it the same way, which is what makes
-    the bonus a statement about shared structure rather than about the other
-    tasks agreeing with each other over the on-task teacher's objection.
+    TWO channels, two factors each, and nothing else. The evidence is the whole
+    of what the weight is built from, so every gate in it multiplies every other
+    one; the arm's own history is the argument for keeping the count down. The
+    shipped mechanism ran ``|c|`` behind a unanimity AND a minimum AND an
+    advantage correlation, and the source channel it was supposed to test
+    reached 0.24% of its own headroom over the 131 steps that have a control.
+    Five [0, 1] gates multiplied together is that failure again with more
+    places for it to hide.
 
-    The consequence is worth stating because it is the cost of that choice: the
-    on-task teacher is silent at about 64% of teacher mass, and ``c`` is capped
-    by its shift, so the corroboration channel is quiet across most of the
-    support. :func:`decompose_common_residual` still returns the off-task-only
-    ``common_ev``, which is reported as a counterfactual so the size of that
-    quiet region is a measurement rather than an assumption -- but nothing in
-    the loss reads it.
+    ``common``       the corroboration, ``common_soft`` from
+                     :func:`decompose_common_residual`. Signed there, absolute
+                     here: a KL term has no direction to carry.
+    ``source_gate``  (bs, resp, k), :func:`teacher_similarity`. WHETHER the
+                     off-task teachers are worth believing at this candidate.
+    ``exclusive``    (bs, resp, k, n_off), :func:`source_exclusive_shift`. WHAT
+                     they add beyond the on-task teacher.
+    ``source_scale`` a plain multiplier on the source channel, for the probe
+                     series only. 1.0 is the shipped value; the training path
+                     never passes anything else.
 
-    Args:
-        common: (bs, resp, k) the on-task-inclusive corroboration from
-            :func:`decompose_common_residual`. Signed there, absolute here: a KL
-            term has no direction to carry.
-        hat_off: (bs, resp, k, n_off) standardized source shifts. The FULL
-            shift, not the residual -- see the module docstring for why
-            subtracting the common part here makes corroboration score lower
-            than conflict once ``alpha`` passes ``1/n_off``.
-        source_alpha: (bs, n_off) or broadcastable, the reliability of each
-            plane's teacher for this row's destination, in [0, 1].
+    The two source factors are not two views of one quantity -- the gate is a
+    second-order statement about how alike the teachers' shifts are, the
+    exclusive shift is a first-order statement about their level -- so a lone
+    loud teacher and two concordant ones are told apart rather than summed.
 
-    The residual is deliberately absent from this signature. ``alpha`` is
-    ESTIMATED from the residual and APPLIED to the full shift, and keeping the
-    residual out of the call is what stops the two from being confused at a call
-    site.
+    NO ADVANTAGE. The reliability the row's reward used to supply is gone from
+    this function and from the loss; ``corr_adv_source_effect`` and the GRPO
+    gradient cosines still report it, which makes "did the reward-free rule
+    happen to agree with the reward" a measurement instead of the rule's own
+    input. What that buys, beyond not fitting the gate to the objective it is
+    supposed to be independent of, is a source channel that is live from step 1
+    at every destination -- the advantage rule was identically zero for two of
+    the six pairs across the whole control window, and would be off for the ~70%
+    of ``search`` groups whose rollouts all score the same.
+
+    The residual is deliberately absent from this signature, as it was from the
+    advantage version: it is what the reliability DIAGNOSTICS are still measured
+    on, and keeping it out of the call is what stops the two from being confused
+    at a call site.
     """
-    a = source_alpha.to(hat_off.dtype)
-    while a.dim() < hat_off.dim():
-        a = a.unsqueeze(1)
-    return common.abs() + (a * hat_off.abs()).sum(dim=-1)
+    return common.abs() + float(source_scale) * source_gate * exclusive.sum(dim=-1)
 
 
 SIDECAR_NAME = "cross_teacher_kl_weight_state.pt"
@@ -1428,6 +1641,14 @@ POSITION_TERMS = (
     "push_shared_sq",
     "push_source_sq",
     "push_cross",
+    # The two source gates as MASS rather than as a rate, so "the mechanism is
+    # quiet here" and "the gates closed here" stop being the same reading. Both
+    # are sum_v p(v) * (...), the same expectation ``evidence`` is, so their
+    # ratios against it and against each other are the pass rates of the two
+    # stages the source now goes through.
+    "source_gross",            # sum_v p sum_m |hat_m|      before either gate
+    "source_exclusive_gross",  # sum_v p sum_m relu(|hat_m| - |hat_on|)
+    "gate_mass",               # sum_v p q_sim
     "available",
 )
 
@@ -1443,18 +1664,32 @@ POSITION_TERMS = (
 # corroborated moves" from "it starved the on-task teacher's own specialism".
 STATE_TERMS = tuple(f"shift_{n}" for n in _STATE_NAMES.values()) + ("shift_norm_offset",)
 
-# What a probe series is for. The training path runs at whatever alpha the
-# reliability statistics produced; these run the same arithmetic at fixed alphas
-# and never touch the loss. Without the top of the bracket a Phase-2 go/no-go
-# would be measuring the corroboration channel alone -- which is structurally the
-# minority one, since the on-task teacher is silent at 64% of teacher mass -- and
-# would say nothing about what the finished mechanism can do.
+# What a probe series is for: the size of the source channel, held next to the
+# size it is. The names are unchanged from the advantage era -- ``alpha000`` is
+# still the corroboration channel alone and still the reading a control arm
+# reproduces -- but the number is now a plain multiplier on the GATED source
+# term, not a reliability. ``alpha100`` is therefore the shipped weight rather
+# than an upper bracket; what the bracket used to say is now
+# ``ungated_source``'s job, which is a counterfactual about the gate and not
+# about the channel's size.
 PROBE_ALPHAS = (0.0, 0.1, 1.0)
 
 # The channel counterfactuals. Named rather than numbered because they are not a
 # series: each removes a different part of the evidence, and reading them as a
 # ladder would suggest an ordering they do not have.
-CHANNEL_PROBES = ("no_shared", "offtask_shared")
+#
+#   no_shared       the source channel alone.
+#   offtask_shared  the off-task-only agreement rule for the corroboration.
+#   ungated_source  q_sim forced to 1. What the similarity gate COSTS, which is
+#                   the number that says whether the gate is selecting or just
+#                   attenuating.
+#   shuffled_gate   q_sim recomputed on :func:`decorrelated_off_shifts`. What
+#                   the gate would have found if the teachers had never been
+#                   looking at the same candidate -- the null the shared base
+#                   and the shared RL recipe can produce on their own. Its ratio
+#                   to the live gate is the only evidence available here that
+#                   agreement means two findings rather than one grammar.
+CHANNEL_PROBES = ("no_shared", "offtask_shared", "ungated_source", "shuffled_gate")
 
 # The per-position scopes. Role comes from the tag scan; turn from the runs of
 # ones in the multi-turn loss mask.
@@ -2274,10 +2509,20 @@ def build_position_weight(
     alpha = alpha_table.to(hat_off.device)
     dst = task_ids.reshape(-1).to(torch.long).clamp(min=0)
     src = off_plane_tasks.to(torch.long).clamp(min=0)
+    # KEPT AND NOT APPLIED. The advantage reliability is a diagnostic now: it is
+    # returned so the outcome tables can still ask whether the reward-free gate
+    # happened to land where the reward would have, and it reaches no evidence,
+    # no probe and no weight in this function.
     row_alpha = alpha[dst.unsqueeze(-1), src]                       # (bs, n_off)
 
+    # The two source factors, at the candidate. Both from the same standardized
+    # shifts everything else here is built from -- no accumulator, no history,
+    # nothing that has to warm up before the channel is live.
+    q_sim = teacher_similarity(hat_off)
+    exclusive = source_exclusive_shift(hat_on=hat_on, hat_off=hat_off)
+
     evidence = candidate_kl_evidence(
-        common=dec["common"], hat_off=hat_off, source_alpha=row_alpha
+        common=dec["common_soft"], source_gate=q_sim, exclusive=exclusive
     )
     # The off-task-only variant, computed and never applied. It answers the one
     # question the all-teacher rule cannot: how much corroboration the on-task
@@ -2285,7 +2530,7 @@ def build_position_weight(
     # nothing. A counterfactual, so it is reported beside the applied share and
     # reaches no weight.
     evidence_offtask_only = candidate_kl_evidence(
-        common=dec["common_ev"], hat_off=hat_off, source_alpha=row_alpha
+        common=dec["common_ev"], source_gate=q_sim, exclusive=exclusive
     )
     pre = position_pre_weight(evidence=evidence, on_task_logprob=on_task_logprob)
     pre = torch.where(avail.reshape(-1, 1), pre, torch.ones_like(pre))
@@ -2318,8 +2563,8 @@ def build_position_weight(
     # W - 1 SPLIT EXACTLY THREE WAYS, made here so every reader gets the same
     # split. W~ = 1 + B_shared + sum_m B_m with
     #
-    #     B_shared = sum_v p(v) |c(v)|          the corroboration channel
-    #     B_m      = sum_v p(v) alpha_m |dhat_m(v)|   source m's own channel
+    #     B_shared = sum_v p(v) |c(v)|                      corroboration
+    #     B_m      = sum_v p(v) q(v) relu(|dhat_m(v)| - |dhat_on(v)|)   source m
     #
     # and W = W~/mu, so
     #
@@ -2337,10 +2582,8 @@ def build_position_weight(
     inv_mu = 1.0 / mu.clamp(min=1e-12)
     ok_evidence = (mu_valid.reshape(-1, 1) & finite_pre & finite_w).to(pre.dtype)
     ok_normalizer = (mu_valid.reshape(-1, 1) & finite_w).to(pre.dtype)
-    evidence_shared_sum = (p_teacher * dec["common"].abs()).sum(dim=-1)
-    evidence_by_source_cand = (
-        p_teacher.unsqueeze(-1) * row_alpha.unsqueeze(1).unsqueeze(1) * hat_off.abs()
-    )
+    evidence_shared_sum = (p_teacher * dec["common_soft"].abs()).sum(dim=-1)
+    evidence_by_source_cand = p_teacher.unsqueeze(-1) * q_sim.unsqueeze(-1) * exclusive
     push_shared = evidence_shared_sum * inv_mu * ok_evidence
     push_by_source = (
         evidence_by_source_cand.sum(dim=2) * inv_mu.unsqueeze(-1) * ok_evidence.unsqueeze(-1)
@@ -2375,9 +2618,19 @@ def build_position_weight(
     # mask, so the only difference from the shipped weight is the channel.
     channels = {
         "no_shared": candidate_kl_evidence(
-            common=torch.zeros_like(dec["common"]), hat_off=hat_off, source_alpha=row_alpha
+            common=torch.zeros_like(dec["common_soft"]),
+            source_gate=q_sim, exclusive=exclusive,
         ),
         "offtask_shared": evidence_offtask_only,
+        "ungated_source": candidate_kl_evidence(
+            common=dec["common_soft"],
+            source_gate=torch.ones_like(q_sim), exclusive=exclusive,
+        ),
+        "shuffled_gate": candidate_kl_evidence(
+            common=dec["common_soft"],
+            source_gate=teacher_similarity(decorrelated_off_shifts(hat_off)),
+            exclusive=exclusive,
+        ),
     }
     channel_pre = {}
     channel_evidence = {}
@@ -2392,8 +2645,8 @@ def build_position_weight(
     probe_evidence = {}
     for a in probe_alphas:
         e_a = candidate_kl_evidence(
-            common=dec["common"], hat_off=hat_off,
-            source_alpha=torch.full_like(row_alpha, float(a)),
+            common=dec["common_soft"], source_gate=q_sim,
+            exclusive=exclusive, source_scale=float(a),
         )
         p_a = position_pre_weight(evidence=e_a, on_task_logprob=on_task_logprob)
         probes[probe_name(a)] = torch.where(avail.reshape(-1, 1), p_a, torch.ones_like(p_a))
@@ -2417,6 +2670,14 @@ def build_position_weight(
         "hat_off": hat_off,
         "common": dec["common"],
         "common_ev": dec["common_ev"],
+        "common_soft": dec["common_soft"],
+        # (bs, resp, k) and (bs, resp, k, n_off): the two source factors, kept
+        # so a caller can cut them the same ways the evidence is cut.
+        "q_sim": q_sim,
+        "source_exclusive": exclusive,
+        # (bs, n_off). The advantage reliability, carried for the diagnostics
+        # and applied to nothing -- see the note at its assignment.
+        "row_alpha": row_alpha,
         # (bs, resp, k) long / (bs, resp, k, 1 + n_off) / (bs, resp, k).
         # Column 0 of ``without`` is the on-task teacher, columns 1.. are the
         # off-task planes in ``off_plane_tasks`` order -- the same layout
@@ -2450,6 +2711,15 @@ def build_position_weight(
         "push_shared": push_shared,                 # (bs, resp)
         "push_by_source": push_by_source,           # (bs, resp, n_off)
         "push_normalizer": push_normalizer,         # (bs, resp)
+        # THE TWO STAGES THE SOURCE PASSES THROUGH, as position mass, so each
+        # one's cost is a ratio and not an inference. All three are the same
+        # expectation ``evidence`` is, over the same p(v):
+        #   source_gross            everything the off-task teachers said
+        #   source_exclusive_gross  what survived the on-task ceiling
+        #   (evidence - shared)     what survived the similarity gate as well
+        "source_gross": (p_teacher.unsqueeze(-1) * hat_off.abs()).sum(dim=(2, 3)),
+        "source_exclusive_gross": (p_teacher.unsqueeze(-1) * exclusive).sum(dim=(2, 3)),
+        "gate_mass": (p_teacher * q_sim).sum(dim=-1),
         "probe_pre_weight": probes,
         "probe_evidence": probe_evidence,
         "channel_pre_weight": channel_pre,
@@ -3169,6 +3439,13 @@ def assert_all_finite(counts: dict) -> None:
         )
 
 
+def _optional_column(built: dict, name: str, like: torch.Tensor) -> torch.Tensor:
+    """A (bs, resp) column the shipped arm has and a counterfactual scope does not."""
+    if name not in built:
+        return torch.zeros_like(like)
+    return built[name].detach().to(torch.float32)
+
+
 def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     """The (bs, resp) columns :data:`POSITION_TERMS` names."""
     w = built["weight"].detach().to(torch.float32)
@@ -3210,6 +3487,13 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
         "push_shared_sq": s_push * s_push,
         "push_source_sq": r_push * r_push,
         "push_cross": s_push * r_push,
+        # Same guard as the partition above, and for the same reason: a
+        # counterfactual scope is handed a pre-weight and an evidence tensor,
+        # never the gate masses, and a scope that published 0.0 for them would
+        # read as "both gates closed here" rather than "not measured here".
+        "source_gross": _optional_column(built, "source_gross", w),
+        "source_exclusive_gross": _optional_column(built, "source_exclusive_gross", w),
+        "gate_mass": _optional_column(built, "gate_mass", w),
         "available": built["available"].reshape(-1, 1).expand_as(w).to(torch.float32),
     }
 
@@ -3668,6 +3952,25 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # bonus IS the arm; near 0 it is decoration and what the run tests is
             # "reliable source activity", not agreement.
             out[f"{head}/evidence/shared_share"] = tot["evidence_shared"] / tot["evidence"]
+        # THE SOURCE CHANNEL'S TWO GATES, each as the share it let through of
+        # what reached it. Reported as a chain rather than as one number because
+        # they fail differently and the fix is different: a low
+        # ``exclusive_pass_rate`` means the on-task teacher already covers what
+        # the sources are saying -- the channel is redundant, not gated -- while
+        # a low ``gate_pass_rate`` means the sources are saying things they do
+        # not agree with each other about, which is the gate working.
+        if tot["source_gross"] > 1e-12:
+            out[f"{head}/evidence/exclusive_pass_rate"] = (
+                tot["source_exclusive_gross"] / tot["source_gross"]
+            )
+            # Inside the same guard, so a counterfactual scope -- which is
+            # handed no gate masses at all -- publishes nothing here instead of
+            # a 0.0 that reads as a closed gate.
+            out[f"{head}/evidence/gate_mean"] = tot["gate_mass"] / n
+        if tot["source_exclusive_gross"] > 1e-12:
+            out[f"{head}/evidence/gate_pass_rate"] = (
+                tot["evidence"] - tot["evidence_shared"]
+            ) / tot["source_exclusive_gross"]
         # WHERE EACH CHANNEL PUTS ITS BUDGET, against where the other one does.
         # Both channels only ever ADD weight, so they cannot fight at a
         # position; they compete for the fixed per-task mean mu preserves, which
