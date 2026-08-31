@@ -160,9 +160,9 @@ def test_the_on_task_teacher_gets_a_slot_and_not_a_self_pair_label():
     task paired with itself, which is the one cell the module's own claim about
     ``|hat_on|`` capping ``c`` lives in."""
     m = _acc(on=[[1.0]], off=[[[4.0, 5.0]]], task_ids=[0], off_planes=[[1, 2]])
-    assert "kl_weight/corroboration/alfworld/on_task/bottleneck_share" in m
+    assert "kl_weight/legacy_hard_common/alfworld/on_task/bottleneck_share" in m
     assert not any("alfworld__on__alfworld" in k for k in m)
-    assert m["kl_weight/corroboration/alfworld/on_task/bottleneck_share"] == pytest.approx(1.0)
+    assert m["kl_weight/legacy_hard_common/alfworld/on_task/bottleneck_share"] == pytest.approx(1.0)
 
 
 def test_the_bottleneck_shares_are_a_partition_of_the_applied_corroboration():
@@ -176,7 +176,7 @@ def test_the_bottleneck_shares_are_a_partition_of_the_applied_corroboration():
         off=[[[4.0, 5.0], [2.0, 8.0]]],
         task_ids=[0], off_planes=[[1, 2]],
     )
-    head = "kl_weight/corroboration/alfworld"
+    head = "kl_weight/legacy_hard_common/alfworld"
     shares = {
         s: m[f"{head}/{s}/bottleneck_share"]
         for s in ("on_task", "search", "webshop") if f"{head}/{s}/bottleneck_share" in m
@@ -196,7 +196,7 @@ def test_a_teacher_can_be_zero_on_bottleneck_and_dominant_on_suppression():
     are here: a teacher that never sets the bonus and cancels it outright."""
     # on +1, search +2 (agrees), webshop -3 (vetoes every unanimity) -> c = 0.
     m = _acc(on=[[1.0]], off=[[[2.0, -3.0]]], task_ids=[0], off_planes=[[1, 2]])
-    head = "kl_weight/corroboration/alfworld"
+    head = "kl_weight/legacy_hard_common/alfworld"
     assert m[f"{head}/shared_mass_mean"] == pytest.approx(0.0)
     # No applied mass to take a share of, so the share keys are absent by
     # design; suppression is still counted, which is the whole point.
@@ -211,7 +211,7 @@ def test_suppression_is_reported_against_the_corroboration_that_survived():
         off=[[[4.0, 5.0], [2.0, -3.0]]],
         task_ids=[0], off_planes=[[1, 2]],
     )
-    head = "kl_weight/corroboration/alfworld"
+    head = "kl_weight/legacy_hard_common/alfworld"
     assert m[f"{head}/shared_mass_mean"] == pytest.approx(0.5), "1 nat over 2 candidates"
     # webshop: candidate 0 it is redundant (|c_-w| = min(1,4) = 1, no lift);
     # candidate 1 dropping it restores min(1,2) = 1. Total lift 1 over applied 1.
@@ -228,7 +228,7 @@ def test_a_near_tie_is_flagged_rather_than_counted_as_a_decision():
     of decisions."""
     m = _acc(on=[[1.0]], off=[[[1.01, 5.0]]], task_ids=[0], off_planes=[[1, 2]],
              tie_epsilon=0.05)
-    head = "kl_weight/corroboration/alfworld"
+    head = "kl_weight/legacy_hard_common/alfworld"
     assert m[f"{head}/on_task/near_tie_share"] == pytest.approx(1.0)
 
     clear = _acc(on=[[1.0]], off=[[[5.0, 6.0]]], task_ids=[0], off_planes=[[1, 2]],
@@ -247,12 +247,12 @@ def test_the_columns_are_filed_under_this_row_s_own_off_task_planes():
         off=[[[1.0, 5.0]], [[1.0, 5.0]]],
         task_ids=[0, 1], off_planes=[[1, 2], [0, 2]],
     )
-    assert m["kl_weight/corroboration/alfworld/search/bottleneck_share"] == pytest.approx(1.0)
-    assert m["kl_weight/corroboration/search/alfworld/bottleneck_share"] == pytest.approx(1.0)
+    assert m["kl_weight/legacy_hard_common/alfworld/search/bottleneck_share"] == pytest.approx(1.0)
+    assert m["kl_weight/legacy_hard_common/search/alfworld/bottleneck_share"] == pytest.approx(1.0)
     # The other side of the gate: webshop was never a DESTINATION here, so it
     # gets no head at all -- distinct from the zeros a consulted-but-redundant
     # teacher reports above.
-    assert not any(k.startswith("kl_weight/corroboration/webshop/") for k in m)
+    assert not any(k.startswith("kl_weight/legacy_hard_common/webshop/") for k in m)
 
 
 def test_masked_positions_and_unavailable_rows_contribute_nothing():
@@ -273,7 +273,7 @@ def test_masked_positions_and_unavailable_rows_contribute_nothing():
         response_mask=torch.tensor([[1.0, 0.0]]),
         task_ids=torch.tensor([0]), off_plane_tasks=torch.tensor([[1, 2]]),
     )
-    head = "kl_weight/corroboration/alfworld"
+    head = "kl_weight/legacy_hard_common/alfworld"
     m = acc.metrics(task_names=TASKS)
     # Unmasked it would be (1 + 3) / 2 = 2.0, and search would hold 3/4 of the
     # bottleneck mass instead of none of it.
@@ -281,6 +281,19 @@ def test_masked_positions_and_unavailable_rows_contribute_nothing():
     assert m[f"{head}/on_task/bottleneck_share"] == pytest.approx(1.0)
     assert m[f"{head}/search/bottleneck_share"] == pytest.approx(0.0)
     assert m[f"{head}/on_task/bottleneck_candidate_frac"] == pytest.approx(1.0)
+
+
+def _student_like(teacher_logprob):
+    """A student plane for :func:`build_position_weight`, distinct from the teacher.
+
+    The measure the weight aggregates against is the STUDENT's mass, not the
+    teacher's, so a fixture that passed the teacher twice would make the two
+    indistinguishable and every test here would pass under the bug the measure
+    was changed to fix. Derived deterministically from the teacher and NOT equal
+    to it: a fixed reversal of the support, which keeps it a valid log-softmax
+    over the same candidates while putting its mass somewhere else.
+    """
+    return torch.log_softmax(teacher_logprob.detach().flip(-1) * 1.3, dim=-1)
 
 
 def test_the_attribution_rides_out_of_build_position_weight():
@@ -295,7 +308,7 @@ def test_the_attribution_rides_out_of_build_position_weight():
             "on": torch.randn((bs, resp, k), generator=g),
             "off": torch.randn((bs, resp, k, n_off), generator=g),
         },
-        on_task_logprob=torch.log_softmax(torch.randn((bs, resp, k), generator=g), dim=-1),
+        on_task_logprob=torch.log_softmax(torch.randn((bs, resp, k), generator=g), dim=-1), student_logprob=_student_like(torch.log_softmax(torch.randn((bs, resp, k), generator=g), dim=-1)), response_mask=None,
         task_ids=torch.tensor([0, 1]),
         off_plane_tasks=torch.tensor([[1, 2], [0, 2]]),
         diag=torch.ones(n_task),

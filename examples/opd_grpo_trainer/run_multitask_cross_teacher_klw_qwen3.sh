@@ -38,12 +38,15 @@ set -x
 #              teacher that barely moves out of domain up to a full unit, which
 #              is what the deadzone used to suppress. The off-diagonal is still
 #              recorded, as off_to_in_domain_ratio.
-#   c          delta_hat_d * f: the ON-TASK teacher's own shift, graded by f,
-#              the fraction of off-task mass moving the same way. The on-task
-#              teacher is the direction and the ceiling; the others vote on how
-#              much of it to believe. A continuous vote, not a unanimity, and a
-#              ceiling, not a minimum over the teachers -- so one quiet source
-#              can no longer hold the corroboration down to its own volume.
+#   c          sign(d) * mean_m min([sign(d) delta_hat_m]_+, |delta_hat_d|):
+#              the on-task teacher is the DIRECTION and the CEILING; each other
+#              teacher votes with what it actually said in that direction,
+#              capped at the ceiling, and the votes are averaged. A continuous
+#              vote, not a unanimity, and a per-teacher cap, not a minimum over
+#              the teachers -- so one quiet source can no longer hold the
+#              corroboration down to its own volume, and cannot be hidden by a
+#              loud one either. Continuous in the off-task volume: as the
+#              sources go quiet so does c, at the same rate.
 #   x_m        relu(|delta_hat_m| - |delta_hat_d|): what source m says BEYOND
 #              what the on-task teacher already says. The boundary between the
 #              two channels, so each teacher's volume is spent exactly once.
@@ -54,7 +57,12 @@ set -x
 #              magnitude agreement and not only sign, and a silent teacher
 #              scores it zero rather than a full 1.
 #   e          |c| + q * sum_m x_m, per candidate.
-#   W~         1 + sum_v p_teacher(v) e(v), per position.
+#   W~         1 + sum_v p_student(v) e(v), per position. The STUDENT's mass,
+#              detached. The loss is a reverse KL, sum_v p_s(v)[log p_s - log
+#              p_d], so p_s(v) is each candidate's share of the KL that W
+#              multiplies. Weighting by the teacher's mass instead -- which an
+#              earlier draft did -- moved the weight least at exactly the
+#              candidates carrying most of the KL.
 #   W          W~ / mu_d, the PREVIOUS step's KL-weighted per-task mean.
 #
 # The normaliser is what keeps this a redistribution. W~ is at least 1
@@ -308,7 +316,7 @@ set -x
 #     much less a teacher moves out of its own domain -- the signal the DIAGONAL
 #     divisor exists to preserve, and which a destination-conditioned divisor
 #     would force to 1 by construction.
-#   adv/{src}__on__{dst}/alpha_applied, with rho, rho_lcb95 and the two partials
+#   adv/{src}__on__{dst}/alpha_diagnostic, with rho, rho_lcb95 and the partials
 #     beside it. NONE OF THEM REACHES THE LOSS ANY MORE -- the source channel is
 #     gated by evidence/gate_mean, computed at the candidate. They are kept
 #     because "did the reward-free rule land where the reward would have" is a
@@ -591,8 +599,17 @@ set -x
 #   CHANNEL COUNTERFACTUALS (against the source series' MAGNITUDE ones):
 #     kl_weight/channel/no_shared/*        the source channel alone -- is the
 #       corroboration term carrying the mechanism, or decoration on top of it?
-#     kl_weight/channel/offtask_shared/*   the off-task-only agreement rule, the
-#       option this arm chose against.
+#     kl_weight/channel/legacy_hard_offtask_shared/*   the PREVIOUS mechanism's
+#       corroboration -- off-task unanimity over a minimum. It differs from the
+#       live channel in three things at once (whether the on-task teacher is
+#       required, unanimity vs a per-teacher average, a minimum over teachers vs
+#       a per-teacher cap), so it is NOT "what requiring the on-task teacher
+#       costs". Kept so the two runs can be compared, named so it cannot be read
+#       as a one-factor ablation. Same for evidence/legacy_hard_offtask_only_*
+#       and for the legacy_hard_common/* attribution tables, whose bottleneck
+#       and suppression columns decompose that rule and not this one -- the
+#       applied rule has no bottleneck teacher, only per-source vote mass, which
+#       is corroboration/{dst}/{src}/applied_share.
 #     kl_weight/channel/ungated_source/*   q forced to 1. What the similarity
 #       gate COSTS, which is what says whether it is selecting or attenuating.
 #     kl_weight/channel/shuffled_gate/*    q recomputed on the off-task planes
@@ -604,6 +621,13 @@ set -x
 #       rather than being written by hand.
 #     Each has its own lagged normaliser, so the comparison is like for like,
 #     and none of them touches the loss.
+#
+#   NOT AN ARM YOU CAN RESUME INTO. The sidecar is version 2 and carries
+#   mechanism="source_similarity_v1"; a checkpoint from the advantage-gated arm
+#   is refused rather than migrated. mu_d is a lagged mean of the PREVIOUS
+#   rule's pre-weight, so a resume across the change would divide this rule's W~
+#   by the other rule's normaliser for as long as the lag lasts, and no metric
+#   would distinguish that from the arm working. Start from step 0.
 #
 #   THE SOURCE CHANNEL'S TWO GATES, as the share each let through:
 #     kl_weight/evidence/exclusive_pass_rate  of everything the off-task

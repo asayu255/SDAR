@@ -37,6 +37,7 @@ try:
         CumulativePolicyShiftRMS,
         PreviousStepTaskKLWeightedMean,
         candidate_kl_evidence,
+        candidate_mass,
         compute_raw_policy_shifts,
         decompose_common_residual,
         decorrelated_off_shifts,
@@ -386,12 +387,9 @@ def test_the_counterfactual_is_reported_beside_the_applied_share():
     kl = torch.rand(*got["weight"].shape) + 0.1
     m = _fold_position(got, kl, ctx["task_ids"])
     assert "kl_weight/evidence/shared_mean" in m
-    assert "kl_weight/evidence/shared_offtask_only_mean" in m
+    assert "kl_weight/evidence/legacy_hard_offtask_only_mean" in m
     assert m["kl_weight/evidence/shared_mean"] >= 0.0
-    ceiling = float(
-        (got["teacher_prob"] * got["hat_on"].abs()).sum(dim=-1).mean()
-    )
-    assert m["kl_weight/evidence/shared_mean"] <= ceiling + 1e-6, (
+    assert torch.all(got["common_soft"].abs() <= got["hat_on"].abs() + 1e-6), (
         "the corroboration is capped by the on-task teacher at every candidate"
     )
 
@@ -435,9 +433,11 @@ def _evidence(on_v, off_v, source_scale=1.0):
 
 # --- the graded corroboration -------------------------------------------------
 def test_the_applied_corroboration_is_the_on_task_shift_under_unanimity():
-    """Not ``min_j |hat_j|``: the quiet teacher agreed, it did not set the size."""
+    """Not ``min_j |hat_j|``: the ceiling is the on-task teacher's own shift, and
+    every source that cleared it votes the full ceiling rather than the quietest
+    one setting the size for all of them."""
     assert float(_one(1.0, [3.0, 2.0])["common_soft"]) == pytest.approx(1.0)
-    assert float(_one(-1.0, [-3.0, -0.01])["common_soft"]) == pytest.approx(-1.0)
+    assert float(_one(-1.0, [-3.0, -3.0])["common_soft"]) == pytest.approx(-1.0)
 
 
 def test_one_dissenting_teacher_grades_the_corroboration_instead_of_zeroing_it():
@@ -445,7 +445,9 @@ def test_one_dissenting_teacher_grades_the_corroboration_instead_of_zeroing_it()
     being a counterfactual: the dissenter costs its share of the off-task mass."""
     assert float(_one(1.0, [3.0, 2.0])["common"]) == pytest.approx(1.0)
     assert float(_one(1.0, [3.0, -2.0])["common"]) == 0.0, "the old rule vetoed"
-    assert float(_one(1.0, [3.0, -2.0])["common_soft"]) == pytest.approx(0.6), "3/(3+2)"
+    assert float(_one(1.0, [3.0, -2.0])["common_soft"]) == pytest.approx(0.5), (
+        "one vote of min(3, 1) = 1 and one of 0, averaged"
+    )
     assert float(_one(1.0, [-3.0, -2.0])["common_soft"]) == 0.0, "all of them dissent"
 
 
@@ -641,34 +643,42 @@ def test_the_collapsed_form_matches_the_explicit_sum_over_the_support_and_tail()
     e = torch.rand(2, 3, 5)
     p = on.exp()
     explicit = (p * (1.0 + e)).sum(-1) + (1.0 - p.sum(-1))
-    assert torch.allclose(position_pre_weight(evidence=e, on_task_logprob=on), explicit, atol=1e-6)
+    assert torch.allclose(position_pre_weight(evidence=e, mass=candidate_mass(on)), explicit, atol=1e-6)
 
 
 def test_no_evidence_leaves_the_position_untouched():
     on = _lp(2, 3, 4, seed=21)
-    got = position_pre_weight(evidence=torch.zeros(2, 3, 4), on_task_logprob=on)
+    got = position_pre_weight(evidence=torch.zeros(2, 3, 4), mass=candidate_mass(on))
     assert torch.allclose(got, torch.ones(2, 3), atol=1e-6)
 
 
-def test_the_teachers_own_mass_decides_how_much_a_candidate_counts():
-    on = torch.log(torch.tensor([[[0.80, 0.01]]]))
-    heavy = position_pre_weight(evidence=torch.tensor([[[1.0, 0.0]]]), on_task_logprob=on)
-    light = position_pre_weight(evidence=torch.tensor([[[0.0, 1.0]]]), on_task_logprob=on)
+def test_the_students_own_mass_decides_how_much_a_candidate_counts():
+    """The STUDENT's, and that is the whole of the correction. The loss is a
+    reverse KL, so a candidate's share of it is the student's probability there;
+    weighting the evidence by the teacher's instead moved the weight most where
+    the KL was smallest."""
+    student = torch.log(torch.tensor([[[0.80, 0.01]]]))
+    heavy = position_pre_weight(
+        evidence=torch.tensor([[[1.0, 0.0]]]), mass=candidate_mass(student)
+    )
+    light = position_pre_weight(
+        evidence=torch.tensor([[[0.0, 1.0]]]), mass=candidate_mass(student)
+    )
     assert float(heavy) == pytest.approx(1.80, abs=1e-5)
     assert float(light) == pytest.approx(1.01, abs=1e-5)
 
 
 def test_the_tail_is_neutral_so_a_thin_support_is_modulated_thinly():
     thin = torch.log(torch.tensor([[[0.05, 0.05]]]))   # 90% of the mass is tail
-    got = position_pre_weight(evidence=torch.full((1, 1, 2), 2.0), on_task_logprob=thin)
+    got = position_pre_weight(evidence=torch.full((1, 1, 2), 2.0), mass=candidate_mass(thin))
     assert float(got) == pytest.approx(1.0 + 0.1 * 2.0, abs=1e-5)
 
 
 def test_the_weight_grows_linearly_in_the_evidence():
     on = _lp(1, 1, 3, seed=22)
     e = torch.rand(1, 1, 3)
-    a = position_pre_weight(evidence=e, on_task_logprob=on) - 1.0
-    b = position_pre_weight(evidence=e * 3.0, on_task_logprob=on) - 1.0
+    a = position_pre_weight(evidence=e, mass=candidate_mass(on)) - 1.0
+    b = position_pre_weight(evidence=e * 3.0, mass=candidate_mass(on)) - 1.0
     assert float(b) == pytest.approx(float(a) * 3.0, abs=1e-6)
 
 
@@ -977,6 +987,19 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (  # noqa: E402
 from verl.trainer.ppo.sign_weights import ScopeTermStats  # noqa: E402
 
 
+def _student_like(teacher_logprob):
+    """A student plane for :func:`build_position_weight`, distinct from the teacher.
+
+    The measure the weight aggregates against is the STUDENT's mass, not the
+    teacher's, so a fixture that passed the teacher twice would make the two
+    indistinguishable and every test here would pass under the bug the measure
+    was changed to fix. Derived deterministically from the teacher and NOT equal
+    to it: a fixed reversal of the support, which keeps it a valid log-softmax
+    over the same candidates while putting its mass somewhere else.
+    """
+    return torch.log_softmax(teacher_logprob.detach().flip(-1) * 1.3, dim=-1)
+
+
 def _built(bs=3, resp=4, k=5, n_off=2, seed=40, normalizer="auto", diag_valid=None, alpha=0.5):
     torch.manual_seed(seed)
     on, base = _lp(bs, resp, k), _lp(bs, resp, k)
@@ -992,7 +1015,8 @@ def _built(bs=3, resp=4, k=5, n_off=2, seed=40, normalizer="auto", diag_valid=No
     elif normalizer is not None:
         norm = normalizer
     got = build_position_weight(
-        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        shifts=shifts, on_task_logprob=on, student_logprob=_student_like(on),
+        response_mask=torch.ones(bs, resp), task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=alpha_table, normalizer=norm,
         diag_valid=torch.ones(3, dtype=torch.bool) if diag_valid is None else torch.as_tensor(diag_valid),
     )
@@ -1017,7 +1041,7 @@ def test_the_state_labels_are_the_shipped_seven_and_report_epsilon_reaches_no_we
     got, ctx = _built()
     assert set(int(x) for x in got["state"].unique().tolist()) <= set(STATE_NAMES)
     loose = build_position_weight(
-        shifts=ctx["shifts"], on_task_logprob=ctx["on"], task_ids=ctx["task_ids"],
+        shifts=ctx["shifts"], on_task_logprob=ctx["on"], student_logprob=_student_like(ctx["on"]), response_mask=None, task_ids=ctx["task_ids"],
         off_plane_tasks=ctx["planes"], diag=torch.ones(3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         alpha_table=torch.full((3, 3), 0.5).fill_diagonal_(0.0),
@@ -1114,7 +1138,7 @@ def test_kl_scale_is_one_on_the_snapshot_the_normaliser_came_from():
         response_mask=torch.ones_like(kl), task_ids=ctx["task_ids"],
     )
     again = build_position_weight(
-        shifts=ctx["shifts"], on_task_logprob=ctx["on"], task_ids=ctx["task_ids"],
+        shifts=ctx["shifts"], on_task_logprob=ctx["on"], student_logprob=_student_like(ctx["on"]), response_mask=None, task_ids=ctx["task_ids"],
         off_plane_tasks=ctx["planes"], diag=torch.ones(3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         alpha_table=torch.full((3, 3), 0.5).fill_diagonal_(0.0),
@@ -1181,7 +1205,7 @@ def test_the_specialist_state_has_a_column_and_is_where_budget_is_taken_from():
         "tail_off": torch.zeros(bs, resp, 2),
     }
     got = build_position_weight(
-        shifts=shifts, on_task_logprob=on, task_ids=torch.zeros(1, dtype=torch.long),
+        shifts=shifts, on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=torch.zeros(1, dtype=torch.long),
         off_plane_tasks=torch.tensor([[1, 2]]), diag=torch.ones(3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         alpha_table=torch.ones(3, 3).fill_diagonal_(0.0),
@@ -1596,11 +1620,22 @@ def test_the_identity_written_by_the_worker_names_the_teachers():
 def test_an_unknown_sidecar_version_is_refused_rather_than_guessed():
     rms, mean, adv = _accumulated()
     blob = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=None, identity=IDENTITY)
-    blob["version"] = 2
+    blob["version"] = 99
     with pytest.raises(AssertionError, match="version"):
         load_sidecar_state(
             blob, rms=rms, mean=mean, adv=adv, identity=IDENTITY,
         )
+    # Version 1 is not "old and probably fine": it is the advantage-gated
+    # mechanism, whose corroboration, source term and normaliser are all
+    # different quantities. Resuming would divide this rule's W~ by the other
+    # rule's lagged mean and no metric would show it.
+    blob["version"] = 1
+    with pytest.raises(AssertionError, match="version"):
+        load_sidecar_state(blob, rms=rms, mean=mean, adv=adv, identity=IDENTITY)
+    fresh = sidecar_state(rms=rms, mean=mean, adv=adv, alpha=None, identity=IDENTITY)
+    fresh["mechanism"] = "something_else"
+    with pytest.raises(AssertionError, match="mechanism"):
+        load_sidecar_state(fresh, rms=rms, mean=mean, adv=adv, identity=IDENTITY)
 
 
 def test_the_worker_writes_it_beside_the_checkpoint_from_rank_zero_only():
@@ -1827,7 +1862,7 @@ def test_the_reliability_pass_runs_on_realistic_shapes_and_files_the_right_cells
         shifts=compute_raw_policy_shifts(
             on_task_logprob=on, off_task_logprobs=off, base_logprob=base
         ),
-        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), diag_valid=torch.ones(3, dtype=torch.bool),
         alpha_table=torch.zeros(3, 3),
         normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
@@ -2147,7 +2182,7 @@ def test_a_non_finite_teacher_neutralises_the_position_and_is_counted():
         base_logprob=on,
     )
     got = build_position_weight(
-        shifts=shifts, on_task_logprob=on, task_ids=torch.zeros(2, dtype=torch.long),
+        shifts=shifts, on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=torch.zeros(2, dtype=torch.long),
         off_plane_tasks=torch.tensor([[1, 2], [1, 2]]), diag=torch.ones(3),
         diag_valid=torch.ones(3, dtype=torch.bool), alpha_table=torch.ones(3, 3),
         normalizer={"mean": torch.ones(3), "valid": torch.ones(3, dtype=torch.bool)},
@@ -2173,7 +2208,7 @@ def test_a_non_finite_normaliser_is_invalid_rather_than_a_nan_in_the_loss():
             on_task_logprob=lp, off_task_logprobs=lp.unsqueeze(-1).expand(1, 1, 2, 2).contiguous(),
             base_logprob=lp,
         ),
-        on_task_logprob=lp, task_ids=torch.zeros(1, dtype=torch.long),
+        on_task_logprob=lp, student_logprob=_student_like(lp), response_mask=None, task_ids=torch.zeros(1, dtype=torch.long),
         off_plane_tasks=torch.tensor([[0, 0]]), diag=torch.ones(1),
         diag_valid=torch.ones(1, dtype=torch.bool), alpha_table=torch.zeros(1, 1),
         normalizer=snap,
@@ -2353,7 +2388,7 @@ def test_the_token_tables_are_driven_from_the_new_arms_own_switches():
     helper = actor[actor.index("def _xt_token_tables"):]
     helper = helper[: helper.index("def _read_sidecar_on_rank_zero")]
     assert 'base_logprob=zero_base' in helper
-    assert 'mass=built["teacher_prob"]' in helper, (
+    assert 'mass=built["mass"]' in helper, (
         "a standardized shift does not exponentiate to a probability"
     )
     assert "per_candidate_shift(" in helper
@@ -2626,6 +2661,7 @@ def test_a_probe_partitions_its_own_shift_not_the_live_arms():
             "weight": pre / mu, "pre_weight": pre, "mu": mu,
             "evidence": got["probe_evidence"][name],
             "state": got["state"], "teacher_prob": got["teacher_prob"],
+            "mass": got["mass"],
         }
         terms = state_shift_terms(probe, kl)
         total = sum(terms[t] for t in STATE_TERMS)
@@ -2969,7 +3005,7 @@ def test_a_source_with_nothing_to_add_is_charged_no_effect():
     planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
     alpha = torch.zeros(3, 3)
     got = build_position_weight(
-        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        shifts=shifts, on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=alpha,
         diag_valid=torch.ones(3, dtype=torch.bool),
         normalizer={"mean": torch.full((3,), 1.1), "valid": torch.ones(3, dtype=torch.bool)},
@@ -3661,7 +3697,7 @@ def test_the_channel_probes_remove_a_channel_rather_than_scaling_one():
     assert set(got["channel_pre_weight"]) == set(CHANNEL_PROBES)
     live = got["pre_weight"]
     no_shared = got["channel_pre_weight"]["no_shared"]
-    off_shared = got["channel_pre_weight"]["offtask_shared"]
+    off_shared = got["channel_pre_weight"]["legacy_hard_offtask_shared"]
     # Dropping the corroboration term can only lower the pre-weight: every term
     # in W~ - 1 is non-negative.
     assert bool((no_shared <= live + 1e-6).all())
@@ -3736,7 +3772,7 @@ def _pair_event_rows(bs=6, resp=4, k=5, n_off=2, per_group=2, seed=120):
     alpha = torch.full((3, 3), 0.6)
     alpha.fill_diagonal_(0.0)
     built = build_position_weight(
-        shifts=shifts, on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        shifts=shifts, on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=task_ids, off_plane_tasks=planes,
         # Not all ones: with a unit divisor the raw and standardized columns are
         # the same number and the test that they are separate would pass on a
         # table that had merged them.
@@ -3784,7 +3820,7 @@ def test_the_pair_event_rows_carry_the_source_specific_columns():
         assert r["pair_state"] in PAIR_STATES
         assert 0.0 < r["p_base"] <= 1.0 and 0.0 < r["p_source"] <= 1.0
         assert 0.0 < r["p_on"] <= 1.0 and 0.0 < r["p_student"] <= 1.0
-        assert r["alpha_source"] == pytest.approx(0.6)
+        assert r["alpha_diagnostic_source"] == pytest.approx(0.6), "reported, not applied"
         assert "context_ids" in r and len(r["context_ids"]) == 5
     # Every stratum is present and they are not the same rows.
     assert {r["stratum"] for r in rows} == set(stats.STRATA)
@@ -3997,7 +4033,7 @@ def _no_excess(seed=90, bs=4, resp=3, k=5):
         shifts=compute_raw_policy_shifts(
             on_task_logprob=on, off_task_logprobs=off, base_logprob=base
         ),
-        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
@@ -4045,7 +4081,7 @@ def test_activity_separates_a_source_with_nothing_to_add_from_a_gated_one():
         shifts=compute_raw_policy_shifts(
             on_task_logprob=on, off_task_logprobs=off, base_logprob=base
         ),
-        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        on_task_logprob=on, student_logprob=_student_like(on), response_mask=None, task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
@@ -4168,7 +4204,7 @@ def test_the_pre_alpha_column_is_not_defaulted_to_the_post_alpha_one():
     m = acc.metrics(task_names=TASKS)
     head = "kl_weight/evidence/search__on__alfworld"
     assert m[f"{head}/source_shift_mean"] == pytest.approx(0.0)
-    assert m[f"{head}/source_activity_pre_alpha_mean"] == pytest.approx(0.75)
+    assert m[f"{head}/source_raw_shift_mean"] == pytest.approx(0.75)
 
     silent = PairEvidenceStats(n_tasks=3, device="cpu")
     silent.update(
@@ -4177,7 +4213,7 @@ def test_the_pre_alpha_column_is_not_defaulted_to_the_post_alpha_one():
         off_plane_tasks=torch.tensor([[1]]),
     )
     ms = silent.metrics(task_names=TASKS)
-    assert ms[f"{head}/source_activity_pre_alpha_mean"] == pytest.approx(0.0)
+    assert ms[f"{head}/source_raw_shift_mean"] == pytest.approx(0.0)
 
 
 def test_the_event_push_columns_add_to_the_total_on_every_row():

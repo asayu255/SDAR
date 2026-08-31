@@ -55,6 +55,19 @@ def _lp(*shape, seed=None):
     return torch.log_softmax(torch.randn(*shape), dim=-1)
 
 
+def _student_like(teacher_logprob):
+    """A student plane for :func:`build_position_weight`, distinct from the teacher.
+
+    The measure the weight aggregates against is the STUDENT's mass, not the
+    teacher's, so a fixture that passed the teacher twice would make the two
+    indistinguishable and every test here would pass under the bug the measure
+    was changed to fix. Derived deterministically from the teacher and NOT equal
+    to it: a fixed reversal of the support, which keeps it a valid log-softmax
+    over the same candidates while putting its mass somewhere else.
+    """
+    return torch.log_softmax(teacher_logprob.detach().flip(-1) * 1.3, dim=-1)
+
+
 def _build(on, off, base, *, bs):
     task_ids = torch.arange(bs) % 3
     planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
@@ -62,7 +75,9 @@ def _build(on, off, base, *, bs):
         shifts=compute_raw_policy_shifts(
             on_task_logprob=on, off_task_logprobs=off, base_logprob=base
         ),
-        on_task_logprob=on, task_ids=task_ids, off_plane_tasks=planes,
+        on_task_logprob=on, student_logprob=_student_like(on),
+        response_mask=torch.ones(on.shape[0], on.shape[1]),
+        task_ids=task_ids, off_plane_tasks=planes,
         diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
         diag_valid=torch.ones(3, dtype=torch.bool),
         normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
@@ -99,7 +114,13 @@ def test_a_source_inside_the_on_task_teachers_shadow_earns_nothing():
     hat_off = torch.tensor([[[[1.5, 1.0]]]])
     assert float(source_exclusive_shift(hat_on=hat_on, hat_off=hat_off).sum()) == 0.0
     dec = decompose_common_residual(hat_on=hat_on, hat_off=hat_off)
-    assert float(dec["common_soft"]) == pytest.approx(2.0), "and the agreement IS paid"
+    # 1.25, not 2.0: each source corroborates with what it actually said, and
+    # they said 1.5 and 1.0. The ceiling is |hat_on| and a teacher that only got
+    # most of the way there does not reach it.
+    assert float(dec["common_soft"]) == pytest.approx(1.25), "and the agreement IS paid"
+    assert float(
+        decompose_common_residual(hat_on=hat_on, hat_off=torch.tensor([[[[2.5, 3.0]]]]))["common_soft"]
+    ) == pytest.approx(2.0), "the ceiling is reached only when both sources clear it"
 
 
 def test_the_source_is_paid_in_full_where_the_on_task_teacher_is_silent():
@@ -262,3 +283,153 @@ def test_the_shuffle_cannot_reach_the_weight():
     assert torch.allclose(rebuilt, got["evidence"], atol=1e-6), (
         "the shipped evidence is the live gate, reproducible from the returned parts"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the corrections a review caught before the run
+# --------------------------------------------------------------------------- #
+def test_the_corroboration_is_continuous_in_the_off_task_volume():
+    """The defect this rule was rewritten to remove, pinned as a counter-example.
+
+    The first draft graded the on-task shift by a RATIO, ``f = sum_m
+    relu(sign(hat_on) hat_m) / sum_m |hat_m|``. A ratio is scale-free in its own
+    arguments, so two off-task teachers that between them moved 0.02 licensed
+    the whole of an on-task shift of 10 -- and every claim in the module about
+    near-zero shifts self-attenuating and about needing no deadzone was false
+    under it. Scaling the sources must scale the corroboration.
+    """
+    on = torch.tensor([[[10.0]]])
+    def c(scale):
+        return float(decompose_common_residual(
+            hat_on=on, hat_off=torch.tensor([[[[1.0, 1.0]]]]) * scale
+        )["common_soft"])
+
+    assert c(1.0) == pytest.approx(1.0)
+    for scale in (1e-1, 1e-2, 1e-3):
+        assert c(scale) == pytest.approx(scale, rel=1e-4), "no floor, no deadzone"
+    ratio = 2 * 0.01 / (2 * 0.01)
+    assert ratio == pytest.approx(1.0), "which is what the ratio form would have scored"
+    assert c(0.0) == 0.0
+
+
+def test_the_corroboration_still_reaches_the_ceiling_and_never_passes_it():
+    on = torch.rand(3, 4, 5) * 4.0 - 2.0
+    for off in (on.unsqueeze(-1) * torch.tensor([9.0, 9.0]), torch.randn(3, 4, 5, 2)):
+        c = decompose_common_residual(hat_on=on, hat_off=off)["common_soft"]
+        assert torch.all(c.abs() <= on.abs() + 1e-6)
+        assert torch.all(torch.sign(c) * torch.sign(on) >= 0), "and keeps the on-task sign"
+
+
+def test_one_loud_source_cannot_hide_anothers_silence():
+    """A mean over teachers, not a max and not a sum. The loud one gets its vote
+    and the silent one gets its zero, and the candidate is credited with the
+    average of the two rather than with the louder of them."""
+    loud_and_silent = float(decompose_common_residual(
+        hat_on=torch.tensor([[[2.0]]]), hat_off=torch.tensor([[[[9.0, 0.0]]]])
+    )["common_soft"])
+    both_loud = float(decompose_common_residual(
+        hat_on=torch.tensor([[[2.0]]]), hat_off=torch.tensor([[[[9.0, 9.0]]]])
+    )["common_soft"])
+    assert loud_and_silent == pytest.approx(1.0)
+    assert both_loud == pytest.approx(2.0)
+
+
+def test_the_per_source_votes_add_to_the_applied_corroboration():
+    """Unlike a minimum over a unanimity, the applied rule HAS a per-source
+    decomposition -- which is what the attribution table is allowed to report."""
+    on = torch.randn(2, 3, 4)
+    off = torch.randn(2, 3, 4, 2)
+    dec = decompose_common_residual(hat_on=on, hat_off=off)
+    assert torch.allclose(
+        dec["common_soft_by_source"].sum(dim=-1), dec["common_soft"], atol=1e-6
+    )
+
+
+def test_the_weight_aggregates_against_the_student_and_not_the_teacher():
+    """The measure, as a difference rather than a docstring. Two builds that
+    differ only in which distribution the candidate expectation is taken against
+    must not produce the same weight -- if they did, the reverse KL's own
+    measure would be unobservable and the correction unverifiable."""
+    torch.manual_seed(13)
+    bs, resp, k = 3, 4, 6
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(2)], dim=-1)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+
+    def build(student):
+        return build_position_weight(
+            shifts=compute_raw_policy_shifts(
+                on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+            ),
+            on_task_logprob=on, student_logprob=student,
+            response_mask=torch.ones(bs, resp),
+            task_ids=task_ids, off_plane_tasks=planes,
+            diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
+            diag_valid=torch.ones(3, dtype=torch.bool),
+            normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
+        )
+
+    student = _lp(bs, resp, k)
+    assert not torch.allclose(build(student)["pre_weight"], build(on)["pre_weight"], atol=1e-4)
+    assert torch.allclose(build(student)["mass"], student.exp(), atol=1e-6)
+    assert not build(student)["mass"].requires_grad, "a coefficient, never a gradient path"
+
+
+def test_the_shuffle_permutes_inside_each_rows_own_response():
+    """Rows have different lengths. A roll over the padded axis moves padding
+    into live positions, and the placebo's gap from the live gate would then
+    carry response length as well as the teacher correspondence it is for."""
+    off = torch.arange(24, dtype=torch.float32).reshape(2, 6, 1, 2)
+    mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0], [1.0] * 6])
+    rolled = decorrelated_off_shifts(off, response_mask=mask)
+    assert torch.equal(rolled[0, 4:], off[0, 4:]), "padding is left where it is"
+    for row, length in ((0, 4), (1, 6)):
+        for m in range(2):
+            assert sorted(rolled[row, :length, 0, m].tolist()) == sorted(
+                off[row, :length, 0, m].tolist()
+            ), "and the live prefix is a permutation of itself"
+    assert not torch.equal(rolled[0, :4], off[0, :4])
+
+
+def test_the_channel_is_omitted_when_it_cannot_be_built_honestly():
+    """No mask, no placebo. A shuffled gate that also moved padding would
+    manufacture the finding it exists to test for."""
+    torch.manual_seed(2)
+    bs, resp, k = 2, 4, 5
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(2)], dim=-1)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    kw = dict(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+        ),
+        on_task_logprob=on, student_logprob=_student_like(on),
+        task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+    )
+    assert "shuffled_gate" not in build_position_weight(**kw)["channel_pre_weight"]
+    with_mask = build_position_weight(response_mask=torch.ones(bs, resp), **kw)
+    assert "shuffled_gate" in with_mask["channel_pre_weight"]
+
+
+def test_the_gates_two_teacher_reading_does_not_survive_a_third():
+    """Documented rather than fixed, and pinned so it cannot be discovered as a
+    surprise. At n_off == 2 -- what the multitask arms run -- ``q`` is what the
+    module says it is; past that, three of its claims weaken."""
+    assert float(teacher_similarity(torch.tensor([[[[3.0, 0.0]]]]))) == 0.0
+    assert float(teacher_similarity(torch.tensor([[[[3.0, 3.0, 0.0]]]]))) > 0.0, (
+        "one silent teacher no longer shuts the gate"
+    )
+    assert float(teacher_similarity(torch.tensor([[[[3.0, 3.0, -1.0]]]]))) > 0.0, (
+        "and a dissenter rides through on the majority: q is one number for all"
+    )
+    twice = torch.tensor([[[[3.0, 3.0]]]])
+    once = torch.tensor([[[[3.0]]]])
+    on = torch.tensor([[[1.0]]])
+    q2 = teacher_similarity(twice)
+    dup = float(q2 * source_exclusive_shift(hat_on=on, hat_off=twice).sum(dim=-1))
+    solo = float(source_exclusive_shift(hat_on=on, hat_off=once).sum(dim=-1))
+    assert dup == pytest.approx(2 * solo), "duplicating a teacher doubles the source"

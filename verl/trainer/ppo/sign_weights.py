@@ -2814,7 +2814,8 @@ PAIR_EVENT_FLOATS = (
     # and the shifts, raw nats and RMS units, never mixed with the above
     "delta_on_raw", "delta_source_raw", "delta_on_std", "delta_source_std",
     # the mechanism at this candidate
-    "alpha_source", "shared_evidence", "source_evidence",
+    "alpha_diagnostic_source", "q_sim", "source_exclusive",
+    "shared_evidence", "shared_evidence_legacy_hard", "source_evidence",
     "pre_weight", "applied_weight",
     # what it cost and what it moved
     "teacher_kl", "source_attributed_kl_shift",

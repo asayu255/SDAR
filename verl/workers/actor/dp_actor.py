@@ -642,7 +642,7 @@ class DataParallelPPOActor(BasePPOActor):
                 # to one of them is the error this table exists to avoid. It is
                 # reported whole by evidence/shared_* and per token by the state
                 # table, and source_shift + shared is the position's total.
-                effect=source_shift, mass=built["teacher_prob"],
+                effect=source_shift, mass=built["mass"],
             )
         if event_stats is not None:
             row_scores = data.get("token_level_scores", None)
@@ -744,8 +744,18 @@ class DataParallelPPOActor(BasePPOActor):
             "p_student": k4(student_topk_logprob.detach().to(torch.float32).exp()),
             "delta_on_raw": k4(raw_on), "delta_source_raw": raw_off,
             "delta_on_std": k4(built["hat_on"]), "delta_source_std": built["hat_off"],
-            "alpha_source": alpha.reshape(bs, 1, 1, n_off).expand(bs, resp, k, n_off),
-            "shared_evidence": k4(built["teacher_prob"] * built["common"].abs()),
+            # Diagnostic, not applied -- see alpha_diagnostic. Kept in the dump
+            # so a row can be read against what the old gate would have said.
+            "alpha_diagnostic_source": alpha.reshape(bs, 1, 1, n_off).expand(bs, resp, k, n_off),
+            "q_sim": k4(built["q_sim"]),
+            "source_exclusive": built["source_exclusive"],
+            # The APPLIED corroboration, on the measure the loss aggregates
+            # against. The hard rule beside it, because a candidate with
+            # common_soft > 0 and common == 0 -- a partial agreement -- did move
+            # the weight, and a dump that carried only the second would show it
+            # as zero shared evidence.
+            "shared_evidence": k4(built["mass"] * built["common_soft"].abs()),
+            "shared_evidence_legacy_hard": k4(built["mass"] * built["common"].abs()),
             "source_evidence": built["evidence_by_source"],
             "pre_weight": p4(built["pre_weight"]), "applied_weight": p4(built["weight"]),
             "teacher_kl": p4(kl32),
@@ -945,7 +955,11 @@ class DataParallelPPOActor(BasePPOActor):
         for (dst, src), row in self._xt_adv.alpha(task_names=task_id_names).items():
             head = f"kl_weight/adv/{src}__on__{dst}"
             now = current.get((dst, src), {})
-            out[f"{head}/alpha_applied"] = row["alpha"]
+            # NOT applied. The weight has been independent of this table since
+            # the source channel moved to teacher_similarity; the series is kept
+            # so "did the reward-free gate land where the reward would have" has
+            # a number, and the name has to say which of the two it is.
+            out[f"{head}/alpha_diagnostic"] = row["alpha"]
             out[f"{head}/n_rollouts_cumulative"] = row["n"]
             out[f"{head}/n_rollouts_current"] = now.get("n", 0.0)
             out[f"{head}/veto_rate"] = float(row["rho"] is not None and row["rho"] < 0)
@@ -2751,12 +2765,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 xt_built = build_position_weight(
                                     shifts=xt_shifts,
                                     on_task_logprob=sign_on_task_logprobs,
+                                    # The measure the candidate expectations are
+                                    # taken against: the loss is a reverse KL,
+                                    # so a candidate's share of it is the
+                                    # STUDENT's mass there. Detached inside.
+                                    student_logprob=student_topk_logprobs,
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                     diag=xt_rms_snapshot[0],
                                     diag_valid=xt_rms_snapshot[1],
                                     alpha_table=xt_alpha_snapshot,
                                     normalizer=xt_mean_snapshot,
+                                    response_mask=response_mask,
                                     report_epsilon=xt_report_eps,
                                 )
                                 xt_nonfinite[0] += xt_built["nonfinite"]
@@ -3182,7 +3202,8 @@ class DataParallelPPOActor(BasePPOActor):
                             xt_corr_attr_stats.update(
                                 attribution=xt_built["attribution"],
                                 common=xt_built["common"],
-                                teacher_prob=xt_built["teacher_prob"],
+                                teacher_prob=xt_built["mass"],
+                                applied_by_source=xt_built["common_soft_by_source"],
                                 response_mask=response_mask, task_ids=task_ids,
                                 off_plane_tasks=data["sign_off_tasks"],
                             )
@@ -3240,7 +3261,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     # the live ones by construction.
                                     "evidence": xt_built["probe_evidence"][name],
                                     "state": xt_built["state"],
-                                    "teacher_prob": xt_built["teacher_prob"],
+                                    "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
                                     "available": xt_built["available"],
                                     "evidence_shared": xt_built["evidence_shared"],
                                     "evidence_shared_offtask_only": xt_built[
@@ -3275,7 +3296,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     "weight": pre / mu_c, "pre_weight": pre, "mu": mu_c,
                                     "evidence": xt_built["channel_evidence"][name],
                                     "state": xt_built["state"],
-                                    "teacher_prob": xt_built["teacher_prob"],
+                                    "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
                                     "available": xt_built["available"],
                                     "evidence_shared": xt_built["evidence_shared"],
                                     "evidence_shared_offtask_only": xt_built[
