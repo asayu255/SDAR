@@ -22,6 +22,7 @@ Two gates:
 
 import os
 import re
+import shlex
 
 import pytest
 
@@ -58,6 +59,14 @@ def _overrides(path):
     not continue. `$@` is the caller's trailing overrides and `$HOME` is expanded
     by the shell before Hydra sees it, so do both here too -- and `${VAR:+...}`
     likewise, for the optional RUN_TAG suffix on the run's own directories.
+
+    Split with :func:`shlex.split`, which is the rule bash applies: a quoted
+    argument survives its own spaces. A plain ``str.split`` tore
+    ``"env.multitask.val_per_task_batch_size={search: 252}"`` into ``{search:``
+    and ``252}``, dropped the half without an ``=``, and handed Hydra the other
+    half -- so a structured override that the shell passes as ONE argv element
+    failed to parse here and took the intent-lock check for both cross-teacher
+    arms down with it. The scripts were fine; this parser was not.
     """
     text = open(os.path.join(REPO, path)).read()
     marker = re.search(r"python3 -m verl\.trainer\.main_\w+", text)
@@ -100,7 +109,10 @@ def _overrides(path):
             value = value[1:-1]
         return f"{key}={value}"
 
-    return [_unquote(os.path.expandvars(tok)) for tok in cmd.split() if "=" in tok]
+    # _unquote still runs: shlex strips the OUTER pair, and the scripts nest a
+    # second one ("'{alfworld:0.1,...}'") where the inner quotes are what make
+    # the value a dict rather than one opaque token.
+    return [_unquote(os.path.expandvars(tok)) for tok in shlex.split(cmd) if "=" in tok]
 
 
 @pytest.mark.parametrize("script", COMPOSED_SCRIPTS)
