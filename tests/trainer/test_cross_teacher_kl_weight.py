@@ -2748,8 +2748,7 @@ def test_the_role_columns_are_the_same_ones_the_task_cut_gets():
     src = _update_policy_source()
     # Exactly one call each, and it is the assignment: any second one would be a
     # second definition of the same columns.
-    assert src.count("xt_position_terms(xt_built, teacher_kld)") == 1, "one call"
-    assert src.count("xt_pos_cols = xt_position_terms(xt_built, teacher_kld)") == 1
+    assert src.count("xt_pos_cols = xt_position_terms(") == 1, "one call"
     assert src.count("xt_state_shift_terms(xt_built, teacher_kld)") == 1, "one call"
     assert src.count("xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)") == 1
     for user in (
@@ -3696,7 +3695,7 @@ def test_the_channel_probes_remove_a_channel_rather_than_scaling_one():
     got, _ = _built(alpha=0.5)
     assert set(got["channel_pre_weight"]) == set(CHANNEL_PROBES)
     live = got["pre_weight"]
-    no_shared = got["channel_pre_weight"]["no_shared"]
+    no_shared = got["channel_pre_weight"]["source_only"]
     off_shared = got["channel_pre_weight"]["legacy_hard_offtask_shared"]
     # Dropping the corroboration term can only lower the pre-weight: every term
     # in W~ - 1 is non-negative.
@@ -3705,7 +3704,7 @@ def test_the_channel_probes_remove_a_channel_rather_than_scaling_one():
     # And the off-task-only rule is the counterfactual the arm chose against, so
     # it is a different number from both.
     assert float((off_shared - live).abs().sum()) > 0
-    assert got["channel_evidence"]["no_shared"].shape == got["evidence"].shape
+    assert got["channel_evidence"]["source_only"].shape == got["evidence"].shape
 
 
 def test_a_channel_probe_is_zero_where_the_position_is_unavailable():

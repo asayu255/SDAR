@@ -2875,12 +2875,20 @@ class PairEventSamples:
                    first is about the evidence, the second about the effect on
                    the student, and keeping both is what lets the write-up say
                    which token supplied the reason and which token moved.
+    ``top_source_push``
+                   the largest ``|R_m g0|`` -- where THIS SOURCE's own channel
+                   moved a logit. The stratum above ranks on the whole
+                   mechanism's ``(W - 1) g0``, which carries the corroboration,
+                   the other sources and the normaliser as well, so an event
+                   sampled into the Search-on-AlfWorld cell by ``top_push`` may
+                   have been moved by anything except Search. This one cannot
+                   be: it is that source's exact share of the push.
     ``spread``     a deterministic hash sample, so the median event is
                    represented and a mechanism whose extremes are
                    unrepresentative is visible as such.
     """
 
-    STRATA = ("top_shift", "top_push", "spread")
+    STRATA = ("top_shift", "top_push", "top_source_push", "spread")
     _HASH = 2654435761
 
     def __init__(self, *, n_tasks: int, per_group: int = 4, context: int = 8, device=None):
@@ -2900,7 +2908,8 @@ class PairEventSamples:
         return dst * (self.n_tasks - 1) + src - (src > dst).to(torch.long)
 
     def update(self, *, columns: dict, group: torch.Tensor, valid: torch.Tensor,
-               context_ids: torch.Tensor, shift: torch.Tensor, push: torch.Tensor) -> None:
+               context_ids: torch.Tensor, shift: torch.Tensor, push: torch.Tensor,
+               source_push: torch.Tensor = None) -> None:
         """Take this micro-batch's slate.
 
         Args:
@@ -2912,6 +2921,10 @@ class PairEventSamples:
             context_ids: (bs, resp, k, n_off, 2 * context + 1).
             shift: the ``top_shift`` ranking key.
             push: the ``top_push`` ranking key.
+            source_push: the ``top_source_push`` ranking key -- this source's own
+                share of the added logit push. None falls back to ``push``,
+                which makes the stratum a duplicate of ``top_push`` rather than
+                a silent misattribution.
 
         Sync-free: ``per_group`` topk calls over a masked score, and small device
         tensors appended to a list. Nothing is read to the host until
@@ -2934,6 +2947,9 @@ class PairEventSamples:
         keys = {
             "top_shift": shift.reshape(-1).abs().to(torch.float64),
             "top_push": push.reshape(-1).abs().to(torch.float64),
+            "top_source_push": (
+                push if source_push is None else source_push
+            ).reshape(-1).abs().to(torch.float64),
             "spread": ((idx * self._HASH) % 2147483647).to(torch.float64),
         }
         take = min(self.per_group, n)

@@ -78,6 +78,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     pair_state_index,
     OPD_ROLE_CUT_SUFFIXES as XT_OPD_ROLE_CUT_SUFFIXES,
     ROLE_CUT_SUFFIXES as XT_ROLE_CUT_SUFFIXES,
+    TASK_ROLE_CUT_SUFFIXES as XT_TASK_ROLE_CUT_SUFFIXES,
     ROLE_SCOPE_NAMES as XT_ROLE_SCOPE_NAMES,
     TURN_CUT_SUFFIXES as XT_TURN_CUT_SUFFIXES,
     select_metrics as xt_select_metrics,
@@ -781,6 +782,10 @@ class DataParallelPPOActor(BasePPOActor):
             context_ids=ctx.reshape(bs, resp, 1, 1, -1).expand(bs, resp, k, n_off, 2 * width + 1),
             shift=src_shift,
             push=k4(extra),
+            # THIS source's own share of the added push, so an event sampled
+            # into the Search-on-AlfWorld cell was moved by Search and not by
+            # the corroboration, the other source or the normaliser.
+            source_push=extra_src,
         )
 
     def _read_sidecar_on_rank_zero(self, path):
@@ -2131,6 +2136,20 @@ class DataParallelPPOActor(BasePPOActor):
             PositionScopeTermStats(names=XT_GRAD_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev)
             if xt_on else None
         )
+        # THE CROSS. "AlfWorld" and "reasoning" are each one axis of the same
+        # table and neither says whether the arm's budget on AlfWorld went to
+        # reasoning or to the tags around it -- which is the difference between
+        # transferring task knowledge and agreeing about formatting. Three tasks
+        # by six roles is eighteen scopes on the SAME columns the two marginals
+        # already use, so the rows sum back to both of them.
+        xt_task_role_stats = (
+            PositionScopeTermStats(
+                names=XT_POSITION_TERMS,
+                n_scopes=n_task * len(XT_ROLE_SCOPE_NAMES),
+                device=sign_dev,
+            )
+            if xt_on else None
+        )
         xt_turn_stats = (
             PositionScopeTermStats(names=XT_POSITION_TERMS, n_scopes=XT_TURN_BUCKETS, device=sign_dev)
             if xt_on else None
@@ -2160,6 +2179,15 @@ class DataParallelPPOActor(BasePPOActor):
         # single-axis tables cannot make between "who supplied the push" and
         # "which rollouts it went to".
         xt_source_outcome_stats = (
+            SourceOutcomeStats(n_tasks=n_task, device=sign_dev) if xt_on else None
+        )
+        # THE SAME QUESTION FOR THE OTHER CHANNEL, and the same class: the
+        # applied corroboration decomposes per source now, so "did Search's
+        # agreement with AlfWorld's own teacher go to the rollouts that scored"
+        # is the same arithmetic on a different column. Under the previous rule
+        # it was not askable at all -- a minimum over a unanimity has no per
+        # source share -- which is why only the exclusive channel had one.
+        xt_corroboration_outcome_stats = (
             SourceOutcomeStats(n_tasks=n_task, device=sign_dev) if xt_on else None
         )
         # The per-token side, on the arm's own switches rather than the sign
@@ -3127,7 +3155,29 @@ class DataParallelPPOActor(BasePPOActor):
                             # histogram all decompose the SAME columns, and three
                             # copies of the arithmetic is how three views of one
                             # number come to disagree.
-                            xt_pos_cols = xt_position_terms(xt_built, teacher_kld)
+                            # row_weight and coef so the channel columns come
+                            # out as objective and not only as nats: the tasks
+                            # do not enter the loss with the same share, and the
+                            # distillation term enters it at 0.01.
+                            # The SAME reverse KL against the BASE model, on the
+                            # same support. W multiplies the on-task teacher's
+                            # KL, and hat_on is that teacher measured against the
+                            # base, so wherever hat_on is small the two KLs are
+                            # the same number and raising W is a pull toward the
+                            # base rather than toward anything the RL wrote.
+                            # That is the source channel's own region by
+                            # construction; this makes it a measurement. One
+                            # top-k KL on tensors already gathered.
+                            xt_base_kl = topk_kl_per_token(
+                                student_topk_logprob=student_topk_logprobs,
+                                teacher_topk_logprob=base_logprob,
+                            )
+                            xt_pos_cols = xt_position_terms(
+                                xt_built, teacher_kld,
+                                row_weight=task_loss_weight,
+                                coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                base_kl=xt_base_kl,
+                            )
                             xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)
                             xt_position_stats.update(
                                 xt_pos_cols, response_mask=response_mask, task_ids=task_ids,
@@ -3152,6 +3202,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 xt_role_position_stats.update(
                                     xt_pos_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
                                 )
+                                if xt_task_role_stats is not None:
+                                    # task * n_roles + role. Role is a property
+                                    # of the position and task of the row, so
+                                    # the cross is one index and not a second
+                                    # accumulator class. It is the cut the
+                                    # pooled role table cannot make: "the arm
+                                    # spent its source budget on tag tokens" and
+                                    # "on WebShop's tag tokens" are different
+                                    # findings, and only the second can be read
+                                    # against WebShop's own score.
+                                    xt_task_role_stats.update(
+                                        xt_pos_cols, response_mask=response_mask,
+                                        scope_ids=torch.where(
+                                            (task_ids.reshape(-1, 1) >= 0) & (xt_roles_mb >= 0),
+                                            task_ids.reshape(-1, 1) * len(XT_ROLE_SCOPE_NAMES)
+                                            + xt_roles_mb,
+                                            torch.full_like(xt_roles_mb, -1),
+                                        ),
+                                    )
                                 xt_role_state_stats.update(
                                     xt_state_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
                                 )
@@ -3181,6 +3250,17 @@ class DataParallelPPOActor(BasePPOActor):
                                 # this large and the shift near zero means alpha
                                 # refused what it did say.
                                 activity=xt_built["activity_by_source"].sum(dim=2),
+                                # AND THE SHARED CHANNEL'S OWN SPLIT. The old
+                                # corroboration was a minimum over a unanimity
+                                # and had no per-source share to give; this one
+                                # is a mean of per-teacher votes and does, so a
+                                # source that spent its whole agreement inside
+                                # the corroboration no longer reads as having
+                                # contributed nothing.
+                                corroboration=xt_built["corroboration_by_source"],
+                                corroboration_shift=(
+                                    xt_built["corroboration_by_source"] * xt_src_kl
+                                ),
                             )
                             # The same nats, cut by what the source was doing
                             # relative to the on-task teacher.
@@ -3231,6 +3311,27 @@ class DataParallelPPOActor(BasePPOActor):
                             # scored" cannot be joined without this.
                             xt_source_outcome_stats.update(
                                 push_by_source=xt_built["push_by_source"],
+                                teacher_kl=teacher_kld, response_mask=response_mask,
+                                advantage=(
+                                    _row_adv
+                                    if _row_adv is not None
+                                    else torch.zeros(
+                                        teacher_kld.size(0), device=teacher_kld.device
+                                    )
+                                ),
+                                task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                                reward=(None if _scores is None else _scores.sum(dim=-1)),
+                            )
+                            # The same rows for the OTHER channel. Same class,
+                            # different column: the corroboration decomposes per
+                            # teacher now, so it has an outcome table of its own
+                            # for the first time.
+                            xt_corroboration_outcome_stats.update(
+                                push_by_source=(
+                                    xt_built["corroboration_by_source"]
+                                    / xt_built["mu"].clamp(min=1e-12).unsqueeze(-1)
+                                ),
                                 teacher_kl=teacher_kld, response_mask=response_mask,
                                 advantage=(
                                     _row_adv
@@ -3385,6 +3486,12 @@ class DataParallelPPOActor(BasePPOActor):
                                     # and without it the token ranking is quoted
                                     # with an unstated denominator.
                                     g0_tail=_push["g0_tail"],
+                                    # The exact partition of W - 1, so the
+                                    # ranking splits into one list per channel
+                                    # instead of one list for the mechanism.
+                                    push_shared=xt_built["push_shared"],
+                                    push_source=xt_built["push_by_source"].sum(dim=-1),
+                                    push_normalizer=xt_built["push_normalizer"],
                                 )
                             if xt_grad_stats is not None and xt_pg_grad_coef is not None:
                                 # Analytic, so the diagnostic cannot perturb the
@@ -3418,6 +3525,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     # direction and both channels at once.
                                     push_shared=xt_built["push_shared"],
                                     push_source=xt_built["push_by_source"].sum(dim=-1),
+                                    # The third one. It is the only channel that
+                                    # can be negative, so without it the two
+                                    # above do not add up to the arm's departure
+                                    # from unweighted OPD.
+                                    push_normalizer=xt_built["push_normalizer"],
                                 )
                                 xt_grad_stats.update(
                                     xt_grad_cols, response_mask=response_mask, task_ids=task_ids,
@@ -3770,6 +3882,10 @@ class DataParallelPPOActor(BasePPOActor):
             metrics.update(xt_outcome_stats.metrics(task_names=task_id_names))
             xt_source_outcome_stats.all_reduce()
             metrics.update(xt_source_outcome_stats.metrics(task_names=task_id_names))
+            xt_corroboration_outcome_stats.all_reduce()
+            metrics.update(xt_corroboration_outcome_stats.metrics(
+                task_names=task_id_names, head_name="corroboration_outcome",
+            ))
             if xt_grad_stats is not None:
                 xt_grad_stats.all_reduce()
                 metrics.update(gradient_metrics(xt_grad_stats.sums(task_names=task_id_names)))
@@ -3800,6 +3916,19 @@ class DataParallelPPOActor(BasePPOActor):
                 metrics.update(xt_select_metrics(
                     _render(_acc.sums(scope_names=XT_ROLE_SCOPE_NAMES), prefix="kl_weight/role"),
                     XT_ROLE_CUT_SUFFIXES,
+                ))
+            if xt_task_role_stats is not None:
+                xt_task_role_stats.all_reduce()
+                cross_names = [
+                    f"{t}/role/{r}"
+                    for t in task_id_names
+                    for r in XT_ROLE_SCOPE_NAMES
+                ]
+                metrics.update(xt_select_metrics(
+                    position_weight_metrics(
+                        xt_task_role_stats.sums(scope_names=cross_names), prefix="kl_weight"
+                    ),
+                    XT_TASK_ROLE_CUT_SUFFIXES,
                 ))
             # The rows are stashed and published below, beside the sign arm's:
             # the reports are reset to None there, so assigning them here would

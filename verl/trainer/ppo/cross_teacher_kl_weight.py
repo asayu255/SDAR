@@ -205,6 +205,7 @@ __all__ = [
     "POSITION_TERMS",
     "STATE_TERMS",
     "PROBE_ALPHAS",
+    "GATE_BINS",
     "CHANNEL_PROBES",
     "probe_name",
     "PairEvidenceStats",
@@ -238,6 +239,7 @@ __all__ = [
     "TURN_SCOPE_NAMES",
     "ROLE_SCOPE_NAMES",
     "ROLE_CUT_SUFFIXES",
+    "TASK_ROLE_CUT_SUFFIXES",
     "TURN_CUT_SUFFIXES",
     "select_metrics",
     "BELOW_ONE_EDGE",
@@ -740,7 +742,7 @@ def teacher_similarity(hat_off: torch.Tensor, eps: float = 1e-12) -> torch.Tenso
 
 
 def source_exclusive_shift(*, hat_on: torch.Tensor, hat_off: torch.Tensor) -> torch.Tensor:
-    """``relu(|hat_m| - |hat_on|)``. (bs, resp, k, n_off), non-negative.
+    r"""``relu(|hat_m| - |hat_on|)``. (bs, resp, k, n_off), non-negative.
 
     What source ``m`` says here BEYOND what the on-task teacher already says.
     The boundary between the two channels, and the reason they can be added
@@ -1774,6 +1776,69 @@ POSITION_TERMS = (
     "source_gross",            # sum_v p sum_m |hat_m|      before either gate
     "source_exclusive_gross",  # sum_v p sum_m relu(|hat_m| - |hat_on|)
     "gate_mass",               # sum_v p q_sim
+    # AND ITS SHAPE. gate_mean = 0.1 is two mechanisms: every candidate gated to
+    # a tenth, or a tenth of the candidates gated fully. The first is an
+    # attenuator and the second is a selector, and only the second is what the
+    # gate is for. Student-mass weighted, like everything else here, so the bins
+    # are shares of the KL the gate acted on rather than of candidate slots.
+    "gate_mass_gt_000",
+    "gate_mass_gt_025",
+    "gate_mass_gt_050",
+    "gate_mass_gt_075",
+    "gate_mass_gt_090",
+    "support_mass",            # sum_v p(v), the bins' own denominator
+    # THE PLACEBO AS A RATIO RATHER THAN AS A SEPARATE SCOPE. The shuffled
+    # channel already exists as a counterfactual weight, but a reader comparing
+    # two scopes has to divide two separately-normalised means; these are the
+    # same two quantities in one accumulator, so the ratio is exact and cuts by
+    # task and role the way everything else here does.
+    "gate_mass_shuffled",
+    "source_evidence_shuffled",
+    "source_evidence_live",
+    # DOES THE ON-TASK TEACHER SAY ANYTHING THE BASE DOES NOT, WHERE THE ARM
+    # SPENDS? W multiplies KL(student || on-task teacher), and hat_on is the
+    # on-task teacher measured AGAINST THE BASE, so the source channel's own
+    # region -- on-task silent, off-task loud -- is by construction where the
+    # on-task teacher agrees with the base. Raising W there does not transfer
+    # the off-task teachers' direction; it strengthens a pull toward a
+    # distribution that is, at those candidates, the base model's.
+    #
+    # Whether that is what actually happens is measurable and was not measured:
+    # these four columns are D against the on-task teacher and D against the
+    # base, plain and weighted by each channel's own share of W - 1. A source
+    # channel spending its budget where D_base and D_on agree is the base-pull
+    # reading; one spending it where they differ is transferring something the
+    # RL wrote.
+    "kl_base",
+    "kl_base_source_w",
+    "kl_on_source_w",
+    "kl_base_shared_w",
+    "kl_on_shared_w",
+    # THE THREE CHANNELS AS NATS, and then as objective. Everything above is a
+    # coefficient decomposition of W - 1; these are what the coefficients did to
+    # the loss, which is a different question and the one an arm choice rests
+    # on. "AlfWorld's OPD update was 4% corroboration" is not answerable from a
+    # weight share -- the weight has to be multiplied by the KL it weighted, and
+    # then by the task's own loss share and the distillation coefficient, before
+    # two channels or two tasks are on a common footing.
+    #
+    #   kl_added_c   = (C / mu) * D              nats this channel added
+    #   obj_c        = beta * a_i * kl_added_c   its share of the objective
+    #
+    # with C in {B_shared, sum_m B_m, mu(1/mu - 1)} -- the same exact partition
+    # of W - 1 the push columns carry, so the three sum to (W - 1) D and the
+    # residual below has to be zero.
+    "kl_added_shared",
+    "kl_added_source",
+    "kl_added_normalizer",
+    # Only the normaliser can be negative: it is the one channel that TAKES
+    # budget, from the positions with no evidence. An abs column for it alone,
+    # because a share whose parts can cancel is not a share.
+    "kl_added_normalizer_abs",
+    "obj_shared",
+    "obj_source",
+    "obj_normalizer",
+    "push_normalizer",
     "available",
 )
 
@@ -1805,11 +1870,29 @@ STATE_TERMS = tuple(f"shift_{n}" for n in _STATE_NAMES.values()) + ("shift_norm_
 # for the other.
 PROBE_ALPHAS = (0.0, 0.1, 1.0)
 
+# Where the gate's mass sits, not just where its mean does. Open at the bottom
+# (> 0 is "the gate did not shut here") and dense at the top, because the
+# question the bins answer is whether the mass that got through was gated at
+# all.
+GATE_BINS = (0.0, 0.25, 0.5, 0.75, 0.9)
+
 # The channel counterfactuals. Named rather than numbered because they are not a
 # series: each removes a different part of the evidence, and reading them as a
 # ladder would suggest an ordering they do not have.
 #
-#   no_shared       the source channel alone.
+#   SYMMETRIC PAIR, and it is a pair on purpose. The two arms of this mechanism
+#   used to be compared across namespaces -- shared-only was the bottom of the
+#   alpha probe series and source-only was a channel -- which made them two
+#   different kinds of object with two different sets of published columns.
+#   Here they are the same object with the same columns, and ``unweighted`` (W~
+#   identically 1, no evidence at all) is the third leg every comparison needs.
+#   ``unweighted`` is still not the control ARM: it has this run's policy and
+#   this run's history, and a control arm has neither.
+#
+#   shared_only     the corroboration channel alone, e = |c|.
+#   source_only     the source channel alone, e = q sum_m x_m.
+#   unweighted      e = 0 everywhere. The reference the other two are read
+#                   against, on this step's own positions.
 #   legacy_hard_offtask_shared  the OLD hard rule -- off-task unanimity over a
 #                   minimum -- in place of the corroboration. It differs from
 #                   the live channel in three things at once (whether the
@@ -1828,7 +1911,9 @@ PROBE_ALPHAS = (0.0, 0.1, 1.0)
 #                   to the live gate is the only evidence available here that
 #                   agreement means two findings rather than one grammar.
 CHANNEL_PROBES = (
-    "no_shared",
+    "source_only",
+    "shared_only",
+    "unweighted",
     "legacy_hard_offtask_shared",
     "ungated_source",
     "shuffled_gate",
@@ -1867,6 +1952,23 @@ ROLE_CUT_SUFFIXES = (
     "/grpo/source_grad_cosine",
     "/grpo/grad_norm_ratio",
     "/gross_share",                 # the state composition; shares, never nats
+)
+
+# The task x role cross publishes the CHANNEL columns and little else. The two
+# marginals already carry the weight and effect readings; what the cross is for
+# is the one question neither can answer -- of the budget the arm added on THIS
+# task, how much went to the semantic roles and how much to the scaffolding.
+# Eighteen scopes, so the list is short on purpose.
+TASK_ROLE_CUT_SUFFIXES = (
+    "/effect/kl_unweighted",              # where this cell's OPD budget is
+    "/channel/shared/kl_added_raw",
+    "/channel/source/kl_added_raw",
+    "/channel/normalizer/kl_added_raw",
+    "/channel/source/added_abs_share",
+    "/channel/objective_added_total",
+    "/evidence/shared_share",
+    "/evidence/gate_mean",
+    "/position/w_mean",
 )
 
 # Turn is the thinner cut: what is wanted is whether the arm is front-loaded,
@@ -2303,7 +2405,18 @@ class PairEvidenceStats:
     # produce the identical column, and those are opposite findings about the
     # mechanism. Every planned change to how alpha is estimated is an experiment
     # on the gap between these two numbers.
-    TERMS = ("evidence", "shift", "support_mass", "n", "activity")
+    # ``corroboration`` and ``corroboration_shift`` are the SHARED channel's own
+    # per-source split, which the previous rule did not have. ``c`` was a
+    # minimum over a unanimity -- not additive over teachers, so the whole
+    # channel was one anonymous column and "how much corroboration did Search
+    # supply to AlfWorld" had no answer. ``common_soft`` is a mean of
+    # per-teacher capped votes and DOES decompose, exactly, so a source teacher
+    # can now be charged for both of its contributions and the total of the two
+    # is that teacher's whole effect on this destination.
+    TERMS = (
+        "evidence", "shift", "support_mass", "n", "activity",
+        "corroboration", "corroboration_shift",
+    )
 
     def __init__(self, *, n_tasks: int, device):
         self.n_tasks = T = int(n_tasks)
@@ -2311,7 +2424,8 @@ class PairEvidenceStats:
         self._cpu_cache = None
 
     def update(self, *, evidence, shift, response_mask, task_ids, off_plane_tasks,
-               support_mass=None, activity=None) -> None:
+               support_mass=None, activity=None,
+               corroboration=None, corroboration_shift=None) -> None:
         """``evidence`` and ``shift`` are (bs, resp, n_off).
 
         Args:
@@ -2321,6 +2435,10 @@ class PairEvidenceStats:
             activity: (bs, resp, n_off) the pre-alpha evidence, or None to leave
                 that column at zero. NOT defaulted to ``evidence``: the column
                 exists precisely to differ from it.
+            corroboration: (bs, resp, n_off) this source's vote in the SHARED
+                channel, ``sum_v mass(v) |c_m(v)|``, and
+                ``corroboration_shift`` the nats that vote moved. Both None
+                leaves the columns at zero.
         """
         self._cpu_cache = None
         T, K = self.n_tasks, len(self.TERMS)
@@ -2335,6 +2453,14 @@ class PairEvidenceStats:
             torch.zeros_like(e) if activity is None
             else activity.detach().to(torch.float64) * m
         )
+        cor = (
+            torch.zeros_like(e) if corroboration is None
+            else corroboration.detach().to(torch.float64) * m
+        )
+        cor_s = (
+            torch.zeros_like(e) if corroboration_shift is None
+            else corroboration_shift.detach().to(torch.float64) * m
+        )
         dst = task_ids.reshape(-1).to(torch.long)
         for c in range(e.size(-1)):
             src = off_plane_tasks[:, c].reshape(-1).to(torch.long)
@@ -2343,7 +2469,9 @@ class PairEvidenceStats:
                 [e[..., c].sum(dim=1) * ok, s[..., c].sum(dim=1) * ok,
                  cov[..., c].sum(dim=1) * ok,
                  (response_mask.to(torch.float64).sum(dim=1)) * ok,
-                 act[..., c].sum(dim=1) * ok],
+                 act[..., c].sum(dim=1) * ok,
+                 cor[..., c].sum(dim=1) * ok,
+                 cor_s[..., c].sum(dim=1) * ok],
                 dim=-1,
             )
             base = (dst.clamp(min=0) * T + src.clamp(min=0)) * K
@@ -2384,6 +2512,29 @@ class PairEvidenceStats:
                     # measurement runs on the student's top-k and the teacher's
                     # mass is elsewhere.
                     out[f"{head}/tail_mass"] = 1.0 - mass
+                # THIS TEACHER'S TWO CONTRIBUTIONS AND THEIR TOTAL. The pair
+                # tables used to carry only the exclusive one, so a source that
+                # spent all of its agreement inside the corroboration -- which
+                # is where the majority of it sits -- read as having contributed
+                # nothing to the destination.
+                cor_e = float(buf[dst, src, i["corroboration"]]) / n
+                cor_k = float(buf[dst, src, i["corroboration_shift"]]) / n
+                exc_e = float(buf[dst, src, i["evidence"]]) / n
+                exc_k = float(buf[dst, src, i["shift"]]) / n
+                out[f"{prefix}/corroboration_pair/{name(src)}__on__{name(dst)}/evidence"] = cor_e
+                out[f"{prefix}/corroboration_pair/{name(src)}__on__{name(dst)}/kl_added"] = cor_k
+                out[f"{prefix}/exclusive/{name(src)}__on__{name(dst)}/evidence"] = exc_e
+                out[f"{prefix}/exclusive/{name(src)}__on__{name(dst)}/kl_added"] = exc_k
+                out[f"{prefix}/teacher_total/{name(src)}__on__{name(dst)}/evidence"] = (
+                    cor_e + exc_e
+                )
+                out[f"{prefix}/teacher_total/{name(src)}__on__{name(dst)}/kl_added"] = (
+                    cor_k + exc_k
+                )
+                if abs(cor_e) + abs(exc_e) > 1e-12:
+                    out[
+                        f"{prefix}/teacher_total/{name(src)}__on__{name(dst)}/exclusive_share"
+                    ] = abs(exc_e) / (abs(cor_e) + abs(exc_e))
         return out
 
 
@@ -2714,6 +2865,13 @@ def build_position_weight(
     # nothing that has to warm up before the channel is live.
     q_sim = teacher_similarity(hat_off)
     exclusive = source_exclusive_shift(hat_on=hat_on, hat_off=hat_off)
+    # The placebo's gate, or the live one where no mask makes the placebo
+    # honest. Equal to the live gate then, so every ratio built from the two
+    # reads exactly 1 -- "not measured" and not "the shuffle changed nothing".
+    q_shuffled = (
+        q_sim if response_mask is None
+        else teacher_similarity(decorrelated_off_shifts(hat_off, response_mask=response_mask))
+    )
 
     evidence = candidate_kl_evidence(
         common=dec["common_soft"], source_gate=q_sim, exclusive=exclusive
@@ -2811,10 +2969,15 @@ def build_position_weight(
     # Both reuse this call's alphas, its standardization and its availability
     # mask, so the only difference from the shipped weight is the channel.
     channels = {
-        "no_shared": candidate_kl_evidence(
+        "source_only": candidate_kl_evidence(
             common=torch.zeros_like(dec["common_soft"]),
             source_gate=q_sim, exclusive=exclusive,
         ),
+        "shared_only": candidate_kl_evidence(
+            common=dec["common_soft"],
+            source_gate=torch.zeros_like(q_sim), exclusive=exclusive,
+        ),
+        "unweighted": torch.zeros_like(evidence),
         "legacy_hard_offtask_shared": evidence_offtask_only,
         "ungated_source": candidate_kl_evidence(
             common=dec["common_soft"],
@@ -2827,11 +2990,7 @@ def build_position_weight(
         # only agree because they are aligned" wherever the rows differ in
         # length, which is a finding it would have manufactured.
         channels["shuffled_gate"] = candidate_kl_evidence(
-            common=dec["common_soft"],
-            source_gate=teacher_similarity(
-                decorrelated_off_shifts(hat_off, response_mask=response_mask)
-            ),
-            exclusive=exclusive,
+            common=dec["common_soft"], source_gate=q_shuffled, exclusive=exclusive,
         )
     channel_pre = {}
     channel_evidence = {}
@@ -2873,9 +3032,17 @@ def build_position_weight(
         "common_ev": dec["common_ev"],
         "common_soft": dec["common_soft"],
         "common_soft_by_source": dec["common_soft_by_source"],
+        # (bs, resp, n_off): each source's vote in the SHARED channel, on the
+        # same measure and summed over candidates the same way
+        # evidence_by_source is, so the two are addable and their total is that
+        # teacher's whole contribution to W~ - 1.
+        "corroboration_by_source": (
+            mass.unsqueeze(-1) * dec["common_soft_by_source"].abs()
+        ).sum(dim=2),
         # (bs, resp, k) and (bs, resp, k, n_off): the two source factors, kept
         # so a caller can cut them the same ways the evidence is cut.
         "q_sim": q_sim,
+        "q_sim_shuffled": q_shuffled,
         "source_exclusive": exclusive,
         # (bs, n_off). The advantage reliability, carried for the diagnostics
         # and applied to nothing -- see the note at its assignment.
@@ -2924,6 +3091,16 @@ def build_position_weight(
         "source_gross": (mass.unsqueeze(-1) * hat_off.abs()).sum(dim=(2, 3)),
         "source_exclusive_gross": (mass.unsqueeze(-1) * exclusive).sum(dim=(2, 3)),
         "gate_mass": (mass * q_sim).sum(dim=-1),
+        **{
+            f"gate_mass_gt_{int(round(t * 100)):03d}": (mass * (q_sim > t)).sum(dim=-1)
+            for t in GATE_BINS
+        },
+        "support_mass": mass.sum(dim=-1),
+        "gate_mass_shuffled": (mass * q_shuffled).sum(dim=-1),
+        "source_evidence_shuffled": (
+            mass * q_shuffled * exclusive.sum(dim=-1)
+        ).sum(dim=-1),
+        "source_evidence_live": (mass * q_sim * exclusive.sum(dim=-1)).sum(dim=-1),
         "probe_pre_weight": probes,
         "probe_evidence": probe_evidence,
         "channel_pre_weight": channel_pre,
@@ -2998,8 +3175,20 @@ class LogitPushTokens:
     dense-token family is stride-gated: see ``token_stats.every``.
     """
 
+    # ``extra`` is the WHOLE mechanism's addition, ``(W - 1) g0``. It cannot say
+    # which of the three channels moved a token, and the three do different
+    # things: the corroboration and the source only ever ADD, the normaliser
+    # only ever takes. A token at the top of ``extra`` can be there because two
+    # teachers agreed about it, because one of them knew something the on-task
+    # teacher did not, or because it sat at a position with no evidence at all
+    # while the rest of its task had plenty -- three findings that a single
+    # ranking reports as one. The channel columns split it exactly, since
+    # W - 1 = S + R + (1/mu - 1) and each channel's push is its share times g0.
     TERMS = ("n", "extra", "extra_abs", "weighted", "mass", "sampled",
-             "base", "base_abs", "kl_mass", "kl_mass_abs")
+             "base", "base_abs", "kl_mass", "kl_mass_abs",
+             "shared_push", "shared_push_abs",
+             "source_push", "source_push_abs",
+             "norm_push", "norm_push_abs")
 
     def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 32):
         self.vocab_size = V = int(vocab_size)
@@ -3027,7 +3216,7 @@ class LogitPushTokens:
 
     def update(self, *, support_ids, g0, weight, coef_applied_weight, response_mask,
                task_ids=None, sampled_onehot=None, p_student=None, g0_tail=None,
-               gap=None) -> None:
+               gap=None, push_shared=None, push_source=None, push_normalizer=None) -> None:
         """Fold one micro-batch in.
 
         Args:
@@ -3049,6 +3238,11 @@ class LogitPushTokens:
                 :func:`opd_logit_push`. Needed for ``kl_mass`` and for nothing
                 else; None leaves that column at zero rather than deriving it
                 from ``g0``, which would divide by a probability.
+            push_shared / push_source / push_normalizer: (bs, resp), the exact
+                partition of ``W - 1``. Each channel's own addition to a token's
+                logit is its share times ``g0``, so no second pass and no extra
+                tensor is needed. All None leaves the channel columns at zero,
+                which is what an arm with no partition should report.
         """
         assert weight is coef_applied_weight or torch.equal(weight, coef_applied_weight), (
             "LogitPushTokens takes the APPLIED weight for both the class and the "
@@ -3081,6 +3275,14 @@ class LogitPushTokens:
             klm,
             klm.abs(),
         ]
+        for chan in (push_shared, push_source, push_normalizer):
+            c = (
+                torch.zeros_like(g)
+                if chan is None
+                else chan.detach().to(torch.float64).unsqueeze(-1) * g
+            )
+            cols.append(c * m)
+            cols.append(c.abs() * m)
         vals = torch.stack(cols, dim=-1).reshape(-1, K)
         base = (cls * V + tok).reshape(-1) * K
         offs = torch.arange(K, device=vals.device)
@@ -3294,6 +3496,11 @@ class LogitPushTokens:
         for ranked_by, series in (
             ("base_logit_push", cell[:, idx["base_abs"]]),
             ("kl_mass", cell[:, idx["kl_mass_abs"]]),
+            # One ranking per CHANNEL, so "the corroboration reinforced this"
+            # and "the normaliser took budget off this" stop being one list.
+            ("shared_extra_logit_push", cell[:, idx["shared_push_abs"]]),
+            ("source_extra_logit_push", cell[:, idx["source_push_abs"]]),
+            ("normalizer_extra_logit_push", cell[:, idx["norm_push_abs"]]),
         ):
             if float(series.sum()) <= 0:
                 continue
@@ -3318,6 +3525,11 @@ class LogitPushTokens:
                     "weighted_logit_push": float(cell[tok, idx["weighted"]]),
                     "p_student_mean": (float(cell[tok, idx["mass"]]) / n_tok) if n_tok else 0.0,
                     "sampled_count": int(cell[tok, idx["sampled"]]),
+                    # Every channel on every row, so the three rankings are
+                    # comparable token by token rather than three disjoint lists.
+                    "shared_extra_logit_push": float(cell[tok, idx["shared_push"]]),
+                    "source_extra_logit_push": float(cell[tok, idx["source_push"]]),
+                    "normalizer_extra_logit_push": float(cell[tok, idx["norm_push"]]),
                 })
         return rows
 
@@ -3575,7 +3787,16 @@ class SourceOutcomeStats:
             )
         return self._cpu_cache
 
-    def metrics(self, *, task_names=None, prefix: str = "kl_weight") -> dict:
+    def metrics(self, *, task_names=None, prefix: str = "kl_weight",
+                head_name: str = "source_outcome") -> dict:
+        """``head_name`` names the channel these rows decompose.
+
+        The class is the arithmetic "which trajectories did this per-source
+        column's budget go to", and there are two such columns now: the
+        exclusive channel and, since ``common_soft`` decomposes per teacher, the
+        corroboration. One class, two instances, two heads -- rather than a
+        second copy that would drift.
+        """
         buf = self._cpu()
         i = {t: j for j, t in enumerate(SOURCE_OUTCOME_TERMS)}
         name = lambda t: task_names[t] if task_names and t < len(task_names) else f"task{t}"
@@ -3587,7 +3808,7 @@ class SourceOutcomeStats:
                 cells = buf[dst, src]
                 if float(cells[0, i["n"]]) <= 0:
                     continue
-                head = f"{prefix}/source_outcome/{name(src)}__on__{name(dst)}"
+                head = f"{prefix}/{head_name}/{name(src)}__on__{name(dst)}"
                 shares = {}
                 for b, bucket in enumerate(OUTCOME_BUCKETS):
                     cell = cells[b]
@@ -3650,8 +3871,30 @@ def _optional_column(built: dict, name: str, like: torch.Tensor) -> torch.Tensor
     return built[name].detach().to(torch.float32)
 
 
-def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
-    """The (bs, resp) columns :data:`POSITION_TERMS` names."""
+def position_terms(
+    built: dict,
+    teacher_kl: torch.Tensor,
+    *,
+    row_weight: Optional[torch.Tensor] = None,
+    coef: float = 1.0,
+    base_kl: Optional[torch.Tensor] = None,
+) -> dict:
+    """The (bs, resp) columns :data:`POSITION_TERMS` names.
+
+    Args:
+        row_weight: (bs,) the per-task loss normalisation the objective applies
+            to this row, or None for 1. Without it the ``obj_*`` columns are the
+            added nats again rather than the added objective, and two tasks with
+            different loss shares are compared as if they had the same one.
+        coef: ``teacher_kl_loss_coef``. The distillation term enters the
+            objective at 0.01 on these arms, so a channel reported in raw nats
+            is two orders of magnitude away from what it did to the loss.
+        base_kl: (bs, resp) the SAME reverse KL against the BASE model instead
+            of the on-task teacher, or None to leave the novelty columns at
+            zero. It is what makes "the source channel amplifies a pull toward
+            the base" a measurement instead of an argument -- see
+            :data:`POSITION_TERMS`.
+    """
     w = built["weight"].detach().to(torch.float32)
     pre = built["pre_weight"].detach().to(torch.float32)
     kl = teacher_kl.detach().to(torch.float32)
@@ -3698,7 +3941,76 @@ def position_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
         "source_gross": _optional_column(built, "source_gross", w),
         "source_exclusive_gross": _optional_column(built, "source_exclusive_gross", w),
         "gate_mass": _optional_column(built, "gate_mass", w),
+        **{
+            f"gate_mass_gt_{int(round(t * 100)):03d}": _optional_column(
+                built, f"gate_mass_gt_{int(round(t * 100)):03d}", w
+            )
+            for t in GATE_BINS
+        },
+        "support_mass": _optional_column(built, "support_mass", w),
         "available": built["available"].reshape(-1, 1).expand_as(w).to(torch.float32),
+        "gate_mass_shuffled": _optional_column(built, "gate_mass_shuffled", w),
+        "source_evidence_shuffled": _optional_column(built, "source_evidence_shuffled", w),
+        "source_evidence_live": _optional_column(built, "source_evidence_live", w),
+        **_channel_loss_columns(built, kl, w, row_weight=row_weight, coef=coef),
+        **_base_novelty_columns(built, kl, w, base_kl),
+    }
+
+
+def _base_novelty_columns(built, kl, like, base_kl) -> dict:
+    """D against the base, plain and weighted by each channel. See POSITION_TERMS."""
+    if base_kl is None:
+        z = torch.zeros_like(like)
+        return {
+            "kl_base": z, "kl_base_source_w": z, "kl_on_source_w": z,
+            "kl_base_shared_w": z, "kl_on_shared_w": z,
+        }
+    d_base = base_kl.detach().to(torch.float32)
+    sh = _optional_column(built, "push_shared", like)
+    sr = (
+        built["push_by_source"].detach().to(torch.float32).sum(dim=-1)
+        if "push_by_source" in built
+        else torch.zeros_like(like)
+    )
+    return {
+        "kl_base": d_base,
+        "kl_base_source_w": sr * d_base,
+        "kl_on_source_w": sr * kl,
+        "kl_base_shared_w": sh * d_base,
+        "kl_on_shared_w": sh * kl,
+    }
+
+
+def _channel_loss_columns(built, kl, like, *, row_weight, coef) -> dict:
+    """The three channels in nats and in objective. See :data:`POSITION_TERMS`.
+
+    Zero for a counterfactual scope, which has no partition of its own -- the
+    same rule the push columns follow, and for the same reason: a channel split
+    borrowed from the live arm would decompose the wrong weight.
+    """
+    n_push = _optional_column(built, "push_normalizer", like)
+    sh = _optional_column(built, "push_shared", like)
+    sr = (
+        built["push_by_source"].detach().to(torch.float32).sum(dim=-1)
+        if "push_by_source" in built
+        else torch.zeros_like(like)
+    )
+    a = (
+        torch.ones_like(like)
+        if row_weight is None
+        else row_weight.detach().to(torch.float32).reshape(-1, 1).expand_as(like)
+    )
+    beta = float(coef) * a
+    kl_sh, kl_sr, kl_no = sh * kl, sr * kl, n_push * kl
+    return {
+        "kl_added_shared": kl_sh,
+        "kl_added_source": kl_sr,
+        "kl_added_normalizer": kl_no,
+        "kl_added_normalizer_abs": kl_no.abs(),
+        "obj_shared": beta * kl_sh,
+        "obj_source": beta * kl_sr,
+        "obj_normalizer": beta * kl_no,
+        "push_normalizer": n_push,
     }
 
 
@@ -3732,6 +4044,13 @@ GRAD_TERMS = (
     # cosine above cannot say which of the two the reward signal disagrees with
     # -- which is the question an arm choice rests on.
     "g_shared_sq", "g_shared_dot", "g_source_sq", "g_source_dot", "g_cross_dot",
+    # AND THE NORMALISER, which is not bookkeeping. It is the only channel that
+    # can be negative -- it takes budget from the positions with no evidence --
+    # so shared + source does not account for the arm's whole departure from
+    # unweighted OPD, and a run reading only those two would attribute the
+    # missing part to neither. ``added`` is all three at once, so the identity
+    # (W - 1) = S + R + (1/mu - 1) can be checked in gradient space as well.
+    "g_norm_sq", "g_norm_dot", "g_added_sq", "g_added_dot",
 )
 
 
@@ -3806,6 +4125,7 @@ def logit_gradient_terms(
     row_weight: Optional[torch.Tensor] = None,
     push_shared: Optional[torch.Tensor] = None,
     push_source: Optional[torch.Tensor] = None,
+    push_normalizer: Optional[torch.Tensor] = None,
     push: Optional[dict] = None,
     eps: float = 1e-8,
 ) -> dict:
@@ -3902,6 +4222,8 @@ def logit_gradient_terms(
     zero = torch.zeros_like(g0_sq)
     sh = zero if push_shared is None else push_shared.detach().to(torch.float32)
     sr = zero if push_source is None else push_source.detach().to(torch.float32)
+    no = zero if push_normalizer is None else push_normalizer.detach().to(torch.float32)
+    added = sh + sr + no
 
     out = {
         "g_opd_sq": (g_opd * g_opd).sum(dim=-1) + g_opd_tail * g_opd_tail,
@@ -3912,6 +4234,10 @@ def logit_gradient_terms(
         "g_source_sq": sr * sr * g0_sq,
         "g_source_dot": sr * g0_grpo,
         "g_cross_dot": sh * sr * g0_sq,
+        "g_norm_sq": no * no * g0_sq,
+        "g_norm_dot": no * g0_grpo,
+        "g_added_sq": added * added * g0_sq,
+        "g_added_dot": added * g0_grpo,
     }
     if row_weight is not None:
         # Squared for the squared terms AND for the cross term, so the reported
@@ -3974,6 +4300,34 @@ def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # Read it as redundancy -- near 1 the two are the same mechanism
             # twice -- and never as "the channels agree", which it cannot deny.
             out[f"{head}/channel/shared_source_grad_cosine"] = tot["g_cross_dot"] / (sh * src)
+        # The normaliser, and the three together. |S g0| and |R g0| do not add
+        # up to the arm's departure from unweighted OPD: the normaliser is the
+        # one channel that can be negative, so a run reading only the first two
+        # attributes the remainder to nothing.
+        nrm = math.sqrt(max(tot.get("g_norm_sq", 0.0), 0.0))
+        addn = math.sqrt(max(tot.get("g_added_sq", 0.0), 0.0))
+        out[f"{head}/channel/normalizer_grad_norm"] = nrm
+        out[f"{head}/channel/added_total_grad_norm"] = addn
+        if grpo > 0:
+            if nrm > 0:
+                out[f"{head}/grpo/normalizer_grad_cosine"] = tot["g_norm_dot"] / (nrm * grpo)
+            if addn > 0:
+                out[f"{head}/grpo/added_total_grad_cosine"] = tot["g_added_dot"] / (addn * grpo)
+        # ALIASES, because these are analytic gradients in LOGIT space over the
+        # top-k plus the tail -- not parameter gradients. The bare names have a
+        # run's worth of history behind them and are kept; the explicit ones are
+        # what a new reader should be reading.
+        for src_key, dst_key in (
+            ("grpo/grad_norm_opd", "grpo/logit_grad_norm_opd"),
+            ("grpo/grad_norm_grpo", "grpo/logit_grad_norm_grpo"),
+            ("grpo/grad_cosine", "grpo/logit_grad_cosine"),
+            ("grpo/shared_grad_cosine", "grpo/shared_logit_grad_cosine"),
+            ("grpo/source_grad_cosine", "grpo/source_logit_grad_cosine"),
+            ("channel/shared_grad_norm", "channel/shared_logit_grad_norm"),
+            ("channel/source_grad_norm", "channel/source_logit_grad_norm"),
+        ):
+            if f"{head}/{src_key}" in out:
+                out[f"{head}/{dst_key}"] = out[f"{head}/{src_key}"]
     return out
 
 
@@ -4176,6 +4530,92 @@ def position_weight_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
             # handed no gate masses at all -- publishes nothing here instead of
             # a 0.0 that reads as a closed gate.
             out[f"{head}/evidence/gate_mean"] = tot["gate_mass"] / n
+            # The shape, as shares of the student mass the gate ran over. A run
+            # where gt_090 carries most of gt_000 is selecting; one where the
+            # bins fall away smoothly is attenuating.
+            if tot["support_mass"] > 1e-12:
+                for t in GATE_BINS:
+                    tag = f"{int(round(t * 100)):03d}"
+                    out[f"{head}/gate/q_mass_frac_gt_{tag}"] = (
+                        tot[f"gate_mass_gt_{tag}"] / tot["support_mass"]
+                    )
+            # THE PLACEBO, as the ratio it is read as. Near 1 means the gate
+            # opens as wide on teachers that were never looking at the same
+            # candidate -- shared generation grammar, not two findings -- and it
+            # is the only evidence here that the independence q assumes holds at
+            # all. Near 0 means the agreement needed the correspondence.
+            if tot["gate_mass"] > 1e-12:
+                out[f"{head}/gate/shuffled_to_live_gate_ratio"] = (
+                    tot["gate_mass_shuffled"] / tot["gate_mass"]
+                )
+            if tot["source_evidence_live"] > 1e-12:
+                out[f"{head}/gate/shuffled_to_live_source_evidence_ratio"] = (
+                    tot["source_evidence_shuffled"] / tot["source_evidence_live"]
+                )
+        # DOES THE ON-TASK TEACHER SAY ANYTHING THE BASE DOES NOT, WHERE EACH
+        # CHANNEL SPENDS? ``teacher_novelty`` is 1 - D_on/D_base over the scope:
+        # near 0 the on-task teacher and the base are the same distribution
+        # here, so W is amplifying a pull toward the base whatever the evidence
+        # said. The two weighted versions are the same number restricted to
+        # where each channel put its budget, so a source channel whose novelty
+        # is BELOW the scope's own is spending it on exactly the positions where
+        # the teacher has nothing of its own to give.
+        if tot["kl_base"] > 1e-12:
+            out[f"{head}/base/kl_base_mean"] = tot["kl_base"] / n
+            out[f"{head}/base/teacher_novelty"] = 1.0 - tot["kl"] / tot["kl_base"]
+        if tot["kl_base_source_w"] > 1e-12:
+            out[f"{head}/base/source_weighted_novelty"] = (
+                1.0 - tot["kl_on_source_w"] / tot["kl_base_source_w"]
+            )
+        if tot["kl_base_shared_w"] > 1e-12:
+            out[f"{head}/base/shared_weighted_novelty"] = (
+                1.0 - tot["kl_on_shared_w"] / tot["kl_base_shared_w"]
+            )
+        # SAME GATE AS THE PUSH COLUMNS BELOW, and for the same reason: a
+        # counterfactual scope is handed no partition, and three channels each
+        # reporting 0.0 nats would read as "this scope added nothing" rather
+        # than "this scope has no channels to add with".
+        has_partition = tot["push_shared_sq"] > 0.0 or tot["push_source_sq"] > 0.0
+        # WHAT EACH CHANNEL DID TO THE LOSS, which no weight share answers. The
+        # three are the exact partition of (W - 1) D, so their sum is the whole
+        # of what the arm added to this scope's distillation and the residual
+        # below is a check on the arithmetic rather than a finding.
+        added = (
+            tot["kl_added_shared"] + tot["kl_added_source"] + tot["kl_added_normalizer"]
+        )
+        gross_added = (
+            abs(tot["kl_added_shared"])
+            + abs(tot["kl_added_source"])
+            + tot["kl_added_normalizer_abs"]
+        )
+        for cname, raw, obj in () if not has_partition else (
+            ("shared", tot["kl_added_shared"], tot["obj_shared"]),
+            ("source", tot["kl_added_source"], tot["obj_source"]),
+            ("normalizer", tot["kl_added_normalizer"], tot["obj_normalizer"]),
+        ):
+            out[f"{head}/channel/{cname}/kl_added_raw"] = raw / n
+            out[f"{head}/channel/{cname}/objective_contribution"] = obj / n
+            if gross_added > 1e-12:
+                # Against the gross, not the net: the normaliser TAKES budget,
+                # so a net denominator would let the two sides cancel and report
+                # a channel at more than 100% of a total it helped shrink.
+                out[f"{head}/channel/{cname}/added_abs_share"] = (
+                    abs(raw) if cname != "normalizer" else tot["kl_added_normalizer_abs"]
+                ) / gross_added
+        # (W - 1) D, independently formed, minus the three parts. Relative to
+        # the gross so it is readable at any scope size; it is an assertion in
+        # metric form and anything but ~0 means a channel is being double
+        # counted or dropped.
+        if has_partition and gross_added > 1e-12:
+            out[f"{head}/channel/decomposition_residual"] = (
+                (tot["w_kl"] - tot["kl"]) - added
+            ) / gross_added
+        # How much of the scope's OPD budget the arm moved at all, as objective
+        # rather than as nats -- the number "the mechanism is 3% of the update"
+        # is read from.
+        if has_partition:
+            base_obj = tot["obj_shared"] + tot["obj_source"] + tot["obj_normalizer"]
+            out[f"{head}/channel/objective_added_total"] = base_obj / n
         if tot["source_exclusive_gross"] > 1e-12:
             out[f"{head}/evidence/gate_pass_rate"] = (
                 tot["evidence"] - tot["evidence_shared"]

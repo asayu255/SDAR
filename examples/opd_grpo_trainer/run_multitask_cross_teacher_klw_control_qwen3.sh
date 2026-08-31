@@ -597,7 +597,7 @@ set -x
 #     measurement artefact rather than a finding.
 #
 #   CHANNEL COUNTERFACTUALS (against the source series' MAGNITUDE ones):
-#     kl_weight/channel/no_shared/*        the source channel alone -- is the
+#     kl_weight/channel/source_only/*        the source channel alone -- is the
 #       corroboration term carrying the mechanism, or decoration on top of it?
 #     kl_weight/channel/legacy_hard_offtask_shared/*   the PREVIOUS mechanism's
 #       corroboration -- off-task unanimity over a minimum. It differs from the
@@ -628,6 +628,87 @@ set -x
 #   rule's pre-weight, so a resume across the change would divide this rule's W~
 #   by the other rule's normaliser for as long as the lag lasts, and no metric
 #   would distinguish that from the arm working. Start from step 0.
+#
+#   WHAT EACH CHANNEL DID TO THE LOSS. Everything else on this arm is a
+#   decomposition of W - 1, which is a coefficient; these are what the
+#   coefficients did to the objective, and they are the numbers "AlfWorld's OPD
+#   update was N% corroboration" is read from. All three cut by task, and by
+#   task x role.
+#     kl_weight/{task}/channel/{shared,source,normalizer}/kl_added_raw
+#       the nats each channel added, (C/mu) D summed over the scope.
+#     .../objective_contribution   the same, times the task's own loss share and
+#       teacher_kl_loss_coef, so two tasks and the two channels are on one
+#       footing.
+#     .../added_abs_share   each channel's share of the gross. Against the
+#       GROSS, because the normaliser TAKES budget -- a net denominator would
+#       let the two sides cancel.
+#     kl_weight/{task}/channel/decomposition_residual   (W-1)D formed
+#       independently, minus the three, over the gross. It is an assertion in
+#       metric form: anything but ~0 means a channel is dropped or doubled.
+#     kl_weight/{task}/channel/objective_added_total
+#
+#   THE NORMALISER IS A CHANNEL. It is the only one that can be negative -- it
+#   is where the budget the other two spend comes from -- so shared + source
+#   never accounted for the arm's whole departure from unweighted OPD:
+#     kl_weight/{task}/channel/{normalizer,added_total}_grad_norm
+#     kl_weight/{task}/grpo/{normalizer,added_total}_grad_cosine
+#   Every grad_* series here is an ANALYTIC LOGIT gradient over the top-k plus
+#   the tail, not a parameter gradient. The logit_grad_* aliases say so; the
+#   bare names are kept because a run's history is behind them.
+#
+#   DOES THE ON-TASK TEACHER SAY ANYTHING THE BASE DOES NOT, WHERE THE ARM
+#   SPENDS? W multiplies KL(student || on-task teacher) and hat_on is that
+#   teacher measured AGAINST THE BASE, so the source channel's own region --
+#   on-task silent, off-task loud -- is by construction where the two are the
+#   same distribution. Raising W there does not transfer the off-task teachers'
+#   direction; it strengthens a pull toward what is, at those candidates, the
+#   base model. Whether that is what happens is now a number:
+#     kl_weight/{task}/base/teacher_novelty          1 - D_on/D_base, the scope
+#     kl_weight/{task}/base/source_weighted_novelty  the same, restricted to
+#       where the source channel put its budget
+#     kl_weight/{task}/base/shared_weighted_novelty  and the corroboration's
+#   A source novelty BELOW the scope's own is the base-pull reading, measured.
+#
+#   EACH SOURCE TEACHER'S TWO CONTRIBUTIONS AND THEIR TOTAL. The previous
+#   corroboration was a minimum over a unanimity and had no per-source share, so
+#   the pair tables carried only the exclusive channel and a teacher that spent
+#   its whole agreement inside the corroboration read as having contributed
+#   nothing. common_soft is a mean of per-teacher votes and does decompose:
+#     kl_weight/corroboration_pair/{src}__on__{dst}/{evidence,kl_added}
+#     kl_weight/exclusive/{src}__on__{dst}/{evidence,kl_added}
+#     kl_weight/teacher_total/{src}__on__{dst}/{evidence,kl_added,exclusive_share}
+#     kl_weight/corroboration/{dst}/{src}/applied_share
+#     kl_weight/corroboration_outcome/{src}__on__{dst}/*  the SourceOutcomeStats
+#       arithmetic on the other channel: did that teacher's agreement go to the
+#       rollouts that scored.
+#
+#   TASK x ROLE. "AlfWorld" and "reasoning" are two marginals of one table and
+#   neither says whether AlfWorld's budget went to reasoning or to the tags
+#   around it -- which is the difference between transferring task knowledge and
+#   agreeing about formatting:
+#     kl_weight/{task}/role/{role}/channel/{shared,source,normalizer}/kl_added_raw
+#     kl_weight/{task}/role/{role}/channel/source/added_abs_share
+#     kl_weight/{task}/role/{role}/evidence/{shared_share,gate_mean}
+#
+#   THE GATE'S SHAPE, not only its mean. gate_mean = 0.1 is two mechanisms:
+#   every candidate gated to a tenth, or a tenth of them gated fully. Only the
+#   second is what a gate is for.
+#     kl_weight/{task}/gate/q_mass_frac_gt_{000,025,050,075,090}
+#     kl_weight/{task}/gate/shuffled_to_live_gate_ratio
+#     kl_weight/{task}/gate/shuffled_to_live_source_evidence_ratio
+#   The last two are the placebo as a ratio rather than as a second scope. Near
+#   1 means the gate opens as wide on teachers that were never looking at the
+#   same candidate -- shared grammar, not two findings. Without a response mask
+#   they read exactly 1, which is "not measured".
+#
+#   PER-CHANNEL TOKEN RANKINGS. extra_logit_push is the whole mechanism's
+#   addition and cannot say which channel moved a token; W - 1 = S + R +
+#   (1/mu - 1) splits it exactly, so the dump now ranks by each:
+#     ranked_by = shared_extra_logit_push / source_extra_logit_push /
+#                 normalizer_extra_logit_push / base_logit_push / kl_mass
+#   and the pair event dump gains a top_source_push stratum, ranked on THIS
+#   source's own share -- top_push ranks on the total, so an event in the
+#   Search-on-AlfWorld cell may have been moved by anything except Search.
 #
 #   THE SOURCE CHANNEL'S TWO GATES, as the share each let through:
 #     kl_weight/evidence/exclusive_pass_rate  of everything the off-task

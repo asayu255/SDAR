@@ -31,6 +31,7 @@ torch = pytest.importorskip("torch")
 try:
     from verl.trainer.ppo.cross_teacher_kl_weight import (
         CHANNEL_PROBES,
+        GATE_BINS,
         POSITION_TERMS,
         build_position_weight,
         compute_raw_policy_shifts,
@@ -228,9 +229,9 @@ def test_a_counterfactual_scope_publishes_no_gate_reading_rather_than_a_zero():
     got, task_ids = _random()
     kl = torch.rand(*got["weight"].shape) + 0.1
     chan = {
-        "weight": got["channel_pre_weight"]["no_shared"],
-        "pre_weight": got["channel_pre_weight"]["no_shared"],
-        "evidence": got["channel_evidence"]["no_shared"],
+        "weight": got["channel_pre_weight"]["source_only"],
+        "pre_weight": got["channel_pre_weight"]["source_only"],
+        "evidence": got["channel_evidence"]["source_only"],
         "state": got["state"], "teacher_prob": got["teacher_prob"],
         "available": got["available"],
         "evidence_shared": torch.zeros_like(got["evidence_shared"]),
@@ -241,10 +242,10 @@ def test_a_counterfactual_scope_publishes_no_gate_reading_rather_than_a_zero():
         position_terms(chan, kl),
         response_mask=torch.ones_like(kl), task_ids=task_ids,
     )
-    m = position_weight_metrics(stats.sums(task_names=TASKS), prefix="kl_weight/channel/no_shared")
-    assert "kl_weight/channel/no_shared/position/w_mean" in m, "the scope did render"
+    m = position_weight_metrics(stats.sums(task_names=TASKS), prefix="kl_weight/channel/source_only")
+    assert "kl_weight/channel/source_only/position/w_mean" in m, "the scope did render"
     for key in ("exclusive_pass_rate", "gate_pass_rate", "gate_mean"):
-        assert f"kl_weight/channel/no_shared/evidence/{key}" not in m
+        assert f"kl_weight/channel/source_only/evidence/{key}" not in m
 
 
 # --------------------------------------------------------------------------- #
@@ -433,3 +434,168 @@ def test_the_gates_two_teacher_reading_does_not_survive_a_third():
     dup = float(q2 * source_exclusive_shift(hat_on=on, hat_off=twice).sum(dim=-1))
     solo = float(source_exclusive_shift(hat_on=on, hat_off=once).sum(dim=-1))
     assert dup == pytest.approx(2 * solo), "duplicating a teacher doubles the source"
+
+
+# --------------------------------------------------------------------------- #
+# what each channel did to the LOSS, which no weight share answers
+# --------------------------------------------------------------------------- #
+def _built_with_kl(bs=4, resp=5, k=6, seed=31):
+    torch.manual_seed(seed)
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(2)], dim=-1)
+    got, ids = _build(on, off, base, bs=bs)
+    kl = torch.rand(bs, resp) + 0.1
+    base_kl = torch.rand(bs, resp) + 0.1
+    return got, ids, kl, base_kl
+
+
+def _fold(got, ids, kl, *, base_kl=None, row_weight=None, coef=1.0):
+    stats = ScopeTermStats(names=POSITION_TERMS, n_tasks=3, device="cpu")
+    stats.update(
+        position_terms(got, kl, row_weight=row_weight, coef=coef, base_kl=base_kl),
+        response_mask=torch.ones_like(kl), task_ids=ids,
+    )
+    return position_weight_metrics(stats.sums(task_names=TASKS))
+
+
+def test_the_three_channels_add_to_what_the_arm_did_to_the_kl():
+    """The reading an arm choice rests on and the one a weight share cannot
+    give: of the nats this scope's distillation moved, how many were the
+    corroboration, how many the source, and how many the normaliser taking
+    budget off the positions with no evidence."""
+    got, ids, kl, base_kl = _built_with_kl()
+    m = _fold(got, ids, kl, base_kl=base_kl)
+    for c in ("shared", "source", "normalizer"):
+        assert f"kl_weight/channel/{c}/kl_added_raw" in m
+        assert f"kl_weight/channel/{c}/objective_contribution" in m
+        assert 0.0 <= m[f"kl_weight/channel/{c}/added_abs_share"] <= 1.0
+    shares = sum(m[f"kl_weight/channel/{c}/added_abs_share"] for c in
+                 ("shared", "source", "normalizer"))
+    assert shares == pytest.approx(1.0, abs=1e-6)
+    # float32 columns folded into float64 sums: the residual is float noise on
+    # the gross, not a missing term. Anything above this is a channel being
+    # dropped or double counted.
+    assert abs(m["kl_weight/channel/decomposition_residual"]) < 1e-6, (
+        "(W - 1) D, formed independently, is the three parts"
+    )
+
+
+def test_only_the_normalizer_can_take_budget_away():
+    got, ids, kl, _ = _built_with_kl()
+    m = _fold(got, ids, kl)
+    assert m["kl_weight/channel/shared/kl_added_raw"] >= 0.0
+    assert m["kl_weight/channel/source/kl_added_raw"] >= 0.0
+    assert m["kl_weight/channel/normalizer/kl_added_raw"] < 0.0, (
+        "mu > 1 on this fixture, so the normaliser is where the budget comes from"
+    )
+
+
+def test_the_objective_columns_carry_the_task_share_and_the_coefficient():
+    """Raw nats are not comparable across tasks that enter the loss with
+    different weights, and are two orders of magnitude away from what the
+    distillation term actually contributes."""
+    got, ids, kl, _ = _built_with_kl()
+    plain = _fold(got, ids, kl)
+    scaled = _fold(got, ids, kl, row_weight=torch.full((4,), 2.0), coef=0.01)
+    for c in ("shared", "source", "normalizer"):
+        assert scaled[f"kl_weight/channel/{c}/kl_added_raw"] == pytest.approx(
+            plain[f"kl_weight/channel/{c}/kl_added_raw"]
+        ), "the nats do not move"
+        assert scaled[f"kl_weight/channel/{c}/objective_contribution"] == pytest.approx(
+            0.02 * plain[f"kl_weight/channel/{c}/kl_added_raw"], rel=1e-5
+        )
+
+
+# --------------------------------------------------------------------------- #
+# does the on-task teacher say anything the base does not, where the arm spends
+# --------------------------------------------------------------------------- #
+def test_the_novelty_columns_answer_the_base_pull_question():
+    """``W`` multiplies KL(student || on-task teacher), and ``hat_on`` is that
+    teacher measured against the BASE, so the source channel's own region is by
+    construction where the two are the same distribution. Raising W there is a
+    pull toward the base whatever the evidence said -- and whether that is what
+    happens is a number, not an argument."""
+    got, ids, kl, base_kl = _built_with_kl()
+    m = _fold(got, ids, kl, base_kl=base_kl)
+    for key in ("teacher_novelty", "source_weighted_novelty", "shared_weighted_novelty"):
+        assert f"kl_weight/base/{key}" in m
+    assert m["kl_weight/base/kl_base_mean"] > 0.0
+
+    # A teacher that IS the base: novelty is exactly zero, everywhere and under
+    # both channels' weighting. That is the reading the run is looking for.
+    same = _fold(got, ids, kl, base_kl=kl)
+    assert same["kl_weight/base/teacher_novelty"] == pytest.approx(0.0, abs=1e-9)
+    assert same["kl_weight/base/source_weighted_novelty"] == pytest.approx(0.0, abs=1e-9)
+    assert same["kl_weight/base/shared_weighted_novelty"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_novelty_columns_are_absent_rather_than_zero_without_a_base():
+    got, ids, kl, _ = _built_with_kl()
+    m = _fold(got, ids, kl)
+    assert not any("/base/" in k for k in m), "not measured is not novelty zero"
+
+
+# --------------------------------------------------------------------------- #
+# the gate's shape, and the placebo as a ratio
+# --------------------------------------------------------------------------- #
+def test_the_gate_bins_separate_a_selector_from_an_attenuator():
+    """``gate_mean = 0.1`` is two mechanisms -- every candidate gated to a
+    tenth, or a tenth of them gated fully -- and only the second is what a gate
+    is for."""
+    got, ids, kl, _ = _built_with_kl()
+    m = _fold(got, ids, kl)
+    fracs = [m[f"kl_weight/gate/q_mass_frac_gt_{int(round(t * 100)):03d}"] for t in GATE_BINS]
+    assert all(0.0 <= f <= 1.0 for f in fracs)
+    assert fracs == sorted(fracs, reverse=True), "the bins nest"
+
+
+def test_the_placebo_is_published_as_a_ratio_against_the_live_gate():
+    got, ids, kl, _ = _built_with_kl()
+    m = _fold(got, ids, kl)
+    for key in ("shuffled_to_live_gate_ratio", "shuffled_to_live_source_evidence_ratio"):
+        assert f"kl_weight/gate/{key}" in m
+        assert m[f"kl_weight/gate/{key}"] >= 0.0
+
+
+def test_without_a_mask_the_placebo_ratio_reads_one_and_not_a_finding():
+    """No mask, no honest shuffle. The ratio is then exactly 1 -- "not measured"
+    -- rather than a number that would read as "the shuffle changed nothing"."""
+    torch.manual_seed(17)
+    bs, resp, k = 3, 4, 5
+    on, base = _lp(bs, resp, k), _lp(bs, resp, k)
+    off = torch.stack([_lp(bs, resp, k) for _ in range(2)], dim=-1)
+    task_ids = torch.arange(bs) % 3
+    planes = torch.stack([(task_ids + 1) % 3, (task_ids + 2) % 3], dim=-1)
+    got = build_position_weight(
+        shifts=compute_raw_policy_shifts(
+            on_task_logprob=on, off_task_logprobs=off, base_logprob=base
+        ),
+        on_task_logprob=on, student_logprob=_student_like(on),
+        task_ids=task_ids, off_plane_tasks=planes,
+        diag=torch.ones(3), alpha_table=torch.zeros(3, 3),
+        diag_valid=torch.ones(3, dtype=torch.bool),
+        normalizer={"mean": torch.full((3,), 1.2), "valid": torch.ones(3, dtype=torch.bool)},
+    )
+    m = _fold(got, task_ids, torch.rand(bs, resp) + 0.1)
+    assert m["kl_weight/gate/shuffled_to_live_gate_ratio"] == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# the counterfactuals are a symmetric set
+# --------------------------------------------------------------------------- #
+def test_shared_only_and_source_only_are_the_same_kind_of_object():
+    """They used to live in two namespaces -- shared-only was the bottom of the
+    alpha probe series and source-only was a channel -- so the two arms of one
+    mechanism were compared through two different sets of published columns."""
+    got, _ = _random()
+    for name in ("shared_only", "source_only", "unweighted"):
+        assert name in got["channel_pre_weight"], name
+    shared = got["channel_evidence"]["shared_only"]
+    source = got["channel_evidence"]["source_only"]
+    assert torch.allclose(shared + source, got["evidence"], atol=1e-6), (
+        "and together they are the whole evidence, with nothing double counted"
+    )
+    assert torch.count_nonzero(got["channel_evidence"]["unweighted"]) == 0
+    assert torch.allclose(
+        got["channel_pre_weight"]["unweighted"], torch.ones_like(got["pre_weight"])
+    )
