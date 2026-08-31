@@ -548,7 +548,60 @@ class DataParallelPPOActor(BasePPOActor):
         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
         return full_s_lp[:, -response_length - 1 : -1, :]
 
-    def _cross_teacher_planes(self, data, support_ids):
+    def _all_teacher_planes(self, data, support_ids):
+        """``(on_task, base, off_teachers)`` at ``support_ids``, in ONE exchange.
+
+        The four models this arm reads are the on-task teacher, the base policy
+        and the two off-task teachers, and they are read at ONE support -- the
+        top-k the student just chose, or the sampled token. Their keys live in
+        two columns of the batch for a reason that is about the driver and not
+        about the read: ``teacher_cache_ids`` is filled by the on-task pass that
+        every OPD arm runs, ``sign_cache_ids`` by the three extra forwards only
+        the cross-teacher arms run. Nothing downstream cares which pass filled a
+        key, so the read does not have to be split along that seam.
+
+        It was split anyway, and cost an exchange for it. ``_cross_teacher_planes``
+        already batches its three; the on-task plane went separately, so a
+        micro-batch paid TWO all_gather pairs and TWO all_reduce pairs where one
+        of each will do -- and, offloaded, two device-to-host copies of the
+        gathered keys, each of which drains the CPU's run-ahead inside the
+        micro-batch loop. The support is by far the largest thing that crosses,
+        (n, response_length, k) int64 against (n,) keys, and it went twice.
+
+        Concatenating the key columns is the whole change. Ownership, the count
+        guard and the fingerprint are per (row, plane) either way; the
+        fingerprint column is now derived once instead of twice, from the same
+        rows. Bit-identical, and by the same argument
+        :func:`~verl.workers.teacher_cache.exchange_teacher_logprobs_multi`
+        already carries: ``logprobs_at`` is invoked per (rank, plane) on exactly
+        the same inputs and the reduction is elementwise over the same ranks in
+        the same order.
+
+        Column order is the caller's contract -- 0 on-task, 1 base, 2.. this
+        row's off-task teachers in sorted task order -- because everything below
+        reads them positionally.
+        """
+        cache_ids = self._require_teacher_cache_ids(data.get("teacher_cache_ids", None))
+        planes = self._teacher_logprobs_at_planes(
+            cache_ids=torch.cat([cache_ids.reshape(-1, 1), data["sign_cache_ids"]], dim=1),
+            ids=support_ids,
+            input_ids=data["input_ids"],
+            attention_mask=data["attention_mask"],
+        )
+        return planes[0], planes[1], torch.stack(planes[2:], dim=-1)
+
+    @staticmethod
+    def _require_teacher_cache_ids(cache_ids):
+        """The column that locates each row's cached on-task teacher, or a named
+        refusal. One copy, because both readers of it fail the same way."""
+        if cache_ids is None:
+            raise ValueError(
+                "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
+                "teacher hidden states; the batch has none."
+            )
+        return cache_ids
+
+    def _cross_teacher_planes(self, data, support_ids, cached=None):
         """``(base, off_teachers)`` log-probs at ``support_ids``.
 
         The same exchange the on-task teacher went through, once per model: the
@@ -567,7 +620,22 @@ class DataParallelPPOActor(BasePPOActor):
         copies of the gathered keys. See
         :func:`~verl.workers.teacher_cache.exchange_teacher_logprobs_multi`,
         which is bit-identical to the per-plane calls.
+
+        ``cached`` is ``(support, base, off)`` from a call that already read these
+        planes -- :meth:`_all_teacher_planes` returns them alongside the on-task
+        one, so on the student-indexed path they arrive with the lookup the loss
+        needs anyway. Reused only when the support is the SAME TENSOR OBJECT, not
+        an equal one: the planes are a function of the ids, so anything else is a
+        guess about whether two supports match, and the teacher-indexed path and
+        the sampled-token path both pass supports that do not. Identity is exact
+        and costs no comparison over an (n, resp, k) tensor.
+
+        Two callers ask for these planes at the same support in the same
+        micro-batch when both cross-teacher blocks are live, and this is also
+        what stops that being a second exchange.
         """
+        if cached is not None and cached[0] is support_ids:
+            return cached[1], cached[2]
         planes = self._teacher_logprobs_at_planes(
             cache_ids=data["sign_cache_ids"],
             ids=support_ids,
@@ -846,12 +914,11 @@ class DataParallelPPOActor(BasePPOActor):
         if row_adv is None or informative is None or task_ids is None:
             return
 
+        # One exchange for the four models at this support, not one for the
+        # on-task teacher and another for the other three. Same reason as the
+        # top-k support above: they share y1, which is what the exchange sends.
         y1 = data["responses"].unsqueeze(-1)
-        on_y = self._teacher_logprobs_at(
-            cache_ids=data["teacher_cache_ids"], ids=y1,
-            input_ids=data["input_ids"], attention_mask=data["attention_mask"],
-        )
-        base_y, off_y = self._cross_teacher_planes(data, y1)
+        on_y, base_y, off_y = self._all_teacher_planes(data, y1)
         std_y = standardize_policy_shifts(
             shifts=compute_raw_policy_shifts(
                 on_task_logprob=on_y, off_task_logprobs=off_y, base_logprob=base_y
@@ -1061,11 +1128,7 @@ class DataParallelPPOActor(BasePPOActor):
         Both sides work per ROW: one key locates the row's whole
         (response_length, hidden) block, and ``ids`` stays (bs, response_length, k).
         """
-        if cache_ids is None:
-            raise ValueError(
-                "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
-                "teacher hidden states; the batch has none."
-            )
+        cache_ids = self._require_teacher_cache_ids(cache_ids)
         return self._teacher_logprobs_at_planes(
             cache_ids=cache_ids.unsqueeze(1), ids=ids,
             input_ids=input_ids, attention_mask=attention_mask,
@@ -2578,13 +2641,26 @@ class DataParallelPPOActor(BasePPOActor):
                         # gradient) and the ids that chose them, from one logits
                         # tensor -- there is no second student forward here.
                         student_topk_logprobs, student_topk_ids = student_topk_out
+                        # The cross-teacher blocks below read three more models at
+                        # THIS support. Asking for them here makes it one exchange
+                        # instead of two -- see _all_teacher_planes. The cost lands
+                        # in actor.teacher_lookup rather than actor.sign_weight /
+                        # actor.cross_teacher, so those two phases get cheaper by
+                        # the amount this one gets dearer; the pair is what moved,
+                        # not either alone.
                         with _actor_phase("actor.teacher_lookup"):
-                            fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
-                                cache_ids=data.get("teacher_cache_ids", None),
-                                ids=student_topk_ids,
-                                input_ids=data["input_ids"],
-                                attention_mask=data["attention_mask"],
-                            )
+                            if sign_enabled or xt_enabled:
+                                (fwd_teacher_topk_logprobs, xt_base_plane,
+                                 xt_off_planes) = self._all_teacher_planes(data, student_topk_ids)
+                                cross_planes = (student_topk_ids, xt_base_plane, xt_off_planes)
+                            else:
+                                cross_planes = None
+                                fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
+                                    cache_ids=data.get("teacher_cache_ids", None),
+                                    ids=student_topk_ids,
+                                    input_ids=data["input_ids"],
+                                    attention_mask=data["attention_mask"],
+                                )
                         sign_support_ids = student_topk_ids
                         sign_on_task_logprobs = fwd_teacher_topk_logprobs
                     else:
@@ -2595,7 +2671,10 @@ class DataParallelPPOActor(BasePPOActor):
                         # weights need no lookup to build -- only the other three
                         # models do. The support is then a function of the frozen
                         # teacher alone and does not drift as the student moves,
-                        # which is the whole reason to run this variant.
+                        # which is the whole reason to run this variant. No on-task
+                        # exchange runs here, so there is nothing for the blocks
+                        # below to ride along with and they ask for themselves.
+                        cross_planes = None
                         sign_support_ids = data.get("teacher_topk_ids", None) if teacher_topk_kl else None
                         sign_on_task_logprobs = (
                             data.get("teacher_topk_logprobs", None) if teacher_topk_kl else None
@@ -2620,7 +2699,7 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         with _actor_phase("actor.sign_weight"):
                             base_logprob, off_logprobs = self._cross_teacher_planes(
-                                data, sign_support_ids
+                                data, sign_support_ids, cached=cross_planes
                             )
                             # The rewrite decomposition runs further down, past the
                             # end of this block, and needs the base to measure the
@@ -2765,7 +2844,7 @@ class DataParallelPPOActor(BasePPOActor):
                         xt_collect = epoch == 0
                         with _actor_phase("actor.cross_teacher"):
                             base_logprob, off_logprobs = self._cross_teacher_planes(
-                                data, sign_support_ids
+                                data, sign_support_ids, cached=cross_planes
                             )
                             xt_shifts = compute_raw_policy_shifts(
                                 on_task_logprob=sign_on_task_logprobs,

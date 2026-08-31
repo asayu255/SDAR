@@ -1609,3 +1609,192 @@ def test_the_actor_reads_all_its_planes_in_one_exchange(monkeypatch):
     assert torch.all(base == 0.0), "column 0 is the base policy"
     for c in range(planes - 1):
         assert torch.all(off[..., c] == float(c + 1)), f"off-task column {c} came back out of order"
+
+
+# --------------------------------------------------------------------------- #
+# 18. the on-task teacher rides in the same exchange as the other three
+# --------------------------------------------------------------------------- #
+def _plane_recorder(monkeypatch):
+    """Stand in for the exchange and record every call's key/support shapes.
+
+    Each plane answers with its OWN KEY, per row -- not with its column index.
+    That makes a reordering show up as a value, and it makes the answer a
+    function of the key alone, so the merged read and the split read are
+    comparable: an arrangement that changes what a plane returns would then be
+    visible rather than tautologically equal.
+    """
+    from verl.workers.actor import dp_actor
+    import verl.workers.teacher_cache as tc
+
+    calls = []
+
+    def _fake(cache, cache_ids, ids, group=None, world_size=None, fingerprints=None):
+        calls.append((tuple(cache_ids.shape), tuple(ids.shape), cache_ids.clone()))
+        shape = (cache_ids.size(0),) + (1,) * (ids.dim() - 1)
+        return [cache_ids[:, c].reshape(shape).to(torch.float32).expand(ids.shape).clone()
+                for c in range(cache_ids.size(1))]
+
+    monkeypatch.setattr(dp_actor, "get_teacher_cache", lambda: None, raising=False)
+    monkeypatch.setattr(tc, "exchange_teacher_logprobs_multi", _fake)
+    monkeypatch.setattr(tc, "get_teacher_cache", lambda: None)
+    return dp_actor, calls
+
+
+def _plane_batch(n=4, off=2):
+    return {
+        "teacher_cache_ids": torch.arange(100, 100 + n, dtype=torch.long),
+        "sign_cache_ids": torch.arange(n * (1 + off), dtype=torch.long).view(n, 1 + off),
+        "input_ids": torch.ones((n, 8), dtype=torch.long),
+        "attention_mask": torch.ones((n, 8), dtype=torch.long),
+    }
+
+
+def test_all_four_models_go_in_one_exchange_with_the_columns_in_order(monkeypatch):
+    """The saving, at the seam it is taken.
+
+    The on-task teacher's key lives in teacher_cache_ids and the other three in
+    sign_cache_ids, because different driver passes fill them. Nothing about the
+    READ cares, and splitting it there cost a second all_gather of the support --
+    the largest thing that crosses.
+    """
+    dp_actor, calls = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    n, off = 4, 2
+    data = _plane_batch(n, off)
+    support = torch.randint(0, VOCAB, (n, L, K))
+
+    on, base, off_planes = actor._all_teacher_planes(data, support)
+
+    assert len(calls) == 1, f"one exchange for all four models, got {len(calls)}"
+    keys_shape, ids_shape, keys = calls[0]
+    assert keys_shape == (n, 2 + off), "every model's key column has to go in the same call"
+    assert ids_shape == (n, L, K), "the support goes once"
+    # Column 0 is the on-task teacher and the rest are sign_cache_ids untouched.
+    assert torch.equal(keys[:, 0], data["teacher_cache_ids"])
+    assert torch.equal(keys[:, 1:], data["sign_cache_ids"])
+    def _col(values):
+        return values.reshape(n, 1, 1).to(torch.float32).expand(n, L, K)
+
+    assert torch.equal(on, _col(data["teacher_cache_ids"])), "column 0 is the on-task teacher"
+    assert torch.equal(base, _col(data["sign_cache_ids"][:, 0])), "column 1 is the base policy"
+    for c in range(off):
+        assert torch.equal(off_planes[..., c], _col(data["sign_cache_ids"][:, c + 1])), (
+            f"off-task column {c} out of order"
+        )
+
+
+def test_the_four_planes_are_the_same_values_the_two_calls_gave(monkeypatch):
+    """Bit-identical, compared rather than argued. The merged read and the split
+    read are two arrangements of the same per-(row, plane) lookups."""
+    dp_actor, _ = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    data = _plane_batch()
+    support = torch.randint(0, VOCAB, (4, L, K))
+
+    on, base, off_planes = actor._all_teacher_planes(data, support)
+    # What the two-call arrangement produced: column 0 of a one-column exchange,
+    # then columns 0.. of a sign_cache_ids exchange.
+    split_on = actor._teacher_logprobs_at(
+        cache_ids=data["teacher_cache_ids"], ids=support,
+        input_ids=data["input_ids"], attention_mask=data["attention_mask"],
+    )
+    split_base, split_off = actor._cross_teacher_planes(data, support)
+    assert torch.equal(on, split_on)
+    assert torch.equal(base, split_base)
+    assert torch.equal(off_planes, split_off)
+
+
+def test_a_second_reader_of_the_same_support_costs_no_exchange(monkeypatch):
+    """Both cross-teacher blocks read these planes at the same support in the
+    same micro-batch. The second one has to ride on the first."""
+    dp_actor, calls = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    data = _plane_batch()
+    support = torch.randint(0, VOCAB, (4, L, K))
+
+    on, base, off_planes = actor._all_teacher_planes(data, support)
+    cached = (support, base, off_planes)
+    assert len(calls) == 1
+
+    again_base, again_off = actor._cross_teacher_planes(data, support, cached=cached)
+    assert len(calls) == 1, "the cached planes were re-fetched"
+    assert again_base is base and again_off is off_planes
+
+
+def test_a_different_support_ignores_the_cache_rather_than_answering_wrong(monkeypatch):
+    """The planes are a function of the ids. The sampled-token support and the
+    teacher-indexed support are both different tensors carrying different ids,
+    and answering either from the top-k's planes would be a real teacher
+    log-prob at the wrong candidates -- silent, and in the loss."""
+    dp_actor, calls = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    data = _plane_batch()
+    support = torch.randint(0, VOCAB, (4, L, K))
+    _, base, off_planes = actor._all_teacher_planes(data, support)
+    cached = (support, base, off_planes)
+
+    other = support.clone()                      # equal values, different object
+    actor._cross_teacher_planes(data, other, cached=cached)
+    assert len(calls) == 2, "an equal-but-distinct support was answered from the cache"
+
+    y1 = torch.randint(0, VOCAB, (4, L, 1))
+    actor._cross_teacher_planes(data, y1, cached=cached)
+    assert len(calls) == 3
+
+
+def test_no_cache_at_all_is_the_old_two_call_arrangement(monkeypatch):
+    """The teacher-indexed path never runs the on-task lookup, so there is
+    nothing to ride on and the three planes still have to be asked for."""
+    dp_actor, calls = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    data = _plane_batch()
+    support = torch.randint(0, VOCAB, (4, L, K))
+    actor._cross_teacher_planes(data, support, cached=None)
+    assert len(calls) == 1
+    assert calls[0][0] == (4, 3), "only sign_cache_ids goes when there is no on-task key"
+
+
+def test_a_missing_on_task_key_is_named_rather_than_concatenated(monkeypatch):
+    """Without teacher_cache_ids there is no column 0. Reaching torch.cat with a
+    None would raise somewhere with no mention of the column that is missing."""
+    dp_actor, _ = _plane_recorder(monkeypatch)
+    actor = object.__new__(dp_actor.DataParallelPPOActor)
+    data = _plane_batch()
+    del data["teacher_cache_ids"]
+    with pytest.raises(ValueError, match="teacher_cache_ids"):
+        actor._all_teacher_planes(data, torch.randint(0, VOCAB, (4, L, K)))
+
+
+def test_every_cross_plane_read_in_the_training_loop_offers_the_cached_planes():
+    """The structural half, and the one that actually keeps the saving.
+
+    update_policy legitimately calls both single forms -- _teacher_logprobs_at on
+    the teacher-indexed path, where no cross planes ride along. What must not come
+    back is a _cross_teacher_planes call that does not offer what the lookup
+    already fetched: it would be a second all_gather of the same support, correct
+    in every value, and nothing downstream would notice.
+    """
+    import ast
+
+    from verl.workers.actor import dp_actor
+
+    # Parsed off the MODULE, not off the attribute: update_policy is wrapped by
+    # GPUMemoryLogger, so inspect.getsource hands back the decorator's two-line
+    # wrapper and every structural claim about the body passes vacuously.
+    src = open(dp_actor.__file__).read()
+    fn = next(
+        n for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "update_policy"
+    )
+    tree = fn
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_cross_teacher_planes"
+    ]
+    assert calls, "update_policy no longer reads the cross-teacher planes at all"
+    for call in calls:
+        assert any(kw.arg == "cached" for kw in call.keywords), (
+            "a _cross_teacher_planes call in update_policy does not pass cached=; the planes "
+            "the on-task lookup already fetched are then fetched again"
+        )
