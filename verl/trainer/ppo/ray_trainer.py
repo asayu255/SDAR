@@ -66,6 +66,7 @@ from verl.utils.seqlen_balancing import (
     get_seqlen_balanced_partitions,
     log_minibatch_unbalance,
     log_seqlen_unbalance,
+    rebalance_minibatch_columns,
 )
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -513,6 +514,28 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 # perf/mfu/actor, which is data-independent.
 _BALANCE_MINIBATCH = os.environ.get("BALANCE_MINIBATCH", "0").strip().lower() in (
     "1", "true", "yes", "on")
+
+# Match the columns WITHOUT moving a row to a different optimizer step: re-partition
+# the rows already in mini-batch k among the ranks, instead of re-dealing each rank's
+# whole partition. The objection above does not apply to it -- the column's membership
+# is what an optimizer step sees, and that is exactly what is held fixed. See
+# rebalance_minibatch_columns for why the gradient is then invariant rather than
+# merely similar, and for the one configuration where it is not (an unweighted
+# token-mean, which normalises per micro-batch; these arms pin
+# normalize_loss_by_task instead). Floating-point summation order still moves, so
+# both arms of an A/B have to carry the same setting -- which is why the two
+# cross-teacher scripts export it together.
+_BALANCE_MINIBATCH_COLUMNS = os.environ.get("BALANCE_MINIBATCH_COLUMNS", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+if _BALANCE_MINIBATCH and _BALANCE_MINIBATCH_COLUMNS:
+    raise ValueError(
+        "BALANCE_MINIBATCH and BALANCE_MINIBATCH_COLUMNS are two different orderings of "
+        "the same rows and only one can be dispatched. BALANCE_MINIBATCH re-deals each "
+        "rank's whole partition (changing which rows share an optimizer step); "
+        "BALANCE_MINIBATCH_COLUMNS re-partitions inside each column (holding that fixed). "
+        "Set exactly one."
+    )
+_SAID_BALANCE_MINIBATCH = False
 
 
 class _PreparedValidationBatch(NamedTuple):
@@ -1544,8 +1567,20 @@ class RayPPOTrainer:
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst, k_partitions=world_size, equal_size=True)
         minibatch_rows = self._minibatch_rows_per_rank(world_size)
+        micro_batch_rows = self._micro_batch_rows_per_rank()
+        self._say_balance_minibatch()
         ordered = global_partition_lst
-        if _BALANCE_MINIBATCH and minibatch_rows:
+        if _BALANCE_MINIBATCH_COLUMNS and minibatch_rows:
+            # Same repair, under the constraint that keeps the optimizer step's
+            # row set fixed: the rows already in column k are re-partitioned among
+            # the ranks rather than re-dealt across columns. micro_batch_rows then
+            # spreads each rank's share of the column over its micro-batches,
+            # because the teacher lookup makes the ranks meet there too.
+            ordered = rebalance_minibatch_columns(
+                global_seqlen_lst, global_partition_lst, minibatch_rows,
+                micro_batch_rows=micro_batch_rows,
+            )
+        elif _BALANCE_MINIBATCH and minibatch_rows:
             # Balancing the rank totals leaves mini-batch k unrelated across
             # ranks, and the ranks meet at the gradient reduce that ends every
             # one of them. deal_by_length gives each rank the same length-ordered
@@ -1572,7 +1607,55 @@ class RayPPOTrainer:
             # on the wait it reports is the one the run really paid.
             metrics.update(log_minibatch_unbalance(
                 seqlen_list=global_seqlen_lst, partitions=ordered,
-                minibatch_rows=minibatch_rows, prefix=logging_prefix))
+                minibatch_rows=minibatch_rows, prefix=logging_prefix,
+                micro_batch_rows=micro_batch_rows))
+
+    def _micro_batch_rows_per_rank(self) -> int:
+        """Rows in one micro-batch on one rank, or 0 if this arm has no actor to ask.
+
+        Already a per-GPU count in the config, so unlike ppo_mini_batch_size it is
+        not divided again. None here means the arm sizes its micro-batches by
+        tokens (use_dynamic_bsz) or by the non-per-gpu key, and neither is a fixed
+        row width -- 0 then turns the micro-batch reading off rather than guessing
+        one.
+        """
+        try:
+            actor = self.config.actor_rollout_ref.actor
+            micro = actor.ppo_micro_batch_size_per_gpu
+            if not micro or actor.get("use_dynamic_bsz", False):
+                return 0
+            return int(micro)
+        except Exception:  # noqa: BLE001 - a metric must never break a step
+            return 0
+
+    def _say_balance_minibatch(self) -> None:
+        """Print, once, how this process resolved the two ordering flags.
+
+        Same reason ``_say_rollout_env`` exists: the value is read at import time
+        in whichever process branches on it, and a run that did not take the
+        change looks exactly like one that did from the metrics alone -- the wait
+        it removes is invisible to utilization.gpu either way.
+        """
+        global _SAID_BALANCE_MINIBATCH
+        if _SAID_BALANCE_MINIBATCH:
+            return
+        _SAID_BALANCE_MINIBATCH = True
+        if _BALANCE_MINIBATCH_COLUMNS:
+            how = ("re-partitioned INSIDE each mini-batch column -- the optimizer step's "
+                   "row set is unchanged, only which rank carries which of them")
+        elif _BALANCE_MINIBATCH:
+            how = ("re-dealt length-first across each rank's whole partition -- this DOES "
+                   "change which rows share an optimizer step")
+        else:
+            how = "left in index order; the columns are matched only by accident"
+        print(
+            f"[balance-minibatch] driver: BALANCE_MINIBATCH_COLUMNS="
+            f"{os.environ.get('BALANCE_MINIBATCH_COLUMNS', '<unset>')!r} "
+            f"BALANCE_MINIBATCH={os.environ.get('BALANCE_MINIBATCH', '<unset>')!r} -> rows are {how}. "
+            f"Read global_seqlen/minibatch_wait_frac against _columns and _dealt for the prize, "
+            f"and global_seqlen/microbatch_wait_frac for the meeting the teacher lookup adds.",
+            flush=True,
+        )
 
     def _minibatch_rows_per_rank(self, world_size: int) -> int:
         """Rows in one rank's mini-batch, or 0 if this arm has no actor to ask.

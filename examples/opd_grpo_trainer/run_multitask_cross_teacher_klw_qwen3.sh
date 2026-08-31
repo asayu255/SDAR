@@ -1006,6 +1006,35 @@ export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
 # [val-hash] will not match a pumped run against an unpumped one. Compare
 # scores, not tokens. 0 restores the blocking path.
 export ROLLOUT_ASYNC_GENERATE=${ROLLOUT_ASYNC_GENERATE:-1}
+# Match the mini-batch COLUMNS across ranks. _balance_batch equalises each rank's
+# total over the whole batch and reports that it worked to within a token; that
+# says nothing about mini-batch k, which is where the ranks actually meet. The
+# measurement has been shipping for a while and prices it:
+# global_seqlen/minibatch_wait_frac against _columns, and
+# global_seqlen/microbatch_wait_frac against ITS _columns -- the second pair is
+# the larger one on this arm, because the teacher lookup runs a collective pair
+# from inside the micro-batch loop and so makes the ranks meet every
+# ppo_micro_batch_size_per_gpu rows, not once a mini-batch.
+#
+# NOT the same thing as BALANCE_MINIBATCH, which is still off and stays off: that
+# one re-deals each rank's whole partition, so rows stop sharing an optimizer step
+# and the arm is no longer comparable with the ones already run. This one
+# re-partitions INSIDE each column, so the sixty rows an optimizer step sees are
+# the sixty it saw before and only the rank carrying each of them moves.
+#
+# The gradient is then invariant, not merely similar, and that rests on this arm's
+# config: normalize_loss_by_task=True routes every term through
+# agg_loss_by_task_weights, a weighted row SUM whose weights come from STEP-level
+# token totals, and the actor multiplies back the FSDP average and the configured
+# gradient_accumulation. Under a plain token-mean it would NOT hold -- that
+# normalises per micro-batch -- so this belongs with normalize_loss_by_task and
+# not on any arm without it.
+#
+# What still moves is floating-point summation order, the same class as
+# ppo_micro_batch_size_per_gpu 10 -> 5 above. Both arms of the A/B therefore have
+# to carry the same value, which is why it is exported here and in the control
+# script and not left to a launch command. 0 restores index order.
+export BALANCE_MINIBATCH_COLUMNS=${BALANCE_MINIBATCH_COLUMNS:-1}
 # The base policy and the off-task teachers ride in the same rollout window
 # as the on-task teacher above. All four are frozen, so only the window
 # changes; sign_weight_forward then scores what the window missed. 0 puts

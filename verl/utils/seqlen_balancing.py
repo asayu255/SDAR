@@ -265,7 +265,94 @@ def deal_by_length(seqlen_list: List[int], partition: List[int], minibatch_rows:
     return [i for bucket in buckets for i in bucket]
 
 
-def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]], minibatch_rows: int, prefix):
+def rebalance_minibatch_columns(
+    seqlen_list: List[int],
+    partitions: List[List[int]],
+    minibatch_rows: int,
+    micro_batch_rows: int = 0,
+) -> List[List[int]]:
+    """Re-partition INSIDE each mini-batch column, so the columns match without
+    moving a row to a different optimizer step.
+
+    ``deal_by_length`` matches the columns by re-dealing each rank's whole
+    partition, which changes WHICH ROWS SHARE A MINI-BATCH. With ~70 optimizer
+    steps in a training step that is a different trajectory, and it is why that
+    ordering ships off by default.
+
+    This one is the same repair under a constraint that removes that objection.
+    Mini-batch k is, today,
+
+        {ordered[r][k*M : (k+1)*M]  for every rank r}
+
+    -- W*M rows that meet at one optimizer step. Take exactly those rows back,
+    partition THEM into W equal-size groups by token count, and write the groups
+    back into the same column. The column's membership is unchanged, so the
+    optimizer step sees the same rows; only which rank carries which of them
+    moves.
+
+    WHAT THAT BUYS, AND WHY IT IS NOT MERELY BIT-SHUFFLING. On the arms this
+    exists for the loss is a weighted row SUM -- ``normalize_loss_by_task=True``
+    routes every term through ``agg_loss_by_task_weights``, whose row weights
+    come from STEP-level token totals (``verl/trainer/ppo/task_loss_weights.py``)
+    and so do not depend on where a row is placed. FSDP's gradient average and
+    the per-mini-batch division by the CONFIGURED gradient_accumulation are both
+    undone by the ``task_dp_world_size * gradient_accumulation`` factor the actor
+    multiplies in. So the mini-batch's gradient is
+
+        sum over the column's W*M rows of w_i * grad(sum_t loss_it)
+
+    which is invariant under this reassignment in exact arithmetic. The step's
+    two cumulative statistics are float64 ``index_add_`` totals reduced with
+    ``ReduceOp.SUM`` once per step, so they are invariant too. What moves is
+    floating-point summation order -- the same class as ``ppo_micro_batch_size_
+    per_gpu`` 10 -> 5, which this arm already took deliberately -- and NOT which
+    rows the optimizer sees together.
+
+    IT DOES NOT HOLD FOR AN UNWEIGHTED TOKEN-MEAN. ``agg_loss(..., "token-mean")``
+    divides by the MICRO-BATCH's own token count, so moving a row across ranks
+    reweights it. Callers on that path get a different objective, not a different
+    rounding, which is why the switch in ``_balance_batch`` is off by default and
+    the run scripts that turn it on are the ones that pin
+    ``normalize_loss_by_task``.
+
+    ``micro_batch_rows`` then deals each rank's share of the column longest-first,
+    the way ``deal_by_length`` deals a whole partition. That is not cosmetic here:
+    the ranks do NOT only meet at the mini-batch boundary on these arms. The
+    teacher lookup runs a pair of collectives INSIDE the micro-batch loop
+    (``exchange_teacher_logprobs_multi``, called from ``_teacher_logprobs_at``),
+    so they meet every ``ppo_micro_batch_size_per_gpu`` rows. Balancing the
+    column and then handing it over in index order would leave that finer
+    meeting as unmatched as it is today. Passing 0 skips it.
+
+    Returns the partitions in the new order: the same indices, the same count per
+    rank, and the same multiset of indices in every column.
+    """
+    k_partitions = len(partitions)
+    if k_partitions < 2 or minibatch_rows <= 0:
+        return [list(p) for p in partitions]
+    n = len(partitions[0])
+    if any(len(p) != n for p in partitions):
+        raise ValueError(
+            "rebalance_minibatch_columns needs equal-size partitions -- the columns are "
+            f"defined by position, and these are {[len(p) for p in partitions]}"
+        )
+    out = [[] for _ in partitions]
+    for a in range(0, n, minibatch_rows):
+        b = min(a + minibatch_rows, n)
+        column = [i for p in partitions for i in p[a:b]]
+        groups = get_seqlen_balanced_partitions(
+            [seqlen_list[i] for i in column], k_partitions=k_partitions, equal_size=True
+        )
+        for r, group in enumerate(groups):
+            rows = [column[j] for j in group]
+            if micro_batch_rows:
+                rows = deal_by_length(seqlen_list, rows, micro_batch_rows)
+            out[r].extend(rows)
+    return out
+
+
+def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]], minibatch_rows: int, prefix,
+                           micro_batch_rows: int = 0):
     """How balanced the MINI-BATCHES are across ranks, which is a different
     question from how balanced the ranks are.
 
@@ -286,19 +373,30 @@ def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]],
     close enough for the packed forward this arm runs, and it is an upper bound
     on what any per-mini-batch rebalancing could recover -- NOT a measured stall.
 
-    ``wait_frac_dealt`` is the same number under ``deal_by_length``, which is the
-    ordering a fix would actually use. The gap between the two is the headroom,
-    measured rather than assumed.
+    ``wait_frac_dealt`` is the same number under ``deal_by_length``, and
+    ``wait_frac_columns`` under :func:`rebalance_minibatch_columns` -- the two
+    orderings a fix would actually use. The gap between either and ``wait_frac``
+    is the headroom, measured rather than assumed.
+
+    ``micro_batch_rows`` ADDS THE MEETING THAT ACTUALLY HAPPENS MORE OFTEN. The
+    mini-batch boundary is where FSDP reduces, and on an arm that reads a teacher
+    out of another rank's cache it is not the only place the ranks meet:
+    ``exchange_teacher_logprobs_multi`` runs an all_gather and an all_reduce pair
+    from inside the micro-batch loop, so they meet every
+    ``ppo_micro_batch_size_per_gpu`` rows. ``microbatch_wait_frac`` is the same
+    arithmetic chunked at that width, and it is the larger of the two numbers --
+    a column can hold matching totals and still be split into micro-batches that
+    do not. Reported alongside rather than instead: which one binds depends on
+    whether the arm runs that lookup, and the pair says so.
     """
     if minibatch_rows <= 0:
         return {}
-    per_rank = [[seqlen_list[i] for i in partition] for partition in partitions]
 
-    def _chunk_sums(rows):
-        return [sum(rows[i : i + minibatch_rows]) for i in range(0, len(rows), minibatch_rows)]
+    def _tokens(index_lists):
+        return [[seqlen_list[i] for i in rows] for rows in index_lists]
 
-    def _wait(ordered):
-        chunks = [_chunk_sums(rows) for rows in ordered]
+    def _wait(ordered, width):
+        chunks = [[sum(rows[i : i + width]) for i in range(0, len(rows), width)] for rows in ordered]
         n = min(len(c) for c in chunks)
         waited = total = 0.0
         spreads = []
@@ -310,18 +408,38 @@ def log_minibatch_unbalance(seqlen_list: List[int], partitions: List[List[int]],
             spreads.append(max(column) - min(column))
         return waited, total, spreads
 
-    waited, total, spreads = _wait(per_rank)
-    dealt = [[seqlen_list[i] for i in deal_by_length(seqlen_list, partition, minibatch_rows)]
-             for partition in partitions]
-    sorted_waited, sorted_total, _ = _wait(dealt)
+    per_rank = _tokens(partitions)
+    waited, total, spreads = _wait(per_rank, minibatch_rows)
     if not total:
         return {}
-    return {
+
+    dealt = _tokens([deal_by_length(seqlen_list, p, minibatch_rows) for p in partitions])
+    dealt_waited, dealt_total, _ = _wait(dealt, minibatch_rows)
+    # The counterfactual this metric exists to price, run on the same rows that
+    # were actually dispatched. Cheap enough to leave on: Karmarkar-Karp over
+    # world_size * minibatch_rows items, once per mini-batch column -- the whole
+    # of log_minibatch_unbalance measures 42 ms on a 7,080-row step at
+    # minibatch_rows=30, on the DRIVER, against a step of ~530 s.
+    columns = _tokens(rebalance_minibatch_columns(
+        seqlen_list, partitions, minibatch_rows, micro_batch_rows=micro_batch_rows,
+    ))
+    col_waited, col_total, _ = _wait(columns, minibatch_rows)
+
+    out = {
         f"{prefix}/minibatch_spread_mean": sum(spreads) / len(spreads),
         f"{prefix}/minibatch_spread_max": max(spreads),
         f"{prefix}/minibatch_wait_frac": waited / total,
-        f"{prefix}/minibatch_wait_frac_dealt": (sorted_waited / sorted_total) if sorted_total else 0.0,
+        f"{prefix}/minibatch_wait_frac_dealt": (dealt_waited / dealt_total) if dealt_total else 0.0,
+        f"{prefix}/minibatch_wait_frac_columns": (col_waited / col_total) if col_total else 0.0,
     }
+    if micro_batch_rows > 0:
+        micro_waited, micro_total, _ = _wait(per_rank, micro_batch_rows)
+        micro_col_waited, micro_col_total, _ = _wait(columns, micro_batch_rows)
+        out[f"{prefix}/microbatch_wait_frac"] = (micro_waited / micro_total) if micro_total else 0.0
+        out[f"{prefix}/microbatch_wait_frac_columns"] = (
+            (micro_col_waited / micro_col_total) if micro_col_total else 0.0
+        )
+    return out
 
 
 def ceildiv(a, b):
