@@ -60,6 +60,17 @@ def inject_distillation_config(config) -> None:
         # is built where the student's top-k exists, which is inside the actor's
         # forward -- and the same prerequisite on the ref side, since it reads
         # the same four models at ids nobody knows until that forward runs.
+        # The target arm travels the same way and for the same reason: the actor
+        # is where the support exists, and the resume identity is written from
+        # the actor's config, so a block the actor never saw is a block no
+        # checkpoint can be checked against.
+        xtt_cfg = opd_cfg.get("cross_teacher_target", None)
+        if xtt_cfg is not None:
+            config.actor_rollout_ref.actor.cross_teacher_target = xtt_cfg
+            with open_dict(config):
+                config.actor_rollout_ref.actor.cross_teacher_target.teacher_paths = (
+                    opd_cfg.get("teacher_paths", None)
+                )
         xt_cfg = opd_cfg.get("cross_teacher_kl_weight", None)
         if xt_cfg is not None:
             config.actor_rollout_ref.actor.cross_teacher_kl_weight = xt_cfg

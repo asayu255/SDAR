@@ -1460,7 +1460,9 @@ def test_the_driver_shares_one_gate_for_the_cache_and_the_base_worker():
     and then read nothing."""
     src = open("verl/trainer/ppo/opd_ray_trainer.py").read()
     for marker in (
-        "self.cross_teacher_enabled = self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled",
+        "self.cross_teacher_enabled = (",
+        "or self.cross_teacher_kl_weight_enabled",
+        "or self.cross_teacher_target_enabled",
         "self.need_hidden_cache = self.student_indexed_topk or self.cross_teacher_enabled",
         "if not self.cross_teacher_enabled:",
     ):

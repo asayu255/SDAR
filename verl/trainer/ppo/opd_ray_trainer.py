@@ -242,10 +242,27 @@ class OPDRayTrainer(RayPPOTrainer):
             "both would train an arm that is neither and report both sets of metrics as "
             "if they described it; pick one."
         )
+        # The TARGET arm (verl/trainer/ppo/cross_teacher_target.py). The third
+        # consumer the seam below was written for: same four models, same
+        # support, same cache. It differs from the two above in WHERE it reaches
+        # the loss -- it rewrites the teacher's values instead of scaling the KL,
+        # because a positive scalar on KL(p_s || p_on) is minimised at
+        # p_s = p_on whatever the scalar is.
+        xtt_cfg = dict(opd_cfg.get("cross_teacher_target", {}) or {})
+        self.cross_teacher_target_enabled = bool(xtt_cfg.get("enable", False))
+        assert not (self.cross_teacher_target_enabled
+                    and (self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled)), (
+            "algorithm.opd.cross_teacher_target moves the distillation target while "
+            "sign_weight and cross_teacher_kl_weight scale it. Two of them at once "
+            "trains an arm that is none of the three; pick one."
+        )
         # Who needs base, the cache and the extra forwards -- as opposed to who
         # builds a weight out of them. Every gate below is this one, so adding a
         # third consumer never means finding the cache gates again.
-        self.cross_teacher_enabled = self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled
+        self.cross_teacher_enabled = (
+            self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled
+            or self.cross_teacher_target_enabled
+        )
         # Who needs the hidden-state cache, which is NOT the same question as who
         # picks the top-k support. student_indexed_topk needs it because the
         # on-task teacher is scored at ids that do not exist until the actor's
@@ -257,7 +274,8 @@ class OPDRayTrainer(RayPPOTrainer):
         self.need_hidden_cache = self.student_indexed_topk or self.cross_teacher_enabled
         self.sign_weight_mode = str(sw_cfg.get("mode", "target"))
         self.base_policy_path = (
-            xt_cfg.get("base_path", None) if self.cross_teacher_kl_weight_enabled
+            xtt_cfg.get("base_path", None) if self.cross_teacher_target_enabled
+            else xt_cfg.get("base_path", None) if self.cross_teacher_kl_weight_enabled
             else sw_cfg.get("base_path", None)
         )
         self.base_wg = None
@@ -269,6 +287,17 @@ class OPDRayTrainer(RayPPOTrainer):
                 n_teachers=len(self.teacher_paths),
             )
         if self.cross_teacher_kl_weight_enabled:
+            check_cross_teacher_kl_weight_prerequisites(
+                teacher_topk_kl=self.teacher_topk_kl,
+                base_policy_path=self.base_policy_path,
+                n_teachers=len(self.teacher_paths),
+            )
+        if self.cross_teacher_target_enabled:
+            # The same three prerequisites, and for the same reasons: a dense
+            # top-k support to rewrite, a base policy to measure shifts against,
+            # and two off-task teachers -- with one the sign agreement that gates
+            # both channels is trivially satisfied by a single teacher agreeing
+            # with itself, and the mechanism degenerates to pairwise.
             check_cross_teacher_kl_weight_prerequisites(
                 teacher_topk_kl=self.teacher_topk_kl,
                 base_policy_path=self.base_policy_path,

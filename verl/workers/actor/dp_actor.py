@@ -58,6 +58,9 @@ from verl.trainer.ppo.sign_weights import (
     turn_index,
     reweight_teacher_logprobs,
 )
+from verl.trainer.ppo.cross_teacher_target import (
+    build_target as xtt_build_target,
+)
 from verl.trainer.ppo.cross_teacher_kl_weight import (
     POSITION_TERMS as XT_POSITION_TERMS,
     CHANNEL_PROBES as XT_CHANNEL_PROBES,
@@ -1869,6 +1872,24 @@ class DataParallelPPOActor(BasePPOActor):
         )
         xt_enabled = xt_cfg_on and "sign_cache_ids" in data.batch.keys()
         xt_report_eps = float((xt_cfg or {}).get("report_epsilon", 0.1))
+        # The TARGET arm. It reads the same four models on the same support, but
+        # it does not multiply the teacher KL -- it rewrites the teacher's own
+        # values, because a positive scalar on KL(p_s || p_on) is minimised at
+        # p_s = p_on whatever the scalar is, and this arm exists to inject
+        # something the on-task teacher does not express. See
+        # docs/cross_teacher_target_design.md.
+        xtt_cfg = self.config.get("cross_teacher_target", None)
+        xtt_cfg_on = bool(xtt_cfg and xtt_cfg.get("enable", False))
+        assert not (xtt_cfg_on and (sign_cfg_on or xt_cfg_on)), (
+            "cross_teacher_target moves the distillation target while sign_weight and "
+            "cross_teacher_kl_weight scale it; running two of them trains an arm that "
+            "is none of the three"
+        )
+        xtt_enabled = xtt_cfg_on and "sign_cache_ids" in data.batch.keys()
+        # The one knob, and it is a unit conversion rather than a strength dial:
+        # exp(c) needs c in nats and c is in RMS units. 1.0 reads one RMS unit as
+        # one nat -- the conservative end. The measured conversion is 2.148.
+        xtt_scale = float((xtt_cfg or {}).get("exponent_scale", 1.0))
         # THE ARM-INDEPENDENT CUT. Everything above this line needs the base
         # policy and the off-task teachers, which only cross_teacher_enabled
         # makes the driver load: a control run has no sign_cache_ids column at
@@ -2830,6 +2851,50 @@ class DataParallelPPOActor(BasePPOActor):
                     _scores = data.get("token_level_scores", None)
                     _row_adv = data.get("adv_row_value", None)
                     _push_for_events = None
+                    # The target arm's product: log p_tilde on the support, or
+                    # None when it is off or has no scale yet. Read once, at the
+                    # line that builds teacher_kld -- it multiplies nothing.
+                    xtt_built = None
+                    # One definition of "is this the epoch that folds statistics
+                    # in", shared by both arms. Later PPO epochs re-visit the same
+                    # rows against a student that has already moved, so counting
+                    # them would fold each trajectory in once per epoch and mix
+                    # two policies into one cumulative scale.
+                    xt_collect = epoch == 0
+                    if xtt_enabled:
+                        assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
+                            "cross_teacher_target needs the top-k support and the on-task "
+                            "teacher's log-probs at it"
+                        )
+                        with _actor_phase("actor.cross_teacher_target"):
+                            base_logprob, off_logprobs = self._cross_teacher_planes(
+                                data, sign_support_ids, cached=cross_planes
+                            )
+                            if xt_collect:
+                                self._xt_rms.update(
+                                    shifts=compute_raw_policy_shifts(
+                                        on_task_logprob=sign_on_task_logprobs,
+                                        off_task_logprobs=off_logprobs,
+                                        base_logprob=base_logprob,
+                                    ),
+                                    student_logprob=student_topk_logprobs,
+                                    response_mask=response_mask,
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                )
+                            if xt_rms_snapshot is not None:
+                                xtt_built = xtt_build_target(
+                                    on_logprob=sign_on_task_logprobs,
+                                    off_logprob=off_logprobs,
+                                    base_logprob=base_logprob,
+                                    diag=xt_rms_snapshot[0],
+                                    diag_valid=xt_rms_snapshot[1],
+                                    task_ids=task_ids,
+                                    off_plane_tasks=data["sign_off_tasks"],
+                                    exponent_scale=xtt_scale,
+                                    shuffled_off_logprob=None,
+                                    response_mask=response_mask,
+                                )
                     if xt_enabled:
                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
                             "cross_teacher_kl_weight needs the student's top-k support and the "
@@ -2841,7 +2906,6 @@ class DataParallelPPOActor(BasePPOActor):
                         # has already moved, so folding them in would count each
                         # trajectory once per epoch and mix two policies into one
                         # cumulative scale.
-                        xt_collect = epoch == 0
                         with _actor_phase("actor.cross_teacher"):
                             base_logprob, off_logprobs = self._cross_teacher_planes(
                                 data, sign_support_ids, cached=cross_planes
@@ -3069,6 +3133,17 @@ class DataParallelPPOActor(BasePPOActor):
                                 if fwd_teacher_topk_logprobs is not None
                                 else data["teacher_topk_logprobs"]
                             )
+                            if xtt_built is not None:
+                                # The one line the TARGET arm exists to reach.
+                                # Not a factor on the KL -- the teacher's own
+                                # values, rewritten, so the fixed point moves and
+                                # the off-task teachers can carry something the
+                                # on-task one does not express. Mass on the
+                                # support is conserved exactly, so the tail term
+                                # inside topk_kl_per_token is still correct.
+                                teacher_topk_lp = xtt_built["target_logprob"].to(
+                                    teacher_topk_lp.dtype
+                                )
                             teacher_kld = topk_kl_per_token(
                                 student_topk_logprob=student_topk_logprobs,
                                 teacher_topk_logprob=teacher_topk_lp,

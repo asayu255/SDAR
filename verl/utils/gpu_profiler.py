@@ -1629,6 +1629,10 @@ _PHASE_ORDER = [
     # same reason: it is the most expensive thing this arm adds, and unlisted it
     # sorts alphabetically to the tail, below the backward pass it precedes.
     "actor.cross_teacher",
+    # The target arm's planes and target build. Same position, same reason: it
+    # reads the same four models and is the same share of the step, and the two
+    # are mutually exclusive so only one of them ever appears in a report.
+    "actor.cross_teacher_target",
     "actor.bwd",
     "actor.task_metrics",
     "actor.optim",
