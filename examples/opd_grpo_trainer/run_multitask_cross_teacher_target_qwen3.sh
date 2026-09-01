@@ -1166,7 +1166,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
-    actor_rollout_ref.actor.student_indexed_topk=True \
+    actor_rollout_ref.actor.student_indexed_topk=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.return_rollout_log_probs=True \
     actor_rollout_ref.rollout.disable_log_stats=False \

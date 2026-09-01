@@ -102,7 +102,15 @@
 # the two settings are different (valid) objectives -- comparing arms across them
 # compares nothing. ref.student_indexed_topk follows the actor's value in
 # ppo_trainer.yaml and so is not listed separately.
-"actor_rollout_ref.actor.student_indexed_topk": true
+# FALSE here, deliberately, where the klw arm pins true: the target arm's
+# support is the ON-TASK TEACHER's top-k (design constraint C7). A
+# student-indexed support makes p_tilde a function of the student and the
+# mechanism a feedback loop -- the old student-indexed arm's frac_agree_pos
+# drifted 0.238 -> 0.193 as the student moved -- while the teacher-indexed
+# support makes the target a student-independent fixed point. The teachertopk
+# sign arm already ran this path end to end, and the cache reads three models
+# per row instead of four.
+"actor_rollout_ref.actor.student_indexed_topk": false
 # enable_gradient_checkpointing sits on the gradient path even though it looks
 # like a pure memory knob: a recomputed forward and a stored one differ in their
 # last bits under autocast, the same class as no_sync_grad_accum. It is pinned

@@ -278,6 +278,8 @@ G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step �
 
 **指標(すべて `target/*`、control には0列):** `tv`(=交換量 T)、`shuffled_tv_ratio`(G1)、`acted_novelty`(G2)、`tag_share`(G3)、`max_abs_log_w`(G4)、`mass_error_max`(Z=1 恒等式の実測)、`live_frac`、`throttle_up/down`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、Z=1 なので厳密)、イベントは `SignEventSamples` を再利用 — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
 
+**対 control の差分は厳密には2つある。** 機構キーに加えて `student_indexed_topk`(control: true / target: **false**、C7)。これは意図的で、根拠は測定: teachertopk サインアームがまさにこのキーだけを student-indexed の兄弟アームに対して変え、**全7状態の frac / mass_frac が ±0.006 以内、学習中ロールアウトの episode 指標は区別不能**だった(teachertopk レポート)。ペアリングテストはこのキーを測定根拠のコメント付きで許容している。support が teacher top-k になることで、キャッシュは行あたり 4 → 3 モデル読みになる。
+
 **resume の扱い:** target アームは sidecar を持たない(μ も α も無いため)。resume 時は RMS が生きたバッチから再ウォームされ、最初のスナップショットまで $c\equiv0$(= no-op step が1回入るだけ)。
 
 **再利用するもの:** `CumulativePolicyShiftRMS`、`standardize_policy_shifts`、`decorrelated_off_shifts`(G1)、`TokenStateCounts` / `LogitPushTokens` / `SignEventSamples`(§6)、teacher hidden-state cache(teacher-indexed なので 3 モデル読みで済む)。

@@ -48,6 +48,16 @@ def _mechanism_or_identity(differing):
     allowed = set(IDENTITY)
     allowed |= {k for k in differing if k.startswith(_MECHANISMS)}
     allowed |= {k for k in differing if "micro_batch_size" in k}
+    # The support choice is part of the mechanism, not a drift: design C7 puts
+    # the target arm on the ON-TASK TEACHER's top-k so p_tilde is a
+    # student-independent fixed point, while both comparators run
+    # student-indexed. This is a real second difference against the control and
+    # it is accepted on a measurement, not on faith: the teachertopk sign arm
+    # changed exactly this key against ITS student-indexed sibling and every one
+    # of the seven state fractions and mass fractions moved by less than 0.006
+    # (docs/multitask_signweight_teachertopk_150step_report.md), with the
+    # training-rollout episode metrics indistinguishable.
+    allowed |= {k for k in differing if k.endswith("student_indexed_topk")}
     return allowed
 
 

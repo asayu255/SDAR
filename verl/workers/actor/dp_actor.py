@@ -1888,6 +1888,16 @@ class DataParallelPPOActor(BasePPOActor):
             "cross_teacher_kl_weight scale it; running two of them trains an arm that "
             "is none of the three"
         )
+        if xtt_cfg_on:
+            assert teacher_topk_kl and use_teacher_kl_loss, (
+                "cross_teacher_target rewrites the teacher's top-k values; it needs "
+                "kl_loss_type=topk_kl and use_teacher_kl_loss=true"
+            )
+            assert not student_indexed_topk, (
+                "cross_teacher_target's support is the ON-TASK TEACHER's top-k "
+                "(design C7: a student-indexed support makes the target a feedback "
+                "loop); set actor.student_indexed_topk=false"
+            )
         xtt_enabled = xtt_cfg_on and "sign_cache_ids" in data.batch.keys()
         # The one knob, and it is a unit conversion rather than a strength dial:
         # exp(c) needs c in nats and c is in RMS units. 1.0 reads one RMS unit as
@@ -1976,6 +1986,16 @@ class DataParallelPPOActor(BasePPOActor):
             # Config-gated, and the presence check is uniform across ranks (the
             # driver builds one batch), so it cannot desynchronise anything.
             if bool((sign_cfg.get("event_dump", None) or {}).get("enable", False)) and (
+                "token_level_scores" in data.batch.keys()
+            ):
+                select_keys.append("token_level_scores")
+        if xtt_enabled:
+            # The same two columns the arms above select, for the same reader:
+            # the base and off-task cache rows, and which planes are whose.
+            select_keys += ["sign_cache_ids", "sign_off_tasks"]
+            # The event dump's reward column. Selected on the dump's switch, as
+            # the sign arm does -- this arm has no outcome statistics reading it.
+            if bool((xtt_cfg.get("event_dump", None) or {}).get("enable", False)) and (
                 "token_level_scores" in data.batch.keys()
             ):
                 select_keys.append("token_level_scores")
