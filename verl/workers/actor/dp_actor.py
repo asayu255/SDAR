@@ -59,7 +59,10 @@ from verl.trainer.ppo.sign_weights import (
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.cross_teacher_target import (
+    TAG_TOKEN_IDS as XTT_TAG_TOKEN_IDS,
+    TargetStepStats,
     build_target as xtt_build_target,
+    sign_state_labels as xtt_sign_state_labels,
 )
 from verl.trainer.ppo.cross_teacher_kl_weight import (
     POSITION_TERMS as XT_POSITION_TERMS,
@@ -2177,6 +2180,20 @@ class DataParallelPPOActor(BasePPOActor):
                         self._xt_alpha = restored.to(torch.float32)
                     print(f"[cross_teacher] resumed accumulated state from {pending}", flush=True)
                 self.cross_teacher_sidecar_path = None
+        if xtt_cfg_on:
+            # Indexed by task for the same reason the arm above is; and the RMS
+            # is the SAME accumulator, because it measures the teachers and the
+            # base, none of which differ between the two arms. What this arm
+            # does NOT share is the sidecar: it has no mean, no reliability and
+            # no alpha, and a resume simply re-warms the RMS from live batches
+            # -- c is identically zero until the first snapshot exists, so the
+            # cost of a resume is one no-op step, not a wrong scale.
+            assert n_task >= 3, (
+                "cross_teacher_target is indexed by task and needs at least three of "
+                f"them (a destination and two consensus sources); the batch names {n_task}."
+            )
+            if self._xt_rms is None:
+                self._xt_rms = CumulativePolicyShiftRMS(n_tasks=n_task, device=sign_dev)
         # {tag: [ids]}, set by the worker at startup -- this process has no
         # tokenizer. Absent means the role column reports "format" throughout,
         # which is honest: nothing was classified. Read here rather than beside
@@ -2184,6 +2201,7 @@ class DataParallelPPOActor(BasePPOActor):
         # built or skipped on whether it exists.
         sign_role_tags = getattr(self, "sign_role_tag_ids", None)
         xt_on = xt_cfg_on and self._xt_rms is not None
+        xtt_on = xtt_cfg_on and self._xt_rms is not None
         xt_position_stats = (
             ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev) if xt_on else None
         )
@@ -2354,6 +2372,43 @@ class DataParallelPPOActor(BasePPOActor):
                     context=int(xt_event_cfg.get("context", 16)),
                     device=sign_dev,
                 )
+        # ---- the target arm's own step table and dumps ---------------------- #
+        xtt_stats = xtt_token_stats = xtt_event_stats = None
+        xtt_tag_ids = tuple(XTT_TAG_TOKEN_IDS)
+        if xtt_on:
+            xtt_stats = TargetStepStats(n_tasks=n_task, device=sign_dev)
+            xtt_tag_ids = tuple(
+                int(t) for t in (xtt_cfg.get("tag_token_ids", None) or XTT_TAG_TOKEN_IDS)
+            )
+            xtt_token_cfg = dict(xtt_cfg.get("token_stats", None) or {})
+            xtt_event_cfg = dict(xtt_cfg.get("event_dump", None) or {})
+            xtt_due = (
+                self._xt_step_index % max(1, int(xtt_token_cfg.get("every", 1)))
+            ) == 0
+            if xtt_due and bool(xtt_token_cfg.get("enable", False)):
+                _vocab = model_vocab_size(self.actor_module)
+                if _vocab is None:
+                    print(
+                        "[cross_teacher_target] a per-token table was requested but the "
+                        "model does not report a vocab_size; running without it",
+                        flush=True,
+                    )
+                else:
+                    # The sign arm's class and the sign arm's target-mode effect
+                    # column, dq(v) = p_on (w - 1) -- exact here because Z is 1
+                    # by construction -- filed under the sign arm's state names
+                    # via the exact (branch, sign) mapping. Same dump file, same
+                    # scan script, one vocabulary for readers.
+                    xtt_token_stats = TokenStateCounts(
+                        vocab_size=_vocab, n_tasks=n_task, device=sign_dev,
+                        top_n=int(xtt_token_cfg.get("top_n", 64)), mode="target",
+                    )
+            if xtt_due and bool(xtt_event_cfg.get("enable", False)):
+                xtt_event_stats = SignEventSamples(
+                    capacity=int(xtt_event_cfg.get("per_step", 128)),
+                    context=int(xtt_event_cfg.get("context", 16)),
+                    device=sign_dev,
+                )
         xt_probe_stats = (
             {
                 probe_name(a): ScopeTermStats(names=XT_POSITION_TERMS, n_tasks=n_task, device=sign_dev)
@@ -2399,7 +2454,7 @@ class DataParallelPPOActor(BasePPOActor):
         # still being scored, and reading them here would make the objective
         # depend on the order the micro-batches ran in.
         xt_alpha_snapshot = self._xt_alpha if xt_on else None
-        xt_rms_snapshot = self._xt_rms_snapshot if xt_on else None
+        xt_rms_snapshot = self._xt_rms_snapshot if (xt_on or xtt_on) else None
         xt_outside_topk = torch.zeros(2, dtype=torch.float64, device=sign_dev) if xt_on else None
         # Non-finite tallies, accumulated on the device so counting them costs no
         # sync inside the micro-batch loop, and read once at the step boundary.
@@ -2882,6 +2937,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                 )
+                            xtt_collect = xt_collect and xtt_stats is not None
                             if xt_rms_snapshot is not None:
                                 xtt_built = xtt_build_target(
                                     on_logprob=sign_on_task_logprobs,
@@ -2892,9 +2948,79 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                     exponent_scale=xtt_scale,
-                                    shuffled_off_logprob=None,
+                                    # The counterfactuals ride the collecting
+                                    # epoch only: three more elementwise
+                                    # exchanges, and nothing the loss reads.
+                                    shuffle_counterfactual=xtt_collect,
+                                    channel_counterfactuals=xtt_collect,
                                     response_mask=response_mask,
                                 )
+                            if xtt_built is not None and xtt_collect:
+                                # G2's two ingredients, measured the same way as
+                                # the loss: the same dense top-k reverse KL, one
+                                # against the on-task teacher, one against base.
+                                _d_on = topk_kl_per_token(
+                                    student_topk_logprob=student_topk_logprobs,
+                                    teacher_topk_logprob=sign_on_task_logprobs,
+                                )
+                                _d_base = topk_kl_per_token(
+                                    student_topk_logprob=student_topk_logprobs,
+                                    teacher_topk_logprob=base_logprob,
+                                )
+                                xtt_stats.update(
+                                    built=xtt_built, p_on=xtt_built["p_on"],
+                                    support_ids=sign_support_ids,
+                                    response_mask=response_mask, task_ids=task_ids,
+                                    d_on=_d_on, d_base=_d_base,
+                                    tag_token_ids=xtt_tag_ids,
+                                )
+                                if xtt_token_stats is not None or xtt_event_stats is not None:
+                                    _labels = xtt_sign_state_labels(
+                                        xtt_built["branch"], xtt_built["consensus_sign"]
+                                    )
+                                    # dq = p_on (w - 1): the change to the target
+                                    # distribution. Exact, because Z = 1 is an
+                                    # identity here -- the redistribution term the
+                                    # class documents for the old target arm is
+                                    # structurally zero.
+                                    _dq = (
+                                        (xtt_built["w"] - 1.0) * xtt_built["p_on"].to(torch.float64)
+                                    )
+                                if xtt_token_stats is not None:
+                                    xtt_token_stats.update(
+                                        support_ids=sign_support_ids,
+                                        state=_labels,
+                                        weight=xtt_built["w"],
+                                        on_task_logprob=sign_on_task_logprobs,
+                                        response_mask=response_mask,
+                                        task_ids=task_ids,
+                                        effect=_dq,
+                                    )
+                                if xtt_event_stats is not None:
+                                    _rs = data.get("token_level_scores", None)
+                                    xtt_event_stats.update(
+                                        support_ids=sign_support_ids,
+                                        state=_labels,
+                                        weight=xtt_built["w"],
+                                        effect=_dq,
+                                        on_task_logprob=sign_on_task_logprobs,
+                                        off_task_logprobs=off_logprobs,
+                                        base_logprob=base_logprob,
+                                        student_logprob=student_topk_logprobs,
+                                        response_mask=response_mask,
+                                        responses=data["responses"],
+                                        # Z is identically 1; the column exists so
+                                        # a row reads the same as the old arm's.
+                                        norm=torch.ones_like(_d_on),
+                                        teacher_kl=_d_on,
+                                        task_ids=task_ids,
+                                        roles=(
+                                            token_roles(data["responses"], sign_role_tags)
+                                            if sign_role_tags
+                                            else None
+                                        ),
+                                        reward=(_rs.sum(dim=-1) if _rs is not None else None),
+                                    )
                     if xt_enabled:
                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
                             "cross_teacher_kl_weight needs the student's top-k support and the "
@@ -4203,6 +4329,25 @@ class DataParallelPPOActor(BasePPOActor):
             # every rank, incremented in lockstep, so the dense-token stride
             # cannot make two ranks disagree about whether a table exists.
             self._xt_step_index += 1
+        if xtt_on:
+            # The scale's reduce and snapshot, in the same fixed order the other
+            # arm uses and for the same reason: gated on config alone, so a rank
+            # whose micro-batches held nothing still runs every collective.
+            self._xt_rms.all_reduce()
+            self._xt_rms_snapshot = self._xt_rms.diagonal()
+            if xtt_stats is not None:
+                xtt_stats.all_reduce()
+                metrics.update(xtt_stats.metrics(task_names=task_id_names))
+            # The sigma trajectory, under the series name both weighted arms
+            # already use, so the three runs chart on one axis.
+            metrics.update(self._xt_rms_metrics(task_id_names))
+            if xtt_token_stats is not None:
+                xtt_token_stats.all_reduce()
+                metrics.update(xtt_token_stats.scalar_metrics(
+                    task_names=task_id_names, prefix="target",
+                ))
+            self.cross_teacher_task_order = list(task_id_names or [])
+            self._xt_step_index += 1
         # ---- the arm-independent OPD attribution, rendered ------------------ #
         # OUTSIDE the block above, which is the whole point: `if xt_on` is false
         # for every step of a control run, and these are the keys that make the
@@ -4263,7 +4408,12 @@ class DataParallelPPOActor(BasePPOActor):
             # without going back to the launch command.
             metrics["sign_weight/measure_only"] = 1.0
         self.last_token_report = None
-        if token_stats is not None:
+        if xtt_token_stats is not None:
+            # The target arm's table. all_reduced in its own block above, and an
+            # exclusive branch here for the same reason the two below are: the
+            # arms never run together, so one channel serves all three.
+            self.last_token_report = xtt_token_stats.top_tokens(task_names=task_id_names)
+        elif token_stats is not None:
             token_stats.all_reduce()
             metrics.update(token_stats.scalar_metrics(task_names=task_id_names))
             self.last_token_report = token_stats.top_tokens(task_names=task_id_names)
@@ -4314,7 +4464,9 @@ class DataParallelPPOActor(BasePPOActor):
         # on disk is a sample of rank 0's shard -- itself a random shard of the
         # batch, so unbiased, but world_size times smaller than it looks.
         self.last_event_report = None
-        if event_stats is not None:
+        if xtt_event_stats is not None:
+            self.last_event_report = xtt_event_stats.rows(task_names=task_id_names)
+        elif event_stats is not None:
             self.last_event_report = event_stats.rows(task_names=task_id_names)
         elif xt_event_stats is not None:
             self.last_event_report = xt_event_stats.rows(task_names=task_id_names)

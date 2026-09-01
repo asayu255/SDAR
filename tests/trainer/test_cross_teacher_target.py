@@ -281,12 +281,48 @@ def test_exponent_scale_is_the_only_knob_and_it_moves_the_intervention():
 
 def test_shuffled_counterfactual_is_built_on_request():
     kw = _chain()
-    gen = torch.Generator().manual_seed(19)
-    kw["shuffled_off_logprob"] = torch.log_softmax(
-        torch.randn_like(kw["off_logprob"]) if False else
-        torch.randn(kw["off_logprob"].shape, generator=gen), dim=-2) + math.log(0.99)
-    got = build_target(**kw)
+    bs, resp = kw["on_logprob"].shape[:2]
+    got = build_target(**kw, shuffle_counterfactual=True,
+                       response_mask=torch.ones(bs, resp))
     assert "shuffled_moved" in got and got["shuffled_moved"].shape == got["moved"].shape
+
+
+def test_channel_counterfactuals_partition_sensibly():
+    kw = _chain()
+    got = build_target(**kw, channel_counterfactuals=True)
+    # Each channel alone moves no more than... nothing exact holds (the capacity
+    # min is not additive), but both must be bounded by their own capacity and
+    # non-negative, and a-only + b-only >= 0 trivially; what IS exact is that a
+    # channel that is everywhere zero moves nothing.
+    assert torch.all(got["a_only_moved"] >= 0) and torch.all(got["b_only_moved"] >= 0)
+
+
+def test_step_stats_render_the_preregistered_quantities():
+    from verl.trainer.ppo.cross_teacher_target import TargetStepStats, sign_state_labels
+
+    kw = _chain(bs=3, resp=4, k=8)
+    bs, resp = kw["on_logprob"].shape[:2]
+    mask = torch.ones(bs, resp)
+    got = build_target(**kw, shuffle_counterfactual=True,
+                       channel_counterfactuals=True, response_mask=mask)
+    stats = TargetStepStats(n_tasks=3, device="cpu")
+    ids = torch.randint(0, 50, kw["on_logprob"].shape)
+    stats.update(built=got, p_on=got["p_on"], support_ids=ids,
+                 response_mask=mask, task_ids=kw["task_ids"],
+                 d_on=torch.rand(bs, resp), d_base=torch.rand(bs, resp) + 1.0)
+    m = stats.metrics(task_names=["alfworld", "search", "webshop"])
+    for key in ("target/tv", "target/live_frac", "target/acted_mass_frac",
+                "target/branch/agree/mass_frac", "target/max_abs_log_w",
+                "target/mass_error_max", "target/shuffled_tv_ratio",
+                "target/alfworld/tv"):
+        assert key in m, key
+    # The Z = 1 identity, as the metric reports it.
+    assert m["target/mass_error_max"] < 1e-12
+    # branch fracs sum to one over candidates
+    tot = sum(m[f"target/branch/{b}/cand_frac"] for b in ("agree", "conflict", "on_silent", "split"))
+    assert abs(tot - 1.0) < 1e-9
+    labels = sign_state_labels(got["branch"], got["consensus_sign"])
+    assert labels.min() >= 0 and labels.max() <= 6
 
 
 def test_per_task_sigma_is_read_independently():

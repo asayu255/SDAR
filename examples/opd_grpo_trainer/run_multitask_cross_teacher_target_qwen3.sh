@@ -116,7 +116,7 @@ set -x
 # Teacher and checkpoint paths are written relative to $HOME so the same script
 # resolves correctly on either machine.
 #
-# INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_cross_teacher_klw_control_config.yaml pins the
+# INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_cross_teacher_target_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
 # protocol). main_opd_grpo validates the composed config against it after its own
 # injection and refuses to start on any mismatch. To change such a knob, edit
@@ -1122,7 +1122,7 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
 fi
 
 python3 -m verl.trainer.main_opd_grpo \
-    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_cross_teacher_klw_control_config.yaml \
+    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_cross_teacher_target_config.yaml \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/verl-agent/sdar_multitask/train.parquet \
     data.val_files=$HOME/data/verl-agent/sdar_multitask/test.parquet \
@@ -1201,22 +1201,15 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \
     +algorithm.opd.normalize_loss_by_task=True \
-    +algorithm.opd.cross_teacher_kl_weight.enable=False \
-    +algorithm.opd.cross_teacher_kl_weight.base_path=Qwen/Qwen3-1.7B \
-    +algorithm.opd.cross_teacher_kl_weight.report_epsilon=0.1 \
-    +algorithm.opd.cross_teacher_kl_weight.max_groups=512 \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.enable=True \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.top_n=64 \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.roles=True \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.role_top_n=32 \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.every=5 \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.logit_push=True \
-    +algorithm.opd.cross_teacher_kl_weight.token_stats.push_top_n=32 \
-    +algorithm.opd.cross_teacher_kl_weight.event_dump.enable=True \
-    +algorithm.opd.cross_teacher_kl_weight.event_dump.per_step=128 \
-    +algorithm.opd.cross_teacher_kl_weight.event_dump.context=16 \
-    +algorithm.opd.cross_teacher_kl_weight.event_dump.pair_strata=True \
-    +algorithm.opd.cross_teacher_kl_weight.event_dump.per_group=4 \
+    +algorithm.opd.cross_teacher_target.enable=True \
+    +algorithm.opd.cross_teacher_target.base_path=Qwen/Qwen3-1.7B \
+    +algorithm.opd.cross_teacher_target.exponent_scale=1.0 \
+    +algorithm.opd.cross_teacher_target.token_stats.enable=True \
+    +algorithm.opd.cross_teacher_target.token_stats.top_n=64 \
+    +algorithm.opd.cross_teacher_target.token_stats.every=5 \
+    +algorithm.opd.cross_teacher_target.event_dump.enable=True \
+    +algorithm.opd.cross_teacher_target.event_dump.per_step=128 \
+    +algorithm.opd.cross_teacher_target.event_dump.context=16 \
     +algorithm.opd.opd_attribution.enable=True \
     +algorithm.opd.opd_attribution.every=5 \
     +algorithm.opd.opd_attribution.top_n=64 \
@@ -1241,15 +1234,15 @@ python3 -m verl.trainer.main_opd_grpo \
     env.resources_per_worker.num_cpus=0.1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name="verl_agent_opd_grpo_cross_teacher_klw$RUN_TAG_SUFFIX" \
-    trainer.experiment_name="opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b$RUN_TAG_SUFFIX" \
+    trainer.project_name="verl_agent_opd_grpo_cross_teacher_target$RUN_TAG_SUFFIX" \
+    trainer.experiment_name="opd_grpo_multitask_cross_teacher_target_qwen3_1.7b$RUN_TAG_SUFFIX" \
     trainer.n_gpus_per_node=2 \
     trainer.ray_wait_register_center_timeout=600 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_cross_teacher_klw_control_multitask$RUN_TAG_SUFFIX \
-    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b$RUN_TAG_SUFFIX \
+    trainer.default_local_dir=$HOME/checkpoints/verl_agent_opd_grpo_cross_teacher_target_multitask$RUN_TAG_SUFFIX \
+    trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_cross_teacher_target_qwen3_1.7b$RUN_TAG_SUFFIX \
     +trainer.val_instance_log_text=True \
-    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b$RUN_TAG_SUFFIX \
+    trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_cross_teacher_target_qwen3_1.7b$RUN_TAG_SUFFIX \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \

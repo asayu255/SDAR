@@ -266,6 +266,10 @@ def test_the_reordering_the_scripts_do_not_export_is_still_off():
 _CROSS_TEACHER_SCRIPTS = (
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_control_qwen3.sh",
+    # The target arm carries the block for the same reason the pair above does:
+    # its comparators are exactly those two scripts, and an arm that lacks a
+    # reordering its control has differs from it in more than the mechanism.
+    "examples/opd_grpo_trainer/run_multitask_cross_teacher_target_qwen3.sh",
 )
 
 

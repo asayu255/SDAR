@@ -226,7 +226,8 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
                  base_logprob: torch.Tensor, diag: torch.Tensor,
                  diag_valid: torch.Tensor, task_ids: torch.Tensor,
                  off_plane_tasks: torch.Tensor, exponent_scale: float = 1.0,
-                 shuffled_off_logprob: Optional[torch.Tensor] = None,
+                 shuffle_counterfactual: bool = False,
+                 channel_counterfactuals: bool = False,
                  response_mask: Optional[torch.Tensor] = None) -> dict:
     """The whole chain: standardised shifts -> ``c`` -> ``w`` -> ``log p_tilde``.
 
@@ -235,13 +236,18 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         off_logprob: (bs, resp, k, n_off) the off-task teachers on the same ids.
         base_logprob: (bs, resp, k) the pre-RL policy on the same ids.
         diag, diag_valid: (n_tasks,) from ``CumulativePolicyShiftRMS.diagonal``.
-        shuffled_off_logprob: the same off-task planes rolled within each row, from
-            ``decorrelated_off_shifts``. When given, the counterfactual target is
-            built too and its total variation is returned beside the live one --
-            this is the abort gate G1, not an optional extra. The audit measured
-            the predecessor's gate opening at 0.82 of its live rate on shuffled
-            teachers; a mechanism that scores near that is moving mass for
-            reasons that survive destroying the position correspondence.
+        shuffle_counterfactual: build the target a second time from the
+            off-task planes rolled within each row's real response
+            (``decorrelated_off_shifts`` -- the audit's counterfactual, reused
+            verbatim) and return its exchanged mass as ``shuffled_moved``. This
+            is the abort gate G1, not an optional extra: the predecessor's gate
+            opened at 0.82 of its live rate on shuffled teachers, and a
+            mechanism that scores near that is moving mass for reasons that
+            survive destroying the position correspondence. Needs
+            ``response_mask``.
+        channel_counterfactuals: run the exchange twice more with ``c = a`` and
+            ``c = b`` alone, returning ``a_only_moved`` / ``b_only_moved``. What
+            each intent would have done by itself, measured rather than argued.
 
     Returns:
         ``{"target_logprob", "w", "c", "branch", "moved", ...}``. The support's
@@ -278,17 +284,217 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         "row_available": hat["row_available"],
     }
 
-    if shuffled_off_logprob is not None:
-        sh_shifts = {"on": shifts["on"],
-                     "off": (shuffled_off_logprob - base_logprob.unsqueeze(-1)).detach()}
-        sh_hat = standardize_policy_shifts(
-            shifts=sh_shifts, diag=diag, diag_valid=diag_valid,
-            task_ids=task_ids, off_plane_tasks=off_plane_tasks,
-        )
-        sh_c = target_exponent(hat_on=sh_hat["on"],
-                               consensus=off_task_consensus(sh_hat["off"]),
-                               exponent_scale=exponent_scale)["c"]
-        sh = capacity_limited_weight(c=sh_c, p_on=p_on, row_available=sh_hat["row_available"])
-        out["shuffled_moved"] = sh["moved"]
-        out["shuffled_c"] = sh_c
+    if shuffle_counterfactual:
+        assert response_mask is not None, "the shuffle rolls within the real response"
+        from verl.trainer.ppo.cross_teacher_kl_weight import decorrelated_off_shifts
+
+        sh_c = target_exponent(
+            hat_on=hat["on"],
+            consensus=off_task_consensus(decorrelated_off_shifts(hat["off"], response_mask)),
+            exponent_scale=exponent_scale,
+        )["c"]
+        out["shuffled_moved"] = capacity_limited_weight(
+            c=sh_c, p_on=p_on, row_available=hat["row_available"])["moved"]
+    if channel_counterfactuals:
+        for name in ("a", "b"):
+            out[f"{name}_only_moved"] = capacity_limited_weight(
+                c=tilt[name], p_on=p_on, row_available=hat["row_available"])["moved"]
     return out
+
+
+# Qwen3's tag vocabulary: the single-token think tags, the literal 3-token
+# spelling of "<think" (which the audit measured at 21.7% of webshop's whole
+# teacher KL), and the pieces <action> is built from. The G3 gate reads the
+# share of the intervention that lands here: past 0.3 the run is measuring tag
+# tokenisation, not cross-teacher structure. Tokenizer-specific by nature, so
+# overridable from config as tag_token_ids.
+TAG_TOKEN_IDS = (13708, 766, 27, 29, 522, 1311, 151667, 151668)
+
+# Reused from the sign arm so the dump files, the scan script and the reader's
+# vocabulary stay one thing. The mapping is exact, not approximate: the sign
+# arm's states are defined from the on-task sign against the off-task consensus,
+# which is precisely what the branch + consensus sign carry.
+_SIGN_STATE_BY_BRANCH_AND_SIGN = {
+    # (branch, s > 0): sign_weights.STATE_* index
+    ("agree", True): 0,       # agree_pos
+    ("agree", False): 1,      # agree_neg
+    ("conflict", True): 3,    # off raises, on lowers -> conflict_on_neg
+    ("conflict", False): 2,   # off lowers, on raises -> conflict_on_pos
+    ("on_silent", True): 4,   # neutral_on_task_silent
+    ("on_silent", False): 4,
+    ("split", True): 5,       # neutral_off_task_split
+    ("split", False): 5,
+}
+
+
+def sign_state_labels(branch: torch.Tensor, consensus_sign: torch.Tensor) -> torch.Tensor:
+    """Branch indices -> the sign arm's STATE_* labels, for table/dump reuse."""
+    out = torch.full_like(branch, 5)
+    pos = consensus_sign > 0
+    for (name, is_pos), state in _SIGN_STATE_BY_BRANCH_AND_SIGN.items():
+        mask = (branch == BRANCHES.index(name)) & (pos if is_pos else ~pos)
+        out = torch.where(mask, torch.full_like(out, state), out)
+    return out
+
+
+class TargetStepStats:
+    """The step's gates and pre-registered numbers, as one reduced table.
+
+    Everything in here answers a question the design document asked in advance
+    -- docs/cross_teacher_target_design.md pre-registers target_tv = 0.019, the
+    branch split 0.871/0.129, and the abort gates G1-G4 -- so the class is the
+    run's side of that appointment. Only what no existing metric carries: the
+    per-task teacher KL, the episode metrics and the RMS trajectory are already
+    logged elsewhere.
+
+    Scope 0 is the pooled batch; scope 1 + t is task t. float64 sums, one
+    all_reduce at step end (SUM for the sums, MAX for the two maxima), rendered
+    identically on every rank.
+    """
+
+    _SUMS = (
+        "n_pos",              # response-masked positions
+        "moved",              # sum of per-position exchanged mass = TV
+        "shuffled_moved",     # same, from the position-decorrelated teachers (G1)
+        "a_only_moved",       # corroboration channel alone
+        "b_only_moved",       # fallback channel alone
+        "live_n",             # positions where an exchange actually ran
+        "throttle_up",        # sum over live positions of T / A_U
+        "throttle_down",      # sum over live positions of T / R_D
+        "clamped",            # candidates whose |c| hit the exponent clamp
+        "n_cand",             # masked candidates
+        "mass",               # sum p_on over masked candidates
+        "acted_cand",         # candidates with c != 0
+        "acted_mass",         # their p_on
+        "a_absmass",          # sum |a| * p_on  (channel split, teacher measure)
+        "b_absmass",          # sum |b| * p_on
+        "intervention",       # sum |w - 1| * p_on
+        "tag_intervention",   # the same, restricted to TAG_TOKEN_IDS (G3)
+        "d_on",               # per-position KL(student || on-task), live positions
+        "d_base",             # per-position KL(student || base), live positions (G2)
+        "mass_error",         # sum |sum_v (w-1) p_on(v)| -- the Z = 1 identity
+        # branch reach, candidate count and teacher mass per branch: the audit's
+        # "read frac and mass_frac as a pair" rule, kept as one (4.3% of
+        # candidates carried 64.7% of mass on the old arm).
+        "branch0_cand", "branch1_cand", "branch2_cand", "branch3_cand",
+        "branch0_mass", "branch1_mass", "branch2_mass", "branch3_mass",
+    )
+
+    def __init__(self, *, n_tasks: int, device):
+        self.n_tasks = int(n_tasks)
+        self.n_scopes = 1 + self.n_tasks
+        self.sums = torch.zeros((self.n_scopes, len(self._SUMS)),
+                                dtype=torch.float64, device=device)
+        self.max_log_w = torch.zeros(1, dtype=torch.float64, device=device)  # G4
+        self.max_mass_error = torch.zeros(1, dtype=torch.float64, device=device)
+
+    def _col(self, name):
+        return self._SUMS.index(name)
+
+    def update(self, *, built: dict, p_on: torch.Tensor, support_ids: torch.Tensor,
+               response_mask: torch.Tensor, task_ids: Optional[torch.Tensor],
+               d_on: Optional[torch.Tensor] = None,
+               d_base: Optional[torch.Tensor] = None,
+               tag_token_ids=TAG_TOKEN_IDS) -> None:
+        m_pos = response_mask.to(torch.float64)                       # (bs, resp)
+        m_cand = m_pos.unsqueeze(-1)                                  # (bs, resp, 1)
+        p = p_on.to(torch.float64)
+        w = built["w"].to(torch.float64)
+        c = built["c"].to(torch.float64)
+        live = built["live"].to(torch.float64) * m_pos
+
+        tag = torch.zeros_like(support_ids, dtype=torch.bool)
+        for tid in tag_token_ids:
+            tag |= support_ids == tid
+        acted = (c != 0).to(torch.float64) * m_cand
+        inter = (w - 1.0).abs() * p * m_cand
+        # The identity, measured: sum_v (w - 1) p must be zero per position.
+        pos_err = ((w - 1.0) * p).sum(dim=-1).abs() * m_pos
+
+        cols = {
+            "n_pos": m_pos, "moved": built["moved"].to(torch.float64) * m_pos,
+            "live_n": live,
+            "throttle_up": built["throttle_up"].to(torch.float64) * live,
+            "throttle_down": built["throttle_down"].to(torch.float64) * live,
+            "clamped": built["clamped"].to(torch.float64).sum(dim=-1) * m_pos,
+            "n_cand": m_cand.expand_as(p).to(torch.float64),
+            "mass": p * m_cand, "acted_cand": acted, "acted_mass": p * acted,
+            "a_absmass": built["a"].to(torch.float64).abs() * p * m_cand,
+            "b_absmass": built["b"].to(torch.float64).abs() * p * m_cand,
+            "intervention": inter,
+            "tag_intervention": inter * tag.to(torch.float64),
+            "mass_error": pos_err,
+        }
+        for key in ("shuffled_moved", "a_only_moved", "b_only_moved"):
+            if key in built:
+                cols[key] = built[key].to(torch.float64) * m_pos
+        if d_on is not None:
+            cols["d_on"] = d_on.detach().to(torch.float64) * live
+            cols["d_base"] = d_base.detach().to(torch.float64) * live
+        branch = built["branch"]
+        for i in range(4):
+            sel = (branch == i).to(torch.float64) * m_cand
+            cols[f"branch{i}_cand"] = sel
+            cols[f"branch{i}_mass"] = p * sel
+
+        flat = {k: v.sum() for k, v in cols.items()}
+        for k, v in flat.items():
+            self.sums[0, self._col(k)] += v
+        if task_ids is not None:
+            t = task_ids.reshape(-1).to(torch.long)
+            for k, v in cols.items():
+                per_row = v.sum(dim=tuple(range(1, v.dim())))
+                known = t >= 0
+                self.sums[:, self._col(k)].index_add_(
+                    0, t.clamp(min=0)[known] + 1, per_row[known]
+                )
+        log_w = w.clamp(min=_LOG_FLOOR).log().abs()
+        self.max_log_w = torch.maximum(
+            self.max_log_w, (log_w * m_cand).max().reshape(1).to(torch.float64))
+        self.max_mass_error = torch.maximum(self.max_mass_error,
+                                            pos_err.max().reshape(1))
+
+    def all_reduce(self) -> None:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        torch.distributed.all_reduce(self.sums, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(self.max_log_w, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(self.max_mass_error, op=torch.distributed.ReduceOp.MAX)
+
+    def metrics(self, *, task_names) -> dict:
+        s = self.sums.detach().cpu()
+        out = {}
+        names = ["__pooled__"] + list(task_names or [])
+        for scope in range(min(self.n_scopes, len(names))):
+            head = "target" if scope == 0 else f"target/{names[scope]}"
+            row = s[scope]
+            g = lambda k: float(row[self._col(k)])
+            n_pos, n_cand, mass = max(g("n_pos"), 1e-12), max(g("n_cand"), 1e-12), max(g("mass"), 1e-12)
+            live = max(g("live_n"), 1e-12)
+            out[f"{head}/tv"] = g("moved") / n_pos
+            out[f"{head}/live_frac"] = g("live_n") / n_pos
+            out[f"{head}/throttle_up"] = g("throttle_up") / live
+            out[f"{head}/throttle_down"] = g("throttle_down") / live
+            out[f"{head}/acted_cand_frac"] = g("acted_cand") / n_cand
+            out[f"{head}/acted_mass_frac"] = g("acted_mass") / mass
+            ab = g("a_absmass") + g("b_absmass")
+            if ab > 0:
+                out[f"{head}/channel/a_share"] = g("a_absmass") / ab
+                out[f"{head}/channel/b_share"] = g("b_absmass") / ab
+            inter = g("intervention")
+            if inter > 0:
+                out[f"{head}/tag_share"] = g("tag_intervention") / inter    # G3
+            if g("moved") > 0 and g("shuffled_moved") >= 0 and scope == 0:
+                out[f"{head}/shuffled_tv_ratio"] = g("shuffled_moved") / g("moved")  # G1
+            for key, col in (("a_only_tv", "a_only_moved"), ("b_only_tv", "b_only_moved")):
+                if g(col) > 0:
+                    out[f"{head}/channel/{key}"] = g(col) / n_pos
+            if g("d_base") > 0:
+                out[f"{head}/acted_novelty"] = 1.0 - g("d_on") / g("d_base")  # G2
+            out[f"{head}/clamped_per_step"] = g("clamped")
+            for i, name in enumerate(BRANCHES):
+                out[f"{head}/branch/{name}/cand_frac"] = g(f"branch{i}_cand") / n_cand
+                out[f"{head}/branch/{name}/mass_frac"] = g(f"branch{i}_mass") / mass
+        out["target/max_abs_log_w"] = float(self.max_log_w.item())            # G4
+        out["target/mass_error_max"] = float(self.max_mass_error.item())      # Z = 1
+        return out

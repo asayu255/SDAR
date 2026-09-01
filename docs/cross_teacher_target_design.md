@@ -274,6 +274,12 @@ G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step �
 
 **新モジュール** `verl/trainer/ppo/cross_teacher_target.py`。既存の `cross_teacher_kl_weight.py` は position mode 専用で、$\mu$・$q$・student mass 測度がすべて不要になるため、拡張より新設が明快。
 
+**実装済み(2026-09-02、branch `claude/cross-teacher-target`)。** 中核 `verl/trainer/ppo/cross_teacher_target.py`(§2 の式 + §3 の交換 + `TargetStepStats`)、actor 配線(`dp_actor.py`: 教師 logprob を $\log\tilde p$ に差し替え、3アーム相互排他 assert)、driver 配線(`opd_ray_trainer.py` の第3消費者)、config 伝播(`main_opd.py`)、run script(`run_multitask_cross_teacher_target_qwen3.sh`)、intent lock(`expected_multitask_cross_teacher_target_config.yaml`、機構キーは enable / base_path / exponent_scale の3つ)、対 control・対 klw のペアリングテスト(`test_cross_teacher_target_arm.py`: 差分が機構キーと識別子のみであることを合成 config で機械検証)。
+
+**指標(すべて `target/*`、control には0列):** `tv`(=交換量 T)、`shuffled_tv_ratio`(G1)、`acted_novelty`(G2)、`tag_share`(G3)、`max_abs_log_w`(G4)、`mass_error_max`(Z=1 恒等式の実測)、`live_frac`、`throttle_up/down`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、Z=1 なので厳密)、イベントは `SignEventSamples` を再利用 — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
+
+**resume の扱い:** target アームは sidecar を持たない(μ も α も無いため)。resume 時は RMS が生きたバッチから再ウォームされ、最初のスナップショットまで $c\equiv0$(= no-op step が1回入るだけ)。
+
 **再利用するもの:** `CumulativePolicyShiftRMS`、`standardize_policy_shifts`、`decorrelated_off_shifts`(G1)、`TokenStateCounts` / `LogitPushTokens` / `SignEventSamples`(§6)、teacher hidden-state cache(teacher-indexed なので 3 モデル読みで済む)。
 
 **捨てるもの:** `PreviousStepTaskKLWeightedMean`、cold start、`teacher_similarity`($q$)、`candidate_mass`(student 測度)、`report_epsilon`、sidecar のバージョン管理。

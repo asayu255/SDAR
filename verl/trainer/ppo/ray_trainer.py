@@ -951,7 +951,8 @@ class RayPPOTrainer:
             kwargs["temperature"] = float(task_kwargs["temperature"])
         return kwargs
 
-    def _dump_val_instances(self, *, scores, task_names, data_sources, traj_uids, tool_callings):
+    def _dump_val_instances(self, *, scores, task_names, data_sources, traj_uids,
+                            tool_callings, response_texts=None):
         """One line per validation instance, so a later comparison can be PAIRED.
 
         The aggregate this function sits next to -- a mean per task -- is the only
@@ -998,6 +999,15 @@ class RayPPOTrainer:
                             # file only as good as the guess.
                             "score": float(scores[i]),
                             "tool_calling": float(tool_callings[i]),
+                            # Present only under trainer.val_instance_log_text.
+                            # None rather than absent would make every row carry
+                            # the column; absent is what lets a reader detect
+                            # which runs recorded text at all.
+                            **(
+                                {"response": str(response_texts[i])}
+                                if response_texts is not None and i < len(response_texts)
+                                else {}
+                            ),
                         }
                     )
                     + "\n"
@@ -1176,6 +1186,15 @@ class RayPPOTrainer:
 
     def _validate(self):
         reward_tensor_lst = []
+        # The generated text, per row, when trainer.val_instance_log_text is on.
+        # Off by default: it decodes every validation row on the calling thread
+        # (the exact cost _decode_for_val_table exists to avoid) and multiplies
+        # the instance log's size by the response length. On because a target
+        # arm moves the distillation target, and "what changed in the text" is
+        # unanswerable from scores -- the offline audit's section 12 could not
+        # name a single improved sentence for exactly this reason.
+        val_log_text = bool(self.config.trainer.get("val_instance_log_text", False))
+        response_text_lst = []
         data_source_lst = []
         task_name_lst = []
         tool_calling_list = []
@@ -1251,6 +1270,10 @@ class RayPPOTrainer:
                 task_name_lst.append(batch_task_names)
                 tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
                 traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                if val_log_text:
+                    response_text_lst.extend(
+                        self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                    )
                 # success rate
                 for k in test_batch.non_tensor_batch.keys():
                     if 'success_rate' in k:
@@ -1275,6 +1298,7 @@ class RayPPOTrainer:
             data_sources=data_sources,
             traj_uids=traj_uids,
             tool_callings=tool_callings,
+            response_texts=response_text_lst if val_log_text else None,
         )
 
         # evaluate test_score based on data source
