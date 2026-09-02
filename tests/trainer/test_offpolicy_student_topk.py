@@ -362,3 +362,96 @@ def test_the_two_supports_genuinely_differ_on_disagreeing_models():
     _, s_ids = torch.topk(s_logsm, K, dim=-1)
     overlap = (t_ids.unsqueeze(-1) == s_ids.unsqueeze(-2)).any(-1).float().mean()
     assert overlap < 0.5
+
+
+# --------------------------------------------------------------------------- #
+# 4. the pool columns this arm stops reading
+# --------------------------------------------------------------------------- #
+
+
+def test_the_student_indexed_arm_drops_the_recorded_top_k_at_load():
+    """The largest thing in a row, kept only by the arm that trains on it.
+
+    teacher_topk_logprobs + teacher_topk_ids are ~82 KB of the ~123 KB a row costs
+    resident -- about 105 GB across the pool, on a box the Stage-2 profile measured
+    at 494/503 GB. The teacher-indexed arm's loss IS those two columns. The
+    student-indexed arm never selects them (the support is the student's own
+    top-k), so carrying them buys nothing.
+    """
+    from verl.trainer.ppo.opd_offpolicy_ray_trainer import (
+        _KD_TARGET_TENSOR_KEYS,
+        OffPolicyOPDRayTrainer,
+    )
+
+    control = _trainer_init(student_indexed_topk=False)
+    arm = _trainer_init(
+        student_indexed_topk=True,
+        teacher_paths={"alfworld": "/ckpt/a", "search": "/ckpt/s", "webshop": "/ckpt/w"},
+    )
+
+    kept = control._resolve_drop_tensor_keys()
+    dropped = arm._resolve_drop_tensor_keys()
+    for key in _KD_TARGET_TENSOR_KEYS:
+        assert key not in kept, "the teacher-indexed arm trains on this column"
+        assert key in dropped
+    # Nothing else moved: the class-level dead set is still the floor for both.
+    assert set(OffPolicyOPDRayTrainer._drop_tensor_keys) <= set(kept)
+    assert set(kept) < set(dropped)
+
+
+def test_the_dropped_columns_are_exactly_the_ones_update_policy_stops_selecting():
+    """The two decisions have to agree, and they are made in different files.
+
+    Dropping a column the loss then selects dies at the first micro-batch; keeping
+    one it does not costs 105 GB for nothing. Both are driven by
+    student_indexed_topk, so pin that they read the same names.
+    """
+    import inspect
+
+    from verl.trainer.ppo.opd_offpolicy_ray_trainer import _KD_TARGET_TENSOR_KEYS
+    from verl.workers.actor import dp_actor
+
+    # The module, not update_policy: GPUMemoryLogger wraps that method without
+    # functools.wraps, so getsource on it returns the decorator's body.
+    src = inspect.getsource(dp_actor)
+    # One place selects the recorded top-k, and it is the teacher-indexed branch;
+    # the student-indexed branch selects the cache key instead. A read added
+    # outside that branch changes this count, and the drop above stops being safe.
+    selected = 'select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]'
+    assert src.count(selected) == 1
+    assert src.count('select_keys.append("teacher_cache_ids")') == 1
+    for key in _KD_TARGET_TENSOR_KEYS:
+        assert key in selected
+    # And the two remaining uses are both inside the teacher-indexed else-branch.
+    assert src.count('data["teacher_topk_ids"]') == 1
+    assert src.count('data["teacher_topk_logprobs"]') == 1
+
+
+def test_keeping_them_stays_available_for_the_cross_check():
+    """The retain flag is the only reason to hold them in this arm, and the reason
+    is the oracle above -- so it has to actually be reachable."""
+    from verl.trainer.ppo import opd_offpolicy_ray_trainer as mod
+
+    arm = _trainer_init(
+        student_indexed_topk=True,
+        teacher_paths={"alfworld": "/ckpt/a", "search": "/ckpt/s", "webshop": "/ckpt/w"},
+    )
+    original = mod._KEEP_KD_TARGETS
+    try:
+        mod._KEEP_KD_TARGETS = True
+        assert set(arm._resolve_drop_tensor_keys()) == set(arm._drop_tensor_keys)
+    finally:
+        mod._KEEP_KD_TARGETS = original
+
+
+def test_the_loader_still_defaults_to_the_class_attribute():
+    """The subclass extension point the SFT arm established keeps working: a
+    caller that says nothing gets cls._drop_tensor_keys, unchanged."""
+    import inspect
+
+    from verl.trainer.ppo.opd_offpolicy_ray_trainer import OffPolicyOPDRayTrainer
+
+    sig = inspect.signature(OffPolicyOPDRayTrainer._load_offpolicy_file)
+    assert sig.parameters["drop_keys"].default is None
+    src = inspect.getsource(OffPolicyOPDRayTrainer._load_offpolicy_file)
+    assert "drop_keys = cls._drop_tensor_keys" in src

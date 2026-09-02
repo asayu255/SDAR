@@ -32,6 +32,14 @@ set -x
 # THIS ARM DOES NOT COMPARE WITH THE CONTROL'S LOSS CURVE. Different support,
 # different (still valid) bound. Compare validation scores, not actor/teacher_kl_loss.
 #
+# WHAT IT GIVES BACK. The pool's two largest columns -- the teacher's recorded
+# top-k, ~82 KB of the ~123 KB a row costs resident, about 105 GB across the pool
+# -- are the teacher-indexed arm's training target and are read by nothing here.
+# They are dropped at load, which matters because the Stage-2 profile measured
+# this box at 494/503 GB of host RAM. OFFPOLICY_KEEP_TEACHER_TOPK=1 keeps them,
+# for the one run that cross-checks the live Stage-2 teacher against what Stage 1
+# recorded; do not leave it on for 300 steps.
+#
 # EVERY parameter lives as a literal argument of the python3 commands below —
 # there is deliberately NO variable block, NO ${VAR:-default} fallback, NO
 # shared-args array and NO per-task loop, so there is exactly one place to
@@ -53,6 +61,8 @@ set -x
 # are exported below so they are on without being remembered; set either to 0 to
 # disable:
 #   ROLLOUT_KEEP_VLLM_AWAKE=1   — one vLLM weight-sync per rollout, not per turn
+#   OFFPOLICY_KEEP_TEACHER_TOPK=1 — keep the pool's recorded teacher top-k that
+#     this arm does not read (~105 GB of host RAM). Off by default; see above.
 #   OFFPOLICY_BATCH_PREFETCH=1  — builds step k+1's batch on a background thread
 #     while step k is inside update_actor (a blocking ray.get, so it holds no
 #     GIL). Bit-identical to the sequential path; see _prepared_batch_iter for

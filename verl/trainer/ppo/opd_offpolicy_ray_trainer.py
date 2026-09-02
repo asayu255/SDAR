@@ -101,6 +101,23 @@ _SAVE_NON_TENSOR_KEYS = ["task_name", "traj_uid"]
 # ``_drop_tensor_keys`` class attribute.
 _DROP_TENSOR_KEYS = ("prompts", "response_mask")
 
+# The teacher's top-k distribution: KD's target, and by a wide margin the largest
+# thing in a row -- k log-probs plus k ids at every one of the 512 response slots
+# is ~82 KB of the ~123 KB a row costs resident, about 105 GB across the pool.
+#
+# Dead weight for any arm whose loss does not read it. That was the SFT arm's case
+# (plain NLL on the teacher's sampled tokens), and it is now also the
+# student-indexed KD arm's: there the support is the student's own top-k and the
+# teacher is evaluated at those ids from its cached hidden states, so a top-k
+# chosen by Stage 1 answers nothing. update_policy leaves both columns out of
+# select_keys in that mode, which is what makes dropping them here safe rather
+# than merely plausible.
+#
+# Not folded into _DROP_TENSOR_KEYS, because whether they are dead depends on the
+# run's loss and not on the file: the teacher-indexed arm trains on exactly these
+# two columns.
+_KD_TARGET_TENSOR_KEYS = ("teacher_topk_logprobs", "teacher_topk_ids")
+
 # Storage dtypes for the RESIDENT pool, all lossless: the vocab (151,936) and the
 # padded sequence length (4,608) both fit int32 with room to spare, and
 # attention_mask is 0/1. Stage 1 writes int64 because that is what the rollout
@@ -154,6 +171,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
 # Read once at import, like the other rollout knobs in this tree, so the
 # mechanism cannot change halfway through a run.
 _BATCH_PREFETCH = _env_flag("OFFPOLICY_BATCH_PREFETCH")
+
+# Keep the KD target columns even in an arm that does not read them. The one use
+# left for them there is the cross-check only the off-policy arm can make: Stage 1
+# recorded this teacher's own top-k for these exact rows, so a Stage-2 teacher
+# resolved at those recorded ids must reproduce the recorded values -- a reference
+# written by another process on another day. Worth one run at ~105 GB of host RAM;
+# not worth 300 steps of it.
+_KEEP_KD_TARGETS = _env_flag("OFFPOLICY_KEEP_TEACHER_TOPK")
 
 
 def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
@@ -463,6 +488,14 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
     # unread by *any* Stage-2 loss.
     _drop_tensor_keys = _DROP_TENSOR_KEYS
 
+    # Declared at class level, not only assigned in __init__, because
+    # _resolve_drop_tensor_keys reads it during the pool load and the pool load is
+    # reachable from a bare instance (the loader tests build one with __new__ to
+    # avoid standing up Ray). False is also the right default on its own terms:
+    # the arm this trainer was written for reads the teacher's recorded top-k, and
+    # an unset flag must not be what decides to throw it away.
+    student_indexed_topk = False
+
     # ------------------------------------------------------------------ #
     # Worker setup. The default arm needs none of this -- it is the base
     # trainer's actor_rollout and nothing else. student_indexed_topk adds one
@@ -663,7 +696,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         metrics["teacher_cache/gb"] = float(stats["bytes"]) / (1024**3)
 
     @classmethod
-    def _load_offpolicy_file(cls, path: str) -> DataProto:
+    def _load_offpolicy_file(cls, path: str, drop_keys=None) -> DataProto:
         """Load one Stage-1 ``<task>.pt``, dropping padding rows and dead columns.
 
         Pools written while Stage 1 still called adjust_batch unconditionally carry
@@ -678,10 +711,12 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         Row order is preserved, so the first-seen order of traj_uids -- and hence
         the trajectory sampling sequence -- is unchanged.
 
-        ``cls._drop_tensor_keys`` go too. They are a quarter of every row and nothing
-        in this stage reads them, so keeping them only costs host RAM -- see
-        ``_DROP_TENSOR_KEYS`` for why each is dead, and the class attribute for how a
-        subclass with a narrower loss drops more.
+        ``drop_keys`` go too -- ``cls._drop_tensor_keys`` when the caller does not
+        say otherwise. They are a quarter of every row and nothing in this stage
+        reads them, so keeping them only costs host RAM: see ``_DROP_TENSOR_KEYS``
+        for why each is dead, the class attribute for how a subclass with a
+        narrower loss drops more, and ``_resolve_drop_tensor_keys`` for the columns
+        whose deadness depends on the run rather than on the class.
 
         Both happen in one column-wise pass that releases each source column as soon
         as its replacement exists. Doing it with select_idxs instead would hold the
@@ -693,6 +728,8 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         """
         data = DataProto.load_from_disk(path)
         name = os.path.basename(path)
+        if drop_keys is None:
+            drop_keys = cls._drop_tensor_keys
 
         keep_idx = None
         n_rows = len(data)
@@ -711,7 +748,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         source = data.batch
         for key in list(source.keys()):
             column = source[key]
-            if key in cls._drop_tensor_keys:
+            if key in drop_keys:
                 dropped_cols.append(key)
             else:
                 kept = column if keep_idx is None else column[keep_idx]
@@ -738,6 +775,23 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             print(f"[OPD-offpolicy] {name}: narrowed storage dtypes of {narrowed_cols} "
                   f"(lossless; restored per step batch)")
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
+
+    def _resolve_drop_tensor_keys(self):
+        """Columns to leave on disk for THIS run, not just for this class.
+
+        ``_drop_tensor_keys`` names what no Stage-2 loss reads, which is a property
+        of the subclass. The teacher's top-k is different: the teacher-indexed arm
+        trains on it and the student-indexed arm never looks at it, and those are
+        the same class differing by a config flag. So the decision is made here,
+        from the flag update_policy branches on -- the two have to agree, because
+        dropping a column the loss then selects fails at the first micro-batch, and
+        keeping one it does not costs ~105 GB of host RAM for a run that is already
+        measured at 98% of the box.
+        """
+        keys = tuple(self._drop_tensor_keys)
+        if self.student_indexed_topk and not _KEEP_KD_TARGETS:
+            keys += _KD_TARGET_TENSOR_KEYS
+        return keys
 
     def _load_offpolicy_data(self):
         """Load the Stage-1 pool, keeping every file it was written as.
@@ -768,11 +822,24 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
 
+        drop_keys = self._resolve_drop_tensor_keys()
+        if self.student_indexed_topk:
+            print(
+                "[OPD-offpolicy] student_indexed_topk: the teacher's recorded top-k is "
+                + ("KEPT (OFFPOLICY_KEEP_TEACHER_TOPK=1) -- about 105 GB of host RAM "
+                   "held for a signal this arm's loss does not read"
+                   if _KEEP_KD_TARGETS else
+                   "dropped at load; the support is the student's, so a top-k chosen by "
+                   "Stage 1 answers nothing. Set OFFPOLICY_KEEP_TEACHER_TOPK=1 to keep it "
+                   "for a run that cross-checks the live teacher against it."),
+                flush=True,
+            )
+
         self._task_shards = {}        # task -> [DataProto] (that task's rows, in write order)
         self._task_to_traj_rows = {}  # task -> {traj_uid: (shard idx, np.ndarray(rows in shard))}
         self._task_to_trajs = {}      # task -> np.ndarray(traj_uid) sampling population
         for path in files:
-            data = self._load_offpolicy_file(path)
+            data = self._load_offpolicy_file(path, drop_keys=drop_keys)
             assert "traj_uid" in data.non_tensor_batch, (
                 f"{os.path.basename(path)}: off-policy dataset must carry traj_uid "
                 "for trajectory-level sampling"
