@@ -1,7 +1,8 @@
 import json
 import threading
+import time
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Union
 import argparse
 
 import faiss
@@ -29,8 +30,25 @@ def read_jsonl(file_path):
 
 
 def load_docs(corpus, doc_idxs):
-    results = [corpus[int(idx)] for idx in doc_idxs]
-    return results
+    """Fetch the documents at these row numbers, in this order.
+
+    One gather, not one lookup per row. ``corpus`` is an Arrow-backed
+    datasets.Dataset, and ``corpus[i]`` walks its whole indexing machinery and
+    builds a fresh Python dict every time -- so a turn that retrieves top-3 for
+    44 queries paid 132 of those. Measured end to end, a batched retrieval took
+    292 ms per turn against ~20-40 ms of encoder and FAISS: nearly all of the
+    rest was this loop. ``corpus[list]`` is a single take over the table.
+
+    The return shape is unchanged: one dict per requested row, in the order
+    asked for, duplicates included (different queries do retrieve the same
+    passage).
+    """
+    idxs = [int(idx) for idx in doc_idxs]
+    if not idxs:
+        return []
+    columns = corpus[idxs]
+    names = list(columns.keys())
+    return [{name: columns[name][position] for name in names} for position in range(len(idxs))]
 
 
 # One request at a time on the GPU.
@@ -38,18 +56,18 @@ def load_docs(corpus, doc_idxs):
 # FastAPI runs a synchronous endpoint in its worker threadpool, so this server
 # will happily execute forty /retrieve calls at once against ONE sharded FAISS
 # index and ONE encoder. Two things go wrong. The activations of n concurrent
-# encodes coexist, which is why a single request that a quiet box served was
-# refused with a 500 on a busy one -- the ceiling was never the request, it was
+# encodes coexist, which is why a single request of 384 queries was refused with
+# a 500 on a box where 383 was served -- the ceiling was not the request, it was
 # the request plus whatever else was in flight. And a GpuIndex built by
-# index_cpu_to_all_gpus shares its resources across the shards; searching it
-# from several threads at once is not something faiss promises to survive, and
-# the symptom when it does not is that nothing returns at all -- eleven requests
+# index_cpu_to_all_gpus shares its resources across the shards; searching it from
+# several threads at once is not something faiss promises to survive, and the
+# symptom when it does not is that nothing returns at all -- eleven requests
 # timed out together after 600 s with the server still accepting connections.
 #
 # Serialising costs nothing that was real. The GPU executes these one at a time
 # regardless; running them concurrently only multiplied the memory and removed
-# the guarantee. Document loading stays outside the lock, because it is Arrow
-# and host memory and it is the part that genuinely overlaps.
+# the guarantee. Document loading stays outside the lock, because it is Arrow and
+# host memory and it is the part that genuinely overlaps.
 _GPU = threading.Lock()
 
 
@@ -256,21 +274,42 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
+        spent = {"gpu_wait": 0.0, "encode": 0.0, "faiss": 0.0, "load": 0.0}
         for start_idx in range(0, len(query_list), self.batch_size):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
+            mark = time.perf_counter()
             with _GPU:
+                spent["gpu_wait"] += time.perf_counter() - mark
+                mark = time.perf_counter()
                 batch_emb = self.encoder.encode(query_batch)
+                spent["encode"] += time.perf_counter() - mark
+
+                mark = time.perf_counter()
                 batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+                spent["faiss"] += time.perf_counter() - mark
 
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
-            # load_docs is not vectorized, but is a python list approach
             flat_idxs = sum(batch_idxs, [])
+            mark = time.perf_counter()
             batch_results = load_docs(self.corpus, flat_idxs)
+            spent["load"] += time.perf_counter() - mark
             # chunk them back
             batch_results = [batch_results[i * num : (i + 1) * num] for i in range(len(batch_idxs))]
             results.extend(batch_results)
             scores.extend(batch_scores)
+        # Where the time went, per request -- which with a batched client is once
+        # per rollout turn. The encoder and the FAISS scan are bounded by what the
+        # hardware can do; the document lookup is not, and attributing between
+        # them by argument is how a quarter of a second per turn stayed invisible.
+        print(
+            f"[retrieve] {len(query_list):4d} queries  topk {num}  "
+            f"gpu_wait {1000 * spent['gpu_wait']:7.1f} ms  "
+            f"encode {1000 * spent['encode']:6.1f} ms  "
+            f"faiss {1000 * spent['faiss']:6.1f} ms  "
+            f"load_docs {1000 * spent['load']:6.1f} ms",
+            flush=True,
+        )
         if return_score:
             return results, scores
         else:
@@ -325,7 +364,16 @@ class Config:
 
 
 class QueryRequest(BaseModel):
-    query: str
+    # A list as well as a string, because the index is Flat: a search reads the
+    # whole 32 GB of embeddings regardless of how many queries it is given, so
+    # 126 separate requests read it 126 times and one request with 126 queries
+    # reads it once. Measured against this server, an unloaded single query is
+    # 80 ms and 126 concurrent ones take 7.5 s -- a 93x inflation that is the
+    # index being re-read, not the server being slow.
+    #
+    # A plain string still behaves exactly as before, so an un-upgraded client
+    # keeps working and no restart has to be coordinated with one.
+    query: Union[str, List[str]]
     topk: Optional[int] = None
     return_scores: bool = False
 
@@ -335,55 +383,81 @@ app = FastAPI()
 # How many /retrieve calls are being served right now. A client that retries
 # without bound turns a slow server into a queue and the queue into the reason
 # it is slow, and from the client side that is indistinguishable from a server
-# that has stopped answering. Reported only when it is high enough to be the
-# answer, because a line per request is itself a source of latency here.
+# that has stopped answering -- eleven requests timing out together at 600 s
+# said nothing about how many were in front of them. One number per request is
+# enough to tell the two apart.
 _inflight = 0
 _inflight_lock = threading.Lock()
-_INFLIGHT_REPORT_OVER = 8
 
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
     """
-    Endpoint that accepts a single query and performs retrieval.
+    Endpoint that accepts one query or a list of them and performs retrieval.
     Input format:
     {
-      "query": "What is Python?",
+      "query": "What is Python?",                     # or ["What is Python?", ...]
       "topk": 3,
       "return_scores": true
     }
+    The response is {"result": [...]} with one entry per query, in order -- for a
+    single string that is the one-element list it has always been.
     """
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
+
+    queries = [request.query] if isinstance(request.query, str) else list(request.query)
+    started = time.perf_counter()
 
     global _inflight
     with _inflight_lock:
         _inflight += 1
         concurrent = _inflight
     try:
-        # Perform retrieval
+        # batch_search even for one query. DenseRetriever._batch_search encodes
+        # the whole list in one forward pass and hands FAISS one (n, dim) matrix,
+        # which for a Flat index is one pass over the embeddings instead of n
+        # passes. It chunks by retrieval_batch_size, so a longer list only makes
+        # it read the index fewer times.
+        #
+        # That chunking is NOT a guarantee that any request can be served: a
+        # chunk is encoded and searched on a GPU that also holds the index, and
+        # one that does not fit raises out of here as a bare 500. Measured on
+        # this server at retrieval_batch_size=512, 383 queries in a request were
+        # served and 384 were not -- and that ceiling was free memory over the
+        # cost of a query with every other in-flight request counted against it,
+        # which is what _GPU above now bounds. The client finds what is left of
+        # it by halving a request that keeps drawing 5xx; see _Coalescer._send.
         if request.return_scores:
-            results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
+            results, scores = retriever.batch_search(queries, num=request.topk, return_score=True)
         else:
-            results = retriever.search(query=request.query, num=request.topk, return_score=False)
+            results = retriever.batch_search(queries, num=request.topk, return_score=False)
             scores = None
     finally:
         with _inflight_lock:
             _inflight -= 1
-    if concurrent > _INFLIGHT_REPORT_OVER:
-        print(f"[retrieve] served with {concurrent} requests in flight", flush=True)
 
-    # Format response
+    served = time.perf_counter()
+
+    # One entry per query, in the order they were sent -- which for a single
+    # string is the one-element list the old response already was.
     resp = []
-    if request.return_scores and scores is not None:
-        # If scores are returned, combine them with results
-        combined = []
-        for doc, score in zip(results, scores):
-            # Convert numpy float32 to regular Python float for JSON serialization
-            combined.append({"document": doc, "score": float(score)})
-        resp.append(combined)
-    else:
-        resp.append(results)
+    for position, documents in enumerate(results):
+        if scores is not None:
+            resp.append(
+                # float(): numpy float32 is not JSON serialisable
+                [{"document": doc, "score": float(score)} for doc, score in zip(documents, scores[position])]
+            )
+        else:
+            resp.append(documents)
+    # The two _batch_search cannot see: its own total as the endpoint measures it,
+    # and the reshaping into the response.
+    print(
+        f"[retrieve]              search {1000 * (served - started):6.1f} ms  "
+        f"format {1000 * (time.perf_counter() - served):5.1f} ms  "
+        f"inflight {concurrent:3d}",
+        flush=True,
+    )
     return {"result": resp}
 
 
@@ -421,7 +495,10 @@ if __name__ == "__main__":
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,  # this is unused in the current retrieval implementation, which only supports single query
+        # How many queries one encoder pass and one FAISS search handle. Reached
+        # from /retrieve now that it accepts a list, so it is the cap on how much
+        # of the index re-reading a batched client can amortise away.
+        retrieval_batch_size=512,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
