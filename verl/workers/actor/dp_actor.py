@@ -2074,6 +2074,22 @@ class DataParallelPPOActor(BasePPOActor):
             value = (loss_mat * mask).sum() / den.clamp(min=1)
             _defer(name, value, weight=(den > 0).to(value.dtype))
 
+        def _defer_present(name, value, present):
+            """Defer an ALREADY-AGGREGATED scalar that may be 0/0 for this task.
+
+            ``_defer_task`` builds the aggregate itself; this one takes a value a
+            loss function returned, which is NaN when the task had no rows. The
+            NaN is replaced rather than multiplied away -- ``0 * NaN`` is NaN --
+            and the presence rides along so the read at the end divides by the
+            micro-batches the task was actually in.
+            """
+            value = value.detach()
+            _defer(
+                name,
+                torch.where(present, value, torch.zeros_like(value)),
+                weight=present.to(value.dtype),
+            )
+
         # Pooled across every micro-batch of this call and rendered once at the
         # end. Ratios cannot be emitted per micro-batch: the reducer would average
         # them, and a micro-batch with fewer valid tokens would weigh as much as a
@@ -2084,16 +2100,21 @@ class DataParallelPPOActor(BasePPOActor):
         # per micro-batch. It can exactly when every metric the loop computes is
         # deferred: the branches below that call .item() inside the loop would
         # turn an absent task into a NaN, and would be paying a sync each anyway.
-        # That is the pure-OPD shape, which inject_opd_config forces and the
-        # intent locks pin -- teacher-KL only, no policy gradient, entropy,
-        # reference KL or SD terms.
+        #
+        # pg_loss_coef == 0 WAS in this condition and is not any more. The policy
+        # gradient's four per-task scalars are deferred with a presence weight
+        # (_defer_present), so the GRPO arms reach the same shape the pure-OPD one
+        # did: on a three-task mixture that is 12 syncs a micro-batch, and at 526
+        # micro-batches a rank a step it was the largest single source of them.
+        # What is still required is that the OTHER terms are off, because their
+        # branches read with .item() and an absent task would give them NaN.
         #
         # loss_agg_mode is in the condition because _defer_task hard-codes the
         # token-mean formula; the aggregation is not a term that can be switched
-        # off, so it has to be checked rather than assumed.
+        # off, so it has to be checked rather than assumed. It is also what makes
+        # the row mask in the loop equivalent to a row index -- see there.
         sync_free_task_metrics = (
-            pg_loss_coef == 0
-            and self.config.entropy_coeff == 0
+            self.config.entropy_coeff == 0
             and not self.config.use_kl_loss
             and not self.config.get("use_sdl_loss", False)
             and not self.config.get("use_sdar_loss", False)
@@ -4029,14 +4050,36 @@ class DataParallelPPOActor(BasePPOActor):
                             for task, rows in iter_task_row_masks(
                                 task_ids, task_id_names, include_absent=sync_free_task_metrics
                             ):
-                                task_response_mask = response_mask[rows]
+                                # A ROW MASK FOLDED INTO THE TOKEN MASK, not a
+                                # boolean index. ``x[rows]`` has a data-dependent
+                                # shape, so torch reads the count back to the host
+                                # to allocate the result -- a sync per task per
+                                # micro-batch, on top of the ones this loop is
+                                # being cleared of, and the reason the existing
+                                # "sync-free" path was not. Under token-mean the
+                                # two are the same number: the excluded rows
+                                # contribute zero to the numerator and zero to the
+                                # denominator. Under seq-mean-* they are not (an
+                                # excluded row would still count in the sequence
+                                # average), so that mode keeps the index.
+                                if loss_agg_mode == "token-mean":
+                                    task_rows = None
+                                    task_response_mask = response_mask * rows.reshape(-1, 1).to(response_mask.dtype)
+                                else:
+                                    task_rows = rows
+                                    task_response_mask = response_mask[rows]
+
+                                def _sel(t, _rows=task_rows):
+                                    return t if _rows is None else t[_rows]
+
+                                task_present = task_response_mask.sum() > 0
                                 task_metrics = {}
 
                                 if pg_loss_coef != 0:
                                     task_pg_loss, task_pg_clipfrac, task_ppo_kl, task_pg_clipfrac_lower = policy_loss_fn(
-                                        old_log_prob=old_log_prob[rows],
-                                        log_prob=log_prob[rows],
-                                        advantages=advantages[rows],
+                                        old_log_prob=_sel(old_log_prob),
+                                        log_prob=_sel(log_prob),
+                                        advantages=_sel(advantages),
                                         response_mask=task_response_mask,
                                         cliprange=clip_ratio,
                                         cliprange_low=clip_ratio_low,
@@ -4044,10 +4087,19 @@ class DataParallelPPOActor(BasePPOActor):
                                         clip_ratio_c=clip_ratio_c,
                                         loss_agg_mode=loss_agg_mode,
                                     )
-                                    task_metrics[f"actor/pg_loss/{task}"] = task_pg_loss.detach().item()
-                                    task_metrics[f"actor/pg_clipfrac/{task}"] = task_pg_clipfrac.detach().item()
-                                    task_metrics[f"actor/ppo_kl/{task}"] = task_ppo_kl.detach().item()
-                                    task_metrics[f"actor/pg_clipfrac_lower/{task}"] = task_pg_clipfrac_lower.detach().item()
+                                    # Deferred, not read. Four scalars a task a
+                                    # micro-batch is 12 stream syncs per
+                                    # micro-batch on a three-task mixture -- and
+                                    # each one drains the queue the backward just
+                                    # filled, which is what the update phase's
+                                    # periodic dips to 45% util are made of.
+                                    for _name, _value in (
+                                        ("pg_loss", task_pg_loss),
+                                        ("pg_clipfrac", task_pg_clipfrac),
+                                        ("ppo_kl", task_ppo_kl),
+                                        ("pg_clipfrac_lower", task_pg_clipfrac_lower),
+                                    ):
+                                        _defer_present(f"actor/{_name}/{task}", _value, task_present)
                                 else:
                                     # Reading four device-side constants back per task
                                     # per micro-batch costs a stream sync each; the
@@ -4056,23 +4108,25 @@ class DataParallelPPOActor(BasePPOActor):
 
                                 if entropy_coeff != 0:
                                     task_metrics[f"actor/entropy_loss/{task}"] = (
-                                        agg_loss(loss_mat=entropy[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                        agg_loss(loss_mat=_sel(entropy), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
                                     )
 
                                 if self.config.use_kl_loss:
                                     task_metrics[f"actor/kl_loss/{task}"] = (
-                                        agg_loss(loss_mat=kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                        agg_loss(loss_mat=_sel(kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
                                     )
                                     if kl_loss_coef is not None:
+                                        # Still a row selection: this is a mean over
+                                        # ROWS, which a token mask cannot express.
                                         task_metrics[f"actor/kl_coef/{task}"] = kl_loss_coef[rows].float().mean().detach().item()
 
                                 if self.config.get("use_sdl_loss", False):
                                     from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
 
                                     task_metrics[f"actor/sdl_loss/{task}"] = compute_sdl_loss(
-                                        student_log_probs=log_prob[rows],
-                                        teacher_log_probs=teacher_log_probs[rows],
-                                        old_log_probs=old_log_prob[rows],
+                                        student_log_probs=_sel(log_prob),
+                                        teacher_log_probs=_sel(teacher_log_probs),
+                                        old_log_probs=_sel(old_log_prob),
                                         response_mask=task_response_mask,
                                         loss_agg_mode=loss_agg_mode,
                                     ).detach().item()
@@ -4081,8 +4135,8 @@ class DataParallelPPOActor(BasePPOActor):
                                     from verl.trainer.ppo.sdar_utils import compute_sdar_loss
 
                                     _, task_sdar_metrics = compute_sdar_loss(
-                                        student_log_probs=log_prob[rows],
-                                        teacher_log_probs=teacher_log_probs[rows],
+                                        student_log_probs=_sel(log_prob),
+                                        teacher_log_probs=_sel(teacher_log_probs),
                                         response_mask=task_response_mask,
                                         gate_beta=self.config.get("sdar_gate_beta", 5.0),
                                         loss_agg_mode=loss_agg_mode,
@@ -4096,27 +4150,29 @@ class DataParallelPPOActor(BasePPOActor):
                                         # contributes 0 rather than NaN.
                                         _defer_task(
                                             f"actor/teacher_kl_loss/{task}",
-                                            teacher_kld[rows],
+                                            _sel(teacher_kld),
                                             task_response_mask,
                                         )
                                     else:
                                         _defer(
                                             f"actor/teacher_kl_loss/{task}",
-                                            agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                            agg_loss(loss_mat=_sel(teacher_kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
                                         )
 
                                 append_to_dict(metrics, task_metrics)
 
                     if pg_loss_coef != 0:
-                        data = {
-                            "actor/pg_loss": pg_loss.detach().item(),
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        }
+                        # Deferred for the same reason as the per-task four above,
+                        # and bit-identically: the same tensors, read once at the
+                        # end of the call instead of once per micro-batch. The
+                        # flush takes the mean over micro-batches, which is what
+                        # append_to_dict + reduce_metrics did.
+                        _defer("actor/pg_loss", pg_loss)
+                        _defer("actor/pg_clipfrac", pg_clipfrac)
+                        _defer("actor/ppo_kl", ppo_kl)
+                        _defer("actor/pg_clipfrac_lower", pg_clipfrac_lower)
                     else:
-                        data = dict(_ZERO_PG_METRICS)
-                    append_to_dict(metrics, data)
+                        append_to_dict(metrics, dict(_ZERO_PG_METRICS))
 
                 if student_indexed_topk or sign_enabled:
                     # Every row the exchange was asked about must have been

@@ -139,6 +139,33 @@ if _ROLLOUT_ASYNC_REQUIRE and not _ROLLOUT_ASYNC_GENERATE:
 # watchdog: if the round thread dies in a way that leaves a waiter behind, this
 # is what turns a hung rollout into a failed one.
 _PUMP_RESULT_TIMEOUT_S = float(os.environ.get("ROLLOUT_PUMP_RESULT_TIMEOUT_S", "1800"))
+# Let the TRAINING rollout through the pool as well, and stop joining the teacher
+# chunk before every generation.
+#
+# Both halves are the same mechanism. TokenPump steps the engine on a thread
+# INSIDE the worker (token_pump.py) and keeps stepping it whether or not a
+# pump_step RPC is in flight -- which is the one thing in this tree that breaks
+# the rule that a colocated WorkerDict serialises its GPU calls
+# (docs/gpu_profiling_report_opd.md 2.4). A teacher chunk issued while the pool is
+# decoding therefore runs BESIDE the decode instead of behind it. It does delay
+# the next submit and collect, since those share the actor's one call slot with
+# it, but the decode is the part worth overlapping: the tail is 70.5% of gen's
+# wall clock at smActive 48% and a tensor pipe at 17%.
+#
+# The training call was refused for a reason that no longer holds by itself: a
+# call that leaves the configured sampling params alone might want n > 1, and the
+# pool returns one sequence per request. So the rank reports its configured n in
+# the handshake and the driver offers the call only when that is 1 -- which it is
+# on these arms, where env.rollout.n is applied by repeating rows in the driver.
+#
+# NOT bit-identical, for the reason every pumped call is not: which requests share
+# a decode step is decided by arrival timing, and the logits move with batch
+# composition. Same distribution, same policy (the weights are frozen for the
+# whole rollout, so nothing the teacher does between turns can change what is
+# sampled). OFF reproduces the current behaviour exactly, and all three
+# cross-teacher arms have to carry the same setting.
+_ROLLOUT_PUMP_TRAINING = os.environ.get("ROLLOUT_PUMP_TRAINING", "0").strip().lower() in ("1", "true", "yes", "on")
+
 _PUMP_STATE = {"client": None, "off": not _ROLLOUT_ASYNC_GENERATE, "lock": threading.Lock()}
 _SESSION_DEPTH = {"depth": 0, "lock": threading.Lock()}
 
@@ -148,16 +175,28 @@ _SESSION_DEPTH = {"depth": 0, "lock": threading.Lock()}
 _PUMP_META_KEYS = ("do_sample", "validate", "temperature")
 
 
-def _pump_pins_one_sample(meta_info) -> bool:
+def _pump_pins_one_sample(meta_info, handshake=None) -> bool:
     """Whether this call asks the engine for exactly one sequence per prompt.
 
     Both branches that override sampling -- greedy and validation -- set n=1, and
-    a request out of the pool returns one sequence. A training call that leaves
-    the configured n alone may want several, and quietly keeping the first would
-    be a scoring change, so the whole call goes back to the blocking path.
+    a request out of the pool returns one sequence, so they are servable whatever
+    the rank is configured for.
+
+    A TRAINING call leaves the configured params alone, so what it asks for is the
+    rank's own ``rollout.n``. That is why it was refused outright: quietly keeping
+    sample 0 of n would be a scoring change nobody asked for. It is not a reason
+    to refuse when n IS 1, which is the case on these arms -- ``env.rollout.n`` is
+    applied by repeating rows in the driver, not through SamplingParams. The rank
+    reports its own value in the handshake rather than the driver reading a config
+    it does not own; the worker re-checks ``params.n`` on every submission and
+    fails the request rather than truncating, so a disagreement is loud.
     """
     meta_info = meta_info or {}
-    return (not meta_info.get("do_sample", True)) or bool(meta_info.get("validate", False))
+    if (not meta_info.get("do_sample", True)) or bool(meta_info.get("validate", False)):
+        return True
+    if not _ROLLOUT_PUMP_TRAINING:
+        return False
+    return bool(handshake) and int(handshake.get("n", 0)) == 1
 
 
 def _pump_client(actor_rollout_wg):
@@ -286,7 +325,7 @@ def _as_id_list(prompt_token_ids):
     return np.fromiter(prompt_token_ids, dtype=np.int32)
 
 
-def _why_the_pump_cannot_serve(batch_input_padded) -> Optional[str]:
+def _why_the_pump_cannot_serve(batch_input_padded, handshake=None) -> Optional[str]:
     """Why this particular call is not one the pool can serve identically."""
     if "multi_modal_data" in batch_input_padded.non_tensor_batch:
         return "the call carries multi_modal_data"
@@ -294,21 +333,49 @@ def _why_the_pump_cannot_serve(batch_input_padded) -> Optional[str]:
         # generate_sequences rebuilds these from the padded input_ids when they
         # are missing; rather than keep a second copy of that, let it.
         return "the call has no raw_prompt_ids"
-    if not _pump_pins_one_sample(batch_input_padded.meta_info):
-        return "the call does not pin n=1 (neither do_sample=False nor validate=True)"
+    if not _pump_pins_one_sample(batch_input_padded.meta_info, handshake):
+        if not _ROLLOUT_PUMP_TRAINING:
+            return ("the call does not pin n=1 (neither do_sample=False nor validate=True) "
+                    "and ROLLOUT_PUMP_TRAINING is off")
+        return (f"the call leaves the configured sampling params alone and the rank reports "
+                f"n={(handshake or {}).get('n', '?')}; the pool returns one sequence per request")
     return None
 
 
-def _pump_can_serve(batch_input_padded) -> bool:
-    return _why_the_pump_cannot_serve(batch_input_padded) is None
+def _pump_can_serve(batch_input_padded, handshake=None) -> bool:
+    return _why_the_pump_cannot_serve(batch_input_padded, handshake) is None
+
+
+def _pump_will_serve(actor_rollout_wg, batch_input_padded) -> bool:
+    """Whether ``_generate_sequences`` is about to take the pumped path.
+
+    Asked BEFORE the call because it decides something else: where the teacher
+    prefetch chunk is joined. On the blocking path the join has to happen first --
+    both land on the same colocated actor, so an outstanding chunk would serialise
+    behind the generation anyway, on Ray's queue where the driver cannot see it.
+    Pumped, the actor's call slot is free between rounds and the chunk runs beside
+    the decode, so joining first would throw the window away.
+
+    Side-effect-free beyond the handshake ``_generate_sequences`` would do anyway;
+    the client is cached for the life of the process.
+    """
+    if not (_ROLLOUT_ASYNC_GENERATE and _ROLLOUT_PUMP_TRAINING):
+        return False
+    client = _pump_client(actor_rollout_wg)
+    if client is None:
+        return False
+    return _pump_can_serve(batch_input_padded, client.handshake_info)
 
 
 def _generate_sequences(actor_rollout_wg, batch_input_padded):
     """One generate call, merged with whatever is queued when merging is on."""
     if _ROLLOUT_ASYNC_GENERATE:
-        servable = _pump_can_serve(batch_input_padded)
-        if servable:
-            client = _pump_client(actor_rollout_wg)
+        # The client first, then servability: a training call's answer depends on
+        # the n the rank reports in its handshake, and there is no handshake
+        # without the client. Cached, so this is one round trip per process.
+        client = _pump_client(actor_rollout_wg)
+        handshake = client.handshake_info if client is not None else None
+        if _pump_can_serve(batch_input_padded, handshake):
             if client is not None:
                 return _generate_via_pump(client, batch_input_padded)
             if _ROLLOUT_ASYNC_REQUIRE:
@@ -316,7 +383,7 @@ def _generate_sequences(actor_rollout_wg, batch_input_padded):
         elif _ROLLOUT_ASYNC_REQUIRE:
             raise RuntimeError(
                 "ROLLOUT_ASYNC_REQUIRE=1 but this call cannot go through the pool: "
-                f"{_why_the_pump_cannot_serve(batch_input_padded)}"
+                f"{_why_the_pump_cannot_serve(batch_input_padded, handshake)}"
             )
     if not _ROLLOUT_MERGE_GENERATES:
         return actor_rollout_wg.generate_sequences(batch_input_padded)
@@ -364,6 +431,18 @@ def _say_rollout_env():
         f"{os.environ.get('ROLLOUT_ASYNC_GENERATE', '<unset>')!r} -> generate calls "
         f"{'go through one continuously stepped engine per rank' if _ROLLOUT_ASYNC_GENERATE else 'each block on their own batch'}"
         f"{'; this supersedes merging' if _ROLLOUT_ASYNC_GENERATE and _ROLLOUT_MERGE_GENERATES else ''}",
+        flush=True,
+    )
+    _training_pump = (
+        "goes through the pool too, and the teacher chunk is joined AFTER each "
+        "generation instead of before it"
+        if _ROLLOUT_PUMP_TRAINING
+        else "stays on the blocking path"
+    )
+    print(
+        f"[rollout-pump] driver: ROLLOUT_PUMP_TRAINING="
+        f"{os.environ.get('ROLLOUT_PUMP_TRAINING', '<unset>')!r} -> the TRAINING rollout "
+        f"{_training_pump}",
         flush=True,
     )
     print(
@@ -1557,13 +1636,33 @@ class TrajectoryCollector:
             # covering. That span -- from the launch after the previous generation
             # to here -- is the window the NEXT chunk gets to hide inside, so
             # measure it before collecting, and collect before issuing generation.
-            if self._teacher_glue_mark is not None:
+            # Whether this call's generation will go through the pool, decided
+            # BEFORE it runs because it decides where the teacher chunk is joined
+            # -- and therefore whether the chunk gets the decode tail to hide in.
+            _overlap = _pump_will_serve(actor_rollout_wg, batch_input_padded)
+            if not _overlap and self._teacher_glue_mark is not None:
                 self.note_teacher_glue_window(_now() - self._teacher_glue_mark)
                 self._teacher_glue_mark = None
-            _teacher_wait = self._join_teacher_prefetch()
+            _teacher_wait = 0.0 if _overlap else self._join_teacher_prefetch()
             _gw0 = gpu_profiler.now()
             batch_output_padded = _generate_sequences(actor_rollout_wg, batch_input_padded)
             _gw1 = gpu_profiler.now()
+            if _overlap:
+                # The chunk ran BESIDE this generation. What makes that true is
+                # that TokenPump's own thread keeps calling engine.step() whether
+                # or not a pump_step RPC is in flight, so a teacher RPC occupying
+                # the actor's call slot delays the next SUBMIT and COLLECT -- not
+                # the decode. The decode is the part worth overlapping. What is
+                # paid here is only what the generation did not cover, which is
+                # what tchWait now reports.
+                if self._teacher_glue_mark is not None:
+                    # And the window a chunk gets to hide in is now the glue PLUS
+                    # the generation it overlapped, so the adaptive sizer is told
+                    # about both. Sized to the glue alone it would leave the
+                    # decode tail empty -- the space this path exists to use.
+                    self.note_teacher_glue_window(_now() - self._teacher_glue_mark)
+                    self._teacher_glue_mark = None
+                _teacher_wait = self._join_teacher_prefetch()
             # # unpad
             active_batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
             _m_gen = _now()  # end of GPU generation window

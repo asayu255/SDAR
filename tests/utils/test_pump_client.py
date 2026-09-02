@@ -45,7 +45,8 @@ class FakeWorkerGroup:
         self.raise_on_round = None
         self.stopped = False
         self._handshake = handshake or [
-            {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": 2}
+            {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8,
+             "eos_token_id": 2, "n": 1}
             for _ in range(world_size)
         ]
         self.lock = threading.Lock()
@@ -87,9 +88,41 @@ def _client(wg, **kw):
     return PumpClient(wg, round_s=0.001, printer=lambda *a, **k: None, **kw)
 
 
+def test_the_handshake_carries_the_rank_s_configured_n():
+    """It decides which calls the driver may offer: a training call leaves the
+    sampling params alone, so what it asks for is this number, and the pool
+    returns one sequence per request."""
+    client = _client(FakeWorkerGroup())
+    assert client.handshake()["n"] == 1
+
+
+def test_a_worker_without_the_n_key_reports_it_as_unknown():
+    """0, not 1. Guessing 1 for a rank that did not say is the scoring change the
+    whole refusal exists to prevent -- _pump_pins_one_sample declines on it."""
+    handshake = [
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8, "eos_token_id": 2}
+        for _ in range(WORLD)
+    ]
+    client = _client(FakeWorkerGroup(handshake=handshake))
+    assert client.handshake()["n"] == 0
+
+
+def test_ranks_that_disagree_about_n_are_refused():
+    """A rank that would produce a different number of sequences would make the
+    answer depend on which rank a row landed on."""
+    handshake = [
+        {"refused": None, "in_session": True, "pad_token_id": 0, "response_length": 8,
+         "eos_token_id": 2, "n": 1 if rank == 0 else 4}
+        for rank in range(WORLD)
+    ]
+    client = _client(FakeWorkerGroup(handshake=handshake))
+    with pytest.raises(PumpUnavailable, match="disagree on n"):
+        client.handshake()
+
+
 def test_handshake_reports_what_the_driver_needs_to_assemble():
     client = _client(FakeWorkerGroup())
-    assert client.handshake() == {"pad_token_id": 0, "response_length": 8, "eos_token_id": 2}
+    assert client.handshake() == {"pad_token_id": 0, "response_length": 8, "eos_token_id": 2, "n": 1}
 
 
 def test_a_rank_that_refuses_stops_the_path_with_its_own_reason():

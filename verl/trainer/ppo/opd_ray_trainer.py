@@ -222,6 +222,17 @@ class OPDRayTrainer(RayPPOTrainer):
         # Monotone across the run so a stale entry can never be mistaken for a live
         # one; the cache is cleared each step regardless.
         self._teacher_cache_counter = 0
+        # Token budget for the frozen forwards that run AFTER the rollout, where
+        # vLLM is asleep. The window path keeps ref.log_prob_micro_batch_size_per_gpu
+        # (4 rows), which exists to survive being next to the KV pool; out here
+        # that bound costs ~3.2k tokens a forward on a 1.7B model and the pass
+        # runs launch-bound. 0 restores the row bound on both paths.
+        self._post_rollout_token_budget = int(
+            os.environ.get(
+                "POST_ROLLOUT_FORWARD_TOKENS",
+                self.config.actor_rollout_ref.ref.get("log_prob_max_token_len_per_gpu", 0) or 0,
+            )
+        )
 
         # ---- cross-teacher sign agreement (optional) ----------------------- #
         # Off by default so every existing arm is untouched: with enable=false no
@@ -580,17 +591,32 @@ class OPDRayTrainer(RayPPOTrainer):
         expression. Both call :meth:`_sign_off_tasks_for`.
 
         ``None`` when this arm does not cache the planes at all, which leaves the
-        returned rows exactly as they were before this path existed.
+        returned rows exactly as they were before this path existed -- and SAYS SO
+        ONCE. A run measured at ``sign_prefetch/hit_rate`` 0.000 for 148 steps is
+        indistinguishable, from the metric alone, between "an operator turned it
+        off" and "every row was declined because its task name did not match a
+        teacher". Those want opposite fixes and the metric named neither, so the
+        reason is printed the first time this returns None.
         """
-        if not (self.cross_teacher_enabled and _ROLLOUT_PREFETCH_SIGN):
-            return None
+        if not self.cross_teacher_enabled:
+            return self._decline_sign_prefetch("this arm reads no cross-teacher planes")
+        if not _ROLLOUT_PREFETCH_SIGN:
+            return self._decline_sign_prefetch(
+                f"ROLLOUT_PREFETCH_SIGN={os.environ.get('ROLLOUT_PREFETCH_SIGN', '<unset>')!r} in the "
+                "process running the rollout loop (the driver, not the workers)"
+            )
         task_order = sorted(self.teacher_wg.keys())
         rows = [(key, row, self._normalize_task_name(row.get("task_name"))) for key, row in chunk]
         # A row whose task has no teacher is left for the serial path, which
         # raises on it by name rather than from a background thread.
-        rows = [r for r in rows if r[2] in self.teacher_wg]
-        if not rows:
-            return None
+        kept = [r for r in rows if r[2] in self.teacher_wg]
+        if not kept:
+            seen = sorted({r[2] for r in rows})
+            return self._decline_sign_prefetch(
+                f"no row in this chunk names a task with a teacher: rows carry {seen!r}, "
+                f"teachers are {sorted(self.teacher_wg)!r}"
+            )
+        rows = kept
 
         out = {key: [-1] * (1 + max(0, len(task_order) - 1)) for key, _, _ in rows}
 
@@ -631,6 +657,27 @@ class OPDRayTrainer(RayPPOTrainer):
                 gpu_profiler.pop_phase(f"sign_weight_prefetch/{model}")
         return out
 
+    def _decline_sign_prefetch(self, reason):
+        """Log why the sign planes are not being prefetched, once, and return None.
+
+        Once per process rather than per chunk: this is called from the prefetch
+        thread on every turn of every step, and the interesting fact is the reason,
+        which does not change. ``sign_prefetch/declined`` carries it into the
+        metrics as a flag so a run that never prefetched is visible in wandb
+        without reading the log.
+        """
+        self._sign_prefetch_declined = reason
+        if not getattr(self, "_said_sign_prefetch_declined", False):
+            self._said_sign_prefetch_declined = True
+            print(
+                f"[rollout][sign-prefetch] NOT caching the base and off-task planes in the "
+                f"rollout window: {reason}. They will be scored after the rollout in "
+                f"sign_weight_forward instead -- measured at 143 s a step against ~4.5 s "
+                f"for the same work done in the window.",
+                flush=True,
+            )
+        return None
+
     @staticmethod
     def _sign_off_tasks_for(own, task_order):
         """The off-task teachers of a row whose own task is ``own``, in column order.
@@ -641,8 +688,16 @@ class OPDRayTrainer(RayPPOTrainer):
         """
         return [t for t in task_order if t != own]
 
-    def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None):
+    def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None, budget=False):
         """One teacher call, with the DP padding marked so it is never cached.
+
+        ``budget`` sizes the worker's micro-batches by TOKENS rather than by rows,
+        for the callers that run after the rollout. It is not a free win to hand
+        to every caller: inside the rollout window the row bound is what keeps a
+        chunk's activations next to the KV pool, so the prefetch path leaves it
+        alone. Not bit-identical -- a packed GEMM of a different total length
+        rounds differently -- but the same rows, the same frozen weights and the
+        same function, which is the accuracy class the prefetch path already has.
 
         ``auto_padding`` repeats rows to reach a multiple of the group's world
         size, and it repeats the whole row -- ``teacher_cache_ids`` included. Two
@@ -662,6 +717,10 @@ class OPDRayTrainer(RayPPOTrainer):
         else:
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info[DataProtoConfig.auto_padding_key] = True
+        if budget and self._post_rollout_token_budget > 0:
+            sub.meta_info = dict(sub.meta_info)
+            sub.meta_info["use_dynamic_bsz"] = True
+            sub.meta_info["max_token_len"] = self._post_rollout_token_budget
         if topk:
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info["topk_k"] = self.teacher_kl_topk
@@ -777,11 +836,11 @@ class OPDRayTrainer(RayPPOTrainer):
             gpu_profiler.push_phase(f"teacher_forward/{task}")
             try:
                 if self.teacher_topk_kl and self.student_indexed_topk:
-                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
+                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids, budget=True)
                     for i in idxs:
                         seen[i] = True
                 elif self.teacher_topk_kl:
-                    out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids)
+                    out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids, budget=True)
                     tlp = out.batch["teacher_topk_logprobs"]
                     tid = out.batch["teacher_topk_ids"]
                     for j, i in enumerate(idxs):
@@ -789,7 +848,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         teacher_topk_ids[i] = tid[j]
                         seen[i] = True
                 else:
-                    out = self._teacher_call(wg, sub, topk=False, cache_ids=miss_ids)
+                    out = self._teacher_call(wg, sub, topk=False, cache_ids=miss_ids, budget=True)
                     lp = out.batch["ref_log_prob"]
                     for j, i in enumerate(idxs):
                         teacher_log_probs[i] = lp[j]
@@ -897,6 +956,14 @@ class OPDRayTrainer(RayPPOTrainer):
             n_hit = int((sign_cache_ids >= 0).all(dim=1).sum())
             metrics["sign_prefetch/rows"] = n_hit
             metrics["sign_prefetch/hit_rate"] = n_hit / bs
+            # Which of the two zero-hit-rate stories this run is living. 1 means
+            # the window path was asked for and answered; 0 means it declined,
+            # and _decline_sign_prefetch printed why.
+            metrics["sign_prefetch/enabled"] = float(
+                self.cross_teacher_enabled
+                and _ROLLOUT_PREFETCH_SIGN
+                and getattr(self, "_sign_prefetch_declined", None) is None
+            )
 
         # Only what the forward reads. The batch at this point also carries the
         # rollout's own columns, and every one of them would be shipped to the
@@ -927,7 +994,7 @@ class OPDRayTrainer(RayPPOTrainer):
                     self._teacher_cache_counter += 1
                     ids[j] = self._teacher_cache_counter
                     sign_cache_ids[i, column_for(i)] = self._teacher_cache_counter
-                self._teacher_call(wg, lean.select_idxs(part), topk=True, cache_ids=ids)
+                self._teacher_call(wg, lean.select_idxs(part), topk=True, cache_ids=ids, budget=True)
 
         gpu_profiler.push_phase("sign_weight_forward/base")
         try:
@@ -1261,6 +1328,14 @@ class OPDRayTrainer(RayPPOTrainer):
                         if per_rank:
                             metrics["teacher_cache/rows"] = sum(r["rows"] for r in per_rank)
                             metrics["teacher_cache/gb"] = sum(r["bytes"] for r in per_rank) / 1e9
+                            # What of that is still on the CARD. Since put() copies
+                            # to pinned host as it goes, this should be ~0 between
+                            # calls; it is the number that says the offload is
+                            # actually happening during the rollout rather than at
+                            # the first read inside the update.
+                            metrics["teacher_cache/device_gb"] = (
+                                sum(r.get("device_bytes", r["bytes"]) for r in per_rank) / 1e9
+                            )
                             metrics["teacher_cache/witness_max_err"] = max(
                                 r["witness_max_err"] for r in per_rank
                             )

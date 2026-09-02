@@ -40,7 +40,12 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
-from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
+from verl.utils.metric.memory import (
+    device_footprint_gb,
+    per_rank_memory_metrics,
+    phase_peak_metrics,
+    reset_phase_peak,
+)
 from verl.utils.metric.stall_counters import per_rank_stall_counter_metrics
 from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.phase_timing import PhaseTimer, mark as _mark
@@ -795,6 +800,14 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # A peak window over the UPDATE ALONE. Everything else in this file
+            # reads max_memory_* as a process-lifetime ratchet, which on this
+            # stack means "the rollout's vLLM pool" no matter which phase is
+            # asking. The knobs that need answering here -- gradient
+            # checkpointing, the micro-batch size -- are about what the update
+            # itself needs while that pool is asleep, and that is a different
+            # number. Reset costs nothing and changes no allocation.
+            reset_phase_peak(get_torch_device())
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -821,6 +834,11 @@ class ActorRolloutRefWorker(Worker):
             # Same two key names, so the history stays continuous; they are now
             # actually the cross-rank maxima they claimed to be.
             metrics.update(per_rank_memory_metrics(get_torch_device()))
+            # Read AFTER per_rank_memory_metrics, which only reads: the window
+            # opened above is still the update's, and the lifetime marks it
+            # reports are unaffected by the reset (they were already at their
+            # run-wide high before this step, or they are being set by it).
+            metrics.update(phase_peak_metrics(get_torch_device(), "perf/update_peak"))
             # Which of {cudaMalloc segment growth, gen-2 GC, dynamo recompile}
             # fired on this rank this step. Each is a candidate mechanism for a
             # sub-second in-micro-batch stall and each increments a counter the
@@ -1190,11 +1208,13 @@ class ActorRolloutRefWorker(Worker):
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
+        # setdefault, as in compute_ref_topk_log_prob and for the same reason: the
+        # caller may size its own micro-batches when it knows it is not sharing a
+        # card with the rollout engine.
+        data.meta_info.setdefault("micro_batch_size", self.config.ref.log_prob_micro_batch_size_per_gpu)
         data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("max_token_len", self.config.ref.log_prob_max_token_len_per_gpu)
+        data.meta_info.setdefault("use_dynamic_bsz", self.config.ref.log_prob_use_dynamic_bsz)
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
@@ -1219,10 +1239,22 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(get_torch_device().current_device())
 
         topk_k = int(data.meta_info.get("topk_k", 20))
-        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        # THE CALLER MAY SIZE ITS OWN MICRO-BATCHES. The config values are the
+        # default and stay the default; what they cannot be is the only answer,
+        # because the two callers of this method run in different worlds.
+        # ref.log_prob_micro_batch_size_per_gpu is 4 rows on these arms, and it is
+        # 4 because the prefetch path scores rows INSIDE the rollout window, next
+        # to a vLLM engine holding a KV pool sized to 0.6 of the card (see
+        # docs/speedup_mechanisms.md 7.2). The post-rollout path runs after that
+        # engine is asleep and has tens of GB free, and 4 rows there is ~3.2k
+        # tokens a forward on a 1.7B model -- launch-bound, measured at ~30% MFU
+        # over sign_weight_forward's 143 s a step. Letting that caller ask for a
+        # token budget instead is the whole fix; it changes no value, only which
+        # rows share a packed GEMM.
+        data.meta_info.setdefault("micro_batch_size", self.config.ref.log_prob_micro_batch_size_per_gpu)
         data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("max_token_len", self.config.ref.log_prob_max_token_len_per_gpu)
+        data.meta_info.setdefault("use_dynamic_bsz", self.config.ref.log_prob_use_dynamic_bsz)
         # student_indexed_topk resolves this teacher at ids the student picks during
         # its own training forward, which has not happened yet. Only the final gather
         # depends on those ids, so keep what does not: the body's hidden states and
@@ -1400,7 +1432,12 @@ class ActorRolloutRefWorker(Worker):
 
         cache = get_teacher_cache()
         worst = cache.check_witness(atol=atol)
-        return {"witness_max_err": worst, "rows": len(cache), "bytes": cache.nbytes()}
+        return {
+            "witness_max_err": worst,
+            "rows": len(cache),
+            "bytes": cache.nbytes(),
+            "device_bytes": cache.nbytes(device_only=True),
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

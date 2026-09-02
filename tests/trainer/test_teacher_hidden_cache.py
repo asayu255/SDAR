@@ -1798,3 +1798,71 @@ def test_every_cross_plane_read_in_the_training_loop_offers_the_cached_planes():
             "a _cross_teacher_planes call in update_policy does not pass cached=; the planes "
             "the on-task lookup already fetched are then fetched again"
         )
+
+
+# --------------------------------------------------------------------------- #
+# where the store lives WHILE the rollout is still running
+# --------------------------------------------------------------------------- #
+def _put_one(cache, resp=4, hidden=8, key=7000):
+    h = torch.randn(1, resp, hidden)
+    lse = torch.randn(1, resp)
+    cache.put(torch.tensor([key]), "alfworld", h, lse, live_mask=torch.ones(1, resp))
+    return h, lse
+
+
+def _counting_to_host(cache):
+    """Count the crossings. On a CPU box the tensors are on the host either way,
+    so "did it copy" is the only observable that separates the two paths -- and
+    it is the one the change is about."""
+    calls = []
+    original = cache._to_host
+
+    def spy(t):
+        calls.append(tuple(t.shape))
+        return original(t)
+
+    cache._to_host = spy
+    return calls
+
+
+def test_an_offloading_cache_crosses_to_the_host_inside_put():
+    """_finalize used to be where the store crossed, and _finalize runs on the
+    FIRST READ -- inside the actor update, long after the rollout ended.
+    Everything cached during a rollout therefore sat in device memory beside
+    vLLM's KV pool, and on the cross-teacher arms that is four models a row
+    rather than one (teacher_cache/gb 15.6 against pure OPD's 4.1)."""
+    cache = TeacherHiddenCache()
+    cache._offload = True
+    calls = _counting_to_host(cache)
+    _put_one(cache, resp=4, hidden=8)
+    # h packed to its live positions, and lse alongside it.
+    assert calls == [(4, 8), (4,)]
+
+
+def test_a_resident_cache_does_not_copy_at_all():
+    """TEACHER_CACHE_OFFLOAD=0 has to reproduce exactly what it did before."""
+    cache = TeacherHiddenCache()
+    cache._offload = False
+    calls = _counting_to_host(cache)
+    _put_one(cache)
+    assert calls == []
+
+
+def test_the_crossing_keeps_the_values_and_lands_on_the_host():
+    cache = TeacherHiddenCache()
+    cache._offload = True
+    h, lse = _put_one(cache)
+    assert cache._h[7000].device.type == "cpu"
+    assert torch.equal(cache._h[7000], h[0])
+    assert torch.equal(cache._lse[7000], lse[0])
+
+
+def test_device_only_bytes_exclude_what_has_already_crossed():
+    """teacher_cache/gb keeps meaning "what the entries hold"; the new
+    teacher_cache/device_gb is what is still on the card, and reporting the total
+    under the old name would read as a regression that is in fact the fix."""
+    cache = TeacherHiddenCache()
+    cache._offload = True
+    _put_one(cache)
+    assert cache.nbytes() > 0
+    assert cache.nbytes(device_only=True) == 0

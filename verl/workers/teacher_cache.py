@@ -473,6 +473,22 @@ class TeacherHiddenCache:
         # cache holds exactly the packed size and the padded input is free to go.
         h_packed = h.reshape(n * resp_len, -1)[flat]
         lse_packed = lse.reshape(n * resp_len)[flat]
+        # OFFLOADED MEANS OFFLOADED NOW, NOT AT THE FIRST READ. _finalize used to
+        # be where the store crossed to the host, and _finalize runs on the first
+        # read -- which is inside the actor update, long after the rollout has
+        # ended. Everything cached during a rollout therefore sat in device memory
+        # NEXT TO vLLM's KV pool for the whole rollout, and on the cross-teacher
+        # arms that is four models a row rather than one (teacher_cache/gb 15.6
+        # against pure OPD's 4.1). Copying here bounds the device side at one
+        # chunk's transient instead, which is what makes prefetching the other
+        # three planes affordable at all.
+        #
+        # Blocking, and deliberately: the destination is read later on the host
+        # (check_witness, _finalize) with nothing in between that would order an
+        # async copy against those reads. It runs on the prefetch thread, under
+        # the rollout's CPU glue, which is the window this whole path exists for.
+        if self._offload:
+            h_packed, lse_packed = self._to_host(h_packed), self._to_host(lse_packed)
         chunk = self._next_chunk
         self._next_chunk += 1
         self._chunks[chunk] = [h_packed, lse_packed]
@@ -501,6 +517,22 @@ class TeacherHiddenCache:
                 keys[i], task, h_packed[a:b], lse_packed[a:b], w_ids, w_lp, lens_l[j], temperature, chunk=chunk,
                 fingerprint=None if fingerprints is None else int(fingerprints[i]),
             )
+
+    def _to_host(self, t: torch.Tensor) -> torch.Tensor:
+        """A host copy of ``t``, pinned when a DMA can use it.
+
+        Pinned matters twice over: the copy out of device memory is a DMA rather
+        than a staged pageable transfer, and the copy back in -- which
+        ``_read_packed`` does once per micro-batch of every training step -- is
+        one the copy engine can overlap. Falls back to pageable if pinning is
+        refused, because a cache that cannot pin is still a cache.
+        """
+        try:
+            out = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=t.device.type == "cuda")
+        except RuntimeError:
+            out = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+        out.copy_(t)
+        return out
 
     def _register(self, key, task, h, lse, w_ids, w_lp, length, temperature, chunk=None, fingerprint=None):
         self._h[key] = h
@@ -538,8 +570,14 @@ class TeacherHiddenCache:
     def __contains__(self, key):
         return int(key) in self._h
 
-    def nbytes(self) -> int:
-        """Device memory the step's entries hold, for the metric that watches it.
+    def nbytes(self, device_only: bool = False) -> int:
+        """What the step's entries hold, for the metric that watches it.
+
+        ``device_only`` counts the CUDA-resident part alone. Since ``put`` copies
+        to the host as it goes, an offloaded cache holds ~nothing on the device
+        between calls, and reporting the total under a name that used to mean
+        "device" would read as a regression that is in fact the fix. Both numbers
+        are logged, as ``teacher_cache/gb`` and ``teacher_cache/device_gb``.
 
         Worth a number rather than an estimate because the sign-weighting arms
         multiply it: they cache the base policy and each off-task teacher besides
@@ -549,13 +587,19 @@ class TeacherHiddenCache:
         adding up the views would count the same memory once per row.
         """
         total = 0
+
+        def _add(t):
+            if device_only and t.device.type == "cpu":
+                return 0
+            return t.numel() * t.element_size()
+
         for tensors in self._chunks.values():
             for t in tensors:
-                total += t.numel() * t.element_size()
+                total += _add(t)
         if self._final is not None:
             for t in self._final.values():
                 if hasattr(t, "numel"):
-                    total += t.numel() * t.element_size()
+                    total += _add(t)
         return total
 
     # -- reading ---------------------------------------------------------- #

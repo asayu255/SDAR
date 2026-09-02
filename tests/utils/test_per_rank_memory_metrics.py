@@ -23,7 +23,12 @@ import pytest
 import torch
 
 from verl.utils.metric import reduce_metrics
-from verl.utils.metric.memory import device_footprint_gb, per_rank_memory_metrics
+from verl.utils.metric.memory import (
+    device_footprint_gb,
+    per_rank_memory_metrics,
+    phase_peak_metrics,
+    reset_phase_peak,
+)
 
 _GB = 1024.0**3
 
@@ -31,9 +36,16 @@ _GB = 1024.0**3
 class _Device:
     """The get_torch_device() surface this helper uses."""
 
-    def __init__(self, allocated_gb, reserved_gb, retries=0, ooms=0, stats=True):
+    def __init__(self, allocated_gb, reserved_gb, retries=0, ooms=0, stats=True, resettable=True):
         self._a, self._r = allocated_gb * _GB, reserved_gb * _GB
         self._stats = {"num_alloc_retries": retries, "num_ooms": ooms} if stats else None
+        self._resettable = resettable
+        self.resets = 0
+
+    def reset_peak_memory_stats(self):
+        if not self._resettable:
+            raise RuntimeError("this backend cannot reset peak stats")
+        self.resets += 1
 
     def max_memory_allocated(self):
         return self._a
@@ -278,3 +290,31 @@ def test_neither_gather_sits_after_a_return():
         "update_actor returns before the collectives; whichever rank takes that "
         "path leaves the others waiting in all_gather"
     )
+
+
+# ------------------------------------------------------- the per-phase window
+def test_the_phase_window_reports_the_peak_since_its_reset():
+    """perf/max_memory_* is a process-lifetime ratchet, which on this stack means
+    "the rollout's vLLM pool" whichever phase is asking. The update's own peak is
+    a different number and it is the one the checkpointing and micro-batch
+    decisions turn on."""
+    device = _Device(62.5, 71.0)
+    reset_phase_peak(device)
+    assert device.resets == 1
+
+    m = phase_peak_metrics(device, "perf/update_peak")
+    assert m["perf/update_peak_allocated_gb"] == pytest.approx(62.5)
+    assert m["perf/update_peak_reserved_gb"] == pytest.approx(71.0)
+
+
+def test_a_backend_that_cannot_reset_is_not_a_failed_run():
+    """A measurement must never take down what it measures."""
+    reset_phase_peak(_Device(1.0, 2.0, resettable=False))
+
+
+def test_the_phase_window_does_not_emit_per_rank_keys():
+    """The spread question is the whole step's and per_rank_memory_metrics
+    already answers it; this one is read against the card's capacity, where the
+    cross-rank max is the only number that matters."""
+    m = phase_peak_metrics(_Device(10.0, 12.0), "perf/update_peak")
+    assert set(m) == {"perf/update_peak_allocated_gb", "perf/update_peak_reserved_gb"}

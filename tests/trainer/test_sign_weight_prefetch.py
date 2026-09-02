@@ -259,3 +259,92 @@ def test_the_hit_rate_is_reported():
     trainer.compute_sign_weight_cache(batch, prefetched=prefetched, metrics=metrics)
     assert metrics["sign_prefetch/rows"] == 3
     assert metrics["sign_prefetch/hit_rate"] == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------- #
+# 5. why the window path declined, when it does
+# --------------------------------------------------------------------------- #
+def test_declining_says_why_and_flags_it_in_the_metrics():
+    """A run measured at sign_prefetch/hit_rate 0.000 for 148 straight steps is,
+    from the metric alone, indistinguishable between "an operator turned it off"
+    and "every row was declined". Those want opposite fixes."""
+    import verl.trainer.ppo.opd_ray_trainer as mod
+
+    trainer, teachers, base = _fixture()
+    saved = mod._ROLLOUT_PREFETCH_SIGN
+    mod._ROLLOUT_PREFETCH_SIGN = False
+    try:
+        batch = _batch_with_identity(TASKS)
+        assert trainer._prefetch_sign_planes(_chunk_from(batch)) is None
+        assert "ROLLOUT_PREFETCH_SIGN" in trainer._sign_prefetch_declined
+
+        metrics = {}
+        trainer.compute_sign_weight_cache(batch, prefetched=None, metrics=metrics)
+        assert metrics["sign_prefetch/enabled"] == 0.0
+        assert metrics["sign_prefetch/hit_rate"] == 0.0
+    finally:
+        mod._ROLLOUT_PREFETCH_SIGN = saved
+
+
+def test_a_chunk_whose_tasks_have_no_teacher_says_which_names_it_saw():
+    """The other zero-hit story. The reason names both sides, because the useful
+    fact is the mismatch, not that there was one."""
+    trainer, _, _ = _fixture()
+    batch = _batch_with_identity(["webshop", "alfworld"])
+    chunk = _chunk_from(batch)
+    for _, row in chunk:
+        row["task_name"] = "not_a_task"
+    assert trainer._prefetch_sign_planes(chunk) is None
+    reason = trainer._sign_prefetch_declined
+    assert "not_a_task" in reason and "alfworld" in reason
+
+
+def test_a_working_prefetch_reports_enabled():
+    trainer, _, _ = _fixture()
+    batch = _batch_with_identity(TASKS)
+    sign_ids = trainer._prefetch_sign_planes(_chunk_from(batch))
+    assert sign_ids is not None
+    prefetched = {key: PrefetchedRow(on_task=1, sign_ids=sign_ids[key]) for key, _ in _chunk_from(batch)}
+    metrics = {}
+    trainer.compute_sign_weight_cache(batch, prefetched=prefetched, metrics=metrics)
+    assert metrics["sign_prefetch/enabled"] == 1.0
+    assert metrics["sign_prefetch/hit_rate"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# 6. the post-rollout token budget
+# --------------------------------------------------------------------------- #
+def test_the_post_rollout_pass_asks_for_a_token_budget():
+    """ref.log_prob_micro_batch_size_per_gpu is 4 rows because the WINDOW path
+    scores next to a live vLLM KV pool. Out here the pool is asleep, and 4 rows
+    is ~3.2k tokens a forward on a 1.7B model -- launch-bound, measured at ~30%
+    MFU over 143 s a step."""
+    trainer, teachers, base = _fixture()
+    trainer._post_rollout_token_budget = 18432
+    trainer.compute_sign_weight_cache(_batch_with_identity(TASKS))
+    assert base.meta, "the base plane was never scored"
+    for wg in [base] + list(teachers.values()):
+        for meta in wg.meta:
+            assert meta["use_dynamic_bsz"] is True
+            assert meta["max_token_len"] == 18432
+
+
+def test_the_window_path_keeps_the_row_bound():
+    """The bound exists for the window and has to stay there: a chunk's
+    activations sit beside the KV pool, which is what OOMed this arm once."""
+    trainer, teachers, base = _fixture()
+    trainer._post_rollout_token_budget = 18432
+    trainer._prefetch_sign_planes(_chunk_from(_batch_with_identity(TASKS)))
+    for wg in [base] + list(teachers.values()):
+        for meta in wg.meta:
+            assert "use_dynamic_bsz" not in meta
+            assert "max_token_len" not in meta
+
+
+def test_a_zero_budget_is_the_behaviour_that_was_there_before():
+    trainer, teachers, base = _fixture()
+    trainer._post_rollout_token_budget = 0
+    trainer.compute_sign_weight_cache(_batch_with_identity(TASKS))
+    for wg in [base] + list(teachers.values()):
+        for meta in wg.meta:
+            assert "use_dynamic_bsz" not in meta

@@ -536,6 +536,14 @@ class vLLMRollout(BaseRollout):
                 "refused": refusal,
                 "pad_token_id": self.pad_token_id,
                 "response_length": self.config.response_length,
+                # What a call that leaves the sampling params alone -- i.e. a
+                # TRAINING call -- would ask this rank for. The driver refuses to
+                # offer such a call unless this is 1, because the pool returns one
+                # sequence per request; reported from here rather than read from a
+                # config the driver does not own, and re-checked on every
+                # submission below so a disagreement fails the request loudly
+                # instead of silently keeping sample 0 of n.
+                "n": int(self.config.get("n", 1) or 1),
                 "finished": [],
                 "failed": [],
                 "in_flight": 0,

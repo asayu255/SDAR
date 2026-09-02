@@ -133,7 +133,11 @@ class PumpClient:
                     "between rounds and would be stepping a sleeping one"
                 )
         first = dict(replies[0])
-        for key in ("pad_token_id", "response_length", "eos_token_id"):
+        # "n" joins them because it decides which calls the driver may offer: a
+        # training call is servable only when the rank would produce one sequence
+        # for it, and a rank that disagrees with its neighbours about that would
+        # make the answer depend on which rank a row landed on.
+        for key in ("pad_token_id", "response_length", "eos_token_id", "n"):
             # Compared by equality rather than through a set, because a model with
             # several end tokens reports eos_token_id as a list (Qwen3 gives
             # [151645, 151643]) and a list cannot go into a set.
@@ -148,6 +152,9 @@ class PumpClient:
             "pad_token_id": first["pad_token_id"],
             "response_length": first["response_length"],
             "eos_token_id": first["eos_token_id"],
+            # Absent from a worker built before this key existed; 0 then reads as
+            # "unknown", which _pump_pins_one_sample declines rather than guesses.
+            "n": int(first.get("n", 0) or 0),
         }
         return self.handshake_info
 

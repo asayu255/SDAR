@@ -100,6 +100,9 @@ def _make_trainer(teacher_wg, topk=None, student_indexed=False):
     # so False here is the plain-OPD trainer rather than a hole in the stub.
     trainer.cross_teacher_enabled = False
     trainer.base_wg = None
+    # See test_sign_weight_routing._make_trainer: 0 keeps the worker's own row
+    # bound, which is the behaviour every test in this file was written against.
+    trainer._post_rollout_token_budget = 0
     return trainer
 
 

@@ -154,12 +154,87 @@ def _gate_source():
 
 @pytest.mark.parametrize(
     "term",
-    ["pg_loss_coef", "entropy_coeff", "use_kl_loss", "use_sdl_loss", "use_sdar_loss"],
+    ["entropy_coeff", "use_kl_loss", "use_sdl_loss", "use_sdar_loss"],
 )
 def test_every_syncing_loss_term_is_in_the_gate(term):
     """Each of these adds a branch that calls .item() INSIDE the loop. On an
     empty mask that is a NaN, not a slow path."""
     assert term in _gate_source()
+
+
+def test_the_policy_gradient_is_no_longer_in_the_gate():
+    """pg_loss_coef WAS a term here, because its four per-task scalars were read
+    with .item() inside the loop. They are deferred with a presence weight now,
+    so the GRPO arms reach the same shape the pure-OPD one did -- 12 syncs a
+    micro-batch on a three-task mixture, at 526 micro-batches a rank a step."""
+    assert "pg_loss_coef" not in _gate_source()
+
+
+def _actor_source():
+    import os
+
+    return open(os.path.join(
+        os.path.dirname(__file__), "..", "..", "verl", "workers", "actor", "dp_actor.py"
+    )).read()
+
+
+def test_the_policy_gradients_per_task_scalars_are_deferred():
+    """The four names, and that none of them is read with .item() in the loop."""
+    src = _actor_source()
+    body = src[src.index("with _actor_phase(\"actor.task_metrics\")"):]
+    body = body[: body.index("append_to_dict(metrics, task_metrics)")]
+    for name in ("pg_loss", "pg_clipfrac", "ppo_kl", "pg_clipfrac_lower"):
+        assert f'_defer_present(f"actor/{{name}}/{{task}}"' not in body   # built by loop, not literal
+    assert "_defer_present(" in body
+    assert "task_pg_loss.detach().item()" not in body
+    assert "task_pg_clipfrac.detach().item()" not in body
+
+
+def test_the_pooled_policy_gradient_scalars_are_deferred_too():
+    src = _actor_source()
+    for name in ("pg_loss", "pg_clipfrac", "ppo_kl", "pg_clipfrac_lower"):
+        assert f'_defer("actor/{name}", {name})' in src
+        assert f'"actor/{name}": {name}.detach().item()' not in src
+
+
+def test_the_task_loop_masks_rows_instead_of_indexing_them():
+    """x[rows] has a data-dependent shape, so torch reads the count back to the
+    host to allocate it -- a sync per task per micro-batch that no amount of
+    deferring removes. Under token-mean the mask is the same number."""
+    src = _actor_source()
+    body = src[src.index("for task, rows in iter_task_row_masks("):]
+    body = body[: body.index("append_to_dict(metrics, task_metrics)")]
+    assert "response_mask * rows.reshape(-1, 1)" in body
+    for expr in ("old_log_prob[rows]", "log_prob[rows]", "advantages[rows]",
+                 "teacher_kld[rows]", "entropy[rows]", "kld[rows]"):
+        assert expr not in body, expr
+    # Two survive on purpose: the seq-mean fallback, where the mask is NOT the
+    # same number, and a mean over ROWS that a token mask cannot express.
+    assert "task_response_mask = response_mask[rows]" in body
+    assert "kl_loss_coef[rows].float().mean()" in body
+
+
+def test_masking_and_indexing_agree_under_token_mean():
+    """The equivalence the substitution above rests on, as arithmetic."""
+    torch.manual_seed(0)
+    loss = torch.randn(6, 5)
+    response_mask = (torch.rand(6, 5) > 0.3).float()
+    rows = torch.tensor([True, False, True, True, False, False])
+
+    indexed = _token_mean(loss[rows], response_mask[rows])
+    masked = _token_mean(loss, response_mask * rows.reshape(-1, 1).to(response_mask.dtype))
+    assert masked.item() == pytest.approx(indexed.item(), rel=1e-6)
+
+
+def test_an_absent_task_is_zero_through_defer_present_not_nan():
+    """policy_loss_fn returns NaN for a task with no rows -- masked_mean is 0/0.
+    _defer_present replaces it rather than multiplying it away, because 0 * NaN
+    is NaN."""
+    nan = torch.tensor(float("nan"))
+    present = torch.tensor(False)
+    value = torch.where(present, nan, torch.zeros_like(nan))
+    assert value.item() == 0.0
+    assert not torch.isnan(value)
 
 
 def test_the_aggregation_mode_is_in_the_gate():

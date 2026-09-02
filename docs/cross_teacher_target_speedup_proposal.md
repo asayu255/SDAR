@@ -15,6 +15,49 @@ target アームが足すのは (bs, resp, 20) 上の elementwise 演算と統�
 
 ---
 
+## 0.0 実装済み (1〜7) — 実装して分かった訂正が2件
+
+本文書の §4 の 1〜7 は実装した。**8（KV 0.6→0.68）は未実施。** 実装中に §1.3 の記述が2箇所誤っていたことが分かったので、先に訂正する。
+
+### 訂正1:pump は validation でも使われていなかった
+
+§1.3 で「pump は validation のみが使う」と書いたが、**この run では1回も使われていない。** `rollout.return_rollout_log_probs=True` の間、worker の `_pump_refuse`（`vllm_rollout_spmd.py`）が「rollout log-probs are requested」でパス全体を拒否する — pool が返すのは token id であって log-prob ではないため。handshake が失敗し、`ROLLOUT_ASYNC_GENERATE=1` は**全 step の全 call で inert**だった。証拠は数時間前に1行出る `[rollout-pump] staying on the blocking path: ...` だけである。
+
+これは `sign_prefetch/hit_rate = 0.000` と**同じ形の失敗**である:機構は実装され、既定で on で、script も export しているのに、別の設定が静かに殺している。
+
+したがって #6 を効かせるには `return_rollout_log_probs=False` が必要で、3スクリプトともそう変更した。**代償は rollout-vs-actor のドリフト検査(`training/rollout_probs_diff_*`)を失うこと**で、これは実在する診断である。intent lock には入っていない(「diagnostic であって loss に届く値は同じ」と明記されている)ので変更自体は自由だが、失うことは失う。
+
+### 訂正2:既存の「sync-free」パスは sync-free ではなかった
+
+§3.C で `.item()` を 16回/micro-batch と数えたが、per-task ループは `x[rows]`(bool 索引)も使っていた。**bool 索引は出力サイズを host に読み戻すので、それ自体が sync である。** pure-OPD の `sync_free_task_metrics` パスも `response_mask[rows]` と `teacher_kld[rows]` で 2回/task/micro-batch 払っていた。
+
+token-mean では行索引と行マスクは同じ数になる(除外行は分子にも分母にも 0 を足す)ので、ループ全体を `response_mask * rows` に置き換えた。seq-mean-* では等価でないので、そちらは索引のまま残してある。
+
+### 実装の要約
+
+| # | 手 | 実装 | ビット同一 |
+|---|---|---|:---:|
+| 1 | `perf/update_peak_{allocated,reserved}_gb` | `reset_phase_peak` / `phase_peak_metrics`(`verl/utils/metric/memory.py`)、`update_policy` の前後で開閉 | ○ |
+| 2 | sign prefetch の辞退理由 | `_decline_sign_prefetch` が1回だけ理由を print、`sign_prefetch/enabled` を metric に | ○ |
+| 3 | per-micro-batch host sync | pooled 4 + per-task 12 を `_defer`/`_defer_present` に。bool 索引を行マスクに。`sync_free_task_metrics` から `pg_loss_coef == 0` を削除 | ○(値)/×(per-task 診断の最下位ビット) |
+| 4 | post-rollout のトークン予算 | `_teacher_call(..., budget=True)` → worker 側は `meta_info.setdefault` で caller override を許可。窓側は 4 行のまま | × |
+| 5 | cache を put 時に pinned host へ | `TeacherHiddenCache._to_host`、`teacher_cache/device_gb` を追加 | ○ |
+| 6 | 学習 rollout を pump へ + join を後ろへ | `ROLLOUT_PUMP_TRAINING`、handshake が rank の `n` を報告、`_pump_will_serve` が join の位置を決める | × |
+| 7 | `ROLLOUT_PREFETCH_LOGPROB=1` | 3スクリプトで export | × |
+
+**#3 の per-task 診断について。** 行マスクは token-mean で行索引と同じ値だが、加算順序が変わるので最下位ビットは動く。損失には一切触れないので勾配は不変である。
+
+**新しい env フラグは3アームすべてに同じ値で入れた**(`ROLLOUT_PUMP_TRAINING`、`ROLLOUT_PREFETCH_LOGPROB`)。どれも非ビット同一なので、片方だけ立てると比較が壊れる。
+
+### 走らせる前に読む指標
+
+1. **`sign_prefetch/enabled`** — 0 なら #6/#7 以前に窓が動いていない。理由は起動ログに1行出る
+2. **`teacher_cache/device_gb`** — #5 が効いていれば ~0。ここが `teacher_cache/gb` に近ければ put の host コピーが動いていない
+3. **`perf/update_peak_allocated_gb`** — #8(KV 予算)と gradient checkpointing の判断はこれが出てから。§2.2 の「不明」がこれで潰れる
+4. 起動ログの `[rollout-pump] driver: ROLLOUT_PUMP_TRAINING=...` と、`staying on the blocking path` が**出ていないこと**
+
+---
+
 ## 0. 結論を先に
 
 | 事実 | 数値 |

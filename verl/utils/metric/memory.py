@@ -48,7 +48,7 @@ one step further along: an allocation that failed even after the retry.
 
 import torch
 
-__all__ = ["per_rank_memory_metrics", "device_footprint_gb"]
+__all__ = ["per_rank_memory_metrics", "device_footprint_gb", "reset_phase_peak", "phase_peak_metrics"]
 
 _GB = 1024.0**3
 
@@ -64,6 +64,49 @@ def _allocator_counters(device) -> tuple:
     except Exception:
         return 0.0, 0.0
     return float(stats.get("num_alloc_retries", 0)), float(stats.get("num_ooms", 0))
+
+
+def reset_phase_peak(device) -> None:
+    """Start a fresh peak window on this rank. Pairs with :func:`phase_peak_metrics`.
+
+    ``max_memory_allocated`` is a high-water mark since the PROCESS started, and
+    nothing in these arms ever resets it. That is the right choice for
+    ``per_rank_memory_metrics`` -- a ratchet is what you want when the question is
+    "did this run ever come close to the card" -- but it makes the number useless
+    for the question that actually decides a knob: how much does ONE phase need?
+
+    On this stack the two differ by more than a little. The rollout holds a vLLM
+    pool sized to 0.6 of the card plus a hidden-state cache, and the actor update
+    runs after that pool is asleep. Read without a reset, the update's "peak" is
+    the rollout's, and every headroom argument built on it is about a phase that
+    was not running. The intent lock's note that gradient checkpointing could not
+    be turned off because step 1 reached 93.9 GiB is exactly that reading, and it
+    cannot be told apart from a real update peak without this.
+
+    A no-op on a backend that cannot reset, so a diagnostic never takes a run down.
+    """
+    try:
+        device.reset_peak_memory_stats()
+    except Exception:  # noqa: BLE001 - a measurement must not break what it measures
+        pass
+
+
+def phase_peak_metrics(device, prefix: str, group=None) -> dict:
+    """Cross-rank max of the peak since the last :func:`reset_phase_peak`.
+
+    One key, not the per-rank spread ``per_rank_memory_metrics`` reports: the
+    spread question is about the whole step and is already answered there, while
+    this one is read against the card's capacity, where the max is the only
+    number that matters.
+    """
+    allocated = device.max_memory_allocated() / _GB
+    reserved = device.max_memory_reserved() / _GB
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return {f"{prefix}_allocated_gb": allocated, f"{prefix}_reserved_gb": reserved}
+    local = torch.tensor([allocated, reserved], dtype=torch.float64, device=device.current_device())
+    torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.MAX, group=group)
+    rows = local.tolist()
+    return {f"{prefix}_allocated_gb": rows[0], f"{prefix}_reserved_gb": rows[1]}
 
 
 def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:

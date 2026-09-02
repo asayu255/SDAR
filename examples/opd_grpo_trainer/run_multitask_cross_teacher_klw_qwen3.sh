@@ -779,13 +779,15 @@ set -x
 #   ROLLOUT_PREFETCH_TEACHER=1
 #   (ROLLOUT_SKIP_DONE_PREPROC / ROLLOUT_DECODE_ACTIVE_ONLY /
 #    ROLLOUT_COMPACT_RECORD default to on)
-#   PICK ONE of ROLLOUT_PREFETCH_TEACHER / ROLLOUT_PREFETCH_LOGPROB. Unlike pure
-#   OPD, this arm DOES have an old_log_prob phase, so prefetched log probs would
-#   be consumed — but both prefetches fill the same driver-side glue window and
-#   queue on the same colocated WorkerDict, so running both only makes them wait
-#   on each other. ROLLOUT_PREFETCH_TEACHER is the one exported below: the teacher
-#   forward is by far the more expensive of the two, and the log-prob phase is a
-#   single call the trainer makes anyway.
+#   BOTH ROLLOUT_PREFETCH_TEACHER AND ROLLOUT_PREFETCH_LOGPROB ARE ON NOW. The
+#   note that used to stand here said to pick one, and it was right while both
+#   had to fit inside the same 35-40 s of driver-side glue and queue on the same
+#   colocated WorkerDict: running both only made them wait on each other. What
+#   changed is ROLLOUT_PUMP_TRAINING -- the generation now runs through a pool the
+#   worker steps on its own thread, so the actor's call slot is free DURING the
+#   generation and the window is the glue plus the decode tail rather than the
+#   glue alone. Turning the pump off puts the old objection back: with
+#   ROLLOUT_PUMP_TRAINING=0, set ROLLOUT_PREFETCH_LOGPROB=0 as well.
 #
 # ROLLOUT_PREFETCH_TEACHER scores rows with their task's teacher during the
 # rollout instead of after it. A turn's row is final the moment it is recorded
@@ -931,11 +933,18 @@ set -x
 #     prefetch runs it while vLLM is awake and holding its KV cache. Same
 #     arithmetic, different GEMM shape — the accuracy class of a micro-batch
 #     change, so it goes into every arm at once.
-#   rollout.return_rollout_log_probs stays True here, and is the one wasted-work
-#     removal NOT taken from pure OPD. Its consumer is the rollout-vs-actor drift
-#     check in RayPPOTrainer.fit (rollout_probs_diff), which needs an old_log_prob
-#     to compare against: pure OPD has none and so drops the column, this arm has
-#     one and reads it.
+#   rollout.return_rollout_log_probs is FALSE here, and the change costs a real
+#     diagnostic. Its consumer is the rollout-vs-actor drift check in
+#     RayPPOTrainer.fit (training/rollout_probs_diff_*), which needs an
+#     old_log_prob to compare against; this arm has one, so unlike pure OPD it
+#     could read it, and did. It is off because the WORKER refuses the pumped
+#     path outright while it is on (vllm_rollout_spmd._pump_refuse: "rollout
+#     log-probs are requested" -- the pool returns token ids, not log-probs). On
+#     the sg1 run that refusal made ROLLOUT_ASYNC_GENERATE=1 inert for every call
+#     of every step, validation included, which is only visible as one
+#     "[rollout-pump] staying on the blocking path" line hours earlier. Trading
+#     the drift check for the pool is the trade ROLLOUT_PUMP_TRAINING is worth
+#     ~100 s a step for; set both back together if the check is wanted.
 #   rollout.disable_log_stats=False — MEASUREMENT, not a speedup. Turns on vLLM's
 #     own statistics (prefill/decode token counts, preemptions, running batch,
 #     prefix-cache hits). generate_sequences is opaque to both profilers — the
@@ -1041,6 +1050,23 @@ export BALANCE_MINIBATCH_COLUMNS=${BALANCE_MINIBATCH_COLUMNS:-1}
 # all three back after the rollout. No-op on the control arm, which has no
 # planes to cache.
 export ROLLOUT_PREFETCH_SIGN=${ROLLOUT_PREFETCH_SIGN:-1}
+# Let the TRAINING rollout through the pumped engine pool, and stop joining the
+# teacher prefetch chunk before every generation. TokenPump steps the engine on a
+# thread inside the worker, so between two pump_step RPCs the colocated actor's
+# call slot is free -- the one thing in this tree that breaks the serialisation
+# docs/gpu_profiling_report_opd.md 2.4 describes. The frozen forwards then run
+# BESIDE the decode tail, which is 70.5% of gen's wall clock at 17% tensor-pipe
+# activity. Needs ROLLOUT_ASYNC_GENERATE=1 and return_rollout_log_probs=False
+# (below), and the same value on all three cross-teacher arms: it is not
+# bit-identical (arrival timing decides which requests share a decode step).
+export ROLLOUT_PUMP_TRAINING=${ROLLOUT_PUMP_TRAINING:-1}
+# Score the finished rows' old_log_prob in the rollout window too. The consumer
+# is real on this arm -- opd_grpo_ray_trainer's old_log_prob phase reads it
+# through compute_log_prob_with_prefetch -- and the pure-OPD note that "there is
+# no consumer" is about the thin loop, which has no such phase. Worth ~44 s a
+# step, but only alongside ROLLOUT_PUMP_TRAINING: without it this competes with
+# the teacher chunk for the same 35-40 s of glue.
+export ROLLOUT_PREFETCH_LOGPROB=${ROLLOUT_PREFETCH_LOGPROB:-1}
 # WHERE THIS RUN'S CHECKPOINTS GO. Empty by default, so the paths below are
 # byte-for-byte what they were and an existing run resumes exactly as before.
 #
@@ -1168,7 +1194,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.actor.student_indexed_topk=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.rollout.return_rollout_log_probs=True \
+    actor_rollout_ref.rollout.return_rollout_log_probs=False \
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=18432 \
     actor_rollout_ref.rollout.max_model_len=4608 \

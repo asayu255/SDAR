@@ -28,12 +28,14 @@ class _FakeRefWG:
         self.rows = []  # original indices, in call order
         self.cache_ids = []
         self.call_sizes = []  # rows per call, which is what bounds the transient
+        self.meta = []  # what the caller asked the worker to size its micro-batches by
 
     def compute_ref_topk_log_prob(self, sub):
         first_tok = sub.batch["responses"][:, 0]
         self.rows.extend(first_tok.tolist())
         self.cache_ids.extend(sub.batch["teacher_cache_ids"].tolist())
         self.call_sizes.append(len(first_tok))
+        self.meta.append(dict(sub.meta_info or {}))
         return DataProto.from_dict(
             tensors={"teacher_scored": torch.ones(len(first_tok), 1, dtype=torch.bool)}
         )
@@ -77,6 +79,10 @@ def _make_trainer(teachers, base, enabled=True):
     trainer.teacher_kl_topk = 20
     trainer.student_indexed_topk = True
     trainer._teacher_cache_counter = 0
+    # The token budget the POST-ROLLOUT frozen forwards ask the worker for. 0 is
+    # "keep the row bound", which is what the window path always uses; the tests
+    # that care set it themselves.
+    trainer._post_rollout_token_budget = 0
     return trainer
 
 
