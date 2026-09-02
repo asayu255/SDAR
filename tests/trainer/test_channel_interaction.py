@@ -314,6 +314,11 @@ def _counterfactual(bs=2, resp=4):
         "available": torch.ones(bs, dtype=torch.bool),
         "evidence_shared": torch.rand((bs, resp)),
         "evidence_shared_offtask_only": torch.rand((bs, resp)),
+        # None is the unmasked arm, which is what a probe dict carries unless the
+        # run set role_mask. The shift decompositions are built from mu rather
+        # than from W, so they read this to stay a partition of (W - 1) D under a
+        # role-masked arm -- see _role_gate.
+        "role_keep": None,
     }
 
 

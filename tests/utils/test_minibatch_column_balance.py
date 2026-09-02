@@ -270,6 +270,10 @@ _CROSS_TEACHER_SCRIPTS = (
     # its comparators are exactly those two scripts, and an arm that lacks a
     # reordering its control has differs from it in more than the mechanism.
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_target_qwen3.sh",
+    # The content-only arm is the klw script plus one key, and its comparison run
+    # is the klw control above. Dropping the block here would put a second
+    # difference between them.
+    "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_content_qwen3.sh",
 )
 
 

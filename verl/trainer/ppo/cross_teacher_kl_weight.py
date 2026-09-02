@@ -177,6 +177,80 @@ import torch
 from verl.trainer.ppo.sign_weights import PAIR_STATES
 from verl.trainer.ppo.sign_weights import ROLE_NAMES as _ROLE_NAMES
 from verl.trainer.ppo.sign_weights import STATE_NAMES as _STATE_NAMES
+from verl.trainer.ppo.sign_weights import (
+    ROLE_ENV_ACTION,
+    ROLE_ENV_OBS,
+    ROLE_FORMAT,
+    ROLE_REASONING,
+    ROLE_TAG,
+    ROLE_TOOL_CALL,
+)
+
+# The two halves of the response, by role, and the arms that act on one of them.
+#
+# WHY THESE TWO GROUPS. Measured on the sg1 weighting arm against the xt1
+# control over steps 121-148: the share of the arm's absolute intervention that
+# landed on content roles was 0.165 (alfworld), 0.456 (search) and 0.661
+# (webshop), and the corrected 150-step validation deltas were +6.3pp, +0.3pp
+# and -5.5pp. Spearman(content share, delta) = -1.00 over the three tasks, and
+# the exact per-task role KL shares -- which need no approximation -- order them
+# the same way. Entropy, the previous candidate explanation, reaches +0.50 on
+# the same three points. That is n = 3 with a perfect order (1/6 by chance), so
+# it is a hypothesis worth one run each and not a finding.
+#
+# ROLE_TAG and ROLE_FORMAT are the shared skeleton: the tag tokens themselves
+# and the scaffolding between the spans. The other four are inside a span and
+# are where the task's own content lives -- the move in <action>, the answer in
+# <answer>, the retrieved text in <information>, the reasoning in <think>.
+ROLE_GROUPS = {
+    "structural": (ROLE_TAG, ROLE_FORMAT),
+    "content": (ROLE_REASONING, ROLE_ENV_ACTION, ROLE_TOOL_CALL, ROLE_ENV_OBS),
+}
+
+
+def _role_gate(built: dict, like: torch.Tensor) -> torch.Tensor:
+    """(bs, resp) in ``like``'s dtype: 1 where the arm acted, 0 where it did not.
+
+    The decompositions of ``(W - 1) D`` are built from ``mu`` and the evidence,
+    not from ``W``, so they do not see the role mask on their own -- and at a
+    masked position ``W - 1`` is zero while ``1/mu - 1`` is not. Every reader of
+    those decompositions goes through here so the tables stay a partition of the
+    shift the loss actually took.
+
+    A ``built`` without the key -- the probe and channel dicts assembled at the
+    call site -- is treated as unmasked, which is correct for the arms that have
+    no mask and is why those dicts carry ``role_keep`` explicitly when they do.
+    """
+    keep = built.get("role_keep", None)
+    if keep is None:
+        return torch.ones_like(like)
+    return keep.to(device=like.device, dtype=like.dtype)
+
+
+def role_keep_mask(*, roles: torch.Tensor, group: str) -> torch.Tensor:
+    """(bs, resp) bool, true where a role-masked arm is allowed to act.
+
+    Args:
+        roles: (bs, resp) role codes from :func:`sign_weights.token_roles`.
+        group: a key of :data:`ROLE_GROUPS` -- the half to KEEP.
+
+    Returns:
+        The keep mask. Positions outside the group are held at ``W = 1`` by
+        :func:`build_position_weight` and are excluded from the normaliser's
+        mean by :meth:`PreviousStepTaskKLWeightedMean.update`; those two have to
+        agree or ``kl_scale`` leaves 1.
+
+    A role code this build does not know about lands OUTSIDE every group and is
+    therefore masked off. That is the safe direction: a new span type added to
+    the prompts would silently join the acted set if the mask were built by
+    exclusion, and the arm's name would stop describing it.
+    """
+    if group not in ROLE_GROUPS:
+        raise ValueError(f"unknown role group {group!r}; expected one of {sorted(ROLE_GROUPS)}")
+    keep = torch.zeros_like(roles, dtype=torch.bool)
+    for code in ROLE_GROUPS[group]:
+        keep |= roles == code
+    return keep
 
 __all__ = [
     "compute_raw_policy_shifts",
@@ -214,6 +288,8 @@ __all__ = [
     "PairStateEvidenceStats",
     "CorroborationAttributionStats",
     "build_position_weight",
+    "ROLE_GROUPS",
+    "role_keep_mask",
     "assert_all_finite",
     "position_terms",
     "per_candidate_shift",
@@ -1177,6 +1253,7 @@ class PreviousStepTaskKLWeightedMean:
         response_mask: torch.Tensor,
         task_ids: torch.Tensor,
         row_weights: Optional[torch.Tensor] = None,
+        role_keep: Optional[torch.Tensor] = None,
     ) -> None:
         """Fold one micro-batch in.
 
@@ -1187,6 +1264,26 @@ class PreviousStepTaskKLWeightedMean:
                 docstring is about.
             row_weights: (bs,) the same per-row weights the loss aggregation
                 applies, or None for the token-mean path.
+            role_keep: (bs, resp) bool, the SAME mask
+                :func:`build_position_weight` was given, or None for an
+                unmasked arm. It has to be the same one, and this is the whole
+                reason the argument exists rather than the mask being applied
+                downstream of the division -- see below.
+
+        ``mu`` IS COMPUTED OVER THE RETAINED POSITIONS ONLY, and that placement
+        is what keeps the role-masked arms interpretable. The class's invariant
+        is ``sum W*D / sum D == 1``: the arm reallocates OPD and does not add
+        any. Masking a role means ``W = 1`` there, so the invariant needs
+
+            sum_retained W*D == sum_retained D
+
+        which holds iff ``mu`` is the retained set's own KL-weighted mean. Left
+        unmasked here, ``mu`` would be the mean over ALL positions while ``W``
+        applied to a subset, ``kl_scale`` would drift off 1, and the arm would
+        differ from its control in how much teacher KL it distils as well as in
+        where the reallocation lands. The two are the competing explanations the
+        role-masked arms exist to separate -- so conflating them would make the
+        run answer neither.
         """
         self._cpu_cache = None
         m = response_mask.to(torch.float64)
@@ -1194,6 +1291,8 @@ class PreviousStepTaskKLWeightedMean:
         d = teacher_kl.detach().to(torch.float64)
         if row_weights is not None:
             m = m * row_weights.reshape(-1, 1).to(torch.float64)
+        if role_keep is not None:
+            m = m * role_keep.to(torch.float64)
         num = (w * d * m).sum(dim=1)
         den = (d * m).sum(dim=1)
         t = task_ids.reshape(-1).to(torch.long)
@@ -2784,6 +2883,7 @@ def build_position_weight(
     response_mask: Optional[torch.Tensor] = None,
     report_epsilon: float = 0.1,
     probe_alphas=PROBE_ALPHAS,
+    role_keep: Optional[torch.Tensor] = None,
 ) -> dict:
     """Everything from raw shifts to the scalar that multiplies the KL.
 
@@ -2814,6 +2914,13 @@ def build_position_weight(
         report_epsilon: in RMS units, and used ONLY to bucket a candidate into a
             state for the report. It reaches no weight and no loss; the
             mechanism itself has no deadzone.
+        role_keep: (bs, resp) bool from :func:`role_keep_mask`, or None for the
+            unmasked arm. Positions outside it are held at ``W = 1`` and report
+            zero on all three attribution terms. THE SAME TENSOR HAS TO REACH
+            :meth:`PreviousStepTaskKLWeightedMean.update`, whose ``mu`` must be
+            the retained set's own mean or ``kl_scale`` leaves 1 and the arm
+            starts differing from its control in total distillation as well as
+            in placement.
 
     Returns a mapping whose ``weight`` is the only field the loss may read.
     ``pre_weight`` feeds the next step's normaliser, and everything else is
@@ -2912,6 +3019,22 @@ def build_position_weight(
     weight = torch.where(finite_w, weight, torch.ones_like(weight))
     nonfinite = (~finite_pre).sum() + (~finite_w).sum()
 
+    # THE ROLE MASK IS APPLIED AFTER THE DIVISION, NOT BEFORE, and the two are
+    # not interchangeable. Held at W = 1 here, a masked position contributes
+    # exactly its own unweighted KL and the reallocation is confined to the
+    # retained half. Zeroing `pre` before the division instead would hand the
+    # masked positions W = 1/mu -- a uniform rescale of most of the response,
+    # which is the one thing the normaliser exists to prevent. `pre_weight` is
+    # returned UNMASKED because that is what the normaliser folds in, and it
+    # restricts the mean to the retained set with this same tensor.
+    #
+    # `acted` then joins the gates below, so the W - 1 decomposition stays an
+    # identity: a masked position reports zero on all three terms because zero
+    # is what W - 1 is there. Masking the weight alone would leave the
+    # attribution charging evidence at positions the loss never saw.
+    acted = torch.ones_like(finite_w) if role_keep is None else role_keep.to(finite_w.device)
+    weight = torch.where(acted, weight, torch.ones_like(weight))
+
     # W - 1 SPLIT EXACTLY THREE WAYS, made here so every reader gets the same
     # split. W~ = 1 + B_shared + sum_m B_m with
     #
@@ -2932,8 +3055,8 @@ def build_position_weight(
     # the normaliser term alone is W - 1; where the weight was replaced by 1 all
     # three are zero, which is what W - 1 is there.
     inv_mu = 1.0 / mu.clamp(min=1e-12)
-    ok_evidence = (mu_valid.reshape(-1, 1) & finite_pre & finite_w).to(pre.dtype)
-    ok_normalizer = (mu_valid.reshape(-1, 1) & finite_w).to(pre.dtype)
+    ok_evidence = (mu_valid.reshape(-1, 1) & finite_pre & finite_w & acted).to(pre.dtype)
+    ok_normalizer = (mu_valid.reshape(-1, 1) & finite_w & acted).to(pre.dtype)
     evidence_shared_sum = (mass * dec["common_soft"].abs()).sum(dim=-1)
     evidence_by_source_cand = mass.unsqueeze(-1) * q_sim.unsqueeze(-1) * exclusive
     push_shared = evidence_shared_sum * inv_mu * ok_evidence
@@ -3022,6 +3145,9 @@ def build_position_weight(
     return {
         "weight": weight,
         "pre_weight": pre,
+        # The mask as it was applied, so the normaliser and the metrics read the
+        # same tensor the weight did rather than rebuilding it from the roles.
+        "role_keep": None if role_keep is None else acted,
         # A device scalar, so counting costs no host sync inside the loop.
         "nonfinite": nonfinite,
         "mu": mu,
@@ -4030,7 +4156,10 @@ def per_candidate_shift(built: dict, teacher_kl: torch.Tensor) -> torch.Tensor:
     inv_mu = 1.0 / built["mu"].clamp(min=1e-12)
     kl = teacher_kl.detach().to(torch.float32)
     m = built["mass"] if "mass" in built else built["teacher_prob"]
-    return m * built["evidence"] * inv_mu.unsqueeze(-1) * kl.unsqueeze(-1)
+    out = m * built["evidence"] * inv_mu.unsqueeze(-1) * kl.unsqueeze(-1)
+    # kl is the (bs, resp) reference: the gate is per POSITION, and taking it
+    # from `out` would build a per-candidate one and then unsqueeze to 4-D.
+    return out * _role_gate(built, kl).unsqueeze(-1)
 
 
 # The three per-position scalars the gradient-interference metrics are built
@@ -4460,7 +4589,11 @@ def state_shift_terms(built: dict, teacher_kl: torch.Tensor) -> dict:
     out = {}
     for sid, name in _STATE_NAMES.items():
         out[f"shift_{name}"] = (per_cand * (state == sid).to(per_cand.dtype)).sum(dim=-1)
-    out["shift_norm_offset"] = (inv_mu - 1.0) * kl
+    # Gated like the candidate term above, and for the same reason: at a masked
+    # position W - 1 is zero, so every column of its decomposition has to be. The
+    # offset is the one that would survive otherwise -- it is built from mu alone
+    # and has no evidence to be zero for.
+    out["shift_norm_offset"] = (inv_mu - 1.0) * kl * _role_gate(built, kl)
     return out
 
 

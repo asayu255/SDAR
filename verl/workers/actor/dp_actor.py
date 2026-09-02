@@ -68,7 +68,9 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     POSITION_TERMS as XT_POSITION_TERMS,
     CHANNEL_PROBES as XT_CHANNEL_PROBES,
     PROBE_ALPHAS as XT_PROBE_ALPHAS,
+    ROLE_GROUPS,
     STATE_TERMS as XT_STATE_TERMS,
+    role_keep_mask,
     AdvantageReliabilityStats,
     CorroborationAttributionStats,
     CumulativePolicyShiftRMS,
@@ -370,6 +372,20 @@ def _xt_normalizer_mu(pre_weight, snapshot, task_ids):
     valid = snapshot["valid"].to(pre_weight.device)
     mu = mean[dst].reshape(-1, 1).expand_as(pre_weight)
     return torch.where(valid[dst].reshape(-1, 1), mu.clamp(min=1e-12), floor)
+
+
+def _xt_role_masked(weight, role_keep):
+    """``weight`` held at 1 outside ``role_keep``; unchanged when it is None.
+
+    The role-masked arms restrict the reallocation to one half of the response,
+    and this is the same rule :func:`build_position_weight` applies to the live
+    weight. It is here for the probes and channel counterfactuals, which build
+    their weights themselves and would otherwise report a reallocation on roles
+    the arm never touched.
+    """
+    if role_keep is None:
+        return weight
+    return torch.where(role_keep.to(weight.device), weight, torch.ones_like(weight))
 
 
 def _xt_apply_normalizer(pre_weight, snapshot, task_ids):
@@ -1875,6 +1891,29 @@ class DataParallelPPOActor(BasePPOActor):
         )
         xt_enabled = xt_cfg_on and "sign_cache_ids" in data.batch.keys()
         xt_report_eps = float((xt_cfg or {}).get("report_epsilon", 0.1))
+        # The ROLE-MASKED variants. "" is the unmasked arm this branch has been
+        # running; "content" and "structural" restrict the reallocation to one
+        # half of the response and are the pair that separates the two
+        # explanations for the corrected 150-step result -- see ROLE_GROUPS in
+        # verl/trainer/ppo/cross_teacher_kl_weight.py for the measurement and
+        # docs/cross_teacher_role_mask_arms.md for the pre-registered
+        # predictions. Read as a string rather than a list of role names: the
+        # arm's identity is the group, and letting a run name four roles
+        # individually would make "content-only" a family of runs that all log
+        # under one name.
+        xt_role_group = str((xt_cfg or {}).get("role_mask", "") or "")
+        assert xt_role_group in ("",) + tuple(ROLE_GROUPS), (
+            f"cross_teacher_kl_weight.role_mask={xt_role_group!r} is not a role group; "
+            f"expected one of {sorted(ROLE_GROUPS)} or '' for the unmasked arm"
+        )
+        # A mask cannot be built without the tag ids that classify the roles, and
+        # silently running unmasked is the one failure that would look like a
+        # successful arm. The tags come from sign_role_tag_ids, which is built
+        # from the same prompts the roles are defined against.
+        assert not (xt_role_group and xt_cfg_on and not getattr(self, "sign_role_tag_ids", None)), (
+            "cross_teacher_kl_weight.role_mask needs the role tag ids; none were resolved, "
+            "so every position would be classified as one role and the mask would be a no-op"
+        )
         # The TARGET arm. It reads the same four models on the same support, but
         # it does not multiply the teacher KL -- it rewrites the teacher's own
         # values, because a positive scalar on KL(p_s || p_on) is minimised at
@@ -2939,6 +2978,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     sign_position_weight = pos_w_norm
                     
                     xt_built = None
+                    # Bound here, beside xt_built, because the probe and channel
+                    # readers live in a SIBLING block (under use_teacher_kl_loss)
+                    # rather than under xt_enabled. Reaching them undefined would
+                    # be a NameError on any step where this arm is off.
+                    xt_role_keep = None
                     # Per micro-batch, so the readers below cannot see a
                     # previous one's roles when this one produced none.
                     xt_roles_mb = None
@@ -3115,6 +3159,19 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                 )
+                            # Built once per micro-batch and handed to BOTH the
+                            # weight and the normaliser: the mean has to be taken
+                            # over exactly the positions the weight was applied
+                            # to, or kl_scale leaves 1 and the arm confounds
+                            # "where it reallocates" with "how much it distils".
+                            xt_role_keep = (
+                                role_keep_mask(
+                                    roles=token_roles(data["responses"], sign_role_tags),
+                                    group=xt_role_group,
+                                )
+                                if xt_role_group
+                                else None
+                            )
                             if xt_rms_snapshot is None:
                                 # Step 0: no scale exists, so no weight does
                                 # either. Not the raw W~ -- that would be a
@@ -3123,6 +3180,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 xt_built = None
                             else:
                                 xt_built = build_position_weight(
+                                    role_keep=xt_role_keep,
                                     shifts=xt_shifts,
                                     on_task_logprob=sign_on_task_logprobs,
                                     # The measure the candidate expectations are
@@ -3492,6 +3550,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 pre_weight=xt_built["pre_weight"], teacher_kl=teacher_kld,
                                 response_mask=response_mask, task_ids=task_ids,
                                 row_weights=task_loss_weight,
+                                # Same tensor the weight was masked with, read
+                                # back off the build rather than recomputed.
+                                role_keep=xt_built["role_keep"],
                             )
                             # Computed once and handed to four accumulators:
                             # the task cut, the role cut, the turn cut and the
@@ -3692,13 +3753,26 @@ class DataParallelPPOActor(BasePPOActor):
                                     pre_weight=pre, teacher_kl=teacher_kld,
                                     response_mask=response_mask, task_ids=task_ids,
                                     row_weights=task_loss_weight,
+                                    # The counterfactuals are masked like the
+                                    # live weight. They reach no loss, but an
+                                    # unmasked probe would report reallocation on
+                                    # roles this arm never touched and its
+                                    # kl_scale would not be 1 either -- two
+                                    # readings that disagree with the arm they
+                                    # are the counterfactual FOR.
+                                    role_keep=xt_role_keep,
                                 )
                                 snap = xt_probe_snapshots.get(name, None)
                                 probe_mu = _xt_normalizer_mu(pre, snap, task_ids)
                                 probe = {
-                                    "weight": pre / probe_mu,
+                                    "weight": _xt_role_masked(pre / probe_mu, xt_role_keep),
                                     "pre_weight": pre,
                                     "mu": probe_mu,
+                                    # The state partition is built from mu, not
+                                    # from the weight, so it needs the mask
+                                    # handed to it or a masked position reports
+                                    # a shift the probe did not take.
+                                    "role_keep": xt_role_keep,
                                     # alpha changes the evidence and nothing
                                     # else: the state labels, the teacher's
                                     # probability and the availability mask are
@@ -3733,11 +3807,14 @@ class DataParallelPPOActor(BasePPOActor):
                                     pre_weight=pre, teacher_kl=teacher_kld,
                                     response_mask=response_mask, task_ids=task_ids,
                                     row_weights=task_loss_weight,
+                                    role_keep=xt_role_keep,
                                 )
                                 snap = xt_channel_snapshots.get(name, None)
                                 mu_c = _xt_normalizer_mu(pre, snap, task_ids)
                                 chan = {
-                                    "weight": pre / mu_c, "pre_weight": pre, "mu": mu_c,
+                                    "weight": _xt_role_masked(pre / mu_c, xt_role_keep),
+                                    "pre_weight": pre, "mu": mu_c,
+                                    "role_keep": xt_role_keep,
                                     "evidence": xt_built["channel_evidence"][name],
                                     "state": xt_built["state"],
                                     "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],

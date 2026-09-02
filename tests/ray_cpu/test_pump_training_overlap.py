@@ -167,6 +167,10 @@ _SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_target_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_control_qwen3.sh",
+    # The content-only arm is compared against the klw control above, so it is
+    # inside the same "must carry the same flags" set as the rest -- the whole
+    # claim it makes is that the role mask is the only difference.
+    "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_content_qwen3.sh",
 ]
 
 
