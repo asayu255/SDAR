@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -194,6 +195,63 @@ def _print_turn_timing(records):
     print("\n".join(lines), flush=True)
 
 
+@contextlib.contextmanager
+def rollout_session(actor_rollout_wg):
+    """Hold vLLM awake for everything inside this block.
+
+    Without a session, generate_sequences re-enters the sharding manager on every
+    call: it re-gathers the FSDP state dict, re-syncs the full model weights, and
+    wakes then sleeps the engine. The weights are frozen for as long as nobody
+    trains, so one sync at the top of the block produces the identical weights
+    for every call inside it -- the generated tokens are unchanged.
+
+    Nest it as widely as the frozen weights allow. multi_turn_loop opens one per
+    rollout, and _validate opens one around the whole validation; paying a 21 GB
+    unmap and remap between every batch of a validation measured 10.4% of the
+    evaluation's wall clock on the arm this came from. The worker counts scopes
+    by DEPTH, so the inner ones are free -- with a bool, the first inner close
+    would release the outer one and the hoist would silently do nothing.
+
+    A no-op when ROLLOUT_KEEP_VLLM_AWAKE is off, and on any rollout that is not
+    vLLM's -- the worker decides that, not this.
+    """
+    if not _ROLLOUT_KEEP_VLLM_AWAKE:
+        yield
+        return
+    actor_rollout_wg.begin_rollout_session()
+    try:
+        yield
+    finally:
+        actor_rollout_wg.end_rollout_session()
+
+
+# Reuse of the prompt tokenisation for raw_prompt_ids.
+#
+# In the text-only path preprocess_single_sample tokenises the SAME string
+# twice: once through tokenize_and_postprocess_data (which calls the tokenizer
+# with add_special_tokens=False and pads), and once through tokenizer.encode
+# with add_special_tokens=False to build raw_prompt_ids. The non-pad tokens of
+# the first ARE the second, for the truncation modes this arm uses -- both
+# sides cut "left" the same way, "right" the same way, and "error" raises
+# before this point. That second pass runs once per ROW per TURN: on the
+# multitask batch, 360 rows against alfworld's 50-turn cap.
+#
+# The equality is load-bearing for scoring (raw_prompt_ids is what vLLM
+# generates from), so it is not assumed: the first _RAW_IDS_VERIFY calls run
+# both paths and compare, and any mismatch disables the reuse for the process
+# and says so. "middle" truncation and multimodal prompts always take the old
+# path -- middle is not a mode postprocess_data implements, and multimodal
+# raw_prompt is a different string.
+_RAW_IDS_REUSE = os.environ.get("ROLLOUT_RAW_IDS_REUSE", "1").strip().lower() not in ("0", "false", "no")
+_RAW_IDS_VERIFY = 8
+_RAW_IDS_STATE = {"enabled": _RAW_IDS_REUSE, "verified": 0}
+
+
+def _prompt_ids_from_tensors(input_ids_row, attention_mask_row):
+    """The prompt's token ids, as the already-run tokenisation produced them."""
+    return input_ids_row[attention_mask_row.bool()].tolist()
+
+
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
@@ -225,6 +283,49 @@ class TrajectoryCollector:
             item: self.preprocess_single_sample(item=item, gen_batch=gen_batch, obs=obs)
             for item in items
         }
+
+    def _raw_prompt_ids(self, tokenizer, raw_prompt, input_ids_row, attention_mask_row, is_multi_modal):
+        """raw_prompt_ids for one row, reusing the tokenisation already done.
+
+        See the _RAW_IDS_REUSE comment above for why the reuse is sound and how
+        it is verified. The fallback is the original double-encode, kept intact
+        for multimodal rows, "middle" truncation, and any process where the
+        self-check ever failed.
+        """
+        truncation = self.config.data.truncation
+        eligible = _RAW_IDS_STATE["enabled"] and not is_multi_modal and truncation in ("left", "right", "error")
+        if eligible:
+            extracted = _prompt_ids_from_tensors(input_ids_row, attention_mask_row)
+            if _RAW_IDS_STATE["verified"] >= _RAW_IDS_VERIFY:
+                return extracted
+            encoded = self._encode_raw_prompt(tokenizer, raw_prompt)
+            if encoded == extracted:
+                _RAW_IDS_STATE["verified"] += 1
+                return extracted
+            _RAW_IDS_STATE["enabled"] = False
+            print(
+                "[raw-ids] reused prompt tokens differ from a fresh encode "
+                f"({len(extracted)} vs {len(encoded)} ids); reuse disabled for this process, "
+                "falling back to double tokenisation.",
+                flush=True,
+            )
+            return encoded
+        return self._encode_raw_prompt(tokenizer, raw_prompt)
+
+    def _encode_raw_prompt(self, tokenizer, raw_prompt):
+        raw_prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+            if self.config.data.truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+            elif self.config.data.truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+            elif self.config.data.truncation == "middle":
+                left_half = self.config.data.max_prompt_length // 2
+                right_half = self.config.data.max_prompt_length - left_half
+                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+            elif self.config.data.truncation == "error":
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+        return raw_prompt_ids
 
     def preprocess_single_sample(
         self,
@@ -345,18 +446,9 @@ class TrajectoryCollector:
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
-            if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
-            elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
-            elif self.config.data.truncation == "middle":
-                left_half = self.config.data.max_prompt_length // 2
-                right_half = self.config.data.max_prompt_length - left_half
-                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-            elif self.config.data.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+        raw_prompt_ids = self._raw_prompt_ids(
+            tokenizer, raw_prompt, input_ids[0], attention_mask[0], is_multi_modal
+        )
 
         # Build final output dict
         row_dict.update({
@@ -978,9 +1070,7 @@ class TrajectoryCollector:
         # Open one vLLM session for the whole rollout (opt-in). end_rollout_session
         # runs in finally so the engine is always returned to its slept/offloaded
         # state before the post-rollout (gather/teacher/train) phases.
-        if _ROLLOUT_KEEP_VLLM_AWAKE:
-            actor_rollout_wg.begin_rollout_session()
-        try:
+        with rollout_session(actor_rollout_wg):
             if self.config.algorithm.filter_groups.enable and is_train:
                 # Dynamic Sampling (for DAPO and Dynamic GiGPO)
                 total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
@@ -997,9 +1087,6 @@ class TrajectoryCollector:
                     actor_rollout_wg=actor_rollout_wg,
                     envs=envs,
                 )
-        finally:
-            if _ROLLOUT_KEEP_VLLM_AWAKE:
-                actor_rollout_wg.end_rollout_session()
         assert len(total_batch_list) == len(total_episode_rewards)
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)
