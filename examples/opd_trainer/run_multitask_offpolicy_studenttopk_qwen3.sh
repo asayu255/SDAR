@@ -6,6 +6,7 @@ set -x
 #
 # WHAT DIFFERS FROM run_multitask_offpolicy_qwen3_nogen.sh, and nothing else:
 #   actor.student_indexed_topk=True   the KL's support is the STUDENT's top-20
+#   {actor,ref}.response_only_logits=True   lm_head on the response rows only
 #   algorithm.opd.teacher_paths.*     the three teachers, loaded at Stage 2
 #   trainer.expected_config           this arm's own intent lock
 #   trainer.experiment_name           its own run identity
@@ -31,6 +32,30 @@ set -x
 #
 # THIS ARM DOES NOT COMPARE WITH THE CONTROL'S LOSS CURVE. Different support,
 # different (still valid) bound. Compare validation scores, not actor/teacher_kl_loss.
+#
+# THE TEACHER-SIDE KNOBS BELOW ARE DELIBERATELY NOT THE ON-POLICY ARM'S. That arm
+# (examples/opd_trainer/run_multitask_qwen3.sh on the student-topk branch) sets
+# ref.fsdp_config.param_offload=False, ref.fsdp_config.sharding_strategy=shard_grad_op
+# and ref.log_prob_micro_batch_size_per_gpu=4. None of the three transfers, because
+# its teacher and this one are called differently:
+#
+#   param_offload. There the teacher is scored per TURN inside the rollout, so
+#     paying a host-to-device copy of the weights each time is the dominant cost.
+#     Here it is called three times a step, once per task: the copy is ~10 GB over
+#     PCIe per step against a ~580 s step, well under 1%, and keeping offload ON
+#     is what buys back the ~10 GB/rank that three resident 1.7B teachers cost --
+#     on a card this arm has already added a hidden-state cache and three
+#     unsharded projections to. So it stays True.
+#   sharding_strategy. ZeRO-2 pays off because ZeRO-3 all-gathers a layer three
+#     times per micro-batch under gradient checkpointing: forward, recompute,
+#     backward. The teacher has no backward and no checkpointing, so it gathers
+#     each layer once either way -- ZeRO-2 would buy nothing and hold the params
+#     unsharded for the whole call. Left at the default.
+#   log_prob_micro_batch_size_per_gpu. Theirs is 4 as a MEMORY bound, not a speed
+#     choice. Ours is 16, inherited from a script where the ref role was never
+#     instantiated at all. 16 gives the better GEMM shape and is kept -- but it is
+#     the first knob to lower if the smoke step below runs out of memory, and 4 is
+#     the value the on-policy arm settled on.
 #
 # WHAT IT GIVES BACK. The pool's two largest columns -- the teacher's recorded
 # top-k, ~82 KB of the ~123 KB a row costs resident, about 105 GB across the pool
@@ -231,6 +256,8 @@ python3 -m verl.trainer.main_opd_offpolicy \
     +algorithm.opd.sft_loss_coef=1.0 \
     +algorithm.opd.normalize_loss_by_task=True \
     +algorithm.opd.student_indexed_topk=True \
+    actor_rollout_ref.actor.response_only_logits=True \
+    actor_rollout_ref.ref.response_only_logits=True \
     +algorithm.opd.teacher_paths.alfworld=/opt/home/ohara/checkpoints/teachers/alfworld_step300 \
     +algorithm.opd.teacher_paths.search=/opt/home/ohara/checkpoints/teachers/search_step300 \
     +algorithm.opd.teacher_paths.webshop=/opt/home/ohara/checkpoints/teachers/webshop_step300 \

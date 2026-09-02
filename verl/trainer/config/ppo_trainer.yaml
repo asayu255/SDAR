@@ -92,6 +92,17 @@ actor_rollout_ref:
     # the teachers at all: the pool's precomputed top-k cannot answer at ids the
     # student picks later, so True requires algorithm.opd.teacher_paths.
     student_indexed_topk: False
+    # Run lm_head on the response rows only, by handing the row selection to the
+    # model as logits_to_keep. Every consumer of the forward is sliced to the
+    # response window before it leaves, so the prompt rows' logits were computed
+    # at (rows, vocab) and dropped -- and on this mixture the response is about a
+    # quarter of the tokens, so three quarters of the widest GEMM in the step.
+    #
+    # NOT bit-identical: the projection is the same arithmetic per position, but a
+    # narrower GEMM reduces in a different order. Needs use_remove_padding, no
+    # Ulysses SP, and a transformers whose forward takes a tensor logits_to_keep;
+    # all three are checked at worker init rather than in the first micro-batch.
+    response_only_logits: False
     # Hard-label cross-entropy on the teacher's own sampled tokens -- the
     # degenerate (one-hot teacher) limit of the KL above. Summed with it, over the
     # same tokens and the same mask, when both are on.
@@ -150,6 +161,10 @@ actor_rollout_ref:
     # evaluate it at ids the student picks later. Costs one unsharded copy of the
     # output projection per teacher, held for the run.
     student_indexed_topk: ${actor_rollout_ref.actor.student_indexed_topk}
+    # Same mechanism on the teacher side. NOT set from the actor's value: the two
+    # models are sized and scheduled separately, and the teacher's forward is the
+    # one that runs beside a resident vLLM engine.
+    response_only_logits: False
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}

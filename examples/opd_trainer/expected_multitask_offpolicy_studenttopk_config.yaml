@@ -87,6 +87,19 @@
 "actor_rollout_ref.actor.student_indexed_topk": true
 "actor_rollout_ref.ref.student_indexed_topk": true
 
+# ---- response-only lm_head ---------------------------------------------------------
+# Every consumer of the forward is sliced to the response window before it leaves,
+# so the prompt rows' logits were projected at (rows, vocab) and dropped. On this
+# mixture the response is about a quarter of the tokens, so three quarters of the
+# widest GEMM in the step. Pinned because it is not bit-identical: the arithmetic
+# per position is the same, but a narrower GEMM reduces in a different order.
+#
+# Set on both models. The teacher's is NOT an interpolation of the actor's -- the
+# two are sized and scheduled separately -- and it matters here because this arm is
+# the one that runs a teacher forward every step.
+"actor_rollout_ref.actor.response_only_logits": true
+"actor_rollout_ref.ref.response_only_logits": true
+
 # ---- per-task normalisation of the loss above ------------------------------------
 # The plain token-mean weights a task by its share of response tokens, measured at
 # 69/27/4% for alfworld/webshop/search on these pools purely because of the

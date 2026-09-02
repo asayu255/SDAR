@@ -17,6 +17,7 @@
 Single Process Actor
 """
 
+import functools
 import itertools
 import time
 import logging
@@ -109,6 +110,58 @@ def _actor_phase(name: str):
         if _SYNC_PHASES:
             get_torch_device().synchronize()
         gpu_profiler.pop_phase(name)
+
+
+_VARLEN_KWARGS = os.environ.get("ACTOR_PASS_CU_SEQLENS", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_attention_takes_varlen_kwargs() -> bool:
+    """Does this transformers accept cu_seqlens at the flash-attention entry?
+
+    Checked once, by signature, because the alternative is a silent wrong
+    answer: an older ``_flash_attention_forward`` swallows unknown keywords into
+    **kwargs and passes them to flash-attn, which does not know them either.
+    """
+    try:
+        import inspect
+
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except Exception:  # noqa: BLE001 - any import shape means "do not risk it"
+        return False
+    params = inspect.signature(_flash_attention_forward).parameters
+    return all(name in params for name in
+               ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"))
+
+
+def _supports_logits_to_keep(module) -> bool:
+    """Does the wrapped HF model's forward take ``logits_to_keep``?
+
+    Checked once at construction so ``response_only_logits`` fails at worker init
+    rather than in the first micro-batch. The model arrives wrapped (FSDP, and
+    possibly torch.compile), so unwrap to the module that actually defines
+    forward; the loop is bounded because a broken wrapper chain must not hang
+    startup.
+    """
+    import inspect
+
+    inner = module
+    for _ in range(8):
+        nxt = None
+        for attr in ("_fsdp_wrapped_module", "_orig_mod", "module"):
+            candidate = getattr(inner, attr, None)
+            if candidate is not None and candidate is not inner:
+                nxt = candidate
+                break
+        if nxt is None:
+            break
+        inner = nxt
+    try:
+        params = inspect.signature(inner.forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "logits_to_keep" in params or "num_logits_to_keep" in params
 
 
 def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: int):
@@ -205,6 +258,30 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
+        # Run lm_head on the response rows only. Off by default because it is not
+        # bit-identical: the projection is the same arithmetic per position, but a
+        # narrower GEMM reduces in a different order, so the last bits move.
+        #
+        # Refused rather than silently ignored on the two layouts where the row
+        # map does not describe what the model sees: without remove-padding there
+        # are no packed rows to select, and under Ulysses SP the sequence is split
+        # across ranks after the map is built.
+        self.response_only_logits = bool(self.config.get("response_only_logits", False))
+        if self.response_only_logits:
+            if not self.use_remove_padding or self.use_ulysses_sp:
+                raise ValueError(
+                    "response_only_logits needs use_remove_padding=True and ulysses_sequence_parallel_size=1: "
+                    "the row selection it hands the model indexes the packed batch, which neither layout has"
+                )
+            if not _supports_logits_to_keep(actor_module):
+                raise ValueError(
+                    "response_only_logits needs a model whose forward accepts `logits_to_keep` "
+                    "with a tensor index (transformers >= 4.51 for Qwen3). Set it to False, or "
+                    "upgrade transformers. Failing here rather than silently falling back: the "
+                    "fallback is the slow path this flag exists to avoid."
+                )
+            print("Actor response_only_logits=True (lm_head on response rows only)")
+
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
             if self.config.get("use_torch_compile", True)  #  use torch compile by default
@@ -212,11 +289,11 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, return_lse=False) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, return_lse=False, need_log_prob=True) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
         """
         Returns:
             entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+            log_probs: # (bs, response_len), or None when need_log_prob=False
             topk_out: optional top-k output for distillation KL. None unless
                 topk_k or topk_ids is given. When ``topk_k`` is set (teacher mode):
                 a tuple (topk_logprob, topk_ids) each (bs, response_len, k), where
@@ -266,7 +343,15 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                # cu_seqlens and max_seqlen are kept, not discarded: handing them
+                # to the attention entry saves a device-to-host sync per layer per
+                # forward (see _varlen_kwargs). Older flash_attn returns fewer
+                # values, so the unpack is by length rather than by position.
+                unpadded = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad, indices = unpadded[0], unpadded[1]  # input_ids_rmpad (total_nnz, ...)
+                cu_seqlens, max_seqlen_in_batch = (
+                    (unpadded[2], unpadded[3]) if len(unpadded) >= 4 else (None, None)
+                )
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -308,6 +393,26 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                # Response-only vocab projection. `sel` indexes the packed rows
+                # that survive the final slice; handing it to the model as
+                # logits_to_keep makes lm_head run on those hidden states only.
+                # The transformer body is untouched -- it must still see every
+                # token, and the hidden states the teacher cache hooks are the
+                # body's, so they are unaffected too.
+                #
+                # This is the projection itself, not the vocab-sized work after
+                # it: the block further down already restricted logsumexp/topk/
+                # gather, but only after lm_head had run on every row. On this
+                # mixture the response is about a quarter of the tokens, so the
+                # other three quarters of the widest GEMM in the step were being
+                # computed and dropped.
+                resp_only = self.response_only_logits and not multi_modal_inputs
+                if resp_only:
+                    sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
+                    extra_args["logits_to_keep"] = sel
+
+                extra_args.update(self._varlen_kwargs(cu_seqlens, max_seqlen_in_batch))
+
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -316,6 +421,61 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                if resp_only:
+                    # (n_resp, vocab): already restricted, so nothing below needs
+                    # to re-select. Values are identical to indexing the full
+                    # logits -- lm_head is a per-position linear map, so selecting
+                    # the rows before or after it is the same arithmetic.
+                    logits_resp = output.logits.squeeze(0)
+                    logits_resp.div_(temperature)
+
+                    log_probs = None
+                    if need_log_prob:
+                        log_probs_resp = logprobs_from_logits(
+                            logits=logits_resp,
+                            labels=input_ids_rmpad_rolled[sel],
+                            inplace_backward=False,  # topk/entropy below read logits_resp
+                        )
+                        full_log_probs = pad_input(
+                            hidden_states=log_probs_resp.unsqueeze(-1),
+                            indices=sel_indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                        log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+
+                    if calculate_entropy:
+                        entropy_resp = self.compute_entropy_from_logits(logits_resp)
+                        full_entropy = pad_input(
+                            hidden_states=entropy_resp.unsqueeze(-1),
+                            indices=sel_indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                        entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+
+                    topk_out = None
+                    if topk_k is not None or topk_ids is not None or return_lse:
+                        # One reduction over (n_resp, vocab), shared with the
+                        # helper. This is the widest tensor in the step, so
+                        # computing the normaliser here and again inside would be
+                        # a second full pass over it for nothing.
+                        lse_resp = torch.logsumexp(logits_resp, dim=-1, keepdim=True)
+                        topk_out = self._topk_from_response_logits(
+                            logits_resp=logits_resp,
+                            sel=sel,
+                            sel_indices=sel_indices,
+                            sel_slot=sel_slot,
+                            batch_size=batch_size,
+                            seqlen=seqlen,
+                            response_length=response_length,
+                            topk_k=topk_k,
+                            topk_ids=topk_ids,
+                            return_lse=return_lse,
+                            lse=lse_resp,
+                        )
+                    return entropy, log_probs, topk_out
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -387,62 +547,28 @@ class DataParallelPPOActor(BasePPOActor):
                     # slice drops. On the student side that waste sat inside the
                     # autograd graph, so the backward paid for it a second time.
                     #
+                    # This is NOT response_only_logits: the projection above still ran
+                    # on every row. That path skips it entirely and reaches this same
+                    # helper with logits that are already restricted.
+                    #
                     # Values are unchanged. A row outside the window can only land
                     # outside the slice, and a window position missing from rmpad
                     # (attention_mask==0, i.e. response padding) is zero-filled by
                     # pad_input whether or not any row was scattered elsewhere.
-                    #
-                    # Cost: one (n_resp, vocab) copy of the selected logits. It is a
-                    # quarter of logits_rmpad, which is live either way.
                     sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_length)
                     logits_resp = logits_rmpad[sel]  # (n_resp, vocab)
-                    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
-                    if topk_k is not None:
-                        tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)  # (n_resp, k)
-                        # Use float32 for pad_input: bf16 cannot represent vocab ids
-                        # (>256) exactly, and float32 keeps log-probs precise.
-                        t_lp_rmpad = (tvals - lse).float()
-                        full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        topk_out = (
-                            full_t_lp[:, -response_length - 1 : -1, :],
-                            full_t_id[:, -response_length - 1 : -1, :].round().long(),
-                        )
-                    elif topk_ids is not None:
-                        # Read topk_ids (bs, response_len, k) directly at each selected
-                        # row's (sample, response-slot). The old path scattered it into a
-                        # (bs, seqlen, k) zero tensor and gathered that back through
-                        # `indices`, which is the same map computed the long way round.
-                        ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
-                        s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
-                        full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-                        topk_out = full_s_lp[:, -response_length - 1 : -1, :]
-                    if return_lse:
-                        # The caller wants to evaluate this model at ids nobody has
-                        # chosen yet, which needs the normaliser and the packed row
-                        # map -- the projection itself it can redo for 2*H*k. Handed
-                        # back PACKED, not scattered, because it is paired with the
-                        # body's hidden states, which the forward hook also sees
-                        # packed; `sel` indexes those and `sel_indices` scatters
-                        # either of them back.
-                        #
-                        # With topk_k None the model's OWN top-k is not built at
-                        # all, which is a full-vocabulary selection and two
-                        # scatters saved on every micro-batch that is not the
-                        # witness sample.
-                        tlp, tids_out = topk_out if topk_k is not None else (None, None)
-                        topk_out = (
-                            tlp,
-                            tids_out,
-                            {
-                                "lse": lse.float(),
-                                "sel": sel,
-                                "sel_indices": sel_indices,
-                                "batch_size": batch_size,
-                                "seqlen": seqlen,
-                                "response_length": response_length,
-                            },
-                        )
+                    topk_out = self._topk_from_response_logits(
+                        logits_resp=logits_resp,
+                        sel=sel,
+                        sel_indices=sel_indices,
+                        sel_slot=sel_slot,
+                        batch_size=batch_size,
+                        seqlen=seqlen,
+                        response_length=response_length,
+                        topk_k=topk_k,
+                        topk_ids=topk_ids,
+                        return_lse=return_lse,
+                    )
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -593,6 +719,110 @@ class DataParallelPPOActor(BasePPOActor):
             yield
         finally:
             handle.remove()
+
+    def _topk_from_response_logits(
+        self, *, logits_resp, sel, sel_indices, sel_slot, batch_size, seqlen,
+        response_length, topk_k, topk_ids, return_lse, lse=None,
+    ):
+        """The distillation top-k, from logits already restricted to response rows.
+
+        One implementation for both ways of getting those rows: projecting every
+        row and selecting afterwards, or handing the selection to the model as
+        ``logits_to_keep`` so the projection never runs on the rest. The
+        arithmetic below cannot tell the two apart -- lm_head is a per-position
+        linear map -- which is the whole reason the second is allowed.
+
+        ``lse`` lets the caller pass a normaliser it already computed for its own
+        use, so the widest reduction in the step is not done twice.
+        """
+        if lse is None:
+            lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)  # (n_resp, 1)
+        topk_out = None
+        if topk_k is not None:
+            # sorted=False: the KL sums over the support, so the order within the
+            # k is never read.
+            tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1, sorted=False)  # (n_resp, k)
+            # Use float32 for pad_input: bf16 cannot represent vocab ids
+            # (>256) exactly, and float32 keeps log-probs precise.
+            t_lp_rmpad = (tvals - lse).float()
+            full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            topk_out = (
+                full_t_lp[:, -response_length - 1 : -1, :],
+                full_t_id[:, -response_length - 1 : -1, :].round().long(),
+            )
+        elif topk_ids is not None:
+            # Read topk_ids (bs, response_len, k) directly at each selected row's
+            # (sample, response-slot). The old path scattered it into a
+            # (bs, seqlen, k) zero tensor and gathered that back through
+            # `indices`, which is the same map computed the long way round.
+            ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
+            s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
+            full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            topk_out = full_s_lp[:, -response_length - 1 : -1, :]
+        if return_lse:
+            # The caller wants to evaluate this model at ids nobody has chosen
+            # yet, which needs the normaliser and the packed row map -- the
+            # projection itself it can redo for 2*H*k. Handed back PACKED, not
+            # scattered, because it is paired with the body's hidden states,
+            # which the forward hook also sees packed; `sel` indexes those and
+            # `sel_indices` scatters either of them back.
+            #
+            # With topk_k None the model's OWN top-k is not built at all, which
+            # is a full-vocabulary selection and two scatters saved on every
+            # micro-batch that is not the witness sample.
+            tlp, tids_out = topk_out if topk_k is not None else (None, None)
+            topk_out = (
+                tlp,
+                tids_out,
+                {
+                    "lse": lse.float(),
+                    "sel": sel,
+                    "sel_indices": sel_indices,
+                    "batch_size": batch_size,
+                    "seqlen": seqlen,
+                    "response_length": response_length,
+                },
+            )
+        return topk_out
+
+    def _varlen_kwargs(self, cu_seqlens, max_seqlen_in_batch) -> dict:
+        """The packed-sequence boundaries, handed over instead of re-derived.
+
+        With ``use_remove_padding`` the model is given ``position_ids`` and HF's
+        flash-attention path works the boundaries out itself: whether the
+        sequences are packed at all, and how long the longest is. Both decisions
+        are made on the device and read on the host -- flash-attn needs Python
+        ints -- so each is a device-to-host sync, ONCE PER LAYER PER FORWARD.
+        Twenty-eight layers, doubled because gradient checkpointing recomputes
+        the forward inside the backward.
+
+        ``unpad_input`` has already computed both, once, for the whole
+        micro-batch. Passing them makes _flash_attention_forward skip the
+        position_ids path entirely, and the values are the same ones it would
+        have derived -- both come from the same attention_mask.
+
+        Off in two cases:
+
+        * Ulysses SP > 1. The sequence is split across ranks after this point,
+          so boundaries computed on the unsplit batch describe a different
+          tensor than the attention sees. verl's monkey_patch all-gathers
+          position_ids for exactly that reason; handing it stale cu_seqlens
+          would be wrong rather than merely slower.
+        * A transformers whose entry point does not name the kwargs. It would
+          take them into **kwargs and pass them to flash-attn, which does not
+          know them either -- so the check is by signature, not by version.
+        """
+        if cu_seqlens is None or not _VARLEN_KWARGS or self.use_ulysses_sp:
+            return {}
+        if not _flash_attention_takes_varlen_kwargs():
+            return {}
+        return {
+            "cu_seq_lens_q": cu_seqlens,
+            "cu_seq_lens_k": cu_seqlens,
+            "max_length_q": max_seqlen_in_batch,
+            "max_length_k": max_seqlen_in_batch,
+        }
 
     def _teacher_logprobs_at(self, cache_ids, ids, input_ids=None, attention_mask=None):
         """Teacher log-probs at ids the student just chose.
@@ -888,8 +1118,60 @@ class DataParallelPPOActor(BasePPOActor):
         # micro-batches that append_to_dict + reduce_metrics would have.
         deferred_metrics = {}
 
-        def _defer(name, value):
-            deferred_metrics.setdefault(name, []).append(value.detach())
+        def _defer(name, value, weight=None):
+            deferred_metrics.setdefault(name, []).append(
+                (value.detach(), None if weight is None else weight.detach())
+            )
+
+        def _defer_task(name, loss_mat, mask):
+            """A task's token-mean for this micro-batch, deferred with its presence.
+
+            Written out rather than calling agg_loss so an absent task yields 0
+            instead of 0/0: the read at the end divides the sum of the values by
+            the number of micro-batches the task appeared in, which is the same
+            average the per-task metric has always reported -- it just no longer
+            needs the device to tell the host which micro-batches those were.
+
+            The formula is token-mean, which is why sync_free_task_metrics below
+            also requires loss_agg_mode to be token-mean. Under seq-mean-* this
+            would be a different quantity reported under the same name, and
+            nothing would say so.
+            """
+            den = mask.sum()
+            value = (loss_mat * mask).sum() / den.clamp(min=1)
+            _defer(name, value, weight=(den > 0).to(value.dtype))
+
+        # Pooled across every micro-batch of this call and rendered once at the
+        # end. Ratios cannot be emitted per micro-batch: the reducer would average
+        # them, and a micro-batch with fewer valid tokens would weigh as much as a
+        # full one.
+        # Whether the per-task metric loop can run over ALL tasks, including the
+        # ones with no rows in this micro-batch, and so skip the device read that
+        # would say which those are -- torch.unique(...).tolist(), one host sync
+        # per micro-batch. It can exactly when every metric the loop computes is
+        # deferred: the branches below that call .item() inside the loop would
+        # turn an absent task into a NaN, and would be paying a sync each anyway.
+        # That is the pure-OPD shape, which the off-policy entry point forces and
+        # the intent locks pin -- teacher-KL only, no policy gradient, entropy,
+        # reference KL or SD terms.
+        #
+        # The hard-label CE is the exception and is deliberately NOT in this
+        # condition: it is on in this branch's shipped arm, so excluding it would
+        # retire the mechanism from the only run that uses it. Its per-task metric
+        # is made weight-aware below instead, which is available to it because it
+        # is the same token-mean shape as the teacher-KL.
+        #
+        # loss_agg_mode is in the condition because _defer_task hard-codes the
+        # token-mean formula; the aggregation is not a term that can be switched
+        # off, so it has to be checked rather than assumed.
+        sync_free_task_metrics = (
+            pg_loss_coef == 0
+            and self.config.entropy_coeff == 0
+            and not self.config.use_kl_loss
+            and not self.config.get("use_sdl_loss", False)
+            and not self.config.get("use_sdar_loss", False)
+            and self.config.loss_agg_mode == "token-mean"
+        )
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -985,8 +1267,30 @@ class DataParallelPPOActor(BasePPOActor):
                             fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
                         else:
                             fwd_topk_ids = data["teacher_topk_ids"]
+                    # The sampled-token log-prob is dead weight in pure top-k
+                    # distillation: the KL is built from the top-k gather, and
+                    # every other consumer here is switched off. Computing it
+                    # means a log-softmax and a gather over the full vocabulary
+                    # for every response row, whose only surviving use below is
+                    # reading .device and .dtype off the result.
+                    #
+                    # use_sft_loss is in the condition and is NOT in the branch
+                    # this came from, which has no hard-label term: the CE is
+                    # -log_prob, so it is the one consumer that would still be
+                    # reading the value. That also means this does not fire in
+                    # this branch's default arm, which runs the CE -- it fires in
+                    # the pure-KD arm, the one with no algorithm.opd.sft_loss_coef.
+                    need_log_prob = not (
+                        pg_loss_coef == 0
+                        and teacher_topk_kl
+                        and use_teacher_kl_loss
+                        and not self.config.use_kl_loss
+                        and not self.config.get("use_sft_loss", False)
+                        and not self.config.get("use_sdl_loss", False)
+                        and not self.config.get("use_sdar_loss", False)
+                    )
                     with _actor_phase("actor.fwd"):
-                        entropy, log_prob, student_topk_out = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids, topk_k=fwd_topk_k)
+                        entropy, log_prob, student_topk_out = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids, topk_k=fwd_topk_k, need_log_prob=need_log_prob)
                     if student_indexed_topk:
                         # One logits tensor produced both: the values (which carry
                         # the gradient -- topk's backward is the same scatter a
@@ -1028,8 +1332,11 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     else:
                         # Pure teacher-KL distillation: no policy-gradient signal.
+                        # Take device/dtype from whichever tensor the forward
+                        # actually produced -- log_prob is None when it was skipped.
                         old_log_prob = data.get("old_log_probs", None)
-                        zero = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+                        probe = log_prob if log_prob is not None else student_topk_logprobs
+                        zero = torch.zeros((), device=probe.device, dtype=probe.dtype)
                         pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
 
                     if entropy_coeff != 0:
@@ -1178,7 +1485,9 @@ class DataParallelPPOActor(BasePPOActor):
                         # separately anyway: this phase is where the backward's
                         # queued reduce-scatter tail drains.
                         with _actor_phase("actor.task_metrics"), torch.no_grad():
-                            for task, rows in iter_task_row_masks(task_ids, task_id_names):
+                            for task, rows in iter_task_row_masks(
+                                task_ids, task_id_names, include_absent=sync_free_task_metrics
+                            ):
                                 task_response_mask = response_mask[rows]
                                 task_metrics = {}
 
@@ -1240,16 +1549,38 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
                                 if use_teacher_kl_loss:
-                                    _defer(
-                                        f"actor/teacher_kl_loss/{task}",
-                                        agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
-                                    )
+                                    if sync_free_task_metrics:
+                                        # rows may select nothing here; _defer_task
+                                        # carries the presence so an absent task
+                                        # contributes 0 rather than NaN.
+                                        _defer_task(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            teacher_kld[rows],
+                                            task_response_mask,
+                                        )
+                                    else:
+                                        _defer(
+                                            f"actor/teacher_kl_loss/{task}",
+                                            agg_loss(loss_mat=teacher_kld[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        )
 
                                 if self.config.get("use_sft_loss", False):
-                                    _defer(
-                                        f"actor/sft_loss/{task}",
-                                        agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
-                                    )
+                                    if sync_free_task_metrics:
+                                        # Same reason as the teacher-KL above, and
+                                        # it matters more here: this branch's
+                                        # shipped arm runs the CE term, so a plain
+                                        # _defer would make the NaN the normal
+                                        # case rather than an edge one.
+                                        _defer_task(
+                                            f"actor/sft_loss/{task}",
+                                            -log_prob[rows],
+                                            task_response_mask,
+                                        )
+                                    else:
+                                        _defer(
+                                            f"actor/sft_loss/{task}",
+                                            agg_loss(loss_mat=-log_prob[rows], loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                        )
 
                                 append_to_dict(metrics, task_metrics)
 
@@ -1282,9 +1613,17 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         # The one read for everything deferred above. torch.stack forces a single
-        # host sync here instead of one per micro-batch.
-        for name, values in deferred_metrics.items():
-            metrics[name] = torch.stack(values).mean().item()
+        # host sync here instead of one per micro-batch. Entries carrying a
+        # presence weight are summed and divided by how many micro-batches
+        # actually held the task, which is the mean the unweighted path took over
+        # exactly those.
+        for name, entries in deferred_metrics.items():
+            values = torch.stack([value for value, _ in entries])
+            if entries[0][1] is None:
+                metrics[name] = values.mean().item()
+            else:
+                present = torch.stack([weight for _, weight in entries])
+                metrics[name] = (values.sum() / present.sum().clamp(min=1)).item()
         if _PROFILE_STAGES:
             # One table per update_policy call. The driver's boundary phase
             # ("step") never pops in this process, so the report is asked for

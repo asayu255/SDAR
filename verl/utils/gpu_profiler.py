@@ -753,6 +753,11 @@ _PHASE_ORDER = [
     # Worker-side stages inside update_actor (dp_actor._actor_phase). Listed in
     # execution order so the interior of a step reads top to bottom.
     "actor.fwd",
+    # Resolving the teacher at the ids the student's forward just chose, out of
+    # the hidden states it cached (student_indexed_topk). Between fwd and bwd
+    # because that is where it runs: the ids do not exist before the forward, and
+    # the KL it feeds is built before the backward.
+    "actor.teacher_lookup",
     "actor.bwd",
     "actor.task_metrics",
     "actor.optim",

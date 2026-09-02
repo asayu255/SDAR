@@ -39,6 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.host_gc import collect_at_step_boundary, freeze_permanent_heap, refreeze_if_due
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -670,8 +671,40 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
+        # Everything alive at this point -- the module tree, the sharded
+        # parameters and optimizer state, the tokenizer, Ray's plumbing -- lives
+        # for the whole run, and gen-2 collections walk all of it without ever
+        # being able to free any of it. Freezing it here takes those objects out
+        # of the sweep's reach. See verl/utils/host_gc.py for why a host-side
+        # sweep shows up as a GPU dip.
+        report = freeze_permanent_heap()
+        if report["enabled"]:
+            print(
+                f"[host-gc] rank {self.rank}: froze {report['frozen']} objects "
+                f"({report['collected']} collected, manual={report['manual']}) "
+                f"in {report['seconds']:.2f} s",
+                flush=True,
+            )
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        # Step boundary: the device is idle here by construction, so host-side
+        # GC work is free. Freeze once more to capture what the warm-up step
+        # created and keeps -- Dynamo caches, Adam's lazily allocated state,
+        # FSDP's deferred structures, none of it visible to the init-time freeze
+        # -- then the per-step sweep, which after the freezes costs milliseconds
+        # and drains the survivor count that would otherwise trip a full
+        # collection mid-forward, where it lands on the device.
+        refrozen = refreeze_if_due()
+        if refrozen is not None:
+            print(
+                f"[host-gc] rank {self.rank}: re-froze +{refrozen['frozen_delta']} warm-up objects "
+                f"(total {refrozen['frozen_total']}, {refrozen['collected']} collected) "
+                f"in {refrozen['seconds']:.2f} s",
+                flush=True,
+            )
+        collect_at_step_boundary()
+
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 

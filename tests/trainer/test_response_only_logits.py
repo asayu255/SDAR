@@ -1,0 +1,340 @@
+"""``response_only_logits``: restricting lm_head to the response rows.
+
+The prompt rows' logits were computed at ``(rows, vocab)`` and dropped -- every
+consumer of the actor/teacher forward (sampled-token log-prob, entropy, top-k KL)
+is sliced to ``[:, -response_length-1:-1]`` before it leaves. This path hands the
+row selection to the model as ``logits_to_keep`` so the projection never runs on
+them.
+
+lm_head is a per-position linear map, so selecting rows before or after it is the
+same arithmetic. These tests pin that: a stand-in model whose body is arbitrary
+but position-wise-consistent is run both ways, and the three outputs must match.
+
+The stand-in exists because the claim is about *composition* (selection commutes
+with the projection, and the downstream padding/slicing is unchanged), not about
+Qwen3. Whether the installed transformers actually accepts a tensor
+``logits_to_keep`` is a separate, environment-dependent question, checked at
+construction by ``_supports_logits_to_keep`` and covered below.
+
+CPU-only.
+"""
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+try:
+    from verl.workers.actor.dp_actor import _supports_logits_to_keep, response_row_selection
+except Exception as e:  # pragma: no cover - environment without full deps
+    pytest.skip(f"verl import unavailable: {e}", allow_module_level=True)
+
+
+VOCAB = 37
+
+
+def _ragged_mask(batch_size, prompt_len, response_len, rng):
+    """Left-padded prompt + right-padded response, the layout the rollout writes."""
+    seqlen = prompt_len + response_len
+    mask = torch.zeros((batch_size, seqlen), dtype=torch.long)
+    for b in range(batch_size):
+        n_prompt = int(torch.randint(1, prompt_len + 1, (1,), generator=rng))
+        n_resp = int(torch.randint(1, response_len + 1, (1,), generator=rng))
+        mask[b, prompt_len - n_prompt : prompt_len + n_resp] = 1
+    return mask
+
+
+def _pad_input(values, indices, batch, seqlen):
+    """``pad_input``: scatter packed rows back into a zero-filled (batch*seqlen) grid."""
+    out = torch.zeros((batch * seqlen,) + values.shape[1:], dtype=values.dtype)
+    out[indices] = values
+    return out.view((batch, seqlen) + values.shape[1:])
+
+
+class _Model:
+    """Position-wise body + linear head, with the ``logits_to_keep`` contract.
+
+    ``logits_to_keep`` as a tensor indexes dim 1 of the hidden states *before* the
+    head runs -- the same thing HF's causal-LM forwards do. The body is nonlinear
+    across the vocab dimension but computed per position, which is what makes
+    row selection and projection commute.
+    """
+
+    def __init__(self, hidden=8, vocab=VOCAB, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        self.emb = torch.randn((64, hidden), generator=g)
+        self.head = torch.randn((hidden, vocab), generator=g)
+        self.calls = []
+
+    def __call__(self, input_ids, logits_to_keep=None, **kw):
+        h = self.emb[input_ids % self.emb.shape[0]]  # (1, n, hidden)
+        h = torch.tanh(h)
+        if logits_to_keep is not None:
+            h = h[:, logits_to_keep, :]
+        self.calls.append(h.shape[1])
+        return type("Out", (), {"logits": h @ self.head})()
+
+
+def _reference(model, input_ids_rmpad, indices, batch_size, seqlen, response_length, labels, topk_k):
+    """Full-logits path: project everything, then slice."""
+    logits = model(input_ids_rmpad).logits.squeeze(0)  # (total_nnz, vocab)
+    lp = torch.log_softmax(logits.float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    log_probs = _pad_input(lp.unsqueeze(-1), indices, batch_size, seqlen).squeeze(-1)
+    log_probs = log_probs[:, -response_length - 1 : -1]
+
+    sel, sel_indices, _ = response_row_selection(indices, seqlen, response_length)
+    lse = torch.logsumexp(logits[sel], dim=-1, keepdim=True)
+    tvals, tids = torch.topk(logits[sel], k=topk_k, dim=-1)
+    t_lp = _pad_input((tvals - lse).float(), sel_indices, batch_size, seqlen)
+    t_id = _pad_input(tids.float(), sel_indices, batch_size, seqlen)
+    return log_probs, t_lp[:, -response_length - 1 : -1, :], t_id[:, -response_length - 1 : -1, :].round().long()
+
+
+def _response_only(model, input_ids_rmpad, indices, batch_size, seqlen, response_length, labels, topk_k):
+    """response_only_logits path: select rows, then project."""
+    sel, sel_indices, _ = response_row_selection(indices, seqlen, response_length)
+    logits_resp = model(input_ids_rmpad, logits_to_keep=sel).logits.squeeze(0)  # (n_resp, vocab)
+
+    lp = torch.log_softmax(logits_resp.float(), dim=-1).gather(-1, labels[sel].unsqueeze(-1)).squeeze(-1)
+    log_probs = _pad_input(lp.unsqueeze(-1), sel_indices, batch_size, seqlen).squeeze(-1)
+    log_probs = log_probs[:, -response_length - 1 : -1]
+
+    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)
+    tvals, tids = torch.topk(logits_resp, k=topk_k, dim=-1)
+    t_lp = _pad_input((tvals - lse).float(), sel_indices, batch_size, seqlen)
+    t_id = _pad_input(tids.float(), sel_indices, batch_size, seqlen)
+    return log_probs, t_lp[:, -response_length - 1 : -1, :], t_id[:, -response_length - 1 : -1, :].round().long()
+
+
+@pytest.mark.parametrize("trial", range(12))
+def test_matches_the_full_logits_path(trial):
+    """Same log-probs, same top-k values, same top-k ids -- over randomised ragged
+    prompt/response splits, which is where an off-by-one in the row map would show."""
+    rng = torch.Generator().manual_seed(trial)
+    batch_size, prompt_len, response_len = 4, 11, 5
+    seqlen = prompt_len + response_len
+
+    mask = _ragged_mask(batch_size, prompt_len, response_len, rng)
+    indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+    input_ids_rmpad = torch.randint(0, VOCAB, (1, indices.numel()), generator=rng)
+    labels = torch.randint(0, VOCAB, (indices.numel(),), generator=rng)
+    model = _Model(seed=trial)
+
+    ref = _reference(model, input_ids_rmpad, indices, batch_size, seqlen, response_len, labels, topk_k=3)
+    got = _response_only(model, input_ids_rmpad, indices, batch_size, seqlen, response_len, labels, topk_k=3)
+
+    torch.testing.assert_close(got[0], ref[0])
+    torch.testing.assert_close(got[1], ref[1])
+    assert torch.equal(got[2], ref[2])
+
+
+def test_the_head_actually_runs_on_fewer_rows():
+    """The point of the change. On this mixture prompts dominate, so the selected
+    row count must be well under the packed total -- otherwise the flag is a no-op
+    wearing a cost."""
+    rng = torch.Generator().manual_seed(0)
+    batch_size, prompt_len, response_len = 4, 24, 6
+    seqlen = prompt_len + response_len
+    mask = _ragged_mask(batch_size, prompt_len, response_len, rng)
+    indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+    input_ids_rmpad = torch.randint(0, VOCAB, (1, indices.numel()), generator=rng)
+    model = _Model()
+
+    model(input_ids_rmpad)
+    sel, _, _ = response_row_selection(indices, seqlen, response_len)
+    model(input_ids_rmpad, logits_to_keep=sel)
+
+    full_rows, resp_rows = model.calls
+    assert resp_rows < full_rows
+    assert resp_rows == sel.numel()
+
+
+def test_gradient_reaches_only_the_selected_rows():
+    """The backward saving is the other half of the effect: with the projection
+    behind the selection, prompt positions carry no head gradient at all."""
+    rng = torch.Generator().manual_seed(3)
+    batch_size, prompt_len, response_len = 3, 9, 4
+    seqlen = prompt_len + response_len
+    mask = _ragged_mask(batch_size, prompt_len, response_len, rng)
+    indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+
+    hidden = torch.randn((1, indices.numel(), 6), requires_grad=True)
+    head = torch.randn((6, VOCAB))
+    sel, _, _ = response_row_selection(indices, seqlen, response_len)
+
+    (hidden[:, sel, :] @ head).sum().backward()
+
+    touched = (hidden.grad.squeeze(0).abs().sum(-1) > 0).nonzero(as_tuple=True)[0]
+    assert torch.equal(touched, sel)
+
+
+def test_capability_probe_unwraps_and_reports():
+    class _Plain:
+        def forward(self, input_ids, logits_to_keep=None):
+            return None
+
+    class _NoSupport:
+        def forward(self, input_ids):
+            return None
+
+    class _Wrapper:
+        def __init__(self, inner):
+            self._fsdp_wrapped_module = inner
+
+        def forward(self, *a, **kw):  # the wrapper's own signature must not decide
+            return None
+
+    assert _supports_logits_to_keep(_Plain())
+    assert not _supports_logits_to_keep(_NoSupport())
+    assert _supports_logits_to_keep(_Wrapper(_Plain()))
+    assert not _supports_logits_to_keep(_Wrapper(_NoSupport()))
+
+
+def test_capability_probe_terminates_on_a_self_referential_wrapper():
+    """A broken wrapper chain must not hang worker startup."""
+
+    class _Loop:
+        def forward(self, input_ids):
+            return None
+
+    a = _Loop()
+    b = _Loop()
+    a.module = b
+    b.module = a
+    assert _supports_logits_to_keep(a) is False
+
+
+# --------------------------------------------------------------------------- #
+# the normaliser is computed once
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def _pad_input_available(monkeypatch):
+    """dp_actor imports pad_input from flash_attn, which this environment lacks.
+    The scatter itself is what the code under test uses, and it is four lines."""
+    from verl.workers.actor import dp_actor
+
+    monkeypatch.setattr(dp_actor, "pad_input", _pad_input, raising=False)
+
+
+def _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_length, topk_k, lse):
+    """Call the helper the way this branch spells it.
+
+    Keyword-only, and it also takes ``sel`` and ``return_lse``: the return_lse
+    packing lives in the helper here rather than being repeated in each of the two
+    forward branches, so the packed row map has to reach it. Neither is read on
+    this path (``return_lse=False``), but the signature is the signature.
+    """
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    return DataParallelPPOActor._topk_from_response_logits(
+        None,
+        logits_resp=logits_resp,
+        sel=torch.arange(logits_resp.shape[0]),
+        sel_indices=sel_indices,
+        sel_slot=sel_slot,
+        batch_size=batch_size,
+        seqlen=seqlen,
+        response_length=response_length,
+        topk_k=topk_k,
+        topk_ids=None,
+        return_lse=False,
+        lse=lse,
+    )
+
+
+@pytest.mark.parametrize("trial", range(5))
+def test_a_supplied_normaliser_is_the_one_it_would_have_computed(trial, _pad_input_available):
+    """The caller needs the same logsumexp for its own reasons, and it is a full
+    reduction over the widest tensor in the step -- so it is passed in rather than
+    recomputed. Passing it must not change the answer."""
+    rng = torch.Generator().manual_seed(trial)
+    batch_size, prompt_len, response_len = 3, 7, 4
+    seqlen = prompt_len + response_len
+    mask = _ragged_mask(batch_size, prompt_len, response_len, rng)
+    indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+    sel, sel_indices, sel_slot = response_row_selection(indices, seqlen, response_len)
+    logits_resp = torch.randn((sel.numel(), VOCAB), generator=rng)
+
+    lse = torch.logsumexp(logits_resp, dim=-1, keepdim=True)
+    a = _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_len, 3, None)
+    b = _actor_topk(logits_resp, sel_indices, sel_slot, batch_size, seqlen, response_len, 3, lse)
+
+    torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+    assert torch.equal(a[1], b[1])
+
+
+def test_the_kl_does_not_read_the_order_within_the_top_k():
+    """Why sorted=False is safe: the KL sums over the support, so permuting the k
+    (independently per position) is the same number."""
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+
+    rng = torch.Generator().manual_seed(3)
+    s = torch.log_softmax(torch.randn((2, 4, 6), generator=rng), dim=-1) - 1.0
+    t = torch.log_softmax(torch.randn((2, 4, 6), generator=rng), dim=-1) - 1.0
+    perm = torch.argsort(torch.rand((2, 4, 6), generator=rng), dim=-1)
+
+    torch.testing.assert_close(
+        topk_kl_per_token(s, t), topk_kl_per_token(s.gather(-1, perm), t.gather(-1, perm)), rtol=0, atol=1e-6
+    )
+
+
+# --------------------------------------------------------------------------- #
+# need_log_prob, adapted: this branch has a hard-label CE term and the branch
+# this came from does not.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_ce_term_keeps_the_sampled_token_log_prob():
+    """The CE is ``-log_prob``, so it is the one consumer that still reads it.
+
+    Skipping the sampled-token log-prob is only sound when nothing reads it. The
+    source branch's condition lists policy gradient, reference KL and the two SD
+    terms; it has no hard-label term to list. This branch's default arm runs one,
+    so leaving it out would hand the CE a None.
+    """
+    import inspect
+
+    from verl.workers.actor import dp_actor
+
+    src = inspect.getsource(dp_actor)
+    cond = src[src.index("need_log_prob = not (") :]
+    # to the end of the statement, not to the first ')': the condition contains
+    # .get("...", False) calls whose parens close earlier.
+    cond = cond[: cond.index("with _actor_phase")]
+    for flag in ("pg_loss_coef == 0", "teacher_topk_kl", "use_teacher_kl_loss",
+                 "use_kl_loss", "use_sft_loss", "use_sdl_loss", "use_sdar_loss"):
+        assert flag in cond, f"{flag} is not in the condition that decides to skip log_prob"
+
+
+def test_every_reader_of_log_prob_is_behind_a_flag_the_condition_names():
+    """The condition is only as good as its coverage of the readers.
+
+    A term added later that reads log_prob without being named there would get a
+    None at the first micro-batch of a pure-KD run -- and pure KD is the arm the
+    skip exists for, so it would not show up in the default arm's tests.
+    """
+    import inspect
+    import re
+
+    from verl.workers.actor import dp_actor
+
+    src = inspect.getsource(dp_actor.DataParallelPPOActor)
+    body = src[src.index("need_log_prob = not ("):]
+    guards = ("pg_loss_coef != 0", "use_kl_loss", "use_sft_loss", "use_sdl_loss",
+              "use_sdar_loss", "teacher_topk_kl", "need_log_prob", "probe")
+    for line in body.splitlines():
+        # Reads of the bare name, not old_log_prob / teacher_log_probs / the
+        # locals the restricted branch builds.
+        if not re.search(r"(?<![\w.])log_prob(?![\w])", line):
+            continue
+        if any(g in line for g in guards):
+            continue
+        # Anything left has to be inside a block one of those guards opened; the
+        # cheap structural proxy is that the line is indented deeper than a guard
+        # seen above it. Assert the readers are the known set instead.
+        assert any(
+            tok in line
+            for tok in ("log_prob=log_prob", "logprob=log_prob", "-log_prob",
+                        "student_log_probs=log_prob", "ref_logprob", "#")
+        ), f"unrecognised log_prob reader, check it against the condition: {line.strip()}"

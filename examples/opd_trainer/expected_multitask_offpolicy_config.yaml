@@ -66,6 +66,15 @@
 # not pass would fail on a missing key rather than on a wrong value.
 "actor_rollout_ref.actor.student_indexed_topk": false
 
+# ---- response-only lm_head ---------------------------------------------------------
+# Pinned OFF here, and it is a speed knob rather than a scientific one -- but it is
+# NOT bit-identical (a narrower GEMM reduces in a different order), and this arm
+# already has a completed 300-step run. Turning it on mid-stream would make later
+# steps not bit-comparable with earlier ones of the same experiment name, which is
+# the thing this file exists to prevent. The student-indexed arm is new and turns
+# it on.
+"actor_rollout_ref.actor.response_only_logits": false
+
 # ---- per-task normalisation of the loss above ------------------------------------
 # The plain token-mean weights a task by its share of response tokens, measured at
 # 69/27/4% for alfworld/webshop/search on these pools purely because of the
