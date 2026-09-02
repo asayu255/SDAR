@@ -48,16 +48,13 @@ def _mechanism_or_identity(differing):
     allowed = set(IDENTITY)
     allowed |= {k for k in differing if k.startswith(_MECHANISMS)}
     allowed |= {k for k in differing if "micro_batch_size" in k}
-    # The support choice is part of the mechanism, not a drift: design C7 puts
-    # the target arm on the ON-TASK TEACHER's top-k so p_tilde is a
-    # student-independent fixed point, while both comparators run
-    # student-indexed. This is a real second difference against the control and
-    # it is accepted on a measurement, not on faith: the teachertopk sign arm
-    # changed exactly this key against ITS student-indexed sibling and every one
-    # of the seven state fractions and mass fractions moved by less than 0.006
-    # (docs/multitask_signweight_teachertopk_150step_report.md), with the
-    # training-rollout episode metrics indistinguishable.
-    allowed |= {k for k in differing if k.endswith("student_indexed_topk")}
+    # There is NO exception for student_indexed_topk any more. The arm carried
+    # one while design C7 held (a teacher-indexed support, so p_tilde would not
+    # depend on the student); C7 was withdrawn on 2026-09-02 and the arm is back
+    # on the student's top-k, which both comparators already use. The difference
+    # is therefore the mechanism keys alone -- and this test failing because
+    # somebody re-flipped the support is the point of not re-adding the
+    # exception.
     return allowed
 
 
@@ -94,7 +91,17 @@ def test_the_lock_pins_every_knob_of_the_mechanism():
     for key in ("enable", "base_path", "exponent_scale"):
         assert f"algorithm.opd.cross_teacher_target.{key}" in lock, key
     assert lock["algorithm.opd.cross_teacher_target.enable"] is True
-    assert lock["algorithm.opd.cross_teacher_target.exponent_scale"] == 1.0
+    # The measured RMS-to-nats conversion, not the 1.0 the arm launched with.
+    assert lock["algorithm.opd.cross_teacher_target.exponent_scale"] == 2.148
+
+
+def test_the_support_matches_the_comparators():
+    """The mechanism reads every model at the STUDENT's top-k (C7 withdrawn), and
+    the arm is only comparable to the klw arm and the control if all three agree
+    on it -- the support decides what the coarse-grained KL is exact on, so a
+    mismatch compares two different objectives."""
+    for script in (TARGET, KLW, CONTROL):
+        assert _effective(script)["actor_rollout_ref.actor.student_indexed_topk"] is True, script
 
 
 def test_the_two_mechanisms_cannot_be_enabled_together():

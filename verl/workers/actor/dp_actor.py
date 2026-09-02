@@ -1893,15 +1893,20 @@ class DataParallelPPOActor(BasePPOActor):
                 "cross_teacher_target rewrites the teacher's top-k values; it needs "
                 "kl_loss_type=topk_kl and use_teacher_kl_loss=true"
             )
-            assert not student_indexed_topk, (
-                "cross_teacher_target's support is the ON-TASK TEACHER's top-k "
-                "(design C7: a student-indexed support makes the target a feedback "
-                "loop); set actor.student_indexed_topk=false"
+            assert student_indexed_topk, (
+                "cross_teacher_target's support is the STUDENT's top-k (support: "
+                "student_topk); set actor.student_indexed_topk=true. Design C7 asked "
+                "for the teacher's top-k so p_tilde would not depend on the student, "
+                "and was withdrawn: a teacher top-20 bottoms out at 1e-2..1e-4 and so "
+                "cannot contain the candidates where p_student is high and p_on is "
+                "negligible -- 68.9% of the predecessor arm's effect sat there"
             )
         xtt_enabled = xtt_cfg_on and "sign_cache_ids" in data.batch.keys()
         # The one knob, and it is a unit conversion rather than a strength dial:
-        # exp(c) needs c in nats and c is in RMS units. 1.0 reads one RMS unit as
-        # one nat -- the conservative end. The measured conversion is 2.148.
+        # exp(c) needs c in nats and c is in RMS units. The measured conversion is
+        # 2.148 and that is what the run scripts pin; the 1.0 default here is the
+        # identity reading, kept so a config that omits the key is inert-by-unit
+        # rather than silently scaled.
         xtt_scale = float((xtt_cfg or {}).get("exponent_scale", 1.0))
         # THE ARM-INDEPENDENT CUT. Everything above this line needs the base
         # policy and the off-task teachers, which only cross_teacher_enabled
@@ -2745,7 +2750,7 @@ class DataParallelPPOActor(BasePPOActor):
                         # the amount this one gets dearer; the pair is what moved,
                         # not either alone.
                         with _actor_phase("actor.teacher_lookup"):
-                            if sign_enabled or xt_enabled:
+                            if sign_enabled or xt_enabled or xtt_enabled:
                                 (fwd_teacher_topk_logprobs, xt_base_plane,
                                  xt_off_planes) = self._all_teacher_planes(data, student_topk_ids)
                                 cross_planes = (student_topk_ids, xt_base_plane, xt_off_planes)
@@ -2992,6 +2997,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     support_ids=sign_support_ids,
                                     response_mask=response_mask, task_ids=task_ids,
                                     d_on=_d_on, d_base=_d_base,
+                                    # dKL = log Z - <c>_{p_s} needs the student's
+                                    # mass at the same support. It is the number
+                                    # the revision is judged on, so it is measured
+                                    # here beside the KL it belongs to.
+                                    student_logprob=student_topk_logprobs,
                                     tag_token_ids=xtt_tag_ids,
                                 )
                                 if xtt_token_stats is not None or xtt_event_stats is not None:
@@ -2999,10 +3009,13 @@ class DataParallelPPOActor(BasePPOActor):
                                         xtt_built["branch"], xtt_built["consensus_sign"]
                                     )
                                     # dq = p_on (w - 1): the change to the target
-                                    # distribution. Exact, because Z = 1 is an
-                                    # identity here -- the redistribution term the
-                                    # class documents for the old target arm is
-                                    # structurally zero.
+                                    # distribution AT THIS CANDIDATE, which is
+                                    # exact. What it no longer is, since the
+                                    # revision replaced the exchange with a plain
+                                    # normalisation, is zero-sum over the support:
+                                    # Z != 1, and the tail moved by p_tail(1/Z - 1)
+                                    # as well. Read the column as a per-candidate
+                                    # change, not as a redistribution.
                                     _dq = (
                                         (xtt_built["w"] - 1.0) * xtt_built["p_on"].to(torch.float64)
                                     )
@@ -3029,9 +3042,12 @@ class DataParallelPPOActor(BasePPOActor):
                                         student_logprob=student_topk_logprobs,
                                         response_mask=response_mask,
                                         responses=data["responses"],
-                                        # Z is identically 1; the column exists so
-                                        # a row reads the same as the old arm's.
-                                        norm=torch.ones_like(_d_on),
+                                        # The real Z. It was identically 1 under
+                                        # the capacity exchange and this column
+                                        # was a constant; since the revision it
+                                        # is the head's tax and belongs in the
+                                        # dump beside the candidate it scaled.
+                                        norm=xtt_built["log_z"].exp().to(_d_on.dtype),
                                         teacher_kl=_d_on,
                                         task_ids=task_ids,
                                         roles=(
@@ -4367,17 +4383,28 @@ class DataParallelPPOActor(BasePPOActor):
                 # rank after the all_reduce above.
                 if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
                     _g = lambda k: _xtt_m.get(k, float("nan"))
+                    # The pre-registered tv (0.019) and branch split (0.871/0.129)
+                    # are NOT printed any more. Both were computed on the
+                    # mass-conserving exchange over a teacher-indexed support and
+                    # the revision replaced both, so quoting them here would read
+                    # as a violation every step for no reason. The three gates
+                    # below are ratios of the mechanism against itself and are
+                    # unaffected; abs_dkl is the number the revision is judged on.
                     print(
                         "[cross_teacher_target] gates (advisory): "
-                        f"tv={_g('target/tv'):.4f} (pre-reg 0.019) | "
+                        f"tv={_g('target/tv'):.4f} | "
+                        f"|dKL|={_g('target/abs_dkl_mean'):.4f} nats/pos "
+                        f"(live {_g('target/abs_dkl_live_mean'):.4f}; "
+                        "the predecessor weighting arm's top layer was 58.3) | "
+                        f"log_z={_g('target/log_z_mean'):+.4f} (head tax) | "
                         f"shuffled/live={_g('target/shuffled_tv_ratio'):.3f} "
                         "(concern >0.6; the old gate scored 0.82) | "
                         f"novelty={_g('target/acted_novelty'):.3f} (concern <0.1) | "
                         f"tag_share={_g('target/tag_share'):.3f} (concern >0.3) | "
                         f"max|log w|={_g('target/max_abs_log_w'):.3f} | "
+                        f"clamped={_g('target/clamped_frac_of_acted'):.3f} of acted | "
                         f"mass_err={_g('target/mass_error_max'):.2e} | "
-                        f"A/B={_g('target/channel/a_share'):.3f}/{_g('target/channel/b_share'):.3f} "
-                        "(pre-reg 0.871/0.129)",
+                        f"A/B={_g('target/channel/a_share'):.3f}/{_g('target/channel/b_share'):.3f}",
                         flush=True,
                     )
             # The sigma trajectory, under the series name both weighted arms

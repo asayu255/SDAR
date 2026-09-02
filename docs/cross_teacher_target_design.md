@@ -7,6 +7,57 @@
 
 ---
 
+## 0.0 改訂 (2026-09-02):3点の撤回
+
+**§2(`c` の構成)と §6・§7 は無効化されていない。§3・§3.1〜§3.3・§4 の全数値は無効である。**
+以下は初版の走行前に、初版の設計が生む介入量を実測した結果からの撤回である。撤回の理由を残すため、初版の記述は削除せず「(初版)」として残す。
+
+### 撤回1:質量保存の交換 → 単純正規化
+
+$$\tilde p(v) = \frac{p_{on}(v)\,e^{c(v)}}{Z}, \qquad Z = \sum_{v \in S} p_{on}(v)e^{c(v)} + p_{\text{tail}}$$
+
+§3 の容量制限交換($R_D, A_U, T=\min$)を丸ごと削除する。理由は §4 の事前予測そのものである:**上げ側の throttle が $T/A_U = 0.026$** で、意図1のチャネルは要求した介入の 2.6% しか実行しない。実測で top 層の効き平均は **0.058 nats**、旧 KL 加重アームの 58.3 に対し **1/1000** だった。
+
+* **得たもの:** throttle が消え **38倍**。
+* **失ったもの:** §3.2 の性質2(頭が動かない)と性質3(符号忠実性)。頭は $1/Z$ で課税され、符号忠実性は「$c>0 \Rightarrow w>1$」から「$c > \log Z \Rightarrow w>1$」に弱まる。$Z=1$ は恒等式ではなくなり、`mass_error` が測るのは「$\tilde p$ が分布であること」に変わる。
+
+**正規化だけでは足りない、という測定も同時に記録する。** 単純正規化での損失の変化は
+
+$$\Delta\mathrm{KL} = \mathrm{KL}(p_s\Vert\tilde p) - \mathrm{KL}(p_s\Vert p_{on}) = \log Z - \langle c\rangle_{p_s}, \qquad |\Delta\mathrm{KL}| \le 2\max|c|$$
+
+で、**正規化の書き方に依らず $c$ の大きさだけで上限が決まる。** 旧アームが $(W-1)\cdot\mathrm{KL}$ という無制限な2量の積だったのとは構造が違う。正規化後の top 層は 2.24 nats(旧アーム比 **1/26**)。
+
+### 撤回2:support を student top-k に戻す(C7 の撤回)
+
+C7 は「目標を生徒非依存の固定点にする」ために teacher top-k を要求した。撤回する:**教師 top-20 の下限は 1e-2〜1e-4** なので、$p_{student}$ が高く $p_{on}$ が極小(中央 2.3e-06)の候補を**構造的に含み得ない**。旧アームで効果の **68.9%** はそこにあった。
+
+* **代償:** C7 が名指しした通りのフィードバックループ。旧 student-indexed アームの `frac_agree_pos` は 0.238→0.193 と漂流した。
+* **副次的な利点:** intent lock の差分が**機構キーのみ**になる。ペアリングテストの `student_indexed_topk` 例外を削除した。キャッシュは行あたり 4 モデル読みに戻る(`ppo_micro_batch_size_per_gpu=5` は既にその前提で決まっている)。
+
+### 撤回3:`exponent_scale` 1.0 → 2.148、`_EXPONENT_CLAMP` 30.0 → 3.0
+
+§3.1 で「保守側を採る」とした判断を撤回し、実測の RMS→nats 換算 **2.148** を採る。正規化の 38倍に単位換算の 2.1倍を重ねて top 層 **4.82 nats**、旧アーム比 **1/12**。
+
+クランプは**設計パラメータに変わった**。交換が介入量を自律的に絞っていた間は 30.0 の overflow ガードでよかったが、正規化では他に上限が無い。3.0 は「1候補あたり $e^3\approx20$、1位置あたり $|\Delta\mathrm{KL}| \le 6$ nats」という律速である。`exponent_scale=2.148` では作用候補の $|c|$ 中央が 2.15(クランプの 72%)なので**これは実際に binding する**。`target/clamped_per_step` と `target/clamped_frac_of_acted` は病理の指標ではなく**レート**として読む。
+
+### この改訂で入れた指標
+
+| キー | 意味 |
+|---|---|
+| `target/abs_dkl_mean`, `target/dkl_mean`, `target/abs_dkl_live_mean` | $\Delta\mathrm{KL} = \log Z - \langle c\rangle_{p_s}$、nats/位置。**旧アームと同じ単位**で、スケールが届いたかを決める数字 |
+
+> **比較の注意。** 上に並べた 58.3 / 0.058 / 2.24 / 4.82 nats は **top 層**(効果上位で選ばれた偏った標本)の数字である。偏りのない spread 層では旧アームの位置あたり平均が 0.274 nats、正規化前の新機構が候補あたり 0.0039 nats で、位置あたりに直すと(20候補、符号相殺込み)0.02〜0.08 と**幅のある見積もり**になる。典型的な位置での差は 4〜14倍に留まる可能性が高い。`abs_dkl_mean` は全位置平均なので **top 層の 58.3 と直接比べてはいけない** — この指標を入れたのは、その見積もりの幅を実測で潰すためである。
+| `target/log_z_mean`, `target/max_abs_log_z` | 頭の課税。交換では恒等的に 0 だった |
+| `target/clamped_frac_of_acted` | クランプの発火率 |
+
+**削除した指標:** `target/throttle_up`, `target/throttle_down`(交換に属する量)。
+
+### まだ実行していない選択肢
+
+局所 KL に比例させる tilt($c'(v) = c(v)\cdot \mathrm{KL}_{pos}/\langle\mathrm{KL}\rangle$)は**採用していない**。旧アームの $W$ は KL と無相関(Spearman +0.003、監査 §15)なので、これは旧アームの再現ではなく**新しい性質(focal 化)の追加**であり、そう名付けて別に走らせるべきものである。`target/abs_dkl_mean` の実測を見てから判断する。
+
+---
+
 ## 0. 設計を縛る、測定済みの制約
 
 | # | 制約 | 出典 |
@@ -115,7 +166,11 @@ $b = s\cdot\mathrm{relu}(L-O)$ は $O<L$ なら**符号が逆でも**正にな�
 
 ---
 
-## 3. 目標分布:質量保存を構成上成立させる
+## 3. (初版・撤回)目標分布:質量保存を構成上成立させる
+
+> **撤回済み。** §0.0 撤回1 を参照。この節の交換($R_D, A_U, T=\min$)は実装から削除され、単純正規化に置き換わった。以下は撤回の理由を読むために残す。
+
+
 
 C3(税)を消すため、**再正規化を使わず、作用集合の内部だけで質量を交換する**。交換量は**両側の容量の小さい方**で決める — これが唯一の上限になり、ハイパラを増やさずに $w$ が有界になる。
 
@@ -135,7 +190,11 @@ $$
 
 $U$ か $D$ が空、または $T \le 0$ の位置は $w \equiv 1$(no-op)。
 
-### 3.1 スケール:これは明示的な設計判断であり、唯一残ったハイパラである
+### 3.1 (初版)スケール:これは明示的な設計判断であり、唯一残ったハイパラである
+
+> **決定を撤回。** 「初回は保守側」は撤回し、`exponent_scale = 2.148`(nats 換算)を採る。§0.0 撤回3。
+
+
 
 $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ は RMS 単位(無次元)である。実測で **1 RMS = 2.148 nats**(on-task、中央値)。したがって単位の選択で介入量が変わる:
 
@@ -185,7 +244,13 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 ---
 
-## 4. 走行前に確定している予測値(事前登録)
+## 4. (初版・無効)走行前に確定している予測値(事前登録)
+
+> **この節の数値はすべて無効。** 質量保存交換 × teacher-indexed support の上で計算されており、機構が両方とも変わった。`target_tv = 0.019` と枝別シェア 0.871/0.129 は run ログからも削除した。**stale な事前登録は無いより悪い** — 機構が単に違うだけの状態を「違反」として読ませてしまうため。
+>
+> なお §4.1 の 0.8705/0.1293 は**枝別**の $|c|$ 質量シェアであり、実装が出す `target/channel/{a,b}_share` は**チャネル別**($\Sigma|a|p$ 対 $\Sigma|b|p$)である。一致枝でも $L>O$ なら $b$ が発火するので両者は一致しない。この対応付けの誤りは初版から存在したが、事前登録が無効になったことで実害は消えた。チャネル分解は §6 診断1 の量として引き続き有効である。
+
+
 
 実イベント 10,624 件(両アームの spread、$\hat h$ は既存ダンプの標準化 shift)に**最終設計をそのまま通した**値。手計算ではなく実データからの推定である。
 
@@ -203,7 +268,7 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 旧 teachertopk アームの実測 `target_tv` = 0.0142 に対し **1.3 倍**。$\min$ 版なら 0.0107(旧アーム以下)。**幾何平均にした効果は $L$ で 2.19 倍だが、容量制約が throttle するので TV では 1.8 倍に留まる。**
 
-**上げ側が強く throttle される($T/A_U = 0.026$)** ことは設計上の帰結として認識しておく。ただし絶対質量では上げ側が +23.4% を得るので、介入としては十分な大きさである。`target/throttle_up` = $T/A_U$、`target/throttle_down` = $T/R_D$ を必ず記録すること。
+**上げ側が強く throttle される($T/A_U = 0.026$)** ことは設計上の帰結として認識しておく。ただし絶対質量では上げ側が +23.4% を得るので、介入としては十分な大きさである。~~`target/throttle_up` = $T/A_U$、`target/throttle_down` = $T/R_D$ を必ず記録すること。~~ **この 0.026 が §0.0 撤回1 の直接の原因であり、両指標は交換ごと削除された。**
 
 ### 4.1 枝別のシェア(主チャネルが A であることの確認)
 
@@ -236,15 +301,20 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 実装は自動停止を一切持たない。毎 step、rank 0 が1行を run ログに出す(`[cross_teacher_target] gates (advisory): ...`)。全 rank で all_reduce 済みの同一値なので、rank 0 の1行が全体を代表する。
 
+**改訂 (§0.0) 後の表。** G1〜G3 は機構を機構自身と比べる比なので、$w$ の作り方が変わっても**そのまま有効**である。事前登録に依っていた行(`tv`、`A/B`)は水準を外した。
+
 | 表示名 | wandb キー | 気にすべき水準 | 何を意味するか |
 |---|---|---|---|
-| `tv` | `target/tv` | 事前登録 **0.019** | 交換量 $T$。大きくズレたら §4 の前提が崩れている |
+| `\|dKL\|` | `target/abs_dkl_mean` | **旧アームとの比**が判断材料 | $\log Z - \langle c\rangle_{p_s}$ の絶対値、nats/位置。**この改訂が届いたかを決める数字。** 旧アームの top 層は 58.3 |
+| `log_z` | `target/log_z_mean` | 発散、または `tv` に対して支配的 | 頭の課税。正規化で復活した項(§0.0 撤回1) |
+| `clamped` | `target/clamped_frac_of_acted` | レートとして読む | クランプ 3.0 は binding する設計。0 なら `exponent_scale` が効いていない疑い |
+| `tv` | `target/tv` | 水準なし(事前登録は無効) | $\mathrm{TV}(\tilde p, p_{on})$、tail 込み |
 | `shuffled/live` | `target/shuffled_tv_ratio` | **> 0.6 で懸念** | off-task shift を行内で roll して $c$ を再計算した TV 比。旧機構のゲートはここで 0.82 だった = 文法で同じ質量を動かしていた |
 | `novelty` | `target/acted_novelty` | **< 0.1 で懸念** | 作用先の $1 - \sum D_{on}/\sum D_{base}$。低ければ base 相続の合意に作用しており、on-task 教師が既に教えている |
 | `tag_share` | `target/tag_share` | **> 0.3 で懸念** | タグ語彙への介入シェア。超えたら測っているのはタグのトークン化(§13.5、`'<th'` 単独で webshop の 21.7%) |
-| `max\|log w\|` | `target/max_abs_log_w` | 発散 | §3.1 の病理。有界性は構成上保証されているので、動いたら実装のバグ |
-| `mass_err` | `target/mass_error_max` | $> 10^{-12}$ | $Z=1$ 恒等式の実測違反。これは指標ではなく assertion |
-| `A/B` | `target/channel/{a,b}_share` | 事前登録 **0.871 / 0.129** | 主チャネルが A(全教師一致)であることの確認 |
+| `max\|log w\|` | `target/max_abs_log_w` | $> 2\times$ クランプ | 構成上 $|c_{\text{clamped}}| + |\log Z| \le 6$。超えたら実装のバグ |
+| `mass_err` | `target/mass_error_max` | $> 10^{-12}$ | $\sum \tilde p = 1$($Z=1$ **ではない**)。指標ではなく assertion |
+| `A/B` | `target/channel/{a,b}_share` | 水準なし(§4 参照) | チャネル分解。**枝別シェアとは別量**なので、§4.1 の 0.871/0.129 と直接比べてはいけない |
 
 **読む時期。** `shuffled/live` と `novelty` は step 1 から計算できるので、150 step の完了を待つ必要はない。早期に懸念水準へ振れていたら、それは「機構の実装が悪かった」ではなく「**この教師集合に共有すべきタスク知識が無い**」ことの直接の証拠になり、negative result として §11.6 と合わせて報告できる形になる — その判断をいつ下すかは、走行を止めるかどうかとは別の問題である。
 
@@ -278,9 +348,9 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 **実装済み(2026-09-02、branch `claude/cross-teacher-target`)。** 中核 `verl/trainer/ppo/cross_teacher_target.py`(§2 の式 + §3 の交換 + `TargetStepStats`)、actor 配線(`dp_actor.py`: 教師 logprob を $\log\tilde p$ に差し替え、3アーム相互排他 assert)、driver 配線(`opd_ray_trainer.py` の第3消費者)、config 伝播(`main_opd.py`)、run script(`run_multitask_cross_teacher_target_qwen3.sh`)、intent lock(`expected_multitask_cross_teacher_target_config.yaml`、機構キーは enable / base_path / exponent_scale の3つ)、対 control・対 klw のペアリングテスト(`test_cross_teacher_target_arm.py`: 差分が機構キーと識別子のみであることを合成 config で機械検証)。
 
-**指標(すべて `target/*`、control には0列):** `tv`(=交換量 T)、`shuffled_tv_ratio`・`acted_novelty`・`tag_share`・`max_abs_log_w`(§5、毎 step 1行で run ログにも出る)、`mass_error_max`(Z=1 恒等式の実測)、`live_frac`、`throttle_up/down`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、Z=1 なので厳密)、イベントは `SignEventSamples` を再利用 — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
+**指標(すべて `target/*`、control には0列):** `tv`、`abs_dkl_mean`/`dkl_mean`/`abs_dkl_live_mean`、`log_z_mean`/`max_abs_log_z`、`shuffled_tv_ratio`・`acted_novelty`・`tag_share`・`max_abs_log_w`(§5、毎 step 1行で run ログにも出る)、`mass_error_max`($\sum\tilde p = 1$ の実測)、`live_frac`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`/`clamped_frac_of_acted`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、w は正規化後なので候補ごとの変化として厳密。ただし **support 上でゼロ和ではない** — tail も $p_{tail}(1/Z-1)$ だけ動く)、イベントは `SignEventSamples` を再利用(`norm` 列は本物の $Z$ になった) — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
 
-**対 control の差分は厳密には2つある。** 機構キーに加えて `student_indexed_topk`(control: true / target: **false**、C7)。これは意図的で、根拠は測定: teachertopk サインアームがまさにこのキーだけを student-indexed の兄弟アームに対して変え、**全7状態の frac / mass_frac が ±0.006 以内、学習中ロールアウトの episode 指標は区別不能**だった(teachertopk レポート)。ペアリングテストはこのキーを測定根拠のコメント付きで許容している。support が teacher top-k になることで、キャッシュは行あたり 4 → 3 モデル読みになる。
+**対 control の差分は機構キーのみである。** 初版では `student_indexed_topk`(control: true / target: false、C7)という第2の差分があったが、§0.0 撤回2 で C7 ごと撤回した。ペアリングテストの例外は削除し、代わりに3アームすべてが `student_indexed_topk=true` であることを検査する(`test_the_support_matches_the_comparators`)。キャッシュは行あたり 4 モデル読みに戻る。
 
 **resume の扱い:** target アームは sidecar を持たない(μ も α も無いため)。resume 時は RMS が生きたバッチから再ウォームされ、最初のスナップショットまで $c\equiv0$(= no-op step が1回入るだけ)。
 
@@ -288,7 +358,7 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 **捨てるもの:** `PreviousStepTaskKLWeightedMean`、cold start、`teacher_similarity`($q$)、`candidate_mass`(student 測度)、`report_epsilon`、sidecar のバージョン管理。
 
-**適用点:** `dp_actor.py` の teacher KL 計算で、`sign_on_task_logprobs` を $\log \tilde p$ に差し替える。`teacher_kld *= W` の行は**削除**する(重みは存在しない)。
+**適用点:** `dp_actor.py` の teacher KL 計算で、`sign_on_task_logprobs` を $\log \tilde p$ に差し替える。`teacher_kld *= W` の行は**削除**する(重みは存在しない)。$\log \tilde p = \log p_{on} + (c - \log Z)$ を float64 で作って1回だけキャストするので、作用していない位置では on-task 教師の bit がそのまま渡る。
 
 **テスト(監査の教訓から必須):**
 

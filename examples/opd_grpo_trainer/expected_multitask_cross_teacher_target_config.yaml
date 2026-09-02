@@ -102,15 +102,17 @@
 # the two settings are different (valid) objectives -- comparing arms across them
 # compares nothing. ref.student_indexed_topk follows the actor's value in
 # ppo_trainer.yaml and so is not listed separately.
-# FALSE here, deliberately, where the klw arm pins true: the target arm's
-# support is the ON-TASK TEACHER's top-k (design constraint C7). A
-# student-indexed support makes p_tilde a function of the student and the
-# mechanism a feedback loop -- the old student-indexed arm's frac_agree_pos
-# drifted 0.238 -> 0.193 as the student moved -- while the teacher-indexed
-# support makes the target a student-independent fixed point. The teachertopk
-# sign arm already ran this path end to end, and the cache reads three models
-# per row instead of four.
-"actor_rollout_ref.actor.student_indexed_topk": false
+# TRUE, matching the klw arm and the control. It was pinned FALSE until
+# 2026-09-02 on design constraint C7 (a teacher-indexed support makes p_tilde a
+# student-independent fixed point); C7 is withdrawn. A teacher top-20 bottoms out
+# at 1e-2..1e-4, so it structurally cannot contain the candidates where
+# p_student is high and p_on is negligible (median p_on 2.3e-06) -- and 68.9% of
+# the predecessor weighting arm's effect sat exactly there. The cost is C7's
+# feedback loop, which is real and was measured: the old student-indexed arm's
+# frac_agree_pos drifted 0.238 -> 0.193 as the student moved. Pinning it true
+# also means this arm now differs from both comparators in the mechanism keys
+# ALONE, so the pairing test no longer carries an exception for the support.
+"actor_rollout_ref.actor.student_indexed_topk": true
 # enable_gradient_checkpointing sits on the gradient path even though it looks
 # like a pure memory knob: a recomputed forward and a stored one differ in their
 # last bits under autocast, the same class as no_sync_grad_accum. It is pinned
@@ -133,7 +135,9 @@
 # ---- what bounds the training forward ----------------------------------------
 # Halved from 10 after this arm's first launch: it holds four models per row in
 # the hidden-state cache (teacher_cache/gb 16.3 against pure OPD's 4.1) while
-# vLLM is awake and holding its KV cache. Unlike the rollout key above it does
+# vLLM is awake and holding its KV cache. Four is the count again after the
+# 2026-09-02 revision put the support back on the student's top-k -- the on-task
+# teacher has to be resolved at update time along with the other three. Unlike the rollout key above it does
 # NOT enter adjust_batch's divisor, so it moves no rows and drops no data --
 # only how much is resident at once.
 "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
@@ -231,11 +235,20 @@
 # The mechanism this arm exists to test (verl/trainer/ppo/cross_teacher_target.py).
 # It rewrites the distillation target instead of scaling the KL, and it has ONE
 # knob -- the unit conversion exponent_scale, pinned here because the module
-# refuses to pretend it does not exist: the four readings of {min, geomean} x
-# {RMS, nats} span exp(c) from 1.52 to 9.82, and 1.0 is the conservative end
-# (geomean x RMS units, exp(c) ~ 2.9). docs/cross_teacher_target_design.md 3.1.
+# refuses to pretend it does not exist: exp(c) needs c in nats and c is in RMS
+# units, and the four readings of {min, geomean} x {RMS, nats} span exp(c) from
+# 1.52 to 9.82. docs/cross_teacher_target_design.md 3.1.
+#
+# 2.148 -- the MEASURED conversion (one on-task RMS unit = 2.148 nats), not the
+# conservative 1.0 this arm launched with. Changed with the mechanism revision of
+# 2026-09-02: the mass-conserving exchange throttled the up side to T/A_U = 0.026
+# and was replaced by a plain normalisation, which recovered 38x and still left
+# the intervention at ~1/26 of the predecessor weighting arm's. The unit
+# conversion is the remaining 2.1x that costs no new knob. Read
+# target/abs_dkl_mean for where it actually landed -- that measurement, not this
+# number, decides whether a further scale change is warranted.
 "algorithm.opd.cross_teacher_target.enable": true
-"algorithm.opd.cross_teacher_target.exponent_scale": 1.0
+"algorithm.opd.cross_teacher_target.exponent_scale": 2.148
 # The pre-RL policy every teacher's shift is relative to. It MUST be the exact
 # checkpoint all three were fine-tuned from: the cumulative RMS and both channels
 # are measured against it, so a different base makes every number here mean
@@ -244,5 +257,5 @@
 # effective values after main_opd copies them onto the actor, which is where
 # the target is actually built -- the driver only caches the models it reads.
 "actor_rollout_ref.actor.cross_teacher_target.enable": true
-"actor_rollout_ref.actor.cross_teacher_target.exponent_scale": 1.0
+"actor_rollout_ref.actor.cross_teacher_target.exponent_scale": 2.148
 "actor_rollout_ref.actor.cross_teacher_target.base_path": Qwen/Qwen3-1.7B

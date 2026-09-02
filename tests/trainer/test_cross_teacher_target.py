@@ -27,7 +27,7 @@ import torch
 from verl.trainer.ppo.cross_teacher_target import (
     BRANCHES,
     build_target,
-    capacity_limited_weight,
+    normalized_weight,
     off_task_consensus,
     target_exponent,
 )
@@ -137,97 +137,134 @@ def test_branch_labels_name_the_case_the_value_came_from():
     ]
 
 
-# ------------------------------------------------------ the mass-conserving swap
+# ------------------------------------------------- the tilt-and-renormalise step
 def _random_position(gen, k=20):
     p = torch.distributions.Dirichlet(torch.full((k,), 0.3)).sample()
     tail = torch.rand(1, generator=gen).item() * 0.02
     return (p * (1 - tail)).reshape(1, 1, k), tail
 
 
-def test_mass_is_conserved_exactly():
-    """``sum w*p == sum p`` on the support, which is the invariant the mechanism
-    owns. The tail keeps ``w = 1`` and is therefore still whatever it was, so the
-    two together still sum to one -- but asserting *that* would be asserting the
-    float32 construction of ``p`` in this test, not the exchange."""
+def test_the_target_is_a_distribution():
+    """``sum_S w p + p_tail / Z == 1``. This is the invariant the mechanism owns
+    since the revision; the exchange it replaced owned a stronger one (``Z == 1``,
+    i.e. the support conserved its own mass and the tail never moved) and that
+    one is deliberately gone."""
     gen = torch.Generator().manual_seed(3)
     worst = 0.0
     for _ in range(400):
         p, _ = _random_position(gen)
         p64 = p.to(torch.float64)
         c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.5
-        w = capacity_limited_weight(c=c, p_on=p)["w"]
-        worst = max(worst, abs(((w * p64).sum() - p64.sum()).item()))
-    assert worst < 1e-15
+        got = normalized_weight(c=c, p_on=p)
+        total = (got["w"] * p64).sum() + got["tail"] * got["inv_z"]
+        worst = max(worst, abs((total - 1.0).item()))
+    assert worst < 1e-14
 
 
-def test_the_head_is_never_touched():
-    """c = 0 keeps w = 1. The predecessor took 46-55% of its amplification from
-    exactly these candidates."""
+def test_the_head_is_taxed_and_that_is_the_accepted_cost():
+    """``c = 0`` no longer implies ``w = 1``; it implies ``w = 1/Z``. Asserted
+    rather than lamented: the capacity exchange bought head-invariance at a
+    throttle of ``T/A_U = 0.026`` and the revision spent it back."""
     gen = torch.Generator().manual_seed(4)
+    taxed = 0
     for _ in range(200):
         p, _ = _random_position(gen)
         c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.5
         c[..., ::3] = 0.0
-        w = capacity_limited_weight(c=c, p_on=p)["w"]
-        assert torch.all(w[..., ::3] == 1.0)
+        got = normalized_weight(c=c, p_on=p)
+        untilted = got["w"][..., ::3]
+        # every untilted candidate carries exactly the same factor, 1/Z
+        assert torch.allclose(untilted, got["inv_z"].unsqueeze(-1).expand_as(untilted))
+        taxed += int(not torch.allclose(untilted, torch.ones_like(untilted)))
+    assert taxed > 190, taxed
 
 
-def test_sign_faithfulness_cannot_invert():
+def test_sign_faithfulness_is_relative_to_log_z():
+    """The exchange guaranteed ``w > 1`` iff ``c > 0``. Normalisation weakens that
+    to ``c > log Z``, and the test says so instead of asserting the old rule --
+    a candidate the teachers agreed to raise CAN lose probability."""
     gen = torch.Generator().manual_seed(5)
     for _ in range(400):
         p, _ = _random_position(gen)
         c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.5
-        w = capacity_limited_weight(c=c, p_on=p)["w"]
-        assert torch.all(w[c < 0] <= 1.0 + 1e-12)
-        assert torch.all(w[c > 0] >= 1.0 - 1e-12)
+        got = normalized_weight(c=c, p_on=p)
+        log_z = got["log_z"].unsqueeze(-1)
+        c64 = c.to(torch.float64)
+        assert torch.all(got["w"][c64 > log_z] > 1.0 - 1e-12)
+        assert torch.all(got["w"][c64 < log_z] < 1.0 + 1e-12)
 
 
-def test_w_stays_inside_the_teachers_own_volume():
+def test_the_exponent_clamp_bounds_the_whole_intervention():
+    """With the capacity exchange gone the clamp is the only cap, so it has to
+    hold: ``|log w| <= 2 * clamp`` on the support and ``|log Z| <= clamp``."""
+    from verl.trainer.ppo.cross_teacher_target import _EXPONENT_CLAMP
+
     gen = torch.Generator().manual_seed(6)
     for _ in range(400):
         p, _ = _random_position(gen)
-        c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.5
-        w = capacity_limited_weight(c=c, p_on=p)["w"]
-        e = c.to(torch.float64).exp()
-        assert torch.all(w[c > 0] <= e[c > 0] + 1e-12)
-        assert torch.all(w[c < 0] >= e[c < 0] - 1e-12)
+        c = torch.randn(1, 1, p.size(-1), generator=gen) * 40.0     # far past it
+        got = normalized_weight(c=c, p_on=p)
+        assert torch.all(got["log_w"].abs() <= 2 * _EXPONENT_CLAMP + 1e-9)
+        assert torch.all(got["log_z"].abs() <= _EXPONENT_CLAMP + 1e-9)
+        assert torch.all(got["clamped"] == (c.to(torch.float64).abs() > _EXPONENT_CLAMP))
 
 
-def test_a_position_with_one_empty_side_is_a_no_op():
-    p = torch.full((1, 1, 4), 0.25)
-    for c in (torch.tensor([[[1.0, 2.0, 0.0, 0.0]]]), torch.tensor([[[-1.0, -2.0, 0.0, 0.0]]])):
-        got = capacity_limited_weight(c=c, p_on=p)
-        assert torch.all(got["w"] == 1.0)
-        assert got["moved"].item() == 0.0
+def test_an_untilted_position_is_a_bit_identical_no_op():
+    p = torch.full((1, 1, 4), 0.2)
+    got = normalized_weight(c=torch.zeros(1, 1, 4), p_on=p)
+    assert torch.all(got["w"] == 1.0) and torch.all(got["log_w"] == 0.0)
+    assert got["log_z"].item() == 0.0 and got["inv_z"].item() == 1.0
+    assert got["moved"].item() == 0.0
 
 
 def test_unavailable_rows_are_a_no_op():
     p = torch.full((2, 1, 4), 0.25)
     c = torch.tensor([[[1.0, -1.0, 2.0, -2.0]]]).expand(2, 1, 4).contiguous()
-    got = capacity_limited_weight(c=c, p_on=p,
-                                  row_available=torch.tensor([True, False]))
+    got = normalized_weight(c=c, p_on=p,
+                            row_available=torch.tensor([True, False]))
     assert torch.all(got["w"][1] == 1.0)
     assert not torch.all(got["w"][0] == 1.0)
 
 
-def test_moved_is_the_positions_total_variation():
+def test_moved_is_the_total_variation_including_the_tail():
     gen = torch.Generator().manual_seed(7)
     for _ in range(200):
         p, _ = _random_position(gen)
+        p64 = p.to(torch.float64)
         c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.5
-        got = capacity_limited_weight(c=c, p_on=p)
-        tv = 0.5 * (got["w"] * p.to(torch.float64) - p.to(torch.float64)).abs().sum()
+        got = normalized_weight(c=c, p_on=p)
+        tv = 0.5 * (
+            (got["w"] * p64 - p64).abs().sum()
+            + (got["tail"] * got["inv_z"] - got["tail"]).abs()
+        )
         assert tv.item() == pytest.approx(got["moved"].item(), abs=1e-12)
 
 
-def test_the_exchange_is_limited_by_the_smaller_side():
-    # A thin up side throttles the swap instead of inflating a denormal
-    # candidate, which is how the first draft of this reached max w = 2.4e10.
-    p = torch.tensor([[[0.5, 0.5 - 1e-9, 1e-9]]])
-    c = torch.tensor([[[-2.0, -2.0, 3.0]]])
-    got = capacity_limited_weight(c=c, p_on=p)
-    assert got["w"].max().item() < math.exp(3.0) + 1e-9
-    assert got["throttle_down"].item() < 1e-6      # the down side barely gives
+def test_the_up_side_is_no_longer_throttled_by_the_down_side():
+    """The measurement that forced the revision, as a regression test. The
+    capacity exchange scaled the up side by ``T / A_U``; with a thin down side
+    that was 0.026 in production. Normalisation gives the up candidate its full
+    ``e^c`` up to the shared divisor."""
+    p = torch.tensor([[[0.9, 0.05, 0.05]]])
+    c = torch.tensor([[[0.0, 2.0, -0.01]]])       # nothing to supply, plenty to ask
+    got = normalized_weight(c=c, p_on=p)
+    ratio = (got["w"][..., 1] / got["inv_z"]).item()
+    assert ratio == pytest.approx(math.exp(2.0), rel=1e-9)
+
+
+def test_dkl_is_log_z_minus_the_students_average_tilt():
+    """``dKL = log Z - <c>_{p_s}`` is what TargetStepStats reports and what the
+    scale decision reads, so the identity behind it is checked here."""
+    gen = torch.Generator().manual_seed(8)
+    p, _ = _random_position(gen)
+    c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.2
+    got = normalized_weight(c=c, p_on=p)
+    ps = torch.distributions.Dirichlet(torch.full((p.size(-1),), 0.5)).sample()
+    ps = (ps * 0.97).reshape(1, 1, -1).to(torch.float64)
+    tail_s = 1.0 - ps.sum(dim=-1)
+    from_logs = -(ps * got["log_w"]).sum(dim=-1) + tail_s * got["log_z"]
+    from_c = got["log_z"] - (ps * c.to(torch.float64)).sum(dim=-1)
+    assert torch.allclose(from_logs, from_c, atol=1e-12)
 
 
 # ------------------------------------------------------------------ end to end
@@ -245,12 +282,18 @@ def _chain(k=6, bs=2, resp=3, n_off=2, seed=11):
     )
 
 
-def test_end_to_end_conserves_mass_on_the_support():
+def test_end_to_end_the_target_sums_to_one_with_its_tail():
+    """The support's mass is NOT preserved any more -- that was the exchange. What
+    holds is that the support plus its rescaled tail is a distribution, which is
+    also what topk_kl_per_token reconstructs as 1 - sum_S exp(target_logprob)."""
     kw = _chain()
     got = build_target(**kw)
-    before = kw["on_logprob"].exp().sum(dim=-1)
-    after = got["target_logprob"].exp().sum(dim=-1)
-    assert torch.allclose(before, after, atol=1e-6)
+    tail_before = 1.0 - kw["on_logprob"].exp().sum(dim=-1)
+    on_support = got["target_logprob"].exp().sum(dim=-1)
+    assert torch.allclose(on_support + tail_before / got["log_z"].exp().float(),
+                          torch.ones_like(on_support), atol=1e-6)
+    # and the support's own mass really did move, or the test above is vacuous
+    assert not torch.allclose(on_support, kw["on_logprob"].exp().sum(dim=-1), atol=1e-4)
 
 
 def test_identity_when_nothing_agrees():
@@ -275,7 +318,7 @@ def test_cold_start_rows_are_untouched():
 def test_exponent_scale_is_the_only_knob_and_it_moves_the_intervention():
     kw = _chain()
     small = build_target(**kw, exponent_scale=1.0)
-    large = build_target(**kw, exponent_scale=2.148)     # the measured nats/RMS
+    large = build_target(**kw, exponent_scale=2.148)     # what the arm now pins
     assert large["moved"].sum() > small["moved"].sum()
 
 
@@ -290,11 +333,13 @@ def test_shuffled_counterfactual_is_built_on_request():
 def test_channel_counterfactuals_partition_sensibly():
     kw = _chain()
     got = build_target(**kw, channel_counterfactuals=True)
-    # Each channel alone moves no more than... nothing exact holds (the capacity
-    # min is not additive), but both must be bounded by their own capacity and
-    # non-negative, and a-only + b-only >= 0 trivially; what IS exact is that a
-    # channel that is everywhere zero moves nothing.
-    assert torch.all(got["a_only_moved"] >= 0) and torch.all(got["b_only_moved"] >= 0)
+    # Nothing exact holds across the two -- a total variation is not additive in
+    # the exponent -- so what is asserted is that each is a TV of its own channel:
+    # non-negative, and zero exactly when that channel is silent.
+    for name in ("a", "b"):
+        assert torch.all(got[f"{name}_only_moved"] >= 0)
+        silent = (got[name] == 0).all(dim=-1)
+        assert torch.all(got[f"{name}_only_moved"][silent] == 0)
 
 
 def test_step_stats_render_the_preregistered_quantities():
@@ -309,14 +354,20 @@ def test_step_stats_render_the_preregistered_quantities():
     ids = torch.randint(0, 50, kw["on_logprob"].shape)
     stats.update(built=got, p_on=got["p_on"], support_ids=ids,
                  response_mask=mask, task_ids=kw["task_ids"],
-                 d_on=torch.rand(bs, resp), d_base=torch.rand(bs, resp) + 1.0)
+                 d_on=torch.rand(bs, resp), d_base=torch.rand(bs, resp) + 1.0,
+                 student_logprob=torch.log_softmax(
+                     torch.randn(*kw["on_logprob"].shape), dim=-1) + math.log(0.99))
     m = stats.metrics(task_names=["alfworld", "search", "webshop"])
     for key in ("target/tv", "target/live_frac", "target/acted_mass_frac",
                 "target/branch/agree/mass_frac", "target/max_abs_log_w",
+                "target/max_abs_log_z", "target/log_z_mean", "target/dkl_mean",
+                "target/abs_dkl_mean", "target/abs_dkl_live_mean",
                 "target/mass_error_max", "target/shuffled_tv_ratio",
                 "target/alfworld/tv"):
         assert key in m, key
-    # The Z = 1 identity, as the metric reports it.
+    # The throttle metrics belonged to the exchange and must not linger.
+    assert not any(k.endswith("throttle_up") or k.endswith("throttle_down") for k in m)
+    # "p_tilde is a distribution", as the metric reports it.
     assert m["target/mass_error_max"] < 1e-12
     # branch fracs sum to one over candidates
     tot = sum(m[f"target/branch/{b}/cand_frac"] for b in ("agree", "conflict", "on_silent", "split"))

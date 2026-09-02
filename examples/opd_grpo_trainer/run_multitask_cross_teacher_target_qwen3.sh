@@ -116,6 +116,26 @@ set -x
 # Teacher and checkpoint paths are written relative to $HOME so the same script
 # resolves correctly on either machine.
 #
+# REVISION 2026-09-02, THREE CHANGES TO THE MECHANISM. Read
+# verl/trainer/ppo/cross_teacher_target.py's module docstring for the full
+# statement; what changed in THIS FILE is two arguments:
+#   student_indexed_topk  False -> True. Design constraint C7 (a teacher-indexed
+#     support, so the target does not depend on the student) is withdrawn: a
+#     teacher top-20 bottoms out at 1e-2..1e-4 and cannot contain the candidates
+#     where p_student is high and p_on is negligible, which carried 68.9% of the
+#     predecessor arm's effect. The accepted cost is C7's feedback loop. The
+#     incidental benefit is that this arm now differs from the klw arm and the
+#     control in the MECHANISM KEYS ALONE -- the pairing test no longer carries
+#     an exception for the support, and the hidden-state cache is back to four
+#     models per row, which is what ppo_micro_batch_size_per_gpu=5 already sized.
+#   exponent_scale  1.0 -> 2.148, the measured RMS-to-nats conversion. The
+#     mass-conserving exchange was replaced by a plain normalisation (which
+#     removed a 38x throttle) and that still left the intervention at ~1/26 of
+#     the predecessor's; the unit conversion is the rest of what is available
+#     without adding a knob. target/abs_dkl_mean reports where it landed.
+# The pre-registered target_tv = 0.019 and branch split 0.871/0.129 were computed
+# on the old mechanism and are VOID. The run log no longer prints them.
+#
 # INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_cross_teacher_target_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
 # protocol). main_opd_grpo validates the composed config against it after its own
@@ -1166,7 +1186,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     +actor_rollout_ref.actor.no_sync_grad_accum=True \
     actor_rollout_ref.actor.response_only_logits=True \
-    actor_rollout_ref.actor.student_indexed_topk=False \
+    actor_rollout_ref.actor.student_indexed_topk=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.return_rollout_log_probs=True \
     actor_rollout_ref.rollout.disable_log_stats=False \
@@ -1203,7 +1223,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.normalize_loss_by_task=True \
     +algorithm.opd.cross_teacher_target.enable=True \
     +algorithm.opd.cross_teacher_target.base_path=Qwen/Qwen3-1.7B \
-    +algorithm.opd.cross_teacher_target.exponent_scale=1.0 \
+    +algorithm.opd.cross_teacher_target.exponent_scale=2.148 \
     +algorithm.opd.cross_teacher_target.token_stats.enable=True \
     +algorithm.opd.cross_teacher_target.token_stats.top_n=64 \
     +algorithm.opd.cross_teacher_target.token_stats.every=5 \

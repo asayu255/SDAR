@@ -57,9 +57,49 @@ teacher, which the predecessor's pairwise similarity gate was not.
 THE SCALE IS A HYPERPARAMETER AND IS NOT PRETENDED OTHERWISE. ``exp(c)`` is a
 probability ratio, so ``c`` has to be in nats, and ``c`` is in RMS units. One RMS
 unit measured 2.148 nats, so the four combinations of {min, geomean} x {RMS,
-nats} span ``exp(c)`` from 1.52 to 9.82. This module implements the RMS reading
-(the conservative end, ``exp(c) ~ 2.9``) and ``exponent_scale`` exists to reach
-the other; it is the one knob here and the design document says so.
+nats} span ``exp(c)`` from 1.52 to 9.82. ``exponent_scale`` IS that conversion,
+it is the one knob here, and the arm runs it at the measured 2.148 -- the nats
+reading -- because the conservative end did not reach the scale it had to match.
+See the revision below.
+
+REVISION (2026-09-02), THREE CHANGES, EACH A RETRACTION.
+
+1. THE MASS-CONSERVING EXCHANGE IS GONE. The first shipped form moved mass only
+between the acted candidates and limited the exchange by the smaller side, which
+made ``Z = 1`` an identity and left the head at ``w = 1``. Measured, it cost too
+much for that: the up side ran at ``T / A_U = 0.026``, so intent 1's channel
+delivered 2.6% of what it asked for, and the top layer's effect came out at 0.058
+nats against the predecessor weighting arm's 58.3 -- a factor of 1000. It is
+replaced by a plain normalisation, ``p_tilde = p_on e^c / Z``, which removes the
+throttle (38x) and gives up the two properties the exchange was built for: the
+head is taxed by ``1/Z``, and sign faithfulness weakens from "``c > 0`` implies
+``w > 1``" to "``c > log Z`` implies ``w > 1``".
+
+Normalisation cannot restore the predecessor's scale by itself, and this module
+does not pretend otherwise. The change it makes to the loss is
+
+    dKL = log Z - <c>_{p_s},        |dKL| <= 2 max|c|
+
+so it is bounded by ``c`` however the normalisation is written, where the
+predecessor multiplied two unbounded quantities (``(W - 1) * KL``). At
+``exponent_scale = 2.148`` the top layer reaches 4.82 nats: 1/12 of the
+predecessor rather than 1/1000. ``target/abs_dkl_mean`` reports the left-hand
+side every step, in the predecessor's own units, so the remaining gap is a
+measurement and not an estimate.
+
+2. THE SUPPORT IS THE STUDENT'S TOP-K AGAIN, withdrawing design constraint C7.
+C7 asked for a teacher-indexed support so ``p_tilde`` would be a
+student-independent fixed point. What it also did was hide the candidates where
+``p_student`` is high and ``p_on`` is negligible (median ``p_on`` 2.3e-06) --
+68.9% of the predecessor's effect sat there, and a teacher top-20 whose smallest
+member is 1e-2 to 1e-4 cannot contain them at all. The cost is the feedback loop
+C7 named: the old student-indexed arm's ``frac_agree_pos`` drifted 0.238 -> 0.193
+as the student moved. The incidental benefit is that this arm's intent lock now
+differs from both comparators in the mechanism keys ALONE.
+
+3. THE EXPONENT CLAMP IS A RATE LIMIT, not an overflow guard -- see
+``_EXPONENT_CLAMP``. With the capacity exchange gone, nothing else bounds one
+candidate's tilt.
 """
 from typing import Optional
 
@@ -67,14 +107,19 @@ import torch
 
 # Numerical floors only. Neither is a threshold on the mechanism: the geometric
 # mean's floor is applied inside a log whose result is overwritten wherever an
-# exact zero was present, and the capacity floors gate positions that are left
-# at w = 1 rather than scaled by something derived from a divide-by-zero.
+# exact zero was present, and the normaliser's floor guards a divide at positions
+# that are held at w = 1 anyway.
 _LOG_FLOOR = 1e-30
-_CAPACITY_FLOOR = 1e-12
-# exp() guard. Chosen so float64 cannot overflow and float32 round-trips; a
-# shift this large has already broken an assumption upstream, so the count is
-# reported rather than the value silently truncated.
-_EXPONENT_CLAMP = 30.0
+_NORM_FLOOR = 1e-12
+# The bound on one candidate's tilt, in nats, and it is a DESIGN PARAMETER now
+# rather than the overflow guard it was at 30.0. The capacity exchange used to
+# throttle the intervention on its own; under plain normalisation nothing else
+# does, so this is the rate limit: e^3 ~ 20 on a single candidate and
+# |dKL| <= 6 nats at a position. At exponent_scale = 2.148 the median acted |c|
+# is 2.15, i.e. 72% of the clamp, so this BINDS on a real share of the candidates
+# instead of firing on a pathology -- `target/clamped_per_step` is a rate to
+# read against the acted count, not a bug indicator.
+_EXPONENT_CLAMP = 3.0
 
 BRANCHES = ("agree", "conflict", "on_silent", "split")
 
@@ -150,73 +195,79 @@ def target_exponent(*, hat_on: torch.Tensor, consensus: dict,
             "b": b * float(exponent_scale)}
 
 
-def capacity_limited_weight(*, c: torch.Tensor, p_on: torch.Tensor,
-                            row_available: Optional[torch.Tensor] = None) -> dict:
-    """Per-position mass-conserving exchange. Returns ``w`` with ``sum w*p == sum p``.
+def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
+                      row_available: Optional[torch.Tensor] = None) -> dict:
+    """Per-position tilt-and-renormalise: ``p_tilde(v) = p_on(v) e^{c(v)} / Z``.
 
     Args:
-        c: (bs, resp, k) the tilt exponent.
+        c: (bs, resp, k) the tilt exponent, in nats.
         p_on: (bs, resp, k) the on-task teacher's probability on the support.
         row_available: (bs,) bool, false for a row with no usable sigma yet. Those
             rows get ``w = 1`` -- the cold start is a no-op rather than a guess.
 
     Returns:
-        ``{"w", "moved", "throttle_up", "throttle_down", "clamped"}``.
-        ``moved`` is (bs, resp): the mass ``T`` actually exchanged at that
-        position, which is also that position's total variation.
+        ``{"w", "log_w", "log_z", "inv_z", "tail", "moved", "clamped", "live"}``.
+        ``w`` is ``p_tilde / p_on`` on the support and ``inv_z`` is that same ratio
+        on the tail; ``moved`` is (bs, resp), the total variation between
+        ``p_tilde`` and ``p_on`` over the WHOLE vocabulary, tail included.
 
-    THE EXCHANGE IS LIMITED BY THE SMALLER SIDE, and that is the only bound in
-    the mechanism. The down side can supply at most ``R_D = sum (1 - e^c) p``,
-    the up side can absorb at most ``A_U = sum (e^c - 1) p``, and ``T = min``.
-    Scaling each side to move exactly ``T`` gives four properties by
-    construction, all of them tested rather than argued:
+    THE TAIL IS IN Z AND IS NOT TILTED. ``c`` exists only where the four models
+    were read, so the mass outside the support keeps its shape -- but it is
+    rescaled with everything else, and that is the difference from the exchange
+    this replaces: there the tail was untouched and the support conserved its own
+    mass; here the whole distribution is divided by one ``Z``. It is also exactly
+    what ``topk_kl_per_token`` reads back, since ``1 - sum_S exp(target_logprob)``
+    is ``p_tail / Z``, so the loss's tail bucket needs no separate handling.
 
-    * mass is conserved exactly, so ``Z = 1`` is an identity and not a metric;
-    * candidates at ``c = 0`` -- the head -- keep ``w = 1``. The predecessor's
-      renormalisation took 46-55% of its amplification out of the token the
-      teacher was most confident about, and that is what this removes;
-    * ``w <= 1`` on the down side and ``w >= 1`` on the up side ALWAYS, because
-      both scale factors are in (0, 1]. "Agreed against, therefore attenuated"
-      cannot invert;
-    * ``w`` stays inside ``e^c``, so the teachers' own volume is the cap and no
-      separate clip is needed.
+    WHAT THIS GIVES UP -- stated, because the form it replaces was built to keep it:
 
-    The first draft of this released the down side's mass and handed it to the up
-    side in proportion to ``g * p``. It conserved mass just as exactly and was
-    unusable: with the up side sometimes a single denormal candidate, the p99 of
-    ``max w`` was 2,331 and the maximum 2.4e10. The failure is a capacity
-    mismatch, not an allocation one, which is why the fix is ``min`` and not a
-    different set of weights.
+    * THE HEAD IS TAXED. ``c = 0`` no longer implies ``w = 1``; it implies
+      ``w = 1/Z``. The old target arm took 46-55% of its amplification out of the
+      token the teacher was most confident about and the capacity exchange existed
+      to stop exactly that. It is back, bounded by ``|log Z| <= max|c|``;
+    * SIGN FAITHFULNESS IS RELATIVE, NOT ABSOLUTE. ``w > 1`` iff ``c > log Z``, so
+      a candidate the off-task teachers agreed to raise can still lose probability
+      when the rest of the position was tilted up harder.
+
+    What it buys is the reason for the change: the capacity exchange ran the up
+    side at ``T / A_U = 0.026``, so intent 1's channel delivered 2.6% of what it
+    asked for. Here every candidate gets its own ``e^c`` under one shared divisor,
+    and the only cap left is :data:`_EXPONENT_CLAMP`.
     """
     c64 = c.to(torch.float64).clamp(min=-_EXPONENT_CLAMP, max=_EXPONENT_CLAMP)
     clamped = (c.to(torch.float64).abs() > _EXPONENT_CLAMP)
     p = p_on.to(torch.float64)
     e = c64.exp()
 
-    up, down = c64 > 0, c64 < 0
-    supply = torch.where(down, (1.0 - e) * p, torch.zeros_like(p)).sum(dim=-1)
-    demand = torch.where(up, (e - 1.0) * p, torch.zeros_like(p)).sum(dim=-1)
-    moved = torch.minimum(supply, demand)
+    # The teacher's mass outside the support, which the loss reconstructs the same
+    # way. clamp(min=0) is float hygiene, not a rule: sum p can exceed 1 by an ulp.
+    tail = (1.0 - p.sum(dim=-1)).clamp(min=0.0)
+    z = (p * e).sum(dim=-1) + tail
 
-    live = (supply > _CAPACITY_FLOOR) & (demand > _CAPACITY_FLOOR) & (moved > 0)
+    # A position with no tilt anywhere is left alone BIT-IDENTICALLY rather than
+    # divided by a Z that ought to be 1: sum p + (1 - sum p) is not exactly 1 in
+    # every rounding mode, and an arm that is off must not perturb the target.
+    live = (c64 != 0).any(dim=-1) & (z > _NORM_FLOOR)
     if row_available is not None:
         live = live & row_available.reshape(-1, 1).to(live.device)
 
-    # Ratios are only read where live, but the divisor is floored anyway: an
-    # unread inf still poisons the reductions the metrics take below.
-    t_down = (moved / supply.clamp(min=_CAPACITY_FLOOR)).unsqueeze(-1)
-    t_up = (moved / demand.clamp(min=_CAPACITY_FLOOR)).unsqueeze(-1)
+    # Everything downstream is built from log_z so the support and the tail cannot
+    # disagree about the divisor, and so both are exactly 1 where live is false.
+    log_z = torch.where(live, z.clamp(min=_NORM_FLOOR).log(), torch.zeros_like(z))
+    inv_z = (-log_z).exp()
+    log_w = torch.where(live.unsqueeze(-1), c64 - log_z.unsqueeze(-1),
+                        torch.zeros_like(c64))
+    w = log_w.exp()
 
-    w = torch.ones_like(p)
-    w = torch.where(down, 1.0 - t_down * (1.0 - e), w)
-    w = torch.where(up, 1.0 + t_up * (e - 1.0), w)
-    w = torch.where(live.unsqueeze(-1), w, torch.ones_like(p))
+    moved = 0.5 * (((w - 1.0) * p).abs().sum(dim=-1) + (tail * (inv_z - 1.0)).abs())
 
     return {
         "w": w,
-        "moved": torch.where(live, moved, torch.zeros_like(moved)),
-        "throttle_up": torch.where(live, t_up.squeeze(-1), torch.ones_like(moved)),
-        "throttle_down": torch.where(live, t_down.squeeze(-1), torch.ones_like(moved)),
+        "log_w": log_w,
+        "log_z": log_z,
+        "inv_z": inv_z,
+        "tail": tail,
+        "moved": moved,
         "clamped": clamped,
         "live": live,
     }
@@ -229,7 +280,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
                  shuffle_counterfactual: bool = False,
                  channel_counterfactuals: bool = False,
                  response_mask: Optional[torch.Tensor] = None) -> dict:
-    """The whole chain: standardised shifts -> ``c`` -> ``w`` -> ``log p_tilde``.
+    """The whole chain: standardised shifts -> ``c`` -> ``w = e^c / Z`` -> ``log p_tilde``.
 
     Args:
         on_logprob: (bs, resp, k) on-task teacher log-probs on the support.
@@ -239,25 +290,28 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         shuffle_counterfactual: build the target a second time from the
             off-task planes rolled within each row's real response
             (``decorrelated_off_shifts`` -- the audit's counterfactual, reused
-            verbatim) and return its exchanged mass as ``shuffled_moved``. This
+            verbatim) and return its total variation as ``shuffled_moved``. This
             is the abort gate G1, not an optional extra: the predecessor's gate
             opened at 0.82 of its live rate on shuffled teachers, and a
             mechanism that scores near that is moving mass for reasons that
             survive destroying the position correspondence. Needs
             ``response_mask``.
-        channel_counterfactuals: run the exchange twice more with ``c = a`` and
-            ``c = b`` alone, returning ``a_only_moved`` / ``b_only_moved``. What
-            each intent would have done by itself, measured rather than argued.
+        channel_counterfactuals: normalise twice more with ``c = a`` and ``c = b``
+            alone, returning ``a_only_moved`` / ``b_only_moved``. What each intent
+            would have done by itself, measured rather than argued.
 
     Returns:
-        ``{"target_logprob", "w", "c", "branch", "moved", ...}``. The support's
-        probabilities are rescaled; the tail is untouched and therefore still
-        sums with them to one.
+        ``{"target_logprob", "w", "c", "branch", "moved", "log_z", ...}``. The
+        support is tilted and the whole distribution -- tail included -- is
+        divided by ``Z``, so it still sums to one but no longer candidate by
+        candidate. ``log_z`` is the head's tax and is a first-class metric.
 
-    The support is the ON-TASK teacher's top-k, which is not a compromise: the
-    off-task teachers keep 98.4-99.3% of their own probability mass inside it
-    (measured on all six ordered pairs), so widening it would buy coverage that
-    is already there and pay for it in cache rows.
+    THE SUPPORT IS THE STUDENT'S TOP-K (revision 2, module docstring). Every model
+    is read at the ids the student just chose, which is where the reverse KL puts
+    its weight and where the candidates with high ``p_student`` and negligible
+    ``p_on`` live -- the ones a teacher top-20 cannot contain. It also makes the
+    target a function of the student, which is the feedback loop C7 was written to
+    avoid; that is the accepted cost, not an oversight.
     """
     from verl.trainer.ppo.cross_teacher_kl_weight import standardize_policy_shifts
 
@@ -272,13 +326,17 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
     p_on = on_logprob.detach().exp()
     cons = off_task_consensus(hat["off"])
     tilt = target_exponent(hat_on=hat["on"], consensus=cons, exponent_scale=exponent_scale)
-    built = capacity_limited_weight(c=tilt["c"], p_on=p_on, row_available=hat["row_available"])
+    built = normalized_weight(c=tilt["c"], p_on=p_on, row_available=hat["row_available"])
 
     out = {
-        "target_logprob": on_logprob + built["w"].to(on_logprob.dtype).clamp(min=_LOG_FLOOR).log(),
-        "w": built["w"], "c": tilt["c"], "a": tilt["a"], "b": tilt["b"],
+        # log_w, not log(w): the subtraction is done in float64 and cast once, and
+        # it is exactly 0.0 wherever the mechanism did not act, so an inert
+        # position hands the loss the on-task teacher's own bits.
+        "target_logprob": on_logprob + built["log_w"].to(on_logprob.dtype),
+        "w": built["w"], "log_w": built["log_w"], "c": tilt["c"],
+        "a": tilt["a"], "b": tilt["b"],
         "branch": tilt["branch"], "moved": built["moved"], "live": built["live"],
-        "throttle_up": built["throttle_up"], "throttle_down": built["throttle_down"],
+        "log_z": built["log_z"], "inv_z": built["inv_z"], "tail": built["tail"],
         "clamped": built["clamped"], "p_on": p_on,
         "consensus_volume": cons["L"], "consensus_sign": cons["s"],
         "row_available": hat["row_available"],
@@ -293,11 +351,11 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
             consensus=off_task_consensus(decorrelated_off_shifts(hat["off"], response_mask)),
             exponent_scale=exponent_scale,
         )["c"]
-        out["shuffled_moved"] = capacity_limited_weight(
+        out["shuffled_moved"] = normalized_weight(
             c=sh_c, p_on=p_on, row_available=hat["row_available"])["moved"]
     if channel_counterfactuals:
         for name in ("a", "b"):
-            out[f"{name}_only_moved"] = capacity_limited_weight(
+            out[f"{name}_only_moved"] = normalized_weight(
                 c=tilt[name], p_on=p_on, row_available=hat["row_available"])["moved"]
     return out
 
@@ -340,12 +398,19 @@ def sign_state_labels(branch: torch.Tensor, consensus_sign: torch.Tensor) -> tor
 class TargetStepStats:
     """The step's gates and pre-registered numbers, as one reduced table.
 
-    Everything in here answers a question the design document asked in advance
-    -- docs/cross_teacher_target_design.md pre-registers target_tv = 0.019, the
-    branch split 0.871/0.129, and the abort gates G1-G4 -- so the class is the
-    run's side of that appointment. Only what no existing metric carries: the
-    per-task teacher KL, the episode metrics and the RMS trajectory are already
-    logged elsewhere.
+    Everything in here answers a question the design document asked in advance,
+    so the class is the run's side of that appointment. Only what no existing
+    metric carries: the per-task teacher KL, the episode metrics and the RMS
+    trajectory are already logged elsewhere.
+
+    THE PRE-REGISTERED NUMBERS ARE VOID. ``target_tv = 0.019`` and the branch
+    split ``0.871/0.129`` were computed on the mass-conserving exchange over a
+    TEACHER-indexed support, and the revision changed both. They are not restated
+    here as expectations, and the run log no longer prints them: a stale
+    pre-registration is worse than none, because it reads as a violation whenever
+    the mechanism is merely different. The gates G1-G3 survive unchanged --
+    ``shuffled_tv_ratio``, ``acted_novelty`` and ``tag_share`` are ratios of the
+    mechanism against itself and do not depend on how ``w`` was built.
 
     Scope 0 is the pooled batch; scope 1 + t is task t. float64 sums, one
     all_reduce at step end (SUM for the sums, MAX for the two maxima), rendered
@@ -354,13 +419,20 @@ class TargetStepStats:
 
     _SUMS = (
         "n_pos",              # response-masked positions
-        "moved",              # sum of per-position exchanged mass = TV
+        "moved",              # sum of per-position TV(p_tilde, p_on), tail included
         "shuffled_moved",     # same, from the position-decorrelated teachers (G1)
         "a_only_moved",       # corroboration channel alone
         "b_only_moved",       # fallback channel alone
-        "live_n",             # positions where an exchange actually ran
-        "throttle_up",        # sum over live positions of T / A_U
-        "throttle_down",      # sum over live positions of T / R_D
+        "live_n",             # positions the mechanism actually tilted
+        "log_z",              # sum over live positions of log Z -- the head's tax
+        # The change this arm makes to the loss, IN THE PREDECESSOR'S UNITS:
+        # dKL = KL(p_s||p_tilde) - KL(p_s||p_on) = log Z - <c>_{p_s}, nats. This
+        # is the number that decides whether the scale reached the predecessor's,
+        # so it is measured rather than inferred from c. Signed and absolute both:
+        # the signed mean says which way the target moved on average, the absolute
+        # one is what compares against the old arm's per-position magnitude.
+        "dkl",
+        "abs_dkl",
         "clamped",            # candidates whose |c| hit the exponent clamp
         "n_cand",             # masked candidates
         "mass",               # sum p_on over masked candidates
@@ -372,7 +444,10 @@ class TargetStepStats:
         "tag_intervention",   # the same, restricted to TAG_TOKEN_IDS (G3)
         "d_on",               # per-position KL(student || on-task), live positions
         "d_base",             # per-position KL(student || base), live positions (G2)
-        "mass_error",         # sum |sum_v (w-1) p_on(v)| -- the Z = 1 identity
+        # sum |sum_S w p_on + p_tail/Z - 1|. Under the exchange this measured the
+        # Z = 1 identity; under normalisation Z = 1 is false by design and what is
+        # asserted instead is that p_tilde is a distribution at all.
+        "mass_error",
         # branch reach, candidate count and teacher mass per branch: the audit's
         # "read frac and mass_frac as a pair" rule, kept as one (4.3% of
         # candidates carried 64.7% of mass on the old arm).
@@ -386,6 +461,7 @@ class TargetStepStats:
         self.sums = torch.zeros((self.n_scopes, len(self._SUMS)),
                                 dtype=torch.float64, device=device)
         self.max_log_w = torch.zeros(1, dtype=torch.float64, device=device)  # G4
+        self.max_log_z = torch.zeros(1, dtype=torch.float64, device=device)
         self.max_mass_error = torch.zeros(1, dtype=torch.float64, device=device)
 
     def _col(self, name):
@@ -395,6 +471,7 @@ class TargetStepStats:
                response_mask: torch.Tensor, task_ids: Optional[torch.Tensor],
                d_on: Optional[torch.Tensor] = None,
                d_base: Optional[torch.Tensor] = None,
+               student_logprob: Optional[torch.Tensor] = None,
                tag_token_ids=TAG_TOKEN_IDS) -> None:
         m_pos = response_mask.to(torch.float64)                       # (bs, resp)
         m_cand = m_pos.unsqueeze(-1)                                  # (bs, resp, 1)
@@ -408,14 +485,18 @@ class TargetStepStats:
             tag |= support_ids == tid
         acted = (c != 0).to(torch.float64) * m_cand
         inter = (w - 1.0).abs() * p * m_cand
-        # The identity, measured: sum_v (w - 1) p must be zero per position.
-        pos_err = ((w - 1.0) * p).sum(dim=-1).abs() * m_pos
+        log_z = built["log_z"].to(torch.float64)
+        # p_tilde is a distribution, measured: the support's rescaled mass plus
+        # the rescaled tail must be one. Not the Z = 1 identity the exchange had
+        # -- Z is deliberately not 1 here -- but still an assertion, not a metric.
+        pos_err = (
+            (w * p).sum(dim=-1) + built["tail"].to(torch.float64) * built["inv_z"].to(torch.float64) - 1.0
+        ).abs() * m_pos
 
         cols = {
             "n_pos": m_pos, "moved": built["moved"].to(torch.float64) * m_pos,
             "live_n": live,
-            "throttle_up": built["throttle_up"].to(torch.float64) * live,
-            "throttle_down": built["throttle_down"].to(torch.float64) * live,
+            "log_z": log_z * live,
             "clamped": built["clamped"].to(torch.float64).sum(dim=-1) * m_pos,
             "n_cand": m_cand.expand_as(p).to(torch.float64),
             "mass": p * m_cand, "acted_cand": acted, "acted_mass": p * acted,
@@ -431,6 +512,16 @@ class TargetStepStats:
         if d_on is not None:
             cols["d_on"] = d_on.detach().to(torch.float64) * live
             cols["d_base"] = d_base.detach().to(torch.float64) * live
+        if student_logprob is not None:
+            # dKL = -sum_S p_s log w + p_s,tail log Z, which telescopes to
+            # log Z - <c>_{p_s}. Read off log_w rather than c so the clamp and the
+            # cold-start no-op are already in it: this is what the loss saw, not
+            # what the tilt asked for.
+            p_s = student_logprob.detach().to(torch.float64).exp()
+            tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=0.0)
+            dkl = -(p_s * built["log_w"].to(torch.float64)).sum(dim=-1) + tail_s * log_z
+            cols["dkl"] = dkl * m_pos
+            cols["abs_dkl"] = dkl.abs() * m_pos
         branch = built["branch"]
         for i in range(4):
             sel = (branch == i).to(torch.float64) * m_cand
@@ -448,9 +539,11 @@ class TargetStepStats:
                 self.sums[:, self._col(k)].index_add_(
                     0, t.clamp(min=0)[known] + 1, per_row[known]
                 )
-        log_w = w.clamp(min=_LOG_FLOOR).log().abs()
+        abs_log_w = built["log_w"].to(torch.float64).abs()
         self.max_log_w = torch.maximum(
-            self.max_log_w, (log_w * m_cand).max().reshape(1).to(torch.float64))
+            self.max_log_w, (abs_log_w * m_cand).max().reshape(1).to(torch.float64))
+        self.max_log_z = torch.maximum(
+            self.max_log_z, (log_z.abs() * m_pos).max().reshape(1).to(torch.float64))
         self.max_mass_error = torch.maximum(self.max_mass_error,
                                             pos_err.max().reshape(1))
 
@@ -459,6 +552,7 @@ class TargetStepStats:
             return
         torch.distributed.all_reduce(self.sums, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(self.max_log_w, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(self.max_log_z, op=torch.distributed.ReduceOp.MAX)
         torch.distributed.all_reduce(self.max_mass_error, op=torch.distributed.ReduceOp.MAX)
 
     def metrics(self, *, task_names) -> dict:
@@ -473,8 +567,16 @@ class TargetStepStats:
             live = max(g("live_n"), 1e-12)
             out[f"{head}/tv"] = g("moved") / n_pos
             out[f"{head}/live_frac"] = g("live_n") / n_pos
-            out[f"{head}/throttle_up"] = g("throttle_up") / live
-            out[f"{head}/throttle_down"] = g("throttle_down") / live
+            # The head's tax, per live position. Zero under the exchange this
+            # replaced, and the first thing to read if the arm starts flattening
+            # the teacher instead of tilting it.
+            out[f"{head}/log_z_mean"] = g("log_z") / live
+            # What the arm did to the loss, in nats. Compare abs_dkl_mean against
+            # the predecessor weighting arm's per-position magnitude -- that
+            # comparison is the whole point of the revision.
+            out[f"{head}/dkl_mean"] = g("dkl") / n_pos
+            out[f"{head}/abs_dkl_mean"] = g("abs_dkl") / n_pos
+            out[f"{head}/abs_dkl_live_mean"] = g("abs_dkl") / live
             out[f"{head}/acted_cand_frac"] = g("acted_cand") / n_cand
             out[f"{head}/acted_mass_frac"] = g("acted_mass") / mass
             ab = g("a_absmass") + g("b_absmass")
@@ -491,10 +593,16 @@ class TargetStepStats:
                     out[f"{head}/channel/{key}"] = g(col) / n_pos
             if g("d_base") > 0:
                 out[f"{head}/acted_novelty"] = 1.0 - g("d_on") / g("d_base")  # G2
+            # A rate now, not an alarm: at exponent_scale = 2.148 the clamp is
+            # the mechanism's only cap, so read it against the acted count.
             out[f"{head}/clamped_per_step"] = g("clamped")
+            if g("acted_cand") > 0:
+                out[f"{head}/clamped_frac_of_acted"] = g("clamped") / g("acted_cand")
             for i, name in enumerate(BRANCHES):
                 out[f"{head}/branch/{name}/cand_frac"] = g(f"branch{i}_cand") / n_cand
                 out[f"{head}/branch/{name}/mass_frac"] = g(f"branch{i}_mass") / mass
         out["target/max_abs_log_w"] = float(self.max_log_w.item())            # G4
-        out["target/mass_error_max"] = float(self.max_mass_error.item())      # Z = 1
+        out["target/max_abs_log_z"] = float(self.max_log_z.item())
+        # sum p_tilde = 1, which is construction, so this is an assertion.
+        out["target/mass_error_max"] = float(self.max_mass_error.item())
         return out
