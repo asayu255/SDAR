@@ -238,9 +238,14 @@ class OPDRayTrainer(RayPPOTrainer):
         # 7.2): a chunk's activations sit next to a live vLLM KV pool.
         #
         # What changed is that the hidden-state cache no longer piles up beside
-        # them -- put() copies to pinned host as it goes, and teacher_cache/device_gb
+        # them -- put() copies to host memory as it goes, and teacher_cache/device_gb
         # reads 0.000 on the first run to carry it, against a teacher_cache/gb of
         # ~15. That is 7-8 GB a card the window did not have before.
+        #
+        # It buys card headroom and it is NOT free elsewhere: those bytes are now
+        # the node's. Read perf/pinned_host_gb and the host RAM alongside this one
+        # -- the first run to carry the offload was killed by Ray's node-memory
+        # threshold, not by a card.
         #
         # It is worth spending because the window path is where the work IS now.
         # Prefetching the sign planes took sign_weight_forward from 143 s to 2.5 s
@@ -1358,7 +1363,7 @@ class OPDRayTrainer(RayPPOTrainer):
                             metrics["teacher_cache/rows"] = sum(r["rows"] for r in per_rank)
                             metrics["teacher_cache/gb"] = sum(r["bytes"] for r in per_rank) / 1e9
                             # What of that is still on the CARD. Since put() copies
-                            # to pinned host as it goes, this should be ~0 between
+                            # to host memory as it goes, this should be ~0 between
                             # calls; it is the number that says the offload is
                             # actually happening during the rollout rather than at
                             # the first read inside the update.

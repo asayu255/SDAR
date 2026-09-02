@@ -81,9 +81,25 @@ _OFFLOAD = os.environ.get("TEACHER_CACHE_OFFLOAD", "1").strip().lower() not in (
 # _projection_rows. Above what the arm asks for today, so it changes nothing
 # until the micro batch or the support grows.
 _PROJ_CHUNK_BYTES = int(float(os.environ.get("TEACHER_PROJ_CHUNK_MB", "64")) * (1 << 20))
+# WHETHER THE OFFLOADED STORE IS PAGE-LOCKED. On by default because that is what
+# makes the per-micro-batch pull a DMA the copy engine can overlap, and the store
+# is pulled from thousands of times a step.
+#
+# It is off-able because the page-locked cost is not the store's size. torch
+# rounds a pinned request up to a power of two and never gives the block back, so
+# a store that swings 7.0-10.3 GB a rank (teacher_cache/gb 14.0-20.7 over run
+# n9zfny6m) settles into an 8.6 GiB block AND a 17.2 GiB one: ~24 GiB a rank,
+# ~48 GB on a two-card box, for 9.6 GiB of data. On tamago that is a fifth of the
+# node, and the node is what run e8x57zyu died on.
+#
+# Unpinned the store is ordinary host memory the OS takes back, and _read_packed's
+# copies become staged and synchronous -- ~1-2% of a step by the shapes here.
+# That is a trade to make when host RAM is the binding constraint, which is why it
+# is a knob and not a rewrite.
+_PIN_STORE = os.environ.get("TEACHER_CACHE_PIN_STORE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-def store_placement(offload: bool, read_device, cuda_available: Optional[bool] = None):
+def store_placement(offload: bool, read_device, cuda_available: Optional[bool] = None, pin: Optional[bool] = None):
     """``(store_device, pin_memory, index_device)`` for a finalized store.
 
     A function, and not three expressions inline in ``_finalize``, because a CPU
@@ -98,15 +114,19 @@ def store_placement(offload: bool, read_device, cuda_available: Optional[bool] =
     exists to avoid.
 
     Pinning is a property of the READ device: it only buys a DMA, and
-    ``torch.empty(pin_memory=True)`` raises outright with no CUDA driver.
+    ``torch.empty(pin_memory=True)`` raises outright with no CUDA driver. It is
+    also a property of how much host RAM there is to spend -- see ``_PIN_STORE``,
+    which ``pin`` overrides for tests.
     """
     read = torch.device(read_device)
     if cuda_available is None:
         cuda_available = torch.cuda.is_available()
+    if pin is None:
+        pin = _PIN_STORE
     if not offload:
         return read, False, read
     host = torch.device("cpu")
-    return host, bool(read.type == "cuda" and cuda_available), host
+    return host, bool(pin and read.type == "cuda" and cuda_available), host
 
 
 _PROCESS_CACHE: Optional["TeacherHiddenCache"] = None
@@ -519,18 +539,33 @@ class TeacherHiddenCache:
             )
 
     def _to_host(self, t: torch.Tensor) -> torch.Tensor:
-        """A host copy of ``t``, pinned when a DMA can use it.
+        """A host copy of ``t``. PAGEABLE, and that is the whole point.
 
-        Pinned matters twice over: the copy out of device memory is a DMA rather
-        than a staged pageable transfer, and the copy back in -- which
-        ``_read_packed`` does once per micro-batch of every training step -- is
-        one the copy engine can overlap. Falls back to pageable if pinning is
-        refused, because a cache that cannot pin is still a cache.
+        This chunk is written once and read twice: ``check_witness`` samples a
+        row or two, and ``_finalize`` copies it into the contiguous store and
+        drops it. Nothing else ever touches it -- ``_read_packed``, which runs
+        once per micro-batch of every training step, pulls from ``final["h"]``,
+        a SEPARATE tensor that is pinned on its own account. So pinning here
+        would buy a DMA on one copy per chunk and nothing after that.
+
+        What it costs is unbounded. torch's pinned allocator rounds every request
+        up to the next power of two, keys its free list by that bucket, and NEVER
+        returns a block to the OS -- on torch 2.8 (what setup.py pins) unconditionally,
+        and on 2.14 unless ``pinned_max_cached_size`` is set, which defaults to
+        SIZE_MAX. ``put`` runs many times a step -- once per teacher per prefetch
+        window -- with a different row count each time, and every chunk stays live
+        until ``_finalize`` drains it, so the pool has to hold all of them at once
+        and grows to the worst arrangement any step has yet produced. Measured:
+        host RAM went from +0.37 GB/step (run n9zfny6m, 148 steps, plateauing) to
+        +5.06 GB/step (run e8x57zyu), which took the node from 207 GB at step 1 to
+        Ray's 0.98 kill threshold at step 10.
+
+        Pageable host memory goes through the ordinary allocator, which hands
+        large blocks back at free. The copy is a staged transfer instead of a DMA:
+        ~8 GB a rank a step at a few GB/s, on the prefetch thread inside the
+        rollout's CPU glue, against a step of ~250 s.
         """
-        try:
-            out = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=t.device.type == "cuda")
-        except RuntimeError:
-            out = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+        out = torch.empty(t.shape, dtype=t.dtype, device="cpu")
         out.copy_(t)
         return out
 
@@ -578,6 +613,11 @@ class TeacherHiddenCache:
         between calls, and reporting the total under a name that used to mean
         "device" would read as a regression that is in fact the fix. Both numbers
         are logged, as ``teacher_cache/gb`` and ``teacher_cache/device_gb``.
+
+        Neither is the PAGE-LOCKED footprint, and they should not be read as it:
+        torch rounds a pinned request up to a power of two and keeps the block, so
+        the store's 9.6 GB is 17.2 GB of pinned pages. That number is
+        ``perf/pinned_host_gb``.
 
         Worth a number rather than an estimate because the sign-weighting arms
         multiply it: they cache the base policy and each off-task teacher besides
@@ -641,8 +681,10 @@ class TeacherHiddenCache:
         offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
         total = int(lens.sum())
         probe = self._h[keys[0]]
-        # Pinned host memory when offloading, so the per-micro-batch pull is a DMA
-        # the copy engine can overlap rather than a staged pageable copy.
+        # Pinned host memory when offloading, because THIS is the tensor the
+        # micro-batch loop pulls from -- once per micro batch of every training
+        # step, which is where a DMA the copy engine can overlap is worth having.
+        # (The put() chunks are not: they are read once and dropped. See _to_host.)
         store_dev, pin, _index_dev = store_placement(self._offload, device)
         store_h = torch.empty(
             (total, probe.shape[-1]), dtype=probe.dtype, device=store_dev, pin_memory=pin

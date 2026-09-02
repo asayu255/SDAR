@@ -1866,3 +1866,77 @@ def test_device_only_bytes_exclude_what_has_already_crossed():
     _put_one(cache)
     assert cache.nbytes() > 0
     assert cache.nbytes(device_only=True) == 0
+
+
+# --------------------------------------------------------------------------- #
+# 13. what page-locked memory costs
+#
+# torch's pinned allocator (CachingHostAllocator) rounds every request up to the
+# next power of two, keys its free list by that bucket, and never hands a block
+# back to the OS. So pinned memory is a RATCHET over the distinct bucket sizes a
+# process
+# has ever asked for, it never shows up in any CUDA memory counter, and it lands
+# in RSS, where Ray's node-memory monitor kills at 0.98.
+#
+# Run e8x57zyu died there at step 10: put() had started pinning its per-call
+# chunks, and host RAM went from +0.37 GB/step (run n9zfny6m, 148 steps) to
+# +5.06 GB/step, off a baseline already 24 GB higher.
+#
+# The two tests below pin the two halves of the answer -- don't pin what is read
+# once, and ask for the same SIZE every step for what is read a thousand times.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_per_call_chunks_are_not_page_locked():
+    """They are written once and read twice -- check_witness samples a row,
+    _finalize copies them into the store and drops them. The tensor the micro-batch
+    loop actually pulls from is final["h"], which is pinned on its own account."""
+    cache = TeacherHiddenCache()
+    cache._offload = True
+    _put_one(cache)
+    for tensors in cache._chunks.values():
+        for t in tensors:
+            assert not t.is_pinned(), "a put() chunk is page-locked; the pool never gives that back"
+    # Honest about its reach: a box with no driver cannot pin anything, so this
+    # only bites where it can. The rounding test below is the one that holds on
+    # CPU, because a request SIZE is visible whether or not it can be page-locked.
+
+
+def test_the_store_can_be_taken_off_page_locked_memory():
+    """The page-locked cost is not the store's size. torch rounds a pinned request
+    up to a power of two and keeps the block, so a store that swings 7.0-10.3 GB a
+    rank settles into an 8.6 GiB block AND a 17.2 GiB one -- ~48 GB on this box for
+    9.6 GiB of data. That is a fifth of the node run e8x57zyu died on, so it has to
+    be spendable back when host RAM is what binds.
+
+    Checked through store_placement, because on a box with no driver every branch
+    collapses to the same answer and a test that only looks at where the tensors
+    landed passes just as happily when the knob does nothing (the reason that
+    function exists at all).
+    """
+    from verl.workers.teacher_cache import store_placement
+
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=True, pin=True)
+    assert (store.type, pin, index.type) == ("cpu", True, "cpu")
+
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=True, pin=False)
+    assert (store.type, index.type) == ("cpu", "cpu"), "unpinning must not move the store"
+    assert pin is False
+
+    # Resident is unaffected: there is nothing to page-lock either way.
+    assert store_placement(False, "cuda:0", cuda_available=True, pin=True)[1] is False
+    assert store_placement(False, "cuda:0", cuda_available=True, pin=False)[1] is False
+
+
+def test_the_pin_knob_defaults_to_on(monkeypatch):
+    """Off by accident would be a silent throughput regression in the micro-batch
+    loop, so the default is the DMA and the saving is opt-in."""
+    import verl.workers.teacher_cache as tc
+
+    assert tc._PIN_STORE is True, "TEACHER_CACHE_PIN_STORE must default to on"
+    assert tc.store_placement(True, "cuda:0", cuda_available=True)[1] is True
+
+    monkeypatch.setattr(tc, "_PIN_STORE", False)
+    assert tc.store_placement(True, "cuda:0", cuda_available=True)[1] is False
+    # An explicit argument still wins, so the knob cannot silently override a caller.
+    assert tc.store_placement(True, "cuda:0", cuda_available=True, pin=True)[1] is True

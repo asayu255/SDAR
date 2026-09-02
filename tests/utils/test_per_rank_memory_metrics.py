@@ -73,16 +73,20 @@ def test_without_distributed_it_reports_this_ranks_own_numbers():
     assert not [k for k in m if "rank" in k]     # no per-rank keys to mislead
 
 
+_WIDTH = 5  # allocated, reserved, retries, ooms, pinned_host
+
+
 def _fake_all_gather(per_rank):
     """Stand in for torch.distributed with a fixed set of per-rank readings.
 
-    Each entry is (allocated, reserved) or (allocated, reserved, retries, ooms).
+    Each entry is a prefix of (allocated, reserved, retries, ooms, pinned_host);
+    whatever it leaves off reads as zero, so a test only says what it is about.
     """
 
     def all_gather(out_list, local, *a, **kw):
         for tensor, row in zip(out_list, per_rank):
-            row = tuple(row) + (0.0, 0.0)
-            tensor.copy_(torch.tensor(row[:4], dtype=tensor.dtype))
+            row = (tuple(row) + (0.0,) * _WIDTH)[:_WIDTH]
+            tensor.copy_(torch.tensor(row, dtype=tensor.dtype))
 
     return all_gather
 
@@ -357,3 +361,71 @@ def test_the_lifetime_mark_still_climbs_with_a_new_peak():
 def test_without_any_window_the_lifetime_mark_is_the_counter():
     """A run that never opens a window has to read exactly as it did before."""
     assert per_rank_memory_metrics(_Device(39.877, 45.5))["perf/max_memory_allocated_gb"] == pytest.approx(39.877)
+
+
+# --------------------------------------------------------------------------- #
+# Page-locked HOST memory, which none of the above can see.
+#
+# Run e8x57zyu was killed by Ray's node-memory monitor at step 10 while every
+# perf/* key sat flat, because every perf/* key was about the card. The pinned
+# pool is a ratchet -- torch rounds each request to a power of two, keys its free
+# list by that bucket, and never gives a block back to the OS -- and it lands in
+# RSS, which is what Ray counts.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_pinned_pool_is_summed_across_ranks_not_maxed(dist3):
+    """The one reduction in this file that is not a max, and deliberately: pinned
+    pages are charged to the NODE, and the ranks are separate processes on one box.
+    A max would report "a rank holds 16 GB" where what kills the run is that both
+    of them do."""
+    dist3([(30.0, 36.0, 0, 0, 16.0), (30.0, 36.0, 0, 0, 15.0), (30.0, 36.0, 0, 0, 8.0)])
+    m = per_rank_memory_metrics(_Device(30.0, 36.0))
+
+    assert m["perf/pinned_host_gb/rank0"] == pytest.approx(16.0)
+    assert m["perf/pinned_host_gb/rank2"] == pytest.approx(8.0)
+    assert m["perf/pinned_host_gb"] == pytest.approx(39.0)
+    # And it is not quietly the max under a summed name.
+    assert m["perf/pinned_host_gb"] != pytest.approx(16.0)
+
+
+def test_a_single_process_run_still_reports_the_pinned_pool():
+    m = per_rank_memory_metrics(_Device(39.877, 45.5))
+    assert "perf/pinned_host_gb" in m
+    assert m["perf/pinned_host_gb"] >= 0.0
+
+
+def test_the_pinned_reading_never_takes_a_run_down(monkeypatch):
+    """A backend with no host_memory_stats, or a torch too old for it, reports
+    zero rather than raising -- a measurement must not break what it measures."""
+    from verl.utils.metric.memory import pinned_host_bytes
+
+    def boom():
+        raise RuntimeError("no host allocator on this backend")
+
+    monkeypatch.setattr(torch.cuda, "host_memory_stats", boom)
+    assert pinned_host_bytes() == 0.0
+
+    monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {"allocated_bytes.current": 3.0 * _GB})
+    assert pinned_host_bytes() == pytest.approx(3.0 * _GB)
+    assert per_rank_memory_metrics(_Device(1.0, 2.0))["perf/pinned_host_gb"] == pytest.approx(3.0)
+
+
+def test_the_pinned_reading_finds_the_pool_under_either_torch_name(monkeypatch):
+    """torch 2.8 -- what setup.py pins -- puts the pool in reserved_bytes and the
+    handed-out part in allocated_bytes; 2.14 renamed the pool to allocated_bytes
+    and handed-out to active_bytes. A cached block is still page-locked, so it is
+    the POOL that has to be reported on both."""
+    from verl.utils.metric.memory import pinned_host_bytes
+
+    # 2.8 shape: 16 GiB pinned, 9 of it currently handed out.
+    monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {
+        "reserved_bytes.current": 16.0 * _GB, "allocated_bytes.current": 9.0 * _GB,
+    })
+    assert pinned_host_bytes() == pytest.approx(16.0 * _GB)
+
+    # 2.14 shape: the same 16 GiB, under the other name, with no reserved_bytes.
+    monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {
+        "allocated_bytes.current": 16.0 * _GB, "active_bytes.current": 9.0 * _GB,
+    })
+    assert pinned_host_bytes() == pytest.approx(16.0 * _GB)

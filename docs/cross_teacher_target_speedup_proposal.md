@@ -41,7 +41,7 @@ token-mean では行索引と行マスクは同じ数になる(除外行は分�
 | 2 | sign prefetch の辞退理由 | `_decline_sign_prefetch` が1回だけ理由を print、`sign_prefetch/enabled` を metric に | ○ |
 | 3 | per-micro-batch host sync | pooled 4 + per-task 12 を `_defer`/`_defer_present` に。bool 索引を行マスクに。`sync_free_task_metrics` から `pg_loss_coef == 0` を削除 | ○(値)/×(per-task 診断の最下位ビット) |
 | 4 | post-rollout のトークン予算 | `_teacher_call(..., budget=True)` → worker 側は `meta_info.setdefault` で caller override を許可。窓側は 4 行のまま | × |
-| 5 | cache を put 時に pinned host へ | `TeacherHiddenCache._to_host`、`teacher_cache/device_gb` を追加 | ○ |
+| 5 | cache を put 時に host へ | `TeacherHiddenCache._to_host`、`teacher_cache/device_gb` を追加。**pinned で入れて node OOM を起こし、pageable に修正 — §0.1** | ○ |
 | 6 | 学習 rollout を pump へ + join を後ろへ | `ROLLOUT_PUMP_TRAINING`、handshake が rank の `n` を報告、`_pump_will_serve` が join の位置を決める | × |
 | 7 | `ROLLOUT_PREFETCH_LOGPROB=1` | 3スクリプトで export | × |
 
@@ -55,6 +55,86 @@ token-mean では行索引と行マスクは同じ数になる(除外行は分�
 2. **`teacher_cache/device_gb`** — #5 が効いていれば ~0。ここが `teacher_cache/gb` に近ければ put の host コピーが動いていない
 3. **`perf/update_peak_allocated_gb`** — #8(KV 予算)と gradient checkpointing の判断はこれが出てから。§2.2 の「不明」がこれで潰れる
 4. 起動ログの `[rollout-pump] driver: ROLLOUT_PUMP_TRAINING=...` と、`staying on the blocking path` が**出ていないこと**
+
+---
+
+## 0.1 #5 は host RAM を食い尽くして run を殺した（`e8x57zyu` step 10）
+
+1〜7 を入れた最初の run（`asayu255-/verl_agent_opd_grpo_cross_teacher_klw_content_sg1fast/runs/e8x57zyu`、
+commit `600f16f`）は **step 10 の rollout 中に Ray の node-memory monitor に殺された**
+（246.49 / 251.52 GB = 0.980、`RAY_memory_usage_threshold=0.98`）。カードではなく**ホスト**である。
+
+### 数字
+
+| | `n9zfny6m`（旧コード、148 step） | `e8x57zyu`（1〜7 込み、8 step） |
+|---|---|---|
+| `perf/cpu_memory_used_gb` step 1 | 183.9 | **207.6**（+23.7） |
+| 同 増加率 | +0.370 GB/step（step 141 付近で 238 GB に頭打ち） | **+5.057 GB/step** |
+| 到達点 | 238.2 GB = 94.6%（0.98 の下を 8.5 GB で通過） | step 9 で 245.9、step 10 で kill |
+| `teacher_cache/gb` | 14.0–20.7 | 14.6–17.3 |
+| `teacher_cache/device_gb` | （キーなし） | **0.000** — #5 は意図どおり動いていた |
+
+`perf/*` は全 step 平坦だった。**当然で、`perf/*` は全部カードの話だったからである。**
+
+### 機構
+
+torch の pinned allocator（`CachingHostAllocator`）は3つのことを同時にやる:
+
+1. すべての要求を**次の2の冪に切り上げる**（`PowerOf2Ceil`）
+2. free list を**その bucket で索引する** — 同じ bucket に落ちた要求しか再利用できない
+3. **OS に返さない** — 解放されたブロックは永遠に free list に残る（torch 2.8 では無条件。
+   `setup.py` が pin しているのは 2.8 で、実行機はこれ。2.14 でも `pinned_max_cached_size` の既定が
+   `SIZE_MAX` なので同じ）
+
+つまり pinned メモリは「これまでに要求した相異なる bucket サイズの総和」というラチェットで、
+**CUDA のどのメモリ指標にも現れず**、RSS に出る。RSS を見ているのは Ray である。
+
+`_to_host` は `put()` ごとに pinned buffer を1つ取っていた。`put()` は step あたり何度も走る
+（teacher × prefetch window）、行数は毎回違う、そして chunk は `_finalize` が吸い出すまで**全部同時に生きている**。
+pool はその全部を同時に抱えられる大きさまで育ち、以後どの step でも縮まない。これが +5.06 GB/step である。
+step 1 の +23.7 GB は、`_finalize` の store に**もう一世代分**が積まれた分にあたる。
+
+### 直したこと
+
+**1. `put()` の chunk は pinned をやめた（pageable にした）。** この chunk は1回書いて2回読むだけ
+（`check_witness` が1行、`_finalize` が写して捨てる）。micro-batch ループが毎回引くのは `final["h"]` —
+**別のテンソル**で、そちらは自前で pinned のままである。つまり chunk の pin が買っていたのは
+「chunk あたり1回の DMA」だけで、払っていたのは返ってこない page-locked ブロックだった。
+pageable の staged copy は ~8 GB/rank/step、driver の bounce buffer 経由で数 GB/s なので 2 秒前後。
+rollout の CPU glue の中の prefetch thread 上で走り、step は 250 s である。
+（pageable は glibc が mmap で取って free で munmap するので、OS に返る。）
+
+**2. store の pin を外せるようにした（`TEACHER_CACHE_PIN_STORE`、既定 on）。** page-locked の
+コストは store のサイズではない。torch は2の冪に丸めてブロックを返さないので、rank あたり
+7.0–10.3 GB を振れる store（`teacher_cache/gb` 14.0–20.7）は 8.6 GiB のブロックと 17.2 GiB の
+ブロックの**両方**に落ち着く — 9.6 GiB のデータに対して rank あたり ~24 GiB、2枚で ~48 GB。
+tamago ではノードの5分の1で、そのノードが `e8x57zyu` を殺した側である。
+
+これは #5 以前からある。ただし**これは `n9zfny6m` の +0.370 GB/step の説明にはならない**:
+上の 24 GiB は数 step で頭打ちになる定数であって、147 step かけて 54 GB 登るものではない。
+step 1 の 183.9 GB には既にその1つ目のブロックが入っている。したがって sg1 の漸増は
+**teacher cache ではない**（env worker / webshop JVM / Ray object store のいずれか）。
+今回は測っていないので、そこは分かっていないと書いておく。
+
+（最初は「step 間で要求サイズを単調な2の冪に固定すれば pool が1ブロックで済む」という
+修正を書いたが、torch 2.8 の allocator をそのままシミュレートしたら pool 合計は
+24.0 GiB のまま**変わらなかった** — 単調な mark でも 8.6 → 17.2 と登る途中で 8.6 が孤児に
+なるので、bucket を交互に使う今と総和が同じになる。根拠が消えたので入れていない。）
+
+pin を外すと store は OS が回収する普通のホストメモリになり、`_read_packed` のコピーは
+staged / 同期になる。ここの形状だと step の 1〜2% 程度。**host RAM が律速のときに払う価値のある
+トレードで、そうでないときは払う必要がない**ので knob にしてある。
+
+**3. `perf/pinned_host_gb` を足した。** これが無かったから見えなかった。
+rank ごとと**合計**を出す（このファイルで唯一 max ではない reduction — page-locked ページはノードに
+課金され、rank は同じ箱の別プロセスだからである）。
+
+### 走らせる前に読む指標(追加)
+
+5. **`perf/pinned_host_gb`** — step 間で増え続けるなら、どこかがまた pinned を掴んで離していない。
+   `perf/cpu_memory_used_gb` と並べて見ること
+6. **`perf/cpu_memory_used_gb`** — `n9zfny6m` ですら 238 GB / 94.6% まで行っている。0.98 との余裕は
+   もともと 8.5 GB しかない
 
 ---
 

@@ -34,9 +34,15 @@ exactly that. The caching allocator gives the peak back only where
 the training path, so ``nvidia-smi`` shows a ratchet across a step: whatever a
 rank once reached during the update, it keeps until the next generation.
 
-One all-gather of four floats per step is what makes any of that visible.
+One all-gather of five floats per step is what makes any of that visible.
 
-The other two floats are the allocator's own counters. ``num_alloc_retries``
+The last of the five is not about the card at all. ``pinned_host_bytes`` reports
+the page-locked HOST pool, which every other counter here is blind to and which
+no CUDA metric can see -- and which is what actually killed run e8x57zyu, at
+Ray's node-memory threshold rather than on a GPU. It is summed across ranks
+rather than maxed, because that memory is charged to the box the ranks share.
+
+Two more of the five are the allocator's own counters. ``num_alloc_retries``
 increments every time a malloc could not be served from the cache and the
 allocator had to release cached blocks back to the driver and try again -- and
 ``cudaFree`` synchronizes the device, so each retry is a full queue drain in the
@@ -48,7 +54,10 @@ one step further along: an allocation that failed even after the retry.
 
 import torch
 
-__all__ = ["per_rank_memory_metrics", "device_footprint_gb", "reset_phase_peak", "phase_peak_metrics"]
+__all__ = [
+    "per_rank_memory_metrics", "device_footprint_gb", "reset_phase_peak", "phase_peak_metrics",
+    "pinned_host_bytes",
+]
 
 _GB = 1024.0**3
 
@@ -71,6 +80,45 @@ def _allocator_counters(device) -> tuple:
     except Exception:
         return 0.0, 0.0
     return float(stats.get("num_alloc_retries", 0)), float(stats.get("num_ooms", 0))
+
+
+def pinned_host_bytes() -> float:
+    """Page-locked HOST memory torch's pinned pool owns -- handed out and cached.
+
+    The counter this file was missing, and the one that would have named a crash.
+    Pinned memory is not the process's to give back: ``CachingHostAllocator``
+    rounds every request up to a power of two, keys its free list by that bucket,
+    and does not return blocks to the OS (on torch 2.8 at all; on 2.14 only above
+    ``pinned_max_cached_size``, SIZE_MAX by default). So the pool is a ratchet over
+    the distinct bucket sizes a run has ever asked for, it is invisible to every
+    CUDA memory metric above, and RSS is where it shows up -- next to Ray's own
+    accounting, which kills the node at ``RAY_memory_usage_threshold``.
+
+    That is how run e8x57zyu died at step 10: the teacher cache had started pinning
+    its per-put chunks, host RAM climbed 5.06 GB a step from 207 GB, and nothing in
+    ``perf/*`` moved, because everything in ``perf/*`` was about the card.
+
+    TWO KEYS, because torch renamed the one that means "the pool". On 2.8 --
+    which is what setup.py pins, so it is what the runs are on -- ``getStats``
+    fills ``reserved_bytes`` from the slow-path counter ("bytes reserved by this
+    allocator, both free and used") and ``allocated_bytes`` from the per-bucket
+    handed-out counters, which drop when a block goes back on the free list. On
+    2.14 ``allocated_bytes`` IS the pool (active + cached) and handed-out moved to
+    ``active_bytes``. Taking the larger reads the pool on either, and the pool is
+    the number: a cached block is still page-locked, and the OS still cannot have
+    it back.
+
+    Both are at the ROUNDED block size, which is what was actually taken. 0.0 on
+    any backend without the counters, so a diagnostic never takes a run down.
+    """
+    try:
+        stats = torch.cuda.host_memory_stats()
+    except Exception:  # noqa: BLE001 - a measurement must not break what it measures
+        return 0.0
+    return max(
+        float(stats.get("reserved_bytes.current", 0.0) or 0.0),
+        float(stats.get("allocated_bytes.current", 0.0) or 0.0),
+    )
 
 
 def reset_phase_peak(device) -> None:
@@ -144,6 +192,7 @@ def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
     allocated = max(device.max_memory_allocated(), _LIFETIME[0]) / _GB
     reserved = max(device.max_memory_reserved(), _LIFETIME[1]) / _GB
     retries, ooms = _allocator_counters(device)
+    pinned = pinned_host_bytes() / _GB
 
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return {
@@ -151,25 +200,31 @@ def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
             f"{prefix}/max_memory_reserved_gb": reserved,
             f"{prefix}/max_alloc_retries": retries,
             f"{prefix}/max_alloc_ooms": ooms,
+            f"{prefix}/pinned_host_gb": pinned,
         }
 
     world_size = torch.distributed.get_world_size()
-    local = torch.tensor([allocated, reserved, retries, ooms], dtype=torch.float64,
+    local = torch.tensor([allocated, reserved, retries, ooms, pinned], dtype=torch.float64,
                          device=device.current_device())
     gathered = [torch.empty_like(local) for _ in range(world_size)]
     torch.distributed.all_gather(gathered, local)
     rows = [g.tolist() for g in gathered]
 
     metrics = {}
-    for rank, (alloc, res, retry, oom) in enumerate(rows):
+    for rank, (alloc, res, retry, oom, pin) in enumerate(rows):
         metrics[f"{prefix}/memory_allocated_gb/rank{rank}"] = alloc
         metrics[f"{prefix}/memory_reserved_gb/rank{rank}"] = res
         metrics[f"{prefix}/alloc_retries/rank{rank}"] = retry
         metrics[f"{prefix}/alloc_ooms/rank{rank}"] = oom
+        metrics[f"{prefix}/pinned_host_gb/rank{rank}"] = pin
     allocs = [r[0] for r in rows]
     reserveds = [r[1] for r in rows]
     metrics[f"{prefix}/max_alloc_retries"] = max(r[2] for r in rows)
     metrics[f"{prefix}/max_alloc_ooms"] = max(r[3] for r in rows)
+    # SUMMED, not maxed, and that is the point: page-locked memory is charged to
+    # the NODE, and the ranks are separate processes on one box. The max would say
+    # "one rank holds 16 GB" where what kills the run is that two of them do.
+    metrics[f"{prefix}/pinned_host_gb"] = sum(r[4] for r in rows)
     # Named so reduce_metrics' key convention ("max" -> np.max, "min" -> np.min)
     # is right rather than merely harmless: these already ARE the cross-rank
     # extremes, and reducing a scalar leaves them alone.
