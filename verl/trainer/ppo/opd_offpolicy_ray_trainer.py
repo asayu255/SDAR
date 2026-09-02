@@ -24,8 +24,23 @@ Two stages, sharing all data / env / config / teacher / loss machinery with OPD:
   no teacher forward pass happen during training — the teacher top-k is already
   baked into the dataset. Only validation rolls the student out (identical to
   OPD via the inherited ``_validate``).
+
+One knob moves Stage 2 off that description: ``actor.student_indexed_topk``. It
+takes the KL's support from the STUDENT's top-k instead of the teacher's, which
+is a tighter lower bound on the same full reverse KL — the mass the bound drops
+is weighted by the student's tail, so a support chosen by the teacher leaves the
+student's own drift outside it. A support the student picks cannot be answered
+from a top-k baked in before the student existed, so in that mode the teachers
+are loaded here and score the step's own rows just before the update, keeping
+their hidden states rather than their top-k (``verl/workers/teacher_cache.py``).
+
+That is one teacher forward per row for the whole run, because the loop draws
+each pool row about once: 36,000 trajectories per task at 120 a step is 300
+steps. The same teacher compute one re-scoring pass over the pool would cost,
+except evaluated where the student actually put its mass.
 """
 
+import copy
 import glob
 import os
 import queue
@@ -35,10 +50,13 @@ from pprint import pprint
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.protocol import DataProtoConfig
+from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
+from verl.single_controller.ray import RayClassWithInitArgs
+from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -47,6 +65,7 @@ from verl.trainer.ppo.opd_ray_trainer import compute_opd_data_metrics, compute_o
 from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
+    Role,
     _timer,
     compute_response_mask,
 )
@@ -399,6 +418,37 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             "off-policy OPD requires algorithm.opd.teacher_data_dir "
             "(directory of Stage-1 <task>.pt files)"
         )
+        actor_cfg = self.config.actor_rollout_ref.actor
+        self.teacher_topk_kl = actor_cfg.get("teacher_kl_loss_type", "low_var_kl") == "topk_kl"
+        self.teacher_kl_topk = int(actor_cfg.get("teacher_kl_topk", 20))
+        # Whose top-k the KL's support comes from. Off (the default) is the arm
+        # this trainer was written for: the teacher's top-k is baked into the pool
+        # by Stage 1 and no teacher runs here at all. On, the support is the
+        # student's, which cannot be known when Stage 1 runs -- so the teachers
+        # come back, scoring the step's own rows just before the update.
+        #
+        # What that costs is one teacher forward per row, and the run draws each
+        # pool row about once (36,000 trajectories per task at 120 a step is 300
+        # steps), so it is the same teacher compute a single re-scoring pass over
+        # the pool would take -- except it is evaluated at the ids the student
+        # actually picked rather than at ids chosen in advance. What it buys back
+        # is the pool's two largest columns, which this arm no longer reads.
+        self.student_indexed_topk = self.teacher_topk_kl and bool(
+            actor_cfg.get("student_indexed_topk", False)
+        )
+        self.teacher_wg = {}
+        self._teacher_cache_counter = 0
+        if self.student_indexed_topk:
+            teacher_paths = opd_cfg.get("teacher_paths", None)
+            assert teacher_paths is not None, (
+                "student_indexed_topk needs the teachers themselves at Stage 2 -- the support is the "
+                "student's, so the pool's precomputed top-k cannot answer it. Pass "
+                "algorithm.opd.teacher_paths.{alfworld,search,webshop}"
+            )
+            self.teacher_paths = {
+                self._normalize_task_name(task): path for task, path in dict(teacher_paths).items()
+            }
+            assert None not in self.teacher_paths, "teacher_paths contains an unknown task name"
         # Per-step, per-task TRAJECTORY count == OPD's per-task prompts * group size
         # (15 * 8 = 120). Each step draws this many whole trajectories per task and
         # expands them to all their turn-rows, matching OPD's per-step composition.
@@ -412,6 +462,205 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
     # more; it must never drop fewer, since everything listed here is already
     # unread by *any* Stage-2 loss.
     _drop_tensor_keys = _DROP_TENSOR_KEYS
+
+    # ------------------------------------------------------------------ #
+    # Worker setup. The default arm needs none of this -- it is the base
+    # trainer's actor_rollout and nothing else. student_indexed_topk adds one
+    # frozen teacher per task, colocated with the actor.
+    # ------------------------------------------------------------------ #
+    def init_workers(self):
+        if not self.student_indexed_topk:
+            return super().init_workers()
+
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        if not self.hybrid_engine:
+            raise NotImplementedError
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+        self.resource_pool_to_cls[resource_pool]["actor_rollout"] = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.ActorRollout],
+            config=self.config.actor_rollout_ref,
+            role="actor_rollout",
+        )
+
+        if self.use_critic:
+            critic_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            self.resource_pool_to_cls[critic_pool]["critic"] = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Critic], config=self.config.critic
+            )
+
+        # One teacher worker group per task, each with its own checkpoint, sharing
+        # the actor's pool so a teacher's hidden states and the rows that need them
+        # are at least in the same processes -- though not the same ranks, which is
+        # what teacher_cache.py's ownership exchange exists to resolve.
+        teacher_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+        self._teacher_keys = {}
+        for task, path in self.teacher_paths.items():
+            teacher_cfg = copy.deepcopy(self.config.actor_rollout_ref)
+            with open_dict(teacher_cfg):
+                teacher_cfg.model.path = path
+                # Avoid the LoRA branch in compute_ref_log_prob; teachers are full models.
+                teacher_cfg.model.lora_rank = 0
+            key = f"teacher_{task}"
+            self._teacher_keys[task] = key
+            self.resource_pool_to_cls[teacher_pool][key] = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=teacher_cfg,
+                role="ref",
+            )
+
+        if self.use_rm:
+            rm_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            self.resource_pool_to_cls[rm_pool]["rm"] = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model
+            )
+
+        all_wg = {}
+        wg_kwargs = {}
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+
+        for pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs
+            )
+            all_wg.update(wg_dict.spawn(prefix_set=class_dict.keys()))
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        val_only = bool(self.config.trainer.get("val_only", False))
+        n_teachers = len(self._teacher_keys)
+        for slot, (task, key) in enumerate(sorted(self._teacher_keys.items())):
+            wg = all_wg[key]
+            wg.init_model()
+            self.teacher_wg[task] = wg
+            if not val_only:
+                # The actor resolves this teacher at ids nobody has picked yet, so
+                # it needs the output projection at update time -- by which point
+                # the ref path has resharded it. One unsharded copy per teacher,
+                # taken once here, labelled with the task the cache files it under.
+                #
+                # Not in a val_only run: nothing scores a teacher there, and this
+                # is ~1.9 GB a rank held for the life of the process, next to a
+                # vLLM engine already sized for validation.
+                #
+                # The slot is passed so the copy lands directly in its slice of the
+                # stacked projection the lookup reads, instead of being cloned on
+                # its own and stacked later -- that holds both layouts at once, and
+                # peaks here, before vLLM measures free memory.
+                wg.register_teacher_lm_head(task, slot=slot, n_tasks=n_teachers)
+
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+
+        # Rollout last, so vLLM sizes its KV cache against what is really left.
+        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg.init_model()
+
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            from verl.workers.rollout.async_server import AsyncLLMServerManager
+
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AsyncLLMServerManager(
+                config=self.config.actor_rollout_ref,
+                worker_group=self.actor_rollout_wg,
+            )
+
+    def _score_teachers_for_step(self, batch: DataProto, timing_raw: dict):
+        """Cache this step's teacher hidden states, and key the batch to them.
+
+        Runs between batch preparation and ``update_actor``: the rows are final by
+        then (``adjust_batch`` has padded, ``_balance_batch`` has reordered), so a
+        key assigned here stays attached to the row it names. The teacher forward
+        itself is a forward over exactly the rows this step trains -- one per row
+        for the whole run, since the loop draws each pool row about once.
+
+        The padding rows ``adjust_batch`` appended are scored like any other. They
+        are duplicates of real rows, so scoring them again is ~3% of wasted teacher
+        compute -- and the alternative, marking them -1, hands the loss a zero
+        teacher target on rows it still evaluates.
+        """
+        wgs = self.teacher_wg
+        with _timer("teacher_cache_clear", timing_raw):
+            # Every group, not just one. The entry store is per PROCESS, so one
+            # call empties it for all three -- but the witness BUDGET is per
+            # worker instance, and leaving two of them at the zero they reached in
+            # step 1 would quietly retire the check on two thirds of the teachers
+            # after the first step. Clearing an already-empty store is free.
+            for wg in wgs.values():
+                wg.clear_teacher_hidden_cache()
+
+        n = len(batch)
+        cache_ids = torch.arange(
+            self._teacher_cache_counter + 1, self._teacher_cache_counter + 1 + n, dtype=torch.long
+        )
+        self._teacher_cache_counter += n
+
+        task_names = batch.non_tensor_batch.get("task_name", None)
+        assert task_names is not None, "student_indexed_topk needs a task_name column to route each row to its teacher"
+        normalized = np.array([self._normalize_task_name(t) for t in task_names], dtype=object)
+        # Before any teacher runs, not after: a row with no teacher would
+        # otherwise be skipped in the loop below, spend a full pass being scored
+        # around, and only then raise.
+        unrouted = set(np.unique(normalized).tolist()) - set(wgs)
+        assert not unrouted, (
+            f"no teacher configured for task(s) {sorted(unrouted)}; "
+            f"algorithm.opd.teacher_paths has {sorted(wgs)}"
+        )
+
+        with _timer("teacher_hidden", timing_raw):
+            for task, wg in wgs.items():
+                rows = np.nonzero(normalized == task)[0]
+                if len(rows) == 0:
+                    continue
+                sub = batch.select_idxs(rows.tolist())
+                sub = DataProto.from_dict(
+                    tensors={
+                        name: sub.batch[name]
+                        for name in ("input_ids", "attention_mask", "position_ids", "responses")
+                    }
+                )
+                sub.batch["teacher_cache_ids"] = cache_ids[rows.tolist()]
+                # auto_padding would repeat whole rows to reach a multiple of the
+                # group's world size -- teacher_cache_ids included -- and two ranks
+                # would then cache the same key, which the exchange reports as a row
+                # answered twice. Padding explicitly instead lets the copies carry
+                # -1: still scored (the shapes have to match), still discarded, but
+                # never entering any cache.
+                sub, pad_size = pad_dataproto_to_divisor(sub, wg.world_size)
+                if pad_size:
+                    sub.batch["teacher_cache_ids"][-pad_size:] = -1
+                sub.meta_info = dict(sub.meta_info)
+                sub.meta_info["topk_k"] = self.teacher_kl_topk
+                out = wg.compute_ref_topk_log_prob(sub)
+                if pad_size:
+                    out = unpad_dataproto(out, pad_size=pad_size)
+                assert len(out) == len(rows), f"teacher scored {len(out)} rows for {len(rows)} asked"
+
+        batch.batch["teacher_cache_ids"] = cache_ids
+        # One group is enough for the witness: it walks the process-wide store, so
+        # asking all three would read the same entries three times.
+        return next(iter(wgs.values()))
+
+    def _check_teacher_cache(self, wg, metrics: dict, timing_raw: dict):
+        """Witness the cache, and report what it costs on the card.
+
+        Once per step and on one worker group: the cache is per PROCESS, so asking
+        all three teachers would walk the same entries three times.
+        """
+        with _timer("teacher_witness", timing_raw):
+            stats = wg.check_teacher_hidden_cache()
+        if isinstance(stats, list):
+            stats = stats[0]
+        metrics["teacher_cache/witness_max_err"] = float(stats["witness_max_err"])
+        metrics["teacher_cache/rows"] = float(stats["rows"])
+        metrics["teacher_cache/gb"] = float(stats["bytes"]) / (1024**3)
 
     @classmethod
     def _load_offpolicy_file(cls, path: str) -> DataProto:
@@ -877,6 +1126,17 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
                 # prefetch thread when it is enabled. Its balance statistics are
                 # folded in here so the logged global_seqlen/* are unchanged.
                 metrics.update(prep_metrics)
+
+                # Under student_indexed_topk the teacher has to have run before the
+                # student picks its support, but only to leave its hidden states
+                # behind -- the values are resolved inside update_actor, at ids
+                # chosen there. Placed here rather than on the prefetch thread:
+                # this is a GPU worker call, and the prefetch thread exists to
+                # overlap driver-side CPU work with the update, not to race it for
+                # the cards.
+                if self.student_indexed_topk:
+                    wg = self._score_teachers_for_step(batch, timing_raw)
+                    self._check_teacher_cache(wg, metrics, timing_raw)
 
                 with _timer("update_actor", timing_raw):
                     # update_policy scales student logits by this temperature (same value

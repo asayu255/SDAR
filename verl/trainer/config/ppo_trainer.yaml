@@ -71,6 +71,27 @@ actor_rollout_ref:
     teacher_kl_loss_coef: 1.0 # OPD: weight of the teacher KL term
     teacher_kl_loss_type: low_var_kl # OPD: KL form: single-token (low_var_kl / kl / abs / mse) or dense top-k (topk_kl)
     teacher_kl_topk: 20 # OPD: support size for topk_kl (dense top-k + tail-bucket reverse KL)
+    # Whose top-k the KL's support comes from. False (default) is the teacher's,
+    # which is what the loss has always used. True is the STUDENT's own top-k,
+    # with the teacher then evaluated at those ids.
+    #
+    # NOT a performance knob -- it changes what is optimised. The loss is a
+    # coarse-grained reverse KL: exact on the support, everything outside it
+    # lumped into one tail bucket. What that drops is
+    #     KL_full - KL_A = tail_s * KL(p_s|A-bar || p_t|A-bar)
+    # weighted by the STUDENT's tail mass, so a support taken from the teacher
+    # leaves exactly the region where the student has moved away from the teacher
+    # outside it -- the region this term exists to penalise. Taking it from the
+    # student covers that.
+    #
+    # Both are valid lower bounds on the same full reverse KL, so this is a
+    # tighter bound rather than a different objective -- but two runs being
+    # COMPARED still have to agree on it, because the supports differ.
+    #
+    # In the off-policy (offline KD) arm this also decides whether Stage 2 loads
+    # the teachers at all: the pool's precomputed top-k cannot answer at ids the
+    # student picks later, so True requires algorithm.opd.teacher_paths.
+    student_indexed_topk: False
     # Hard-label cross-entropy on the teacher's own sampled tokens -- the
     # degenerate (one-hot teacher) limit of the KL above. Summed with it, over the
     # same tokens and the same mask, when both are on.
@@ -124,6 +145,11 @@ actor_rollout_ref:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
     use_torch_compile: ${actor_rollout_ref.actor.use_torch_compile}
+    # Mirrors actor.student_indexed_topk. When on, this teacher also keeps the
+    # hidden states and normaliser of every row it scores, so the actor can
+    # evaluate it at ids the student picks later. Costs one unsharded copy of the
+    # output projection per teacher, held for the run.
+    student_indexed_topk: ${actor_rollout_ref.actor.student_indexed_topk}
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}

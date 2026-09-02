@@ -1,5 +1,16 @@
 # Expected effective config for Stage 2 of off-policy multitask distillation
-# (offline KD): the student trained on the fixed teacher-trajectory dataset.
+# (offline KD), STUDENT-INDEXED top-k arm: the student trained on the fixed
+# teacher-trajectory dataset, but with the KL's support taken from its own top-20
+# instead of the teacher's.
+#
+# WHAT THIS ARM CAN AND CANNOT BE COMPARED WITH. student_indexed_topk decides
+# which support the coarse-grained reverse KL is exact on. Both settings give a
+# valid lower bound on the same full reverse KL, and the student-indexed one is
+# the tighter of the two -- but a run under one support and a run under the other
+# are not the same objective, so their loss curves do not compare. The control is
+# expected_multitask_offpolicy_config.yaml, which differs from this file in
+# exactly the three values below (the flag, the teachers it forces to be loaded,
+# and the run identity) and in nothing else.
 #
 # main_opd_offpolicy validates the composed Hydra config against every key
 # below AFTER its own config injection (verl/utils/expected_config.py) and
@@ -55,16 +66,26 @@
 # the coarse-grained reverse KL is exact on, and therefore what is optimised. Two
 # runs that disagree on it compare nothing.
 #
-# false is this arm: the support is the TEACHER's top-20, precomputed by Stage 1
-# and carried in the pool, so no teacher runs during training at all. The
-# student-indexed arm is a separate run script with its own expectations file
-# (expected_multitask_offpolicy_studenttopk_config.yaml), because it also has to
-# load the three teachers.
+# true is this arm: the support is the STUDENT's own top-20 at each position,
+# with the teacher evaluated there afterwards. The pool's precomputed top-k
+# cannot answer that -- it was chosen before the student existed -- so Stage 2
+# loads the three frozen teachers and scores the step's own rows just before the
+# update, keeping their hidden states and normaliser rather than their top-k
+# (verl/workers/teacher_cache.py).
 #
-# Only the EFFECTIVE actor key is pinned here. algorithm.opd has no schema entry
-# -- the run script creates it with "+" -- so pinning a key this run script does
-# not pass would fail on a missing key rather than on a wrong value.
-"actor_rollout_ref.actor.student_indexed_topk": false
+# The teacher forward that costs is one per row for the whole run: 36,000
+# trajectories per task drawn 120 at a time is 300 steps, which is one pass over
+# the pool. The same total teacher compute a single re-scoring pass would take --
+# except evaluated at the ids the student actually picked rather than at ids
+# fixed in advance.
+#
+# ref.student_indexed_topk is an interpolation of the actor's value in
+# ppo_trainer.yaml, so it is pinned too: it is what makes the teacher keep its
+# hidden states, and an override that broke the link would leave the teacher
+# returning a top-k nobody reads while the actor waits for a cache nobody filled.
+"algorithm.opd.student_indexed_topk": true
+"actor_rollout_ref.actor.student_indexed_topk": true
+"actor_rollout_ref.ref.student_indexed_topk": true
 
 # ---- per-task normalisation of the loss above ------------------------------------
 # The plain token-mean weights a task by its share of response tokens, measured at
@@ -194,4 +215,4 @@
 "trainer.project_name": verl_agent_opd_offpolicy_multitask
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
 # name for a different config) requires touching this file next to the knobs.
-"trainer.experiment_name": sdar_multitask_offline_qwen3_1.7b
+"trainer.experiment_name": sdar_multitask_offline_studenttopk_qwen3_1.7b

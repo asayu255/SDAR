@@ -78,6 +78,23 @@ class OPDOffPolicyTaskRunner:
             config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
             config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "topk_kl")
             config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
+            # Whose top-k the KL's support comes from. Scientific knob, so it is
+            # surfaced under algorithm.opd with the rest of the loss settings and
+            # pinned in the expectations file. True brings the teachers back into
+            # Stage 2 -- the pool's precomputed top-k is answered at ids chosen in
+            # advance, and the student's are not known until it runs -- so it also
+            # requires algorithm.opd.teacher_paths, which the trainer checks.
+            student_indexed_topk = bool(opd_cfg.get("student_indexed_topk", False))
+            config.actor_rollout_ref.actor.student_indexed_topk = student_indexed_topk
+            # Set explicitly, NOT left to the interpolation in ppo_trainer.yaml.
+            # ref.student_indexed_topk is ${actor_rollout_ref.actor.student_indexed_topk},
+            # but OmegaConf.resolve above has already run -- it froze ref at the
+            # actor's pre-injection value (the yaml default) before this block
+            # touched it. The teacher would then return a top-k nobody reads while
+            # the actor waited on a cache nobody filled, which surfaces as every
+            # row unowned on the first mini-batch. Loud, but every run would die at
+            # step 1; the expectations file pins both halves for the same reason.
+            config.actor_rollout_ref.ref.student_indexed_topk = student_indexed_topk
             # None -> KD only. 0.0 is NOT the same thing: it keeps the term (and its
             # metrics) with a zero weight, which is a useful control run, so it is
             # taken at face value rather than folded into "off".
@@ -173,8 +190,13 @@ class OPDOffPolicyTaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        # NOTE: off-policy OPD registers neither Role.RefPolicy nor teacher workers;
-        # the teacher top-k signal is precomputed in the Stage-1 dataset.
+        # NOTE: off-policy OPD registers no Role.RefPolicy -- the teacher top-k
+        # signal is precomputed in the Stage-1 dataset. Under
+        # algorithm.opd.student_indexed_topk the trainer's own init_workers does
+        # spawn one frozen teacher per task, as role="ref" instances of the
+        # ActorRollout class already mapped above (that is how the on-policy arm
+        # builds them too), because a support the student chooses cannot be
+        # answered from a top-k baked in before the student existed.
 
         reward_manager_name = config.reward_model.get("reward_manager", "episode")
         if reward_manager_name == "episode":
@@ -210,6 +232,12 @@ class OPDOffPolicyTaskRunner:
         print(f"[OPD-offpolicy] teacher_data_dir: {teacher_data_dir}")
         print(f"[OPD-offpolicy] teacher_kl_loss_type: {config.actor_rollout_ref.actor.teacher_kl_loss_type}")
         print(f"[OPD-offpolicy] teacher_kl_topk: {config.actor_rollout_ref.actor.teacher_kl_topk}")
+        # Printed because it decides both what is optimised and whether three more
+        # models are about to be loaded onto the same cards.
+        print(
+            f"[OPD-offpolicy] student_indexed_topk: "
+            f"{config.actor_rollout_ref.actor.student_indexed_topk}"
+        )
 
         from verl.trainer.ppo.opd_offpolicy_ray_trainer import OffPolicyOPDRayTrainer
 

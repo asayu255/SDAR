@@ -212,7 +212,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, topk_k=None, topk_ids=None, return_lse=False) -> Tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -224,10 +224,32 @@ class DataParallelPPOActor(BasePPOActor):
                 top-k ids. When ``topk_ids`` is given (student mode): a tensor
                 (bs, response_len, k) of this model's full-vocab log-softmax values
                 gathered at the provided ids (carries gradient).
+
+                With ``return_lse`` the teacher mode appends a third element: the
+                packed-row map and the full-vocabulary normaliser, which is what
+                lets a caller keep this forward's output usable at ids nobody has
+                chosen yet (see verl/workers/teacher_cache.py). Only the last
+                gather depends on the ids, so everything else here is already the
+                whole answer.
         """
         topk_out = None
         if (topk_k is not None or topk_ids is not None) and self.use_fused_kernels:
             raise NotImplementedError("top-k KL forward is not supported with fused kernels")
+        if return_lse and topk_ids is not None:
+            # Student mode returns one tensor where teacher mode returns a pair,
+            # and the return_lse packing below unpacks a pair. Nothing asks for
+            # this combination -- only the teacher path caches -- so refuse it
+            # rather than let it drop the student's values on the floor.
+            raise NotImplementedError("return_lse is for the teacher path (topk_k), not for topk_ids")
+        if return_lse and not self.use_remove_padding:
+            # The hidden states come off a forward hook on the packed sequence, so
+            # the row map that pairs them with a (bs, response_length) grid only
+            # exists on the remove-padding path. Refuse rather than hand back a
+            # normaliser the caller cannot align anything to.
+            raise NotImplementedError(
+                "return_lse needs use_remove_padding: the caller pairs the normaliser with the body's "
+                "packed hidden states, and there is no row map without it"
+            )
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch:
@@ -304,7 +326,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy or topk_k is not None or topk_ids is not None:
+                    if calculate_entropy or topk_k is not None or topk_ids is not None or return_lse:
                         # top-k KL reads logits_rmpad after this call, so don't mutate it.
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
@@ -354,7 +376,7 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 # top-k distillation log-probs (teacher: own top-k; student: gather at given ids)
-                if topk_k is not None or topk_ids is not None:
+                if topk_k is not None or topk_ids is not None or return_lse:
                     if self.use_fused_kernels or self.use_ulysses_sp:
                         raise NotImplementedError("top-k KL forward is not supported with fused kernels or ulysses SP")
                     # Restrict the vocab-sized work to the rows that survive the slice
@@ -386,7 +408,7 @@ class DataParallelPPOActor(BasePPOActor):
                             full_t_lp[:, -response_length - 1 : -1, :],
                             full_t_id[:, -response_length - 1 : -1, :].round().long(),
                         )
-                    else:
+                    elif topk_ids is not None:
                         # Read topk_ids (bs, response_len, k) directly at each selected
                         # row's (sample, response-slot). The old path scattered it into a
                         # (bs, seqlen, k) zero tensor and gathered that back through
@@ -395,6 +417,32 @@ class DataParallelPPOActor(BasePPOActor):
                         s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
                         full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
                         topk_out = full_s_lp[:, -response_length - 1 : -1, :]
+                    if return_lse:
+                        # The caller wants to evaluate this model at ids nobody has
+                        # chosen yet, which needs the normaliser and the packed row
+                        # map -- the projection itself it can redo for 2*H*k. Handed
+                        # back PACKED, not scattered, because it is paired with the
+                        # body's hidden states, which the forward hook also sees
+                        # packed; `sel` indexes those and `sel_indices` scatters
+                        # either of them back.
+                        #
+                        # With topk_k None the model's OWN top-k is not built at
+                        # all, which is a full-vocabulary selection and two
+                        # scatters saved on every micro-batch that is not the
+                        # witness sample.
+                        tlp, tids_out = topk_out if topk_k is not None else (None, None)
+                        topk_out = (
+                            tlp,
+                            tids_out,
+                            {
+                                "lse": lse.float(),
+                                "sel": sel,
+                                "sel_indices": sel_indices,
+                                "batch_size": batch_size,
+                                "seqlen": seqlen,
+                                "response_length": response_length,
+                            },
+                        )
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -515,15 +563,102 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_topk_log_prob(self, data: DataProto, topk_k: int):
+    @contextmanager
+    def _capture_last_hidden(self, sink: dict):
+        """Grab the transformer body's output without asking for all 29 layers.
+
+        ``output_hidden_states=True`` would return every layer -- on a teacher
+        micro-batch that is gigabytes of tensors, 28/29 of them discarded. A
+        forward hook on the base model takes only what the projection consumes.
+        Registered on the unwrapped module so FSDP's own forward still runs
+        normally around it; a model whose body cannot be located falls back to
+        yielding nothing and the caller raises with a readable message.
+        """
+        inner = self.actor_module
+        for _ in range(8):
+            nxt = getattr(inner, "_fsdp_wrapped_module", None) or getattr(inner, "_orig_mod", None)
+            if nxt is None or nxt is inner:
+                break
+            inner = nxt
+        body = getattr(inner, "model", None)
+        if body is None:
+            yield
+            return
+
+        def _hook(_module, _inputs, output):
+            sink["h"] = output[0] if isinstance(output, tuple) else output.last_hidden_state
+
+        handle = body.register_forward_hook(_hook)
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    def _teacher_logprobs_at(self, cache_ids, ids, input_ids=None, attention_mask=None):
+        """Teacher log-probs at ids the student just chose.
+
+        The teacher's hidden states were cached wherever its forward ran, which is
+        not where this micro-batch is being trained: between the two calls the rows
+        are padded by ``adjust_batch`` and reordered by ``_balance_batch`` to
+        equalise tokens per rank. ``exchange_teacher_logprobs`` therefore asks every
+        rank and sums the one answer that exists, raising if a row is unanswered or
+        answered twice. See verl/workers/teacher_cache.py.
+
+        Both sides work per ROW: one key locates the row's whole
+        (response_length, hidden) block, and ``ids`` stays (bs, response_length, k).
+        """
+        from verl.workers.teacher_cache import exchange_teacher_logprobs, get_teacher_cache, row_fingerprint
+
+        if cache_ids is None:
+            raise ValueError(
+                "student_indexed_topk needs a `teacher_cache_ids` column locating each row's cached "
+                "teacher hidden states; the batch has none."
+            )
+        # Derived from the rows being trained RIGHT HERE, so a key column shifted
+        # against its batch is caught. The key alone would resolve cleanly and
+        # return a real teacher log-prob for somebody else's sample.
+        fingerprints = None
+        if input_ids is not None and attention_mask is not None:
+            fingerprints = row_fingerprint(input_ids, attention_mask)
+        return exchange_teacher_logprobs(get_teacher_cache(), cache_ids, ids, fingerprints=fingerprints)
+
+    def compute_topk_log_prob(
+        self, data: DataProto, topk_k: int, return_hidden: bool = False, witness_micro_batches=None
+    ):
         """Teacher-side: per response token, the teacher's top-k token ids and the
         teacher's full-vocab log-softmax values at those ids.
 
+        Args:
+            return_hidden: also return the body's hidden states and the
+                full-vocabulary logsumexp at the scored positions, so the caller
+                can evaluate this teacher at ids chosen later (see
+                verl/workers/teacher_cache.py). The expensive work is unchanged --
+                only the last gather depends on the ids.
+            witness_micro_batches: build the teacher's OWN top-k for that many
+                leading micro-batches only, and return it as a sample instead of a
+                full column. In this mode nothing downstream reads it: the support
+                comes from the student, and the teacher's top-k exists only to
+                check the cache against the forward that filled it. Building it is
+                a selection over the whole vocabulary and a scatter back to
+                (bs, response_length, k), so running it on every row is the
+                expensive way to do a spot check. Requires ``return_hidden``.
+
         Returns:
-            topk_logprob: (bs, response_length, k)
-            topk_ids:     (bs, response_length, k) int64
+            witness_micro_batches is None:
+                topk_logprob: (bs, response_length, k)
+                topk_ids:     (bs, response_length, k) int64
+                hidden, lse:  (bs, response_length, hidden) / (bs, response_length),
+                              only when ``return_hidden``
+            otherwise:
+                hidden, lse, witness_rows, witness_ids, witness_logprob -- where
+                ``witness_rows`` indexes the ORIGINAL row order (so it survives the
+                dynamic-batching reorder) and the other two are
+                (len(witness_rows), response_length, k).
         """
         self.actor_module.eval()
+        sampled_witness = witness_micro_batches is not None
+        if sampled_witness and not return_hidden:
+            raise ValueError("witness_micro_batches only makes sense with return_hidden=True")
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
@@ -542,24 +677,93 @@ class DataParallelPPOActor(BasePPOActor):
 
         topk_logprob_lst = []
         topk_ids_lst = []
-        for micro_batch in micro_batches:
+        hidden_lst = []
+        lse_lst = []
+        witness_rows_lst = []
+        row_cursor = 0
+        for mb_i, micro_batch in enumerate(micro_batches):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            with torch.no_grad():
-                _, _, topk_out = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=False, topk_k=topk_k)
-            tlp, tids = topk_out
-            topk_logprob_lst.append(tlp)
-            topk_ids_lst.append(tids)
+            n_rows = micro_batch["responses"].size(0)
+            # In sampled-witness mode the teacher's own top-k is a spot check, not
+            # a column: a full-vocabulary selection plus two scatters per row, for
+            # values nothing downstream reads once the support is the student's.
+            want_topk = (not sampled_witness) or mb_i < witness_micro_batches
+            sink = {}
+            with torch.no_grad(), self._capture_last_hidden(sink if return_hidden else {}):
+                _, _, topk_out = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    topk_k=topk_k if want_topk else None,
+                    return_lse=return_hidden,
+                )
+            if return_hidden:
+                tlp, tids, extras = topk_out
+                if "h" not in sink:
+                    raise RuntimeError(
+                        "student_indexed_topk needs the teacher's hidden states, but the forward hook did "
+                        "not fire -- the model's transformer body could not be located under its wrappers."
+                    )
+                # Select the same packed rows the projection used, then scatter both
+                # back into (bs, response_length, ·) so they line up row-for-row with
+                # the top-k the caller also gets.
+                h_resp = sink["h"].squeeze(0)[extras["sel"]]  # (n_resp, hidden)
+                bs_, sl_, rl_ = extras["batch_size"], extras["seqlen"], extras["response_length"]
+                hidden_lst.append(
+                    pad_input(h_resp, indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, :]
+                )
+                lse_lst.append(
+                    pad_input(extras["lse"], indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, 0]
+                )
+            else:
+                tlp, tids = topk_out
+            if want_topk:
+                topk_logprob_lst.append(tlp)
+                topk_ids_lst.append(tids)
+                if sampled_witness:
+                    # Original row numbers: rearrange_micro_batches hands back, per
+                    # micro-batch, where each of its rows came from, so the sample
+                    # needs no revert of its own.
+                    witness_rows_lst.append(
+                        torch.as_tensor(indices[mb_i], dtype=torch.long)
+                        if use_dynamic_bsz
+                        else torch.arange(row_cursor, row_cursor + n_rows, dtype=torch.long)
+                    )
+            row_cursor += n_rows
 
-        topk_logprob = torch.concat(topk_logprob_lst, dim=0)
-        topk_ids = torch.concat(topk_ids_lst, dim=0)
+        hidden = torch.concat(hidden_lst, dim=0) if return_hidden else None
+        lse = torch.concat(lse_lst, dim=0) if return_hidden else None
+        if not sampled_witness:
+            topk_logprob = torch.concat(topk_logprob_lst, dim=0)
+            topk_ids = torch.concat(topk_ids_lst, dim=0)
+
         if use_dynamic_bsz:
-            indices = list(itertools.chain.from_iterable(indices))
-            assert len(indices) == topk_logprob.size(0), f"{len(indices)} vs. {topk_logprob.size()}"
-            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-            topk_logprob = topk_logprob[revert_indices]
-            topk_ids = topk_ids[revert_indices]
+            flat = list(itertools.chain.from_iterable(indices))
+            revert_indices = torch.tensor(get_reverse_idx(flat), dtype=torch.long)
+            if not sampled_witness:
+                assert len(flat) == topk_logprob.size(0), f"{len(flat)} vs. {topk_logprob.size()}"
+                topk_logprob = topk_logprob[revert_indices]
+                topk_ids = topk_ids[revert_indices]
+            if return_hidden:
+                # The hidden states are per row like the top-k, so they follow the
+                # same reordering; skipping this would file every entry under a
+                # neighbour's key, which is exactly what the witness catches.
+                assert len(flat) == hidden.size(0), f"{len(flat)} vs. {hidden.size()}"
+                hidden = hidden[revert_indices]
+                lse = lse[revert_indices]
 
+        if sampled_witness:
+            if witness_rows_lst:
+                w_rows = torch.cat(witness_rows_lst)
+                w_ids = torch.concat(topk_ids_lst, dim=0)
+                w_lp = torch.concat(topk_logprob_lst, dim=0)
+            else:
+                w_rows = torch.empty(0, dtype=torch.long)
+                w_ids = w_lp = None
+            return hidden, lse, w_rows, w_ids, w_lp
+        if return_hidden:
+            return topk_logprob, topk_ids, hidden, lse
         return topk_logprob, topk_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -582,6 +786,15 @@ class DataParallelPPOActor(BasePPOActor):
         use_teacher_kl_loss = self.config.get("use_teacher_kl_loss", False)
         teacher_kl_loss_type = self.config.get("teacher_kl_loss_type", "low_var_kl")
         teacher_topk_kl = use_teacher_kl_loss and teacher_kl_loss_type == "topk_kl"
+        # Whose top-k defines the KL's support. Teacher-indexed (the default) reads
+        # the ids the teacher already chose off the batch. Student-indexed asks
+        # this forward for the student's OWN top-k and resolves the teacher at
+        # those ids afterwards, out of the hidden states the teacher left behind --
+        # see verl/workers/teacher_cache.py for why that does not force the teacher
+        # to run second. Both are lower bounds on the same full reverse KL; the
+        # student-indexed one is the tighter of the two, because the mass the bound
+        # drops is weighted by the STUDENT's tail.
+        student_indexed_topk = teacher_topk_kl and bool(self.config.get("student_indexed_topk", False))
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         # advantages / old_log_probs are only needed by the policy-gradient (and SDL) paths.
         # Pure teacher-KL distillation (pg_loss_coef==0) does not produce them, so don't require them.
@@ -598,7 +811,15 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or (use_teacher_kl_loss and not teacher_topk_kl):
             select_keys.append("teacher_log_probs")
         if teacher_topk_kl:
-            select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
+            if student_indexed_topk:
+                # The support is chosen here, so the teacher's own top-k is not an
+                # input any more -- only the key locating its cached hidden states.
+                # The pool still carries the top-k columns (they are what a
+                # teacher-indexed control arm trains on, and what the Stage-2
+                # teacher can be checked against), they are just not read here.
+                select_keys.append("teacher_cache_ids")
+            else:
+                select_keys += ["teacher_topk_logprobs", "teacher_topk_ids"]
         # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
         # so the loss metrics below can also be reported per task. Absent in single-task runs.
         task_id_names = data.meta_info.get("task_id_names", None)
@@ -755,9 +976,33 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    fwd_topk_ids = data["teacher_topk_ids"] if teacher_topk_kl else None
+                    # Teacher-indexed hands the forward the ids the teacher already
+                    # chose; student-indexed asks it for the student's own top-k
+                    # and resolves the teacher at those ids below.
+                    fwd_topk_ids = fwd_topk_k = None
+                    if teacher_topk_kl:
+                        if student_indexed_topk:
+                            fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
+                        else:
+                            fwd_topk_ids = data["teacher_topk_ids"]
                     with _actor_phase("actor.fwd"):
-                        entropy, log_prob, student_topk_logprobs = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids)
+                        entropy, log_prob, student_topk_out = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, topk_ids=fwd_topk_ids, topk_k=fwd_topk_k)
+                    if student_indexed_topk:
+                        # One logits tensor produced both: the values (which carry
+                        # the gradient -- topk's backward is the same scatter a
+                        # gather at those ids would give) and the ids that chose
+                        # them. There is no second student forward here.
+                        student_topk_logprobs, student_topk_ids = student_topk_out
+                        with _actor_phase("actor.teacher_lookup"):
+                            fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
+                                cache_ids=data.get("teacher_cache_ids", None),
+                                ids=student_topk_ids,
+                                input_ids=data["input_ids"],
+                                attention_mask=data["attention_mask"],
+                            )
+                    else:
+                        student_topk_logprobs = student_topk_out
+                        fwd_teacher_topk_logprobs = None
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -853,7 +1098,11 @@ class DataParallelPPOActor(BasePPOActor):
                             # Dense reverse KL over the teacher's top-k support (+ tail bucket).
                             teacher_kld = topk_kl_per_token(
                                 student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=data["teacher_topk_logprobs"],
+                                teacher_topk_logprob=(
+                                    fwd_teacher_topk_logprobs
+                                    if student_indexed_topk
+                                    else data["teacher_topk_logprobs"]
+                                ),
                             )
                         else:
                             # Single-sampled-token estimator (low_var_kl / kl / mse / abs).
@@ -1014,6 +1263,18 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         data = dict(_ZERO_PG_METRICS)
                     append_to_dict(metrics, data)
+
+                if student_indexed_topk:
+                    # Every row the exchange was asked about must have been
+                    # answered by exactly one rank, and by the row it was asked
+                    # for. Checked here rather than inside the exchange because
+                    # reading the tally synchronises and the exchange runs once
+                    # per micro-batch -- and this is still the last point before
+                    # the weights move, so a row that went unresolved cannot
+                    # reach them.
+                    from verl.workers.teacher_cache import assert_rows_were_owned_once
+
+                    assert_rows_were_owned_once()
 
                 with _actor_phase("actor.optim"):
                     grad_norm = self._optimizer_step()
