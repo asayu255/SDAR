@@ -22,6 +22,7 @@ made it look like a cross-rank max. These pin the shape of the replacement.
 import pytest
 import torch
 
+import verl.utils.metric.memory as memory_mod
 from verl.utils.metric import reduce_metrics
 from verl.utils.metric.memory import (
     device_footprint_gb,
@@ -46,6 +47,7 @@ class _Device:
         if not self._resettable:
             raise RuntimeError("this backend cannot reset peak stats")
         self.resets += 1
+        self._a = self._r = 0.0        # what a real reset does to the counters
 
     def max_memory_allocated(self):
         return self._a
@@ -298,9 +300,10 @@ def test_the_phase_window_reports_the_peak_since_its_reset():
     "the rollout's vLLM pool" whichever phase is asking. The update's own peak is
     a different number and it is the one the checkpointing and micro-batch
     decisions turn on."""
-    device = _Device(62.5, 71.0)
+    device = _Device(97.6, 126.2)             # the rollout's peak
     reset_phase_peak(device)
     assert device.resets == 1
+    device._a, device._r = 62.5 * _GB, 71.0 * _GB   # what the update itself reaches
 
     m = phase_peak_metrics(device, "perf/update_peak")
     assert m["perf/update_peak_allocated_gb"] == pytest.approx(62.5)
@@ -318,3 +321,39 @@ def test_the_phase_window_does_not_emit_per_rank_keys():
     cross-rank max is the only number that matters."""
     m = phase_peak_metrics(_Device(10.0, 12.0), "perf/update_peak")
     assert set(m) == {"perf/update_peak_allocated_gb", "perf/update_peak_reserved_gb"}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_lifetime():
+    """The running max is process-level, as the counters it stands in for are."""
+    saved = list(memory_mod._LIFETIME)
+    memory_mod._LIFETIME[:] = [0.0, 0.0]
+    yield
+    memory_mod._LIFETIME[:] = saved
+
+
+def test_the_window_does_not_cost_the_lifetime_high_water_mark():
+    """perf/max_memory_allocated_gb has meant "did this run ever come close to the
+    card" since it was added. Opening a phase window in front of it turned it into
+    that phase's number under the run-long name -- visibly, because the series
+    then went DOWN between steps, which a high-water mark cannot do."""
+    device = _Device(97.6, 126.2)            # the rollout's peak, say
+    reset_phase_peak(device)                  # ... and the update starts
+    device._a, device._r = 62.5 * _GB, 71.0 * _GB   # the update's own, smaller
+
+    assert phase_peak_metrics(device, "perf/update_peak")["perf/update_peak_allocated_gb"] == pytest.approx(62.5)
+    lifetime = per_rank_memory_metrics(device)
+    assert lifetime["perf/max_memory_allocated_gb"] == pytest.approx(97.6)
+    assert lifetime["perf/max_memory_reserved_gb"] == pytest.approx(126.2)
+
+
+def test_the_lifetime_mark_still_climbs_with_a_new_peak():
+    device = _Device(50.0, 60.0)
+    reset_phase_peak(device)
+    device._a, device._r = 80.0 * _GB, 90.0 * _GB
+    assert per_rank_memory_metrics(device)["perf/max_memory_allocated_gb"] == pytest.approx(80.0)
+
+
+def test_without_any_window_the_lifetime_mark_is_the_counter():
+    """A run that never opens a window has to read exactly as it did before."""
+    assert per_rank_memory_metrics(_Device(39.877, 45.5))["perf/max_memory_allocated_gb"] == pytest.approx(39.877)

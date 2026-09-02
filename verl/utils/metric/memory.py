@@ -52,6 +52,13 @@ __all__ = ["per_rank_memory_metrics", "device_footprint_gb", "reset_phase_peak",
 
 _GB = 1024.0**3
 
+# The lifetime high-water marks, carried across the resets reset_phase_peak does.
+# torch's own max_memory_* ARE the lifetime marks only while nothing resets them;
+# once a phase window opens one, the reading after it covers that phase alone.
+# Both readings are wanted -- see reset_phase_peak -- so the older one is kept
+# here rather than lost.
+_LIFETIME = [0.0, 0.0]
+
 
 def _allocator_counters(device) -> tuple:
     """(num_alloc_retries, num_ooms) for this rank, 0 when unavailable.
@@ -83,9 +90,19 @@ def reset_phase_peak(device) -> None:
     be turned off because step 1 reached 93.9 GiB is exactly that reading, and it
     cannot be told apart from a real update peak without this.
 
+    THE LIFETIME MARKS ARE PRESERVED ACROSS THIS, and that is not incidental.
+    ``per_rank_memory_metrics`` reads the same counters, and it means the ratchet:
+    "did this run ever come close to the card". Resetting in front of it silently
+    turned that key into the update phase's number under the run-long name -- with
+    the ratchet gone, the series could even go DOWN between steps, which is the
+    one thing a high-water mark cannot do. So the pre-reset values are folded into
+    a process-level running max here and taken back into account there.
+
     A no-op on a backend that cannot reset, so a diagnostic never takes a run down.
     """
     try:
+        _LIFETIME[0] = max(_LIFETIME[0], device.max_memory_allocated())
+        _LIFETIME[1] = max(_LIFETIME[1], device.max_memory_reserved())
         device.reset_peak_memory_stats()
     except Exception:  # noqa: BLE001 - a measurement must not break what it measures
         pass
@@ -121,8 +138,11 @@ def per_rank_memory_metrics(device, prefix: str = "perf") -> dict:
     Falls back to this rank's own numbers when torch.distributed is not up, so
     single-process runs and tests keep working.
     """
-    allocated = device.max_memory_allocated() / _GB
-    reserved = device.max_memory_reserved() / _GB
+    # max(counter, what was seen before the last reset). Without the second term
+    # this reports whatever window reset_phase_peak last opened, under a name that
+    # has meant the run's high-water mark since it was added.
+    allocated = max(device.max_memory_allocated(), _LIFETIME[0]) / _GB
+    reserved = max(device.max_memory_reserved(), _LIFETIME[1]) / _GB
     retries, ooms = _allocator_counters(device)
 
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
