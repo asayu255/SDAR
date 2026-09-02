@@ -1,4 +1,5 @@
 import json
+import threading
 import warnings
 from typing import List, Optional
 import argparse
@@ -30,6 +31,26 @@ def read_jsonl(file_path):
 def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
+
+
+# One request at a time on the GPU.
+#
+# FastAPI runs a synchronous endpoint in its worker threadpool, so this server
+# will happily execute forty /retrieve calls at once against ONE sharded FAISS
+# index and ONE encoder. Two things go wrong. The activations of n concurrent
+# encodes coexist, which is why a single request that a quiet box served was
+# refused with a 500 on a busy one -- the ceiling was never the request, it was
+# the request plus whatever else was in flight. And a GpuIndex built by
+# index_cpu_to_all_gpus shares its resources across the shards; searching it
+# from several threads at once is not something faiss promises to survive, and
+# the symptom when it does not is that nothing returns at all -- eleven requests
+# timed out together after 600 s with the server still accepting connections.
+#
+# Serialising costs nothing that was real. The GPU executes these one at a time
+# regardless; running them concurrently only multiplied the memory and removed
+# the guarantee. Document loading stays outside the lock, because it is Arrow
+# and host memory and it is the part that genuinely overlaps.
+_GPU = threading.Lock()
 
 
 def load_model(model_path: str, use_fp16: bool = False):
@@ -216,8 +237,9 @@ class DenseRetriever(BaseRetriever):
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
-        query_emb = self.encoder.encode(query)
-        scores, idxs = self.index.search(query_emb, k=num)
+        with _GPU:
+            query_emb = self.encoder.encode(query)
+            scores, idxs = self.index.search(query_emb, k=num)
         idxs = idxs[0]
         scores = scores[0]
         results = load_docs(self.corpus, idxs)
@@ -236,8 +258,9 @@ class DenseRetriever(BaseRetriever):
         scores = []
         for start_idx in range(0, len(query_list), self.batch_size):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
-            batch_emb = self.encoder.encode(query_batch)
-            batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            with _GPU:
+                batch_emb = self.encoder.encode(query_batch)
+                batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
 
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
@@ -309,6 +332,15 @@ class QueryRequest(BaseModel):
 
 app = FastAPI()
 
+# How many /retrieve calls are being served right now. A client that retries
+# without bound turns a slow server into a queue and the queue into the reason
+# it is slow, and from the client side that is indistinguishable from a server
+# that has stopped answering. Reported only when it is high enough to be the
+# answer, because a line per request is itself a source of latency here.
+_inflight = 0
+_inflight_lock = threading.Lock()
+_INFLIGHT_REPORT_OVER = 8
+
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
@@ -324,12 +356,22 @@ def retrieve_endpoint(request: QueryRequest):
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform retrieval
-    if request.return_scores:
-        results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
-    else:
-        results = retriever.search(query=request.query, num=request.topk, return_score=False)
-        scores = None
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
+        concurrent = _inflight
+    try:
+        # Perform retrieval
+        if request.return_scores:
+            results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
+        else:
+            results = retriever.search(query=request.query, num=request.topk, return_score=False)
+            scores = None
+    finally:
+        with _inflight_lock:
+            _inflight -= 1
+    if concurrent > _INFLIGHT_REPORT_OVER:
+        print(f"[retrieve] served with {concurrent} requests in flight", flush=True)
 
     # Format response
     resp = []
