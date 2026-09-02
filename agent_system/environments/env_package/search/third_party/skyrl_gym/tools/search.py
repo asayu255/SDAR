@@ -46,6 +46,42 @@ _BATCH_WINDOW_S = float(os.environ.get("SEARCH_BATCH_WINDOW_MS", "10")) / 1000.0
 # for hours. Re-probing costs one rejected request per period -- the queries are
 # sent singly either way. 0 makes the disable permanent.
 _BATCH_RETRY_S = float(os.environ.get("SEARCH_BATCH_RETRY_S", "300"))
+# How many consecutive 5xx a *multi-query* request absorbs before it is handed
+# back for splitting. The retriever encodes and searches a request in chunks of
+# its own retrieval_batch_size, so a request larger than what its GPU can hold
+# answers 5xx to every attempt, forever: measured on the retriever in use, 383
+# queries were served and 384 were not, with the server configured to chunk at
+# 512. That ceiling is free memory divided by the cost of a query, so it moves
+# with whatever else is on the box -- which is why it cannot be a fixed cap in
+# either the client or the server, and why the answer is to find it by halving.
+#
+# The budget must clear a genuine outage, because those also answer 5xx while a
+# restarting server is up but not ready. Observed recoveries took 2-6 attempts;
+# 4 attempts is 6 s of backoff before the first split, and splitting a request
+# the server is merely too busy to serve is harmless -- the halves are retried
+# under the same policy. 0 restores the unbounded wait for batches too.
+_SPLIT_AFTER_5XX = max(0, int(os.environ.get("SEARCH_SPLIT_AFTER_5XX", "4")))
+# How long a learned size cap holds before it is doubled. The ceiling rises as
+# the box frees memory, and nothing would ever tell us: a validation pass that
+# learned a cap while the trainer held its KV cache would keep it for the rest
+# of the run. Re-probing costs one split request per period; 0 makes a cap
+# permanent, the way 0 makes the un-batched flag permanent above.
+_BATCH_GROW_S = float(os.environ.get("SEARCH_BATCH_GROW_S", "300"))
+
+
+class _RetryableServerError(Exception):
+    """A multi-query request the retriever answered 5xx to, repeatedly.
+
+    Raised instead of returned so it cannot be mistaken for the errors that end
+    up in an ``<information>`` block: nothing here reaches a trajectory. Only a
+    caller that passed ``server_error_budget`` can see it, and the only caller
+    that does is the coalescer, which can act on it by sending less at once.
+    """
+
+    def __init__(self, message: str, status_code: int, attempts: int):
+        super().__init__(message)
+        self.status_code = status_code
+        self.attempts = attempts
 
 
 def _search_api_request(
@@ -57,6 +93,7 @@ def _search_api_request(
     log_requests: bool = True,
     session: Optional[requests.Session] = None,
     max_retries: Optional[int] = MAX_RETRIES,
+    server_error_budget: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Calls the search API with a single query.
@@ -88,6 +125,11 @@ def _search_api_request(
         session: The session to use for the request. If none is provided, a new session will be created.
         max_retries: Attempts before giving up on a retryable failure. ``None``
             (or <= 0) retries until the retriever answers.
+        server_error_budget: Consecutive 5xx after which to raise
+            ``_RetryableServerError`` rather than keep waiting. Set only for a
+            request carrying several queries, where the caller can respond by
+            sending fewer; a single query has nothing to give up and keeps the
+            unbounded wait, which is the whole point of ``max_retries=None``.
 
     Returns:
         response: The response from the search API (json if successful, None otherwise)
@@ -132,6 +174,7 @@ def _search_api_request(
 
     last_error = None
     attempt = 0
+    server_errors = 0
     while True:
         attempt += 1
         can_retry = unlimited or attempt < max_retries
@@ -149,8 +192,16 @@ def _search_api_request(
 
             # Check for Gateway Timeout (504) and other server errors for retrying
             if response.status_code in [500, 502, 503, 504]:
+                server_errors += 1
                 last_error = f"{log_prefix}API Request Error: Server Error ({response.status_code}) on attempt {attempt}/{budget}"
                 logger.warning(last_error)
+                # A request the retriever cannot serve at this size answers the
+                # same way however long we wait. Hand it back while the caller
+                # still has something to try -- fewer queries in one request.
+                if server_error_budget and server_errors >= server_error_budget:
+                    if should_close_session:
+                        session.close()
+                    raise _RetryableServerError(last_error, response.status_code, server_errors)
                 if can_retry:
                     _wait(attempt, f"HTTP {response.status_code}")
                     continue
@@ -176,7 +227,13 @@ def _search_api_request(
 
             return response.json(), None
 
+        except _RetryableServerError:
+            # Not an outcome of the request loop: the caller asked to be told.
+            raise
         except requests.exceptions.ConnectionError as e:
+            # A refused connection says nothing about how large the request was,
+            # so it must not count towards the budget that decides to split one.
+            server_errors = 0
             last_error = f"{log_prefix}Connection Error: {e}"
             logger.warning(last_error)
             if can_retry:
@@ -184,6 +241,7 @@ def _search_api_request(
                 continue
             break
         except requests.exceptions.Timeout as e:
+            server_errors = 0
             last_error = f"{log_prefix}Timeout Error: {e}"
             logger.warning(last_error)
             if can_retry:
@@ -246,6 +304,13 @@ class _Coalescer:
 
     Batching is per (url, topk, return_scores, timeout, retries): a window only
     ever holds requests that would have been identical apart from the query.
+
+    A window has no size of its own -- it is however many environments happened
+    to act at once -- and the retriever has a ceiling on how many queries it can
+    serve in one request that moves with the memory left on its GPU. Where the
+    two meet, the request answers 5xx to every attempt and unbounded retries
+    wait on it forever. So a batch that keeps drawing 5xx is halved until it is
+    served, and the size that worked is remembered for the next window.
     """
 
     def __init__(self):
@@ -256,6 +321,13 @@ class _Coalescer:
         # succeeds one query at a time is a server that does not take lists.
         self._batchable: Dict[str, bool] = {}
         self._retry_at: Dict[str, float] = {}
+        # The largest request this URL was seen to serve, learned the same way:
+        # a size that answered 5xx to every attempt is a size not to send again.
+        # Unset means unlimited, which is where every URL starts -- capping by
+        # default would cost an index re-read per extra request on a retriever
+        # that was never going to refuse.
+        self._max_batch: Dict[str, int] = {}
+        self._grow_at: Dict[str, float] = {}
 
     def enabled_for(self, url: str) -> bool:
         if not _BATCH_ENABLED:
@@ -268,6 +340,33 @@ class _Coalescer:
             self._batchable[url] = True
         logger.warning(f"{url}: re-probing batched search after {_BATCH_RETRY_S:.0f}s un-batched")
         return True
+
+    def batch_cap(self, url: str) -> Optional[int]:
+        """The most queries to put in one request to this URL, or None.
+
+        Doubled once per grow period so a cap learned under a transient squeeze
+        does not outlive it. It rises past any window this rollout can produce
+        and stops mattering, which is the same thing as being forgotten.
+        """
+        grown = None
+        with self._lock:
+            cap = self._max_batch.get(url)
+            if cap is not None and _BATCH_GROW_S > 0 and time.monotonic() >= self._grow_at.get(url, 0.0):
+                cap = grown = cap * 2
+                self._max_batch[url] = cap
+                self._grow_at[url] = time.monotonic() + _BATCH_GROW_S
+        if grown is not None:
+            logger.info(f"{url}: retrying batches of up to {grown} queries after {_BATCH_GROW_S:.0f}s capped")
+        return cap
+
+    def _learn_cap(self, url: str, refused: int) -> int:
+        """Record that ``refused`` queries in one request was too many."""
+        cap = max(1, refused // 2)
+        with self._lock:
+            cap = min(cap, self._max_batch.get(url, cap))
+            self._max_batch[url] = cap
+            self._grow_at[url] = time.monotonic() + _BATCH_GROW_S
+        return cap
 
     def call(self, url: str, query: str, send, **key_parts):
         # Checked here as well as in call_search_api: once a URL has told us it
@@ -295,32 +394,7 @@ class _Coalescer:
 
     def _flush(self, url, batch, send):
         try:
-            queries = [item.query for item in batch]
-            # One query goes as a bare string: identical to the un-batched call,
-            # so a lone environment never probes a server for list support it may
-            # not have.
-            response, error = send(queries[0] if len(queries) == 1 else queries)
-            if len(queries) > 1 and error:
-                # Either the server does not accept a list or the retriever is
-                # unwell. Re-send one at a time: if that works, it was the former
-                # and this URL stops batching; if it fails too, the caller gets
-                # the error it would have got anyway.
-                logger.warning(f"batched search of {len(queries)} queries failed ({error}); retrying singly")
-                singles = [send(item.query) for item in batch]
-                if all(single_error is None for _, single_error in singles):
-                    with self._lock:
-                        self._batchable[url] = False
-                        self._retry_at[url] = time.monotonic() + _BATCH_RETRY_S
-                    logger.warning(
-                        f"{url} rejected a batched request but served the queries individually; "
-                        "batching disabled for it. Restart the retriever with a server that "
-                        "accepts a list of queries -- this URL is re-probed every "
-                        f"{_BATCH_RETRY_S:.0f}s, so a restart is picked up without restarting the run."
-                    )
-                for item, (single_response, single_error) in zip(batch, singles):
-                    item.response, item.error = single_response, single_error
-                return
-            self._distribute(batch, response, error)
+            self._send(url, batch, send)
         except BaseException as exc:  # noqa: BLE001 - a leader that dies must not hang its followers
             for item in batch:
                 if item.error is None and item.response is None:
@@ -329,6 +403,69 @@ class _Coalescer:
         finally:
             for item in batch:
                 item.done.set()
+
+    def _send(self, url, batch, send):
+        """Send one slice, halving it if the retriever refuses it for its size.
+
+        The halves go back through the same path, so the search for a size the
+        retriever will serve costs log2(n) requests once and nothing after: the
+        cap it lands on is remembered, and the next window is sliced to it.
+
+        A slice of one is sent as a bare string, which sets no budget: there the
+        unbounded wait is the only thing left, and it is the behaviour
+        ``max_retries=None`` was asked for. Splitting never turns a retriever
+        outage into an error string in a trajectory -- it only stops a request
+        that is too large from waiting on a server that will never serve it.
+        """
+        cap = self.batch_cap(url)
+        if cap and len(batch) > cap:
+            for start in range(0, len(batch), cap):
+                self._send(url, batch[start : start + cap], send)
+            return
+
+        queries = [item.query for item in batch]
+        try:
+            # One query goes as a bare string: identical to the un-batched call,
+            # so a lone environment never probes a server for list support it may
+            # not have.
+            response, error = send(queries[0] if len(queries) == 1 else queries)
+        except _RetryableServerError as exc:
+            if len(batch) == 1:
+                raise  # a budget is never set for a bare string; nothing to split
+            cap = self._learn_cap(url, len(batch))
+            logger.warning(
+                f"{url}: {len(batch)} queries in one request drew HTTP {exc.status_code} on "
+                f"{exc.attempts} consecutive attempts; batches capped at {cap} for "
+                f"{_BATCH_GROW_S:.0f}s and this one re-sent in slices. The retriever is up -- "
+                "this request was too large for it to serve, which waiting cannot change."
+            )
+            # Re-send the same queries, not two halves: the cap just learned is
+            # what slices them, so the rest of this window does not have to
+            # rediscover a size that has already been refused.
+            self._send(url, batch, send)
+            return
+        if len(queries) > 1 and error:
+            # A returned error is not the size refusal handled above -- that one
+            # is raised. So this is a server that does not accept a list, or one
+            # that failed in a way retrying cannot fix. Re-send one at a time: if
+            # that works, it was the former and this URL stops batching; if it
+            # fails too, the caller gets the error it would have got anyway.
+            logger.warning(f"batched search of {len(queries)} queries failed ({error}); retrying singly")
+            singles = [send(item.query) for item in batch]
+            if all(single_error is None for _, single_error in singles):
+                with self._lock:
+                    self._batchable[url] = False
+                    self._retry_at[url] = time.monotonic() + _BATCH_RETRY_S
+                logger.warning(
+                    f"{url} rejected a batched request but served the queries individually; "
+                    "batching disabled for it. Restart the retriever with a server that "
+                    "accepts a list of queries -- this URL is re-probed every "
+                    f"{_BATCH_RETRY_S:.0f}s, so a restart is picked up without restarting the run."
+                )
+            for item, (single_response, single_error) in zip(batch, singles):
+                item.response, item.error = single_response, single_error
+            return
+        self._distribute(batch, response, error)
 
     @staticmethod
     def _distribute(batch, response, error):
@@ -377,6 +514,10 @@ def call_search_api(
             log_requests=log_requests,
             session=session,
             max_retries=max_retries,
+            # A list can be made smaller; a bare string cannot. So only a batch
+            # is allowed to stop waiting on a 5xx, and it stops in order to send
+            # less -- never to give up on the query.
+            server_error_budget=_SPLIT_AFTER_5XX if isinstance(payload_query, list) else None,
         )
 
     if not _COALESCER.enabled_for(retrieval_service_url):
