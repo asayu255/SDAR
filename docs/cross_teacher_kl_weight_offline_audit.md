@@ -761,6 +761,50 @@ token id `{13708 '<th', 766 'ink'}` だけで **webshop の全 teacher-KL の 21
 
 ---
 
+## 14. sg1 の 150 step 到達後:検証で control を上回った理由
+
+### 14.1 結果
+
+検証(`val_step150.jsonl`、traj 単位)は ARM(sg1)が全タスクで control を上回った。一方、**同じ区間の学習中ロールアウト(T=1.0)では control が全タスクで上回っている。**
+
+| | alfworld | webshop acc | search |
+|---|---:|---:|---:|
+| **検証** ARM / CTL | **0.714 / 0.651** | **0.667 / 0.635** | **0.394 / 0.384** |
+| 非対応 z | +1.08(ノイズ内) | +0.53(ノイズ内) | **+3.17**(n=51,713) |
+| **学習ロールアウト T=1.0、steps 121–148** ARM / CTL | **0.656 / 0.722** | **0.598 / 0.647** | 0.408 / 0.413 |
+
+alfworld は 126 エピソード中 90 対 82、**8 エピソードの差**。手元の 5 run の `val_step150` は alfworld 0.651–0.714、webshop 0.627–0.675、search 0.386–0.394 に散っており、ARM は3つとも上端、control は下端付近。対応あり検定(McNemar)には control の `val_step150.jsonl` が必要で、本ホストには無い。
+
+### 14.2 符号反転を説明する事実
+
+検証と学習でサンプリングが違う: **alfworld / webshop の検証は T=0.4、search は greedy**(`rollout.val_kwargs_by_task`)、学習ロールアウトは T=1.0。そして ARM の entropy は control の **2.4 倍**(121–148: 0.590 対 0.249、alfworld 0.691 対 0.282)。search の entropy は両者同じ(0.099 対 0.103)。
+
+| steps | alfworld teacher_kl ARM/CTL | entropy ARM/CTL | T=1.0 success ARM−CTL |
+|---:|---|---|---:|
+| 51–60 | 0.383 / 0.399 | 0.177 / 0.146 | **+0.175** |
+| 81–90 | 0.307 / 0.353 | 0.483 / 0.160 | −0.023 |
+| 111–120 | 0.280 / 0.280 | 0.823 / 0.290 | −0.066 |
+| 141–148 | **0.234 / 0.196** | **0.772 / 0.322** | **−0.114** |
+
+entropy の差が開くほど T=1.0 の成功率差が負に振れる。同時に alfworld では **step 120 以降 control の方が教師に近い**(teacher_kl の逆転)。応答も ARM の方が長い(alfworld +19% tokens、+16% turns; webshop +16% turns)。
+
+### 14.3 解釈:改善は2経路で、どちらも cross-teacher 知識ではない
+
+**(i) search(greedy 検証、entropy 不変、z=3.2):** ARM は教師に近い(teacher_kl 0.089 対 0.115、−23%)。監査 §2 の通り $W$ は per-token KL と正相関(`weight_kl_lift` 1.27–1.29 を維持)し、**KL が大きい位置を重く蒸留する focal 型の再重み付け**として働く。KL 予算が最小の search で「教師への収束が速い」が最も素直に検証成績に出た。cross-teacher の裏付けは不要な説明である。
+
+**(ii) alfworld / webshop(T=0.4 検証、entropy 2.4倍):** 機構の裾増幅(監査 §2.1)が方策を平坦化した。T=1.0 では裾のサンプルが成功率を下げ(14.2 の負の差)、T=0.4 では裾が抑えられてモード付近が評価される。**モードが control より良いかどうかは、この標本では決まらない**(z=1.08 / 0.53)。確立しているのは「同じ方策が T=1.0 で負け、T=0.4 で勝つ」という符号反転であり、これは entropy 経路の指紋である。
+
+機構の内部量は監査の結論から動いていない: `shuffled_to_live_gate_ratio` 0.82(文法で開く)、`reward_positive/net_effect` は 61 step 以降負のまま(成功エピソードから圧を引く)、`teacher_novelty` は 0.70 まで上がるが `acted` 限定ではない。**cross-teacher の裏付けがタスク知識を運んだ証拠は、150 step 時点でも増えていない。**
+
+### 14.4 決着させる測定
+
+1. **対応あり検定。** control の `val_step150.jsonl` を本ホストへ。`scripts/val_paired.py` で traj_uid 初出順に対応づけ McNemar。
+2. **温度感度。** 両 step-150 checkpoint を **T=1.0** と **T=0.4** の両方で `val_only`。(ii) が正しければ alfworld/webshop の差は T=1.0 で消える(か反転する)。
+3. **cross-teacher 抜きの ablation。** $W$ を per-token KL の単調関数(例: $1+\kappa\,\mathrm{KL}/\overline{\mathrm{KL}}$ を mean-1 正規化)にした arm。(i) が正しければ search の +1pp が再現し、cross-teacher 部分は不活性と確定する。entropy bonus のみの arm が (ii) の対照。
+4. **webshop "Score" 列の出所。** `val_step150.jsonl` の score は二値(成功×10)で、表の 0.768 / 0.760 は別ソース(`episode/webshop_webshop_task_score` 相当)。学習中の同指標は 121–148 で ARM 0.752 対 CTL 0.822 と**逆向き**なので、検証側の値の定義を揃えて再確認すること。
+
+---
+
 ## 付録: 本監査で参照したコード位置
 
 | 量 | 位置 |
