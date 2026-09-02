@@ -305,3 +305,202 @@ def test_the_cooldown_can_be_turned_off(monkeypatch):
     _concurrent(_Server(accepts_lists=False), ["a", "b", "c"])
     clock[0] += 100000.0
     assert search_tool._COALESCER.enabled_for("http://r/retrieve") is False
+
+
+# ---------------------------------------------------------------------------
+# A window has no size of its own, and the retriever has a ceiling. Where the
+# two meet, every attempt answers 5xx and an unbounded retry waits on it for as
+# long as the run lasts -- which is how one validation pass sat on a single
+# request for 21 minutes with the GPUs idle. Measured on the retriever in use,
+# 383 queries in a request were served and 384 were not, so the ceiling is not a
+# constant either side can be configured with: it is free memory over the cost
+# of a query, and it moves. These hold the way out -- halve the request, learn
+# the size, and never mistake an outage for it.
+# ---------------------------------------------------------------------------
+
+
+class _Response:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self.text = "Internal Server Error" if status_code >= 500 else "ok"
+        self._payload = payload if payload is not None else {"result": [[]]}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise search_tool.requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+
+class _HttpSession:
+    """Answers the first ``failures`` posts with ``status``, then serves."""
+
+    def __init__(self, failures, status=500, raises=None):
+        self.failures = failures
+        self.status = status
+        self.raises = raises
+        self.posts = 0
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.posts += 1
+        if self.posts <= self.failures:
+            if self.raises is not None:
+                raise self.raises
+            return _Response(self.status)
+        return _Response(200)
+
+    def close(self):
+        pass
+
+
+def _request(session, query, **kw):
+    return search_tool._search_api_request(
+        retrieval_service_url="http://r/retrieve",
+        query=query,
+        session=session,
+        log_requests=False,
+        max_retries=None,
+        **kw,
+    )
+
+
+def test_a_batch_that_keeps_drawing_5xx_is_handed_back_for_splitting(monkeypatch):
+    """Raised, not returned: an error that is returned becomes the
+    <information> block the student reads, and nothing here belongs there."""
+    monkeypatch.setattr(search_tool.time, "sleep", lambda _s: None)
+    session = _HttpSession(failures=10**6)
+
+    with pytest.raises(search_tool._RetryableServerError) as caught:
+        _request(session, ["a", "b"], server_error_budget=3)
+
+    assert caught.value.status_code == 500
+    assert caught.value.attempts == 3
+    assert session.posts == 3
+
+
+def test_a_single_query_still_waits_out_a_5xx(monkeypatch):
+    """The unbounded wait is the whole point of max_retries=None, and a lone
+    query has nothing to give up -- it cannot be made smaller."""
+    monkeypatch.setattr(search_tool.time, "sleep", lambda _s: None)
+    session = _HttpSession(failures=8)
+
+    response, error = _request(session, "a")
+
+    assert error is None and response is not None
+    assert session.posts == 9
+
+
+def test_an_outage_does_not_count_towards_the_split_budget(monkeypatch):
+    """A refused connection says nothing about how large the request was. The
+    retriever outage this client already survives (44 s of No route to host,
+    every query recovered) must not be turned into a size hunt."""
+    monkeypatch.setattr(search_tool.time, "sleep", lambda _s: None)
+    session = _HttpSession(
+        failures=8, raises=search_tool.requests.exceptions.ConnectionError("No route to host")
+    )
+
+    response, error = _request(session, ["a", "b"], server_error_budget=3)
+
+    assert error is None and response is not None
+    assert session.posts == 9
+
+
+def test_the_budget_is_off_by_default(monkeypatch):
+    """Existing callers must keep the behaviour they were written against."""
+    monkeypatch.setattr(search_tool.time, "sleep", lambda _s: None)
+    session = _HttpSession(failures=8)
+
+    response, error = _request(session, ["a", "b"])
+
+    assert error is None and session.posts == 9
+
+
+class _SizeLimitedServer:
+    """Serves at most ``limit`` queries per request, and refuses larger ones the
+    way the retry loop reports a retriever that keeps answering 5xx."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.requests = []
+        self._lock = threading.Lock()
+
+    @property
+    def served(self):
+        return [n for n in self.requests if n <= self.limit]
+
+    def __call__(self, query):
+        queries = query if isinstance(query, list) else [query]
+        with self._lock:
+            self.requests.append(len(queries))
+        if len(queries) > self.limit:
+            raise search_tool._RetryableServerError("Server Error (500)", 500, 4)
+        if isinstance(query, list):
+            return {"result": [[{"document": {"contents": f"doc for {q}"}}] for q in query]}, None
+        return {"result": [[{"document": {"contents": f"doc for {query}"}}]]}, None
+
+
+def test_a_request_too_large_is_split_until_it_is_served():
+    server = _SizeLimitedServer(limit=3)
+    queries = [f"q{i}" for i in range(16)]
+
+    out = _concurrent(server, queries)
+
+    assert all(error is None for _, error in out)
+    assert [response["result"][0][0]["document"]["contents"] for response, _ in out] == [
+        f"doc for {q}" for q in queries
+    ]
+    # Every query served exactly once, and by fewer requests than sending them
+    # one at a time would have taken -- the fallback this replaces sent 16.
+    assert sum(server.served) == 16
+    assert len(server.requests) < 16, server.requests
+
+
+def test_the_size_that_was_refused_is_not_sent_again():
+    """The cost of finding the ceiling is paid once. A window that re-probed it
+    every turn would spend the run bisecting instead of retrieving."""
+    server = _SizeLimitedServer(limit=3)
+    _concurrent(server, [f"q{i}" for i in range(16)])
+    probes = len(server.requests)
+
+    server.requests.clear()
+    out = _concurrent(server, [f"p{i}" for i in range(16)])
+
+    assert all(error is None for _, error in out)
+    assert server.requests == server.served, server.requests  # nothing refused
+    assert len(server.requests) < probes
+
+
+def test_splitting_does_not_disable_batching_for_the_url():
+    """A retriever that cannot serve 400 queries at once still takes lists --
+    dropping to one request per query is the outcome to avoid, not the cure."""
+    server = _SizeLimitedServer(limit=3)
+    _concurrent(server, [f"q{i}" for i in range(16)])
+
+    assert search_tool._COALESCER.enabled_for("http://r/retrieve") is True
+    assert max(server.served) > 1, server.requests
+
+
+def test_the_cap_is_relaxed_so_a_box_that_frees_memory_gets_big_batches_again(monkeypatch):
+    """The ceiling moves both ways. A cap learned while the trainer held its KV
+    cache would otherwise outlive it for the rest of the run."""
+    clock = [1000.0]
+    monkeypatch.setattr(search_tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(search_tool, "_BATCH_GROW_S", 300.0)
+
+    coalescer = search_tool._COALESCER
+    coalescer._learn_cap("http://r/retrieve", 16)
+    assert coalescer.batch_cap("http://r/retrieve") == 8
+
+    clock[0] += 299.0
+    assert coalescer.batch_cap("http://r/retrieve") == 8
+    clock[0] += 2.0
+    assert coalescer.batch_cap("http://r/retrieve") == 16
+
+
+def test_a_learned_cap_only_ever_shrinks_while_it_holds():
+    coalescer = search_tool._COALESCER
+    assert coalescer._learn_cap("http://r/retrieve", 400) == 200
+    assert coalescer._learn_cap("http://r/retrieve", 200) == 100
+    # A later refusal of a larger size cannot undo what a smaller one taught.
+    assert coalescer._learn_cap("http://r/retrieve", 400) == 100
