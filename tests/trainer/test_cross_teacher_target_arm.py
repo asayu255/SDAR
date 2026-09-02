@@ -101,3 +101,20 @@ def test_the_two_mechanisms_cannot_be_enabled_together():
     a = _effective(TARGET)
     assert a.get("algorithm.opd.cross_teacher_target.enable") is True
     assert a.get("algorithm.opd.cross_teacher_kl_weight.enable", False) in (False, None, "<absent>")
+
+
+def test_the_gate_line_is_printed_and_nothing_aborts_on_it():
+    """The gates are advisory (decided 2026-09-02): printed every step, acted on
+    by a human. A future edit that turns one back into a raise would make the run
+    stop on a number the design says to read, not to obey."""
+    src = open(os.path.join(REPO, "verl", "workers", "actor", "dp_actor.py")).read()
+    block = src[src.index("[cross_teacher_target] gates (advisory)"):]
+    block = block[: block.index("flush=True")]
+    for key in ("target/tv", "target/shuffled_tv_ratio", "target/acted_novelty",
+                "target/tag_share", "target/max_abs_log_w", "target/mass_error_max"):
+        assert key in block, key
+    # Nothing in the arm raises or exits on a gate value.
+    where = src.index("if xtt_on:")
+    tail = src[where : where + 4000]
+    for banned in ("raise RuntimeError", "sys.exit", "assert_all_finite({\n                \"target"):
+        assert banned not in tail, banned

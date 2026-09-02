@@ -230,27 +230,29 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 **この表からのズレは、設計かデータのどちらかの理解が違うことを意味する。** 特に「下げ側が律速」は質量の非対称から出ているので、逆転したら前提が崩れている。
 
-## 5. 中止条件(step 20 で判定、150 step を燃やす前に)
+## 5. 監視する指標(自動中止はしない — 判断は人間が行う)
 
-監査は「この教師集合では信号が弱い」と繰り返し示している($\phi = 0.066$、新規性のある一致質量 0.3%)。**したがって以下を事前登録の gate にする。**
+監査は「この教師集合では信号が弱い」と繰り返し示している($\phi = 0.066$、新規性のある一致質量 0.3%)。当初は自動中止のゲートとして設計したが、**2026-09-02 に「中止はせず、指標の表示のみ」に変更した。** 走行は 150 step まで進み、下の値は判断材料として提示されるだけである。
 
-| # | 指標 | 中止条件 | 理由 |
+実装は自動停止を一切持たない。毎 step、rank 0 が1行を run ログに出す(`[cross_teacher_target] gates (advisory): ...`)。全 rank で all_reduce 済みの同一値なので、rank 0 の1行が全体を代表する。
+
+| 表示名 | wandb キー | 気にすべき水準 | 何を意味するか |
 |---|---|---|---|
-| G1 | `shuffled_to_live_tv_ratio` | **> 0.6** で中止 | C8。off-task shift を行内で roll して $c$ を再計算し、TV 比を出す。0.8 なら機構は文法で同じ質量を動かしている。`decorrelated_off_shifts` が既にある |
-| G2 | `acted/base_novelty` = $1 - \sum_{c\neq0} D_{on}/\sum_{c\neq0} D_{base}$ | **< 0.1** で中止 | 作用先が base 相続の合意なら、on-task 教師が既に教えている |
-| G3 | `target/tag_token_share` | **> 0.3** で警告 | C9。`{13708, 766}` が介入の 3割を超えたら、測っているのはタグのトークン化 |
-| G4 | `target/max_log_ratio` | 発散 | §3.1 の病理。(ii) に切替 |
-| G5 | 質量・TV が §4 の予測から 2倍以上ズレる | 原因究明まで停止 | 設計の理解が誤っている |
+| `tv` | `target/tv` | 事前登録 **0.019** | 交換量 $T$。大きくズレたら §4 の前提が崩れている |
+| `shuffled/live` | `target/shuffled_tv_ratio` | **> 0.6 で懸念** | off-task shift を行内で roll して $c$ を再計算した TV 比。旧機構のゲートはここで 0.82 だった = 文法で同じ質量を動かしていた |
+| `novelty` | `target/acted_novelty` | **< 0.1 で懸念** | 作用先の $1 - \sum D_{on}/\sum D_{base}$。低ければ base 相続の合意に作用しており、on-task 教師が既に教えている |
+| `tag_share` | `target/tag_share` | **> 0.3 で懸念** | タグ語彙への介入シェア。超えたら測っているのはタグのトークン化(§13.5、`'<th'` 単独で webshop の 21.7%) |
+| `max\|log w\|` | `target/max_abs_log_w` | 発散 | §3.1 の病理。有界性は構成上保証されているので、動いたら実装のバグ |
+| `mass_err` | `target/mass_error_max` | $> 10^{-12}$ | $Z=1$ 恒等式の実測違反。これは指標ではなく assertion |
+| `A/B` | `target/channel/{a,b}_share` | 事前登録 **0.871 / 0.129** | 主チャネルが A(全教師一致)であることの確認 |
 
-G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step で判定**すること。
-
----
+**読む時期。** `shuffled/live` と `novelty` は step 1 から計算できるので、150 step の完了を待つ必要はない。早期に懸念水準へ振れていたら、それは「機構の実装が悪かった」ではなく「**この教師集合に共有すべきタスク知識が無い**」ことの直接の証拠になり、negative result として §11.6 と合わせて報告できる形になる — その判断をいつ下すかは、走行を止めるかどうかとは別の問題である。
 
 ## 6. 診断(監査で「無いと読めなかった」ものだけ)
 
 1. **チャネル分解。** $c = a + b$ の厳密な分割で、各チャネルの質量・TV・$\sum |c|$ シェア。`a` が支配なら意図1、`b` が支配なら意図2 が効いている。両方報告し、`allocation_cosine`(2チャネルが同じ候補を触っているか)も。
 2. **状態別。** 一致枝 / B枝(on-task 沈黙) / B枝(on-task 反対だが $O<L$) / $s=0$ の4状態で、候補数・**教師質量**・TV。監査の「frac と mass_frac を必ず対で読む」を踏襲(候補数 4.3% が質量 64.7% だった)。
-3. **反実仮想を3本。** `shuffled`(G1)、`a` のみ、`b` のみ。それぞれ TV と状態分布。
+3. **反実仮想を3本。** `shuffled`(§5 の `shuffled/live`)、`a` のみ、`b` のみ。それぞれ TV と状態分布。
 4. **タグトークンの分離**(G3)。`{13708, 766, 27, 29, 522, 1311, 151667, 151668}` の介入シェア。
 5. **`top64_share` を必ず出す。** 監査で control のトークン表の絶対量を出せなかった原因(`opd/*` にはあった)。新アームでは `target/*` に同名で出す。
 6. **event dump は全ターン。** 監査 §9-0 で判明した通り、既存ダンプは `turn=0` しか含まない。ターン層別サンプリングにすること。
@@ -276,13 +278,13 @@ G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step �
 
 **実装済み(2026-09-02、branch `claude/cross-teacher-target`)。** 中核 `verl/trainer/ppo/cross_teacher_target.py`(§2 の式 + §3 の交換 + `TargetStepStats`)、actor 配線(`dp_actor.py`: 教師 logprob を $\log\tilde p$ に差し替え、3アーム相互排他 assert)、driver 配線(`opd_ray_trainer.py` の第3消費者)、config 伝播(`main_opd.py`)、run script(`run_multitask_cross_teacher_target_qwen3.sh`)、intent lock(`expected_multitask_cross_teacher_target_config.yaml`、機構キーは enable / base_path / exponent_scale の3つ)、対 control・対 klw のペアリングテスト(`test_cross_teacher_target_arm.py`: 差分が機構キーと識別子のみであることを合成 config で機械検証)。
 
-**指標(すべて `target/*`、control には0列):** `tv`(=交換量 T)、`shuffled_tv_ratio`(G1)、`acted_novelty`(G2)、`tag_share`(G3)、`max_abs_log_w`(G4)、`mass_error_max`(Z=1 恒等式の実測)、`live_frac`、`throttle_up/down`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、Z=1 なので厳密)、イベントは `SignEventSamples` を再利用 — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
+**指標(すべて `target/*`、control には0列):** `tv`(=交換量 T)、`shuffled_tv_ratio`・`acted_novelty`・`tag_share`・`max_abs_log_w`(§5、毎 step 1行で run ログにも出る)、`mass_error_max`(Z=1 恒等式の実測)、`live_frac`、`throttle_up/down`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、Z=1 なので厳密)、イベントは `SignEventSamples` を再利用 — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
 
 **対 control の差分は厳密には2つある。** 機構キーに加えて `student_indexed_topk`(control: true / target: **false**、C7)。これは意図的で、根拠は測定: teachertopk サインアームがまさにこのキーだけを student-indexed の兄弟アームに対して変え、**全7状態の frac / mass_frac が ±0.006 以内、学習中ロールアウトの episode 指標は区別不能**だった(teachertopk レポート)。ペアリングテストはこのキーを測定根拠のコメント付きで許容している。support が teacher top-k になることで、キャッシュは行あたり 4 → 3 モデル読みになる。
 
 **resume の扱い:** target アームは sidecar を持たない(μ も α も無いため)。resume 時は RMS が生きたバッチから再ウォームされ、最初のスナップショットまで $c\equiv0$(= no-op step が1回入るだけ)。
 
-**再利用するもの:** `CumulativePolicyShiftRMS`、`standardize_policy_shifts`、`decorrelated_off_shifts`(G1)、`TokenStateCounts` / `LogitPushTokens` / `SignEventSamples`(§6)、teacher hidden-state cache(teacher-indexed なので 3 モデル読みで済む)。
+**再利用するもの:** `CumulativePolicyShiftRMS`、`standardize_policy_shifts`、`decorrelated_off_shifts`(§5 の反実仮想)、`TokenStateCounts` / `LogitPushTokens` / `SignEventSamples`(§6)、teacher hidden-state cache(teacher-indexed なので 3 モデル読みで済む)。
 
 **捨てるもの:** `PreviousStepTaskKLWeightedMean`、cold start、`teacher_similarity`($q$)、`candidate_mass`(student 測度)、`report_epsilon`、sidecar のバージョン管理。
 
@@ -303,9 +305,9 @@ G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step �
 
 **この設計は監査が指摘した機構側の欠陥をすべて潰すが、信号が無いという測定結果は変わらない。** $\phi = 0.066$、base 統制後の偏相関 0.00–0.04、新規性のある一致質量 0.3%、advantage 予測 ≤ 0、action 粒度でも回復せず。
 
-設計が正しくても効かない可能性が高い、という前提で走らせるべきである。だからこそ §5 の中止条件を step 20 で見る。**G1(shuffled 比)と G2(novelty)が予測通りなら、それは「機構の実装が悪かったのではなく、この教師集合に共有すべきタスク知識が無い」ことの、これまでで最も直接的な証拠になる** — negative result として §11.6 と合わせて報告できる形になる。
+設計が正しくても効かない可能性が高い、という前提で走らせるべきである。だからこそ §5 の指標を step 1 から見る(中止はしない)。**`shuffled/live` と `novelty` が予測通りなら、それは「機構の実装が悪かったのではなく、この教師集合に共有すべきタスク知識が無い」ことの、これまでで最も直接的な証拠になる** — negative result として §11.6 と合わせて報告できる形になる。
 
-そのうえで、監査が指摘した唯一の正方向の手掛かりは別にある: $\Delta_{on}$ の action 粒度(base 統制後 +0.128、§4.4/§5.2)。本機構が G1/G2 で落ちた場合の次の候補はそちらである。
+そのうえで、監査が指摘した唯一の正方向の手掛かりは別にある: $\Delta_{on}$ の action 粒度(base 統制後 +0.128、§4.4/§5.2)。本機構の指標が懸念水準に振れた場合の次の候補はそちらである。
 
 ---
 
@@ -323,10 +325,10 @@ G1・G2 は **step 1 から計算できる**。150 step ではなく **20 step �
 ### 10.2 決めるべきもの(影響の大きい順)
 
 **(D1) シード数 1 か 2 か。** 監査の中心的な失敗は「どの比較も結論に至らなかった」ことである。ノイズ実測では全体成功率の 20-step 窓差の 2SE ≈ **0.032**。単一シード対では**それより小さい効果は原理的に検出できない**。2シードにすればコストは倍(150 step × 2 アーム × 2 シード)。
-→ **決定: 1 シード。** §5 の gate で判断する前提。**結果水準の差は原理的に 0.032 以下を検出できない**ことを、報告時に必ず添えること。
+→ **決定: 1 シード。** §5 の指標で判断する前提(自動中止はしない)。**結果水準の差は原理的に 0.032 以下を検出できない**ことを、報告時に必ず添えること。
 
 **(D2) 対照を新規に走らせるか、既存を流用するか。** §7 は同一ホスト・同一 GPU 枚数・同一コミットを要求する。既存 control(`91v55ri7`)は 3 GPU・別ホスト・`BALANCE_MINIBATCH_COLUMNS` 導入前で、**流用すると §0.2 の失敗を再現する**。新規は 150 step で約 27–29 時間。
-→ **決定: 既存(`91v55ri7`)を流用。** よって §0.2 の交絡がこのアームにも引き継がれる: **GPU 2 対 3、別ホスト、`BALANCE_MINIBATCH_COLUMNS` 導入前のコード**。成功率の差は機構の効果として解釈できない。**§5 の機構診断が事実上の唯一の判断材料になる**ので、G1/G2 を step 20 で必ず見ること。
+→ **決定: 既存(`91v55ri7`)を流用。** よって §0.2 の交絡がこのアームにも引き継がれる: **GPU 2 対 3、別ホスト、`BALANCE_MINIBATCH_COLUMNS` 導入前のコード**。成功率の差は機構の効果として解釈できない。**§5 の機構診断が事実上の唯一の判断材料になる**ので、`shuffled/live` と `novelty` を早期から必ず見ること。
 
 **(D3) `pg_loss_coef` を 1(OPD+GRPO)か 0(純 OPD)か。** 1 なら現行アーム群と比較可能だが結果が GRPO と混ざる(`grpo/grad_cosine ≈ 0.01` でほぼ直交はしている)。0 なら機構の効果が分離できるが、比較相手は旧 signweight アーム群になる。
 → 推奨: 1(走行中の control と揃える)。

@@ -4357,7 +4357,29 @@ class DataParallelPPOActor(BasePPOActor):
             self._xt_rms_snapshot = self._xt_rms.diagonal()
             if xtt_stats is not None:
                 xtt_stats.all_reduce()
-                metrics.update(xtt_stats.metrics(task_names=task_id_names))
+                _xtt_m = xtt_stats.metrics(task_names=task_id_names)
+                metrics.update(_xtt_m)
+                # The gate readings, one line in the run log, every step. They
+                # are ADVISORY -- the run does not stop itself on them (decided
+                # 2026-09-02); a human reads them against the pre-registered
+                # numbers instead of opening wandb to find them among two
+                # thousand keys. Rank 0 only: the values are identical on every
+                # rank after the all_reduce above.
+                if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                    _g = lambda k: _xtt_m.get(k, float("nan"))
+                    print(
+                        "[cross_teacher_target] gates (advisory): "
+                        f"tv={_g('target/tv'):.4f} (pre-reg 0.019) | "
+                        f"shuffled/live={_g('target/shuffled_tv_ratio'):.3f} "
+                        "(concern >0.6; the old gate scored 0.82) | "
+                        f"novelty={_g('target/acted_novelty'):.3f} (concern <0.1) | "
+                        f"tag_share={_g('target/tag_share'):.3f} (concern >0.3) | "
+                        f"max|log w|={_g('target/max_abs_log_w'):.3f} | "
+                        f"mass_err={_g('target/mass_error_max'):.2e} | "
+                        f"A/B={_g('target/channel/a_share'):.3f}/{_g('target/channel/b_share'):.3f} "
+                        "(pre-reg 0.871/0.129)",
+                        flush=True,
+                    )
             # The sigma trajectory, under the series name both weighted arms
             # already use, so the three runs chart on one axis.
             metrics.update(self._xt_rms_metrics(task_id_names))
