@@ -83,6 +83,9 @@ def _make_trainer(teachers, base, enabled=True):
     # "keep the row bound", which is what the window path always uses; the tests
     # that care set it themselves.
     trainer._post_rollout_token_budget = 0
+    # The window path's own budget, off by default -- the 4-row bound there
+    # was bought with an OOM beside a live KV pool.
+    trainer._window_forward_token_budget = 0
     return trainer
 
 

@@ -233,6 +233,24 @@ class OPDRayTrainer(RayPPOTrainer):
                 self.config.actor_rollout_ref.ref.get("log_prob_max_token_len_per_gpu", 0) or 0,
             )
         )
+        # The same knob for the IN-WINDOW path, and off by default because the
+        # 4-row bound there was bought with an OOM (docs/speedup_mechanisms.md
+        # 7.2): a chunk's activations sit next to a live vLLM KV pool.
+        #
+        # What changed is that the hidden-state cache no longer piles up beside
+        # them -- put() copies to pinned host as it goes, and teacher_cache/device_gb
+        # reads 0.000 on the first run to carry it, against a teacher_cache/gb of
+        # ~15. That is 7-8 GB a card the window did not have before.
+        #
+        # It is worth spending because the window path is where the work IS now.
+        # Prefetching the sign planes took sign_weight_forward from 143 s to 2.5 s
+        # -- and gen grew by very nearly the same amount, because the forwards run
+        # in there at the same ~30% MFU that made them 143 s in the first place.
+        # Overlapping a launch-bound pass with a decode does not make it stop being
+        # launch-bound. Opt-in, so the OOM is a decision and not a surprise.
+        self._window_forward_token_budget = int(
+            os.environ.get("ROLLOUT_WINDOW_FORWARD_TOKENS", "0")
+        )
 
         # ---- cross-teacher sign agreement (optional) ----------------------- #
         # Off by default so every existing arm is untouched: with enable=false no
@@ -553,17 +571,20 @@ class OPDRayTrainer(RayPPOTrainer):
                 # hidden states this call just cached. What used to travel here
                 # was (rows, 512, 20) log-probs plus the same in int64 ids --
                 # ~860 MB a step, merged into the batch and never read.
-                self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+                self._teacher_call(wg, sub, topk=True, cache_ids=ids,
+                                   budget=self._window_forward_token_budget)
                 for key, _ in entries:
                     out[key] = cache_id_for[key]
             elif self.teacher_topk_kl:
-                scored = self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+                scored = self._teacher_call(wg, sub, topk=True, cache_ids=ids,
+                                            budget=self._window_forward_token_budget)
                 tlp = scored.batch["teacher_topk_logprobs"]
                 tid = scored.batch["teacher_topk_ids"]
                 for j, (key, _) in enumerate(entries):
                     out[key] = (tlp[j], tid[j], cache_id_for.get(key, -1))
             else:
-                scored = self._teacher_call(wg, sub, topk=False, cache_ids=ids)
+                scored = self._teacher_call(wg, sub, topk=False, cache_ids=ids,
+                                            budget=self._window_forward_token_budget)
                 lp = scored.batch["ref_log_prob"]
                 for j, (key, _) in enumerate(entries):
                     out[key] = lp[j]
@@ -634,7 +655,8 @@ class OPDRayTrainer(RayPPOTrainer):
                 self._teacher_cache_counter += 1
                 ids[j] = self._teacher_cache_counter
                 out[key][column_for(own)] = self._teacher_cache_counter
-            self._teacher_call(wg, sub, topk=True, cache_ids=ids)
+            self._teacher_call(wg, sub, topk=True, cache_ids=ids,
+                               budget=self._window_forward_token_budget)
 
         gpu_profiler.push_phase("sign_weight_prefetch/base")
         try:
@@ -688,16 +710,19 @@ class OPDRayTrainer(RayPPOTrainer):
         """
         return [t for t in task_order if t != own]
 
-    def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None, budget=False):
+    def _teacher_call(self, wg, sub: DataProto, topk: bool, cache_ids=None, budget=0):
         """One teacher call, with the DP padding marked so it is never cached.
 
-        ``budget`` sizes the worker's micro-batches by TOKENS rather than by rows,
-        for the callers that run after the rollout. It is not a free win to hand
-        to every caller: inside the rollout window the row bound is what keeps a
-        chunk's activations next to the KV pool, so the prefetch path leaves it
-        alone. Not bit-identical -- a packed GEMM of a different total length
-        rounds differently -- but the same rows, the same frozen weights and the
-        same function, which is the accuracy class the prefetch path already has.
+        ``budget`` sizes the worker's micro-batches by TOKENS rather than by rows.
+        A number and not a flag, because the two callers do not want the same one:
+        after the rollout vLLM is asleep and the card is nearly empty, while inside
+        the window a chunk's activations sit beside a live KV pool. 0 keeps the
+        worker's own row bound, which is what the window path used until the
+        hidden-state cache stopped accumulating on the device.
+
+        Not bit-identical -- a packed GEMM of a different total length rounds
+        differently -- but the same rows, the same frozen weights and the same
+        function, which is the accuracy class the prefetch path already has.
 
         ``auto_padding`` repeats rows to reach a multiple of the group's world
         size, and it repeats the whole row -- ``teacher_cache_ids`` included. Two
@@ -717,10 +742,10 @@ class OPDRayTrainer(RayPPOTrainer):
         else:
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info[DataProtoConfig.auto_padding_key] = True
-        if budget and self._post_rollout_token_budget > 0:
+        if budget and int(budget) > 0:
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info["use_dynamic_bsz"] = True
-            sub.meta_info["max_token_len"] = self._post_rollout_token_budget
+            sub.meta_info["max_token_len"] = int(budget)
         if topk:
             sub.meta_info = dict(sub.meta_info)
             sub.meta_info["topk_k"] = self.teacher_kl_topk
@@ -836,11 +861,13 @@ class OPDRayTrainer(RayPPOTrainer):
             gpu_profiler.push_phase(f"teacher_forward/{task}")
             try:
                 if self.teacher_topk_kl and self.student_indexed_topk:
-                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids, budget=True)
+                    self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids,
+                                       budget=self._post_rollout_token_budget)
                     for i in idxs:
                         seen[i] = True
                 elif self.teacher_topk_kl:
-                    out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids, budget=True)
+                    out = self._teacher_call(wg, sub, topk=True, cache_ids=miss_ids,
+                                             budget=self._post_rollout_token_budget)
                     tlp = out.batch["teacher_topk_logprobs"]
                     tid = out.batch["teacher_topk_ids"]
                     for j, i in enumerate(idxs):
@@ -848,7 +875,8 @@ class OPDRayTrainer(RayPPOTrainer):
                         teacher_topk_ids[i] = tid[j]
                         seen[i] = True
                 else:
-                    out = self._teacher_call(wg, sub, topk=False, cache_ids=miss_ids, budget=True)
+                    out = self._teacher_call(wg, sub, topk=False, cache_ids=miss_ids,
+                                             budget=self._post_rollout_token_budget)
                     lp = out.batch["ref_log_prob"]
                     for j, i in enumerate(idxs):
                         teacher_log_probs[i] = lp[j]
@@ -994,7 +1022,8 @@ class OPDRayTrainer(RayPPOTrainer):
                     self._teacher_cache_counter += 1
                     ids[j] = self._teacher_cache_counter
                     sign_cache_ids[i, column_for(i)] = self._teacher_cache_counter
-                self._teacher_call(wg, lean.select_idxs(part), topk=True, cache_ids=ids, budget=True)
+                self._teacher_call(wg, lean.select_idxs(part), topk=True, cache_ids=ids,
+                                   budget=self._post_rollout_token_budget)
 
         gpu_profiler.push_phase("sign_weight_forward/base")
         try:

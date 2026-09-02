@@ -103,6 +103,9 @@ def _make_trainer(teacher_wg, topk=None, student_indexed=False):
     # See test_sign_weight_routing._make_trainer: 0 keeps the worker's own row
     # bound, which is the behaviour every test in this file was written against.
     trainer._post_rollout_token_budget = 0
+    # The window path's own budget, off by default -- the 4-row bound there
+    # was bought with an OOM beside a live KV pool.
+    trainer._window_forward_token_budget = 0
     return trainer
 
 

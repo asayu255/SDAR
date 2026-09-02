@@ -187,6 +187,9 @@ def test_every_cross_teacher_arm_carries_the_same_rollout_flags(script):
     for flag in ("ROLLOUT_ASYNC_GENERATE", "ROLLOUT_PUMP_TRAINING", "ROLLOUT_PREFETCH_LOGPROB",
                  "ROLLOUT_PREFETCH_TEACHER", "ROLLOUT_PREFETCH_SIGN"):
         assert f"export {flag}=${{{flag}:-1}}" in src, flag
+    # Off, and the same off, on all three: the row bound it lifts was bought with
+    # an OOM beside a live KV pool, so turning it on is a decision.
+    assert "export ROLLOUT_WINDOW_FORWARD_TOKENS=${ROLLOUT_WINDOW_FORWARD_TOKENS:-0}" in src
 
 
 @pytest.mark.parametrize("script", _SCRIPTS)

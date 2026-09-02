@@ -329,16 +329,34 @@ def test_the_post_rollout_pass_asks_for_a_token_budget():
             assert meta["max_token_len"] == 18432
 
 
-def test_the_window_path_keeps_the_row_bound():
-    """The bound exists for the window and has to stay there: a chunk's
-    activations sit beside the KV pool, which is what OOMed this arm once."""
+def test_the_window_path_does_not_inherit_the_post_rollout_budget():
+    """The two callers do not want the same number. After the rollout vLLM is
+    asleep; in the window a chunk's activations sit beside a live KV pool, which
+    is what OOMed this arm once."""
     trainer, teachers, base = _fixture()
     trainer._post_rollout_token_budget = 18432
+    trainer._window_forward_token_budget = 0
     trainer._prefetch_sign_planes(_chunk_from(_batch_with_identity(TASKS)))
     for wg in [base] + list(teachers.values()):
         for meta in wg.meta:
             assert "use_dynamic_bsz" not in meta
             assert "max_token_len" not in meta
+
+
+def test_the_window_path_takes_its_own_budget_when_it_is_given_one():
+    """Where the work IS, since the sign planes moved into the window: the
+    forwards run in there at the same ~30% MFU that made them 143 s a step
+    outside it, and overlapping a launch-bound pass with a decode does not make
+    it stop being launch-bound."""
+    trainer, teachers, base = _fixture()
+    trainer._post_rollout_token_budget = 18432
+    trainer._window_forward_token_budget = 8192
+    trainer._prefetch_sign_planes(_chunk_from(_batch_with_identity(TASKS)))
+    assert base.meta, "the base plane was never scored"
+    for wg in [base] + list(teachers.values()):
+        for meta in wg.meta:
+            assert meta["use_dynamic_bsz"] is True
+            assert meta["max_token_len"] == 8192
 
 
 def test_a_zero_budget_is_the_behaviour_that_was_there_before():

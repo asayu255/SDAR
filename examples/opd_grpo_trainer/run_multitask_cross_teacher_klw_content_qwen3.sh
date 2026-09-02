@@ -1109,6 +1109,23 @@ export ROLLOUT_PUMP_TRAINING=${ROLLOUT_PUMP_TRAINING:-1}
 # step, but only alongside ROLLOUT_PUMP_TRAINING: without it this competes with
 # the teacher chunk for the same 35-40 s of glue.
 export ROLLOUT_PREFETCH_LOGPROB=${ROLLOUT_PREFETCH_LOGPROB:-1}
+# Size the IN-WINDOW frozen forwards by tokens instead of by 4 rows. OFF (0) by
+# default and left off here, because the row bound was bought with an OOM: a
+# chunk's activations sit beside a live vLLM KV pool.
+#
+# It is the next thing to try, and the first run to carry the mechanisms above
+# says why. Prefetching the sign planes took sign_weight_forward from 143 s to
+# 2.5 s a step -- and gen grew by very nearly the same amount, because the
+# forwards run inside the window at the same ~30% MFU that made them 143 s
+# outside it. Overlapping a launch-bound pass with a decode does not make it stop
+# being launch-bound; only a bigger micro-batch does. teacher_cache/device_gb now
+# reads 0.000 against a teacher_cache/gb of ~15, so the 7-8 GB a card that the
+# cache used to hold during the rollout is free for exactly this.
+#
+# Try 8192 (2.5x the ~3.2k tokens 4 rows come to) and watch
+# perf/update_peak_allocated_gb and the allocator's retry counter:
+#   ROLLOUT_WINDOW_FORWARD_TOKENS=8192 bash examples/opd_grpo_trainer/...
+export ROLLOUT_WINDOW_FORWARD_TOKENS=${ROLLOUT_WINDOW_FORWARD_TOKENS:-0}
 # WHERE THIS RUN'S CHECKPOINTS GO. Empty by default, so the paths below are
 # byte-for-byte what they were and an existing run resumes exactly as before.
 #
