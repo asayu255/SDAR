@@ -239,16 +239,23 @@
 # units, and the four readings of {min, geomean} x {RMS, nats} span exp(c) from
 # 1.52 to 9.82. docs/cross_teacher_target_design.md 3.1.
 #
-# 2.148 -- the MEASURED conversion (one on-task RMS unit = 2.148 nats), not the
-# conservative 1.0 this arm launched with. Changed with the mechanism revision of
-# 2026-09-02: the mass-conserving exchange throttled the up side to T/A_U = 0.026
-# and was replaced by a plain normalisation, which recovered 38x and still left
-# the intervention at ~1/26 of the predecessor weighting arm's. The unit
-# conversion is the remaining 2.1x that costs no new knob. Read
-# target/abs_dkl_mean for where it actually landed -- that measurement, not this
-# number, decides whether a further scale change is warranted.
+# 1.0, the conservative RMS reading. It was moved to 2.148 (the measured
+# RMS-to-nats conversion) and then moved back, and the round trip is recorded
+# here because this file is where a future edit would repeat it. The "still ~26x
+# short of the predecessor" estimate that justified 2.148 was wrong twice over:
+# it was measured on the PREDECESSOR'S OWN top-effect layer -- a sample selected
+# by the predecessor's effect, so biased in its favour -- and it converted from
+# candidates to positions assuming sqrt(n) cancellation across the 20 candidates.
+# The student's mass is concentrated on ONE candidate (p_s > 0.3 events are 5.3%
+# of all and carry 72.2% of sum |p_s c|, which is what drawing the argmax
+# uniformly from 20 gives), so nothing cancels and the conversion is K = 20. At
+# K = 20 the per-position gross is 0.91 of the predecessor's at scale 1.0 and
+# 1.72 at 2.148 -- an OVERSHOOT, not a shortfall.
+#
+# target/abs_dkl_mean measures this during the run. Do not move this key again on
+# an offline estimate alone.
 "algorithm.opd.cross_teacher_target.enable": true
-"algorithm.opd.cross_teacher_target.exponent_scale": 2.148
+"algorithm.opd.cross_teacher_target.exponent_scale": 1.0
 # The pre-RL policy every teacher's shift is relative to. It MUST be the exact
 # checkpoint all three were fine-tuned from: the cumulative RMS and both channels
 # are measured against it, so a different base makes every number here mean
@@ -257,5 +264,5 @@
 # effective values after main_opd copies them onto the actor, which is where
 # the target is actually built -- the driver only caches the models it reads.
 "actor_rollout_ref.actor.cross_teacher_target.enable": true
-"actor_rollout_ref.actor.cross_teacher_target.exponent_scale": 2.148
+"actor_rollout_ref.actor.cross_teacher_target.exponent_scale": 1.0
 "actor_rollout_ref.actor.cross_teacher_target.base_path": Qwen/Qwen3-1.7B

@@ -128,11 +128,19 @@ set -x
 #     control in the MECHANISM KEYS ALONE -- the pairing test no longer carries
 #     an exception for the support, and the hidden-state cache is back to four
 #     models per row, which is what ppo_micro_batch_size_per_gpu=5 already sized.
-#   exponent_scale  1.0 -> 2.148, the measured RMS-to-nats conversion. The
-#     mass-conserving exchange was replaced by a plain normalisation (which
-#     removed a 38x throttle) and that still left the intervention at ~1/26 of
-#     the predecessor's; the unit conversion is the rest of what is available
-#     without adding a knob. target/abs_dkl_mean reports where it landed.
+#   exponent_scale  UNCHANGED at 1.0. It was pinned to 2.148 in the same commit
+#     as the two changes above, on an estimate that the mechanism was still ~26x
+#     short of the predecessor arm; that estimate was retracted. It rested on the
+#     predecessor's OWN top-effect layer (a sample selected by the predecessor's
+#     effect) and on a sqrt(n) cancellation across the 20 candidates that does not
+#     happen -- the student's mass sits on one candidate, so the conversion is
+#     K = 20. At K = 20 the per-position gross at scale 1.0 is 0.91 of the
+#     predecessor's and 2.148 would be a 1.7x OVERSHOOT.
+#   _EXPONENT_CLAMP (in the module, not a config key) 30.0 -> 5.0. At the briefly
+#     pinned (2.148, 3.0), 35.4% of acted candidates sat at the cap carrying 68.3%
+#     of the total |c| -- the continuous signal collapsing back to a flat +-3
+#     exactly where the teachers agreed hardest. At (1.0, 5.0) it is 1.9% of
+#     candidates and 8.3% of |c|. Read target/clamped_mass_frac, not the count.
 # The pre-registered target_tv = 0.019 and branch split 0.871/0.129 were computed
 # on the old mechanism and are VOID. The run log no longer prints them.
 #
@@ -1223,7 +1231,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.normalize_loss_by_task=True \
     +algorithm.opd.cross_teacher_target.enable=True \
     +algorithm.opd.cross_teacher_target.base_path=Qwen/Qwen3-1.7B \
-    +algorithm.opd.cross_teacher_target.exponent_scale=2.148 \
+    +algorithm.opd.cross_teacher_target.exponent_scale=1.0 \
     +algorithm.opd.cross_teacher_target.token_stats.enable=True \
     +algorithm.opd.cross_teacher_target.token_stats.top_n=64 \
     +algorithm.opd.cross_teacher_target.token_stats.every=5 \

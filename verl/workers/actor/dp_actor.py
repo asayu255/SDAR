@@ -3002,6 +3002,12 @@ class DataParallelPPOActor(BasePPOActor):
                                     # the revision is judged on, so it is measured
                                     # here beside the KL it belongs to.
                                     student_logprob=student_topk_logprobs,
+                                    # H(p_tilde) - H(p_on) needs log p_on itself,
+                                    # not p_on: a student-indexed support reaches
+                                    # candidates where the teacher's probability
+                                    # underflows float32, and log(exp(x)) would
+                                    # lose exactly those.
+                                    on_logprob=sign_on_task_logprobs,
                                     tag_token_ids=xtt_tag_ids,
                                 )
                                 if xtt_token_stats is not None or xtt_event_stats is not None:
@@ -4394,15 +4400,22 @@ class DataParallelPPOActor(BasePPOActor):
                         "[cross_teacher_target] gates (advisory): "
                         f"tv={_g('target/tv'):.4f} | "
                         f"|dKL|={_g('target/abs_dkl_mean'):.4f} nats/pos "
-                        f"(live {_g('target/abs_dkl_live_mean'):.4f}; "
-                        "the predecessor weighting arm's top layer was 58.3) | "
+                        f"(live {_g('target/abs_dkl_live_mean'):.4f}; pre-run "
+                        "estimate 0.91x the predecessor arm at this scale) | "
+                        f"dH={_g('target/entropy_delta'):+.4f} (audit s15: the one "
+                        "channel that tracked the accuracy gain) | "
+                        f"corr(dKL,KL)={_g('target/dkl_kl_corr'):+.3f} "
+                        "(focal test; the predecessor scored +0.003) | "
                         f"log_z={_g('target/log_z_mean'):+.4f} (head tax) | "
                         f"shuffled/live={_g('target/shuffled_tv_ratio'):.3f} "
                         "(concern >0.6; the old gate scored 0.82) | "
                         f"novelty={_g('target/acted_novelty'):.3f} (concern <0.1) | "
                         f"tag_share={_g('target/tag_share'):.3f} (concern >0.3) | "
                         f"max|log w|={_g('target/max_abs_log_w'):.3f} | "
-                        f"clamped={_g('target/clamped_frac_of_acted'):.3f} of acted | "
+                        f"clamped={_g('target/clamped_mass_frac'):.3f} of |c| "
+                        f"({_g('target/clamped_frac_of_acted'):.3f} of acted) | "
+                        f"support={_g('target/support_mass/student'):.3f}s/"
+                        f"{_g('target/support_mass/teacher'):.3f}t | "
                         f"mass_err={_g('target/mass_error_max'):.2e} | "
                         f"A/B={_g('target/channel/a_share'):.3f}/{_g('target/channel/b_share'):.3f}",
                         flush=True,

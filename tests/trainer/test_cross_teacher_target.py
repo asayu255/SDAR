@@ -266,6 +266,152 @@ def test_dkl_is_log_z_minus_the_students_average_tilt():
     from_c = got["log_z"] - (ps * c.to(torch.float64)).sum(dim=-1)
     assert torch.allclose(from_logs, from_c, atol=1e-12)
 
+    # And the claim the identity is FOR: this is the change to the loss itself,
+    # not an approximation of it. Compared against the loss's own bucketed KL --
+    # every candidate on its own, the tail as one -- taken twice and differenced.
+    on_lp = p.to(torch.float64).log()
+    tgt_lp = on_lp + got["log_w"]
+    s_lp = ps.log()
+    direct = (_bucketed_kl(s_lp, tgt_lp) - _bucketed_kl(s_lp, on_lp))
+    assert torch.allclose(direct, from_logs, atol=1e-10)
+
+
+def _bucketed_kl(student_logprob, teacher_logprob, eps=1e-8):
+    """A transcription of ``core_algos.topk_kl_per_token``.
+
+    Transcribed rather than imported because importing it pulls transformers in
+    through verl.utils.torch_functional, which these pure-tensor tests do not
+    otherwise need. ``test_the_loss_still_computes_what_the_transcription_says``
+    is what stops the copy drifting from the original.
+    """
+    p_s, p_t = student_logprob.exp(), teacher_logprob.exp()
+    tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)
+    tail_t = (1.0 - p_t.sum(dim=-1)).clamp(min=eps, max=1.0)
+    topk_term = (p_s * (student_logprob - teacher_logprob)).sum(dim=-1)
+    return topk_term + tail_s * (tail_s.log() - tail_t.log())
+
+
+def test_the_loss_still_computes_what_the_transcription_says():
+    """The transcription above is only evidence while the original agrees with
+    it, and the original lives in a module these tests cannot import."""
+    import os
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "..",
+                            "verl", "trainer", "ppo", "core_algos.py")).read()
+    body = src[src.index("def topk_kl_per_token("):]
+    body = body[: body.index("\ndef ", 1)]
+    for line in (
+        "tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=eps, max=1.0)",
+        "tail_t = (1.0 - p_t.sum(dim=-1)).clamp(min=eps, max=1.0)",
+        "topk_term = (p_s * (student_topk_logprob - teacher_topk_logprob)).sum(dim=-1)",
+        "tail_term = tail_s * (torch.log(tail_s) - torch.log(tail_t))",
+        "return topk_term + tail_term",
+    ):
+        assert line in body, line
+
+
+def test_entropy_delta_matches_a_direct_bucketed_entropy():
+    """``target/entropy_delta`` is bucketed the same way the loss is, so it is
+    checked against the definition rather than against its own implementation."""
+    from verl.trainer.ppo.cross_teacher_target import TargetStepStats
+
+    gen = torch.Generator().manual_seed(12)
+    p, _ = _random_position(gen)
+    c = torch.randn(1, 1, p.size(-1), generator=gen) * 1.2
+    got = normalized_weight(c=c, p_on=p)
+    built = dict(got, branch=torch.zeros_like(c, dtype=torch.long),
+                 c=c, a=c, b=torch.zeros_like(c))
+    mask = torch.ones(1, 1)
+    stats = TargetStepStats(n_tasks=1, device="cpu")
+    on_lp = p.to(torch.float64).log()
+    stats.update(built=built, p_on=p, support_ids=torch.zeros_like(c, dtype=torch.long),
+                 response_mask=mask, task_ids=None, on_logprob=on_lp)
+
+    def _h(logp):
+        q = logp.exp()
+        tail = (1.0 - q.sum(dim=-1)).clamp(min=0.0)
+        out = -(q * logp).sum(dim=-1)
+        return out - torch.where(tail > 0, tail * tail.clamp(min=1e-30).log(),
+                                 torch.zeros_like(tail))
+
+    want = (_h(on_lp + got["log_w"]) - _h(on_lp)).item()
+    m = stats.metrics(task_names=["t"])
+    assert m["target/entropy_delta"] == pytest.approx(want, abs=1e-12)
+
+
+def test_the_saturation_metric_weighs_by_magnitude_not_by_count():
+    """The count ratio understates saturation because the clamped candidates are
+    the large ones; that gap is the reason clamped_mass_frac exists, and it is
+    asserted here rather than left to the reader."""
+    from verl.trainer.ppo.cross_teacher_target import _EXPONENT_CLAMP, TargetStepStats
+
+    k = 8
+    # Two candidates far past the clamp, the rest well inside it.
+    c = torch.full((1, 1, k), 0.2)
+    c[..., 0] = 50.0
+    c[..., 1] = -50.0
+    p = torch.full((1, 1, k), 0.12)
+    got = normalized_weight(c=c, p_on=p)
+    built = dict(got, branch=torch.zeros_like(c, dtype=torch.long),
+                 c=c, a=c, b=torch.zeros_like(c))
+    stats = TargetStepStats(n_tasks=1, device="cpu")
+    stats.update(built=built, p_on=p, support_ids=torch.zeros_like(c, dtype=torch.long),
+                 response_mask=torch.ones(1, 1), task_ids=None)
+    m = stats.metrics(task_names=["t"])
+    assert m["target/clamped_frac_of_acted"] == pytest.approx(2 / k)
+    # rel, not abs: 0.2 is not a float32 value, so the unclamped sum carries the
+    # representation error of the input rather than of the accumulation.
+    want = 2 * _EXPONENT_CLAMP / (2 * _EXPONENT_CLAMP + (k - 2) * 0.2)
+    assert m["target/clamped_mass_frac"] == pytest.approx(want, rel=1e-6)
+    assert m["target/clamped_mass_frac"] > m["target/clamped_frac_of_acted"]
+
+
+def test_the_focal_correlation_is_a_real_pearson():
+    """Checked against a value computed the long way, because the metric is built
+    from running moments so that it can survive an all_reduce without a sort."""
+    from verl.trainer.ppo.cross_teacher_target import TargetStepStats
+
+    gen = torch.Generator().manual_seed(13)
+    bs, resp, k = 4, 5, 6
+    kw = _chain(k=k, bs=bs, resp=resp, seed=14)
+    mask = torch.ones(bs, resp)
+    got = build_target(**kw)
+    s_lp = torch.log_softmax(torch.randn(bs, resp, k, generator=gen), dim=-1) + math.log(0.99)
+    d_on = torch.rand(bs, resp, generator=gen) + 0.1
+    stats = TargetStepStats(n_tasks=1, device="cpu")
+    stats.update(built=got, p_on=got["p_on"],
+                 support_ids=torch.zeros(bs, resp, k, dtype=torch.long),
+                 response_mask=mask, task_ids=None, d_on=d_on,
+                 d_base=d_on + 1.0, student_logprob=s_lp)
+    m = stats.metrics(task_names=["t"])
+
+    live = got["live"]
+    p_s = s_lp.to(torch.float64).exp()
+    tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=0.0)
+    d = (-(p_s * got["log_w"]).sum(dim=-1) + tail_s * got["log_z"])[live]
+    kk = d_on.to(torch.float64)[live]
+    d = d - d.mean()
+    kk = kk - kk.mean()
+    want = (d * kk).sum() / (d.pow(2).sum().sqrt() * kk.pow(2).sum().sqrt())
+    assert m["target/dkl_kl_corr"] == pytest.approx(want.item(), abs=1e-9)
+
+
+def test_support_mass_is_reported_for_both_models():
+    from verl.trainer.ppo.cross_teacher_target import TargetStepStats
+
+    kw = _chain(bs=2, resp=2, k=5)
+    bs, resp, k = 2, 2, 5
+    got = build_target(**kw)
+    s_lp = torch.log_softmax(torch.randn(bs, resp, k), dim=-1) + math.log(0.8)
+    stats = TargetStepStats(n_tasks=1, device="cpu")
+    stats.update(built=got, p_on=got["p_on"],
+                 support_ids=torch.zeros(bs, resp, k, dtype=torch.long),
+                 response_mask=torch.ones(bs, resp), task_ids=None,
+                 student_logprob=s_lp)
+    m = stats.metrics(task_names=["t"])
+    assert m["target/support_mass/student"] == pytest.approx(0.8, abs=1e-5)
+    assert m["target/support_mass/teacher"] == pytest.approx(0.99, abs=1e-5)
+
 
 # ------------------------------------------------------------------ end to end
 def _chain(k=6, bs=2, resp=3, n_off=2, seed=11):
@@ -317,8 +463,8 @@ def test_cold_start_rows_are_untouched():
 
 def test_exponent_scale_is_the_only_knob_and_it_moves_the_intervention():
     kw = _chain()
-    small = build_target(**kw, exponent_scale=1.0)
-    large = build_target(**kw, exponent_scale=2.148)     # what the arm now pins
+    small = build_target(**kw, exponent_scale=1.0)      # what the arm pins
+    large = build_target(**kw, exponent_scale=2.148)    # the nats reading
     assert large["moved"].sum() > small["moved"].sum()
 
 
@@ -356,12 +502,15 @@ def test_step_stats_render_the_preregistered_quantities():
                  response_mask=mask, task_ids=kw["task_ids"],
                  d_on=torch.rand(bs, resp), d_base=torch.rand(bs, resp) + 1.0,
                  student_logprob=torch.log_softmax(
-                     torch.randn(*kw["on_logprob"].shape), dim=-1) + math.log(0.99))
+                     torch.randn(*kw["on_logprob"].shape), dim=-1) + math.log(0.99),
+                 on_logprob=kw["on_logprob"])
     m = stats.metrics(task_names=["alfworld", "search", "webshop"])
     for key in ("target/tv", "target/live_frac", "target/acted_mass_frac",
                 "target/branch/agree/mass_frac", "target/max_abs_log_w",
                 "target/max_abs_log_z", "target/log_z_mean", "target/dkl_mean",
                 "target/abs_dkl_mean", "target/abs_dkl_live_mean",
+                "target/dkl_kl_corr", "target/entropy_delta",
+                "target/support_mass/student", "target/support_mass/teacher",
                 "target/mass_error_max", "target/shuffled_tv_ratio",
                 "target/alfworld/tv"):
         assert key in m, key

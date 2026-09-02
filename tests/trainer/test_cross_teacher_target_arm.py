@@ -91,8 +91,10 @@ def test_the_lock_pins_every_knob_of_the_mechanism():
     for key in ("enable", "base_path", "exponent_scale"):
         assert f"algorithm.opd.cross_teacher_target.{key}" in lock, key
     assert lock["algorithm.opd.cross_teacher_target.enable"] is True
-    # The measured RMS-to-nats conversion, not the 1.0 the arm launched with.
-    assert lock["algorithm.opd.cross_teacher_target.exponent_scale"] == 2.148
+    # 1.0. It was 2.148 for one commit, on an offline estimate that was retracted
+    # (the yaml records why); pinning the value here is what makes a repeat of
+    # that round trip a deliberate edit rather than a drift.
+    assert lock["algorithm.opd.cross_teacher_target.exponent_scale"] == 1.0
 
 
 def test_the_support_matches_the_comparators():
@@ -118,7 +120,14 @@ def test_the_gate_line_is_printed_and_nothing_aborts_on_it():
     block = src[src.index("[cross_teacher_target] gates (advisory)"):]
     block = block[: block.index("flush=True")]
     for key in ("target/tv", "target/shuffled_tv_ratio", "target/acted_novelty",
-                "target/tag_share", "target/max_abs_log_w", "target/mass_error_max"):
+                "target/tag_share", "target/max_abs_log_w", "target/mass_error_max",
+                # The revision's own readings. abs_dkl decides the scale,
+                # entropy_delta is the only channel that tracked the accuracy
+                # gain, dkl_kl_corr is the focal test the predecessor failed, and
+                # clamped_mass_frac is the saturation reading the count ratio
+                # understates -- none of them is useful in wandb alone.
+                "target/abs_dkl_mean", "target/entropy_delta",
+                "target/dkl_kl_corr", "target/clamped_mass_frac"):
         assert key in block, key
     # Nothing in the arm raises or exits on a gate value.
     where = src.index("if xtt_on:")

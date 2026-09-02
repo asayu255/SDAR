@@ -57,10 +57,9 @@ teacher, which the predecessor's pairwise similarity gate was not.
 THE SCALE IS A HYPERPARAMETER AND IS NOT PRETENDED OTHERWISE. ``exp(c)`` is a
 probability ratio, so ``c`` has to be in nats, and ``c`` is in RMS units. One RMS
 unit measured 2.148 nats, so the four combinations of {min, geomean} x {RMS,
-nats} span ``exp(c)`` from 1.52 to 9.82. ``exponent_scale`` IS that conversion,
-it is the one knob here, and the arm runs it at the measured 2.148 -- the nats
-reading -- because the conservative end did not reach the scale it had to match.
-See the revision below.
+nats} span ``exp(c)`` from 1.52 to 9.82. ``exponent_scale`` IS that conversion and
+it is the one knob here. The arm runs it at 1.0 -- see revision 3 below, which
+also records the 2.148 that was briefly pinned and why it was wrong.
 
 REVISION (2026-09-02), THREE CHANGES, EACH A RETRACTION.
 
@@ -75,17 +74,15 @@ throttle (38x) and gives up the two properties the exchange was built for: the
 head is taxed by ``1/Z``, and sign faithfulness weakens from "``c > 0`` implies
 ``w > 1``" to "``c > log Z`` implies ``w > 1``".
 
-Normalisation cannot restore the predecessor's scale by itself, and this module
-does not pretend otherwise. The change it makes to the loss is
+The change it makes to the loss is
 
     dKL = log Z - <c>_{p_s},        |dKL| <= 2 max|c|
 
 so it is bounded by ``c`` however the normalisation is written, where the
-predecessor multiplied two unbounded quantities (``(W - 1) * KL``). At
-``exponent_scale = 2.148`` the top layer reaches 4.82 nats: 1/12 of the
-predecessor rather than 1/1000. ``target/abs_dkl_mean`` reports the left-hand
-side every step, in the predecessor's own units, so the remaining gap is a
-measurement and not an estimate.
+predecessor multiplied two unbounded quantities (``(W - 1) * KL``). That bound is
+the reason normalisation alone cannot be assumed to reach the predecessor's
+scale, and ``target/abs_dkl_mean`` reports the left-hand side every step so the
+question is settled by measurement rather than by the estimate in revision 3.
 
 2. THE SUPPORT IS THE STUDENT'S TOP-K AGAIN, withdrawing design constraint C7.
 C7 asked for a teacher-indexed support so ``p_tilde`` would be a
@@ -97,9 +94,28 @@ C7 named: the old student-indexed arm's ``frac_agree_pos`` drifted 0.238 -> 0.19
 as the student moved. The incidental benefit is that this arm's intent lock now
 differs from both comparators in the mechanism keys ALONE.
 
-3. THE EXPONENT CLAMP IS A RATE LIMIT, not an overflow guard -- see
-``_EXPONENT_CLAMP``. With the capacity exchange gone, nothing else bounds one
-candidate's tilt.
+3. THE SCALE, TWICE. This module first pinned ``exponent_scale = 1.0`` (the
+conservative RMS reading), then 2.148 (the measured nats conversion) on an
+estimate that the mechanism was still ~26x short of the predecessor, then 1.0
+again. The retraction of 2.148 is worth writing down because it is a lesson about
+the estimate, not about the mechanism:
+
+* the "26x short" figure came from the TOP LAYER of the predecessor's own effect
+  ranking. That layer is selected BY the predecessor's effect, so comparing a new
+  mechanism against it is biased in the predecessor's favour by construction;
+* correcting for that needs a candidate-to-position conversion, and the first
+  attempt assumed sqrt(n) cancellation across the 20 candidates. Measured, the
+  student's mass is concentrated on ONE candidate -- events with ``p_s > 0.3`` are
+  5.3% of all events and carry 72.2% of ``sum |p_s c|``, which is what drawing the
+  argmax uniformly from 20 would give -- so the candidates do not cancel and the
+  conversion is K = 20, not sqrt(20);
+* at K = 20 the mechanism's per-position gross at ``exponent_scale = 1.0`` is
+  0.281 against the predecessor's, a ratio of 0.91. 2.148 gives 1.72 -- an
+  OVERSHOOT of 1.7x, not a shortfall.
+
+THE EXPONENT CLAMP IS A RATE LIMIT, not an overflow guard, since the capacity
+exchange no longer bounds one candidate's tilt -- and the same measurement set
+its value. See ``_EXPONENT_CLAMP``.
 """
 from typing import Optional
 
@@ -111,15 +127,26 @@ import torch
 # that are held at w = 1 anyway.
 _LOG_FLOOR = 1e-30
 _NORM_FLOOR = 1e-12
-# The bound on one candidate's tilt, in nats, and it is a DESIGN PARAMETER now
-# rather than the overflow guard it was at 30.0. The capacity exchange used to
-# throttle the intervention on its own; under plain normalisation nothing else
-# does, so this is the rate limit: e^3 ~ 20 on a single candidate and
-# |dKL| <= 6 nats at a position. At exponent_scale = 2.148 the median acted |c|
-# is 2.15, i.e. 72% of the clamp, so this BINDS on a real share of the candidates
-# instead of firing on a pathology -- `target/clamped_per_step` is a rate to
-# read against the acted count, not a bug indicator.
-_EXPONENT_CLAMP = 3.0
+# The bound on one candidate's tilt, in nats, and a DESIGN PARAMETER rather than
+# the overflow guard it was at 30.0: with the capacity exchange gone nothing else
+# bounds it. e^5 ~ 148 on a single candidate and |dKL| <= 10 nats at a position.
+#
+# 5.0 rather than the 3.0 this briefly carried, and the reason is SATURATION, not
+# headroom. At (scale 2.148, clamp 3.0) 35.4% of acted candidates sat exactly at
+# the cap and they carried 68.3% of the total |c| -- so two thirds of the signal's
+# magnitude was the flat value ±3, and the mechanism degenerated back to a binary
+# decision precisely where the teachers agreed most strongly, which is the one
+# thing the continuous formulation of section 2 exists to avoid. At (1.0, 5.0) the
+# cap is reached by 1.9% of acted candidates carrying 8.3% of |c|, and the gross
+# per-position effect is 0.296 -- 0.96 of the predecessor's, i.e. the clamp is no
+# longer paying for the scale. The cost is log Z's p99 moving 0.88 -> 1.14 and a
+# single candidate being able to move 148x, which lands on p_on ~ 1e-6 and so
+# reaches p_tilde ~ 1.5e-4.
+#
+# READ `target/clamped_mass_frac`, NOT `target/clamped_per_step`. The count ratio
+# understates the saturation by 1.9-3.1x (0.090 against 0.280 at scale 1.0; 0.354
+# against 0.683 at 2.148) because the clamped candidates are the large ones.
+_EXPONENT_CLAMP = 5.0
 
 BRANCHES = ("agree", "conflict", "on_silent", "split")
 
@@ -206,10 +233,12 @@ def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
             rows get ``w = 1`` -- the cold start is a no-op rather than a guess.
 
     Returns:
-        ``{"w", "log_w", "log_z", "inv_z", "tail", "moved", "clamped", "live"}``.
-        ``w`` is ``p_tilde / p_on`` on the support and ``inv_z`` is that same ratio
-        on the tail; ``moved`` is (bs, resp), the total variation between
-        ``p_tilde`` and ``p_on`` over the WHOLE vocabulary, tail included.
+        ``{"w", "log_w", "log_z", "inv_z", "tail", "moved", "clamped", "c_eff",
+        "live"}``. ``w`` is ``p_tilde / p_on`` on the support and ``inv_z`` is that
+        same ratio on the tail; ``moved`` is (bs, resp), the total variation
+        between ``p_tilde`` and ``p_on`` over the WHOLE vocabulary, tail included.
+        ``c_eff`` is the tilt AFTER the clamp -- what was delivered rather than
+        what was asked for -- which is what the saturation metric has to weigh.
 
     THE TAIL IS IN Z AND IS NOT TILTED. ``c`` exists only where the four models
     were read, so the mass outside the support keeps its shape -- but it is
@@ -269,6 +298,7 @@ def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
         "tail": tail,
         "moved": moved,
         "clamped": clamped,
+        "c_eff": c64,
         "live": live,
     }
 
@@ -334,7 +364,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         # position hands the loss the on-task teacher's own bits.
         "target_logprob": on_logprob + built["log_w"].to(on_logprob.dtype),
         "w": built["w"], "log_w": built["log_w"], "c": tilt["c"],
-        "a": tilt["a"], "b": tilt["b"],
+        "c_eff": built["c_eff"], "a": tilt["a"], "b": tilt["b"],
         "branch": tilt["branch"], "moved": built["moved"], "live": built["live"],
         "log_z": built["log_z"], "inv_z": built["inv_z"], "tail": built["tail"],
         "clamped": built["clamped"], "p_on": p_on,
@@ -413,8 +443,10 @@ class TargetStepStats:
     mechanism against itself and do not depend on how ``w`` was built.
 
     Scope 0 is the pooled batch; scope 1 + t is task t. float64 sums, one
-    all_reduce at step end (SUM for the sums, MAX for the two maxima), rendered
-    identically on every rank.
+    all_reduce at step end (SUM for the sums, MAX for the three maxima), rendered
+    identically on every rank. Nothing here needs a sort or a second pass, which
+    is why the correlation is carried as five running moments rather than as a
+    rank statistic.
     """
 
     _SUMS = (
@@ -433,7 +465,29 @@ class TargetStepStats:
         # one is what compares against the old arm's per-position magnitude.
         "dkl",
         "abs_dkl",
+        # The three extra moments that turn dkl and d_on into a correlation at
+        # step end. Pearson from running sums needs no sort and no second pass, so
+        # it survives the all_reduce like everything else here; dkl is exactly
+        # zero off the live positions, so its sums are already live-restricted.
+        "dkl_sq",
+        "d_on_sq",
+        "dkl_d_on",
+        # H(p_tilde) - H(p_on) per position, bucketed the way the loss buckets:
+        # the support term by term, the tail as one. THE ONE CHANNEL THAT MOVED
+        # WITH THE 150-STEP ACCURACY GAIN (Spearman +1.00, audit section 15) and
+        # the mechanism had no way to say whether it reproduces it.
+        "ent_delta",
+        # What the support actually covers, for the two masses dkl and log_z
+        # depend on. Assumed ~1.0 by a rough estimate that came out slightly
+        # above 1; measured here instead.
+        "student_support_mass",
+        "teacher_support_mass",
         "clamped",            # candidates whose |c| hit the exponent clamp
+        # Sum |c_eff| over acted / over clamped candidates. The RATIO of these two
+        # is the saturation reading; the count ratio understates it 1.9-3.1x
+        # because the clamped candidates are the large ones.
+        "abs_c_acted",
+        "abs_c_clamped",
         "n_cand",             # masked candidates
         "mass",               # sum p_on over masked candidates
         "acted_cand",         # candidates with c != 0
@@ -472,6 +526,7 @@ class TargetStepStats:
                d_on: Optional[torch.Tensor] = None,
                d_base: Optional[torch.Tensor] = None,
                student_logprob: Optional[torch.Tensor] = None,
+               on_logprob: Optional[torch.Tensor] = None,
                tag_token_ids=TAG_TOKEN_IDS) -> None:
         m_pos = response_mask.to(torch.float64)                       # (bs, resp)
         m_cand = m_pos.unsqueeze(-1)                                  # (bs, resp, 1)
@@ -500,6 +555,10 @@ class TargetStepStats:
             "clamped": built["clamped"].to(torch.float64).sum(dim=-1) * m_pos,
             "n_cand": m_cand.expand_as(p).to(torch.float64),
             "mass": p * m_cand, "acted_cand": acted, "acted_mass": p * acted,
+            "abs_c_acted": built["c_eff"].to(torch.float64).abs() * acted,
+            "abs_c_clamped": (built["c_eff"].to(torch.float64).abs()
+                              * built["clamped"].to(torch.float64) * m_cand),
+            "teacher_support_mass": (1.0 - built["tail"].to(torch.float64)) * m_pos,
             "a_absmass": built["a"].to(torch.float64).abs() * p * m_cand,
             "b_absmass": built["b"].to(torch.float64).abs() * p * m_cand,
             "intervention": inter,
@@ -522,6 +581,30 @@ class TargetStepStats:
             dkl = -(p_s * built["log_w"].to(torch.float64)).sum(dim=-1) + tail_s * log_z
             cols["dkl"] = dkl * m_pos
             cols["abs_dkl"] = dkl.abs() * m_pos
+            cols["dkl_sq"] = dkl * dkl * m_pos
+            cols["student_support_mass"] = p_s.sum(dim=-1) * m_pos
+            if d_on is not None:
+                k = d_on.detach().to(torch.float64) * live
+                cols["d_on_sq"] = k * k
+                cols["dkl_d_on"] = dkl * k
+        if on_logprob is not None:
+            # Bucketed entropy, the loss's own partition: every support candidate
+            # on its own and the whole tail as one. p_tilde = w p on the support
+            # and tail/Z outside it, so -sum p log p is taken twice and
+            # subtracted. The tail's own term is dropped where the tail is empty,
+            # which is 0 log 0 = 0 and not a floor on the mechanism.
+            lp = on_logprob.detach().to(torch.float64)
+            pw = w * p
+            tail64 = built["tail"].to(torch.float64)
+            tail_t = tail64 * built["inv_z"].to(torch.float64)
+            ent_on = -(p * lp).sum(dim=-1)
+            ent_tilt = -(pw * (lp + built["log_w"].to(torch.float64))).sum(dim=-1)
+            has_tail = tail64 > 0
+            ent_on = ent_on - torch.where(
+                has_tail, tail64 * tail64.clamp(min=_LOG_FLOOR).log(), torch.zeros_like(tail64))
+            ent_tilt = ent_tilt - torch.where(
+                has_tail, tail_t * tail_t.clamp(min=_LOG_FLOOR).log(), torch.zeros_like(tail_t))
+            cols["ent_delta"] = (ent_tilt - ent_on) * m_pos
         branch = built["branch"]
         for i in range(4):
             sel = (branch == i).to(torch.float64) * m_cand
@@ -577,6 +660,28 @@ class TargetStepStats:
             out[f"{head}/dkl_mean"] = g("dkl") / n_pos
             out[f"{head}/abs_dkl_mean"] = g("abs_dkl") / n_pos
             out[f"{head}/abs_dkl_live_mean"] = g("abs_dkl") / live
+            # Is the arm FOCAL -- does it push where the teacher KL already is?
+            # The audit put the same question to the predecessor's weight and got
+            # Spearman +0.003, which is what killed the focal reading of it. The
+            # offline estimate for this arm is +0.067 (Pearson +0.023), i.e. also
+            # flat; a run that comes out materially above that is doing something
+            # the offline events did not predict.
+            n_live = g("live_n")
+            if n_live > 1:
+                sd, sk = g("dkl"), g("d_on")
+                vd = n_live * g("dkl_sq") - sd * sd
+                vk = n_live * g("d_on_sq") - sk * sk
+                if vd > 0 and vk > 0:
+                    out[f"{head}/dkl_kl_corr"] = (
+                        (n_live * g("dkl_d_on") - sd * sk) / ((vd * vk) ** 0.5)
+                    )
+            # Entropy is the only channel that tracked the 150-step accuracy gain
+            # (Spearman +1.00). Negative = the target is sharper than the teacher.
+            out[f"{head}/entropy_delta"] = g("ent_delta") / n_pos
+            # What the top-k support covers, for each of the two models whose mass
+            # the metrics above divide by.
+            out[f"{head}/support_mass/student"] = g("student_support_mass") / n_pos
+            out[f"{head}/support_mass/teacher"] = g("teacher_support_mass") / n_pos
             out[f"{head}/acted_cand_frac"] = g("acted_cand") / n_cand
             out[f"{head}/acted_mass_frac"] = g("acted_mass") / mass
             ab = g("a_absmass") + g("b_absmass")
@@ -593,11 +698,17 @@ class TargetStepStats:
                     out[f"{head}/channel/{key}"] = g(col) / n_pos
             if g("d_base") > 0:
                 out[f"{head}/acted_novelty"] = 1.0 - g("d_on") / g("d_base")  # G2
-            # A rate now, not an alarm: at exponent_scale = 2.148 the clamp is
-            # the mechanism's only cap, so read it against the acted count.
+            # A rate, not an alarm: the clamp is the mechanism's only cap. READ
+            # THE MASS RATIO. The count ratio understates saturation 1.9-3.1x
+            # because the clamped candidates are the large ones, and it is the
+            # mass ratio that says whether the continuous signal has collapsed
+            # back to a flat +-clamp -- which is what the section 2 construction
+            # exists to avoid, and what retired the (2.148, 3.0) setting.
             out[f"{head}/clamped_per_step"] = g("clamped")
             if g("acted_cand") > 0:
                 out[f"{head}/clamped_frac_of_acted"] = g("clamped") / g("acted_cand")
+            if g("abs_c_acted") > 0:
+                out[f"{head}/clamped_mass_frac"] = g("abs_c_clamped") / g("abs_c_acted")
             for i, name in enumerate(BRANCHES):
                 out[f"{head}/branch/{name}/cand_frac"] = g(f"branch{i}_cand") / n_cand
                 out[f"{head}/branch/{name}/mass_frac"] = g(f"branch{i}_mass") / mass

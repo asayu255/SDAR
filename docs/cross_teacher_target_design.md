@@ -10,6 +10,8 @@
 ## 0.0 改訂 (2026-09-02):3点の撤回
 
 **§2(`c` の構成)と §6・§7 は無効化されていない。§3・§3.1〜§3.3・§4 の全数値は無効である。**
+
+> **§0.0 自体も一度改訂している。** 2026-09-02 の第1版は撤回3として `exponent_scale` を 2.148 に、`_EXPONENT_CLAMP` を 3.0 にした。どちらも同日中に差し戻した(1.0 / 5.0)。理由は撤回3の本文にある — **根拠にした「旧アーム比 1/26」が、旧アーム自身の効果で選んだ層の上で測った数字だった。**
 以下は初版の走行前に、初版の設計が生む介入量を実測した結果からの撤回である。撤回の理由を残すため、初版の記述は削除せず「(初版)」として残す。
 
 ### 撤回1:質量保存の交換 → 単純正規化
@@ -34,27 +36,53 @@ C7 は「目標を生徒非依存の固定点にする」ために teacher top-k
 * **代償:** C7 が名指しした通りのフィードバックループ。旧 student-indexed アームの `frac_agree_pos` は 0.238→0.193 と漂流した。
 * **副次的な利点:** intent lock の差分が**機構キーのみ**になる。ペアリングテストの `student_indexed_topk` 例外を削除した。キャッシュは行あたり 4 モデル読みに戻る(`ppo_micro_batch_size_per_gpu=5` は既にその前提で決まっている)。
 
-### 撤回3:`exponent_scale` 1.0 → 2.148、`_EXPONENT_CLAMP` 30.0 → 3.0
+### 撤回3:`exponent_scale` は 1.0 のまま、`_EXPONENT_CLAMP` 30.0 → 5.0
 
-§3.1 で「保守側を採る」とした判断を撤回し、実測の RMS→nats 換算 **2.148** を採る。正規化の 38倍に単位換算の 2.1倍を重ねて top 層 **4.82 nats**、旧アーム比 **1/12**。
+§3.1 で「保守側を採る」とした判断は**維持する**(`exponent_scale = 1.0`)。この節は一度 2.148 に変更し、同日中に戻した。往復を記録するのは、戻した理由が機構ではなく**見積もりの作り方**の教訓だからである。
 
-クランプは**設計パラメータに変わった**。交換が介入量を自律的に絞っていた間は 30.0 の overflow ガードでよかったが、正規化では他に上限が無い。3.0 は「1候補あたり $e^3\approx20$、1位置あたり $|\Delta\mathrm{KL}| \le 6$ nats」という律速である。`exponent_scale=2.148` では作用候補の $|c|$ 中央が 2.15(クランプの 72%)なので**これは実際に binding する**。`target/clamped_per_step` と `target/clamped_frac_of_acted` は病理の指標ではなく**レート**として読む。
+**2.148 を正当化した「まだ 1/26 不足」という見積もりは、二重に誤っていた。**
+
+1. **top 層は旧アーム自身の効果で選ばれた層である。** 効果上位で抽出した標本上で新旧を比べれば、選択基準を持つ旧アームに構造的に有利になる。58.3 / 0.058 / 2.24 / 4.82 nats はすべてこの層の数字であり、**新機構の評価に使ってはいけない。**
+2. **候補→位置の換算に $\sqrt n$ 相殺を仮定していたが、相殺は起きない。** 生徒質量は1候補に集中している:$p_s>0.3$ の事象は全体の 5.3% しかないのに $\sum|p_s c|$ の **72.2%** を占める(20候補から argmax を一様に引く確率 1/20 と一致する)。したがって換算係数は $K=20$ である。
+
+$K=20$ で測り直すと:
+
+| scale | gross | 旧アーム比 | clamp 到達(件数比) | 到達が $\|c\|$ に占める比 | $\log Z$ p99 |
+|---:|---:|---:|---:|---:|---:|
+| **1.0**(採用) | 0.281 | **0.91** | 0.090 | 0.280 | 0.88 |
+| 1.5 | 0.400 | 1.30 | 0.211 | 0.504 | 1.20 |
+| 2.148 | 0.533 | **1.72** | 0.354 | 0.683 | 1.52 |
+
+**2.148 は不足ではなく 1.7倍の過剰だった。**
+
+### 撤回3b:`_EXPONENT_CLAMP` 30.0 → **5.0**(3.0 ではない)
+
+クランプは**設計パラメータに変わった**。交換が介入量を自律的に絞っていた間は 30.0 の overflow ガードでよかったが、正規化では他に上限が無い。
+
+値を 3.0 ではなく 5.0 にする理由は headroom ではなく**飽和**である。(scale 2.148, clamp 3.0) では**作用候補の 35.4% が cap に張り付き、それが $|c|$ 総量の 68.3% を占める**。つまり信号の大きさの3分の2が平坦な $\pm 3$ になり、**教師が最も強く一致した候補でこそ §2 の連続構成が二択に退化する** — 連続化はこの改訂の主眼だったので、これは受け入れられない。
+
+(1.0, 5.0) では到達が候補の 1.9%・$|c|$ の 8.3%、gross 0.296(旧比 0.96)。**クランプがスケールを削らなくなる。** 代償は $\log Z$ の p99 が 0.88→1.14 と、単一候補が最大 148倍動きうること — ただしそれは $p_{on}\sim$1e-6 に載るので $\tilde p\sim$1.5e-4 であり無害である。
+
+**読むのは `target/clamped_mass_frac` であり `clamped_frac_of_acted` ではない。** 件数比は飽和を **1.9〜3.1倍過小評価する**(scale 1.0 で 0.090 対 0.280、2.148 で 0.354 対 0.683)。張り付く候補は大きい候補だからである。
 
 ### この改訂で入れた指標
 
 | キー | 意味 |
 |---|---|
-| `target/abs_dkl_mean`, `target/dkl_mean`, `target/abs_dkl_live_mean` | $\Delta\mathrm{KL} = \log Z - \langle c\rangle_{p_s}$、nats/位置。**旧アームと同じ単位**で、スケールが届いたかを決める数字 |
-
-> **比較の注意。** 上に並べた 58.3 / 0.058 / 2.24 / 4.82 nats は **top 層**(効果上位で選ばれた偏った標本)の数字である。偏りのない spread 層では旧アームの位置あたり平均が 0.274 nats、正規化前の新機構が候補あたり 0.0039 nats で、位置あたりに直すと(20候補、符号相殺込み)0.02〜0.08 と**幅のある見積もり**になる。典型的な位置での差は 4〜14倍に留まる可能性が高い。`abs_dkl_mean` は全位置平均なので **top 層の 58.3 と直接比べてはいけない** — この指標を入れたのは、その見積もりの幅を実測で潰すためである。
+| `target/abs_dkl_mean`, `target/dkl_mean`, `target/abs_dkl_live_mean` | $\Delta\mathrm{KL} = \log Z - \langle c\rangle_{p_s}$、nats/位置。スケールが届いたかを決める数字。**全位置平均なので top 層の 58.3 と直接比べてはいけない**(上記の誤り1) |
+| `target/dkl_kl_corr` | focal 性の検定。監査 §15 は Spearman$(W,\mathrm{KL})=+0.003$ で旧アームの focal 仮説を棄却した。新アームに同じ検定を課す。オフライン実測は Spearman +0.067 / Pearson +0.023 でやはり平坦。live 位置上の5つの走行和から step 末に Pearson(ソート不要、all_reduce 可能) |
+| `target/entropy_delta` | 位置あたり $H(\tilde p) - H(p_{on})$、loss と同じバケット分割。**150step の精度向上と唯一一致したチャネルが entropy(Spearman +1.00、§15)** であり、これまで機構がそれを再現したか見る手段が無かった。負なら目標が尖鋭化 |
+| `target/clamped_mass_frac` | $\Sigma\|c_{\text{eff}}\|_{\text{clamped}} / \Sigma\|c_{\text{eff}}\|_{\text{acted}}$。連続信号が死んでいるかを判定するのはこちら(上記) |
+| `target/support_mass/{student,teacher}` | support が覆う質量。`dkl` は $p_{s,\text{tail}}$ に、`log_z` は $p_{\text{tail}}$ に直接依存する。どちらも ≈1.0 という粗い推定(1 を僅かに超えた)を置いていたので、仮定せず実測する |
 | `target/log_z_mean`, `target/max_abs_log_z` | 頭の課税。交換では恒等的に 0 だった |
-| `target/clamped_frac_of_acted` | クランプの発火率 |
 
 **削除した指標:** `target/throttle_up`, `target/throttle_down`(交換に属する量)。
 
 ### まだ実行していない選択肢
 
-局所 KL に比例させる tilt($c'(v) = c(v)\cdot \mathrm{KL}_{pos}/\langle\mathrm{KL}\rangle$)は**採用していない**。旧アームの $W$ は KL と無相関(Spearman +0.003、監査 §15)なので、これは旧アームの再現ではなく**新しい性質(focal 化)の追加**であり、そう名付けて別に走らせるべきものである。`target/abs_dkl_mean` の実測を見てから判断する。
+局所 KL に比例させる tilt($c'(v) = c(v)\cdot \mathrm{KL}_{pos}/\langle\mathrm{KL}\rangle$)は**採用していない**。旧アームの $W$ は KL と無相関(Spearman +0.003、監査 §15)なので、これは旧アームの再現ではなく**新しい性質(focal 化)の追加**であり、そう名付けて別に走らせるべきものである。
+
+判断材料は `target/abs_dkl_mean`(スケールが届いているか)と `target/dkl_kl_corr`(既に focal になっていないか)の2つで、どちらも本改訂で入れた。**オフライン見積もりだけで scale を動かす判断はもうしない** — 一度それで往復したので。
 
 ---
 
@@ -192,7 +220,7 @@ $U$ か $D$ が空、または $T \le 0$ の位置は $w \equiv 1$(no-op)。
 
 ### 3.1 (初版)スケール:これは明示的な設計判断であり、唯一残ったハイパラである
 
-> **決定を撤回。** 「初回は保守側」は撤回し、`exponent_scale = 2.148`(nats 換算)を採る。§0.0 撤回3。
+> **この節の決定は維持される。** 一度「2.148(nats 換算)を採る」に変更したが差し戻した。理由は §0.0 撤回3 — 変更を正当化した見積もりが、旧アーム自身の効果で選んだ層の上で測られていた。ただし「本機構はハイパラを持たない」という主張を撤回する、という**この節の本論はそのまま有効**である。
 
 
 
@@ -307,12 +335,14 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 |---|---|---|---|
 | `\|dKL\|` | `target/abs_dkl_mean` | **旧アームとの比**が判断材料 | $\log Z - \langle c\rangle_{p_s}$ の絶対値、nats/位置。**この改訂が届いたかを決める数字。** 旧アームの top 層は 58.3 |
 | `log_z` | `target/log_z_mean` | 発散、または `tv` に対して支配的 | 頭の課税。正規化で復活した項(§0.0 撤回1) |
-| `clamped` | `target/clamped_frac_of_acted` | レートとして読む | クランプ 3.0 は binding する設計。0 なら `exponent_scale` が効いていない疑い |
+| `clamped` | **`target/clamped_mass_frac`** | **> 0.3 で懸念** | クランプ 5.0 に張り付いた $\|c\|$ の比。高いと連続信号が平坦な $\pm5$ に潰れている(§0.0 撤回3b)。件数比 `clamped_frac_of_acted` は 1.9〜3.1倍過小評価するので**そちらを読まない** |
+| `dH` | `target/entropy_delta` | 符号と大きさを見る | $H(\tilde p)-H(p_{on})$。§15 で 150step の精度向上と唯一一致したチャネル |
+| `corr(dKL,KL)` | `target/dkl_kl_corr` | オフライン実測 **+0.023**(Pearson) | focal 性。旧アームは +0.003 で棄却された。大きく正なら機構が新しい性質を獲得している |
 | `tv` | `target/tv` | 水準なし(事前登録は無効) | $\mathrm{TV}(\tilde p, p_{on})$、tail 込み |
 | `shuffled/live` | `target/shuffled_tv_ratio` | **> 0.6 で懸念** | off-task shift を行内で roll して $c$ を再計算した TV 比。旧機構のゲートはここで 0.82 だった = 文法で同じ質量を動かしていた |
 | `novelty` | `target/acted_novelty` | **< 0.1 で懸念** | 作用先の $1 - \sum D_{on}/\sum D_{base}$。低ければ base 相続の合意に作用しており、on-task 教師が既に教えている |
 | `tag_share` | `target/tag_share` | **> 0.3 で懸念** | タグ語彙への介入シェア。超えたら測っているのはタグのトークン化(§13.5、`'<th'` 単独で webshop の 21.7%) |
-| `max\|log w\|` | `target/max_abs_log_w` | $> 2\times$ クランプ | 構成上 $|c_{\text{clamped}}| + |\log Z| \le 6$。超えたら実装のバグ |
+| `max\|log w\|` | `target/max_abs_log_w` | $> 2\times$ クランプ | 構成上 $|c_{\text{clamped}}| + |\log Z| \le 10$。超えたら実装のバグ |
 | `mass_err` | `target/mass_error_max` | $> 10^{-12}$ | $\sum \tilde p = 1$($Z=1$ **ではない**)。指標ではなく assertion |
 | `A/B` | `target/channel/{a,b}_share` | 水準なし(§4 参照) | チャネル分解。**枝別シェアとは別量**なので、§4.1 の 0.871/0.129 と直接比べてはいけない |
 
@@ -348,7 +378,7 @@ $e^{c}$ が確率比なので $c$ は nats でなければならないが、$c$ 
 
 **実装済み(2026-09-02、branch `claude/cross-teacher-target`)。** 中核 `verl/trainer/ppo/cross_teacher_target.py`(§2 の式 + §3 の交換 + `TargetStepStats`)、actor 配線(`dp_actor.py`: 教師 logprob を $\log\tilde p$ に差し替え、3アーム相互排他 assert)、driver 配線(`opd_ray_trainer.py` の第3消費者)、config 伝播(`main_opd.py`)、run script(`run_multitask_cross_teacher_target_qwen3.sh`)、intent lock(`expected_multitask_cross_teacher_target_config.yaml`、機構キーは enable / base_path / exponent_scale の3つ)、対 control・対 klw のペアリングテスト(`test_cross_teacher_target_arm.py`: 差分が機構キーと識別子のみであることを合成 config で機械検証)。
 
-**指標(すべて `target/*`、control には0列):** `tv`、`abs_dkl_mean`/`dkl_mean`/`abs_dkl_live_mean`、`log_z_mean`/`max_abs_log_z`、`shuffled_tv_ratio`・`acted_novelty`・`tag_share`・`max_abs_log_w`(§5、毎 step 1行で run ログにも出る)、`mass_error_max`($\sum\tilde p = 1$ の実測)、`live_frac`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`/`clamped_frac_of_acted`。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、w は正規化後なので候補ごとの変化として厳密。ただし **support 上でゼロ和ではない** — tail も $p_{tail}(1/Z-1)$ だけ動く)、イベントは `SignEventSamples` を再利用(`norm` 列は本物の $Z$ になった) — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
+**指標(すべて `target/*`、control には0列):** `tv`、`abs_dkl_mean`/`dkl_mean`/`abs_dkl_live_mean`、`log_z_mean`/`max_abs_log_z`、`shuffled_tv_ratio`・`acted_novelty`・`tag_share`・`max_abs_log_w`(§5、毎 step 1行で run ログにも出る)、`mass_error_max`($\sum\tilde p = 1$ の実測)、`live_frac`、`dkl_kl_corr`(focal 検定)、`entropy_delta`、`support_mass/{student,teacher}`、`branch/<name>/{cand_frac,mass_frac}`(frac と mass_frac を対で)、`channel/{a,b}_share`、`channel/{a,b}_only_tv`(チャネル単独の反実仮想)、per-task 変種、`clamped_per_step`/`clamped_frac_of_acted`/**`clamped_mass_frac`**(読むのは最後の1つ)。σ の軌跡は既存の `kl_weight/rms/*` を同名で再利用(3 run が1軸に載る)。トークン表は `TokenStateCounts(mode="target")` を (branch,sign)→旧 state 名の完全対応で再利用し(dq = p_on(w−1)、w は正規化後なので候補ごとの変化として厳密。ただし **support 上でゼロ和ではない** — tail も $p_{tail}(1/Z-1)$ だけ動く)、イベントは `SignEventSamples` を再利用(`norm` 列は本物の $Z$ になった) — **ダンプファイル・scan script・読み手の語彙が3アームで共通**。D8 も実装: `trainer.val_instance_log_text=True` で検証 jsonl に生成文が載り、3スクリプトすべてに付与(既存2アームは次回の val_only から効く)。
 
 **対 control の差分は機構キーのみである。** 初版では `student_indexed_topk`(control: true / target: false、C7)という第2の差分があったが、§0.0 撤回2 で C7 ごと撤回した。ペアリングテストの例外は削除し、代わりに3アームすべてが `student_indexed_topk=true` であることを検査する(`test_the_support_matches_the_comparators`)。キャッシュは行あたり 4 モデル読みに戻る。
 
