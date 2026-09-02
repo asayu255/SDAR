@@ -377,8 +377,17 @@ def retrieve_endpoint(request: QueryRequest):
     # batch_search even for one query. DenseRetriever._batch_search encodes the
     # whole list in one forward pass and hands FAISS one (n, dim) matrix, which
     # for a Flat index is one pass over the embeddings instead of n passes. It
-    # already chunks by retrieval_batch_size (512), so a caller cannot make the
-    # request too large to serve; it only makes it read the index fewer times.
+    # chunks by retrieval_batch_size, so a longer list only makes it read the
+    # index fewer times.
+    #
+    # That chunking is NOT a guarantee that any request can be served: a chunk
+    # is encoded and searched on a GPU that also holds the index, and one that
+    # does not fit raises out of here as a bare 500. Measured on this server at
+    # retrieval_batch_size=512, 383 queries in a request were served and 384
+    # were not -- the ceiling is free memory over the cost of a query, so it
+    # moves with whatever else is on the box and cannot be fixed by a constant
+    # here. The client finds it by halving a request that keeps drawing 5xx;
+    # see _Coalescer._send in the search tool.
     if request.return_scores:
         results, scores = retriever.batch_search(queries, num=request.topk, return_score=True)
     else:
