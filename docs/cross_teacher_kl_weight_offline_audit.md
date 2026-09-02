@@ -788,20 +788,28 @@ alfworld は 126 エピソード中 90 対 82、**8 エピソードの差**。�
 
 entropy の差が開くほど T=1.0 の成功率差が負に振れる。同時に alfworld では **step 120 以降 control の方が教師に近い**(teacher_kl の逆転)。応答も ARM の方が長い(alfworld +19% tokens、+16% turns; webshop +16% turns)。
 
-### 14.3 解釈:改善は2経路で、どちらも cross-teacher 知識ではない
+### 14.3 T=1.0 での逆転は結果を否定しない(2026-09-02 訂正)
+
+当初この節は T=1.0 の逆転を反証として扱っていた。**それは誤りである。** 検証プロトコル(alfworld/webshop T=0.4、search greedy)は両アームで同一かつ事前に固定されており、そこで測った値がこのプロジェクトの「精度」の定義である。T=1.0 の学習ロールアウトは**最適化の副産物**であって成果物ではない — RL は探索のために高温でサンプルするのであり、その条件での成功率が低いことは「わざと雑音を足したら弱い」と言っているに等しい。
+
+さらに、**entropy が上がって T=1.0 の成功率が下がるのは、探索の対価としてむしろ健全な形**である。方策が平坦化して探索が増え、学習したモードは良くなり、低温評価でそれが読める — entropy bonus と同じ論理で、これは肯定的な筋書きですらある。
+
+逆転が示すのは結果の可否ではなく、**帰属についての弱い手掛かり**にとどまる: 「目標分布が良くなった」なら全温度で良いはずで、「平坦だがモードが良い」なら低温だけで良い。観測は後者寄りだが、機構が知識を運びつつ副作用で entropy を上げた場合も同じ形になるので、決定的ではない。
+
+### 14.4 では何が結果を脅かすのか(温度とは無関係な3点)
 
 **検証条件は完全には同一でない(2026-09-02 追記)。** 温度は同一(`val_kwargs_by_task` は config 差分に現れない: alfworld/webshop T=0.4、search greedy)だが、**`env.multitask.val_per_task_batch_size` が ARM `.search=252` 対 control フラット 126**。さらに control は起動が pump 既定化(commit `9c5d528`)より前で、そのコミット自身が「pumped と unpumped では [val-hash] は一致しない — どのリクエストが decode step を共有するかが変わるため。トークンはこの比較の gate にならず、スコアが gate である」と書いている。**greedy 復号でバッチ構成が変われば argmax は同点近傍で反転しうる**ので、search の n=51,713 はこの差が最も効く場所である。加えて **control の `val_step150.jsonl` は本ホストに無く**(`/opt/home/...`)、その検証がどの step・どのバッチ幅・pump 有無で走ったかを本監査は確認できていない。
 
 **(i) search(greedy 検証、entropy 不変、z=3.2):** ARM は教師に近い(teacher_kl 0.089 対 0.115、−23%)。監査 §2 の通り $W$ は per-token KL と正相関(`weight_kl_lift` 1.27–1.29 を維持)し、**KL が大きい位置を重く蒸留する focal 型の再重み付け**として働く。KL 予算が最小の search で「教師への収束が速い」が最も素直に検証成績に出た。cross-teacher の裏付けは不要な説明である。ただし上記の通り、**検証バッチ幅と pump の差という機構と無関係な説明も同じデータと整合する**。1pp は 51,713 問中 517 問で、軌跡の 2% が復号の分岐で別経路に入り半分が結果反転すれば出る大きさである。
 
-**(ii) alfworld / webshop(T=0.4 検証、entropy 2.4倍):** 機構の裾増幅(監査 §2.1)が方策を平坦化した。T=1.0 では裾のサンプルが成功率を下げ(14.2 の負の差)、T=0.4 では裾が抑えられてモード付近が評価される。**モードが control より良いかどうかは、この標本では決まらない**(z=1.08 / 0.53)。確立しているのは「同じ方策が T=1.0 で負け、T=0.4 で勝つ」という符号反転であり、これは entropy 経路の指紋である。
+**(ii) alfworld / webshop(T=0.4 検証):** ここが本当の争点で、**統計的な力の問題**である。z=1.08 / 0.53、alfworld は 126 エピソード中 **90 対 82、8 エピソードの差**。手元の `val_step150` 5本は alfworld 0.651–0.714 に散る(ただし4本は純 OPD 系で目的関数が違うので厳密な replicate ではない)。ARM はその全てより高いが、**同一条件の反復が1本も無いため、8 エピソードがノイズかどうかを現データで決められない。**
 
 機構の内部量は監査の結論から動いていない: `shuffled_to_live_gate_ratio` 0.82(文法で開く)、`reward_positive/net_effect` は 61 step 以降負のまま(成功エピソードから圧を引く)、`teacher_novelty` は 0.70 まで上がるが `acted` 限定ではない。**cross-teacher の裏付けがタスク知識を運んだ証拠は、150 step 時点でも増えていない。**
 
-### 14.4 決着させる測定
+### 14.5 決着させる測定
 
-1. **control を ARM と同一条件で再検証。** 同一ホスト・同一 `val_per_task_batch_size`・同一 pump 設定で step-150 checkpoint を `val_only`。search の +1pp を機構に帰属できるかを決める唯一の測定であり、同時に `val_step150.jsonl` が揃って `scripts/val_paired.py` の McNemar(traj_uid 初出順)が走る。
-2. **温度感度。** 両 step-150 checkpoint を **T=1.0** と **T=0.4** の両方で `val_only`。(ii) が正しければ alfworld/webshop の差は T=1.0 で消える(か反転する)。
+1. **【最優先】control を ARM と同一条件で再検証し、対応あり検定にかける。** 同一ホスト・同一 `val_per_task_batch_size`・同一 pump 設定で step-150 checkpoint を `val_only`。これが2つの脅威を同時に潰す: search の検証条件差が消え、`val_step150.jsonl` が揃って `scripts/val_paired.py` の McNemar(traj_uid 初出順)が走る。**対応あり検定は力が大きく違う** — 非対応 z=1.08 は 126 の独立標本を仮定しているが、両アームは同じ 126 問を解いており一致率が高ければ不一致ペアだけが効く。alfworld の正味 +8 が、例えば不一致 20 ペア中 14–6 なら McNemar で有意に届く。**現データを捨てずに結論を強められる唯一の測定。**
+2. **シードを増やす。** 1 で有意に届かなければ、8 エピソードの差はシード反復でしか決まらない。
 3. **cross-teacher 抜きの ablation。** $W$ を per-token KL の単調関数(例: $1+\kappa\,\mathrm{KL}/\overline{\mathrm{KL}}$ を mean-1 正規化)にした arm。(i) が正しければ search の +1pp が再現し、cross-teacher 部分は不活性と確定する。entropy bonus のみの arm が (ii) の対照。
 4. **webshop "Score" 列の出所。** `val_step150.jsonl` の score は二値(成功×10)で、表の 0.768 / 0.760 は別ソース(`episode/webshop_webshop_task_score` 相当)。学習中の同指標は 121–148 で ARM 0.752 対 CTL 0.822 と**逆向き**なので、検証側の値の定義を揃えて再確認すること。
 
