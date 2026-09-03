@@ -244,7 +244,7 @@
 "algorithm.opd.cross_teacher_target.mode": curriculum
 # THE SCHEDULE IS THE ONLY FREE PARAMETER OF THE ARM, which is why it is pinned
 # here rather than left in the script. Stage 1 is steps 1-40, the pair layer
-# ramps over 41-50, stage 2 is 51-80, the own layer ramps over 81-90, and 91-300
+# ramps over 41-49, stage 2 is 50-80, the own layer ramps over 81-89, and 90-300
 # is the control exactly.
 #
 # Where the three numbers come from: the 8/13 arm's early lead stood at steps

@@ -155,10 +155,14 @@ set -x
 #
 # THE SCHEDULE IS THE ONLY FREE PARAMETER, and it is pre-registered here and in
 # the intent lock: stage_steps=[40,80], ramp_steps=10. Stage 1 is steps 1-40
-# (the 8/13 arm's early lead stood at 31-60), the pair layer ramps over 41-50,
-# stage 2 is 51-80 (short, because the design's null simulation puts stage 2's
-# selectivity at 48% against stage 1's 10.5%), the own layer ramps over 81-90,
-# and 91-300 is the control exactly. Releasing fully at 91 discards nothing
+# (the 8/13 arm's early lead stood at 31-60), the pair layer ramps over 41-49,
+# stage 2 is 50-80 (short, because the design's null simulation puts stage 2's
+# selectivity at 48% against stage 1's 10.5%), the own layer ramps over 81-89,
+# and 90-300 is the control exactly -- each ramp reaches 1.0 AT its last step, so
+# stage 2 begins at 50 and full release at 90. On a 300-step run that is 89 steps
+# restricted (29.7%); on a 150-step one (trainer.stop_after_steps=150) the
+# boundaries do not move, so the restricted share is 59.3% instead.
+# Releasing fully at 90 discards nothing
 # measured to matter: the 8/13 arm kept intervening at over nine tenths of its
 # initial rate through the whole window where its lead disappeared
 # (docs/cross_teacher_theory.md 4.3.1).
@@ -177,7 +181,7 @@ set -x
 #     after full release. This is the maturity-trigger question of design 5.2,
 #     logged so it can be answered after the fact.
 #   tag_share  EXPECTED HIGH in stage 1 and not a concern there, unlike on the
-#     tilt arm. It falls to the control's by step 91.
+#     tilt arm. It falls to the control's by step 90.
 #
 # INTENT LOCK: examples/opd_grpo_trainer/expected_multitask_cross_teacher_curriculum_config.yaml pins the
 # scientific knobs (loss type/coefs, seeds, batch sizes, teachers, eval
