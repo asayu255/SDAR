@@ -1,5 +1,22 @@
 set -x
 #
+# TRAINING ONLY. trainer.test_freq=-1: this script trains and does not validate.
+# examples/opd_trainer/eval_checkpoints.sh is the other half -- it scores the
+# checkpoints afterwards, one process per checkpoint, and logs each at the
+# checkpoint's own step so the curve lands on this run's x-axis.
+#
+# The separation is not tidiness. alfworld draws each episode from TextWorld's
+# seeded game-file cycle, which is stateful: every reset advances it, so a second
+# validation inside one process plays different games than the first. Two
+# checkpoints scored in one process are therefore not scored on the same episodes,
+# and the difference between them carries a difference in what they were asked to
+# do. A fresh process rebuilds the cycle from env.seed at position 0.
+#
+# rollout.gpu_memory_utilization is read from the environment for the same reason:
+# it is the one setting evaluation genuinely wants different. This arm keeps FSDP
+# parameters, gradients and optimizer state on the same cards, so 0.3 is right
+# here; an eval process holds none of them and eval_checkpoints.sh raises it.
+#
 # SHARED CHECKPOINT DIRECTORY. trainer.default_local_dir below is also used by the
 # other off-policy arms (run_multitask_offpolicy_qwen3.sh,
 # run_multitask_offpolicy_qwen3_nogen.sh, run_multitask_offpolicy_studenttopk_qwen3.sh).
@@ -171,7 +188,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.3} \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     +actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.enforce_eager=False \
@@ -221,7 +238,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     trainer.experiment_name=sdar_multitask_offline_qwen3_1.7b \
     trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask \
     trainer.save_freq=25 \
-    trainer.test_freq=150 \
+    trainer.test_freq=-1 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@"

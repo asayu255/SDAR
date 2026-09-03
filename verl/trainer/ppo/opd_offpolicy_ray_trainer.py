@@ -443,6 +443,11 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             "off-policy OPD requires algorithm.opd.teacher_data_dir "
             "(directory of Stage-1 <task>.pt files)"
         )
+        # Read once here because three places branch on it -- the pool load below,
+        # the teacher worker groups in init_workers, and fit's early return -- and
+        # they have to agree. A run that skipped the pool but still built the
+        # teachers would pay most of the cost of the thing it opted out of.
+        self.val_only = bool(self.config.trainer.get("val_only", False))
         actor_cfg = self.config.actor_rollout_ref.actor
         self.teacher_topk_kl = actor_cfg.get("teacher_kl_loss_type", "low_var_kl") == "topk_kl"
         self.teacher_kl_topk = int(actor_cfg.get("teacher_kl_topk", 20))
@@ -480,7 +485,20 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         per_task_prompts = int(self.config.data.task_balance.per_task_batch_size)
         group_size = int(self.config.env.rollout.n)
         self.per_task_traj_per_step = per_task_prompts * group_size
-        self._load_offpolicy_data()
+        # A val_only process scores a checkpoint and returns; it never draws a
+        # batch, so it never reads the pool. Loading it anyway costs the whole
+        # resident footprint (~149 GiB, or ~55 GiB once this arm drops the top-k
+        # columns) and the minutes of unpickling that go with it, on a box the
+        # Stage-2 profile measured at 98% of host RAM -- for a process whose work
+        # is generation. teacher_data_dir is still validated above, because it is
+        # part of the arm's identity even when its contents are not read.
+        if self.val_only:
+            print("[OPD-offpolicy] val_only: skipping the Stage-1 pool load", flush=True)
+            self._task_shards = {}
+            self._task_to_traj_rows = {}
+            self._task_to_trajs = {}
+        else:
+            self._load_offpolicy_data()
 
     # Tensor columns discarded as each Stage-1 file is loaded. A subclass whose
     # loss consumes fewer columns than the top-k KD loss overrides this to drop
@@ -502,7 +520,18 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
     # frozen teacher per task, colocated with the actor.
     # ------------------------------------------------------------------ #
     def init_workers(self):
-        if not self.student_indexed_topk:
+        # The teachers exist to be scored during the update. A val_only process
+        # runs no update, so it would load three 1.7B models onto the same cards
+        # the rollout is about to size its KV cache against, and query none of
+        # them. Fall back to the base setup, which is exactly the control arm's:
+        # actor_rollout and nothing else.
+        if not self.student_indexed_topk or self.val_only:
+            if self.student_indexed_topk:
+                print(
+                    "[OPD-offpolicy] val_only: not building the per-task teachers "
+                    "(nothing scores them without an update)",
+                    flush=True,
+                )
             return super().init_workers()
 
         self.resource_pool_manager.create_resource_pool()
@@ -620,6 +649,15 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         teacher target on rows it still evaluates.
         """
         wgs = self.teacher_wg
+        # Unreachable from fit(), which returns after validating under val_only --
+        # but the failure without this is StopIteration from next(iter({})), which
+        # names nothing. If a future caller reaches here in a val_only process, the
+        # answer is that the teachers were deliberately not built.
+        assert wgs, (
+            "student_indexed_topk needs the per-task teachers, and none were built. "
+            "init_workers skips them under trainer.val_only, which is a validation "
+            "process rather than a training one."
+        )
         with _timer("teacher_cache_clear", timing_raw):
             # Every group, not just one. The entry store is per PROCESS, so one
             # call empties it for all three -- but the witness BUDGET is per
@@ -1170,12 +1208,23 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         # already been incremented below, and the off-by-one would be silent.
         consumed_steps = self.global_steps
 
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        # val_only is read on its own, NOT nested inside val_before_train. The two
+        # answer different questions -- "validate before the first step" and "do
+        # nothing but validate" -- and nesting them means val_only is silently
+        # ignored by exactly the runs that set val_before_train=False, which is
+        # every Stage-2 script here. A process asked to validate would have
+        # trained instead.
+        #
+        # The step it logs at is the checkpoint's own: _load_checkpoint above set
+        # global_steps from the resumed checkpoint, so a score for global_step_150
+        # lands at 150 on the training run's x-axis.
+        val_only = bool(self.config.trainer.get("val_only", False))
+        if self.val_reward_fn is not None and (val_only or self.config.trainer.get("val_before_train", True)):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
+            pprint(f"{'val_only' if val_only else 'Initial'} validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
+            if val_only:
                 return
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="OPD-offpolicy Training")

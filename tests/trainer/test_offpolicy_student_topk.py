@@ -106,6 +106,10 @@ def _init(opd, actor):
         actor_rollout_ref=_Cfg(actor=actor),
         data=_Cfg(task_balance=_Cfg(per_task_batch_size=15)),
         env=_Cfg(rollout=_Cfg(n=8)),
+        # Empty rather than absent: __init__ reads trainer.val_only to decide
+        # whether this process will draw a batch at all, and these tests are all
+        # about the training path.
+        trainer=_Cfg(),
     )
     trainer._load_offpolicy_data = lambda: None
     with patch.object(RayPPOTrainer, "__init__", lambda self, *a, **k: None):
