@@ -10,6 +10,13 @@ set -x
 #   algorithm.opd.teacher_paths.*     the three teachers, loaded at Stage 2
 #   trainer.expected_config           this arm's own intent lock
 #   trainer.experiment_name           its own run identity
+#   trainer.default_local_dir         its own checkpoint tree -- NOT cosmetic.
+#     Checkpoints land in default_local_dir/global_step_N; experiment_name is not
+#     in that path. Sharing the directory with the control arm would have this run
+#     overwrite the control's checkpoints step for step, and -- because
+#     trainer.resume_mode defaults to auto and reads
+#     default_local_dir/latest_checkpointed_iteration.txt -- would have it RESUME
+#     FROM THE CONTROL ARM'S WEIGHTS on its first start, silently.
 #
 # WHY THE TEACHERS COME BACK. The loss is a coarse-grained reverse KL: exact on
 # a support, everything outside it in one tail bucket. What that drops is
@@ -274,7 +281,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_offpolicy_multitask' \
     trainer.experiment_name=sdar_multitask_offline_studenttopk_qwen3_1.7b \
-    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask \
+    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask_studenttopk \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
