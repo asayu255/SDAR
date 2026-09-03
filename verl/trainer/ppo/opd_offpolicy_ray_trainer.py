@@ -181,6 +181,34 @@ _BATCH_PREFETCH = _env_flag("OFFPOLICY_BATCH_PREFETCH")
 _KEEP_KD_TARGETS = _env_flag("OFFPOLICY_KEEP_TEACHER_TOPK")
 
 
+def _dir_size_gb(paths):
+    """Total size of ``paths`` in GiB; missing files count as zero rather than raise."""
+    total = 0
+    for path in paths:
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total / (1024**3)
+
+
+def _host_rss_gb():
+    """This process's resident set size in GiB, or None where /proc is not there.
+
+    Read from /proc rather than psutil because psutil is not a hard dependency of
+    this package and a progress line must not be the thing that raises. It is the
+    number the pool load is bounded by -- the measured steady state is ~149 GiB on
+    a 503 GB box -- so printing it beside each shard turns "is it still going" into
+    a number that either moves or does not.
+    """
+    try:
+        with open("/proc/self/statm") as fh:
+            pages = int(fh.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return pages * os.sysconf("SC_PAGE_SIZE") / (1024**3)
+
+
 def find_padding_duplicates(traj_uids: np.ndarray) -> np.ndarray:
     """Boolean mask of the rows an earlier Stage 1 appended as adjust_batch padding.
 
@@ -777,7 +805,7 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             if n_dup:
                 keep_idx = torch.from_numpy(np.flatnonzero(~is_dup))
                 print(f"[OPD-offpolicy] {name}: dropping {n_dup} Stage-1 padding rows "
-                      f"({n_dup / n_rows:.1%}), keeping {n_rows - n_dup}")
+                      f"({n_dup / n_rows:.1%}), keeping {n_rows - n_dup}", flush=True)
         keep_np = keep_idx.numpy() if keep_idx is not None else None
 
         dropped_cols = []
@@ -808,10 +836,10 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             for key, value in data.non_tensor_batch.items()
         }
         if dropped_cols:
-            print(f"[OPD-offpolicy] {name}: dropped unused columns {dropped_cols}")
+            print(f"[OPD-offpolicy] {name}: dropped unused columns {dropped_cols}", flush=True)
         if narrowed_cols:
             print(f"[OPD-offpolicy] {name}: narrowed storage dtypes of {narrowed_cols} "
-                  f"(lossless; restored per step batch)")
+                  f"(lossless; restored per step batch)", flush=True)
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=data.meta_info)
 
     def _resolve_drop_tensor_keys(self):
@@ -859,6 +887,12 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         """
         files = sorted(glob.glob(os.path.join(self.teacher_data_dir, "*.pt")))
         assert files, f"no Stage-1 <task>.pt files found in {self.teacher_data_dir}"
+        load_started = time.monotonic()
+        print(f"[OPD-offpolicy] loading the Stage-1 pool: {len(files)} files from "
+              f"{self.teacher_data_dir} ({_dir_size_gb(files):.0f} GiB on disk). This is "
+              "minutes, not seconds, and it holds the whole pool resident; a line follows "
+              "per file. scripts/cache_teacher_pool.py does the filtering once instead of "
+              "on every start.", flush=True)
 
         drop_keys = self._resolve_drop_tensor_keys()
         if self.student_indexed_topk:
@@ -876,8 +910,16 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
         self._task_shards = {}        # task -> [DataProto] (that task's rows, in write order)
         self._task_to_traj_rows = {}  # task -> {traj_uid: (shard idx, np.ndarray(rows in shard))}
         self._task_to_trajs = {}      # task -> np.ndarray(traj_uid) sampling population
-        for path in files:
+        for file_idx, path in enumerate(files, start=1):
             data = self._load_offpolicy_file(path, drop_keys=drop_keys)
+            # Unconditional, because the prints inside _load_offpolicy_file are not:
+            # a pool already filtered by cache_teacher_pool.py has no padding to drop
+            # and no column to remove, so without this line an hour-long load says
+            # nothing at all and is indistinguishable from a hang.
+            rss = _host_rss_gb()
+            print(f"[OPD-offpolicy] [{file_idx}/{len(files)}] {os.path.basename(path)}: "
+                  f"{len(data)} rows, {time.monotonic() - load_started:.0f}s elapsed"
+                  + (f", host RSS {rss:.0f} GiB" if rss is not None else ""), flush=True)
             assert "traj_uid" in data.non_tensor_batch, (
                 f"{os.path.basename(path)}: off-policy dataset must carry traj_uid "
                 "for trajectory-level sampling"
@@ -940,8 +982,9 @@ class OffPolicyOPDRayTrainer(RayPPOTrainer):
             for t, shards in self._task_shards.items()
         }
         total_rows = sum(len(s) for shards in self._task_shards.values() for s in shards)
-        print(f"[OPD-offpolicy] loaded {total_rows} rows from {len(files)} files; "
-              f"per-task (trajectories, rows, shards): {sizes}")
+        print(f"[OPD-offpolicy] loaded {total_rows} rows from {len(files)} files "
+              f"in {time.monotonic() - load_started:.0f}s; "
+              f"per-task (trajectories, rows, shards): {sizes}", flush=True)
         for task, trajs in self._task_to_trajs.items():
             assert len(trajs) > 0, f"no trajectories for task {task}"
 
