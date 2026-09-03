@@ -284,6 +284,36 @@ class OPDRayTrainer(RayPPOTrainer):
         # p_s = p_on whatever the scalar is.
         xtt_cfg = dict(opd_cfg.get("cross_teacher_target", {}) or {})
         self.cross_teacher_target_enabled = bool(xtt_cfg.get("enable", False))
+        # WHICH of the two target mechanisms, and -- for the staged one -- the
+        # schedule, validated here rather than at first use. The curriculum is
+        # a claim about the ORDER components are taught in, so a schedule that
+        # does not fit inside the run is not a smaller version of the experiment:
+        # a run whose stage 2 never ends never tests stage 3, and one whose
+        # release finishes at step 1 is the control with extra logging.
+        self.cross_teacher_target_mode = str(xtt_cfg.get("mode", "tilt"))
+        self.cross_teacher_curriculum = None
+        if self.cross_teacher_target_enabled and self.cross_teacher_target_mode == "curriculum":
+            from verl.trainer.ppo.cross_teacher_target import curriculum_rho
+
+            stage_steps = tuple(int(x) for x in xtt_cfg.get("stage_steps", (40, 80)))
+            ramp_steps = int(xtt_cfg.get("ramp_steps", 10))
+            assert len(stage_steps) == 2, (
+                "cross_teacher_target.stage_steps is (last step of stage 1, last step of "
+                f"stage 2); got {stage_steps}"
+            )
+            # Raises on an overlapping ramp, which is the one way to get a run
+            # with no stage 2 at all.
+            curriculum_rho(step=1, stage_steps=stage_steps, ramp_steps=ramp_steps)
+            total = int(self.config.trainer.get("total_training_steps", 0) or 0)
+            assert total <= 0 or stage_steps[1] + ramp_steps < total, (
+                f"the curriculum finishes releasing at step {stage_steps[1] + ramp_steps} "
+                f"but the run is {total} steps: there would be no fully-released stage, "
+                "and the prediction the arm is judged on (the endpoint agrees with the "
+                "control) is about that stage"
+            )
+            self.cross_teacher_curriculum = {
+                "stage_steps": stage_steps, "ramp_steps": ramp_steps,
+            }
         assert not (self.cross_teacher_target_enabled
                     and (self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled)), (
             "algorithm.opd.cross_teacher_target moves the distillation target while "
@@ -1381,6 +1411,24 @@ class OPDRayTrainer(RayPPOTrainer):
                         # set it explicitly (same value compute_log_prob would set).
                         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        # THE CURRICULUM'S SCHEDULE, evaluated here and shipped as
+                        # two numbers. Here rather than in the actor because the
+                        # actor is never told which step it is on, and because
+                        # global_steps is restored from the checkpoint folder --
+                        # so the release is resume-correct with no state of its
+                        # own, the same way the env schedules are replayed after
+                        # _load_checkpoint. A broadcast scalar also cannot be
+                        # changed by the mini-batch or micro-batch split, which
+                        # keeps the objective invariant to both.
+                        if self.cross_teacher_curriculum is not None:
+                            from verl.trainer.ppo.cross_teacher_target import curriculum_rho
+
+                            _rho = curriculum_rho(
+                                step=self.global_steps, **self.cross_teacher_curriculum
+                            )
+                            batch.meta_info["cross_teacher_curriculum_rho"] = (
+                                _rho["pair"], _rho["own"],
+                            )
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)

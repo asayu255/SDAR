@@ -1,12 +1,17 @@
-# 裏付け限定・段階解放カリキュラム蒸留(corroboration-only curriculum)— 設計案
+# 裏付け限定・段階解放カリキュラム蒸留(corroboration-only curriculum)
 
-状態: **案のみ。実装なし。** 走らせる前に §6 の事前登録を固定すること。
+状態: **設計 + 実装済み(2026-09-03)。未走行。** §6 の事前登録は intent lock
+(`examples/opd_grpo_trainer/expected_multitask_cross_teacher_curriculum_config.yaml`)で機械的に固定されている。
+実装は §7、走らせる前に決まっていること・残っていることは §8。
 
 前提文書: [cross_teacher_theory.md](cross_teacher_theory.md)(理論、命題 1–3、階層モデル、識別不能性)、
 [cross_teacher_target_design.md](cross_teacher_target_design.md)(現行 target 機構と 3 撤回)、
 [cross_teacher_kl_weight_offline_audit.md](cross_teacher_kl_weight_offline_audit.md)(監査: $g$ ≈ 書式、shuffled 比 0.82)。
-対象コード: `verl/trainer/ppo/cross_teacher_target.py`(`target_exponent` / `normalized_weight` / `build_target`)、
-適用点 `verl/workers/actor/dp_actor.py` の `xtt_build_target` 呼び出し。
+対象コード: `verl/trainer/ppo/cross_teacher_target.py`(`mode="curriculum"`: `curriculum_rho` /
+`nested_layers` / `curriculum_exponent` / `build_target` / `TargetStepStats`)、
+適用点 `verl/workers/actor/dp_actor.py` の `xtt_build_target` 呼び出し、
+スケジュールの供給元 `verl/trainer/ppo/opd_ray_trainer.py`。
+アーム: `examples/opd_grpo_trainer/run_multitask_cross_teacher_curriculum_qwen3.sh`。
 
 要求(2026-09-03): 現行機構を **corroboration(裏付け)機能のみ**に変え、
 (1) 前半は全教師の policy shift 一致信号 $g$ だけを蒸留、
@@ -309,29 +314,42 @@ $\sigma$ が有効になるまでの 1–2 step は現行と同じく $c \equiv 
 ### 6.2 結果の事前予測と反証条件
 
 対照: 同一コミット・同一ホスト・同一 GPU 枚数・$\beta = 0.01$・生徒 top-k の control(target 設計 §7)。
-評価: **タスク別成功率を、同一 checkpoint の反復雑音(2.4pp、理論 §4.2.2)を尺度に読む。**
-1 draw 対 1 draw の差の SE は 3.4pp。McNemar は主要評価から降ろす(§6.3)。pooled は報告しない。
+評価: **タスク別成功率を、同一 checkpoint の反復雑音を尺度に読む。** 理論 §4.2.2 が 3 回の反復で
+タスク別に直接測っており、桁が違う(復号設定の違いによる)。McNemar は主要評価から降ろす(§6.3)。
+pooled は報告しない。
 検証点: **@50, @100, @150, @300**(現行の 150 刻みでは中間が見えない。@50/@100 は val_only で後から取れる)。
 alfworld は**サブタスク別内訳を必ず読む** — 検証ログに率が出ており分母(26 / 13 / 25 / 32 / 19 / 11)は率から
 復元できるので、追加 run はいらない(理論 §4.2.3)。
 
 | | 予測 | 外れたときの読み |
 |---|---|---|
-| @300 全タスク | control ± run 間 SD(alfworld 2.1–2.6pp、webshop acc 0.7–3.1pp) | 有意に上: 固定点近似が破れている(共有パラメータ効果が残る)。有意に下: 保留の損失が回収されていない |
+| @300 全タスク | control ± 2 SE(§6.3 の表) | 有意に上: 固定点近似が破れている(共有パラメータ効果が残る)。有意に下: 保留の損失が回収されていない |
 | T=1.0 窓 1–40 | webshop ≤ control(保留コスト)、差 ≤ 0.05。alfworld ≈ control | webshop が control 以上なら保留コストは存在しない(良い外れ) |
 | T=1.0 窓 41–100 | **順序仮説が正しければ** alfworld が 3 窓連続で control + 0.05 以上 | 1 窓も無ければ順序仮説は null。この線を閉じる |
 | 正規形式切替 step(alfworld) | control(135)**より早い**(§4.5) | 遅いなら「書式を先に教えると書式採用が早い」が偽。8/13 アームと同じ向き |
 | alfworld サブタスク内訳 @150 | 差が出るなら **control が最も弱い 2 つ**(cool→place 0.600、two obj 0.316)に局在する。8/13 アームの +14 問中 10 問がそこだった(理論 §4.2.3) | 局在しないなら「control が苦手な所で勝つ」形は本案では再現していない。別の局在なら、その形自体が新しい所見 |
-| **反証条件** | @150 でいずれかのタスクが control より **6.8pp(2 SE)以上下** | 保留の損失 > 順序の利得。カリキュラムは採らない |
+| **反証条件** | @150 でいずれかのタスクが control より **2 SE 以上下**(alfworld 3.9pp、webshop acc 1.3pp、webshop score 4.0pp、search 0.6pp。§6.3) | 保留の損失 > 順序の利得。カリキュラムは採らない |
 | webshop @150 以降 | control − 0.05 を下回らない(注入ゼロなので klw 型の悪化は無い) | 下回れば「害は注入ではなく別経路」。理論 §4.6 の webshop 読みを改める |
 | entropy | control と同等(klw 型の上昇は無い。§3.2-5) | 上がれば裾ゲート解釈が誤り |
 
 ### 6.3 検出力(理論 §4.2.2 の実測値で書き直した)
 
-* **検証値.** 同一 checkpoint・同一プロトコルの反復は alfworld で 2.4pp(126 問中 3 問)。1 draw 対 1 draw の
-  差の SE は $2.4\sqrt2 = 3.4$pp なので、**2 SE = 6.8pp が 1 run 対 1 run で読める下限**である。
-  8/13 アームの +11.1pp はこの尺度で 3.3σ だった。本案に同じ大きさを要求はしないが、
-  **3pp 台の差は「観測されなかった」と同義**として事前に書いておく。
+* **検証値の尺度はタスク別で、桁が違う**(理論 §4.2.2、arm@300 の 3 回、同一 checkpoint・同一プロトコル)。
+  1 draw 対 1 draw の差の SE は $\mathrm{SD}\sqrt2$:
+
+  | metric | 検証時の復号 | 反復 SD | 差の SE | 読める下限(2 SE) |
+  |---|---|---:|---:|---:|
+  | alfworld (n=126) | T=0.4 標本抽出 | 1.39pp | 1.96pp | **3.9pp** |
+  | webshop acc (n=126) | T=0.4 標本抽出 | 0.46pp | 0.65pp | **1.3pp** |
+  | webshop score (n=126) | T=0.4 標本抽出 | 1.42pp | 2.01pp | **4.0pp** |
+  | search (n=51713) | **T=0 貪欲** | (0.06pp は過小) | 0.30pp | **0.6pp** |
+
+  **search の SD は使わない。** 3 桁丸めの値から出ており、$n = 51713$ の二項 SE 0.215pp を下回る。
+  上の 0.30pp は二項 SE から取った($0.215\sqrt2$)。
+  **$n = 3$ の SD は弱い推定**で、$\sigma$ の 95% CI は概ね $[0.52\hat\sigma, 6.3\hat\sigma]$(理論 §4.2.2)。
+  webshop acc の 0.46pp は 3 値のぶれが 1 問しかないので特に運が良い数字で、**単独で 1.3pp を主張してはいけない**。
+  堅く述べるなら range 由来の見積り(alfworld 2.40pp → 3.4pp)も併記する。8/13 アームの +11.1pp は
+  この尺度で 3.3σ(range 由来)〜5.7σ(SD 由来)だった。
 * **McNemar は主要評価から降ろす.** 両アームは同一の 126 問(同じ val set、`data.seed=1`)を採点するので、
   問題サンプリング分散は差の中で既に相殺されている。McNemar の z は不一致対 $b+c$ に対し最良でも 3.74σ、
   現実的な $b+c = 20$–30 では 2.6–3.1σ で、反復 SD 経由の読みを上回らない(理論 §4.2.2)。
@@ -339,6 +357,9 @@ alfworld は**サブタスク別内訳を必ず読む** — 検証ログに率�
 * **サブタスク分解は局在の記述で、検定ではない.** n は 11–32 なので個々の差は二項雑音の内側。
   担保するのは合計の問題数。
 * **学習中の窓平均.** 差の SE ≈ 0.05。順序仮説の検定は「連続窓」の一貫性に依る(§6.2)。可能なら 2 シード。
+  **本案の主要な識別はここで起きる**: 検証値は @50/@100 の 2 点しか中間に無いが、T=1.0 の学習曲線は
+  300 点あり、理論 §6.4 が E−1 を「限界的」に落とした理由もそれである(各 step の alfworld は
+  15 プロンプト × `env.rollout.n=8` = 120 本で、検証の 126 問と標本サイズがほぼ同じ)。
 * **中間 checkpoint(25 step 刻み)を必ず保存する.** この機構は中間にしか差が出ない予測なので、
   @150/@300 だけでは検定不能。
 
@@ -366,35 +387,64 @@ E1($\beta(t)$)との関係は初版のまま: 「時間で何を変えるか」�
 
 ---
 
-## 7. 実装の輪郭(実装はしない。規模感と接点の記録)
+## 7. 実装(2026-09-03 実装済み)
 
 **変更点は 1 モジュール + 配管 3 箇所。** 新しいキャッシュ・新しい教師読みは無い(行あたり 4 モデル読みは現行通り)。
+実装は `claude/cross-teacher-target` の tip を基点にしている。
 
 1. `verl/trainer/ppo/cross_teacher_target.py`
-   * `nested_layers(hat_on, hat_off, sigma_on) -> {a1, a2, a3}`: §2.2。on-task nats に直してから min/max。
-   * `curriculum_exponent(layers, rho2, rho1) -> c`: §3.3。`branch` は `{three, pair, own, none}` に付け替え。
-   * `normalized_weight(..., clamp=None)`: この mode では clamp を外す(§3.2-1)。`live` の恒等経路はそのまま。
-   * `build_target(mode="curriculum", schedule=...)`: `mode` キーは新設(既定 `"tilt"` = 現行の $c = a + b$ 経路)。`curriculum` では `exponent_scale` を受け取らない。
-   * `TargetStepStats`: 層別質量・role 別・保持質量比・$D_k$・$\rho$ の列を追加。`a_only/b_only` は消す。
-2. `verl/trainer/ppo/opd_ray_trainer.py`: `batch.meta_info["global_steps"] = self.global_steps` を `update_actor` の前に 1 行。
-   actor は現状 step を知らない(`meta_info` に無い)。actor 側で `update_policy` 回数を数える案は resume で壊れるので採らない。
-3. `verl/workers/actor/dp_actor.py`: `xtt_build_target` 呼び出しに `global_steps` を渡す。適用点は変わらない。
-4. config / intent lock / script: `algorithm.opd.cross_teacher_target.{mode=curriculum, stage_steps=[40,80], ramp_steps=10}`。
-   `expected_multitask_cross_teacher_curriculum_config.yaml` を新設し、対 control の差分が機構キーのみであることを
-   既存のペアリングテストの形で機械検証。
+   * `MODES = ("tilt", "curriculum")`、`LAYERS`、`LAYER_BRANCHES`。**新モジュールではなく mode キー**にした:
+     正規化経路・`TargetStepStats`・トークン表・イベント dump・3 アーム相互排他 assert・ペアリングテストが
+     そのまま再利用でき、control との差分が機構キーだけで済む。
+   * `curriculum_rho(step, stage_steps, ramp_steps) -> {"pair", "own"}`: §5.1 の線形 ramp。**純関数**で、
+     ramp が重なる設定を assert で拒否する。
+   * `nested_layers(shift_on, hat_off, sigma_on) -> {shared, pair, own, branch}`: §2.2。
+     **`own` は生の shift** で、$\sigma\cdot\hat h$ で作り直さない(そうすると全額解放が bit 一致しない)。
+     off-task 側を on-task nats に変換して比較する。
+   * `curriculum_exponent(layers, rho_pair, rho_own) -> c`: §3.3。**差分形で書く** —
+     $(\rho_{pair}-1)(pair-shared) + (\rho_{own}-1)(own-pair)$。代数的に等しい $a - own$ は
+     $\rho=(1,1)$ で厳密に 0 にならない(`shared + (pair-shared)` は `pair` と bit 一致しない)。
+   * `normalized_weight(..., clamp=None)`: clamp を引数化し、curriculum では外す(§3.2-1)。
+   * `build_target(mode=..., rho=..., curriculum_counterfactuals=...)`。`exponent_scale` は curriculum では
+     受け取らず、config に残っていれば actor が assert で落とす。
+   * `standardize_policy_shifts` が `sigma_on` を返すようになった(index の clamp と mask を呼び出し側で
+     再実装しないため)。既存 2 アームには後方互換。
+   * `TargetStepStats(mode=...)`: 列を mode ごとに切り替える。curriculum では層別質量・層×role・
+     保持質量比・stage 別 KL・層 branch を足し、チャネル分割と shuffled TV と clamp を**落とす**
+     (構造的にゼロな列は測定に見えるので、0 を出すのではなく列を作らない)。
+2. `verl/trainer/ppo/opd_ray_trainer.py`: `__init__` で mode とスケジュールを読み、
+   ramp の重なりと `total_training_steps` との整合を assert。`fit()` で `update_actor` の直前に
+   `batch.meta_info["cross_teacher_curriculum_rho"] = (ρ_pair, ρ_own)`。
+3. `verl/workers/actor/dp_actor.py`: mode と ρ を読み(`update_policy` の先頭で 1 回、micro-batch 分割で
+   `meta_info` が消える経路があるため)、`build_target` に渡し、`roles` を stats に渡す。
+   curriculum 用の 1 行ゲート出力を追加(tilt のゲート行とは別 — A/B シェアも clamp も
+   shuffled/live も、この mode では意味が無い)。
+4. `examples/opd_grpo_trainer/run_multitask_cross_teacher_curriculum_qwen3.sh` と
+   `expected_multitask_cross_teacher_curriculum_config.yaml`(機構キーは
+   `enable / mode / stage_steps / ramp_steps / base_path`、`exponent_scale` は**無い**)。
 
-**テスト(監査の教訓から必須):**
-* 入れ子: 乱数で $|a_3| \le |a_2| \le |a_1|$、非零なら符号一致。
-* 有界: $p_{on}e^{c}$ が候補ごとに $[\min(p_0,p_{on}), \max(p_0,p_{on})]$ 内(ramp 中の $\rho$ でも)。
-* 恒等: $\rho = (1,1)$ で `target_logprob` が on-task の bit と同一。
-* 複製不変: off-task 教師を複製しても $a_2, a_3$ が不変。
-* 連続: $\hat h_{on}$、$\hat h_j$ の符号反転境界と $\rho$ について $c$ が跳ばない。
-* 層の和: 3 層の和が $h_d$ に 1e-12 以内。
-* $\sum\tilde p = 1$ を 1e-12 以内。per-task で $\sigma$ が独立に効く。
+**テスト(`tests/trainer/test_cross_teacher_curriculum{,_arm}.py`、46 件)。** 設計の主張と 1 対 1:
+
+* 入れ子 $|shared| \le |pair| \le |own|$、非零なら符号一致、3 層の和が $h_d$ に 1e-12 以内。
+* **注入ゼロ**: 全 stage・ramp 中も $p_{on}e^c$ が候補ごとに $[\min(p_0,p_{on}), \max(p_0,p_{on})]$ 内。
+* **全額解放が control と bit 同一**($c$ が厳密に 0、`live` が空、`target_logprob` が on-task と `torch.equal`)。
+* clamp 無しで 12 nats の抑制が base まで戻ること(tilt の clamp 5.0 を超える)。
+* 複製不変、符号反転境界と $\rho$ についての連続性、cold start が no-op、per-task $\sigma$ が独立。
+* スケジュールが step の純関数であること(resume 正当性)、境界が事前登録値と一致、単調・有界、
+  ramp 重なりを拒否。
+* stage 別 KL が**損失自身の reverse KL 関数**で計算した値と一致すること、全額解放後も測り続けること。
+* 保持質量比が shared 層自身の比であること、curriculum の列が出て tilt の列が出ないこと。
+* 対 control・対 tilt の差分が機構キーのみ、ディレクトリ非共有、$\beta$ と support が 3 アームで一致、
+  スケジュールが run に収まること、中間 checkpoint が各 stage に入ること、
+  **composed config + `inject_distillation_config` + intent lock が通ること**(= この設定で実際に起動する)、
+  driver が ρ を送り actor が `curriculum_rho` を import していないこと(resume 正当性をコードの性質として)。
+
+**既知の無関係な失敗**: `tests/trainer/test_cross_teacher_kl_weight.py::test_the_reliability_pass_runs_on_realistic_shapes_and_files_the_right_cells`
+はこの実装の前から失敗している(`sign_cache_ids` の KeyError)。基点コミットで stash して確認した。
 
 ---
 
-## 8. 決めるべきこと(影響の大きい順)
+## 8. 決めたこと(2026-09-03、A–G は推奨で確定)
 
 | # | 論点 | 推奨 | 理由 |
 |---|---|---|---|
@@ -404,6 +454,7 @@ E1($\beta(t)$)との関係は初版のまま: 「時間で何を変えるか」�
 | D4 | cold start | $c \equiv 0$(現行踏襲) | 2 step、雑音の内側(§5.3) |
 | D5 | 対照 | 新規 control(同一コミット・ホスト・GPU) | 予測「@300 一致」は同条件の control でしか検定できない。既存 control 流用は target 設計 §0.2 の失敗を再現する |
 | D6 | 中間検証 | @50, @100 を追加、25 step 刻みで checkpoint 保存 | 差は中間にしか出ない予測(§6.3) |
+| — | **未決 (D)** | control を並列に走らせるか逐次か | GPU の空きで決まる。実装には影響しない |
 | D7 | ablation「stage 1 のまま解放しない」 | 任意(第 2 run) | 「$g$ + GRPO だけで control に届くか」= 書式以外を教師から学ぶ必要があるかの直接検定。理論 §3.3 は届かないと予測 |
 | D8 | $\beta$ | 0.01 のまま | 比較可能性。stage 1 で `teacher_kl_loss` が小さくなるのは目標が近いからで、$\beta$ を上げる理由にはならない |
 

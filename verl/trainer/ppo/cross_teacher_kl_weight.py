@@ -621,10 +621,17 @@ def standardize_policy_shifts(
         diag_valid: (n_tasks,) bool, from the same global snapshot.
 
     Returns:
-        ``{"on", "off", "row_available"}``. ``row_available`` is (bs,) and false
-        for a row whose own teacher or any of whose sources has no usable
-        diagonal yet; the caller leaves those positions at ``W = 1`` rather than
-        weighting them from a scale it does not have.
+        ``{"on", "off", "sigma_on", "row_available"}``. ``row_available`` is
+        (bs,) and false for a row whose own teacher or any of whose sources has
+        no usable diagonal yet; the caller leaves those positions at ``W = 1``
+        rather than weighting them from a scale it does not have.
+
+        ``sigma_on`` is (bs, 1, 1), the row's OWN divisor, returned so a caller
+        that has to compare an off-task teacher against the on-task shift IN
+        NATS can convert without re-deriving the index-clamp-and-mask above.
+        The curriculum arm needs exactly that: its layers are capped by
+        ``|log pi_on - log pi_0|``, a raw quantity, so the off-task volumes have
+        to come back out of standardized units to be comparable to it.
 
     The result is dimensionless: "how many of that teacher's own typical units
     did it move here". A teacher that barely moves out of its domain keeps a
@@ -650,6 +657,10 @@ def standardize_policy_shifts(
     return {
         "on": shifts["on"].to(torch.float32) / s_on.clamp(min=1e-12),
         "off": shifts["off"].to(torch.float32) / s_off.clamp(min=1e-12),
+        # The same clamped divisor the two lines above used, handed back rather
+        # than recomputed by a caller. Rows whose sigma is not usable are
+        # excluded by row_available, so the clamp value is never read.
+        "sigma_on": s_on.clamp(min=1e-12),
         "row_available": ok_on & ok_off.all(dim=-1),
     }
 

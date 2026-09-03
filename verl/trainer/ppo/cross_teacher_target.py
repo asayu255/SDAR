@@ -116,6 +116,34 @@ the estimate, not about the mechanism:
 THE EXPONENT CLAMP IS A RATE LIMIT, not an overflow guard, since the capacity
 exchange no longer bounds one candidate's tilt -- and the same measurement set
 its value. See ``_EXPONENT_CLAMP``.
+
+THE SECOND MODE (2026-09-03): CORROBORATION ONLY, RELEASED OVER TRAINING. The
+theory document that followed this arm showed intent 2 has no support in the
+hierarchical model -- the off-task teachers' mean carries OTHER tasks'
+task-specific components into this task's target, and identifiability says no
+function of the four models can separate the on-task teacher's knowledge from
+its estimation error. What survives is intent 1, and ``mode="curriculum"``
+(``docs/cross_teacher_curriculum_design.md``) is intent 1 alone, written as a
+restriction instead of an amplification:
+
+    log p_tilde = log p_0 + shared + rho_pair (pair - shared)
+                                   + rho_own  (own - pair)
+
+where ``shared``/``pair``/``own`` are the on-task shift split by how many
+teachers assert its direction (:func:`nested_layers`) and the two ``rho`` are
+released in turn over training (:func:`curriculum_rho`). Three consequences are
+structural rather than argued:
+
+* OFF-TASK INJECTION IS ZERO. Every candidate stays between ``p_0`` and
+  ``p_on``, so the failure mode the tilt path is read through cannot occur. The
+  only remaining cost is teaching a component LATE.
+* THERE IS NO SCALE AND NO CLAMP. The layers are already in the on-task
+  teacher's nats, so ``exponent_scale`` has nothing to convert, and ``p_0``
+  bounds the move where the tilt path had nothing bounding it.
+* THE LAST STAGE IS THE CONTROL, BIT-FOR-BIT. ``rho = (1, 1)`` makes ``c``
+  exactly ``0.0`` (see :func:`curriculum_exponent` on why it is written as a
+  difference), so the fixed point is the control's and the arm is a claim about
+  ORDER, testable only in the intermediate steps.
 """
 from typing import Optional
 
@@ -149,6 +177,35 @@ _NORM_FLOOR = 1e-12
 _EXPONENT_CLAMP = 5.0
 
 BRANCHES = ("agree", "conflict", "on_silent", "split")
+
+# The two things this module can do to the target, and they are different
+# mechanisms rather than two settings of one.
+#
+#   tilt        c = a + b, the corroboration channel PLUS the off-task fallback
+#               (docs/cross_teacher_target_design.md). The target can leave the
+#               interval between base and the on-task teacher, which is what
+#               lets it inject something the on-task teacher does not express --
+#               and also what carries other tasks' task-specific components into
+#               this task's target.
+#   curriculum  corroboration ONLY, and as a restriction rather than an
+#               amplification: the on-task shift is split by how many teachers
+#               assert its direction and the layers are released over training
+#               (docs/cross_teacher_curriculum_design.md). Off-task injection is
+#               zero by construction and the final stage IS the control.
+MODES = ("tilt", "curriculum")
+
+# The three layers of the on-task shift, coarsest first. Nested by construction:
+# |shared| <= |pair| <= |own|, all three carrying sign(h_on), and summing to
+# h_on identically. "own" is the whole on-task shift, so a target built from it
+# alone is the plain on-task teacher.
+LAYERS = ("shared", "pair", "own")
+
+# Per-candidate label: the COARSEST layer that is non-zero there, i.e. how many
+# teachers back the direction the on-task teacher took. Not the same partition
+# as BRANCHES -- that one is built from the geometric-mean consensus and is kept
+# alongside so the token tables and the event dumps stay one vocabulary across
+# the three arms.
+LAYER_BRANCHES = ("three", "pair", "own", "none")
 
 
 def off_task_consensus(hat_off: torch.Tensor) -> dict:
@@ -222,8 +279,151 @@ def target_exponent(*, hat_on: torch.Tensor, consensus: dict,
             "b": b * float(exponent_scale)}
 
 
+def curriculum_rho(*, step: int, stage_steps, ramp_steps: int) -> dict:
+    """``{"pair", "own"}`` in [0, 1]: how much of each layer is released at ``step``.
+
+    Args:
+        step: the driver's ``global_steps``, 1-based.
+        stage_steps: ``(s_pair, s_own)``. The last step of stage 1 and the last
+            step of stage 2 -- release BEGINS after each of them.
+        ramp_steps: how many steps each release takes. 1 is a hard switch.
+
+    Returns:
+        ``{"pair": rho_pair, "own": rho_own}``. ``(0, 0)`` is stage 1 (the
+        target is base plus what all three teachers back), ``(1, 0)`` is stage 2
+        (plus what the on-task teacher and at least one other back), ``(1, 1)``
+        is stage 3 -- which is the control, exactly.
+
+    A PURE FUNCTION OF THE STEP, and that is the point rather than a
+    convenience. The alternative -- letting the actor count its own
+    ``update_policy`` calls -- breaks on resume, silently, in the direction that
+    looks fine: a run restarted at step 150 would re-run the curriculum from
+    stage 1 against a student that is already 150 steps trained. ``global_steps``
+    is restored from the checkpoint folder, so reading the schedule off it is
+    resume-correct with no state of its own to save. This is the same shape as
+    the env-side schedule replay in ``ray_trainer._fast_forward_env_schedules``.
+
+    It is also why the schedule is evaluated in the DRIVER and the two numbers
+    ride in ``meta_info``: the actor is never told which step it is on, the
+    mini-batch/micro-batch split cannot change a broadcast scalar, and the
+    schedule itself is then testable without a model.
+    """
+    s_pair, s_own = (int(x) for x in stage_steps)
+    ramp = int(ramp_steps)
+    assert ramp >= 1, f"ramp_steps must be at least 1 (a hard switch), got {ramp}"
+    assert 0 <= s_pair, f"stage_steps[0] must be non-negative, got {s_pair}"
+    assert s_pair + ramp <= s_own, (
+        f"stage 2 would start before stage 1's release finished: stage_steps={stage_steps}, "
+        f"ramp_steps={ramp}. The two ramps must not overlap, or the run has no stage 2 "
+        "and the arm stops testing the thing it is for"
+    )
+
+    def _ramp(start: int) -> float:
+        return min(1.0, max(0.0, (float(step) - float(start)) / float(ramp)))
+
+    return {"pair": _ramp(s_pair), "own": _ramp(s_own)}
+
+
+def nested_layers(*, shift_on: torch.Tensor, hat_off: torch.Tensor,
+                  sigma_on: torch.Tensor) -> dict:
+    """Split the on-task shift by HOW MANY teachers assert its direction.
+
+    Args:
+        shift_on: (bs, resp, k) ``log pi_on - log pi_0`` in nats, NOT standardised.
+        hat_off: (bs, resp, k, n_off) the off-task shifts in their own RMS units.
+        sigma_on: (bs, 1, 1) the row's own RMS, from
+            :func:`~verl.trainer.ppo.cross_teacher_kl_weight.standardize_policy_shifts`.
+
+    Returns:
+        ``{"shared", "pair", "own", "branch"}``. The first three are (bs, resp, k)
+        in the on-task teacher's own nats and nest: ``|shared| <= |pair| <=
+        |own|``, every non-zero one carrying ``sign(shift_on)``, and
+        ``shared + (pair - shared) + (own - pair) = own`` identically.
+        ``branch`` indexes :data:`LAYER_BRANCHES`.
+
+    WHY ``own`` IS THE RAW SHIFT AND NOT ``sigma * hat_on``. The layers exist to
+    be subtracted from the on-task shift, so the fully-released stage has to
+    reproduce it EXACTLY -- and ``h / sigma * sigma`` does not. Taking ``own``
+    from the raw difference and converting the off-task volumes INTO nats
+    instead (rather than the on-task one out of them) keeps the arithmetic on
+    the side where an exact answer is needed. The comparison itself is
+    unaffected: ``min(|h_on|, sigma_d |hat_j|)`` and ``sigma_d min(|hat_on|,
+    |hat_j|)`` are the same number up to that rounding.
+
+    MINIMA OVER SUBSETS, NOT THE GEOMETRIC MEAN the tilt path uses. The
+    curriculum needs the layers to NEST -- a bigger set of teachers can only
+    assert less -- and ``min`` has that (``S`` inside ``S'`` implies ``min_S' <=
+    min_S``) where a geometric mean does not. Duplication-insensitivity, the
+    other property the geometric mean was chosen for, holds for min and max too.
+
+    MAX OVER PAIRS, i.e. a UNION. "the on-task teacher and any ONE other" is a
+    union over the off-task teachers, so the pair layer takes the largest
+    corroborated volume rather than an average of them; averaging would halve a
+    component that only one off-task teacher shares and stop it meaning "two
+    teachers agree".
+
+    WHERE THE ON-TASK TEACHER EQUALS BASE nothing happens at all: ``sign`` is 0,
+    no off-task teacher can agree with it, all three layers are 0 and the
+    position is left bit-identical. That is 24.5% of positions on this mixture,
+    and it is the correct behaviour -- there is no shift there to be backed.
+    """
+    own = shift_on
+    sign = own.sign()
+    o = own.abs()
+    zero = torch.zeros_like(own)
+
+    # Into the on-task teacher's nats, where |own| lives.
+    off_nats = (hat_off * sigma_on.unsqueeze(-1)).abs()
+    agrees = (hat_off.sign() == sign.unsqueeze(-1)) & (sign.unsqueeze(-1) != 0)
+
+    # Each off-task teacher corroborates at most what it said and at most what
+    # the on-task teacher said; a teacher of the other sign corroborates nothing.
+    capped = torch.where(agrees, torch.minimum(o.unsqueeze(-1), off_nats),
+                         torch.zeros_like(off_nats))
+    pair = sign * capped.max(dim=-1).values
+    shared = torch.where(agrees.all(dim=-1),
+                         sign * torch.minimum(o, off_nats.min(dim=-1).values), zero)
+
+    branch = torch.full_like(own, LAYER_BRANCHES.index("none"), dtype=torch.long)
+    branch = torch.where(own != 0,
+                         torch.full_like(branch, LAYER_BRANCHES.index("own")), branch)
+    branch = torch.where(pair != 0,
+                         torch.full_like(branch, LAYER_BRANCHES.index("pair")), branch)
+    branch = torch.where(shared != 0,
+                         torch.full_like(branch, LAYER_BRANCHES.index("three")), branch)
+    return {"shared": shared, "pair": pair, "own": own, "branch": branch}
+
+
+def curriculum_exponent(*, layers: dict, rho_pair: float, rho_own: float) -> torch.Tensor:
+    """``c``, the tilt that turns the on-task teacher into the released target.
+
+    ``log p_tilde = log p_on + c`` with
+
+        c = (rho_pair - 1) (pair - shared) + (rho_own - 1) (own - pair)
+
+    so ``p_on e^c = p_0 e^{a}`` where ``a`` is the released part of the shift.
+    Note the SIGN: ``c`` is opposite to the on-task shift and bounded by it in
+    magnitude, so this SUBTRACTS what no second teacher backs. Nothing is
+    amplified and the target never leaves the interval between base and the
+    on-task teacher -- which is the whole difference from the tilt path.
+
+    IT IS WRITTEN AS THE DIFFERENCE FORM ON PURPOSE. The algebraically equal
+    ``a - own``, with ``a = shared + rho_pair (pair - shared) + rho_own (own -
+    pair)``, does NOT give exactly zero at full release: ``shared + (pair -
+    shared)`` is not bit-identically ``pair``. In the form above both
+    coefficients are exactly ``0.0`` at ``rho = (1, 1)``, so ``c`` is exactly
+    ``0.0``, :func:`normalized_weight` sees a dead position, and the loss is
+    handed the on-task teacher's own bits. The final stage being the control
+    EXACTLY -- not to within a rounding error -- is what makes "@300 agrees with
+    the control" a prediction about the mechanism rather than about float noise.
+    """
+    shared, pair, own = layers["shared"], layers["pair"], layers["own"]
+    return (float(rho_pair) - 1.0) * (pair - shared) + (float(rho_own) - 1.0) * (own - pair)
+
+
 def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
-                      row_available: Optional[torch.Tensor] = None) -> dict:
+                      row_available: Optional[torch.Tensor] = None,
+                      clamp: Optional[float] = _EXPONENT_CLAMP) -> dict:
     """Per-position tilt-and-renormalise: ``p_tilde(v) = p_on(v) e^{c(v)} / Z``.
 
     Args:
@@ -231,6 +431,16 @@ def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
         p_on: (bs, resp, k) the on-task teacher's probability on the support.
         row_available: (bs,) bool, false for a row with no usable sigma yet. Those
             rows get ``w = 1`` -- the cold start is a no-op rather than a guess.
+        clamp: the per-candidate bound on ``|c|``, or ``None`` for no bound.
+            :data:`_EXPONENT_CLAMP` for the tilt path, where nothing else bounds
+            one candidate's move. ``None`` for the curriculum path, where
+            ``p_on e^c = p_0 e^{a}`` with ``a`` bounded by the on-task shift
+            itself, so every candidate already lands between base and the
+            on-task teacher -- see :func:`curriculum_exponent`. Clamping there
+            would not be a rate limit but a change of target: on a candidate the
+            teacher suppressed by more than the clamp, the restricted stage would
+            stop short of base and aim at something in between, which is not the
+            distribution the design names.
 
     Returns:
         ``{"w", "log_w", "log_z", "inv_z", "tail", "moved", "clamped", "c_eff",
@@ -263,8 +473,12 @@ def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
     asked for. Here every candidate gets its own ``e^c`` under one shared divisor,
     and the only cap left is :data:`_EXPONENT_CLAMP`.
     """
-    c64 = c.to(torch.float64).clamp(min=-_EXPONENT_CLAMP, max=_EXPONENT_CLAMP)
-    clamped = (c.to(torch.float64).abs() > _EXPONENT_CLAMP)
+    c64 = c.to(torch.float64)
+    if clamp is None:
+        clamped = torch.zeros_like(c64, dtype=torch.bool)
+    else:
+        clamped = c64.abs() > float(clamp)
+        c64 = c64.clamp(min=-float(clamp), max=float(clamp))
     p = p_on.to(torch.float64)
     e = c64.exp()
 
@@ -307,8 +521,10 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
                  base_logprob: torch.Tensor, diag: torch.Tensor,
                  diag_valid: torch.Tensor, task_ids: torch.Tensor,
                  off_plane_tasks: torch.Tensor, exponent_scale: float = 1.0,
+                 mode: str = "tilt", rho: Optional[dict] = None,
                  shuffle_counterfactual: bool = False,
                  channel_counterfactuals: bool = False,
+                 curriculum_counterfactuals: bool = False,
                  response_mask: Optional[torch.Tensor] = None) -> dict:
     """The whole chain: standardised shifts -> ``c`` -> ``w = e^c / Z`` -> ``log p_tilde``.
 
@@ -317,6 +533,27 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         off_logprob: (bs, resp, k, n_off) the off-task teachers on the same ids.
         base_logprob: (bs, resp, k) the pre-RL policy on the same ids.
         diag, diag_valid: (n_tasks,) from ``CumulativePolicyShiftRMS.diagonal``.
+        mode: one of :data:`MODES`. ``"tilt"`` is the two-channel target this
+            module was written for; ``"curriculum"`` is the corroboration-only
+            staged target of ``docs/cross_teacher_curriculum_design.md``, which
+            needs ``rho`` and ignores ``exponent_scale`` (its layers are already
+            in the on-task teacher's nats, so there is no unit to convert).
+        rho: ``{"pair", "own"}`` from :func:`curriculum_rho`, required in
+            curriculum mode. ``(1, 1)`` makes the target the on-task teacher
+            bit-for-bit.
+        curriculum_counterfactuals: in curriculum mode, also return what the two
+            restricted stages would do -- ``stage_dkl_{shared,pair}`` (the change
+            each makes to the loss, needs ``student_logprob``... which this
+            function does not take, so it returns the ingredients instead:
+            ``stage_log_w_{shared,pair}`` and ``stage_log_z_{shared,pair}``) --
+            and ``shared_shuffled``, the shared layer rebuilt from
+            position-decorrelated off-task teachers. That last one replaces gate
+            G1 for this mode: ``shuffled_tv_ratio`` INVERTS here (less
+            corroboration means more subtraction, so a shuffled run moves MORE),
+            while the retained-mass ratio ``sum p |shared_shuffled| / sum p
+            |shared|`` keeps G1's meaning -- near 1 says the shared layer is
+            noise, and the design's null simulation puts it at 0.1-0.2 if the
+            shared component is real.
         shuffle_counterfactual: build the target a second time from the
             off-task planes rolled within each row's real response
             (``decorrelated_off_shifts`` -- the audit's counterfactual, reused
@@ -354,23 +591,54 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         task_ids=task_ids, off_plane_tasks=off_plane_tasks,
     )
     p_on = on_logprob.detach().exp()
+    assert mode in MODES, f"unknown mode {mode!r}; expected one of {MODES}"
+
+    # The corroboration BRANCH is computed in both modes and from the same
+    # geometric-mean consensus, because the token tables, the event dumps and the
+    # scan script are shared across the three arms and a reader must not have to
+    # ask which vocabulary a dump is in. In curriculum mode it is a diagnostic
+    # only -- nothing below reads `tilt["c"]`.
     cons = off_task_consensus(hat["off"])
     tilt = target_exponent(hat_on=hat["on"], consensus=cons, exponent_scale=exponent_scale)
-    built = normalized_weight(c=tilt["c"], p_on=p_on, row_available=hat["row_available"])
+
+    if mode == "curriculum":
+        assert rho is not None, (
+            "curriculum mode needs rho from curriculum_rho(step=...); the driver "
+            "evaluates the schedule and ships it in meta_info, because the actor is "
+            "never told which step it is on"
+        )
+        layers = nested_layers(shift_on=shifts["on"], hat_off=hat["off"],
+                               sigma_on=hat["sigma_on"])
+        c = curriculum_exponent(layers=layers, rho_pair=rho["pair"], rho_own=rho["own"])
+        # No clamp: the target is bounded by base on one side and the on-task
+        # teacher on the other, by construction. See normalized_weight's `clamp`.
+        built = normalized_weight(c=c, p_on=p_on, row_available=hat["row_available"],
+                                  clamp=None)
+    else:
+        layers = None
+        c = tilt["c"]
+        built = normalized_weight(c=c, p_on=p_on, row_available=hat["row_available"])
 
     out = {
         # log_w, not log(w): the subtraction is done in float64 and cast once, and
         # it is exactly 0.0 wherever the mechanism did not act, so an inert
         # position hands the loss the on-task teacher's own bits.
         "target_logprob": on_logprob + built["log_w"].to(on_logprob.dtype),
-        "w": built["w"], "log_w": built["log_w"], "c": tilt["c"],
+        "w": built["w"], "log_w": built["log_w"], "c": c,
         "c_eff": built["c_eff"], "a": tilt["a"], "b": tilt["b"],
         "branch": tilt["branch"], "moved": built["moved"], "live": built["live"],
         "log_z": built["log_z"], "inv_z": built["inv_z"], "tail": built["tail"],
         "clamped": built["clamped"], "p_on": p_on,
         "consensus_volume": cons["L"], "consensus_sign": cons["s"],
         "row_available": hat["row_available"],
+        "mode": mode,
     }
+    if layers is not None:
+        out.update({
+            "layer_shared": layers["shared"], "layer_pair": layers["pair"],
+            "layer_own": layers["own"], "layer_branch": layers["branch"],
+            "rho_pair": float(rho["pair"]), "rho_own": float(rho["own"]),
+        })
 
     if shuffle_counterfactual:
         assert response_mask is not None, "the shuffle rolls within the real response"
@@ -387,6 +655,31 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         for name in ("a", "b"):
             out[f"{name}_only_moved"] = normalized_weight(
                 c=tilt[name], p_on=p_on, row_available=hat["row_available"])["moved"]
+    if curriculum_counterfactuals:
+        assert layers is not None, "curriculum counterfactuals need curriculum mode"
+        assert response_mask is not None, "the shuffle rolls within the real response"
+        from verl.trainer.ppo.cross_teacher_kl_weight import decorrelated_off_shifts
+
+        # The two restricted stages, whatever stage the run is actually in. Both
+        # are needed for the whole run: "has the shared layer been learnt yet"
+        # is the question the maturity trigger of design section 5.2 would read,
+        # and it can only be answered after the fact if it was logged before.
+        for name, (rp, ro) in (("shared", (0.0, 0.0)), ("pair", (1.0, 0.0))):
+            st = normalized_weight(
+                c=curriculum_exponent(layers=layers, rho_pair=rp, rho_own=ro),
+                p_on=p_on, row_available=hat["row_available"], clamp=None,
+            )
+            out[f"stage_log_w_{name}"] = st["log_w"]
+            out[f"stage_log_z_{name}"] = st["log_z"]
+            out[f"stage_moved_{name}"] = st["moved"]
+        # G1's replacement. Only the SHARED layer is rebuilt: it is the one whose
+        # whole claim is that the three teachers agree for a reason, and it is
+        # the layer stage 1 distils alone.
+        out["shared_shuffled"] = nested_layers(
+            shift_on=shifts["on"],
+            hat_off=decorrelated_off_shifts(hat["off"], response_mask),
+            sigma_on=hat["sigma_on"],
+        )["shared"]
     return out
 
 
@@ -449,6 +742,43 @@ class TargetStepStats:
     rank statistic.
     """
 
+    # Columns only the tilt path can fill. In curriculum mode there is no channel
+    # partition (one channel), and the shuffled counterfactual measures the
+    # OPPOSITE of what it does there, so these are dropped rather than logged as
+    # zeros: a column that is structurally zero reads as a measurement.
+    _TILT_ONLY = (
+        "shuffled_moved", "a_only_moved", "b_only_moved", "a_absmass", "b_absmass",
+    )
+
+    # ...and the columns only the curriculum path can fill.
+    _CURRICULUM_ONLY = (
+        # sum |layer| * p_on, the three layers of the on-task shift. Their shares
+        # say where the shift's magnitude sits: how much of what the on-task
+        # teacher wrote is backed by three teachers, by two, by itself alone.
+        "layer_shared_absmass", "layer_pair_absmass", "layer_own_absmass",
+        # the same for the shared layer rebuilt on position-decorrelated
+        # teachers. G1's replacement is the RATIO of this to the live one.
+        "layer_shared_absmass_shuffled",
+        # what the two restricted stages do to the loss, every step, whatever
+        # stage the run is in. Reported beside the plain on-task KL over the same
+        # positions, so stage_kl is exact rather than a difference of two means
+        # taken over different denominators.
+        "d_on_all",
+        "stage_dkl_shared", "stage_abs_dkl_shared", "stage_moved_shared",
+        "stage_dkl_pair", "stage_abs_dkl_pair", "stage_moved_pair",
+        # the layer branch: how many teachers back this candidate's direction.
+        # Candidate count AND teacher mass, the audit's read-them-as-a-pair rule.
+        "lb0_cand", "lb1_cand", "lb2_cand", "lb3_cand",
+        "lb0_mass", "lb1_mass", "lb2_mass", "lb3_mass",
+        # layer x role. The design predicts the shared layer is format+tag (the
+        # audit measured the shared component as format), and the PAIR layer's
+        # content share is the number nothing has measured yet -- it is what
+        # stage 2 would be teaching.
+        "layer_shared_structural", "layer_shared_content",
+        "layer_pair_structural", "layer_pair_content",
+        "layer_own_structural", "layer_own_content",
+    )
+
     _SUMS = (
         "n_pos",              # response-masked positions
         "moved",              # sum of per-position TV(p_tilde, p_on), tail included
@@ -509,7 +839,15 @@ class TargetStepStats:
         "branch0_mass", "branch1_mass", "branch2_mass", "branch3_mass",
     )
 
-    def __init__(self, *, n_tasks: int, device):
+    def __init__(self, *, n_tasks: int, device, mode: str = "tilt"):
+        assert mode in MODES, f"unknown mode {mode!r}; expected one of {MODES}"
+        self.mode = mode
+        # Instance-level, so the rendered table has a column exactly when the
+        # mode can fill it. _col() and metrics() both go through self._SUMS.
+        if mode == "curriculum":
+            self._SUMS = tuple(
+                k for k in self._SUMS if k not in self._TILT_ONLY
+            ) + self._CURRICULUM_ONLY
         self.n_tasks = int(n_tasks)
         self.n_scopes = 1 + self.n_tasks
         self.sums = torch.zeros((self.n_scopes, len(self._SUMS)),
@@ -527,6 +865,7 @@ class TargetStepStats:
                d_base: Optional[torch.Tensor] = None,
                student_logprob: Optional[torch.Tensor] = None,
                on_logprob: Optional[torch.Tensor] = None,
+               roles: Optional[torch.Tensor] = None,
                tag_token_ids=TAG_TOKEN_IDS) -> None:
         m_pos = response_mask.to(torch.float64)                       # (bs, resp)
         m_cand = m_pos.unsqueeze(-1)                                  # (bs, resp, 1)
@@ -559,15 +898,72 @@ class TargetStepStats:
             "abs_c_clamped": (built["c_eff"].to(torch.float64).abs()
                               * built["clamped"].to(torch.float64) * m_cand),
             "teacher_support_mass": (1.0 - built["tail"].to(torch.float64)) * m_pos,
-            "a_absmass": built["a"].to(torch.float64).abs() * p * m_cand,
-            "b_absmass": built["b"].to(torch.float64).abs() * p * m_cand,
             "intervention": inter,
             "tag_intervention": inter * tag.to(torch.float64),
             "mass_error": pos_err,
         }
-        for key in ("shuffled_moved", "a_only_moved", "b_only_moved"):
-            if key in built:
-                cols[key] = built[key].to(torch.float64) * m_pos
+        if self.mode == "tilt":
+            cols["a_absmass"] = built["a"].to(torch.float64).abs() * p * m_cand
+            cols["b_absmass"] = built["b"].to(torch.float64).abs() * p * m_cand
+            for key in ("shuffled_moved", "a_only_moved", "b_only_moved"):
+                if key in built:
+                    cols[key] = built[key].to(torch.float64) * m_pos
+        else:
+            # The three layers, by teacher mass. p_on and not the student's mass:
+            # the evidence is read on the measure of the distribution being
+            # rewritten, which is the theory document's section 3.5 correction to
+            # the predecessor -- the student's mass is the reverse KL's COST
+            # weight, not the weight of the evidence.
+            for name in LAYERS:
+                cols[f"layer_{name}_absmass"] = (
+                    built[f"layer_{name}"].to(torch.float64).abs() * p * m_cand
+                )
+            if "shared_shuffled" in built:
+                cols["layer_shared_absmass_shuffled"] = (
+                    built["shared_shuffled"].to(torch.float64).abs() * p * m_cand
+                )
+            if roles is not None:
+                from verl.trainer.ppo.cross_teacher_kl_weight import ROLE_GROUPS, role_keep_mask
+
+                for group in ("structural", "content"):
+                    keep = role_keep_mask(roles=roles, group=group).to(torch.float64)
+                    for name in LAYERS:
+                        cols[f"layer_{name}_{group}"] = (
+                            built[f"layer_{name}"].to(torch.float64).abs()
+                            * p * m_cand * keep.unsqueeze(-1)
+                        )
+                assert set(ROLE_GROUPS) == {"structural", "content"}, (
+                    "the layer x role table names its two groups explicitly; a third "
+                    "group in ROLE_GROUPS would be silently dropped from it"
+                )
+            lb = built["layer_branch"]
+            for i in range(4):
+                sel = (lb == i).to(torch.float64) * m_cand
+                cols[f"lb{i}_cand"] = sel
+                cols[f"lb{i}_mass"] = p * sel
+            if d_on is not None:
+                # NOT live-restricted, unlike "d_on" above. stage_kl is
+                # d_on_all + stage_dkl per position, so both terms have to be
+                # summed over the same denominator -- and at full release there
+                # are no live positions at all, which is exactly when the
+                # restricted stages' cost is still worth logging.
+                cols["d_on_all"] = d_on.detach().to(torch.float64) * m_pos
+            if student_logprob is not None:
+                p_s = student_logprob.detach().to(torch.float64).exp()
+                tail_s = (1.0 - p_s.sum(dim=-1)).clamp(min=0.0)
+                for name in ("shared", "pair"):
+                    key = f"stage_log_w_{name}"
+                    if key not in built:
+                        continue
+                    dkl = (
+                        -(p_s * built[key].to(torch.float64)).sum(dim=-1)
+                        + tail_s * built[f"stage_log_z_{name}"].to(torch.float64)
+                    )
+                    cols[f"stage_dkl_{name}"] = dkl * m_pos
+                    cols[f"stage_abs_dkl_{name}"] = dkl.abs() * m_pos
+                    cols[f"stage_moved_{name}"] = (
+                        built[f"stage_moved_{name}"].to(torch.float64) * m_pos
+                    )
         if d_on is not None:
             cols["d_on"] = d_on.detach().to(torch.float64) * live
             cols["d_base"] = d_base.detach().to(torch.float64) * live
@@ -684,18 +1080,66 @@ class TargetStepStats:
             out[f"{head}/support_mass/teacher"] = g("teacher_support_mass") / n_pos
             out[f"{head}/acted_cand_frac"] = g("acted_cand") / n_cand
             out[f"{head}/acted_mass_frac"] = g("acted_mass") / mass
-            ab = g("a_absmass") + g("b_absmass")
-            if ab > 0:
-                out[f"{head}/channel/a_share"] = g("a_absmass") / ab
-                out[f"{head}/channel/b_share"] = g("b_absmass") / ab
+            if self.mode == "tilt":
+                ab = g("a_absmass") + g("b_absmass")
+                if ab > 0:
+                    out[f"{head}/channel/a_share"] = g("a_absmass") / ab
+                    out[f"{head}/channel/b_share"] = g("b_absmass") / ab
+            else:
+                # WHERE THE ON-TASK SHIFT'S MAGNITUDE SITS, by how many teachers
+                # back it. The three shares are of the SUM of the layers, not of
+                # the whole shift, so they read as "of the corroborated volume".
+                tot = sum(g(f"layer_{n}_absmass") for n in LAYERS)
+                if tot > 0:
+                    for name in LAYERS:
+                        out[f"{head}/layer/{name}/mass_share"] = g(f"layer_{name}_absmass") / tot
+                for name in LAYERS:
+                    own = g(f"layer_{name}_absmass")
+                    if own <= 0:
+                        continue
+                    # Of THIS layer's magnitude, how much is on structure and how
+                    # much on content. The two do not sum to 1: a role code this
+                    # build does not know lands in neither group.
+                    for group in ("structural", "content"):
+                        col = f"layer_{name}_{group}"
+                        if col in self._SUMS:
+                            out[f"{head}/layer/{name}/role/{group}_share"] = g(col) / own
+                shared = g("layer_shared_absmass")
+                if shared > 0 and "layer_shared_absmass_shuffled" in self._SUMS:
+                    # G1, in the form that keeps its meaning here. Near 1 says the
+                    # shared layer survives destroying the position
+                    # correspondence, i.e. it is noise; the design's null
+                    # simulation puts a real shared component at 0.1-0.2.
+                    out[f"{head}/retained_shuffled_ratio"] = (
+                        g("layer_shared_absmass_shuffled") / shared
+                    )
+                # What each stage costs the loss, in nats per position, on ONE
+                # denominator. "own" is the control's own teacher KL.
+                if "d_on_all" in self._SUMS and g("d_on_all") != 0:
+                    out[f"{head}/stage_kl/own"] = g("d_on_all") / n_pos
+                    for name in ("shared", "pair"):
+                        if f"stage_dkl_{name}" in self._SUMS:
+                            out[f"{head}/stage_kl/{name}"] = (
+                                g("d_on_all") + g(f"stage_dkl_{name}")
+                            ) / n_pos
+                for name in ("shared", "pair"):
+                    if f"stage_moved_{name}" in self._SUMS:
+                        out[f"{head}/stage_tv/{name}"] = g(f"stage_moved_{name}") / n_pos
+                        out[f"{head}/stage_abs_dkl/{name}"] = (
+                            g(f"stage_abs_dkl_{name}") / n_pos
+                        )
+                for i, name in enumerate(LAYER_BRANCHES):
+                    out[f"{head}/layer_branch/{name}/cand_frac"] = g(f"lb{i}_cand") / n_cand
+                    out[f"{head}/layer_branch/{name}/mass_frac"] = g(f"lb{i}_mass") / mass
             inter = g("intervention")
             if inter > 0:
                 out[f"{head}/tag_share"] = g("tag_intervention") / inter    # G3
-            if g("moved") > 0 and g("shuffled_moved") >= 0 and scope == 0:
-                out[f"{head}/shuffled_tv_ratio"] = g("shuffled_moved") / g("moved")  # G1
-            for key, col in (("a_only_tv", "a_only_moved"), ("b_only_tv", "b_only_moved")):
-                if g(col) > 0:
-                    out[f"{head}/channel/{key}"] = g(col) / n_pos
+            if self.mode == "tilt":
+                if g("moved") > 0 and g("shuffled_moved") >= 0 and scope == 0:
+                    out[f"{head}/shuffled_tv_ratio"] = g("shuffled_moved") / g("moved")  # G1
+                for key, col in (("a_only_tv", "a_only_moved"), ("b_only_tv", "b_only_moved")):
+                    if g(col) > 0:
+                        out[f"{head}/channel/{key}"] = g(col) / n_pos
             if g("d_base") > 0:
                 out[f"{head}/acted_novelty"] = 1.0 - g("d_on") / g("d_base")  # G2
             # A rate, not an alarm: the clamp is the mechanism's only cap. READ
@@ -704,11 +1148,12 @@ class TargetStepStats:
             # mass ratio that says whether the continuous signal has collapsed
             # back to a flat +-clamp -- which is what the section 2 construction
             # exists to avoid, and what retired the (2.148, 3.0) setting.
-            out[f"{head}/clamped_per_step"] = g("clamped")
-            if g("acted_cand") > 0:
-                out[f"{head}/clamped_frac_of_acted"] = g("clamped") / g("acted_cand")
-            if g("abs_c_acted") > 0:
-                out[f"{head}/clamped_mass_frac"] = g("abs_c_clamped") / g("abs_c_acted")
+            if self.mode == "tilt":
+                out[f"{head}/clamped_per_step"] = g("clamped")
+                if g("acted_cand") > 0:
+                    out[f"{head}/clamped_frac_of_acted"] = g("clamped") / g("acted_cand")
+                if g("abs_c_acted") > 0:
+                    out[f"{head}/clamped_mass_frac"] = g("abs_c_clamped") / g("abs_c_acted")
             for i, name in enumerate(BRANCHES):
                 out[f"{head}/branch/{name}/cand_frac"] = g(f"branch{i}_cand") / n_cand
                 out[f"{head}/branch/{name}/mass_frac"] = g(f"branch{i}_mass") / mass

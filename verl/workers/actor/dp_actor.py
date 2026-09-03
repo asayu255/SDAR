@@ -59,6 +59,7 @@ from verl.trainer.ppo.sign_weights import (
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.cross_teacher_target import (
+    MODES as XTT_MODES,
     TAG_TOKEN_IDS as XTT_TAG_TOKEN_IDS,
     TargetStepStats,
     build_target as xtt_build_target,
@@ -1947,6 +1948,39 @@ class DataParallelPPOActor(BasePPOActor):
         # identity reading, kept so a config that omits the key is inert-by-unit
         # rather than silently scaled.
         xtt_scale = float((xtt_cfg or {}).get("exponent_scale", 1.0))
+        # WHICH MECHANISM. Not two settings of one knob -- see MODES in
+        # cross_teacher_target.py. "tilt" is corroboration plus the off-task
+        # fallback; "curriculum" is corroboration alone, released over training,
+        # and its final stage is the control exactly.
+        xtt_mode = str((xtt_cfg or {}).get("mode", "tilt"))
+        assert xtt_mode in XTT_MODES, (
+            f"actor.cross_teacher_target.mode={xtt_mode!r} is not one of {XTT_MODES}"
+        )
+        xtt_rho = None
+        if xtt_cfg_on and xtt_mode == "curriculum":
+            # REFUSED rather than ignored. The curriculum's layers are already in
+            # the on-task teacher's nats, so there is nothing for a unit
+            # conversion to convert; a config that still carries the key was
+            # copied from the tilt arm's script and its author expects it to do
+            # something.
+            assert "exponent_scale" not in (xtt_cfg or {}), (
+                "cross_teacher_target.mode=curriculum has no exponent_scale: its layers "
+                "are in the on-task teacher's own nats already. Remove the key rather "
+                "than setting it to 1.0, so the run's config says which mechanism it is"
+            )
+            # The schedule is evaluated in the DRIVER and rides here as two
+            # numbers. The actor is never told which step it is on, and the
+            # alternative -- counting update_policy calls -- is wrong on resume in
+            # the direction that looks fine: a run restarted at step 150 would
+            # re-run the curriculum from stage 1 against a 150-step student.
+            _rho = data.meta_info.get("cross_teacher_curriculum_rho", None)
+            assert _rho is not None, (
+                "cross_teacher_target.mode=curriculum needs meta_info["
+                "'cross_teacher_curriculum_rho'], which the driver sets from "
+                "curriculum_rho(step=global_steps, ...). Without it the actor would "
+                "have to guess which stage the run is in"
+            )
+            xtt_rho = {"pair": float(_rho[0]), "own": float(_rho[1])}
         # THE ARM-INDEPENDENT CUT. Everything above this line needs the base
         # policy and the off-task teachers, which only cross_teacher_enabled
         # makes the driver load: a control run has no sign_cache_ids column at
@@ -2461,7 +2495,7 @@ class DataParallelPPOActor(BasePPOActor):
         xtt_stats = xtt_token_stats = xtt_event_stats = None
         xtt_tag_ids = tuple(XTT_TAG_TOKEN_IDS)
         if xtt_on:
-            xtt_stats = TargetStepStats(n_tasks=n_task, device=sign_dev)
+            xtt_stats = TargetStepStats(n_tasks=n_task, device=sign_dev, mode=xtt_mode)
             xtt_tag_ids = tuple(
                 int(t) for t in (xtt_cfg.get("tag_token_ids", None) or XTT_TAG_TOKEN_IDS)
             )
@@ -3038,11 +3072,23 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                     off_plane_tasks=data["sign_off_tasks"],
                                     exponent_scale=xtt_scale,
+                                    mode=xtt_mode,
+                                    rho=xtt_rho,
                                     # The counterfactuals ride the collecting
-                                    # epoch only: three more elementwise
+                                    # epoch only: a few more elementwise
                                     # exchanges, and nothing the loss reads.
-                                    shuffle_counterfactual=xtt_collect,
-                                    channel_counterfactuals=xtt_collect,
+                                    # Each mode gets its own set -- the tilt
+                                    # path's channel split does not exist here
+                                    # (one channel), and its shuffled TV inverts
+                                    # its meaning (less corroboration means more
+                                    # subtraction), so what replaces it is the
+                                    # shared layer's retained mass.
+                                    shuffle_counterfactual=(
+                                        xtt_collect and xtt_mode == "tilt"),
+                                    channel_counterfactuals=(
+                                        xtt_collect and xtt_mode == "tilt"),
+                                    curriculum_counterfactuals=(
+                                        xtt_collect and xtt_mode == "curriculum"),
                                     response_mask=response_mask,
                                 )
                             if xtt_built is not None and xtt_collect:
@@ -3073,6 +3119,18 @@ class DataParallelPPOActor(BasePPOActor):
                                     # underflows float32, and log(exp(x)) would
                                     # lose exactly those.
                                     on_logprob=sign_on_task_logprobs,
+                                    # layer x role, curriculum mode only. The
+                                    # design predicts the shared layer is format
+                                    # and tag -- the audit measured the shared
+                                    # component as format -- and the pair
+                                    # layer's content share is the number that
+                                    # says whether stage 2 teaches anything but
+                                    # structure. Nothing has measured it before.
+                                    roles=(
+                                        token_roles(data["responses"], sign_role_tags)
+                                        if (xtt_mode == "curriculum" and sign_role_tags)
+                                        else None
+                                    ),
                                     tag_token_ids=xtt_tag_ids,
                                 )
                                 if xtt_token_stats is not None or xtt_event_stats is not None:
@@ -4514,6 +4572,12 @@ class DataParallelPPOActor(BasePPOActor):
                 xtt_stats.all_reduce()
                 _xtt_m = xtt_stats.metrics(task_names=task_id_names)
                 metrics.update(_xtt_m)
+                if xtt_rho is not None:
+                    # What the schedule asked for this step, logged next to what
+                    # the mechanism then did. Two numbers, so a chart of the
+                    # release lines up with the intervention it produced.
+                    metrics["target/rho/pair"] = xtt_rho["pair"]
+                    metrics["target/rho/own"] = xtt_rho["own"]
                 # The gate readings, one line in the run log, every step. They
                 # are ADVISORY -- the run does not stop itself on them (decided
                 # 2026-09-02); a human reads them against the pre-registered
@@ -4522,6 +4586,42 @@ class DataParallelPPOActor(BasePPOActor):
                 # rank after the all_reduce above.
                 if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
                     _g = lambda k: _xtt_m.get(k, float("nan"))
+                if ((not torch.distributed.is_initialized())
+                        or torch.distributed.get_rank() == 0) and xtt_mode == "curriculum":
+                    # The curriculum's own line. Deliberately NOT the tilt gates:
+                    # A/B share does not exist (one channel), clamped is
+                    # structurally zero (no clamp), and shuffled/live inverts its
+                    # meaning here -- retained is what carries G1's question.
+                    print(
+                        "[cross_teacher_curriculum] rho="
+                        f"({xtt_rho['pair']:.2f},{xtt_rho['own']:.2f}) | "
+                        f"tv={_g('target/tv'):.4f} live={_g('target/live_frac'):.3f} | "
+                        f"|dKL|={_g('target/abs_dkl_mean'):.4f} nats/pos | "
+                        "layer mass g/pair/own="
+                        f"{_g('target/layer/shared/mass_share'):.3f}/"
+                        f"{_g('target/layer/pair/mass_share'):.3f}/"
+                        f"{_g('target/layer/own/mass_share'):.3f} | "
+                        "g role struct/content="
+                        f"{_g('target/layer/shared/role/structural_share'):.3f}/"
+                        f"{_g('target/layer/shared/role/content_share'):.3f} | "
+                        "pair role struct/content="
+                        f"{_g('target/layer/pair/role/structural_share'):.3f}/"
+                        f"{_g('target/layer/pair/role/content_share'):.3f} | "
+                        f"retained_shuffled={_g('target/retained_shuffled_ratio'):.3f} "
+                        "(concern >0.6: the shared layer would be noise) | "
+                        "stage_kl g/pair/own="
+                        f"{_g('target/stage_kl/shared'):.4f}/"
+                        f"{_g('target/stage_kl/pair'):.4f}/"
+                        f"{_g('target/stage_kl/own'):.4f} | "
+                        f"dH={_g('target/entropy_delta'):+.4f} | "
+                        f"tag_share={_g('target/tag_share'):.3f} (EXPECTED high in "
+                        "stage 1: the shared component is format) | "
+                        f"log_z={_g('target/log_z_mean'):+.4f} | "
+                        f"max|log w|={_g('target/max_abs_log_w'):.3f} | "
+                        f"mass_err={_g('target/mass_error_max'):.2e}",
+                        flush=True,
+                    )
+                elif (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
                     # The pre-registered tv (0.019) and branch split (0.871/0.129)
                     # are NOT printed any more. Both were computed on the
                     # mass-conserving exchange over a teacher-indexed support and
