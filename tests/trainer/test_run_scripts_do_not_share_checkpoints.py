@@ -28,19 +28,26 @@ import pytest
 _DIR = pathlib.Path(__file__).resolve().parents[2] / "examples/opd_trainer"
 _SCRIPTS = sorted(_DIR.glob("run_*.sh"))
 
-# Known collision, pre-existing and deliberately not changed here.
+# Directories the operator has decided to share, listed exhaustively so the check
+# stays live for every script that is NOT on this list.
 #
-# run_multitask_offpolicy_qwen3.sh (Stage 1 + Stage 2) and
-# run_multitask_offpolicy_qwen3_nogen.sh (Stage 2 only) train under different
-# experiment names into one directory. It is the same hazard as the one this file
-# exists for, but the fix -- pointing one of them elsewhere -- would orphan
-# whatever checkpoints are already under that path on the machine that runs them,
-# and that is the operator's call rather than a test's. Listed so it stays visible
-# instead of being absorbed into a passing assertion.
+# All three off-policy scripts train into one directory under three experiment
+# names. Two of them (the Stage 1 + Stage 2 script and the Stage 2 -only one)
+# predate this check. The student-indexed arm was given its own tree when this
+# hazard was found, and then put back here on the operator's instruction --
+# whether the control's checkpoints under that path still matter is theirs to
+# know, not this file's.
+#
+# What the exemption does NOT do is make the consequences go away, and the run
+# script says so at the assignment: under resume_mode=auto the arm that starts
+# second resumes from whatever is already there, and its own saves overwrite the
+# other's at the same step number. This list is a record of an accepted cost, not
+# a statement that the cost is zero.
 _KNOWN_SHARED = {
     "/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask": {
         "run_multitask_offpolicy_qwen3.sh",
         "run_multitask_offpolicy_qwen3_nogen.sh",
+        "run_multitask_offpolicy_studenttopk_qwen3.sh",
     }
 }
 
@@ -106,23 +113,30 @@ def test_one_checkpoint_directory_never_holds_two_experiments():
     )
 
 
-def test_the_student_indexed_arm_has_its_own_tree():
-    """Named directly, because it is the one this file was written for and the
-    generic check above would let it back in if it were added to the exemption."""
-    arms = {
-        script: local_dir
-        for script, local_dir, _ in _training_invocations()
-        if "studenttopk" in script
-    }
-    assert arms, "the student-indexed run script is missing"
-    control = {
-        local_dir for script, local_dir, _ in _training_invocations() if "studenttopk" not in script
-    }
-    for script, local_dir in arms.items():
-        assert local_dir not in control, (
-            f"{script} shares {local_dir} with a control arm; it would resume from "
-            "the control's weights on its first start"
-        )
+def test_a_script_that_shares_a_tree_says_so_where_the_value_is_set():
+    """An exemption in this file is invisible to whoever runs the script.
+
+    Sharing a checkpoint directory is allowed -- the operator may know the other
+    arm's checkpoints are gone, or may intend to move them -- but it changes what
+    happens on start, and the person typing the command is the one who has to
+    steer around it. So a script on the shared list has to carry the two
+    consequences in its own header: that resume_mode=auto will pick up whatever is
+    already there, and that its saves overwrite the other arm's.
+    """
+    for local_dir, scripts in _KNOWN_SHARED.items():
+        for name in scripts:
+            path = _DIR / name
+            if not path.exists():
+                continue
+            header = path.read_text()
+            assert "resume_mode" in header, (
+                f"{name} shares {local_dir} but never mentions resume_mode; whoever "
+                "runs it cannot know it may resume from another arm's weights"
+            )
+            assert "overwrite" in header.lower(), (
+                f"{name} shares {local_dir} but does not say its saves overwrite the "
+                "other arm's checkpoints at the same step"
+            )
 
 
 @pytest.mark.parametrize(

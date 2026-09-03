@@ -1,4 +1,16 @@
 set -x
+#
+# SHARED CHECKPOINT DIRECTORY. trainer.default_local_dir below is also used by the
+# other off-policy arms (run_multitask_offpolicy_qwen3.sh,
+# run_multitask_offpolicy_qwen3_nogen.sh, run_multitask_offpolicy_studenttopk_qwen3.sh).
+# Checkpoints land in default_local_dir/global_step_N and trainer.experiment_name
+# is NOT in that path, so two things follow, both silent:
+#   - trainer.resume_mode defaults to auto and reads
+#     default_local_dir/latest_checkpointed_iteration.txt, so this run resumes
+#     from whichever arm checkpointed there last. trainer.resume_mode=disable
+#     starts from the base model instead.
+#   - this run's saves overwrite the other arms' checkpoints at the same step.
+# Check the directory before starting a different arm than the one that filled it.
 
 # Off-policy multitask distillation (offline KD), Qwen3-1.7B.
 # Stage 1: each task's frozen single-task RL teacher generates a fixed

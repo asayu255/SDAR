@@ -10,13 +10,23 @@ set -x
 #   algorithm.opd.teacher_paths.*     the three teachers, loaded at Stage 2
 #   trainer.expected_config           this arm's own intent lock
 #   trainer.experiment_name           its own run identity
-#   trainer.default_local_dir         its own checkpoint tree -- NOT cosmetic.
-#     Checkpoints land in default_local_dir/global_step_N; experiment_name is not
-#     in that path. Sharing the directory with the control arm would have this run
-#     overwrite the control's checkpoints step for step, and -- because
-#     trainer.resume_mode defaults to auto and reads
-#     default_local_dir/latest_checkpointed_iteration.txt -- would have it RESUME
-#     FROM THE CONTROL ARM'S WEIGHTS on its first start, silently.
+#
+# THE CHECKPOINT DIRECTORY IS SHARED WITH THE CONTROL ARM, ON PURPOSE, AND THAT
+# HAS TWO CONSEQUENCES YOU HAVE TO STEER AROUND. Checkpoints land in
+# default_local_dir/global_step_N; trainer.experiment_name names the wandb run and
+# is NOT in that path. So while this arm and
+# run_multitask_offpolicy_qwen3_nogen.sh point at the same directory:
+#
+#   1. trainer.resume_mode defaults to auto and reads
+#      default_local_dir/latest_checkpointed_iteration.txt. If the control arm has
+#      ever checkpointed here, THIS RUN RESUMES FROM THE CONTROL ARM'S WEIGHTS and
+#      reports it as a fresh run under its own experiment name. Pass
+#      trainer.resume_mode=disable to start from the base model instead.
+#   2. Whatever this run saves overwrites the control's checkpoint at the same
+#      step number. Move or copy the control's tree first if you still need it.
+#
+# Both are silent. Check the directory before starting:
+#   ls /opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask
 #
 # WHY THE TEACHERS COME BACK. The loss is a coarse-grained reverse KL: exact on
 # a support, everything outside it in one tail bucket. What that drops is
@@ -281,7 +291,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_opd_offpolicy_multitask' \
     trainer.experiment_name=sdar_multitask_offline_studenttopk_qwen3_1.7b \
-    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask_studenttopk \
+    trainer.default_local_dir=/opt/home/ohara/checkpoints/verl_agent_opd_offpolicy_multitask \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
