@@ -158,6 +158,20 @@ export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
 
+# PRE-FLIGHT: can the worker path even be imported?
+#
+# A missing module in the rollout or worker chain does not surface until
+# init_workers(), which on this arm is after Ray starts, after the config dump
+# and after the 90-file Stage-1 pool load -- an hour in, reported as one line at
+# the bottom of a Ray traceback. It happened: vllm_rollout_spmd.py was ported
+# from another branch carrying an import of verl.utils.phase_timing, which was
+# not ported with it, and three workers died at init_model().
+#
+# Importing the same modules here costs seconds and fails before anything is
+# loaded. It proves only that the program loads, not that it runs -- but that is
+# the failure that is expensive to find late.
+python3 -c "import verl.workers.rollout.vllm_rollout, verl.workers.fsdp_workers; print('Validated the worker import path')"
+
 # Data prep — same prompts/tasks as the on-policy OPD run. These literals are
 # cross-checked by the expectations files (per_task_batch_size=15,
 # val_per_task_size=126, total_training_steps=300, seed=1).
