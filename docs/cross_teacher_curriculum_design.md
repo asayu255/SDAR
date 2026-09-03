@@ -303,13 +303,26 @@ $\sigma$ が有効になるまでの 1–2 step は現行と同じく $c \equiv 
 |---|---|
 | $\rho \equiv 1$ で `target/tv` = 0、`target/live_frac` = 0 | control と bit-identical(テスト + step 91 以降の run ログ) |
 | `target/rho/{2,1}` | 指定スケジュールと一致 |
-| `target/layer/{g,pair,own}/mass_share` = $\sum p_{on}\lvert\text{層}\rvert / \sum p_{on}\lvert h_d\rvert$ | 3 層の和が 1(恒等)。$g$ 層のシェアが監査の shuffled 比・書式シェアと整合するか |
+| `target/layer/{shared,pair,own}/backed_frac` = $\sum p_{on}\lvert a_k\rvert / \sum p_{on}\lvert h_d\rvert$ | 入れ子 $0 \le$ shared $\le$ pair $\le$ own $= 1$。**§2.3 の帰無表(0.105 / 0.48)の実データ版。** 保留率は $1 - [\text{shared} + \rho_{pair}(\text{pair}-\text{shared}) + \rho_{own}(1-\text{pair})]$ で厳密に導出できる(層が同符号で入れ子だから)ので、別指標にしない |
 | `target/layer/{g,pair,own}/role/{format,tag,env_action,tool_call,reasoning}` | **予測**: $g$ 層の 80% 以上が format+tag。pair 層の内容 role シェアはこれが初測定(監査の base 統制後相関 −0.003〜+0.043 から、小さいと予測) |
 | **保持質量比**(G1 の置換)`target/retained_shuffled_ratio` = $\sum p_{on}\lvert a_3^{sh}\rvert / \sum p_{on}\lvert a_3\rvert$ | shuffled off-task(`decorrelated_off_shifts`)で $a_3$ を作り直す。**1 に近いなら $a_3$ は雑音**、§2.3 の目盛りで 0.1–0.2 なら $g$ は実在。現行の `shuffled_tv_ratio` は本 mode では ≥ 1 になり(裏付けが減るほど差し引きが増える)意味が反転するので使わない |
 | `target/tag_share`(G3) | stage 1 で**高い**ことを確認(警告ではない)。stage 3 で消える |
 | `target/stage_kl/{1,2,3}` = $D_k$ タスク別 | §5.2 の事後読み。stage 1 の $D_1$ が早期に飽和するか |
 | `target/log_z_mean`, `mass_error_max`, `max_abs_log_w` | 現行同様。`max_abs_log_w` は $\max\lvert h_d\rvert$ 級まで許容(clamp 無し) |
 | `actor/teacher_kl_loss` | stage 1 で control より**小さい**(目標が base 寄りで生徒が base 近傍)。stage 3 で control と同水準に**上がる** |
+| **`target/control/grad_cosine`**、`target/control/grad_norm_ratio` | live 目標の OPD 勾配と、同じ位置・同じ生徒での control(素の on-task)の OPD 勾配の余弦と norm 比(logit 空間、解析的、`opd/grpo/*` と同じ構成)。**「制限であって方向転換ではない」の直接測定。** 全額解放で恒等的に 1 / 1。stage 1 で余弦が**負**に振れる位置は、報酬が未裏付け成分の方向に生徒を動かした所を stage 1 が base へ引き戻している所 = §3.2-4 の「参照 KL」の読みの実測。role 別(`target/role/<role>/control/*`)で**内容 role に負が集中する**と予測 |
+| `target/grpo/grad_cosine` と `target/control/grpo_grad_cosine` | live 目標の OPD 勾配 vs 報酬勾配、control の OPD 勾配 vs 報酬勾配。同一の位置・行重みで対にしたもの(klw アームの `kl_weight/grpo` 対 `opd/grpo` と同じ対)。カリキュラムが蒸留項と報酬の整合を変えるか |
+| `target/kl_to_base` | KL(生徒‖base) を全位置で。`stage_kl/own`(KL(生徒‖教師))と並べると、生徒が base と教師の間のどこに居るかが読める。stage 1 では control より base 寄りに留まる(参照 KL 効果)と予測 |
+| `target/tail/{cand_frac,student_mass_frac,three_frac,withheld_share}` | 裾領域($p_\theta > 0.5$ かつ $p_{on} < 10^{-3}$、理論 §3.5 の unlearning 裾)。`three_frac` = 裾候補のうち 3 教師全員が抑制したもの(stage 1 でも蒸留される割合)、`withheld_share` = 生徒質量で重み付けた保留量のうち裾に載る割合。**§3.2-5 の裾ゲート主張の直接測定**: `three_frac` が小さければ stage 1 は裾をほぼ base に戻している |
+| `target/<dst>/pair_source/<src>/share` | pair 層 ($\lvert pair\rvert - \lvert shared\rvert$) の質量を、それを決めた off-task 教師のタスク名で分けたもの。**pair 層が常に同じ 1 本(例: search)で決まっているなら、stage 2 は 2 教師一致ではなくその教師の写し**。target 設計 D4 の問いの実測 |
+| トークン表 `target/…/token/*`(`sign_tokens_step*.jsonl`) | **層で分類する**(`three / pair / own`、`state` 列)。「stage 1 は何のトークンを保留しているか」は層の分割でしか読めない。corroboration state での分類は tilt アームのまま; イベント dump の `state` は corroboration のまま(行は 4 モデルの確率を持つので層は事後に導出できる) |
+| `target/withheld_smass_mean` | $\sum p_\theta \lvert c\rvert$ / 位置数。生徒の質量で重み付けた保留量 = reverse KL の勾配が感じる保留の大きさ。$p_{on}$ 重みの層質量(教師が何を書いたか)と対で読む |
+
+**測らないと決めたもの(理由つき)。** (i) **パラメータ空間でのタスク間勾配整合**(§4.3 の順序仮説の文字通りの機構)。
+タスク別の backward が要り(3 倍、または task 別 hook)、`ppo_micro_batch_size_per_gpu=5` のメモリ上限で step 時間と常駐量を変える。
+§6.2 の事前登録した検定は結果水準(窓プロファイル・書式切替 step・サブタスク内訳)で、この量を要求しない。
+logit 空間の `target/control/grad_cosine` が手の届く代理である。(ii) 保留率(上記の通り厳密に導出できる)。
+(iii) イベント dump への層・ρ 列の追加(行の 4 確率と wandb の σ から層は導出でき、ρ は step の関数)。
 
 ### 6.2 結果の事前予測と反証条件
 
@@ -409,9 +422,14 @@ E1($\beta(t)$)との関係は初版のまま: 「時間で何を変えるか」�
      受け取らず、config に残っていれば actor が assert で落とす。
    * `standardize_policy_shifts` が `sigma_on` を返すようになった(index の clamp と mask を呼び出し側で
      再実装しないため)。既存 2 アームには後方互換。
-   * `TargetStepStats(mode=...)`: 列を mode ごとに切り替える。curriculum では層別質量・層×role・
-     保持質量比・stage 別 KL・層 branch を足し、チャネル分割と shuffled TV と clamp を**落とす**
-     (構造的にゼロな列は測定に見えるので、0 を出すのではなく列を作らない)。
+   * `TargetStepStats(mode=...)`: 列を mode ごとに切り替える。curriculum では層別 `backed_frac`・層×role・
+     保持質量比・stage 別 KL・層 branch・`kl_to_base`・裾領域・pair 層の供給元・生徒質量重みの保留量を足し、
+     チャネル分割と shuffled TV と clamp を**落とす**(構造的にゼロな列は測定に見えるので、0 を出すのではなく列を作らない)。
+   * `curriculum_gradient_terms` / `curriculum_gradient_metrics`: live 目標・control 目標・報酬の 3 方向の
+     logit 空間勾配の全ペア積(6 項)。`opd_logit_push` と `logit_gradient_terms` を再利用し、報酬勾配の式は 1 箇所のまま。
+     pooled・task 別・role 別(curated 3 種)。
+   * `TokenStateCounts(state_names=..., acted_states=...)`(`sign_weights.py`): 状態語彙をインスタンス単位に。
+     既定は従来の 7 状態で後方互換。curriculum のトークン表は層で分類し、`scripts/sign_token_scan.py` は層名の表も出す。
 2. `verl/trainer/ppo/opd_ray_trainer.py`: `__init__` で mode とスケジュールを読み、
    ramp の重なりと `total_training_steps` との整合を assert。`fit()` で `update_actor` の直前に
    `batch.meta_info["cross_teacher_curriculum_rho"] = (ρ_pair, ρ_own)`。

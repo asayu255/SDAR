@@ -335,11 +335,18 @@ def nested_layers(*, shift_on: torch.Tensor, hat_off: torch.Tensor,
             :func:`~verl.trainer.ppo.cross_teacher_kl_weight.standardize_policy_shifts`.
 
     Returns:
-        ``{"shared", "pair", "own", "branch"}``. The first three are (bs, resp, k)
-        in the on-task teacher's own nats and nest: ``|shared| <= |pair| <=
-        |own|``, every non-zero one carrying ``sign(shift_on)``, and
-        ``shared + (pair - shared) + (own - pair) = own`` identically.
-        ``branch`` indexes :data:`LAYER_BRANCHES`.
+        ``{"shared", "pair", "own", "branch", "pair_source"}``. The first three
+        are (bs, resp, k) in the on-task teacher's own nats and nest:
+        ``|shared| <= |pair| <= |own|``, every non-zero one carrying
+        ``sign(shift_on)``, and ``shared + (pair - shared) + (own - pair) = own``
+        identically. ``branch`` indexes :data:`LAYER_BRANCHES`. ``pair_source``
+        is the index (into the off-task axis) of the teacher that SET the pair
+        layer -- the loudest agreeing one -- or -1 where the layer is zero. It
+        exists because the pair layer is a union over the off-task teachers,
+        and a union one teacher always wins is a different finding from one
+        both contribute to: the search teacher was trained at a 10x smaller KL
+        coefficient, and the target design's D4 asked whether it carries any
+        signal at all.
 
     WHY ``own`` IS THE RAW SHIFT AND NOT ``sigma * hat_on``. The layers exist to
     be subtracted from the on-task shift, so the fully-released stage has to
@@ -380,7 +387,9 @@ def nested_layers(*, shift_on: torch.Tensor, hat_off: torch.Tensor,
     # the on-task teacher said; a teacher of the other sign corroborates nothing.
     capped = torch.where(agrees, torch.minimum(o.unsqueeze(-1), off_nats),
                          torch.zeros_like(off_nats))
-    pair = sign * capped.max(dim=-1).values
+    pair_mag, pair_src = capped.max(dim=-1)
+    pair = sign * pair_mag
+    pair_source = torch.where(pair_mag > 0, pair_src, torch.full_like(pair_src, -1))
     shared = torch.where(agrees.all(dim=-1),
                          sign * torch.minimum(o, off_nats.min(dim=-1).values), zero)
 
@@ -391,7 +400,8 @@ def nested_layers(*, shift_on: torch.Tensor, hat_off: torch.Tensor,
                          torch.full_like(branch, LAYER_BRANCHES.index("pair")), branch)
     branch = torch.where(shared != 0,
                          torch.full_like(branch, LAYER_BRANCHES.index("three")), branch)
-    return {"shared": shared, "pair": pair, "own": own, "branch": branch}
+    return {"shared": shared, "pair": pair, "own": own, "branch": branch,
+            "pair_source": pair_source}
 
 
 def curriculum_exponent(*, layers: dict, rho_pair: float, rho_own: float) -> torch.Tensor:
@@ -419,6 +429,133 @@ def curriculum_exponent(*, layers: dict, rho_pair: float, rho_own: float) -> tor
     """
     shared, pair, own = layers["shared"], layers["pair"], layers["own"]
     return (float(rho_pair) - 1.0) * (pair - shared) + (float(rho_own) - 1.0) * (own - pair)
+
+
+# The tail region of the theory document's section 3.5: the student is confident
+# and the on-task teacher gives next to nothing. The reverse KL's gradient is
+# largest and DOWNWARD there, the predecessor weighting arm amplified it, and the
+# audit read its entropy rise off exactly these candidates. The curriculum's
+# claim (design 3.2-5) is that stage 1 returns this region to base unless all
+# three teachers suppressed it -- so the region has to be measured on its own.
+TAIL_STUDENT_MIN = 0.5
+TAIL_TEACHER_MAX = 1e-3
+
+# The per-position scalars of the curriculum's gradient geometry, analytic in
+# logit space over the support plus the tail bucket (the same construction as
+# cross_teacher_kl_weight.GRAD_TERMS: no second backward, and the metric cannot
+# perturb the step the optimizer takes). Three directions at each position --
+# the LIVE target's OPD descent, the CONTROL's (plain on-task) OPD descent on the
+# same positions, and the policy gradient -- and every pairwise product.
+CURRICULUM_GRAD_TERMS = (
+    "g_live_sq", "g_ctl_sq", "g_grpo_sq",
+    "g_live_grpo", "g_ctl_grpo", "g_live_ctl",
+)
+
+# The role cut is curated like OPD_ROLE_CUT_SUFFIXES and for the same reason.
+# These three are the ones the pooled row cannot answer: does stage 1 pull
+# AGAINST the control's own direction on content positions specifically, which
+# is where the withheld layers live.
+CURRICULUM_GRAD_ROLE_CUT_SUFFIXES = (
+    "/control/grad_cosine", "/control/grad_norm_ratio", "/grpo/grad_cosine",
+)
+
+
+def curriculum_gradient_terms(*, student_logprob: torch.Tensor,
+                              target_logprob: torch.Tensor, on_logprob: torch.Tensor,
+                              live_kl: torch.Tensor, on_kl: torch.Tensor,
+                              pg_grad_coef: torch.Tensor, sampled_onehot: torch.Tensor,
+                              coef: float, pg_coef: float = 1.0,
+                              row_weight: Optional[torch.Tensor] = None,
+                              eps: float = 1e-8) -> dict:
+    """``{term: (bs, resp)}`` for :data:`CURRICULUM_GRAD_TERMS`.
+
+    Args:
+        target_logprob, live_kl: the released target the loss is taken against
+            and the per-position KL to it -- what the optimizer sees this step.
+        on_logprob, on_kl: the on-task teacher and the KL to it -- what the
+            CONTROL would see at these same positions, on this same student.
+        The rest are what ``opd_attribution_terms`` takes, and mean the same.
+
+    WHAT THE TWO NEW COSINES SAY. ``g_live . g_ctl`` is the direct measurement
+    of "restriction, not redirection": with the curriculum SUBTRACTING layers,
+    the live direction should be a shortened control direction -- unless the
+    student has already moved past the restricted target. Where the reward has
+    pushed a candidate toward the teacher on a component no second teacher
+    backs, stage 1's target sits at base and its gradient pulls the student
+    BACK, against the control's pull. That is the "reference KL to base" reading
+    of design 3.2-4, and a negative cosine here is it, measured. ``g_live .
+    g_pg`` beside ``g_ctl . g_pg`` is then the curriculum's effect on how the
+    distillation term agrees with the reward, with the policy held fixed -- the
+    same pairing kl_weight/grpo against opd/grpo makes for the weighting arm.
+
+    ``g_ctl . g_pg`` duplicates what ``opd/grpo/grad_cosine`` publishes, on
+    purpose: that one is rendered from its own accumulator with its own row
+    weighting, and a ratio of two numbers from two tables is one only when both
+    ran over the same positions with the same weights. Here all six terms share
+    one mask and one ``row_weight``.
+    """
+    from verl.trainer.ppo.cross_teacher_kl_weight import logit_gradient_terms, opd_logit_push
+
+    live = opd_logit_push(student_logprob=student_logprob, teacher_logprob=target_logprob,
+                          teacher_kl=live_kl, coef=coef, eps=eps)
+    ctl = opd_logit_push(student_logprob=student_logprob, teacher_logprob=on_logprob,
+                         teacher_kl=on_kl, coef=coef, eps=eps)
+    ones = torch.ones_like(live_kl, dtype=torch.float32)
+    # The policy gradient's formula lives in logit_gradient_terms and nowhere
+    # else; it is called twice so the two OPD directions meet ONE g_pg.
+    lv = logit_gradient_terms(
+        student_logprob=student_logprob, teacher_logprob=target_logprob, weight=ones,
+        teacher_kl=live_kl, pg_grad_coef=pg_grad_coef, sampled_onehot=sampled_onehot,
+        coef=coef, pg_coef=pg_coef, row_weight=row_weight, push=live, eps=eps,
+    )
+    ct = logit_gradient_terms(
+        student_logprob=student_logprob, teacher_logprob=on_logprob, weight=ones,
+        teacher_kl=on_kl, pg_grad_coef=pg_grad_coef, sampled_onehot=sampled_onehot,
+        coef=coef, pg_coef=pg_coef, row_weight=row_weight, push=ctl, eps=eps,
+    )
+    cross = (live["g0"] * ctl["g0"]).sum(dim=-1) + live["g0_tail"] * ctl["g0_tail"]
+    if row_weight is not None:
+        rw = row_weight.detach().to(torch.float32).reshape(-1, 1)
+        cross = cross * rw * rw
+    return {
+        "g_live_sq": lv["g_opd_sq"], "g_ctl_sq": ct["g_opd_sq"],
+        "g_grpo_sq": lv["g_grpo_sq"],
+        "g_live_grpo": lv["g_dot"], "g_ctl_grpo": ct["g_dot"],
+        "g_live_ctl": cross,
+    }
+
+
+def curriculum_gradient_metrics(sums: dict, prefix: str = "target") -> dict:
+    """Norms, ratios and cosines from the six accumulated terms.
+
+    ``control/grad_norm_ratio`` is the share of the control's OPD pull the
+    curriculum keeps this step -- 1.0 at full release, by construction, since
+    the live target IS the on-task teacher there. ``control/grad_cosine`` is the
+    direction of what it keeps. Both are reported pooled, per task and (curated)
+    per role.
+    """
+    import math
+
+    out = {}
+    for scope, tot in sums.items():
+        head = prefix if scope is None else f"{prefix}/{scope}"
+        if tot.get("n", 0) <= 0:
+            continue
+        live = math.sqrt(max(tot["g_live_sq"], 0.0))
+        ctl = math.sqrt(max(tot["g_ctl_sq"], 0.0))
+        pg = math.sqrt(max(tot["g_grpo_sq"], 0.0))
+        out[f"{head}/grpo/grad_norm_live"] = live
+        if pg > 1e-12:
+            out[f"{head}/grpo/grad_norm_ratio"] = live / pg
+            if live > 1e-12:
+                out[f"{head}/grpo/grad_cosine"] = tot["g_live_grpo"] / (live * pg)
+            if ctl > 1e-12:
+                out[f"{head}/control/grpo_grad_cosine"] = tot["g_ctl_grpo"] / (ctl * pg)
+        if ctl > 1e-12:
+            out[f"{head}/control/grad_norm_ratio"] = live / ctl
+            if live > 1e-12:
+                out[f"{head}/control/grad_cosine"] = tot["g_live_ctl"] / (live * ctl)
+    return out
 
 
 def normalized_weight(*, c: torch.Tensor, p_on: torch.Tensor,
@@ -637,6 +774,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         out.update({
             "layer_shared": layers["shared"], "layer_pair": layers["pair"],
             "layer_own": layers["own"], "layer_branch": layers["branch"],
+            "layer_pair_source": layers["pair_source"],
             "rho_pair": float(rho["pair"]), "rho_own": float(rho["own"]),
         })
 
@@ -777,6 +915,21 @@ class TargetStepStats:
         "layer_shared_structural", "layer_shared_content",
         "layer_pair_structural", "layer_pair_content",
         "layer_own_structural", "layer_own_content",
+        # KL(student || base) over ALL masked positions. Stage 1's target is
+        # base plus the shared layer, so "stage 1 behaves as a reference KL to
+        # base" (design 3.2-4) is read off this beside stage_kl/own: where the
+        # student sits between the two models the curriculum interpolates.
+        "d_base_all",
+        # The live tilt weighted by the STUDENT's mass, sum p_s |c|: the
+        # withheld amount as the reverse KL's gradient feels it. The p_on-
+        # weighted layer masses above say what the teacher wrote; this says how
+        # much of it the student is currently being held back from.
+        "withheld_smass",
+        # The unlearning tail (TAIL_STUDENT_MIN / TAIL_TEACHER_MAX): candidate
+        # count, student mass there, how many of them all three teachers
+        # suppressed (so stage 1 still distils them), and the withheld amount
+        # that sits there. Design 3.2-5's claim, measured.
+        "tail_cand", "tail_smass", "tail_three_cand", "tail_withheld_smass",
     )
 
     _SUMS = (
@@ -847,7 +1000,12 @@ class TargetStepStats:
         if mode == "curriculum":
             self._SUMS = tuple(
                 k for k in self._SUMS if k not in self._TILT_ONLY
-            ) + self._CURRICULUM_ONLY
+            ) + self._CURRICULUM_ONLY + tuple(
+                # The pair layer's mass by the off-task teacher that set it, one
+                # column per task, so a run can say WHICH second teacher stage 2
+                # is learning from at each destination.
+                f"pairsrc{t}_absmass" for t in range(int(n_tasks))
+            )
         self.n_tasks = int(n_tasks)
         self.n_scopes = 1 + self.n_tasks
         self.sums = torch.zeros((self.n_scopes, len(self._SUMS)),
@@ -866,6 +1024,7 @@ class TargetStepStats:
                student_logprob: Optional[torch.Tensor] = None,
                on_logprob: Optional[torch.Tensor] = None,
                roles: Optional[torch.Tensor] = None,
+               off_plane_tasks: Optional[torch.Tensor] = None,
                tag_token_ids=TAG_TOKEN_IDS) -> None:
         m_pos = response_mask.to(torch.float64)                       # (bs, resp)
         m_cand = m_pos.unsqueeze(-1)                                  # (bs, resp, 1)
@@ -941,6 +1100,34 @@ class TargetStepStats:
                 sel = (lb == i).to(torch.float64) * m_cand
                 cols[f"lb{i}_cand"] = sel
                 cols[f"lb{i}_mass"] = p * sel
+            if off_plane_tasks is not None:
+                # (|pair| - |shared|) is the pair LAYER's magnitude (nested,
+                # same sign), attributed to the teacher whose voice set it.
+                layer_mass = (
+                    built["layer_pair"].to(torch.float64).abs()
+                    - built["layer_shared"].to(torch.float64).abs()
+                ) * p * m_cand
+                ps = built["layer_pair_source"]
+                valid = ps >= 0
+                bs_, resp_, k_ = ps.shape
+                planes = off_plane_tasks.to(ps.device, torch.long)
+                src = torch.gather(
+                    planes.view(bs_, 1, 1, -1).expand(bs_, resp_, k_, planes.size(-1)),
+                    -1, ps.clamp(min=0).unsqueeze(-1),
+                ).squeeze(-1)
+                for t in range(self.n_tasks):
+                    cols[f"pairsrc{t}_absmass"] = layer_mass * ((src == t) & valid).to(torch.float64)
+            if d_base is not None:
+                cols["d_base_all"] = d_base.detach().to(torch.float64) * m_pos
+            if student_logprob is not None:
+                p_s_ = student_logprob.detach().to(torch.float64).exp()
+                withheld = p_s_ * c.abs() * m_cand
+                cols["withheld_smass"] = withheld
+                tail = ((p_s_ > TAIL_STUDENT_MIN) & (p < TAIL_TEACHER_MAX)).to(torch.float64) * m_cand
+                cols["tail_cand"] = tail
+                cols["tail_smass"] = p_s_ * tail
+                cols["tail_three_cand"] = tail * (lb == LAYER_BRANCHES.index("three")).to(torch.float64)
+                cols["tail_withheld_smass"] = withheld * tail
             if d_on is not None:
                 # NOT live-restricted, unlike "d_on" above. stage_kl is
                 # d_on_all + stage_dkl per position, so both terms have to be
@@ -1086,13 +1273,42 @@ class TargetStepStats:
                     out[f"{head}/channel/a_share"] = g("a_absmass") / ab
                     out[f"{head}/channel/b_share"] = g("b_absmass") / ab
             else:
-                # WHERE THE ON-TASK SHIFT'S MAGNITUDE SITS, by how many teachers
-                # back it. The three shares are of the SUM of the layers, not of
-                # the whole shift, so they read as "of the corroborated volume".
-                tot = sum(g(f"layer_{n}_absmass") for n in LAYERS)
-                if tot > 0:
+                # HOW MUCH OF THE ON-TASK SHIFT IS BACKED by at least three, at
+                # least two, at least one teacher: each layer's p_on-weighted
+                # magnitude over the whole shift's. Nested by construction --
+                # shared <= pair <= own = 1 -- and the empirical counterpart of
+                # the design's null-simulation table (10.5% / 48% / 100% when
+                # nothing is shared). The withheld fraction at any rho is then
+                # 1 - [shared + rho_pair (pair - shared) + rho_own (1 - pair)],
+                # exactly, because the layers nest with one sign.
+                own_abs = g("layer_own_absmass")
+                if own_abs > 0:
                     for name in LAYERS:
-                        out[f"{head}/layer/{name}/mass_share"] = g(f"layer_{name}_absmass") / tot
+                        out[f"{head}/layer/{name}/backed_frac"] = g(f"layer_{name}_absmass") / own_abs
+                    # ...and which second teacher the pair layer came from.
+                    srcs = {t: g(f"pairsrc{t}_absmass") for t in range(self.n_tasks)
+                            if f"pairsrc{t}_absmass" in self._SUMS}
+                    tot_src = sum(srcs.values())
+                    if tot_src > 0:
+                        for t, v in srcs.items():
+                            src_name = names[1 + t] if 1 + t < len(names) else f"task{t}"
+                            out[f"{head}/pair_source/{src_name}/share"] = v / tot_src
+                if "d_base_all" in self._SUMS and g("d_base_all") != 0:
+                    out[f"{head}/kl_to_base"] = g("d_base_all") / n_pos
+                # The unlearning tail. three_frac is the share of tail candidates
+                # stage 1 still distils (all three teachers suppressed them);
+                # withheld_share is how much of the student-felt restriction sits
+                # in the tail at all.
+                if "tail_cand" in self._SUMS:
+                    tail_n = g("tail_cand")
+                    out[f"{head}/tail/cand_frac"] = tail_n / n_cand
+                    if g("student_support_mass") > 0:
+                        out[f"{head}/tail/student_mass_frac"] = g("tail_smass") / g("student_support_mass")
+                    if tail_n > 0:
+                        out[f"{head}/tail/three_frac"] = g("tail_three_cand") / tail_n
+                    if g("withheld_smass") > 0:
+                        out[f"{head}/tail/withheld_share"] = g("tail_withheld_smass") / g("withheld_smass")
+                        out[f"{head}/withheld_smass_mean"] = g("withheld_smass") / n_pos
                 for name in LAYERS:
                     own = g(f"layer_{name}_absmass")
                     if own <= 0:

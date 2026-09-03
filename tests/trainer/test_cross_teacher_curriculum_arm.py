@@ -160,11 +160,15 @@ def test_the_curriculum_gate_line_is_printed_and_nothing_aborts_on_it():
     block = src[src.index("[cross_teacher_curriculum] rho="):]
     block = block[: block.index("flush=True")]
     for key in ("target/tv", "target/live_frac", "target/abs_dkl_mean",
-                "target/layer/shared/mass_share", "target/layer/pair/mass_share",
+                "target/layer/shared/backed_frac", "target/layer/pair/backed_frac",
                 "target/layer/shared/role/structural_share",
                 "target/layer/pair/role/content_share",
                 "target/retained_shuffled_ratio",
                 "target/stage_kl/shared", "target/stage_kl/own",
+                # the analysis metrics added after the first implementation
+                "target/control/grad_cosine", "target/control/grad_norm_ratio",
+                "target/grpo/grad_cosine", "target/control/grpo_grad_cosine",
+                "target/kl_to_base", "target/tail/three_frac", "target/tail/withheld_share",
                 "target/entropy_delta", "target/tag_share",
                 "target/max_abs_log_w", "target/mass_error_max"):
         assert key in block, key

@@ -857,10 +857,24 @@ class TokenStateCounts:
     # into every dumped row, so a table can never be read as the other quantity.
     EFFECT_KIND = EFFECT_KIND
 
-    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64, mode: str = "target"):
+    def __init__(self, *, vocab_size: int, n_tasks: int, device, top_n: int = 64, mode: str = "target",
+                 state_names=None, acted_states=None):
+        """``state_names`` / ``acted_states`` default to the sign arm's seven
+        states. A caller whose partition of the candidates is a different one --
+        the curriculum arm files by how many teachers back a candidate, not by the
+        corroboration state -- passes its own ``{index: name}`` and the subset that
+        counts as acted, and every metric key, every dumped row and the scan
+        script's tables then carry THOSE names. The vocabulary is per instance so
+        two tables with different partitions can coexist in one run without either
+        being read as the other."""
         assert mode in self.EFFECT_KIND, f"mode must be one of {sorted(self.EFFECT_KIND)}, got {mode!r}"
+        self.state_names = dict(STATE_NAMES if state_names is None else state_names)
+        self.acted_states = tuple(ACTED_STATES if acted_states is None else acted_states)
+        assert set(self.acted_states) <= set(self.state_names), (
+            f"acted_states {self.acted_states} not all in state_names {sorted(self.state_names)}"
+        )
         self.vocab_size = int(vocab_size)
-        self.n_states = len(STATE_NAMES)
+        self.n_states = len(self.state_names)
         self.n_scopes = 1 + int(n_tasks)
         self.top_n = int(top_n)
         self.mode = mode
@@ -1028,12 +1042,12 @@ class TokenStateCounts:
         for scope in range(self.n_scopes):
             scope_name = self._scope_name(scope, task_names)
             head = prefix if scope_name is None else f"{prefix}/{scope_name}"
-            for sid in ACTED_STATES:
+            for sid in self.acted_states:
                 counts = n[scope, sid]
                 total = int(counts.sum())
                 if total <= 0:
                     continue
-                sname = STATE_NAMES[sid]
+                sname = self.state_names[sid]
                 out[f"{head}/token/n_distinct/{sname}"] = float((counts > 0).sum())
                 out[f"{head}/token/top{N}_share/{sname}"] = float(torch.topk(counts, N).values.sum()) / total
                 # The gross effect of this state, by sign. A state whose two
@@ -1106,7 +1120,7 @@ class TokenStateCounts:
                         "effect_gross": float(eff_gross_any[tok]),
                     }
                 return {
-                    "scope": scope_name, "ranked_by": ranked_by, "state": STATE_NAMES[sid],
+                    "scope": scope_name, "ranked_by": ranked_by, "state": self.state_names[sid],
                     "rank": rank, "token_id": int(tok),
                     "count": int(n[scope, sid, tok]), "mass": float(mass[scope, sid, tok]),
                     "effect_kind": kind,
@@ -1114,7 +1128,7 @@ class TokenStateCounts:
                     "effect_gross": float(eff_pos[scope, sid, tok] - eff_neg[scope, sid, tok]),
                 }
 
-            for sid in ACTED_STATES:
+            for sid in self.acted_states:
                 if int(n[scope, sid].sum()) <= 0:
                     continue
                 for ranked_by, series in (("count", n[scope, sid].to(torch.float64)),

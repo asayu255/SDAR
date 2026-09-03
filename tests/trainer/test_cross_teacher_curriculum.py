@@ -380,8 +380,8 @@ def test_step_stats_render_the_curriculum_quantities_and_not_the_tilt_ones():
         roles=torch.randint(0, 3, (bs, resp)),
     )
     m = stats.metrics(task_names=["alfworld", "search", "webshop"])
-    for key in ("target/tv", "target/layer/shared/mass_share",
-                "target/layer/pair/mass_share", "target/layer/own/mass_share",
+    for key in ("target/tv", "target/layer/shared/backed_frac",
+                "target/layer/pair/backed_frac", "target/layer/own/backed_frac",
                 "target/layer/shared/role/structural_share",
                 "target/layer/pair/role/content_share",
                 "target/retained_shuffled_ratio",
@@ -389,6 +389,8 @@ def test_step_stats_render_the_curriculum_quantities_and_not_the_tilt_ones():
                 "target/stage_tv/shared", "target/stage_abs_dkl/pair",
                 "target/layer_branch/three/cand_frac",
                 "target/layer_branch/own/mass_frac",
+                "target/kl_to_base", "target/withheld_smass_mean",
+                "target/tail/cand_frac", "target/tail/student_mass_frac",
                 "target/branch/agree/mass_frac", "target/alfworld/tv"):
         assert key in m, key
     # The tilt path's columns must be ABSENT, not zero: a structurally-zero
@@ -398,8 +400,9 @@ def test_step_stats_render_the_curriculum_quantities_and_not_the_tilt_ones():
                 "target/channel/a_only_tv"):
         assert key not in m, key
     assert m["target/mass_error_max"] < 1e-12
-    shares = sum(m[f"target/layer/{n}/mass_share"] for n in LAYERS)
-    assert shares == pytest.approx(1.0, abs=1e-9)
+    # backed_frac nests like the layers do, and own is the whole shift.
+    assert 0.0 <= m["target/layer/shared/backed_frac"] <= m["target/layer/pair/backed_frac"] <= 1.0
+    assert m["target/layer/own/backed_frac"] == pytest.approx(1.0, abs=1e-12)
     fracs = sum(m[f"target/layer_branch/{b}/cand_frac"] for b in LAYER_BRANCHES)
     assert fracs == pytest.approx(1.0, abs=1e-9)
 
@@ -486,3 +489,199 @@ def test_the_retained_shuffled_ratio_is_the_shared_layers_own_ratio():
     want = ((got["shared_shuffled"].to(torch.float64).abs() * p).sum()
             / (got["layer_shared"].to(torch.float64).abs() * p).sum()).item()
     assert m["target/retained_shuffled_ratio"] == pytest.approx(want, rel=1e-9)
+
+
+# ------------------------------------------------- the metrics added for analysis
+def _stats_for(got, kw, *, student=None, d_on=None, d_base=None, off_plane_tasks=None,
+               task_names=("alfworld", "search", "webshop")):
+    from verl.trainer.ppo.cross_teacher_target import TargetStepStats
+
+    bs, resp, k = kw["on_logprob"].shape
+    stats = TargetStepStats(n_tasks=len(task_names), device="cpu", mode="curriculum")
+    stats.update(built=got, p_on=got["p_on"],
+                 support_ids=torch.zeros(bs, resp, k, dtype=torch.long),
+                 response_mask=torch.ones(bs, resp), task_ids=kw["task_ids"],
+                 d_on=d_on, d_base=d_base, student_logprob=student,
+                 on_logprob=kw["on_logprob"], off_plane_tasks=off_plane_tasks)
+    return stats.metrics(task_names=list(task_names))
+
+
+def test_kl_to_base_is_the_mean_over_all_positions_not_the_live_ones():
+    """Unlike acted_novelty's d_base, which is live-restricted: at full release
+    nothing is live, and that is exactly when "where does the student sit between
+    base and the teacher" is still worth reading."""
+    got, kw = _cur(1.0, 1.0)
+    bs, resp = kw["on_logprob"].shape[:2]
+    d_base = torch.rand(bs, resp) + 0.2
+    m = _stats_for(got, kw, d_base=d_base, d_on=d_base * 0.5)
+    assert not bool(got["live"].any())
+    assert m["target/kl_to_base"] == pytest.approx(d_base.mean().item(), rel=1e-6)
+
+
+def test_the_pair_source_names_the_teacher_that_set_the_pair_layer():
+    """Only the second off-task plane (task 2) agrees with the on-task teacher, so
+    the whole pair layer is attributed to it -- by task NAME, per destination."""
+    k, bs = 4, 1
+    base = torch.log_softmax(torch.zeros(bs, 1, k), dim=-1)
+    on = base.clone(); on[..., 0] += 2.0
+    on = on - on.exp().sum(-1, keepdim=True).log()
+    off_agree = base.clone(); off_agree[..., 0] += 1.5
+    off_agree = off_agree - off_agree.exp().sum(-1, keepdim=True).log()
+    off_oppose = base.clone(); off_oppose[..., 0] -= 1.5
+    off_oppose = off_oppose - off_oppose.exp().sum(-1, keepdim=True).log()
+    off = torch.stack([off_oppose, off_agree], dim=-1)          # plane 0: task 1, plane 1: task 2
+    kw = dict(on_logprob=on, off_logprob=off, base_logprob=base,
+              diag=torch.ones(3), diag_valid=torch.ones(3, dtype=torch.bool),
+              task_ids=torch.zeros(bs, dtype=torch.long),
+              off_plane_tasks=torch.tensor([[1, 2]]))
+    got = build_target(mode="curriculum", rho={"pair": 0.0, "own": 0.0}, **kw)
+    assert got["layer_pair_source"][..., 0].item() == 1                 # the second plane
+    m = _stats_for(got, kw, off_plane_tasks=kw["off_plane_tasks"])
+    assert m["target/alfworld/pair_source/webshop/share"] == pytest.approx(1.0)
+    assert "target/alfworld/pair_source/search/share" in m
+    assert m["target/alfworld/pair_source/search/share"] == pytest.approx(0.0)
+    # The pair layer at candidate 0 is the agreeing teacher's SHIFT (not its
+    # logit: log-softmax renormalises), capped by the on-task shift.
+    want = min((on - base)[..., 0].item(), (off_agree - base)[..., 0].item())
+    assert got["layer_pair"][..., 0].item() == pytest.approx(want, abs=1e-5)
+    assert got["layer_shared"][..., 0].item() == 0.0
+    # Candidates 1-3 were lowered by both the on-task teacher and the agreeing
+    # one (renormalisation), so the pair layer is non-zero there too and comes
+    # from the same plane; the opposing plane raised them and sets nothing.
+    assert torch.all(got["layer_pair_source"][..., 1:] == 1)
+
+
+def test_the_tail_region_is_measured_and_stage_one_keeps_only_what_all_three_suppress():
+    """Design 3.2-5: the student is confident, the on-task teacher gives ~0.
+    Case A: all three teachers suppressed the candidate -> it is in the shared
+    layer, stage 1 distils it, three_frac = 1. Case B: only the on-task teacher
+    did -> stage 1 returns it to base, three_frac = 0, and the withheld amount
+    the student feels sits entirely in the tail."""
+    k = 3
+    base = torch.log_softmax(torch.tensor([[[0.0, 0.0, 0.0]]]), dim=-1)          # 1/3 each
+    on = torch.log_softmax(torch.tensor([[[-12.0, 0.0, 0.0]]]), dim=-1)          # crushed cand 0
+    student = torch.log_softmax(torch.tensor([[[3.0, 0.0, 0.0]]]), dim=-1)       # confident on 0
+    assert student[..., 0].exp().item() > 0.5 and on[..., 0].exp().item() < 1e-3
+    common = dict(base_logprob=base, diag=torch.ones(3),
+                  diag_valid=torch.ones(3, dtype=torch.bool),
+                  task_ids=torch.zeros(1, dtype=torch.long),
+                  off_plane_tasks=torch.tensor([[1, 2]]))
+    # A: the off-task teachers crushed it too
+    off_a = on.unsqueeze(-1).expand(1, 1, k, 2).clone()
+    got = build_target(mode="curriculum", rho={"pair": 0.0, "own": 0.0},
+                       on_logprob=on, off_logprob=off_a, **common)
+    m = _stats_for(got, dict(on_logprob=on, task_ids=common["task_ids"]), student=student)
+    assert m["target/tail/cand_frac"] == pytest.approx(1.0 / k)
+    assert m["target/tail/three_frac"] == pytest.approx(1.0)
+    # B: only the on-task teacher did
+    off_b = base.unsqueeze(-1).expand(1, 1, k, 2).clone()
+    got = build_target(mode="curriculum", rho={"pair": 0.0, "own": 0.0},
+                       on_logprob=on, off_logprob=off_b, **common)
+    m = _stats_for(got, dict(on_logprob=on, task_ids=common["task_ids"]), student=student)
+    assert m["target/tail/three_frac"] == pytest.approx(0.0)
+    # Not exactly 1: crushing candidate 0 renormalised candidates 1 and 2 UP by
+    # log(1/2) - log(1/3), nobody backs that either, and the student's 5% there
+    # feels a little of it. The tail still carries essentially all of it.
+    assert m["target/tail/withheld_share"] > 0.99
+    assert m["target/tail/student_mass_frac"] > 0.5
+
+
+def test_gradient_geometry_at_full_release_is_the_control_exactly():
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+    from verl.trainer.ppo.cross_teacher_target import (
+        CURRICULUM_GRAD_TERMS, curriculum_gradient_metrics, curriculum_gradient_terms,
+    )
+
+    got, kw = _cur(1.0, 1.0)
+    bs, resp, k = kw["on_logprob"].shape
+    student = torch.log_softmax(torch.randn(bs, resp, k), dim=-1) + math.log(0.97)
+    on_kl = topk_kl_per_token(student_topk_logprob=student, teacher_topk_logprob=kw["on_logprob"])
+    cols = curriculum_gradient_terms(
+        student_logprob=student, target_logprob=got["target_logprob"],
+        on_logprob=kw["on_logprob"], live_kl=on_kl, on_kl=on_kl,
+        pg_grad_coef=torch.randn(bs, resp), sampled_onehot=torch.zeros(bs, resp, k),
+        coef=0.01, pg_coef=1.0,
+    )
+    assert set(cols) == set(CURRICULUM_GRAD_TERMS)
+    assert torch.allclose(cols["g_live_sq"], cols["g_ctl_sq"])
+    assert torch.allclose(cols["g_live_ctl"], cols["g_ctl_sq"])
+    assert torch.allclose(cols["g_live_grpo"], cols["g_ctl_grpo"])
+    sums = {None: {n: float(v.sum()) for n, v in cols.items()}}
+    sums[None]["n"] = float(bs * resp)
+    m = curriculum_gradient_metrics(sums, prefix="target")
+    assert m["target/control/grad_cosine"] == pytest.approx(1.0, abs=1e-6)
+    assert m["target/control/grad_norm_ratio"] == pytest.approx(1.0, abs=1e-6)
+    assert m["target/grpo/grad_cosine"] == pytest.approx(m["target/control/grpo_grad_cosine"], abs=1e-6)
+
+
+def test_stage_one_pulls_against_the_control_where_the_reward_moved_the_student_past_base():
+    """The reference-KL-to-base reading of design 3.2-4, as a sign.
+
+    The on-task teacher raised candidate 0 and nobody backs it, so stage 1's
+    target is base there. A student that has already moved toward the teacher
+    on candidate 0 is pulled BACK by stage 1 and FORWARD by the control: the two
+    OPD directions point opposite ways at that logit and their cosine is negative.
+    """
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+    from verl.trainer.ppo.cross_teacher_target import curriculum_gradient_terms
+
+    k = 3
+    base = torch.log_softmax(torch.tensor([[[0.0, 0.0, 0.0]]]), dim=-1)
+    on = torch.log_softmax(torch.tensor([[[3.0, 0.0, 0.0]]]), dim=-1)          # teacher raised 0
+    student = torch.log_softmax(torch.tensor([[[1.5, 0.0, 0.0]]]), dim=-1)     # halfway there
+    off = base.unsqueeze(-1).expand(1, 1, k, 2).clone()                         # nobody backs it
+    kw = dict(on_logprob=on, off_logprob=off, base_logprob=base, diag=torch.ones(3),
+              diag_valid=torch.ones(3, dtype=torch.bool),
+              task_ids=torch.zeros(1, dtype=torch.long), off_plane_tasks=torch.tensor([[1, 2]]))
+    got = build_target(mode="curriculum", rho={"pair": 0.0, "own": 0.0}, **kw)
+    assert torch.allclose(got["target_logprob"], base, atol=1e-5)               # stage 1 = base
+    live_kl = topk_kl_per_token(student_topk_logprob=student, teacher_topk_logprob=got["target_logprob"])
+    on_kl = topk_kl_per_token(student_topk_logprob=student, teacher_topk_logprob=on)
+    cols = curriculum_gradient_terms(
+        student_logprob=student, target_logprob=got["target_logprob"], on_logprob=on,
+        live_kl=live_kl, on_kl=on_kl, pg_grad_coef=torch.zeros(1, 1),
+        sampled_onehot=torch.zeros(1, 1, k), coef=0.01,
+    )
+    assert cols["g_live_ctl"].item() < 0.0
+    assert cols["g_live_sq"].item() > 0.0 and cols["g_ctl_sq"].item() > 0.0
+    assert cols["g_grpo_sq"].item() == 0.0                                        # no reward term here
+
+
+def test_the_role_cut_suffixes_are_keys_the_renderer_produces():
+    from verl.trainer.ppo.cross_teacher_target import (
+        CURRICULUM_GRAD_ROLE_CUT_SUFFIXES, CURRICULUM_GRAD_TERMS, curriculum_gradient_metrics,
+    )
+
+    sums = {"env_action": {n: 1.0 for n in CURRICULUM_GRAD_TERMS}}
+    sums["env_action"]["n"] = 10.0
+    m = curriculum_gradient_metrics(sums, prefix="target/role")
+    for suf in CURRICULUM_GRAD_ROLE_CUT_SUFFIXES:
+        assert f"target/role/env_action{suf}" in m, suf
+
+
+def test_the_token_table_can_be_filed_by_layer():
+    """TokenStateCounts with the curriculum's state vocabulary: every rendered
+    key and every dumped row carries the LAYER names, none of the sign arm's."""
+    from verl.trainer.ppo.sign_weights import STATE_NAMES, TokenStateCounts
+
+    names = {i: n for i, n in enumerate(LAYER_BRANCHES)}
+    acted = tuple(i for i, n in enumerate(LAYER_BRANCHES) if n != "none")
+    tab = TokenStateCounts(vocab_size=50, n_tasks=1, device="cpu", top_n=8, mode="target",
+                           state_names=names, acted_states=acted)
+    bs, resp, k = 2, 3, 5
+    ids = torch.randint(0, 50, (bs, resp, k))
+    state = torch.randint(0, len(LAYER_BRANCHES), (bs, resp, k))
+    w = torch.rand(bs, resp, k) + 0.5
+    lp = torch.log_softmax(torch.randn(bs, resp, k), dim=-1)
+    tab.update(support_ids=ids, state=state, weight=w, on_task_logprob=lp,
+               response_mask=torch.ones(bs, resp), task_ids=torch.zeros(bs, dtype=torch.long),
+               effect=(w - 1.0) * lp.exp())
+    m = tab.scalar_metrics(task_names=["t"], prefix="target")
+    assert any(key.endswith("/three") for key in m), sorted(m)[:5]
+    assert not any(any(key.endswith("/" + sn) for sn in STATE_NAMES.values()) for key in m)
+    rows = tab.top_tokens(task_names=["t"])
+    states = {r["state"] for r in rows}
+    assert states <= set(LAYER_BRANCHES) | {"__any__"}, states
+    # and the default is unchanged
+    dflt = TokenStateCounts(vocab_size=50, n_tasks=1, device="cpu", top_n=8, mode="target")
+    assert dflt.state_names == STATE_NAMES

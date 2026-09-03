@@ -71,6 +71,12 @@ STEM = "sign_tokens_step"
 # a configuration fact, not an error.
 PAIR_CLASSES = ("agree", "conflict", "blindspot")
 ACTED_STATES = ("agree_pos", "agree_neg", "conflict_on_pos", "conflict_on_neg")
+# The curriculum arm files its token table by how many teachers back the
+# candidate's direction instead of by corroboration state (cross_teacher_target
+# LAYER_BRANCHES). Same file, same columns, different state names; a state with
+# no rows does not print, so both vocabularies can be listed and whichever the
+# run wrote is what appears.
+LAYER_STATES = ("three", "pair", "own")
 TASKS = ("alfworld", "search", "webshop")
 
 
@@ -138,7 +144,7 @@ def report_tokens(rows, scope, top):
         table(f"all states / ranked by {ranked_by}",
               rank(scoped, state="__any__", ranked_by=ranked_by), cols, top)
 
-    for state in ACTED_STATES:
+    for state in ACTED_STATES + LAYER_STATES:
         # Both series, adjacent: see the module docstring on why one is not
         # enough. A state with no rows simply does not print.
         for ranked_by in ("mass", "count"):

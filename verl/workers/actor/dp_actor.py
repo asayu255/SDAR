@@ -59,10 +59,15 @@ from verl.trainer.ppo.sign_weights import (
     reweight_teacher_logprobs,
 )
 from verl.trainer.ppo.cross_teacher_target import (
+    CURRICULUM_GRAD_ROLE_CUT_SUFFIXES as XTT_GRAD_ROLE_CUT_SUFFIXES,
+    CURRICULUM_GRAD_TERMS as XTT_GRAD_TERMS,
+    LAYER_BRANCHES as XTT_LAYER_BRANCHES,
     MODES as XTT_MODES,
     TAG_TOKEN_IDS as XTT_TAG_TOKEN_IDS,
     TargetStepStats,
     build_target as xtt_build_target,
+    curriculum_gradient_metrics as xtt_gradient_metrics,
+    curriculum_gradient_terms as xtt_gradient_terms,
     sign_state_labels as xtt_sign_state_labels,
 )
 from verl.trainer.ppo.cross_teacher_kl_weight import (
@@ -2493,9 +2498,21 @@ class DataParallelPPOActor(BasePPOActor):
                 )
         # ---- the target arm's own step table and dumps ---------------------- #
         xtt_stats = xtt_token_stats = xtt_event_stats = None
+        xtt_grad_stats = xtt_role_grad_stats = None
         xtt_tag_ids = tuple(XTT_TAG_TOKEN_IDS)
         if xtt_on:
             xtt_stats = TargetStepStats(n_tasks=n_task, device=sign_dev, mode=xtt_mode)
+            if xtt_mode == "curriculum":
+                # The live target's gradient against the control's and against
+                # the reward, analytic in logit space. Constructed on config
+                # alone, like every accumulator here, because it all_reduces.
+                xtt_grad_stats = ScopeTermStats(
+                    names=XTT_GRAD_TERMS, n_tasks=n_task, device=sign_dev
+                )
+                if sign_role_tags:
+                    xtt_role_grad_stats = PositionScopeTermStats(
+                        names=XTT_GRAD_TERMS, n_scopes=len(ROLE_NAMES), device=sign_dev
+                    )
             xtt_tag_ids = tuple(
                 int(t) for t in (xtt_cfg.get("tag_token_ids", None) or XTT_TAG_TOKEN_IDS)
             )
@@ -2518,9 +2535,24 @@ class DataParallelPPOActor(BasePPOActor):
                     # by construction -- filed under the sign arm's state names
                     # via the exact (branch, sign) mapping. Same dump file, same
                     # scan script, one vocabulary for readers.
+                    # In curriculum mode the table is filed by LAYER -- how many
+                    # teachers back the candidate's direction -- because that is
+                    # the partition the mechanism acts on: "which tokens does
+                    # stage 1 hold back" is a question about the own and pair
+                    # layers, and the corroboration state cannot answer it.
+                    # The event dump keeps the corroboration state, and its rows
+                    # carry the four probabilities the layer is a function of.
+                    _cur = xtt_mode == "curriculum"
                     xtt_token_stats = TokenStateCounts(
                         vocab_size=_vocab, n_tasks=n_task, device=sign_dev,
                         top_n=int(xtt_token_cfg.get("top_n", 64)), mode="target",
+                        state_names=(
+                            {i: n for i, n in enumerate(XTT_LAYER_BRANCHES)} if _cur else None
+                        ),
+                        acted_states=(
+                            tuple(i for i, n in enumerate(XTT_LAYER_BRANCHES) if n != "none")
+                            if _cur else None
+                        ),
                     )
             if xtt_due and bool(xtt_event_cfg.get("enable", False)):
                 xtt_event_stats = SignEventSamples(
@@ -3131,6 +3163,10 @@ class DataParallelPPOActor(BasePPOActor):
                                         if (xtt_mode == "curriculum" and sign_role_tags)
                                         else None
                                     ),
+                                    # Which off-task teacher set the pair layer,
+                                    # named by task. Curriculum mode reads it;
+                                    # the tilt path ignores it.
+                                    off_plane_tasks=data["sign_off_tasks"],
                                     tag_token_ids=xtt_tag_ids,
                                 )
                                 if xtt_token_stats is not None or xtt_event_stats is not None:
@@ -3151,7 +3187,10 @@ class DataParallelPPOActor(BasePPOActor):
                                 if xtt_token_stats is not None:
                                     xtt_token_stats.update(
                                         support_ids=sign_support_ids,
-                                        state=_labels,
+                                        state=(
+                                            xtt_built["layer_branch"]
+                                            if xtt_mode == "curriculum" else _labels
+                                        ),
                                         weight=xtt_built["w"],
                                         on_task_logprob=sign_on_task_logprobs,
                                         response_mask=response_mask,
@@ -4082,6 +4121,40 @@ class DataParallelPPOActor(BasePPOActor):
                                         opd_cols, response_mask=response_mask,
                                         scope_ids=_opd_roles,
                                     )
+                        if (xtt_grad_stats is not None and xtt_built is not None
+                                and xt_pg_grad_coef is not None):
+                            # The curriculum's gradient geometry. teacher_kld is
+                            # the KL to the LIVE target here (the target arm
+                            # rewrote teacher_topk_lp before it was built); the
+                            # control's KL is recomputed against the untouched
+                            # on-task teacher so both directions sit on the same
+                            # student, positions and row weights.
+                            _xtt_on_kl = topk_kl_per_token(
+                                student_topk_logprob=student_topk_logprobs,
+                                teacher_topk_logprob=sign_on_task_logprobs,
+                            )
+                            _xtt_cols = xtt_gradient_terms(
+                                student_logprob=student_topk_logprobs,
+                                target_logprob=xtt_built["target_logprob"],
+                                on_logprob=sign_on_task_logprobs,
+                                live_kl=teacher_kld,
+                                on_kl=_xtt_on_kl,
+                                pg_grad_coef=xt_pg_grad_coef,
+                                sampled_onehot=(
+                                    sign_support_ids == data["responses"].unsqueeze(-1)
+                                ).to(teacher_kld.dtype),
+                                coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                pg_coef=float(pg_loss_coef),
+                                row_weight=task_loss_weight,
+                            )
+                            xtt_grad_stats.update(
+                                _xtt_cols, response_mask=response_mask, task_ids=task_ids,
+                            )
+                            if xtt_role_grad_stats is not None:
+                                xtt_role_grad_stats.update(
+                                    _xtt_cols, response_mask=response_mask,
+                                    scope_ids=token_roles(data["responses"], sign_role_tags),
+                                )
                         if xt_built is not None:
                             # The one line the whole module exists to reach.
                             teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
@@ -4578,6 +4651,22 @@ class DataParallelPPOActor(BasePPOActor):
                     # release lines up with the intervention it produced.
                     metrics["target/rho/pair"] = xtt_rho["pair"]
                     metrics["target/rho/own"] = xtt_rho["own"]
+                if xtt_grad_stats is not None:
+                    xtt_grad_stats.all_reduce()
+                    _xtt_g = xtt_gradient_metrics(
+                        xtt_grad_stats.sums(task_names=task_id_names), prefix="target"
+                    )
+                    metrics.update(_xtt_g)
+                    _xtt_m.update(_xtt_g)
+                if xtt_role_grad_stats is not None:
+                    xtt_role_grad_stats.all_reduce()
+                    metrics.update(xt_select_metrics(
+                        xtt_gradient_metrics(
+                            xtt_role_grad_stats.sums(scope_names=XT_ROLE_SCOPE_NAMES),
+                            prefix="target/role",
+                        ),
+                        XTT_GRAD_ROLE_CUT_SUFFIXES,
+                    ))
                 # The gate readings, one line in the run log, every step. They
                 # are ADVISORY -- the run does not stop itself on them (decided
                 # 2026-09-02); a human reads them against the pre-registered
@@ -4597,10 +4686,17 @@ class DataParallelPPOActor(BasePPOActor):
                         f"({xtt_rho['pair']:.2f},{xtt_rho['own']:.2f}) | "
                         f"tv={_g('target/tv'):.4f} live={_g('target/live_frac'):.3f} | "
                         f"|dKL|={_g('target/abs_dkl_mean'):.4f} nats/pos | "
-                        "layer mass g/pair/own="
-                        f"{_g('target/layer/shared/mass_share'):.3f}/"
-                        f"{_g('target/layer/pair/mass_share'):.3f}/"
-                        f"{_g('target/layer/own/mass_share'):.3f} | "
+                        "backed g/pair="
+                        f"{_g('target/layer/shared/backed_frac'):.3f}/"
+                        f"{_g('target/layer/pair/backed_frac'):.3f} "
+                        "(null sim 0.105/0.48) | "
+                        f"cos(live,ctl)={_g('target/control/grad_cosine'):+.3f} "
+                        f"|live|/|ctl|={_g('target/control/grad_norm_ratio'):.3f} | "
+                        f"cos(live,pg)={_g('target/grpo/grad_cosine'):+.3f} "
+                        f"vs ctl {_g('target/control/grpo_grad_cosine'):+.3f} | "
+                        f"kl_to_base={_g('target/kl_to_base'):.4f} | "
+                        f"tail three_frac={_g('target/tail/three_frac'):.3f} "
+                        f"withheld_share={_g('target/tail/withheld_share'):.3f} | "
                         "g role struct/content="
                         f"{_g('target/layer/shared/role/structural_share'):.3f}/"
                         f"{_g('target/layer/shared/role/content_share'):.3f} | "
