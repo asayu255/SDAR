@@ -33,12 +33,16 @@
    理論的に整合し、かつ実行可能なのは (a) 時間で減衰する信頼 $\beta(t)$、(b) reverse KL の unlearning 裾を切るゲート、
    (c) 目標の一様縮小 $\lambda'$ の 3 つ（§5）。**PG 項を教師統計で重み付けることは、教師と独立な唯一の信号に
    教師を混ぜることであり、推奨しない**（§5.4）。
-5. **経験的記録の訂正**（§4）: 67b1249 §0.1 の「signweight target（1.25/0.75）」アームの @150 値
-   （alfworld 0.762、webshop acc 0.667）は、**content マスク付き klw アーム**（`sg1fast`、$\beta=0.01$）の
-   per-instance 再計算値と 2 タスクとも一致する。signweight target の OPD+GRPO run は本日 $\beta=1.0$ で
-   起動されたばかりで検証値を持たない。signweight 系列（$\beta=1.0$）と klw 系列（$\beta=0.01$）は係数が
-   100 倍違う（commit `ed8994f` が明記）。よって §0.3 の 2×2 は機構も係数も混ざっており、
-   「重みづけ × GRPO の交互作用 +11.1pp」の根拠にならない。
+5. **経験的記録の照合**（§4）: 67b1249 §0.1 の「signweight target（1.25/0.75、target mode、OPD+GRPO）」という
+   アームの同定は**正しい**。この文書の初版はそれを content マスク klw アームと読み違え、「係数が 100 倍違う」とも書いたが、
+   **両方とも撤回する**（§4.0）。検証ログの `experiment_name` は流用したスクリプトの名で、`resume_from_path` は 8/13 に起動した
+   signweight target GRPO run の checkpoint を指していた。そのアームも、その対照（8/5 の GRPO run）も、klw 系列も、
+   すべて `teacher_kl_loss_coef = 0.01` である。**残る訂正は 3 つ。** (i) 67b1249 の control 列は klw 系列の control
+   （別 run）で、このアーム自身の control@300 は alfworld **0.754** — アームの @300（0.754 / 0.778）と一致し、
+   「control が追い付いた」が観測になる（§4.2）。学習中の T=1.0 プロファイルもそれを支持する: 優位は step 31–60 で立ち、
+   200 step 以降は全指標が一致する（§4.3）。(ii) §0.3 の 2×2 の「重みづけあり」2 セルは重み表も support も異なる（§4.4）。
+   (iii) 現在のスクリプトと lock（β=1.0、`4d4c681` 以降の重み表、生徒 top-k）は 8/13 のアームを再現せず、本日再起動された
+   run もそうである（§4.5、§5.6）。
 
 ---
 
@@ -121,7 +125,7 @@ $W^{pg}$ は歩幅だけを変える。固定点に到達していなくても�
 実際は 1 つのネットワークが全位置を担うので、$W^{pg}$ が決める歩幅は「どの位置がパラメータ空間で勝つか」を左右する。
 つまり `both` は固定点では control と同じだが、有限 step では**一致した位置を優先して当てる**カリキュラムとして働く。
 命題 1 の帰結（純 OPD で位置重みが結果を変えない）は、このカリキュラム経路が少なくとも 150 step では効かなかったことを
-示唆する（§4.1 表: signweight position 純 OPD は +4pp だが 1 run の揺れ 2–3pp の内側）。
+示唆する（§4.2 参考: signweight position 純 OPD は +4pp だが 1 run の揺れ 2–3pp の内側）。
 
 ### 2.3 命題 3（PG 項の状態依存重みは、状態分布の再重み付け）
 
@@ -251,61 +255,115 @@ RMS 標準化はそれを「大きな shift」に見せる。証拠を読む測�
 
 ## 4. 経験的記録の再読
 
-### 4.1 per-instance ログからの再計算（本ホスト、`~/val_instances/*/val_step*.jsonl`）
+### 4.0 同定の手順と、この文書の初版が踏んだ罠
 
-`traj_uid` で畳んで max、score > 0 を成功とする（role_mask 文書 §0.1 と同じ手順。klw sg1@150 の 0.7143 / 0.6667 で照合済み）。
+検証ログと per-instance jsonl の `experiment_name` は**流用したスクリプトの名**であり、検証した checkpoint の名ではない。
+`~/logs/opd_grpo_klw_content_sg1fast_val{150,300}.log` は名前が content klw アームだが、`resume_from_path` は
+`~/checkpoints/verl_agent_opd_grpo_tmp_multitask/global_step_{150,300}`、すなわち **8/13 に起動した signweight target GRPO run**
+（wandb `t6vg80ut`、`sdar_multitask_opd_grpo_signweight_target_qwen3_1.7b`）の checkpoint である。content klw アームの学習
+（9/02）は Ray のノードメモリで OOM し、checkpoint を 1 つも残していない。この文書の初版はここで誤った。
+**同定は `resume_from_path` と wandb の config dump（`wandb/run-*/logs/debug.log`）で行うこと。** 以下はそれで取り直した。
 
-| run | 損失 | $\beta$ | step | alfworld | webshop acc | search |
-|---|---|---:|---:|---:|---:|---:|
-| `opd_multitask`（純 OPD control） | OPD | — | 150 | 0.6508 | 0.6270 | 0.3906 |
-| | | | 300 | 0.6746 | 0.6667 | 0.3886 |
-| `opd_multitask_signweight_position` | OPD | — | 150 | 0.6905 | 0.6746 | 0.3858 |
-| | | | 300 | 0.7143 | 0.6349 | 0.3851 |
-| `opd_multitask_signweight_target` | OPD | — | 150 | **0.6508** | 0.6429 | 0.3859 |
-| | | | 300 | 0.6905 | 0.6667 | 0.3884 |
-| `opd_multitask_signweight_target_teachertopk` | OPD | — | 150 | 0.6667 | 0.6667 | 0.3903 |
-| `opd_grpo_..._klw_sg1`（新機構） | OPD+GRPO | 0.01 | 150 | 0.7143 | 0.6667 | 0.3938 |
-| `opd_grpo_..._klw_xt1`（旧機構） | OPD+GRPO | 0.01 | 300 | 0.7460 | 0.6825 | 0.3993 |
-| `opd_grpo_..._klw_content_sg1fast`（content マスク） | OPD+GRPO | 0.01 | 150 | **0.7619** | **0.6667** | 0.3825 |
-| | | | 300 | 0.7778 | 0.7540 | 0.3963 |
-| control（`xt1/885xeeru`, `bvl7inr6`。本ホストに無し、role_mask 文書 §0/§5 より） | OPD+GRPO | 0.01 | 150 / 300 | 0.651 / 0.738 | 0.722 / — | 0.390 / — |
+### 4.1 run の対応と、走った設定（config dump より）
 
-純 OPD では係数は Adam のスケール不変性により実質無関係。
+| 役割 | run | 起動 | $\beta$ | 機構 | top-k support | GPU |
+|---|---|---|---:|---|---|---:|
+| **アーム** | `t6vg80ut`（+resume `rnmmiwc7`, `i1nbo7wz`）→ `tmp_multitask` | 8/13 | **0.01** | target、`agree_weight=1.25`、**`disagree_weight=0.75`**、deadzone 0.1 | 教師 | 2 |
+| **その control** | `ktrcnege` → `verl_agent_opd_grpo_multitask` | 8/5 | **0.01** | なし | 教師 | 2 |
+| klw control（67b1249 が引いた control） | `91v55ri7`（xt1） | 8/29 | 0.01 | なし | 生徒 | 3 |
+| klw sg1（新機構） | `n9zfny6m` | 8/31 | 0.01 | klw | 生徒 | 2 |
+| klw xt1（旧機構） | — | 8/28 | 0.01 | klw（旧） | 生徒 | — |
+| 純 OPD signweight target | `owv67d3y` / `h2ihajq2` | 8/20–22 | 1.0（pg=0、無関係） | target、`agree_neg_weight=0.75`、`disagree_weight=1.0` | 生徒 | — |
 
-### 4.2 67b1249 が並べた数値の出所と、係数の混同
+**8/13 のアームが実行した重み表**は起動時のコード（`e75051f` の `sign_weights.py`）で決まる。`candidate_weights(agree_weight,
+disagree_weight)` に `agree_neg_weight` は**存在せず**、target mode でも `agree → ×1.25`（上げ一致・下げ一致とも）、
+`conflict → ×0.75`、他は 1.0。目標は `reweight_teacher_logprobs` による $\tilde p \propto w\,p_{on}$（tail 固定、再正規化）。
+**したがって論文の表（負/負 → 増強、対立 → ×0.75）は、論文の数値を出した run に対して正しい。** 8/26 の `4d4c681` が表を
+`agree_neg×0.75 / conflict×1.0` に変え、target mode で `disagree_weight ≠ 1` を assert で拒否するようにした。現在のコードとの
+食い違いは論文の誤りではなく、**論文の run とその後のコードの違い**である。なお現在の module docstring が「下げ一致を増強すると、
+全教師が抑制に同意したトークンの目標確率を上げてしまう」と書く批判は、まさに 8/13 のアームがしたことへの批判であり、
+論文のアームが「一致の内容」で効いたという読みには不利な材料になる。
 
-* 67b1249 §0.1 の「signweight target（1.25/0.75、target mode、OPD+GRPO）」の @150 値 alfworld 0.762 / webshop acc 0.667 は、
-  上表の **content マスク klw アーム（sg1fast）@150 と 2 タスクとも一致**する（126 問中 96 / 84）。
-  signweight target の OPD+GRPO run（`opd_grpo_multitask_signweight_target_qwen3_1.7b_sg1fast`）は
-  **本日 2026-09-03 に 4 回起動され、`teacher_kl_loss_coef: 1.0`、検証はまだ無い**（`wandb/run-20260903_*/logs/debug.log`）。
-  @300 値（alfworld 0.754 / webshop 0.746）は上表の content@300（0.7778 / 0.7540）と一致しないので、別の出所である。
-* commit `ed8994f`（2026-08-27）は「OPD 係数を 1.0 → 0.01 に動かしたので、**それ以前の全アームと 150-step sign-weight 報告は、
-  機構より先に係数で違う**」と明記している。signweight 系列（`examples/opd_grpo_trainer/run_multitask_signweight_*.sh`、$\beta=1.0$）と
-  klw 系列（$\beta=0.01$）の control は別物で、前者の control は `run_multitask_qwen3.sh`（`expected_multitask_config.yaml`、$\beta=1.0$）である。
-* よって 67b1249 §0.3 の 2×2 は、「重みづけあり・純 OPD」= signweight **target**（機構 M2）、「重みづけあり・OPD+GRPO」=
-  content マスク **klw**（機構 M1、別の証拠・別の正規化）で、**別機構の 2 セルを 1 つの因子として読んでいる**。
-  さらに純 OPD の 2 セルと OPD+GRPO control が 3 つとも 0.6508（82/126）で並ぶのは偶然であり、「+0.0pp」の読みは
-  1 run の揺れ（alfworld 2.1–2.6pp）の内側の話である。交互作用の主張は現時点で支持されない。
+### 4.2 検証値（一致した control で）
 
-### 4.3 $\beta = 0.01$ がどの regime か
+control は `~/logs/opd_grpo_val_{150,300}.log`（8/7–8/8 の val_only、`verl_agent_opd_grpo_multitask/global_step_{150,300}`）。
+アームは `tmp_multitask` の checkpoint を 9/02–03 に検証したもので、@300 は**同一 checkpoint の 2 回の検証**
+（67b1249 §0.1 の値と、per-instance jsonl の再計算値）。
+
+| | control @150 → @300 | アーム @150 → @300 | 差 @150 → @300 |
+|---|---|---|---|
+| alfworld | 0.651 → **0.754** | **0.762** → 0.754 / 0.778 | **+11.1pp** → **0.0 / +2.4pp** |
+| webshop acc | 0.635 → 0.738 | 0.667 → 0.746 / 0.754 | +3.2 → +0.8 / +1.6 |
+| webshop score | 0.760 → 0.869 | 0.783 → 0.849 | +2.3 → −2.0 |
+| search | 0.384 → 0.395 | 0.382 → 0.396 | −0.2 → +0.1 |
+
+run 間 SD（alfworld 2.1–2.6pp、webshop acc 0.7–3.1pp）で読むと: **alfworld の +11pp は @300 で消え、control が同じ水準に到達している。**
+webshop・search はどちらの step でも雑音の内側。**符号反転はどこにも無い。**
+
+67b1249 §0.1 が control 列に置いた 0.651 → 0.738 は klw 系列の control（`91v55ri7`: 別 run、3 GPU、生徒 top-k、8/29 のコード）で、
+このアームの対照ではない。@150 が偶然同じ 0.651（82/126）だったため差は @300 にだけ現れ、「アームは飽和し control は 0.738 まで」
+という読みになった。正しい対照では**「control は 0.754 まで伸び、アームに追い付く」**である。
+
+参考（同じ手順で取り直した他アーム、per-instance jsonl）: klw sg1@150 0.714 / 0.667 / 0.394（`..._klw_multitask_sg1/global_step_150`）、
+klw xt1@300 0.746 / 0.683 / 0.399（`..._klw_multitask_xt1/global_step_300`、`9dfp1kav`）。純 OPD 系列（control / signweight position /
+signweight target / teachertopk）@150: alfworld 0.651 / 0.690 / 0.651 / 0.667、@300: 0.675 / 0.714 / 0.690 / —。
+
+### 4.3 学習中の時間プロファイル（T=1.0 rollout、`wandb/*/files/output.log`、10-step 窓平均）
+
+| 窓 | alfworld 成功 CTL | ARM | 差 | 正規形式採用（alfworld）CTL / ARM | entropy CTL / ARM |
+|---|---|---|---|---|---|
+| 1–30 | 0.10–0.29 | 0.10–0.30 | ≈ 0 | 0 / 0 | ≈ 等 |
+| **31–60** | 0.38–0.49 | 0.46–0.58 | **+0.08 〜 +0.09**（3 窓連続） | 0 / 0 | **≈ 等**（0.19–0.20 / 0.17–0.21） |
+| 61–100 | 0.59–0.70 | 0.57–0.72 | −0.01 〜 +0.07 | 0 / 0 | 0.16–0.35 / 0.22–0.31 |
+| 101–150 | 0.62–0.68 | 0.69–0.79 | +0.06 〜 **+0.11** | CTL が **step 135** で切替 / ARM 0 | 0.48–0.64 / 0.35–0.72（ARM が低い窓が多い） |
+| 151–200 | 0.65–0.73 | 0.73–0.78 | +0.03 〜 +0.13 | 0.99 / ARM が **step 162** で切替 | 0.26–0.42 / 0.23–0.49 |
+| **201–300** | 0.69–0.83 | 0.72–0.83 | **−0.02 〜 +0.03**（10 窓連続） | 0.99 / 0.99 | ≈ 等 |
+
+各窓 n=10 step。1 step の成功率 SD は ≈ 0.10–0.15 なので窓平均の差の SE ≈ 0.05。単一の窓では決まらないが、31–60 の 3 窓連続の
++0.08〜0.09 と、201–300 の 10 窓連続の ≈ 0 は、それぞれ一貫している。応答長も 291–300 で 197 対 196。
+
+読み:
+
+* **優位は step 31–60 で既に立っている。** そこでは両 run とも正規形式を採用しておらず、entropy も等しい。klw アームで監査が
+  伸びの主因とした entropy 上昇（§3.5）は、このアームの早期優位の説明にならない。
+* **正規形式の切替は control が 135、アームが 162。** アームは切替を 27 step 遅らせた（klw アームでも同じ方向: role_mask 文書 §1）。
+  ただし優位は切替の前後を通じて存在し、切替時期の差は優位の起源ではない。
+* **200 step 以降、T=1.0 成功率・形式採用・entropy・応答長・検証値がすべて一致する。到達点は同じで、到達が早かった。**
+  命題 2 の言葉では、$\beta = 0.01$ と目標の TV 0.7%（signweight 引継ぎ文書 §1）の下で固定点は control と実質同一で、
+  差は動学だけである。この文書の初版が §4.4 に「予測」として書いた「十分な step で control に追い付かれる」は、
+  一致した control ではこの run で**観測**になる。
+* **早い理由は未測定。** 8/13 の run には token 表・event dump が無い（dump 機構は 8/26 以降）。step ≤ 60 で 1.25/0.75 の
+  tilt が何を動かしたかは、dump を付けた再現 run でしか分からない。「到達順序が効いた」は言えるが、「何の順序か」は言えない。
+
+### 4.4 2×2 は一因子の階乗ではない
+
+67b1249 §0.3 の「重みづけあり・純 OPD」= 8/20 の純 OPD signweight target（`agree_neg×0.75, conflict×1.0`、生徒 top-k）、
+「重みづけあり・OPD+GRPO」= 8/13 のアーム（`agree×1.25` 両符号、`conflict×0.75`、教師 top-k）。**重み表も support も異なる。**
+「重みづけ単独 +0.0、GRPO 単独 +0.0、両方で +11.1」という交互作用の読みは、2 つの「重みづけ」が別物なので成立しない。
+「GRPO 単独 +0.0」は 8/5 control@150（0.651）と純 OPD control@150（0.651）が偶然同値だったことに依る。
+
+### 4.5 $\beta = 0.01$ がどの regime か
 
 $A$ は群内標準化されているので $|\tilde Q| \sim 1$。命題 2 の固定点 $\pi_d\exp(\tilde Q/\tau)$ は $\tau = 0.01\,W$ では
-$\exp(100\,\tilde Q/W)$ で、**advantage が非ゼロな位置では報酬がほぼ単独で固定点を決める**。
-教師が効くのは $A = 0$ の位置（群内の報酬が揃った場合。search の群の約 7 割）と、動学の初期である。
-これは「OPD は 150 step で頭打ち、以後の伸びは GRPO」という観測の、弱い事前分布として当然の振る舞いであって、
-重み付けを増やして直すべき欠陥ではない。$\beta = 1.0$ の signweight 系列は逆に教師支配の regime にあり、
-2 系列の「飽和」を同じ物語で読むことはできない。**係数の選択が一次、位置別の重みは二次**である。
+$\exp(100\,\tilde Q/W)$ で、**advantage が非ゼロな位置では報酬がほぼ単独で固定点を決める**。教師が効くのは $A = 0$ の位置
+（群内の報酬が揃った場合。search の群の約 7 割）と、動学の初期である。「OPD は 150 step で頭打ち、以後の伸びは GRPO」は
+弱い事前分布として当然の振る舞いで、重み付けを増やして直すべき欠陥ではない。§4.3 の「到達点は同じ」もこれと整合する。
+**係数の選択が一次、位置別の重みは二次**である。
 
-### 4.4 理論が説明するもの・しないもの
+現在の GRPO signweight スクリプトと intent lock は `4d4c681`（8/26）以降 $\beta = 1.0$ を書いており、本日再起動された
+`opd_grpo_multitask_signweight_target_qwen3_1.7b_sg1fast` もそれで走っている。$\beta = 1.0$ は教師支配の別 regime で、
+8/13 のアームの再現にも、その対照にもならない（§5.6）。
 
-* **説明する:** klw の entropy 上昇と裾集中（§3.5）、純 OPD で位置重みが効かないこと（命題 1）、
-  contrastive 除去の悪化（§3.3）、webshop の一貫した悪化の方向（内容位置に他タスクの固有成分を混入させる介入。
-  webshop は内容 role のシェアが最大）。
-* **説明しない:** alfworld の早期優位（監査 §15.5 の残差、entropy 同等の区間で +4.7σ）。
-  理論は「一致の内容が運んだ」を否定するが、代わりの機構を特定しない。シード反復なしにこれ以上は言えない。
-* **予測（未検証）:** control は 300 step でまだ伸びており（0.651 → 0.738）、klw 系アームの固定点は control と違う（§2.2）。
-  一致位置で教師を過信し・非一致位置で教師を軽視する $\tau(x)$ が誤っているなら、**十分な step で control に追い付かれる**。
-  content@300 0.778 > control@300 0.738 はこれと矛盾するが、1 run 差 4pp は揺れの 1.5–2σ である。
+### 4.6 理論が説明するもの・しないもの
+
+* **説明する:** klw の entropy 上昇と裾集中（§3.5）、純 OPD で位置重みが効かないこと（命題 1）、contrastive 除去の悪化（§3.3）、
+  webshop の一貫した悪化の方向（klw 系列。内容位置に他タスクの固有成分を混入させる介入）、そして signweight target アームの
+  **到達点が control と一致すること**（命題 2、$\beta=0.01$、TV 0.7%）。
+* **説明しない:** signweight target アームの step 31–60 の早期優位。entropy でも形式切替の時期でもない（§4.3）。
+  「tilt された目標は早期に学びやすい」以上のことは、dump のある再現 run なしには言えない。klw の alfworld 早期優位
+  （監査 §15.5）も同じく未説明で、2 つの別機構が同じ形の早期優位を出していることは記録に残す価値がある。
+* **予測（未検証）:** 一致した control で 8/13 アームの全 checkpoint（25 step 刻み）を検証すれば、検証値の優位は
+  @50–75 で立ち、@200 以降で消える（§6.1 E−1）。
 
 ---
 
@@ -367,10 +425,13 @@ PG だけに掛ける `pg` は `kl` の逆を走る。どちらも「証拠を�
 $c$、`shared_share`、shuffled 比は**共有成分 $g$ の診断**として価値がある（どの role に $g$ が載っているか、
 教師集合に書式以外の共有があるか）。損失には入れない。
 
-### 5.6 係数を明示する
+### 5.6 係数と重み表を明示する
 
-比較は同じ $\beta$ の中でしか成立しない（§4.2）。本日起動した signweight target（$\beta = 1.0$）には
-`run_multitask_qwen3.sh`（`opd_grpo_trainer`、$\beta=1.0$）が対応する control であり、klw control ではない。
+比較は同じ $\beta$・同じ重み表・同じ support の中でしか成立しない（§4.1、§4.4）。8/13 のアームを再現するには
+$\beta = 0.01$、`agree×1.25`（両符号）、`conflict×0.75`、教師 top-k が要り、**現在のコードは target mode の `disagree_weight ≠ 1`
+を assert で拒否する**。本日再起動された run（$\beta = 1.0$、`agree_neg×0.75 / conflict×1.0`、生徒 top-k）は 3 点で異なり、
+その対照は `run_multitask_qwen3.sh`（$\beta = 1.0$）であって 8/5 の control でも klw control でもない。再現に価値があるかは
+§6.1 E−1 の結果で決めるべきで、それまでは走らせる理由が無い。
 
 ---
 
@@ -380,7 +441,8 @@ $c$、`shared_share`、shuffled 比は**共有成分 $g$ の診断**として価
 
 | # | アーム | 何を答えるか | 事前予測 |
 |---|---|---|---|
-| E0 | control（$\beta=0.01$）を 300 → 450 step に延長 | control の固定点は 300 で到達しているか。§4.4 の「追い付かれる」予測の前提 | alfworld はさらに伸びる |
+| **E−1** | **既存 checkpoint の全点検証**: 8/5 control と 8/13 アームの `global_step_{25,…,300}`（各 12 点、全て `~/checkpoints/` に存在）を標準プロトコルで検証。**学習なし** | 検証値での優位の時間プロファイル。§4.3 の T=1.0 プロファイルが T=0.4 の検証でも成り立つか | **@50–75 で優位が立ち、@200 以降で消える。** @150 の +11pp が孤立点なら §4.3 の読みは誤り。最も安く、最も識別力が高い |
+| E0 | control（$\beta=0.01$）を 300 → 450 step に延長 | control の固定点は 300 で到達しているか | alfworld はさらに伸びる。E−1 で到達点一致が確認されれば優先度は下がる |
 | E1 | $\beta(t)$ 減衰（§5.3a）、cross-teacher なし | 「OPD は前半」を目的関数に書くだけで klw 系の早期優位が出るか | @150 で control 以上、@300 で control 以上。entropy は control 同等 |
 | E2 | 裾ゲート（§5.3b）、cross-teacher なし | klw の伸びが裾の副作用なら、裾を切る方向で webshop の悪化が消えるか | webshop が control 以上に戻る。entropy は上がらない。alfworld は不明（残差） |
 | E3 | 一様縮小 $\lambda' = 0.8$（§5.2） | この教師集合に、書式以外の共有知識があるか | alfworld ≈ 0、webshop ≤ 0（§5.2）。正なら重要 |
@@ -389,6 +451,8 @@ $c$、`shared_share`、shuffled 比は**共有成分 $g$ の診断**として価
 67b1249 の `both` / `pg` を走らせる場合の**書き直した予測**: `both` は @150・@300 とも control と区別できない
 （信頼プロファイルが同じ）。`pg` は一致位置で教師を軽視するので、alfworld @300 で **control 以下**。
 どちらかが外れたら命題 2 の tabular 近似（位置別の歩幅が結果を変えない）が破れている、と読む。
+
+**anneal（前半だけ 1.25/0.75、以後 1.0/1.0）について。** 到達点が control と同じなら（§4.3）、anneal は full arm と区別できない結果を出す。目標変更と到達順序を分けるという目的には、到達点が違う場合にしか効かない。E−1 で到達点の一致が確認された時点で、anneal は走らせる理由を失う。順序の**中身**を問うなら、dump を付けた 8/13 設定の再現（seed 2）の方が答えに近い。
 
 ### 6.2 配線の検証（結果ではない）
 
@@ -409,13 +473,20 @@ $c$、`shared_share`、shuffled 比は**共有成分 $g$ の診断**として価
 
 ## 7. 検証できなかったこと・限界
 
-* **control の per-instance ログは本ホストに無い。** §4.1 の control 行は role_mask 文書からの転記で、再計算していない。
-* **67b1249 の @300 値（0.754 / 0.746）の出所は特定できなかった。** @150 値は content klw アームと一致するが、@300 は一致しない。
-* **階層モデルはガウス・等分散・独立。** 定理（§3.2）の識別不能性は 2 次モーメントの話なので分布形に依らないが、
-  縮小推定量の**形**（一様 $\lambda'$）は等分散に依る。異分散なら $\lambda'(x)$ になるが、それでも一致の関数にはならない（§3.4）。
+* **control の per-instance ログは本ホストに無い。** 8/5 control の値は `~/logs/opd_grpo_val_{150,300}.log` の集計値、klw control の値は
+  role_mask 文書からの転記で、どちらも `traj_uid` 単位では再計算していない。
+* **アーム @300 は同一 checkpoint の 2 回の検証で 0.754 / 0.778**（SD 2.1pp の範囲）。3 回目（temperature 0、`val300_det1.log`）は
+  本日実行中で未完。
+* **§4.3 の時間プロファイルは n=1 対 n=1 の run** で、窓平均の差の SE ≈ 0.05。31–60 の連続 3 窓と 201–300 の連続 10 窓の一貫性に
+  依っており、シード反復は無い。
+* **早期優位の機構は未測定**（§4.3、§4.6）。8/13 の run に dump は無い。
+* **階層モデルはガウス・等分散・独立。** 定理（§3.2）の識別不能性は 2 次モーメントの話なので分布形に依らないが、縮小推定量の**形**
+  （一様 $\lambda'$）は等分散に依る。異分散なら $\lambda'(x)$ になるが、それでも一致の関数にはならない（§3.4）。
 * **命題 2 の tabular 近似。** 共有パラメータの下では位置別の歩幅が結果を変えうる。それが 150 step で効いていないことは
-  純 OPD の 2×2 行が示唆するが、証明ではない。`both` アームがこの近似の直接の検定になる。
-* **alfworld の早期優位は未説明のまま**（§4.4）。本文書はそれを一致の内容に帰属させる読みを否定するが、代替を特定していない。
-* **単タスク参照（67b1249 が引く alfworld 0.849）との差 7–10pp を、cross-teacher 情報で埋める根拠は理論からは出ない。**
-  理論が指す一次の変数は $\beta$ のスケジュールと裾の扱いであり、control が 300 step でまだ伸びていることから、
+  純 OPD の記録が示唆するが、証明ではない。`both` アームがこの近似の直接の検定になる。
+* **単タスク参照（67b1249 が引く alfworld 0.849）との差を cross-teacher 情報で埋める根拠は理論からは出ない。**
+  理論が指す一次の変数は $\beta$ のスケジュールと裾の扱いであり、8/5 control が 300 step で 0.754 に達していることから、
   step 数そのものも候補である。
+* **記録の罠（再発防止）。** 検証ログ・jsonl の `experiment_name` は流用スクリプトの名で checkpoint の名ではない（§4.0）。
+  この文書の初版はそれで run を取り違えた。同定は `resume_from_path` と wandb の config dump で行い、`teacher_kl_loss_coef`・
+  重み表・`student_indexed_topk` を run ごとに読むこと。スクリプトの現在値から過去の run の設定を推定してはいけない。
