@@ -1394,17 +1394,17 @@ def test_the_placement_decision_is_what_it_claims_on_a_gpu_box():
     """
     from verl.workers.teacher_cache import store_placement
 
-    store, pin, index = store_placement(True, "cuda:0", cuda_available=True)
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=True, pin=True)
     assert store.type == "cpu", "offload on, store still on the card -- it frees nothing"
     assert index.type == "cpu", "the index has to follow the store, or the gather is illegal"
-    assert pin is True, "a device read wants pinned host memory, or the pull is not a DMA"
+    assert pin is True, "a device read that asked for pinned host memory gets it"
 
-    store, pin, index = store_placement(False, "cuda:0", cuda_available=True)
+    store, pin, index = store_placement(False, "cuda:0", cuda_available=True, pin=True)
     assert store.type == "cuda" and index.type == "cuda", "resident: nothing moves"
     assert pin is False
 
     # No driver: the store still moves off the device, but pinning would raise.
-    store, pin, index = store_placement(True, "cuda:0", cuda_available=False)
+    store, pin, index = store_placement(True, "cuda:0", cuda_available=False, pin=True)
     assert store.type == "cpu" and pin is False
 
 
@@ -1928,15 +1928,18 @@ def test_the_store_can_be_taken_off_page_locked_memory():
     assert store_placement(False, "cuda:0", cuda_available=True, pin=False)[1] is False
 
 
-def test_the_pin_knob_defaults_to_on(monkeypatch):
-    """Off by accident would be a silent throughput regression in the micro-batch
-    loop, so the default is the DMA and the saving is opt-in."""
+def test_the_pin_knob_defaults_to_off(monkeypatch):
+    """Off, because the page-locked residue of an on-store is 51.5 GB on the
+    two-card box for under 0.2% of a step, and two runs sat 5 GB under Ray's kill
+    line because of it. On is a knob for a box where host RAM is not the limit."""
     import verl.workers.teacher_cache as tc
 
-    assert tc._PIN_STORE is True, "TEACHER_CACHE_PIN_STORE must default to on"
-    assert tc.store_placement(True, "cuda:0", cuda_available=True)[1] is True
-
-    monkeypatch.setattr(tc, "_PIN_STORE", False)
+    assert tc._PIN_STORE is False, "TEACHER_CACHE_PIN_STORE must default to off"
     assert tc.store_placement(True, "cuda:0", cuda_available=True)[1] is False
+    # The store still leaves the device when unpinned; only the page-lock goes.
+    assert tc.store_placement(True, "cuda:0", cuda_available=True)[0].type == "cpu"
+
+    monkeypatch.setattr(tc, "_PIN_STORE", True)
+    assert tc.store_placement(True, "cuda:0", cuda_available=True)[1] is True
     # An explicit argument still wins, so the knob cannot silently override a caller.
-    assert tc.store_placement(True, "cuda:0", cuda_available=True, pin=True)[1] is True
+    assert tc.store_placement(True, "cuda:0", cuda_available=True, pin=False)[1] is False

@@ -104,37 +104,59 @@ pageable の staged copy は ~8 GB/rank/step、driver の bounce buffer 経由�
 rollout の CPU glue の中の prefetch thread 上で走り、step は 250 s である。
 （pageable は glibc が mmap で取って free で munmap するので、OS に返る。）
 
-**2. store の pin を外せるようにした（`TEACHER_CACHE_PIN_STORE`、既定 on）。** page-locked の
-コストは store のサイズではない。torch は2の冪に丸めてブロックを返さないので、rank あたり
-7.0–10.3 GB を振れる store（`teacher_cache/gb` 14.0–20.7）は 8.6 GiB のブロックと 17.2 GiB の
-ブロックの**両方**に落ち着く — 9.6 GiB のデータに対して rank あたり ~24 GiB、2枚で ~48 GB。
-tamago ではノードの5分の1で、そのノードが `e8x57zyu` を殺した側である。
+**2. store の pin を既定で外した（`TEACHER_CACHE_PIN_STORE`、既定 off、`=1` で戻る）。**
+これは #5 以前からある問題で、**両 run の step 8 の +26〜34 GB がこれ**である。
 
-これは #5 以前からある。ただし**これは `n9zfny6m` の +0.370 GB/step の説明にはならない**:
-上の 24 GiB は数 step で頭打ちになる定数であって、147 step かけて 54 GB 登るものではない。
-step 1 の 183.9 GB には既にその1つ目のブロックが入っている。したがって sg1 の漸増は
-**teacher cache ではない**（env worker / webshop JVM / Ray object store のいずれか）。
-今回は測っていないので、そこは分かっていないと書いておく。
+| | `n9zfny6m` | `p7qdwsyl`（`4fbf618` 込み、58 step） |
+|---|---:|---:|
+| step 7 の rank あたり store | 7.53 GB → 8 GiB bucket | 7.18 GB → 8 GiB bucket |
+| step 8 の rank あたり store | **9.09 GB → 16 GiB bucket** | **8.76 GB → 16 GiB bucket** |
+| `cpu_used` step 7 → 8 | 191.7 → 225.7（**+34.0**） | 201.0 → 227.8（**+26.8**） |
+| ジャンプの位置 | — | update_actor の中（`_finalize` が走る場所） |
 
-（最初は「step 間で要求サイズを単調な2の冪に固定すれば pool が1ブロックで済む」という
-修正を書いたが、torch 2.8 の allocator をそのままシミュレートしたら pool 合計は
-24.0 GiB のまま**変わらなかった** — 単調な mark でも 8.6 → 17.2 と登る途中で 8.6 が孤児に
-なるので、bucket を交互に使う今と総和が同じになる。根拠が消えたので入れていない。）
+torch は要求を2の冪に丸め、bucket 別の free list からしか返さず、ブロックを OS に返さない
+（2.8 のヘッダで確認）。store は rank あたりほとんどの step で 8 GiB の線の**すぐ下**（7.2〜8.4 GB）、
+応答の長い step で**すぐ上**（8.8〜9.1 GB）にいる。最初にまたいだ step で 16 GiB のブロックが
+8 GiB の隣に追加で pin され、両方がプロセスの寿命いっぱい残る。以後の run は 0.98 の kill line の
+5 GB 下に座り続け、rollout の一過性の +7 GB で越える（`p7qdwsyl` step 58、`n9zfny6m` は 148 step
+を 1.2 ポイント差で通過）。9.1 GB を超えない store のために rank あたり 25.8 GB、2枚で 51.5 GB。
 
-pin を外すと store は OS が回収する普通のホストメモリになり、`_read_packed` のコピーは
-staged / 同期になる。ここの形状だと step の 1〜2% 程度。**host RAM が律速のときに払う価値のある
-トレードで、そうでないときは払う必要がない**ので knob にしてある。
+前の版の本節で「bucket の交互使用は数 step で頭打ちになる定数なので leak の説明にならない」と書いた。
+定数であることは正しかったが、**その定数が +34 GB の一発で、それが kill line までの余裕を全部食っていた**。
+過小評価だった。
 
-**3. `perf/pinned_host_gb` を足した。** これが無かったから見えなかった。
+pin を外した store は OS が回収する普通のホストメモリになる。代償は `_read_packed` の行ごとの
+slice copy が DMA から staged copy になること — 行 ~520 KB × 1 call 5〜20 行 × ~150 call/step/rank で
+**step の 0.2% 未満**。51.5 GB と引き換えなら既定 off が正しい。
+
+**3. `perf/pinned_host_gb` を足した — が、最初の版は壊れたカウンタを読んでいた。**
 rank ごとと**合計**を出す（このファイルで唯一 max ではない reduction — page-locked ページはノードに
 課金され、rank は同じ箱の別プロセスだからである）。
 
+`p7qdwsyl` ではこれが **step あたり +16.04 GiB ずつ直線的に増え、step 58 で 1027 GB** を示した。
+251 GB のノードで。torch 2.8 の `allocated_bytes.current` は bucket 別の払い出しカウンタで、
+stream event 待ちのブロックを free list に戻す `process_events_for_specific_size(size)` が
+`block->size_` ではなく引数 `size`（汎用パスでは -1）で減算するため、**micro-batch ループが読んだ
+ブロック（event が記録される）は回収されるたびにサイズ分をカウンタに残す**。私は 2.8 の
+`reserved_bytes.current`（cudaHostAlloc で +、cudaFreeHost でだけ −、つまり pool そのもの）と
+この壊れた値の max を取っていたので、大きい方＝壊れた方が出ていた。`reserved_bytes` があれば
+それだけを読むように直した（2.14 には無く、そこでは `allocated_bytes` が pool）。
+
+**4. `node_mem/<class>_gb` を足した。** `perf/cpu_memory_used_gb` はノード1個の数字で、
+3回の死をこれと kill 時の top-10 だけで推理してきた。Ray の process title（`ray::<Class>.<method>`）
+でクラス別に PSS を合計し、`/dev/shm`（plasma store）も出す。rank 0 で step に1回、~0.1 s。
+`n9zfny6m` / `p7qdwsyl` の +0.1〜0.2 GB/step の漸増（150 step で 15〜30 GB）はまだ名前が付いていない。
+次の run でこれが付ける。
+
 ### 走らせる前に読む指標(追加)
 
-5. **`perf/pinned_host_gb`** — step 間で増え続けるなら、どこかがまた pinned を掴んで離していない。
-   `perf/cpu_memory_used_gb` と並べて見ること
-6. **`perf/cpu_memory_used_gb`** — `n9zfny6m` ですら 238 GB / 94.6% まで行っている。0.98 との余裕は
-   もともと 8.5 GB しかない
+5. **`perf/pinned_host_gb`** — 既定（store pin off）なら vLLM の swap 分の ~4 GiB/rank 前後で
+   **平ら**のはず。step ごとに増えるなら、どこかがまた pinned を掴んで離していない
+6. **`perf/cpu_memory_used_gb`** — pin off で plateau は ~190〜205 GB に下がる見込み
+   （`p7qdwsyl` の 240 から 51.5 GB 引いた値から、pageable store の update 中の一過性 +8〜9 GB/rank を戻す）。
+   漸増 0.1〜0.2 GB/step で 150 step なら 215〜235 GB。0.98 = 246.5 GB
+7. **`node_mem/*_gb`** — 漸増が `WebshopWorker` / `AlfworldWorker` / `OPDGRPOTaskRunner` / `dev_shm` の
+   どれに乗っているか。これで次の1回で決まる
 
 ---
 
