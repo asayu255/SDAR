@@ -42,6 +42,7 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.metric.memory import (
     device_footprint_gb,
+    node_memory_breakdown,
     per_rank_memory_metrics,
     phase_peak_metrics,
     reset_phase_peak,
@@ -848,6 +849,16 @@ class ActorRolloutRefWorker(Worker):
             # rising is not evidence the freeze failed.
             metrics.update(per_rank_stall_counter_metrics(get_torch_device()))
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            # And WHO holds it, by process class, plus the plasma store. Rank 0
+            # only: the number is the node's, DataProto.concat keeps rank 0's
+            # meta_info anyway, and it is one /proc sweep a step. Three runs died
+            # on the line above with nothing to say which of the ~300 processes
+            # on the box had moved.
+            if self.rank == 0:
+                try:
+                    metrics.update(node_memory_breakdown())
+                except Exception as exc:  # noqa: BLE001 - a measurement must not break what it measures
+                    print(f"[node-mem] breakdown skipped: {exc!r}", flush=True)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr

@@ -56,7 +56,7 @@ import torch
 
 __all__ = [
     "per_rank_memory_metrics", "device_footprint_gb", "reset_phase_peak", "phase_peak_metrics",
-    "pinned_host_bytes",
+    "pinned_host_bytes", "node_memory_breakdown",
 ]
 
 _GB = 1024.0**3
@@ -98,27 +98,93 @@ def pinned_host_bytes() -> float:
     its per-put chunks, host RAM climbed 5.06 GB a step from 207 GB, and nothing in
     ``perf/*`` moved, because everything in ``perf/*`` was about the card.
 
-    TWO KEYS, because torch renamed the one that means "the pool". On 2.8 --
-    which is what setup.py pins, so it is what the runs are on -- ``getStats``
-    fills ``reserved_bytes`` from the slow-path counter ("bytes reserved by this
-    allocator, both free and used") and ``allocated_bytes`` from the per-bucket
-    handed-out counters, which drop when a block goes back on the free list. On
-    2.14 ``allocated_bytes`` IS the pool (active + cached) and handed-out moved to
-    ``active_bytes``. Taking the larger reads the pool on either, and the pool is
-    the number: a cached block is still page-locked, and the OS still cannot have
-    it back.
+    WHICH KEY, and why it is not the larger of the two. On torch 2.8 -- what
+    setup.py pins, so what the runs are on -- ``getStats`` fills ``reserved_bytes``
+    from the slow-path counter (+size on every ``cudaHostAlloc``, -size only on
+    ``cudaFreeHost``, i.e. the pool) and ``allocated_bytes`` from the per-bucket
+    handed-out counters. Those per-bucket counters are BROKEN on 2.8: a block that
+    is freed with a stream event pending is returned to the free list by
+    ``process_events_for_specific_size(size)``, which decrements the bucket by the
+    ``size`` argument -- and the generic ``process_events()`` passes -1. So every
+    block the micro-batch loop has read from (which records an event on it) leaves
+    its full size in ``allocated_bytes.current`` when it is recycled. Run p7qdwsyl
+    logged exactly that: +16.04 GiB a step, one 8 GiB store block a rank, to a
+    "pool" of 1027 GB on a 251 GB node. The first version of this function took
+    ``max`` of the two and reported the broken one.
 
-    Both are at the ROUNDED block size, which is what was actually taken. 0.0 on
-    any backend without the counters, so a diagnostic never takes a run down.
+    On 2.14 the counters were reworked: ``allocated_bytes`` IS the pool (active +
+    cached, at the rounded size), handed-out moved to ``active_bytes``, and there
+    is no ``reserved_bytes``. So: ``reserved_bytes.current`` when the key exists,
+    ``allocated_bytes.current`` only when it does not. Never the max.
+
+    0.0 on any backend without the counters, so a diagnostic never takes a run down.
     """
     try:
         stats = torch.cuda.host_memory_stats()
     except Exception:  # noqa: BLE001 - a measurement must not break what it measures
         return 0.0
-    return max(
-        float(stats.get("reserved_bytes.current", 0.0) or 0.0),
-        float(stats.get("allocated_bytes.current", 0.0) or 0.0),
-    )
+    if "reserved_bytes.current" in stats:
+        return float(stats["reserved_bytes.current"] or 0.0)
+    return float(stats.get("allocated_bytes.current", 0.0) or 0.0)
+
+
+def node_memory_breakdown(prefix: str = "node_mem", top: int = 12, process_iter=None, shm_usage=None) -> dict:
+    """Host memory by PROCESS CLASS, node-wide, plus the shared-memory object store.
+
+    ``perf/cpu_memory_used_gb`` is one number for the whole box, and three runs
+    have now died against Ray's threshold with only that number and a kill-time
+    "top 10" to reason from. This is the breakdown that turns the next one into a
+    lookup: how much do the two training workers hold, how much the driver, how
+    much the few hundred environment actors together, and how much sits in
+    ``/dev/shm``, where Ray's plasma store lives and fills to its cap with
+    dead-but-cached objects as a matter of course.
+
+    Ray sets each worker's process title to ``ray::<Class>.<method>``, so grouping
+    on the class name collapses ~200 ``WebshopWorker`` processes into one row.
+    Sizes are PSS (proportional set size) where the kernel offers it, so pages
+    shared between processes -- shared libraries, and the plasma store mapped into
+    every worker that reads from it -- are split rather than counted once per
+    process; RSS is the fallback. One sweep of /proc per step, ~0.1 s at 300
+    processes, from rank 0 only.
+
+    ``process_iter`` and ``shm_usage`` are injection points for tests. Never
+    raises: a process that exits mid-sweep is skipped, and a box without
+    ``/dev/shm`` just omits that key.
+    """
+    import os
+
+    import psutil
+
+    if process_iter is None:
+        process_iter = lambda: psutil.process_iter(["cmdline", "name"])  # noqa: E731
+    if shm_usage is None:
+        shm_usage = lambda: psutil.disk_usage("/dev/shm").used  # noqa: E731
+
+    by_class: dict = {}
+    for proc in process_iter():
+        try:
+            cmd = proc.info.get("cmdline") if isinstance(getattr(proc, "info", None), dict) else None
+            head = (cmd[0] if cmd else None) or (proc.info.get("name") if isinstance(getattr(proc, "info", None), dict) else None) or "?"
+            try:
+                size = proc.memory_full_info().pss
+            except Exception:  # noqa: BLE001 - no smaps_rollup, or no permission
+                size = proc.memory_info().rss
+        except Exception:  # noqa: BLE001 - exited or inaccessible mid-sweep
+            continue
+        if head.startswith("ray::"):
+            cls = head[5:].split(".")[0].split("(")[0] or "ray"
+        else:
+            cls = os.path.basename(head)[:24] or "?"
+        by_class[cls] = by_class.get(cls, 0.0) + float(size)
+
+    ranked = sorted(by_class.items(), key=lambda kv: -kv[1])[:top]
+    out = {f"{prefix}/{cls}_gb": size / _GB for cls, size in ranked}
+    out[f"{prefix}/other_gb"] = sum(size for cls, size in by_class.items() if cls not in dict(ranked)) / _GB
+    try:
+        out[f"{prefix}/dev_shm_gb"] = float(shm_usage()) / _GB
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def reset_phase_peak(device) -> None:

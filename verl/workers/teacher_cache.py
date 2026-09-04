@@ -81,22 +81,29 @@ _OFFLOAD = os.environ.get("TEACHER_CACHE_OFFLOAD", "1").strip().lower() not in (
 # _projection_rows. Above what the arm asks for today, so it changes nothing
 # until the micro batch or the support grows.
 _PROJ_CHUNK_BYTES = int(float(os.environ.get("TEACHER_PROJ_CHUNK_MB", "64")) * (1 << 20))
-# WHETHER THE OFFLOADED STORE IS PAGE-LOCKED. On by default because that is what
-# makes the per-micro-batch pull a DMA the copy engine can overlap, and the store
-# is pulled from thousands of times a step.
+# WHETHER THE OFFLOADED STORE IS PAGE-LOCKED. OFF by default, and that is a
+# measured decision, not a cautious one.
 #
-# It is off-able because the page-locked cost is not the store's size. torch
-# rounds a pinned request up to a power of two and never gives the block back, so
-# a store that swings 7.0-10.3 GB a rank (teacher_cache/gb 14.0-20.7 over run
-# n9zfny6m) settles into an 8.6 GiB block AND a 17.2 GiB one: ~24 GiB a rank,
-# ~48 GB on a two-card box, for 9.6 GiB of data. On tamago that is a fifth of the
-# node, and the node is what run e8x57zyu died on.
+# What pinning buys: _read_packed's per-row slice copies become DMAs the copy
+# engine can overlap instead of staged transfers. Priced at this arm's shapes --
+# ~520 KB a row, 5-20 rows a call, ~150 calls a step per rank -- that is well
+# under half a second of a ~300 s update. Under 0.2% of the step.
 #
-# Unpinned the store is ordinary host memory the OS takes back, and _read_packed's
-# copies become staged and synchronous -- ~1-2% of a step by the shapes here.
-# That is a trade to make when host RAM is the binding constraint, which is why it
-# is a knob and not a rewrite.
-_PIN_STORE = os.environ.get("TEACHER_CACHE_PIN_STORE", "1").strip().lower() not in ("0", "false", "no", "off")
+# What pinning costs: torch rounds a pinned request up to the next power of two,
+# keys its free list by that bucket, and never hands a block back. The store's
+# per-rank size sits just under the 8 GiB line most steps (7.2-8.4 GB) and just
+# over it on a long-response step (8.8-9.1 GB). The FIRST such step -- step 8 in
+# both run n9zfny6m and run p7qdwsyl -- pins a second, 16 GiB block beside the
+# 8 GiB one, and both stay for the life of the process: node RAM jumped 191.7 ->
+# 225.7 GB and 201.0 -> 227.8 GB inside that step's update_actor, and the runs
+# then sat 5 GB under Ray's 0.98 kill line until a rollout transient crossed it
+# (p7qdwsyl, step 58). That is 25.8 GB a rank, 51.5 GB on the two-card box, for
+# a store that is never more than 9.1 GB.
+#
+# Unpinned, the store is ordinary host memory the OS takes back at free, and the
+# node loses the whole 51.5 GB of page-locked residue. TEACHER_CACHE_PIN_STORE=1
+# opts back in, for a box where host RAM is not the binding constraint.
+_PIN_STORE = os.environ.get("TEACHER_CACHE_PIN_STORE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def store_placement(offload: bool, read_device, cuda_available: Optional[bool] = None, pin: Optional[bool] = None):
@@ -545,8 +552,8 @@ class TeacherHiddenCache:
         row or two, and ``_finalize`` copies it into the contiguous store and
         drops it. Nothing else ever touches it -- ``_read_packed``, which runs
         once per micro-batch of every training step, pulls from ``final["h"]``,
-        a SEPARATE tensor that is pinned on its own account. So pinning here
-        would buy a DMA on one copy per chunk and nothing after that.
+        a SEPARATE tensor whose placement is its own decision (``_PIN_STORE``).
+        So pinning here would buy a DMA on one copy per chunk and nothing after.
 
         What it costs is unbounded. torch's pinned allocator rounds every request
         up to the next power of two, keys its free list by that bucket, and NEVER
@@ -614,9 +621,10 @@ class TeacherHiddenCache:
         "device" would read as a regression that is in fact the fix. Both numbers
         are logged, as ``teacher_cache/gb`` and ``teacher_cache/device_gb``.
 
-        Neither is the PAGE-LOCKED footprint, and they should not be read as it:
-        torch rounds a pinned request up to a power of two and keeps the block, so
-        the store's 9.6 GB is 17.2 GB of pinned pages. That number is
+        Neither is the PAGE-LOCKED footprint, and they should not be read as it.
+        With ``TEACHER_CACHE_PIN_STORE=1`` torch rounds the store's request up to a
+        power of two and keeps the block, so a 9.1 GB store is 17.2 GB of pinned
+        pages -- plus the 8.6 GB block it outgrew. That number is
         ``perf/pinned_host_gb``.
 
         Worth a number rather than an estimate because the sign-weighting arms
@@ -681,10 +689,10 @@ class TeacherHiddenCache:
         offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)[:-1]])
         total = int(lens.sum())
         probe = self._h[keys[0]]
-        # Pinned host memory when offloading, because THIS is the tensor the
-        # micro-batch loop pulls from -- once per micro batch of every training
-        # step, which is where a DMA the copy engine can overlap is worth having.
-        # (The put() chunks are not: they are read once and dropped. See _to_host.)
+        # Host memory when offloading; page-locked only if TEACHER_CACHE_PIN_STORE
+        # says so. THIS is the tensor the micro-batch loop pulls from, so it is the
+        # one place a pin could pay -- and _PIN_STORE's note prices why it does not
+        # here. (The put() chunks never could: read once and dropped. See _to_host.)
         store_dev, pin, _index_dev = store_placement(self._offload, device)
         store_h = torch.empty(
             (total, probe.shape[-1]), dtype=probe.dtype, device=store_dev, pin_memory=pin

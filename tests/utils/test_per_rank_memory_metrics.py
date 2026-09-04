@@ -412,20 +412,98 @@ def test_the_pinned_reading_never_takes_a_run_down(monkeypatch):
 
 
 def test_the_pinned_reading_finds_the_pool_under_either_torch_name(monkeypatch):
-    """torch 2.8 -- what setup.py pins -- puts the pool in reserved_bytes and the
-    handed-out part in allocated_bytes; 2.14 renamed the pool to allocated_bytes
-    and handed-out to active_bytes. A cached block is still page-locked, so it is
-    the POOL that has to be reported on both."""
+    """torch 2.8 -- what setup.py pins -- puts the pool in reserved_bytes; 2.14
+    renamed the pool to allocated_bytes and dropped reserved_bytes. And on 2.8
+    allocated_bytes is not merely "the handed-out part": its per-bucket counter
+    leaks one block size every time a block with a pending stream event is
+    recycled, which is every step for the store. Run p7qdwsyl logged it climbing
+    to 1027 GB on a 251 GB node. So reserved_bytes wins whenever it exists -- not
+    the larger of the two, which is how that number got logged."""
     from verl.utils.metric.memory import pinned_host_bytes
 
-    # 2.8 shape: 16 GiB pinned, 9 of it currently handed out.
+    # 2.8 shape, mid-run: the pool is 16 GiB and the broken counter is far past it.
+    monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {
+        "reserved_bytes.current": 16.0 * _GB, "allocated_bytes.current": 1027.0 * _GB,
+    })
+    assert pinned_host_bytes() == pytest.approx(16.0 * _GB)
+
+    # 2.8 shape, early: reserved is the larger one, and is still what is reported.
     monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {
         "reserved_bytes.current": 16.0 * _GB, "allocated_bytes.current": 9.0 * _GB,
     })
     assert pinned_host_bytes() == pytest.approx(16.0 * _GB)
 
-    # 2.14 shape: the same 16 GiB, under the other name, with no reserved_bytes.
+    # 2.14 shape: no reserved_bytes at all, and allocated_bytes is the pool.
     monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {
         "allocated_bytes.current": 16.0 * _GB, "active_bytes.current": 9.0 * _GB,
     })
     assert pinned_host_bytes() == pytest.approx(16.0 * _GB)
+
+
+# --------------------------------------------------------------------------- #
+# Who holds the node's memory. One number for the whole box was what three runs
+# died with; this is the breakdown that would have named the culprit each time.
+# --------------------------------------------------------------------------- #
+
+
+class _Proc:
+    def __init__(self, head, size, pss=True, dies=False):
+        self.info = {"cmdline": [head] if head else None, "name": head or None}
+        self._size, self._pss, self._dies = size, pss, dies
+
+    def memory_full_info(self):
+        if self._dies:
+            raise RuntimeError("NoSuchProcess")
+        if not self._pss:
+            raise AttributeError("no smaps_rollup here")
+        return type("m", (), {"pss": self._size})()
+
+    def memory_info(self):
+        if self._dies:
+            raise RuntimeError("NoSuchProcess")
+        return type("m", (), {"rss": self._size})()
+
+
+def test_the_breakdown_groups_ray_actors_by_class_and_reads_the_object_store():
+    from verl.utils.metric.memory import node_memory_breakdown
+
+    procs = [
+        _Proc("ray::WorkerDict.actor_rollout_update_actor", 40 * _GB),
+        _Proc("ray::WorkerDict", 39 * _GB),                       # idle title, same class
+        _Proc("ray::OPDGRPOTaskRunner.run", 11 * _GB),
+        *[_Proc("ray::WebshopWorker.step", int(0.68 * _GB)) for _ in range(120)],
+        *[_Proc("ray::AlfworldWorker", int(0.3 * _GB), pss=False) for _ in range(60)],  # RSS fallback
+        _Proc("/usr/bin/java", 6 * _GB),
+        _Proc("ray::WebshopWorker", 1, dies=True),                  # exits mid-sweep: skipped
+        _Proc(None, 2 * _GB),                                       # no cmdline, no name
+    ]
+    m = node_memory_breakdown(process_iter=lambda: procs, shm_usage=lambda: 70 * _GB)
+
+    assert m["node_mem/WorkerDict_gb"] == pytest.approx(79.0)
+    assert m["node_mem/OPDGRPOTaskRunner_gb"] == pytest.approx(11.0)
+    assert m["node_mem/WebshopWorker_gb"] == pytest.approx(120 * 0.68, rel=1e-3)
+    assert m["node_mem/AlfworldWorker_gb"] == pytest.approx(60 * 0.3, rel=1e-3)
+    assert m["node_mem/java_gb"] == pytest.approx(6.0)
+    assert m["node_mem/dev_shm_gb"] == pytest.approx(70.0)
+    assert m["node_mem/?_gb"] == pytest.approx(2.0)
+    assert "node_mem/other_gb" in m
+
+
+def test_the_breakdown_keeps_the_top_rows_and_folds_the_rest():
+    from verl.utils.metric.memory import node_memory_breakdown
+
+    procs = [_Proc(f"/bin/tool{i}", (i + 1) * _GB) for i in range(20)]
+    m = node_memory_breakdown(top=3, process_iter=lambda: procs, shm_usage=lambda: 0)
+    named = [k for k in m if k not in ("node_mem/other_gb", "node_mem/dev_shm_gb")]
+    assert len(named) == 3 and "node_mem/tool19_gb" in named
+    assert m["node_mem/other_gb"] == pytest.approx(sum(range(1, 18)))     # tool0..tool16
+
+
+def test_the_breakdown_never_takes_a_run_down():
+    from verl.utils.metric.memory import node_memory_breakdown
+
+    def boom():
+        raise RuntimeError("no /dev/shm on this box")
+
+    m = node_memory_breakdown(process_iter=lambda: [], shm_usage=boom)
+    assert m == {"node_mem/other_gb": 0.0}
