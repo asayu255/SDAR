@@ -68,6 +68,7 @@ from verl.trainer.ppo.cross_teacher_target import (
     build_target as xtt_build_target,
     curriculum_gradient_metrics as xtt_gradient_metrics,
     curriculum_gradient_terms as xtt_gradient_terms,
+    load_target_sidecar_state as xtt_load_sidecar_state,
     sign_state_labels as xtt_sign_state_labels,
 )
 from verl.trainer.ppo.cross_teacher_kl_weight import (
@@ -2308,16 +2309,42 @@ class DataParallelPPOActor(BasePPOActor):
             # Indexed by task for the same reason the arm above is; and the RMS
             # is the SAME accumulator, because it measures the teachers and the
             # base, none of which differ between the two arms. What this arm
-            # does NOT share is the sidecar: it has no mean, no reliability and
-            # no alpha, and a resume simply re-warms the RMS from live batches
-            # -- c is identically zero until the first snapshot exists, so the
-            # cost of a resume is one no-op step, not a wrong scale.
+            # does not share is the FILE: it has no mean, no reliability and no
+            # alpha, and the other loader requires all three. It has its own
+            # sidecar, with its own mechanism id, so each arm refuses the
+            # other's state by name.
+            #
+            # This used to cold-start instead, on the grounds that "a resume
+            # simply re-warms the RMS from live batches ... the cost is one
+            # no-op step, not a wrong scale". The no-op step was real; the rest
+            # was not. See target_sidecar_state for what the step-59 run
+            # measured about its own resume.
             assert n_task >= 3, (
                 "cross_teacher_target is indexed by task and needs at least three of "
                 f"them (a destination and two consensus sources); the batch names {n_task}."
             )
             if self._xt_rms is None:
                 self._xt_rms = CumulativePolicyShiftRMS(n_tasks=n_task, device=sign_dev)
+                # Restored here rather than in load_checkpoint for the reason the
+                # other arm's is: the accumulator is indexed by task and does not
+                # exist until the first batch names them, which is also what
+                # completes the identity the check runs against.
+                pending = getattr(self, "cross_teacher_target_sidecar_path", None)
+                blob = self._read_sidecar_on_rank_zero(pending)
+                if blob is not None:
+                    self._xt_step_index = xtt_load_sidecar_state(
+                        blob,
+                        rms=self._xt_rms,
+                        identity=resume_identity(
+                            getattr(self, "cross_teacher_identity", None), task_id_names
+                        ),
+                    )
+                    # Without this the first resumed step still has no scale and
+                    # still emits c == 0 -- the restore would fix the number the
+                    # step after the one that reads it.
+                    self._xt_rms_snapshot = self._xt_rms.diagonal()
+                    print(f"[cross_teacher_target] resumed accumulated state from {pending}", flush=True)
+                self.cross_teacher_target_sidecar_path = None
         # {tag: [ids]}, set by the worker at startup -- this process has no
         # tokenizer. Absent means the role column reports "format" throughout,
         # which is honest: nothing was classified. Read here rather than beside
@@ -4759,6 +4786,13 @@ class DataParallelPPOActor(BasePPOActor):
                 ))
             self.cross_teacher_task_order = list(task_id_names or [])
             self._xt_step_index += 1
+            # What the worker writes beside the actor checkpoint. Held by
+            # reference, like the other arm's: the RMS keeps accumulating and
+            # the save reads it at whatever step it lands on. The step index is
+            # a value, so it is re-published every step.
+            self.cross_teacher_target_state = {
+                "rms": self._xt_rms, "step_index": self._xt_step_index,
+            }
         # ---- the arm-independent OPD attribution, rendered ------------------ #
         # OUTSIDE the block above, which is the whole point: `if xt_on` is false
         # for every step of a control run, and these are the keys that make the

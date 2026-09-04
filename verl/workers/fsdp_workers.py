@@ -1503,15 +1503,32 @@ class ActorRolloutRefWorker(Worker):
         and nothing in the metrics to say so.
         """
         from verl.trainer.ppo.cross_teacher_kl_weight import SIDECAR_NAME, sidecar_state
+        from verl.trainer.ppo.cross_teacher_target import (
+            TARGET_SIDECAR_NAME,
+            target_sidecar_state,
+        )
 
+        # Two arms, two files. The weighting arm publishes cross_teacher_state,
+        # the target arm publishes cross_teacher_target_state, and a control
+        # publishes neither; a run with both enabled writes both. One rank check
+        # and one makedirs covers every case, so the two can never disagree
+        # about whether this rank is the writer.
         state = getattr(self.actor, "cross_teacher_state", None)
-        if state is None or dist.get_rank() != 0:
+        target_state = getattr(self.actor, "cross_teacher_target_state", None)
+        if (state is None and target_state is None) or dist.get_rank() != 0:
             return
         os.makedirs(local_path, exist_ok=True)
-        torch.save(
-            sidecar_state(**state, identity=self._cross_teacher_identity()),
-            os.path.join(local_path, SIDECAR_NAME),
-        )
+        identity = self._cross_teacher_identity()
+        if state is not None:
+            torch.save(
+                sidecar_state(**state, identity=identity),
+                os.path.join(local_path, SIDECAR_NAME),
+            )
+        if target_state is not None:
+            torch.save(
+                target_sidecar_state(**target_state, identity=identity),
+                os.path.join(local_path, TARGET_SIDECAR_NAME),
+            )
 
     def _cross_teacher_identity(self) -> dict:
         """What the accumulated numbers are measured against.
@@ -1521,7 +1538,14 @@ class ActorRolloutRefWorker(Worker):
         log-probs were normalised at one temperature, and every matrix here is
         indexed by task order.
         """
+        # Whichever arm this run has. Both measure the same shifts against the
+        # same base and teachers, and main_opd injects teacher_paths into each,
+        # so the identity is the same shape either way -- but reading only the
+        # weighting arm's key left a target-arm run with base_path=None and
+        # teacher_paths={}, i.e. an identity check that passed on anything.
         xt = (self.config.actor.get("cross_teacher_kl_weight", None) or {})
+        if not xt.get("base_path", None):
+            xt = (self.config.actor.get("cross_teacher_target", None) or {})
         teachers = xt.get("teacher_paths", None) or {}
         return {
             "base_path": xt.get("base_path", None),
@@ -1553,7 +1577,12 @@ class ActorRolloutRefWorker(Worker):
         if getattr(self, "actor", None) is not None:
             from verl.trainer.ppo.cross_teacher_kl_weight import SIDECAR_NAME
 
+            from verl.trainer.ppo.cross_teacher_target import TARGET_SIDECAR_NAME
+
             self.actor.cross_teacher_sidecar_path = os.path.join(local_path, SIDECAR_NAME)
+            self.actor.cross_teacher_target_sidecar_path = os.path.join(
+                local_path, TARGET_SIDECAR_NAME
+            )
             self.actor.cross_teacher_identity = self._cross_teacher_identity()
 
         if self._is_offload_param:

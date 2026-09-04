@@ -208,6 +208,110 @@ LAYERS = ("shared", "pair", "own")
 LAYER_BRANCHES = ("three", "pair", "own", "none")
 
 
+# --------------------------------------------------------------------------- #
+# resume state
+# --------------------------------------------------------------------------- #
+# The target arm's own sidecar, deliberately NOT the weighting arm's.
+#
+# Both arms accumulate the SAME statistic -- CumulativePolicyShiftRMS, which
+# measures the teachers and the base and so cannot differ between them -- but
+# they accumulate nothing else in common: this arm has no lagged normaliser, no
+# reliability moments and no alpha table, and the other arm's loader requires
+# all three to be present. Sharing one file would mean either padding this
+# arm's state with keys it has no meaning for, or weakening a check that exists
+# to refuse a resume across a mechanism change. A second file, with a second
+# mechanism id, lets each arm refuse the other's state by name.
+TARGET_SIDECAR_NAME = "cross_teacher_target_state.pt"
+TARGET_SIDECAR_VERSION = 1
+# The rule that produced the numbers, not just what they were measured against.
+# ``nested_layers`` + ``curriculum_exponent`` is what a resumed RMS feeds; a
+# build whose layering differs cannot use this scale even with an identical
+# base, teacher set and temperature.
+TARGET_MECHANISM_ID = "nested_layers_v1"
+
+
+def target_sidecar_state(*, rms, step_index: int, identity: dict) -> dict:
+    """The target arm's accumulated state, for the checkpoint beside it.
+
+    THE RMS IS TRAINING STATE, NOT A DIAGNOSTIC, and this arm's own code used to
+    say otherwise: "a resume simply re-warms the RMS from live batches -- c is
+    identically zero until the first snapshot exists, so the cost of a resume is
+    one no-op step, not a wrong scale". The first half is right and the second
+    is not, and the run that died at step 59 measured both. Resumed at step 50
+    against its own uninterrupted trace:
+
+        target/tv                     0.068 -> 0.000   at the first step
+        rms/alfworld/n_positions      3.5e7 -> 7.1e5   the accumulator restarts
+        rms/search__on__search        x0.763, and FLAT over the next five steps
+        target/layer/shared/backed    +16-19%, every step
+
+    The scale does not re-warm to where it was, because sigma DRIFTS DOWN as the
+    student moves (search: 3.42 at step 2, 2.76 at step 59). An accumulation
+    restarted at step k never contains the earlier, larger contributions, so it
+    converges to a different number and stays there -- at step 150 a third of
+    the gap is still open. What that moves is not the intervention's size (TV
+    was off by 2%) but its COMPOSITION: ``shared`` is the layer every teacher
+    has to clear a bar in RMS units to enter, so a scale 24% low admits 16-19%
+    more candidates into the very layer stage 1 distils. The curriculum's first
+    stage was measuring a different "g" after the resume than before it.
+
+    ``step_index`` rides along because the dump cadence is keyed to it
+    (``self._xt_step_index % every``). It reaches no loss and no target; without
+    it a resumed run simply dumps on different steps than an uninterrupted one,
+    which makes two logs harder to diff for no reason.
+
+    ``identity`` pins what the numbers mean -- base, teachers, temperature, task
+    order -- exactly as the weighting arm's does. A resume that disagrees on any
+    of it is not this run continued.
+    """
+    return {
+        "version": TARGET_SIDECAR_VERSION,
+        "mechanism": TARGET_MECHANISM_ID,
+        "identity": dict(identity),
+        "rms": rms.state_dict(),
+        "step_index": int(step_index),
+    }
+
+
+def load_target_sidecar_state(state: dict, *, rms, identity: dict) -> int:
+    """Restore the RMS after checking the identity. Returns the step index.
+
+    Every key the caller names must be PRESENT in the checkpoint and must match,
+    the same rule the weighting arm's loader applies and for the same reason: an
+    absent key passing would make the check weaker the older the checkpoint is,
+    which is backwards.
+    """
+    found = int(state.get("version", 0))
+    assert found == TARGET_SIDECAR_VERSION, (
+        f"cross_teacher_target resume: sidecar version {found}, this build writes "
+        f"{TARGET_SIDECAR_VERSION}. Start the arm fresh rather than reinterpret it."
+    )
+    stored_mech = state.get("mechanism", None)
+    assert stored_mech == TARGET_MECHANISM_ID, (
+        f"cross_teacher_target resume: sidecar mechanism {stored_mech!r}, this build is "
+        f"{TARGET_MECHANISM_ID!r}. The accumulated scale is what the layering divides by, "
+        "so carrying it across a change of layering rule is neither mechanism and would not "
+        "show up in any metric. Start the arm fresh."
+    )
+    stored = dict(state.get("identity", {}))
+    for key, value in identity.items():
+        if key not in stored:
+            raise AssertionError(
+                f"cross_teacher_target resume: the checkpoint's identity does not record "
+                f"{key!r}, so it cannot be shown to describe this run. The accumulated scale "
+                "is only meaningful against a known base, teacher set and temperature; start "
+                "the arm fresh rather than assume."
+            )
+        if stored[key] != value:
+            raise AssertionError(
+                f"cross_teacher_target resume mismatch on {key!r}: checkpoint has "
+                f"{stored[key]!r}, this run has {value!r}. The accumulated scale is measured "
+                "against that, so it cannot be carried over."
+            )
+    rms.load_state_dict(state["rms"])
+    return int(state.get("step_index", 0))
+
+
 def off_task_consensus(hat_off: torch.Tensor) -> dict:
     """The off-task teachers' agreed sign and consensus volume.
 
