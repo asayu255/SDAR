@@ -1290,6 +1290,14 @@ class ActorRolloutRefWorker(Worker):
                     cache_ids, hidden, lse, w_rows, w_ids, w_lp,
                     attention_mask=data.batch["attention_mask"],
                     input_ids=data.batch["input_ids"],
+                    # Teacher-mode privileged notice: the driver prepended a
+                    # system block to THIS model's input and says by how much the
+                    # fingerprint moved, so the entry is filed under the row the
+                    # student holds. Absent on every other call.
+                    fingerprint_adjust=(
+                        data.batch["fingerprint_adjust"]
+                        if "fingerprint_adjust" in data.batch.keys() else None
+                    ),
                 )
                 # The driver only needs the row count back (it unpads by it); the
                 # values it used to merge here are now resolved in the actor.
@@ -1324,7 +1332,7 @@ class ActorRolloutRefWorker(Worker):
         return take
 
     def _cache_teacher_hidden(self, cache_ids, hidden, lse, witness_rows, witness_ids, witness_lp,
-                              attention_mask=None, input_ids=None):
+                              attention_mask=None, input_ids=None, fingerprint_adjust=None):
         """Keep this call's hidden states so the actor can score arbitrary ids later.
 
         One entry per ROW, holding every response position that carries signal,
@@ -1363,6 +1371,13 @@ class ActorRolloutRefWorker(Worker):
             # What this row IS, so the actor can check that the key it holds names
             # the row it is training. The key alone is taken on trust otherwise.
             fingerprints = row_fingerprint(input_ids, attention_mask).to("cpu")
+            if fingerprint_adjust is not None:
+                # The actor fingerprints the STUDENT's row. This forward saw that
+                # row with a notice prefixed; the fingerprint is a masked sum plus
+                # a count, so the prefix's contribution subtracts exactly
+                # (privileged_notice.fingerprint_adjust). Without this the exchange
+                # would refuse every teacher-mode entry as belonging to another row.
+                fingerprints = fingerprints - fingerprint_adjust.to("cpu").to(fingerprints.dtype)
         cache.put(
             cache_ids.to("cpu"),
             task,

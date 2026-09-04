@@ -30,6 +30,11 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
+from verl.trainer.ppo.privileged_notice import (
+    normalize_task as _notice_task,
+    notice_text as _notice_text,
+    parse_notice_config as _parse_notice_config,
+)
 from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -841,6 +846,20 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        # The privileged multitask notice, STUDENT mode: a system message chosen by
+        # the row's task, prepended to every turn's prompt at tokenisation time so
+        # it is in the rollout and in the update alike (the two must agree, since
+        # the student's log-probs are those of the policy that generated). None
+        # unless algorithm.opd.privileged_notice.enable and "student" in apply_to.
+        # Teacher mode does not pass through here at all -- see the driver.
+        self._student_notice = None
+        try:
+            _ncfg = self.config.algorithm.opd.get("privileged_notice", None)
+        except Exception:
+            _ncfg = None
+        _parsed = _parse_notice_config(_ncfg)
+        if _parsed is not None and _parsed.to_student:
+            self._student_notice = _parsed
         # ROLLOUT_PREFETCH_LOGPROB state: rows of finished trajectories waiting for
         # a prefetched compute_log_prob, and the per-row results keyed by
         # (traj_uid, turn_step). Cleared at the start of every multi_turn_loop.
@@ -968,10 +987,33 @@ class TrajectoryCollector:
             print(f"Warning: No text observation found!")
 
         
-        chat = np.array([{
+        messages = [{
             "content": obs_content,
             "role": "user",
-        }])
+        }]
+        # STUDENT-MODE NOTICE. A system message ahead of the observation, chosen by
+        # the row's task. Recorded as notice_len (its token count, 0 when absent)
+        # so the actor's effect probe can strip exactly it and ask what the same
+        # student would have said without it; and as notice_truncated, which is
+        # 1 when the whole prompt hit data.max_prompt_length -- with
+        # truncation=left the notice sits at the head and is what gets cut first.
+        notice_len = 0
+        if self._student_notice is not None:
+            _task = _notice_task(
+                gen_batch.non_tensor_batch['task_name'][item]
+                if 'task_name' in gen_batch.non_tensor_batch else None
+            )
+            if _task is not None:
+                _text = _notice_text(self._student_notice.variant, _task)
+                messages.insert(0, {"role": "system", "content": _text})
+                # The block's own tokens: the difference of the two renders, which
+                # is exact under this template (verified once by the driver).
+                _with = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False, **apply_chat_template_kwargs)
+                _without = tokenizer.apply_chat_template(
+                    messages[1:], add_generation_prompt=True, tokenize=False, **apply_chat_template_kwargs)
+                notice_len = len(tokenizer.encode(_with[: len(_with) - len(_without)], add_special_tokens=False))
+        chat = np.array(messages)
         
         # Apply chat template
         prompt_with_chat_template = tokenizer.apply_chat_template(
@@ -1051,7 +1093,13 @@ class TrajectoryCollector:
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
             'index': item,
-            'data_source': data_source
+            'data_source': data_source,
+            # Present on EVERY row (0 / 0 when the notice is off) so collate_fn
+            # stacks them into batch columns the driver and actor can read.
+            'notice_len': torch.tensor(notice_len, dtype=torch.long),
+            'notice_truncated': torch.tensor(
+                int(notice_len > 0 and int(attention_mask[0].sum()) >= int(self.config.data.max_prompt_length)),
+                dtype=torch.long),
         })
 
         if 'task_name' in gen_batch.non_tensor_batch:
@@ -1102,12 +1150,21 @@ class TrajectoryCollector:
             'anchor_obs': _obs_anchor,
             'index': item,
             'data_source': gen_batch.non_tensor_batch['data_source'][item],
+            # Finished rows are dropped by gather_rollout_data; the columns exist
+            # only so collate_fn sees one schema for the whole batch.
+            'notice_len': torch.tensor(0, dtype=torch.long),
+            'notice_truncated': torch.tensor(0, dtype=torch.long),
         }
         if 'task_name' in gen_batch.non_tensor_batch:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]
         if self.config.data.get('return_raw_chat', False):
-            chat = np.array([{"content": obs_text if obs_text is not None else '', "role": "user"}])
-            row_dict['raw_prompt'] = chat.tolist()
+            messages = [{"content": obs_text if obs_text is not None else '', "role": "user"}]
+            if self._student_notice is not None and 'task_name' in gen_batch.non_tensor_batch:
+                _task = _notice_task(gen_batch.non_tensor_batch['task_name'][item])
+                if _task is not None:
+                    messages.insert(0, {"role": "system",
+                                        "content": _notice_text(self._student_notice.variant, _task)})
+            row_dict['raw_prompt'] = np.array(messages).tolist()
         return row_dict
 
     def preprocess_batch(

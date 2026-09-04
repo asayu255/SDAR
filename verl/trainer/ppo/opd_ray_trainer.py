@@ -29,6 +29,16 @@ from verl import DataProto
 from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo.privileged_notice import (
+    TASKS as NOTICE_TASKS,
+    fingerprint_adjust as notice_fingerprint_adjust,
+    leak_flags as notice_leak_flags,
+    normalize_task as notice_normalize_task,
+    notice_prefix_ids,
+    parse_notice_config,
+    prepend_prefix as notice_prepend_prefix,
+    verify_doc_hashes as notice_verify_doc_hashes,
+)
 from verl.trainer.ppo.metric_utils import (
     _compute_response_info,
     compute_metrics_by_task,
@@ -323,7 +333,19 @@ class OPDRayTrainer(RayPPOTrainer):
         # Who needs base, the cache and the extra forwards -- as opposed to who
         # builds a weight out of them. Every gate below is this one, so adding a
         # third consumer never means finding the cache gates again.
+        # The stand-alone transfer ladder (docs/privileged_multitask_notice_design.md
+        # section 4): the four-model cache with NO weighting attached, so an arm
+        # that leaves the loss alone can still report transfer/off_travel. A
+        # fourth consumer of the same seam, and nothing more.
+        ladder_cfg = dict(opd_cfg.get("transfer_ladder", {}) or {})
+        self.transfer_ladder_enabled = bool(ladder_cfg.get("enable", False))
         self.cross_teacher_enabled = (
+            self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled
+            or self.cross_teacher_target_enabled or self.transfer_ladder_enabled
+        )
+        # The three that WEIGHT or MOVE the target, as opposed to the ladder,
+        # which only reads. On any shared setting the ladder yields to them.
+        self.weighted_arm_enabled = (
             self.sign_weight_enabled or self.cross_teacher_kl_weight_enabled
             or self.cross_teacher_target_enabled
         )
@@ -340,8 +362,40 @@ class OPDRayTrainer(RayPPOTrainer):
         self.base_policy_path = (
             xtt_cfg.get("base_path", None) if self.cross_teacher_target_enabled
             else xt_cfg.get("base_path", None) if self.cross_teacher_kl_weight_enabled
-            else sw_cfg.get("base_path", None)
+            else sw_cfg.get("base_path", None) if self.weighted_arm_enabled
+            else ladder_cfg.get("base_path", None)
         )
+        if self.transfer_ladder_enabled and not self.weighted_arm_enabled:
+            # Same three structural needs as the weighted arms -- a shared top-k
+            # support, the exact base, two off-task teachers -- for the same reason.
+            check_cross_teacher_kl_weight_prerequisites(
+                teacher_topk_kl=self.teacher_topk_kl,
+                base_policy_path=self.base_policy_path,
+                n_teachers=len(self.teacher_paths),
+            )
+        # The privileged multitask notice. Parsed once; the text hashes are
+        # checked against the lock's pins HERE, before any model loads, because
+        # the text is the mechanism and a drift is a different experiment.
+        self.privileged_notice = parse_notice_config(opd_cfg.get("privileged_notice", None))
+        self._teacher_notice_prefix = None
+        if self.privileged_notice is not None:
+            notice_verify_doc_hashes(self.privileged_notice)
+            if self.privileged_notice.to_teacher:
+                # Teacher mode: the block's token ids per task, from the tokenizer's
+                # own chat template and checked to be an exact prefix (system_block
+                # asserts). Computed once, used on every on-task call.
+                kw = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
+                self._teacher_notice_prefix = {
+                    task: notice_prefix_ids(self.tokenizer, self.privileged_notice.variant, task, kw)
+                    for task in NOTICE_TASKS
+                }
+            print(
+                f"[privileged_notice] variant={self.privileged_notice.variant} "
+                f"apply_to={sorted(self.privileged_notice.apply_to)}"
+                + (f" teacher prefix tokens={ {t: len(v) for t, v in self._teacher_notice_prefix.items()} }"
+                   if self._teacher_notice_prefix else ""),
+                flush=True,
+            )
         self.base_wg = None
         if self.sign_weight_enabled:
             check_sign_weight_prerequisites(
@@ -595,6 +649,10 @@ class OPDRayTrainer(RayPPOTrainer):
                     for name in ("input_ids", "attention_mask", "position_ids", "responses")
                 }
             )
+            # Teacher-mode notice rides the prefetch too: the on-task teacher is
+            # scored here for most rows, and a notice missing from this path would
+            # make the target depend on WHEN a row was scored.
+            sub = self._with_teacher_notice(sub, task)
             ids = (
                 torch.tensor([cache_id_for[key] for key, _ in entries], dtype=torch.long)
                 if self.student_indexed_topk
@@ -805,6 +863,70 @@ class OPDRayTrainer(RayPPOTrainer):
         # to the same entry -- reading it twice is what makes them duplicates.
         return {i: (str(traj_uid[i]), int(turn_step[i])) for i in range(len(batch))}
 
+    def _with_teacher_notice(self, sub: DataProto, task: str) -> DataProto:
+        """Teacher-mode notice: prepend the task's system block to THIS teacher's input.
+
+        Only the on-task teacher's calls come through here. The student's own rows
+        are untouched -- the rollout is the control's -- so what moves is the KL
+        target alone. Rows are re-left-padded to one width so the response window,
+        selected from the end on the worker, is where it always was, and
+        ``fingerprint_adjust`` tells the worker how much the prefix added to the
+        row fingerprint so the cache entry is filed under the STUDENT's row.
+        """
+        prefix_by_task = getattr(self, "_teacher_notice_prefix", None)
+        if prefix_by_task is None:
+            return sub
+        task = notice_normalize_task(task)
+        if task not in prefix_by_task:
+            return sub
+        pre = prefix_by_task[task]
+        pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        ids, mask, pos = notice_prepend_prefix(
+            sub.batch["input_ids"], sub.batch["attention_mask"], [pre] * len(sub), pad_token_id=pad,
+        )
+        tensors = {k: v for k, v in sub.batch.items()}
+        tensors.update({
+            "input_ids": ids, "attention_mask": mask, "position_ids": pos,
+            "fingerprint_adjust": torch.full((len(sub),), notice_fingerprint_adjust(pre), dtype=torch.long),
+        })
+        out = DataProto.from_dict(tensors=tensors, non_tensors=dict(sub.non_tensor_batch))
+        out.meta_info = dict(sub.meta_info)
+        return out
+
+    def _notice_metrics(self, batch: DataProto) -> dict:
+        """Design section 4, diagnostic 2 and the truncation floor. Per task: the
+        share of responses carrying ANOTHER task's action syntax, and the share of
+        rows whose prompt hit the cap with the notice at its head."""
+        if getattr(self, "privileged_notice", None) is None:
+            return {}
+        out = {}
+        task_names = batch.non_tensor_batch.get("task_name", None)
+        if task_names is None:
+            return out
+        texts = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+        by_task = {}
+        for i, t in enumerate(task_names):
+            nt = notice_normalize_task(t)
+            if nt in NOTICE_TASKS:
+                by_task.setdefault(nt, []).append(i)
+        n_all = leak_all = 0
+        for task, idxs in by_task.items():
+            flags = notice_leak_flags([texts[i] for i in idxs], task)
+            out[f"notice/leak_rate/{task}"] = sum(flags) / len(flags)
+            n_all += len(flags); leak_all += sum(flags)
+        if n_all:
+            out["notice/leak_rate"] = leak_all / n_all
+        if "notice_truncated" in batch.batch.keys():
+            tr = batch.batch["notice_truncated"].float()
+            nl = batch.batch["notice_len"].float()
+            out["notice/truncated_frac"] = float(tr.mean())
+            out["notice/prefix_tokens_mean"] = float(nl.mean())
+            for task, idxs in by_task.items():
+                sel = torch.tensor(idxs, dtype=torch.long)
+                out[f"notice/truncated_frac/{task}"] = float(tr[sel].mean())
+                out[f"notice/prefix_tokens/{task}"] = float(nl[sel].mean())
+        return out
+
     def compute_teacher_log_probs(self, batch: DataProto, prefetched=None, metrics=None) -> None:
         """Route each sample to its task's teacher and write the distillation
         signal into ``batch.batch`` in original order.
@@ -879,6 +1001,7 @@ class OPDRayTrainer(RayPPOTrainer):
             if not idxs:
                 continue
             sub = batch.select_idxs(idxs)
+            sub = self._with_teacher_notice(sub, task)
             miss_ids = None
             if self.student_indexed_topk:
                 miss_ids = torch.empty(len(idxs), dtype=torch.long)
@@ -1359,6 +1482,8 @@ class OPDRayTrainer(RayPPOTrainer):
                     # its off-task planes under these ids, and rebuilding the
                     # numbering separately would drift from this one.
                     self._attach_task_ids(batch)
+                    # The notice's own readouts (leak floor, truncation floor).
+                    metrics.update(self._notice_metrics(batch))
 
                     # ---- Cross-teacher sign agreement (no-op unless enabled) ---- #
                     # The weights themselves are built in the actor, where the

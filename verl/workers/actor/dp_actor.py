@@ -58,6 +58,10 @@ from verl.trainer.ppo.sign_weights import (
     turn_index,
     reweight_teacher_logprobs,
 )
+from verl.trainer.ppo.privileged_notice import (
+    parse_notice_config as _parse_notice_config,
+    strip_prefix as _strip_notice_prefix,
+)
 from verl.trainer.ppo.cross_teacher_target import (
     CURRICULUM_GRAD_ROLE_CUT_SUFFIXES as XTT_GRAD_ROLE_CUT_SUFFIXES,
     CURRICULUM_GRAD_TERMS as XTT_GRAD_TERMS,
@@ -461,6 +465,11 @@ class DataParallelPPOActor(BasePPOActor):
         # in their last bits (the expectation is identical -- summing then
         # averaging across ranks and averaging then summing are the same number).
         self.no_sync_grad_accum = bool(self.config.get("no_sync_grad_accum", False))
+        # Cadence for the privileged notice's effect probe (student mode): one
+        # extra no-grad forward on one micro-batch every N update_policy calls.
+        # A plain call counter -- the probe is a diagnostic, so being off by a
+        # few steps after a resume costs nothing.
+        self._notice_probe_counter = 0
         if self.no_sync_grad_accum:
             print("Actor no_sync_grad_accum=True (one gradient reduce per mini-batch)")
 
@@ -1948,6 +1957,21 @@ class DataParallelPPOActor(BasePPOActor):
                 "negligible -- 68.9% of the predecessor arm's effect sat there"
             )
         xtt_enabled = xtt_cfg_on and "sign_cache_ids" in data.batch.keys()
+        # The stand-alone transfer ladder: planes read, nothing weighted. Same
+        # config-vs-batch split as the three arms above and for the same reason
+        # (the accumulators run collectives, so they are built on config alone).
+        ladder_cfg = self.config.get("transfer_ladder", None)
+        ladder_cfg_on = bool(ladder_cfg and ladder_cfg.get("enable", False))
+        ladder_enabled = ladder_cfg_on and "sign_cache_ids" in data.batch.keys()
+        # The privileged notice, for the effect probe below. Student mode only:
+        # in teacher mode the student never saw the text and there is nothing
+        # to strip.
+        notice_cfg = _parse_notice_config(self.config.get("privileged_notice", None))
+        notice_probe_on = (
+            notice_cfg is not None and notice_cfg.to_student
+            and "notice_len" in data.batch.keys()
+            and (self._notice_probe_counter % max(1, int(notice_cfg.effect_probe_every))) == 0
+        )
         # The one knob, and it is a unit conversion rather than a strength dial:
         # exp(c) needs c in nats and c is in RMS units. The measured conversion is
         # 2.148 and that is what the run scripts pin; the 1.0 default here is the
@@ -2073,6 +2097,14 @@ class DataParallelPPOActor(BasePPOActor):
                 "token_level_scores" in data.batch.keys()
             ):
                 select_keys.append("token_level_scores")
+        if ladder_enabled and "sign_cache_ids" not in select_keys:
+            assert teacher_topk_kl and use_teacher_kl_loss and student_indexed_topk, (
+                "transfer_ladder reads four models on the STUDENT's top-k; it needs "
+                "kl_loss_type=topk_kl, use_teacher_kl_loss=true and student_indexed_topk=true"
+            )
+            select_keys += ["sign_cache_ids", "sign_off_tasks"]
+        if notice_probe_on:
+            select_keys.append("notice_len")
         if xtt_enabled:
             # The same two columns the arms above select, for the same reader:
             # the base and off-task cache rows, and which planes are whose.
@@ -2248,7 +2280,20 @@ class DataParallelPPOActor(BasePPOActor):
             if sign_cfg_on
             else (1.0, 1.0)
         )
-        ladder_stats = OffTaskLadderStats(n_tasks=n_task, device=sign_dev) if (transfer_on and n_task) else None
+        # Config-only, like transfer_on: the ladder is built whenever either the
+        # sign-weight arm or the standalone transfer_ladder block asks for it, so
+        # every rank reaches its all_reduce regardless of what its batch carried.
+        ladder_on = transfer_on or ladder_cfg_on
+        ladder_stats = (
+            OffTaskLadderStats(n_tasks=n_task, device=sign_dev)
+            if (ladder_on and n_task) else None
+        )
+        # The notice's effect probe: sum of per-token KL(student_with || student_without)
+        # over response positions, and the token count, per scope (pooled + task).
+        notice_probe_sums = (
+            torch.zeros((1 + n_task, 2), dtype=torch.float64, device=sign_dev)
+            if notice_cfg is not None and notice_cfg.to_student and n_task else None
+        )
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
         # The parameter-free arm's three accumulators, built on the config alone
@@ -2895,6 +2940,41 @@ class DataParallelPPOActor(BasePPOActor):
                         # gradient) and the ids that chose them, from one logits
                         # tensor -- there is no second student forward here.
                         student_topk_logprobs, student_topk_ids = student_topk_out
+                        if notice_probe_on and notice_probe_sums is not None and epoch == 0 and micro_idx == 0:
+                            # DESIGN SECTION 4, DIAGNOSTIC 1: did the notice move the
+                            # policy at all? The same student, the same response
+                            # tokens, the notice stripped from the prompt, scored at
+                            # the ids the with-notice forward chose; the reverse KL
+                            # on that support is what the loss itself would read.
+                            # One no-grad forward on one micro-batch every N steps.
+                            with torch.no_grad(), _actor_phase("actor.notice_probe"):
+                                _pad = int(data["input_ids"][0, 0].item())  # left-padded: column 0 is pad
+                                _ids, _mask, _pos = _strip_notice_prefix(
+                                    data["input_ids"].cpu(), data["attention_mask"].cpu(),
+                                    data["notice_len"].cpu(), _pad)
+                                _notice_mb = {k: v for k, v in data.items()}
+                                _notice_mb.update({"input_ids": _ids.to(data["input_ids"].device),
+                                               "attention_mask": _mask.to(data["attention_mask"].device),
+                                               "position_ids": _pos.to(data["position_ids"].device)})
+                                _, _, without_lp = self._forward_micro_batch(
+                                    micro_batch=_notice_mb, temperature=temperature,
+                                    calculate_entropy=False, topk_ids=student_topk_ids,
+                                    need_log_prob=False,
+                                )
+                                _kl = topk_kl_per_token(
+                                    student_topk_logprob=student_topk_logprobs.detach(),
+                                    teacher_topk_logprob=without_lp.detach(),
+                                )
+                                _m = response_mask.to(torch.float64)
+                                _klm = _kl.to(torch.float64) * _m
+                                notice_probe_sums[0, 0] += _klm.sum(); notice_probe_sums[0, 1] += _m.sum()
+                                if task_ids is not None:
+                                    _t = task_ids.reshape(-1).to(torch.long)
+                                    for _tid in range(n_task):
+                                        _rows = _t == _tid
+                                        if bool(_rows.any()):
+                                            notice_probe_sums[1 + _tid, 0] += _klm[_rows].sum()
+                                            notice_probe_sums[1 + _tid, 1] += _m[_rows].sum()
                         # The cross-teacher blocks below read three more models at
                         # THIS support. Asking for them here makes it one exchange
                         # instead of two -- see _all_teacher_planes. The cost lands
@@ -2903,7 +2983,7 @@ class DataParallelPPOActor(BasePPOActor):
                         # the amount this one gets dearer; the pair is what moved,
                         # not either alone.
                         with _actor_phase("actor.teacher_lookup"):
-                            if sign_enabled or xt_enabled or xtt_enabled:
+                            if sign_enabled or xt_enabled or xtt_enabled or ladder_enabled:
                                 (fwd_teacher_topk_logprobs, xt_base_plane,
                                  xt_off_planes) = self._all_teacher_planes(data, student_topk_ids)
                                 cross_planes = (student_topk_ids, xt_base_plane, xt_off_planes)
@@ -2940,6 +3020,22 @@ class DataParallelPPOActor(BasePPOActor):
                     sign_position_inputs = None
                     sign_cand_inputs = None
                     sign_base_logprob = None
+                    if ladder_stats is not None and ladder_enabled and not sign_enabled:
+                        # The ladder without any weighting arm: the same four
+                        # planes, read once, folded into the same accumulator the
+                        # sign arm feeds -- so transfer/off_travel means the same
+                        # thing on an arm that never touched the loss.
+                        with _actor_phase("actor.transfer_ladder"):
+                            _lb, _lo = self._cross_teacher_planes(data, sign_support_ids, cached=cross_planes)
+                            ladder_stats.update(
+                                student_logprob=student_topk_logprobs,
+                                on_task_logprob=sign_on_task_logprobs,
+                                base_logprob=_lb,
+                                off_task_logprobs=_lo,
+                                response_mask=response_mask,
+                                task_ids=task_ids,
+                                off_plane_tasks=data["sign_off_tasks"],
+                            )
                     if sign_enabled:
                         # Refuse rather than skip. This block used to be guarded on
                         # fwd_teacher_topk_logprobs, which is None whenever
@@ -4662,6 +4758,18 @@ class DataParallelPPOActor(BasePPOActor):
             # every rank, incremented in lockstep, so the dense-token stride
             # cannot make two ranks disagree about whether a table exists.
             self._xt_step_index += 1
+        if notice_probe_sums is not None:
+            # Reduced on every rank whether or not this rank's first micro-batch
+            # carried the probe -- the collective must be unconditional.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(notice_probe_sums, op=torch.distributed.ReduceOp.SUM)
+            _s = notice_probe_sums.detach().cpu()
+            if float(_s[0, 1]) > 0:
+                metrics["notice/effect_kl"] = float(_s[0, 0] / _s[0, 1])
+                for _tid, _name in enumerate(task_id_names or []):
+                    if float(_s[1 + _tid, 1]) > 0:
+                        metrics[f"notice/effect_kl/{_name}"] = float(_s[1 + _tid, 0] / _s[1 + _tid, 1])
+            self._notice_probe_counter += 1
         if xtt_on:
             # The scale's reduce and snapshot, in the same fixed order the other
             # arm uses and for the same reason: gated on config alone, so a rank

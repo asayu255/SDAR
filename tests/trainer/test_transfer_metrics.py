@@ -592,7 +592,11 @@ def test_the_measurement_gates_never_depend_on_batch_content():
     # target mode too gave the position arm nothing while its script asked for it.
     assert "rewrite_on = transfer_on and target_mode" in src
     assert "if rewrite_on else None" in src
-    assert "if (transfer_on and n_task) else None" in src
+    # The ladder has a second, sign-weight-free requester (transfer_ladder.enable);
+    # both are config flags, and the gate is their OR, still never the batch.
+    assert "ladder_cfg_on = bool(ladder_cfg and ladder_cfg.get" in src
+    assert "ladder_on = transfer_on or ladder_cfg_on" in src
+    assert "if (ladder_on and n_task) else None" in src
     # the constructors must read the config-only flags, never sign_enabled
     for line in src.splitlines():
         if "ScopeTermStats(" in line or "OffTaskLadderStats(" in line or "SignPairCounts(" in line:

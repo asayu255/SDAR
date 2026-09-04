@@ -93,9 +93,24 @@ def inject_distillation_config(config) -> None:
         opd_attr_cfg = opd_cfg.get("opd_attribution", None)
         if opd_attr_cfg is not None:
             config.actor_rollout_ref.actor.opd_attribution = opd_attr_cfg
+        # The privileged multitask notice (verl/trainer/ppo/privileged_notice.py).
+        # Authored under algorithm.opd like every other scientific knob; the actor
+        # needs it for the effect probe (student mode) and the driver for the
+        # rollout injection and the teacher prefix. Copied whole, so the hash pins
+        # travel with it and the resume identity sees the same block.
+        notice_cfg = opd_cfg.get("privileged_notice", None)
+        if notice_cfg is not None:
+            config.actor_rollout_ref.actor.privileged_notice = notice_cfg
+        # The stand-alone transfer ladder: the off-task planes with NO weighting,
+        # so an arm that touches neither the KL nor the target can still report
+        # transfer/off_travel. It needs the same four-model cache the weighted
+        # arms need, which is why it joins the student_indexed_topk forcing below.
+        ladder_cfg = opd_cfg.get("transfer_ladder", None)
+        if ladder_cfg is not None:
+            config.actor_rollout_ref.actor.transfer_ladder = ladder_cfg
         if (sign_cfg is not None and bool(sign_cfg.get("enable", False))) or (
             xt_cfg is not None and bool(xt_cfg.get("enable", False))
-        ):
+        ) or (ladder_cfg is not None and bool(ladder_cfg.get("enable", False))):
             # The frozen models the weights read (base, and each row's off-task
             # teachers) are scored at ids nobody knows until the training forward
             # picks a support, so they have to keep their hidden states and

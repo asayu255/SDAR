@@ -39,6 +39,11 @@ $$\mathrm{off\_travel} = \frac{\mathrm{KL}(\pi_\theta\Vert\pi_{src}) - \mathrm{K
 **したがって主要な事前予測は null である**（§5.2）。それを承知の上で走らせる、というのが 2026-09-05 の決定である。
 本文書はその決定を記録し、null が出たときに「予測どおり」と読めるようにするために、走行前に書かれている。
 
+**2026-09-05 追記（実装時）。** 操作者の読みは「この機構は特殊トークン（行動構文）の抑制を意図したものではない」であり、
+上の測定は無視して進める、と決まった。測定自体は撤回しない — 行動構文の混入が 0 であることは事実である — が、
+機構の狙いが行動構文以外の何か（語彙の選び方、reasoning の文体）にあるなら、上の 0 はその狙いの反証にはならない。
+§4 の診断 1（文書の効果量）が、狙いが実際に方策を動かしたかを直接測る。
+
 ---
 
 ## 1. 決定事項（2026-09-05 確定）
@@ -48,7 +53,7 @@ $$\mathrm{off\_travel} = \frac{\mathrm{KL}(\pi_\theta\Vert\pi_{src}) - \mathrm{K
 | A | 誰に見せるか | **教師・生徒の両方に対応**し、`apply_to` で切り替える。**初回は生徒モード** |
 | B | 「干渉するな」の行動的定義 | **他タスクの語彙・知識を輸入しない。現タスクが確立した語彙のみを使う** |
 | C | 過去 rollout を含めるか | **含めない**（文書は静的） |
-| C' | コンテキスト予算 | 教師モードでは生徒のプロンプトに入らないので無関係。**生徒モードでは入るので上限を文書ぶん引き上げる**（§3.2） |
+| C' | コンテキスト予算 | 教師モードでは生徒のプロンプトに入らないので無関係。生徒モードでは入るが、rollout の上限はグローバル 4096/left で余裕 1300+ なので**上限は変えない**（§3.2、実装時に訂正） |
 | D | どの教師に足すか | **OPD 教師（$\pi_d$）のみ**。対照が同じ教師なので、差は文書だけに帰属する |
 | E | 対照 | **プラセボ B のみ**（同じ指示から複数タスクの明示だけを抜いたもの）。プラセボ A（長さ対照）は置かない |
 | F | 事前検定 | **行わない**。代わりに run 内診断を必須にする（§4） |
@@ -97,14 +102,16 @@ that do not belong to this environment can surface here」と続く。第 3・4 
 
 ### 2.3 トークン数とハッシュ（intent lock に固定する）
 
-| variant / task | tokens (system msg) | 引き上げ後の上限 | sha256[:12] |
-|---|---:|---:|---|
-| named / alfworld | 193 | 2241 | `46f6f162d9fb` |
-| named / search | 196 | 4292 | `35500e7a3bec` |
-| named / webshop | 199 | 4295 | `c58107a11ff3` |
-| placebo / alfworld | 149 | 2197 | `53b879e2adb6` |
-| placebo / search | 149 | 4245 | `a382c97fdebf` |
-| placebo / webshop | 152 | 4248 | `a4774a75f179` |
+| variant / task | tokens (system msg) | sha256[:12] |
+|---|---:|---|
+| named / alfworld | 193 | `46f6f162d9fb` |
+| named / search | 196 | `35500e7a3bec` |
+| named / webshop | 199 | `c58107a11ff3` |
+| placebo / alfworld | 149 | `53b879e2adb6` |
+| placebo / search | 149 | `a382c97fdebf` |
+| placebo / webshop | 152 | `a4774a75f179` |
+
+（初版にあった「引き上げ後の上限」列は §3.2 の訂正により削除。）
 
 **文書は設定の細部ではなく機構そのものなので、本文のハッシュを lock に固定する。** run ごとに書き換えられては
 比較が壊れる。
@@ -115,6 +122,14 @@ that do not belong to this environment can surface here」と続く。第 3・4 
 
 ### 3.1 挿入点
 
+**system ブロックは chat template 上で厳密な接頭辞である**（実測: `template([system, user]) == "<|im_start|>system\n{text}<|im_end|>\n" + template([user])`、
+文字列でもトークン列でも成立、8 トークン + 本文）。したがって生徒モードの system メッセージと教師モードのトークン前置は
+**同一のトークン列**を生み、1 つの実装で両モードを扱える。起動時にこの性質を assert する。
+
+**生徒モードでは教師も文書を見る。** on-task 教師は生徒の (prompt, response) をそのまま採点するので、生徒のプロンプトに
+入った文書は教師の文脈にも入る。これは「共有文脈」の意味論であり、KL は同じ文脈上の 2 分布の間で取られる。
+base と off-task 教師（ladder 用）は文書を見ない。
+
 教師モードでは、教師の forward にだけ system メッセージとして前置する。生徒の `input_ids` は変わらないので
 `max_prompt_length` も `truncation` も無関係。教師の系列が 193–199 トークン伸びるが、`response_only_logits=True`
 で lm_head は応答行にしか掛からず、`timing_s/teacher_forward` は 0.47–0.85 秒（`update_actor` 226–306 秒に対し
@@ -124,19 +139,28 @@ that do not belong to this environment can surface here」と続く。第 3・4 
 update 時だけ足すことはできない。したがって**軌跡そのものが変わり、報酬も変わる**。教師モードが KL の目標だけを
 動かすのに対し、生徒モードははるかに大きな介入である。
 
-### 3.2 コンテキスト予算（生徒モードのみ）
+### 3.2 コンテキスト予算（生徒モードのみ）— 実装時に訂正
 
-実測プロンプト長と上限:
+**初版の前提が誤っていた。** per-task の上限（`data.task_overrides.<task>.max_prompt_length` と `truncation=error`）は
+**データセットの初期プロンプトのフィルタにしか効かない**（`rl_dataset.py`）。rollout の各ターンでプロンプトを
+トークン化する `TrajectoryCollector.preprocess_single_sample` は**グローバルの** `data.max_prompt_length=4096` と
+`data.truncation=left` を使う。したがって「alfworld で 2048 を超えると run が死ぬ」は成立せず、超過時は
+**左から黙って切り詰められる**。文書は system メッセージとして先頭にあるので、切り詰めが起きれば**文書が最初に消える**。
 
-| task | 平均 | 最大 | 現上限 | truncation | 文書後の最大 |
-|---|---:|---:|---:|---|---:|
-| alfworld | 521 | 1249 | 2048 | **error** | 1442 |
-| search | 699 | 2214 | 4096 | left | 2410 |
-| webshop | 1265 | 2554 | 4096 | **error** | 2753 |
+実測プロンプト長（system 文書を除く）と、文書を足した最大:
 
-alfworld と webshop は `truncation=error` なので**超過は run の死**である。上限を**文書のトークン数ぶんちょうど**
-引き上げる（§2.3 の表）。これでタスク本文に使える実効予算が control と同一に保たれ、かつ本アームとプラセボの
-間でも同一になる。上限そのものは arm ごとに違う値になるが、それが正しい。
+| task | 平均 | 最大 | 文書後の最大 | 4096 までの余裕 |
+|---|---:|---:|---:|---:|
+| alfworld | 521 | 1249 | 1442 | 2654 |
+| search | 699 | 2214 | 2410 | 1686 |
+| webshop | 1265 | 2554 | 2753 | 1343 |
+
+どのタスクも 4096 に対して 1300 トークン以上の余裕があるので、**上限は変えない**（初版の 2241 / 2197 は撤回）。
+上限を変えないことで、両アームと control の実効予算は自動的に同一になる。代わりに、文書が切り詰められた行の割合を
+`notice/truncated_frac/<task>` として毎 step 出し、0 であることを確認する（§4）。
+
+**教師モードでは**文書は生徒の `input_ids` に入らず、教師 forward の系列だけが伸びる。そちらの上限は
+`log_prob_max_token_len_per_gpu=18432` で、無関係。
 
 ### 3.3 config
 
@@ -144,11 +168,22 @@ alfworld と webshop は `truncation=error` なので**超過は run の死**で
 algorithm.opd.privileged_notice.enable: true
 algorithm.opd.privileged_notice.apply_to: [student]      # [teacher] / [student] / 両方
 algorithm.opd.privileged_notice.variant: named           # named / placebo
-algorithm.opd.privileged_notice.path: <per-task 本文を持つ 1 ファイル>
 algorithm.opd.privileged_notice.doc_sha256: {alfworld: ..., search: ..., webshop: ...}
+algorithm.opd.privileged_notice.effect_probe_every: 5    # §4 診断 1 の頻度
+algorithm.opd.transfer_ladder.enable: true               # §4 の ladder（重み付けなし）
+algorithm.opd.transfer_ladder.base_path: Qwen/Qwen3-1.7B
 ```
 
-既定は `enable: false` かつ `apply_to: []` で、そのとき control と bit 一致。
+既定は `enable: false` で、そのとき control と bit 一致。**本文はファイルではなくコード**
+（`verl/trainer/ppo/privileged_notice.py`）に置く — ファイルは編集される物だから。`apply_to` が空の `enable: true` は
+起動時に拒否する（誰にも見せない通知は、アームの名で control を走らせることになる）。
+
+**実装（2026-09-05）。** 生徒モードの挿入点は `TrajectoryCollector.preprocess_single_sample`（全ターンがここを通る）で、
+行ごとに `notice_len`（通知のトークン数、無ければ 0）と `notice_truncated`（プロンプトが上限に達した = 通知が
+左から切られた）の 2 列を載せる。教師モードは全教師 forward の漏斗 `_teacher_call` の**呼び出し側 2 箇所**（rollout 後の
+on-task 呼び出しと prefetch の on-task 呼び出し）で on-task 教師にだけ前置し、worker 側で `fingerprint_adjust` を
+引いて生徒の行として cache に登録する。ladder は `transfer_ladder.enable` で sign_weight なしに planes を読む
+第 4 の消費者として driver/actor 両方にゲートを足した。
 
 ---
 
@@ -167,6 +202,12 @@ run 内で分けられなければならない。** 最低限、次の 3 つを�
 
 加えて、既存の off-task ladder（`transfer/off_travel/<dst>__on__<src>`）を両アームで有効にする。
 文書が「輸入するな」として効いているなら off_travel は**上がる**はずで、これは方向の確認になる。
+
+**指標名（実装）。** 診断 1 = `notice/effect_kl`, `notice/effect_kl/<task>`（`effect_probe_every` step ごと、
+epoch 0 の最初の micro-batch で、通知を剥がした同じ生徒を同じ top-k で読み直した reverse KL）。
+診断 2 = `notice/leak_rate`, `notice/leak_rate/<task>`（他タスクの行動構文 5 種; 語彙リストは §0 で
+偽陽性だったので使わない）。床 = `notice/truncated_frac`, `notice/truncated_frac/<task>`, `notice/prefix_tokens/<task>`。
+ladder = `transfer/off_travel/<dst>__on__<src>` と `transfer/kl_to_off/{base,on,stu}/<pair>`。
 
 ---
 
