@@ -860,6 +860,14 @@ class TrajectoryCollector:
         _parsed = _parse_notice_config(_ncfg)
         if _parsed is not None and _parsed.to_student:
             self._student_notice = _parsed
+        # Decision G: the student sees the document during TRAINING ONLY, so that
+        # evaluation is identical to the control's and the arms are scored on the
+        # same prompts. Validation runs on its own collector instances built from
+        # the same config (ray_trainer's pipeline slots), so the config alone
+        # cannot tell the two apart -- multi_turn_loop sets this from is_train.
+        # True here because a direct preprocess call, which only tests make, is
+        # a training-shaped call.
+        self._notice_active = True
         # ROLLOUT_PREFETCH_LOGPROB state: rows of finished trajectories waiting for
         # a prefetched compute_log_prob, and the per-row results keyed by
         # (traj_uid, turn_step). Cleared at the start of every multi_turn_loop.
@@ -998,7 +1006,7 @@ class TrajectoryCollector:
         # 1 when the whole prompt hit data.max_prompt_length -- with
         # truncation=left the notice sits at the head and is what gets cut first.
         notice_len = 0
-        if self._student_notice is not None:
+        if self._student_notice is not None and self._notice_active:
             _task = _notice_task(
                 gen_batch.non_tensor_batch['task_name'][item]
                 if 'task_name' in gen_batch.non_tensor_batch else None
@@ -1159,7 +1167,8 @@ class TrajectoryCollector:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]
         if self.config.data.get('return_raw_chat', False):
             messages = [{"content": obs_text if obs_text is not None else '', "role": "user"}]
-            if self._student_notice is not None and 'task_name' in gen_batch.non_tensor_batch:
+            if (self._student_notice is not None and self._notice_active
+                    and 'task_name' in gen_batch.non_tensor_batch):
                 _task = _notice_task(gen_batch.non_tensor_batch['task_name'][item])
                 if _task is not None:
                     messages.insert(0, {"role": "system",
@@ -1941,6 +1950,11 @@ class TrajectoryCollector:
         Returns:
             DataProto: Final collected trajectory data with metadata.
         """
+        # Decision G, enforced at the one entry point both loops go through:
+        # the notice is a training-time input, and a validation rollout must
+        # build the same prompt the control would have built.
+        self._notice_active = bool(is_train)
+
         if is_train:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
 

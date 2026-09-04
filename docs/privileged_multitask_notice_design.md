@@ -57,7 +57,7 @@ $$\mathrm{off\_travel} = \frac{\mathrm{KL}(\pi_\theta\Vert\pi_{src}) - \mathrm{K
 | D | どの教師に足すか | **OPD 教師（$\pi_d$）のみ**。対照が同じ教師なので、差は文書だけに帰属する |
 | E | 対照 | **プラセボ B のみ**（同じ指示から複数タスクの明示だけを抜いたもの）。プラセボ A（長さ対照）は置かない |
 | F | 事前検定 | **行わない**。代わりに run 内診断を必須にする（§4） |
-| G | 生徒モードの評価時 | **訓練時のみ**。評価は control と完全に同一 |
+| G | 生徒モードの評価時 | **訓練時のみ**。評価は control と完全に同一（実装: `TrajectoryCollector._notice_active` を `multi_turn_loop(is_train=)` から設定。検証は専用の collector インスタンスで走るため、config だけでは訓練と区別できない） |
 | H | $\beta$ | 0.01 のまま（比較可能性） |
 
 ---

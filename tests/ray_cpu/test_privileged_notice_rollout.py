@@ -129,3 +129,31 @@ def test_placeholder_rows_carry_the_same_columns():
     from verl.utils.dataset.rl_dataset import collate_fn
     batch = collate_fn([live, ph])
     assert batch["notice_len"].tolist() == [int(live["notice_len"]), 0]
+
+
+def test_validation_rollouts_build_the_controls_prompt():
+    """Decision G. The document is a TRAINING-time input: if it were also in the
+    validation prompt, the arm and the control would be scored on different
+    inputs and the 150-step numbers would not be comparable. Validation runs on
+    its own collector instances, built from the SAME config as the training one
+    (ray_trainer's pipeline slots), so the config cannot tell them apart -- only
+    is_train can."""
+    c = _collector("named", ["student"])
+    c._notice_active = False                       # what multi_turn_loop(is_train=False) sets
+    row = _row(c, "alfworld")
+    plain = _row(_collector(None, []), "alfworld")
+    assert row["raw_prompt"][0]["role"] == "user"
+    assert int(row["notice_len"]) == 0 and int(row["notice_truncated"]) == 0
+    assert row["input_ids"].tolist() == plain["input_ids"].tolist()
+
+
+def test_the_entry_point_sets_the_gate_from_is_train():
+    """And the flag is really driven by the one call both loops go through, so
+    no rollout path can reach preprocess with a stale value."""
+    src = open("agent_system/multi_turn_rollout/rollout_loop.py").read()
+    body = src[src.index("    def multi_turn_loop("):]
+    nxt = body.find("\n    def ", 1)
+    body = body if nxt < 0 else body[:nxt]        # it is currently the last method
+    assert "self._notice_active = bool(is_train)" in body
+    # and before either loop is dispatched
+    assert body.index("self._notice_active = bool(is_train)") < body.index("dynamic_multi_turn_loop(")
