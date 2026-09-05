@@ -60,6 +60,18 @@ $$\mathrm{off\_travel} = \frac{\mathrm{KL}(\pi_\theta\Vert\pi_{src}) - \mathrm{K
 | G | 生徒モードの評価時 | **訓練時のみ**。評価は control と完全に同一（実装: `TrajectoryCollector._notice_active` を `multi_turn_loop(is_train=)` から設定。検証は専用の collector インスタンスで走るため、config だけでは訓練と区別できない） |
 | H | $\beta$ | 0.01 のまま（比較可能性） |
 
+**2026-09-05 追記（教師アーム）。** 教師モードの run script と intent lock を追加した
+（`run_multitask_privileged_notice_{named,placebo}_teacher_qwen3.sh`）。生徒モードとの差は
+`apply_to` のみで、本文・ハッシュ・ladder・その他すべて同一である（`test_the_two_modes_differ_in_who_reads_the_document_only`）。
+
+教師モードには **§4 診断 1（`notice/effect_kl`）が存在しない。** あの probe は生徒から
+接頭辞を剥がして同じトークン上で KL を取るもので、生徒が文書を持っていない教師モードでは
+意味を成さない。教師側の等価物は「on-task 教師を接頭辞なしでもう一度読み、同じ生徒 ids に
+射影して差を取る」であり、これは base / off-task 教師と並ぶ**第 4 の cached plane** が要る。
+未実装である。したがって教師アームは「文書がターゲットを動かさなかった」と
+「動かしたが効果がなかった」を区別できない。粗い代替として `actor/teacher_kl_loss/<task>` を
+control と比べる（同じ生徒が動いたターゲットに対して測る値）。
+
 ---
 
 ## 2. 文書
