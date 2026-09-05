@@ -191,14 +191,17 @@ def _rows():
 def test_prepend_keeps_rows_end_aligned_and_rebuilds_positions():
     ids, mask, pad = _rows()
     out, m, pos = pn.prepend_prefix(ids, mask, [[7, 8, 9], [7]], pad)
-    assert out.shape == (2, 9)
-    assert out[0].tolist()[-7:] == [7, 8, 9, 11, 12, 13, 14]
-    assert out[1].tolist()[-6:] == [7, 21, 22, 23, 24, 25]
+    # Row 0 has 2 left pads and wants 3, so the tensor widens by exactly that
+    # deficit -- never by the prefix length, which would push every row's tail.
+    assert out.shape == (2, 7)
+    assert out[0].tolist() == [7, 8, 9, 11, 12, 13, 14]
+    assert out[1].tolist() == [0, 7, 21, 22, 23, 24, 25]
     assert m.sum(-1).tolist() == [7, 6]
-    assert pos[0].tolist()[-7:] == list(range(7))
+    assert pos[0].tolist() == list(range(7))
     assert pos[1].tolist()[-6:] == list(range(6))
-    # the response tail is still the row's last tokens, untouched
+    # the tail -- the response window's columns -- is byte-identical
     assert out[:, -3:].tolist() == ids[:, -3:].tolist()
+    assert m[:, -3:].tolist() == mask[:, -3:].tolist()
 
 
 def test_strip_is_the_inverse_of_prepend_up_to_width():
@@ -237,3 +240,95 @@ def test_leak_patterns_name_the_other_tasks_syntax_only():
     assert pn.leak_flags(["<action>go to</action>"], "search") == [True]
     # ordinary English "go to" is NOT leakage -- the word list was dropped for this
     assert pn.leak_flags(["I will go to the next step of reasoning."], "search") == [False]
+
+
+# ---------------------------------------------------------------------------
+# The verl row layout, which is what both helpers actually operate on:
+#   [left pad | prompt | response | right pad]
+# with the prompt region a fixed width, and every reader downstream anchored to
+# the END. The teacher cache takes the response window as
+# attention_mask[:, -resp-1:-1] and REFUSES a window that is not [live..., pad].
+# A helper that repacks the live tokens right-aligned passes a toy row with no
+# right padding and destroys every real one, so the fixtures here carry it.
+# ---------------------------------------------------------------------------
+P_W, R_W, PAD = 16, 8, 0
+
+
+def _verl_rows():
+    """Two rows with different prompt AND response lengths, plus a row whose
+    left padding is smaller than the prefix (the widening case)."""
+    ids = torch.zeros((3, P_W + R_W), dtype=torch.long)
+    mask = torch.zeros((3, P_W + R_W), dtype=torch.long)
+    for i, (p_len, r_len) in enumerate([(5, 3), (12, 8), (15, 1)]):
+        ids[i, P_W - p_len:P_W] = torch.arange(100 + 10 * i, 100 + 10 * i + p_len)
+        mask[i, P_W - p_len:P_W] = 1
+        ids[i, P_W:P_W + r_len] = torch.arange(900 + 10 * i, 900 + 10 * i + r_len)
+        mask[i, P_W:P_W + r_len] = 1
+    return ids, mask
+
+
+def _window(mask, resp_w=R_W):
+    """What the worker hands the cache as live_mask."""
+    return mask[:, -resp_w - 1:-1]
+
+
+def _is_prefix(win):
+    lens = win.sum(-1)
+    slot = torch.arange(win.shape[1]).unsqueeze(0)
+    return bool(torch.equal(win.bool(), slot < lens.unsqueeze(1)))
+
+
+def test_the_teacher_prefix_leaves_the_response_window_exactly_where_it_was():
+    ids, mask = _verl_rows()
+    pre = [[7, 7, 7], [7, 7, 7], [7, 7, 7]]
+    out_ids, out_mask, out_pos = pn.prepend_prefix(ids, mask, pre, PAD)
+    grew = out_ids.shape[1] - ids.shape[1]
+    assert grew == 2, grew                       # only row 2 (1 left pad) needed room
+    # the tail -- prompt end and the whole response window -- is untouched
+    assert torch.equal(out_ids[:, -R_W:], ids[:, -R_W:])
+    assert torch.equal(out_mask[:, -R_W:], mask[:, -R_W:])
+    # and the window the cache checks is still a prefix, as it was before
+    assert _is_prefix(_window(mask)) and _is_prefix(_window(out_mask))
+    # the prefix really is live, immediately before the prompt
+    for i in range(3):
+        assert int(out_mask[i].sum()) == int(mask[i].sum()) + 3
+    assert torch.equal(out_pos, (out_mask.cumsum(-1) - 1).clamp(min=0))
+
+
+def test_the_prefix_moves_the_fingerprint_by_exactly_the_adjustment():
+    from verl.workers.teacher_cache import row_fingerprint
+    ids, mask = _verl_rows()
+    pre = [[7, 11, 13]] * 3
+    out_ids, out_mask, _ = pn.prepend_prefix(ids, mask, pre, PAD)
+    adj = pn.fingerprint_adjust(pre[0])
+    assert torch.equal(row_fingerprint(out_ids, out_mask) - adj, row_fingerprint(ids, mask))
+
+
+def test_stripping_the_notice_keeps_every_other_column_in_place():
+    """What the actor's effect probe needs: the response tokens must be scored at
+    the same positions as the forward it is differenced against."""
+    ids, mask = _verl_rows()
+    n = torch.tensor([3, 3, 1])
+    out_ids, out_mask, out_pos = pn.strip_prefix(ids, mask, n, PAD)
+    assert out_ids.shape == ids.shape
+    # response window byte-identical, and the prompt tail too
+    assert torch.equal(out_ids[:, -R_W:], ids[:, -R_W:])
+    assert torch.equal(out_mask[:, -R_W:], mask[:, -R_W:])
+    assert _is_prefix(_window(out_mask))
+    for i in range(3):
+        assert int(out_mask[i].sum()) == int(mask[i].sum()) - int(n[i])
+        # exactly the first n live tokens went away; the rest kept their columns
+        f = int(mask[i].bool().float().argmax())
+        assert torch.equal(out_mask[i, f + int(n[i]):], mask[i, f + int(n[i]):])
+        assert torch.equal(out_ids[i, f + int(n[i]):], ids[i, f + int(n[i]):])
+    assert torch.equal(out_pos, (out_mask.cumsum(-1) - 1).clamp(min=0))
+
+
+def test_a_prepended_row_strips_back_to_the_original():
+    ids, mask = _verl_rows()
+    pre = [[7, 11, 13]] * 3
+    out_ids, out_mask, _ = pn.prepend_prefix(ids, mask, pre, PAD)
+    back_ids, back_mask, _ = pn.strip_prefix(out_ids, out_mask, torch.tensor([3, 3, 3]), PAD)
+    grew = out_ids.shape[1] - ids.shape[1]
+    assert torch.equal(back_mask[:, grew:], mask)
+    assert torch.equal(back_ids[:, grew:] * back_mask[:, grew:], ids * mask)

@@ -256,25 +256,48 @@ def prepend_prefix(input_ids: torch.Tensor, attention_mask: torch.Tensor,
                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Put a per-row prefix between the left padding and the row's first real token.
 
-    Rows are left-padded to one width. The result is re-left-padded to
-    ``width + max(len(prefix))`` so every row still ends at the same column --
-    the response window is selected from the END (``[-resp-1:-1]``) on the
-    worker, so the prepend is invisible to it. ``position_ids`` are rebuilt from
-    the new mask.
+    EVERY OTHER COLUMN KEEPS ITS ROLE. A row here is
+    ``[left pad | prompt | response | right pad]`` and the readers downstream are
+    anchored to the END of it: the worker takes the response window as
+    ``attention_mask[:, -response_length-1:-1]`` and the teacher cache REQUIRES
+    that window to be ``[live..., pad...]`` -- a prefix. So the prefix is written
+    into left padding the row already has, in place, and the tail is not touched.
+
+    Repacking the live tokens right-aligned instead (what the first version did)
+    deletes each row's right padding, which slides the response out of its window:
+    the cache then either refuses the batch ("this batch has holes") or, worse,
+    stores hidden states taken at prompt positions.
+
+    Only when some row has less left padding than its prefix is the tensor
+    widened, by that deficit, on the LEFT -- which leaves the tail where it was.
+    With a 4096-wide prompt region and prompts under 2800 tokens this never fires.
+
+    Returns (input_ids, attention_mask, position_ids); position_ids are rebuilt
+    from the new mask.
     """
     bs, width = input_ids.shape
     lens = [len(p) for p in prefix_ids]
     assert len(lens) == bs, f"{len(lens)} prefixes for {bs} rows"
-    new_w = width + (max(lens) if lens else 0)
-    out_ids = torch.full((bs, new_w), int(pad_token_id), dtype=input_ids.dtype)
-    out_mask = torch.zeros((bs, new_w), dtype=attention_mask.dtype)
+    if bs == 0:
+        return input_ids.clone(), attention_mask.clone(), torch.zeros_like(input_ids)
+
+    # first live column per row; a fully padded row is treated as having room
+    live = attention_mask.bool()
+    any_live = live.any(dim=1)
+    first = torch.where(any_live, live.float().argmax(dim=1), torch.full((bs,), width))
+    deficit = max(0, int(max(int(lens[i]) - int(first[i]) for i in range(bs))))
+
+    out_ids = torch.full((bs, width + deficit), int(pad_token_id), dtype=input_ids.dtype)
+    out_mask = torch.zeros((bs, width + deficit), dtype=attention_mask.dtype)
+    out_ids[:, deficit:] = input_ids
+    out_mask[:, deficit:] = attention_mask
     for i in range(bs):
-        live = attention_mask[i].bool()
-        toks = input_ids[i][live]
-        pre = torch.tensor(list(prefix_ids[i]), dtype=input_ids.dtype)
-        row = torch.cat([pre, toks])
-        out_ids[i, new_w - row.numel():] = row
-        out_mask[i, new_w - row.numel():] = 1
+        n = int(lens[i])
+        if n == 0:
+            continue
+        stop = int(first[i]) + deficit          # the row's first live column, shifted
+        out_ids[i, stop - n:stop] = torch.tensor(list(prefix_ids[i]), dtype=input_ids.dtype)
+        out_mask[i, stop - n:stop] = 1
     pos = (out_mask.cumsum(-1) - 1).clamp(min=0).to(torch.long)
     return out_ids, out_mask, pos
 
@@ -282,24 +305,33 @@ def prepend_prefix(input_ids: torch.Tensor, attention_mask: torch.Tensor,
 def strip_prefix(input_ids: torch.Tensor, attention_mask: torch.Tensor,
                  notice_len: torch.Tensor, pad_token_id: int
                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Remove the first ``notice_len[i]`` live tokens of each row; keep the width.
+    """Turn each row's first ``notice_len[i]`` live tokens back into left padding.
 
-    The inverse of the student-mode injection, used by the actor's effect probe
-    to ask what the student would have said without the notice, on the same
-    response tokens.
+    The inverse of the student-mode injection, used by the actor's effect probe to
+    ask what the same student would have said WITHOUT the notice, on the same
+    response tokens. Done in place for the reason prepend_prefix gives: the probe
+    compares its output against a forward on the original row position by
+    position, so every column after the notice has to stay where it is. Repacking
+    the row right-aligned deletes the right padding and slides the response, which
+    makes the probe compare two different positions and report a KL of tens of
+    nats where the true answer is a fraction of one.
     """
     bs, width = input_ids.shape
-    out_ids = torch.full_like(input_ids, int(pad_token_id))
-    out_mask = torch.zeros_like(attention_mask)
+    out_ids = input_ids.clone()
+    out_mask = attention_mask.clone()
+    live = attention_mask.bool()
+    any_live = live.any(dim=1)
+    first = torch.where(any_live, live.float().argmax(dim=1), torch.full((bs,), width))
     for i in range(bs):
-        live = attention_mask[i].bool()
-        toks = input_ids[i][live]
         n = int(notice_len[i])
-        keep = toks[n:] if n > 0 else toks
-        out_ids[i, width - keep.numel():] = keep
-        out_mask[i, width - keep.numel():] = 1
+        if n <= 0:
+            continue
+        f = int(first[i])
+        out_ids[i, f:f + n] = int(pad_token_id)
+        out_mask[i, f:f + n] = 0
     pos = (out_mask.cumsum(-1) - 1).clamp(min=0).to(torch.long)
     return out_ids, out_mask, pos
+
 
 
 # --------------------------------------------------------------------------- #

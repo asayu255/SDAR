@@ -60,6 +60,21 @@ $$\mathrm{off\_travel} = \frac{\mathrm{KL}(\pi_\theta\Vert\pi_{src}) - \mathrm{K
 | G | 生徒モードの評価時 | **訓練時のみ**。評価は control と完全に同一（実装: `TrajectoryCollector._notice_active` を `multi_turn_loop(is_train=)` から設定。検証は専用の collector インスタンスで走るため、config だけでは訓練と区別できない） |
 | H | $\beta$ | 0.01 のまま（比較可能性） |
 
+**2026-09-05 追記（実装バグと修正）。** 教師アームの初回起動が step 1 で落ちた:
+`teacher cache expects each row's live response positions to be a prefix`。原因は
+`prepend_prefix` / `strip_prefix` が行の live トークンを**右詰めし直していた**こと。
+verl の行は `[left pad | prompt | response | right pad]` で、下流は**末尾基準**で読む
+（worker は応答窓を `attention_mask[:, -resp-1:-1]` として取り、teacher cache はその窓が
+`[live..., pad]` であることを要求する）。右詰めは各行の right pad を消し、応答を窓の外へ
+滑らせる。両関数を**その場書き込み**に直した。接頭辞は行が既に持つ left padding に書き、
+左 padding が足りない行がある場合のみ不足分だけ左に広げる。末尾は 1 列も動かない。
+
+同じバグが生徒アームの `notice/effect_kl` を壊していた。probe は接頭辞を剥がした行を
+同じ位置で採点し直すが、右詰めによって応答が別の位置にずれ、KL が 23.2 nats という
+実際の 40 倍の値になっていた（run 内の他の KL はすべて 0.1〜1.0）。**生徒 run の学習自体は
+影響を受けない** — probe は `torch.no_grad()` の計測専用で、勾配にも損失にも入らない。
+step 150 まで走った生徒 run の `notice/effect_kl` の値のみ無効である。
+
 **2026-09-05 追記（教師アーム）。** 教師モードの run script と intent lock を追加した
 （`run_multitask_privileged_notice_{named,placebo}_teacher_qwen3.sh`）。生徒モードとの差は
 `apply_to` のみで、本文・ハッシュ・ladder・その他すべて同一である（`test_the_two_modes_differ_in_who_reads_the_document_only`）。
