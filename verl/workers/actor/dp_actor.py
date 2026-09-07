@@ -259,6 +259,28 @@ def response_row_selection(indices: torch.Tensor, seqlen: int, response_length: 
     return sel, indices[sel], seq_pos[sel] - lo
 
 
+def response_scatter_indices(sel_indices: torch.Tensor, sel_slot: torch.Tensor, seqlen: int, response_length: int):
+    """Where the selected rows go in a ``(bs, response_length, ...)`` grid.
+
+    ``pad_input`` scatters into whatever grid its ``seqlen`` describes, so
+    handing it these indices and ``seqlen=response_length`` builds the response
+    window DIRECTLY, instead of building a full ``(bs, seqlen, ...)`` tensor and
+    slicing the window out of it.
+
+    The slice was not free. It allocated and zero-filled the whole sequence --
+    9x the window at seqlen 4608 and response_length 512 -- and the result was a
+    VIEW, so anything that kept the slice (the per-micro-batch hidden-state list
+    in ``_forward_micro_batches_topk``) kept the full storage alive with it,
+    until the concat at the end.
+
+    ``sel_indices`` are positions in the flattened ``(bs, seqlen)`` grid and
+    ``sel_slot`` is each one's column in the window, both from
+    :func:`response_row_selection`; the row is the same in either grid, so the
+    map is ``row * response_length + slot``.
+    """
+    return (sel_indices // seqlen) * response_length + sel_slot
+
+
 def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses_sequence_parallel_size: int):
     """Refuse a configuration whose loss the per-task row weights do not describe.
 
@@ -572,11 +594,12 @@ class DataParallelPPOActor(BasePPOActor):
             # Use float32 for pad_input: bf16 cannot represent vocab ids
             # (>256) exactly, and float32 keeps log-probs precise.
             t_lp_rmpad = (tvals - lse).float()
-            full_t_lp = pad_input(t_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-            full_t_id = pad_input(tids.float(), indices=sel_indices, batch=batch_size, seqlen=seqlen)
+            resp_idx = response_scatter_indices(sel_indices, sel_slot, seqlen, response_length)
             return (
-                full_t_lp[:, -response_length - 1 : -1, :],
-                full_t_id[:, -response_length - 1 : -1, :].round().long(),
+                pad_input(t_lp_rmpad, indices=resp_idx, batch=batch_size, seqlen=response_length),
+                pad_input(tids.float(), indices=resp_idx, batch=batch_size, seqlen=response_length)
+                .round()
+                .long(),
             )
         # Read topk_ids (bs, response_len, k) directly at each selected row's
         # (sample, response-slot). The original path scattered it into a
@@ -584,8 +607,12 @@ class DataParallelPPOActor(BasePPOActor):
         # which is the same map computed the long way round.
         ids_resp = topk_ids[sel_indices // seqlen, sel_slot]  # (n_resp, k)
         s_lp_rmpad = (logits_resp.gather(-1, ids_resp) - lse).float()  # (n_resp, k), keeps grad
-        full_s_lp = pad_input(s_lp_rmpad, indices=sel_indices, batch=batch_size, seqlen=seqlen)
-        return full_s_lp[:, -response_length - 1 : -1, :]
+        return pad_input(
+            s_lp_rmpad,
+            indices=response_scatter_indices(sel_indices, sel_slot, seqlen, response_length),
+            batch=batch_size,
+            seqlen=response_length,
+        )
 
     def _all_teacher_planes(self, data, support_ids):
         """``(on_task, base, off_teachers)`` at ``support_ids``, in ONE exchange.
@@ -1370,23 +1397,21 @@ class DataParallelPPOActor(BasePPOActor):
                             labels=input_ids_rmpad_rolled[sel],
                             inplace_backward=False,  # topk/entropy below read logits_resp
                         )
-                        full_log_probs = pad_input(
+                        log_probs = pad_input(
                             hidden_states=log_probs_resp.unsqueeze(-1),
-                            indices=sel_indices,
+                            indices=response_scatter_indices(sel_indices, sel_slot, seqlen, response_length),
                             batch=batch_size,
-                            seqlen=seqlen,
-                        )
-                        log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+                            seqlen=response_length,
+                        ).squeeze(-1)
 
                     if calculate_entropy:
                         entropy_resp = self.compute_entropy_from_logits(logits_resp)
-                        full_entropy = pad_input(
+                        entropy = pad_input(
                             hidden_states=entropy_resp.unsqueeze(-1),
-                            indices=sel_indices,
+                            indices=response_scatter_indices(sel_indices, sel_slot, seqlen, response_length),
                             batch=batch_size,
-                            seqlen=seqlen,
-                        )
-                        entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                            seqlen=response_length,
+                        ).squeeze(-1)
 
                     if topk_k is not None or topk_ids is not None or return_lse:
                         # One reduction over (n_resp, vocab), shared. This is the
@@ -1419,9 +1444,14 @@ class DataParallelPPOActor(BasePPOActor):
                                 {
                                     "lse": lse_resp.float(),
                                     "sel": sel,
-                                    "sel_indices": sel_indices,
+                                    # The window map, not the full-sequence one:
+                                    # the consumer keeps these per micro-batch,
+                                    # so a full-sequence scatter would keep 9x
+                                    # the storage alive until the concat.
+                                    "resp_indices": response_scatter_indices(
+                                        sel_indices, sel_slot, seqlen, response_length
+                                    ),
                                     "batch_size": batch_size,
-                                    "seqlen": seqlen,
                                     "response_length": response_length,
                                 },
                             )
@@ -1592,17 +1622,64 @@ class DataParallelPPOActor(BasePPOActor):
                 f"teacher_kl_loss_coef_by_task names {unknown}, which are not tasks in "
                 f"this run ({list(task_id_names)}). A typo here is a silent no-op."
             )
-        # THE IDS THEMSELVES ARE VALIDATED, NOT JUST THE NAMES. A row whose
-        # task_id is 3 in a three-task run fell through every branch below and
-        # silently trained at b = 1; a non-integer id (2.9) was truncated to 2
-        # and became webshop. Padding rows carry a negative id and are exempt --
-        # they are already masked out of the loss by task_loss_weight = 0.
         raw = task_ids.reshape(-1)
         if raw.numel() != n_rows:
+            # A shape mismatch, read off the shapes -- no device value involved.
             raise AssertionError(
                 f"teacher_kl_loss_coef_by_task: task_ids has {raw.numel()} entries for "
                 f"{n_rows} rows; the per-row coefficient cannot be aligned."
             )
+        # ONE GATHER, NO HOST SYNC. The ids themselves are checked once per
+        # update_policy by validate_teacher_kl_task_ids -- they do not depend on
+        # the student's forward, so asking the device about them inside the
+        # micro-batch loop bought nothing and cost a sync per micro-batch per
+        # check (three tasks x ~500 micro-batches a step).
+        #
+        # The table's last slot is the fallback for a padding row (negative id)
+        # and for an out-of-range one: both get 1.0, which is what the previous
+        # per-task comparisons left them at. The difference is that now an
+        # out-of-range id is a startup failure rather than a silent b = 1.
+        n_task = len(task_id_names)
+        table = torch.ones(n_task + 1, device=device, dtype=dtype)
+        for tid, name in enumerate(task_id_names):
+            if name in by_task:
+                table[tid] = by_task[name]
+        flat = raw.round().to(torch.long) if raw.is_floating_point() else raw.to(torch.long)
+        return table[torch.where((flat >= 0) & (flat < n_task), flat, n_task)]
+
+    def validate_teacher_kl_task_ids(self, task_ids, task_id_names):
+        """Check the ids ONCE, on the arranged batch, before the micro-batch loop.
+
+        THE IDS THEMSELVES ARE VALIDATED, NOT JUST THE NAMES. A row whose
+        task_id is 3 in a three-task run fell through every branch of the
+        coefficient lookup and silently trained at b = 1; a non-integer id (2.9)
+        was truncated to 2 and became webshop. Padding rows carry a negative id
+        and are exempt -- they are already masked out of the loss by
+        task_loss_weight = 0.
+
+        Here rather than in the lookup because these are questions about the
+        BATCH, settled before any forward runs, and every one of them reads a
+        device value back to the host. Doing that per micro-batch made the
+        answer no more true and the step measurably slower.
+        """
+        by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
+        if not by_task:
+            return
+        by_task = {str(k): float(v) for k, v in dict(by_task).items()}
+        if task_ids is None or not task_id_names:
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task={by_task} is set, but this batch carries "
+                f"{'no task_ids' if task_ids is None else 'no task_id_names'}; the "
+                f"per-task coefficient cannot be applied and training at a uniform "
+                f"coefficient would contradict the config."
+            )
+        unknown = sorted(set(by_task) - set(task_id_names))
+        if unknown:
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task names {unknown}, which are not tasks in "
+                f"this run ({list(task_id_names)}). A typo here is a silent no-op."
+            )
+        raw = task_ids.reshape(-1)
         if raw.is_floating_point():
             frac = (raw - raw.round()).abs()
             if bool((frac > 0).any()):
@@ -1612,19 +1689,13 @@ class DataParallelPPOActor(BasePPOActor):
                     f"reassign rows to the wrong task."
                 )
         flat = raw.round().to(torch.long) if raw.is_floating_point() else raw.to(torch.long)
-        live = flat >= 0
-        bad = live & (flat >= len(task_id_names))
+        bad = (flat >= 0) & (flat >= len(task_id_names))
         if bool(bad.any()):
             raise AssertionError(
                 f"teacher_kl_loss_coef_by_task: task_ids contains {sorted(set(flat[bad].tolist()))}, "
                 f"outside the {len(task_id_names)} tasks {list(task_id_names)}; such rows would "
                 f"silently keep b = 1."
             )
-        coef = torch.ones(n_rows, device=device, dtype=dtype)
-        for tid, name in enumerate(task_id_names):
-            if name in by_task:
-                coef[flat == tid] = by_task[name]
-        return coef
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -1838,13 +1909,14 @@ class DataParallelPPOActor(BasePPOActor):
                 # back into (bs, response_length, ·) so they line up row-for-row with
                 # the top-k the caller also gets.
                 h_resp = sink["h"].squeeze(0)[extras["sel"]]  # (n_resp, hidden)
-                bs_, sl_, rl_ = extras["batch_size"], extras["seqlen"], extras["response_length"]
-                hidden_lst.append(
-                    pad_input(h_resp, indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, :]
-                )
-                lse_lst.append(
-                    pad_input(extras["lse"], indices=extras["sel_indices"], batch=bs_, seqlen=sl_)[:, -rl_ - 1 : -1, 0]
-                )
+                bs_, rl_ = extras["batch_size"], extras["response_length"]
+                ri_ = extras["resp_indices"]
+                # Straight into (bs, response_length, ·). These go into a list
+                # that lives until the concat below, so the previous
+                # scatter-to-full-sequence-then-slice kept (bs, seqlen, hidden)
+                # alive per micro-batch for a window 9x smaller.
+                hidden_lst.append(pad_input(h_resp, indices=ri_, batch=bs_, seqlen=rl_))
+                lse_lst.append(pad_input(extras["lse"], indices=ri_, batch=bs_, seqlen=rl_)[:, :, 0])
             else:
                 tlp, tids = topk_out
             if want_topk:
@@ -2196,6 +2268,15 @@ class DataParallelPPOActor(BasePPOActor):
         task_id_names = data.meta_info.get("task_id_names", None)
         if "task_ids" in data.batch.keys():
             select_keys.append("task_ids")
+        # Once, here, on the whole arranged batch. Every check inside reads a
+        # device value back to the host, and none of the answers depends on the
+        # student's forward -- so the micro-batch loop below does a lookup and
+        # nothing else. Padding rows carry a negative id and are exempt, so a
+        # padded micro-batch cannot introduce an id this did not see.
+        self.validate_teacher_kl_task_ids(
+            data.batch.get("task_ids", None) if "task_ids" in data.batch.keys() else None,
+            task_id_names,
+        )
         # Per-task normalised distillation loss: the driver attaches a per-row weight
         # (see verl/trainer/ppo/task_loss_weights.py) that makes each task's share of
         # the loss 1/num_tasks instead of its share of the response tokens. Absent ->

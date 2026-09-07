@@ -26,6 +26,7 @@ class _Cfg(dict):
 
 class _Stub:
     teacher_kl_row_coef = DataParallelPPOActor.teacher_kl_row_coef
+    validate_teacher_kl_task_ids = DataParallelPPOActor.validate_teacher_kl_task_ids
 
     def __init__(self, by_task=None):
         self.config = _Cfg(teacher_kl_loss_coef_by_task=by_task)
@@ -233,17 +234,65 @@ def test_unset_takes_the_original_expressions_in_both_branches():
 
 
 def test_an_out_of_range_task_id_is_an_error_not_a_silent_one():
-    """id 3 in a three-task run used to fall through and train at b = 1."""
+    """id 3 in a three-task run used to fall through and train at b = 1.
+
+    Checked ONCE per update on the arranged batch, not per micro-batch: the ids
+    do not depend on the student's forward, and every one of these checks reads
+    a device value back to the host.
+    """
+    s = _Stub({"webshop": 0.5})
     with pytest.raises(AssertionError, match="outside the 3 tasks"):
-        _coef({"webshop": 0.5}, [0, 1, 3])
+        s.validate_teacher_kl_task_ids(torch.tensor([0, 1, 3]), TASKS)
 
 
 def test_a_non_integer_task_id_is_an_error_not_truncated():
     """2.9 used to become 2 and be treated as webshop."""
     s = _Stub({"webshop": 0.5})
     with pytest.raises(AssertionError, match="non-integer"):
-        s.teacher_kl_row_coef(torch.tensor([0.0, 1.0, 2.9]), TASKS, 3,
-                              device=torch.device("cpu"), dtype=torch.float32)
+        s.validate_teacher_kl_task_ids(torch.tensor([0.0, 1.0, 2.9]), TASKS)
+
+
+def test_the_validator_accepts_what_the_arm_actually_carries():
+    s = _Stub({"alfworld": 1.076431, "search": 1.191101, "webshop": 0.5})
+    s.validate_teacher_kl_task_ids(torch.tensor([0, 1, 2, 2, -1, -1]), TASKS)
+    s.validate_teacher_kl_task_ids(torch.tensor([0.0, 1.0, 2.0]), TASKS)
+    # unset -> nothing to validate, and no complaint about missing ids
+    _Stub(None).validate_teacher_kl_task_ids(None, None)
+
+
+def test_the_validator_still_refuses_a_typo_and_missing_ids():
+    with pytest.raises(AssertionError, match="not tasks in"):
+        _Stub({"webshopp": 0.5}).validate_teacher_kl_task_ids(torch.tensor([0, 1, 2]), TASKS)
+    with pytest.raises(AssertionError, match="no task_ids"):
+        _Stub({"webshop": 0.5}).validate_teacher_kl_task_ids(None, TASKS)
+
+
+def test_the_hot_path_lookup_reads_nothing_back_to_the_host():
+    """The whole point of hoisting the checks. A device->host read here is one
+    sync per micro-batch per check; at ~500 micro-batches a step that was the
+    largest remaining source of them in this block."""
+    import ast
+    import inspect
+
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    src = inspect.getsource(DataParallelPPOActor.teacher_kl_row_coef)
+    tree = ast.parse(src.lstrip())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+            assert name not in ("item", "tolist", "nonzero"), f"{name}() syncs the host"
+    assert "bool(" not in src, "a Python bool() of a device tensor is a sync"
+    # and it is a single gather, not a per-task masked assignment
+    assert "table[torch.where(" in src
+
+
+def test_an_out_of_range_id_still_gets_one_from_the_lookup_itself():
+    """Belt and braces: the validator is what refuses it, but if one ever
+    reached the lookup it must land on the fallback slot rather than index out
+    of bounds or silently take another task's coefficient."""
+    c = _coef({"alfworld": 1.5, "search": 1.4, "webshop": 0.5}, [0, 1, 2, 7, -1])
+    assert c.tolist() == pytest.approx([1.5, 1.4, 0.5, 1.0, 1.0], rel=1e-6)
 
 
 def test_padding_rows_with_a_negative_id_are_exempt():
