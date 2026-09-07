@@ -357,3 +357,58 @@ def test_the_readout_never_enters_the_loss():
         isinstance(n, ast.withitem) and "no_grad" in ast.unparse(n.context_expr)
         for n in ast.walk(tree)
     ), "the accumulator must run under no_grad"
+
+
+def test_the_table_runs_on_batch_shaped_terms_not_only_on_none():
+    """The terms branch of update() -- the one the run actually takes.
+
+    _stats_with above passes terms=None, so without this the (rows, T, k)
+    shapes never meet the accumulator until a GPU is holding them.
+    """
+    torch.manual_seed(0)
+    rows, t, k, vocab = 5, 7, 6, 40
+    student_topk = torch.log_softmax(torch.randn(rows, t, k), dim=-1)
+    teacher_topk = torch.log_softmax(torch.randn(rows, t, k), dim=-1)
+    topk_ids = torch.stack([
+        torch.stack([torch.randperm(vocab)[:k] for _ in range(t)]) for _ in range(rows)
+    ])
+    # half the sampled ids inside the support, half outside
+    response_ids = topk_ids[..., 0].clone()
+    response_ids[:, ::2] = vocab + 1
+    kl = torch.rand(rows, t) * 0.1
+    log_prob = torch.log_softmax(torch.randn(rows, vocab + 2), dim=-1)[:, :1].expand(rows, t).contiguous()
+    terms = opd_pg_alignment_terms(
+        student_topk_logprob=student_topk,
+        teacher_topk_logprob=teacher_topk,
+        teacher_kl=kl,
+        topk_ids=topk_ids,
+        response_ids=response_ids,
+        log_prob=log_prob,
+        old_log_prob=log_prob - 0.05,
+        advantages=torch.where(torch.rand(rows, t) < 0.4, 0.0, 1.0),
+    )
+    for key in ("opd_sq", "dot", "cos", "pg_sq", "align_mask"):
+        assert terms[key].shape == (rows, t), key
+
+    mask = torch.ones(rows, t)
+    mask[:, -2:] = 0.0  # padding at the end of every row
+    s = OpdTaskDiagStats(n_tasks=3, device=torch.device("cpu"))
+    s.update(
+        task_ids=torch.tensor([0, 1, 2, 0, -1]),
+        response_mask=mask,
+        teacher_kl=kl,
+        advantages=torch.where(torch.rand(rows, t) < 0.4, 0.0, 1.0),
+        terms=terms,
+        row_basis=torch.ones(rows),
+        row_coef=torch.tensor([1.076431, 1.191101, 0.5, 1.076431, 1.0]),
+    )
+    out = s.rows(["alfworld", "search", "webshop"], coefs={"alfworld": 1.076431, "search": 1.191101, "webshop": 0.5})
+    assert out["actor/opd_diag/tokens/alfworld"] == pytest.approx(2 * (t - 2))
+    for key, value in out.items():
+        assert value == value, key                       # no NaN reaches the logger
+        assert abs(value) != float("inf"), key
+    for task in ("alfworld", "search", "webshop"):
+        assert 0.0 <= out[f"actor/opd_diag/align_cover/{task}"] <= 1.0
+        assert -1.0 <= out[f"actor/opd_diag/pg_cos_mean/{task}"] <= 1.0
+        assert out[f"actor/opd_diag/push_l2_logit/{task}"] > 0
+    assert out["actor/opd_diag/budget_ratio_logit"] > 0

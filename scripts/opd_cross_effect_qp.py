@@ -35,7 +35,6 @@ Three things this script used to get wrong, all found by review before any run:
   quotes an RMS. Both are now reported under their own names, and the uniform
   arm's matching factor is derived from the RMS one (1.110833).
 """
-import itertools
 import json
 import math
 import sys
@@ -103,10 +102,10 @@ def main(path):
     try:
         from scipy import stats
         p = 2 * stats.t.sf(np.abs(t), NB - 1)
-        print("two-sided p (df=%d):\n" % (NB - 1), p, "\nBonferroni x9:\n", np.minimum(1, 9 * p))
+        print(f"two-sided p (df={NB - 1}):\n", p, "\nBonferroni x9:\n", np.minimum(1, 9 * p))
     except Exception:
         pass
-    print("batches with C_ij < 0 (of %d):\n" % NB, (C < 0).sum(0))
+    print(f"batches with C_ij < 0 (of {NB}):\n", (C < 0).sum(0))
     print("mean cosine:\n", masked_mean(*cosine_cells(C, nr, nd))[0])
     print("\n||r_i|| / ||d_j|| (same task) per batch:\n", nr / nd)
     print("live GRPO groups per batch:")
@@ -310,7 +309,7 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
           + ("" if unusable == 0 else "  <- dropped from that cell's mean, not from the matrix"))
     nd_ok = np.isfinite(nd) & (nd > 0)
     nd_mean, _ = masked_mean(nd, nd_ok)
-    print("mean ||d_j|| =", nd_mean, " max/min = %.2f" % (nd_mean.max() / nd_mean.min()))
+    print("mean ||d_j|| =", nd_mean, f" max/min = {nd_mean.max() / nd_mean.min():.2f}")
     lin0, rms0, mean0 = budgets(np.ones(3), D, nd)
     print(f"control b=(1,1,1): sum b||d|| = {lin0:.4f}   ||sum b d|| RMS = {rms0:.4f}  mean = {mean0:.4f}")
 
@@ -334,7 +333,7 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
                                                   min_fraction=min_fraction)
     lin_m, rms_m, mean_m = budgets(b_main, D, nd)
     scale = uniform_match(b_main, D, nd)
-    print(f"\npre-registered (grad budget, cosine, all rows, diagonal kept):")
+    print("\npre-registered (grad budget, cosine, all rows, diagonal kept):")
     print(f"  c = {c_main.round(4)}   q = {q_main.round(4)}   b = {b_main.round(6)}")
     print(f"  sum_j q_j b_j = {float((q_main * b_main).sum()):.6f}   (1.000000 is the rule's invariant)")
     print(f"  linear budget {lin_m:.4f} vs control {lin0:.4f}  ({lin_m / lin0 - 1:+.2%})")
