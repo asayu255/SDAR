@@ -192,3 +192,82 @@ def test_unset_takes_the_original_expressions_in_both_branches():
     # and the metric is only emitted when the coefficient is actually set
     assert "if _kl_row_coef is not None:" in src
     assert src.index("if _kl_row_coef is not None:") < src.index("if task_loss_weight is None:")
+
+
+# ---------------------------------------------------------------------------
+# review round 3: the ids themselves, the wiring on ONE forward, real gradients
+
+
+def test_an_out_of_range_task_id_is_an_error_not_a_silent_one():
+    """id 3 in a three-task run used to fall through and train at b = 1."""
+    with pytest.raises(AssertionError, match="outside the 3 tasks"):
+        _coef({"webshop": 0.5}, [0, 1, 3])
+
+
+def test_a_non_integer_task_id_is_an_error_not_truncated():
+    """2.9 used to become 2 and be treated as webshop."""
+    s = _Stub({"webshop": 0.5})
+    with pytest.raises(AssertionError, match="non-integer"):
+        s.teacher_kl_row_coef(torch.tensor([0.0, 1.0, 2.9]), TASKS, 3,
+                              device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_padding_rows_with_a_negative_id_are_exempt():
+    """They are masked out of the loss by task_loss_weight = 0 already."""
+    c = _coef({"webshop": 0.5}, [0, 1, 2, -1, -1])
+    assert c.tolist() == [1.0, 1.0, 0.5, 1.0, 1.0]
+
+
+def test_a_length_mismatch_between_ids_and_rows_is_an_error():
+    with pytest.raises(AssertionError, match="entries for 3 rows"):
+        _coef({"webshop": 0.5}, [0, 1], n=3)
+
+
+def test_wiring_check_compares_the_same_forward_before_and_after_the_coefficient():
+    """The per-task weighted KL with and without b, from ONE kld tensor.
+
+    This is the check the launch runs in its first steps. It must be a
+    same-forward comparison: two arms' KL losses are not b-fold apart once their
+    parameters have diverged.
+    """
+    kld = torch.tensor([[1.0, 3.0], [2.0, 2.0], [4.0, 0.0], [1.0, 1.0]])
+    mask = torch.ones(4, 2)
+    w = torch.tensor([0.25, 0.25, 0.25, 0.25])
+    ids = [0, 1, 2, 2]
+    b = _coef({"alfworld": 1.076, "search": 1.191, "webshop": 0.5}, ids)
+
+    row_kl = (kld * mask).sum(-1)
+    before = row_kl * w
+    after = row_kl * (w * b)
+    for tid, name, expect in ((0, "alfworld", 1.076), (1, "search", 1.191), (2, "webshop", 0.5)):
+        sel = torch.tensor([t == tid for t in ids])
+        ratio = float(after[sel].sum() / before[sel].sum())
+        assert ratio == pytest.approx(expect, abs=1e-6), name
+
+
+def test_a_small_model_gets_the_intended_per_task_gradient_scaling():
+    """Not a stub: a real parameter, a real KL-shaped loss, real autograd.
+
+    Each task's rows feed a separate parameter so the per-task gradient can be
+    read off directly; the coefficient must scale exactly that task's gradient
+    and leave the others untouched.
+    """
+    torch.manual_seed(0)
+    theta = torch.zeros(3, requires_grad=True)             # one scalar per task
+    ids = [0, 0, 1, 2, 2, 2]
+    target = torch.tensor([0.3, -0.2, 0.5, -0.4, 0.1, 0.6])
+    w = torch.full((6,), 1.0 / 6)
+
+    def loss_with(b_vec):
+        # "row_kl" = squared distance of the task's parameter to a target: a
+        # convex stand-in with a nonzero, task-separable gradient
+        row_kl = torch.stack([(theta[t] - target[i]) ** 2 for i, t in enumerate(ids)])
+        return (row_kl * (w * b_vec)).sum()
+
+    ones = torch.ones(6)
+    g_control = torch.autograd.grad(loss_with(ones), theta)[0]
+    b = _coef({"alfworld": 1.076, "search": 1.191, "webshop": 0.5}, ids)
+    g_treat = torch.autograd.grad(loss_with(b), theta)[0]
+
+    ratio = (g_treat / g_control).tolist()
+    assert ratio == pytest.approx([1.076, 1.191, 0.5], abs=1e-6)

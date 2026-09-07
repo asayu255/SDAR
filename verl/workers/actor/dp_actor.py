@@ -1591,8 +1591,35 @@ class DataParallelPPOActor(BasePPOActor):
                 f"teacher_kl_loss_coef_by_task names {unknown}, which are not tasks in "
                 f"this run ({list(task_id_names)}). A typo here is a silent no-op."
             )
+        # THE IDS THEMSELVES ARE VALIDATED, NOT JUST THE NAMES. A row whose
+        # task_id is 3 in a three-task run fell through every branch below and
+        # silently trained at b = 1; a non-integer id (2.9) was truncated to 2
+        # and became webshop. Padding rows carry a negative id and are exempt --
+        # they are already masked out of the loss by task_loss_weight = 0.
+        raw = task_ids.reshape(-1)
+        if raw.numel() != n_rows:
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task: task_ids has {raw.numel()} entries for "
+                f"{n_rows} rows; the per-row coefficient cannot be aligned."
+            )
+        if raw.is_floating_point():
+            frac = (raw - raw.round()).abs()
+            if bool((frac > 0).any()):
+                raise AssertionError(
+                    f"teacher_kl_loss_coef_by_task: task_ids carries non-integer values "
+                    f"(e.g. {raw[frac > 0][:3].tolist()}); truncating them would silently "
+                    f"reassign rows to the wrong task."
+                )
+        flat = raw.round().to(torch.long) if raw.is_floating_point() else raw.to(torch.long)
+        live = flat >= 0
+        bad = live & (flat >= len(task_id_names))
+        if bool(bad.any()):
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task: task_ids contains {sorted(set(flat[bad].tolist()))}, "
+                f"outside the {len(task_id_names)} tasks {list(task_id_names)}; such rows would "
+                f"silently keep b = 1."
+            )
         coef = torch.ones(n_rows, device=device, dtype=dtype)
-        flat = task_ids.reshape(-1).to(torch.long)
         for tid, name in enumerate(task_id_names):
             if name in by_task:
                 coef[flat == tid] = by_task[name]
