@@ -91,6 +91,9 @@ def test_every_arm_pins_the_readout_and_the_step_count(arm):
     assert flat["algorithm.opd.task_diag"] is True
     assert flat["actor_rollout_ref.actor.teacher_kl_task_diag"] is True
     assert flat["trainer.total_training_steps"] == 150
+    # The arms are only comparable on one machine: sampled rollouts make the GPU
+    # count part of the experiment, not a performance knob.
+    assert flat["trainer.n_gpus_per_node"] == 2
     # unchanged from the control recipe this arm is derived from
     assert flat["actor_rollout_ref.actor.teacher_kl_loss_coef"] == 0.01
     assert flat["algorithm.opd.normalize_loss_by_task"] is True

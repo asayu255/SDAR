@@ -224,6 +224,13 @@
 # optim.total_training_steps drives the cosine schedule, so this also says
 # that the finished 300-step klw_control run is not a substitute for the
 # control arm here.
+# PINNED, because the three arms are only comparable if they ran on the same
+# hardware. The rollouts are SAMPLED: a different GPU count changes the FSDP
+# sharding and the vLLM batching, so the same seed does not give the same
+# trajectories, and an arm moved to a 3-GPU host would differ from its
+# controls by the hardware as well as by b. Nothing else in this file caught
+# that -- it was the one way to relabel an arm without editing a coefficient.
+"trainer.n_gpus_per_node": 2
 "trainer.total_training_steps": 150
 "trainer.project_name": verl_agent_opd_grpo_opd_coef$RUN_TAG_SUFFIX
 # experiment_name is pinned as part of the run identity: renaming (or reusing a
