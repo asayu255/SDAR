@@ -60,9 +60,19 @@ set -x
 # section 5); a 1.56x difference in mean learning rate is orders larger, so it
 # cannot sit on the control side of this comparison.
 #
-# test_freq=150 with a 300-step total gives an evaluation at BOTH 150 and 300
-# (the trainer always validates on the last step), so the 150-step measurement
-# the design was built around is not lost -- it is a waypoint now.
+# NO VALIDATION INSIDE THE TRAINING RUN. test_freq=-1, and the evaluations are
+# separate VAL_ONLY runs off the saved checkpoints (save_freq=25 writes 150 and
+# 300 among the rest).
+#
+# This is not a tidiness preference. Training alone peaks at 183 GB of this
+# host's 251 GB, and the validation pass stands up its own environments for
+# 126 instances a task plus per-instance text logging on top of that -- it has
+# run the host out of RAM before. And the loop validates BEFORE it saves
+# (opd_ray_trainer.py:1579 then :1586), so an OOM at step 150 would take the
+# step-150 checkpoint down with the run: 24 hours lost to a pass whose result
+# can be recomputed from a checkpoint in an hour.
+#
+# test_freq gates the last-step validation too, so -1 really means none.
 #
 # Cost: about 590 s/step measured on 2x RTX PRO 6000, so ~49 h per arm.
 #
@@ -478,7 +488,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +trainer.val_instance_log_text=True \
     trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_opd_coef_${ARM}_qwen3_1.7b$RUN_TAG_SUFFIX \
     trainer.save_freq=25 \
-    trainer.test_freq=150 \
+    trainer.test_freq=-1 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
     trainer.val_before_train=False "$@" "${VAL_ONLY_ARGS[@]}"

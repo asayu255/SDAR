@@ -86,6 +86,26 @@ def test_the_pinned_coefficients_are_the_design_numbers_on_both_sides(arm):
 
 
 @pytest.mark.parametrize("arm", ARMS)
+def test_no_arm_validates_inside_the_training_run(arm):
+    """The loop validates BEFORE it saves (opd_ray_trainer.py:1579 then :1586),
+    and the validation pass has exhausted this host's RAM. An OOM at step 150
+    would therefore cost the step-150 checkpoint as well as the 24 hours that
+    produced it -- for a pass that can be recomputed from a checkpoint. So the
+    arms train only, and the evaluations are separate VAL_ONLY runs.
+
+    Pinned rather than trusted, because re-enabling it costs a whole run and the
+    failure arrives 24 hours after the mistake."""
+    flat = _flat(arm)
+    assert flat["trainer.test_freq"] == -1
+    # ...which means the checkpoints have to be there to evaluate from
+    assert flat["trainer.save_freq"] == 25
+    assert flat["trainer.total_training_steps"] % flat["trainer.save_freq"] == 0
+    assert (flat["trainer.total_training_steps"] // 2) % flat["trainer.save_freq"] == 0, (
+        "the 150-step waypoint must land on a save boundary"
+    )
+
+
+@pytest.mark.parametrize("arm", ARMS)
 def test_every_arm_pins_the_readout_and_the_step_count(arm):
     flat = _flat(arm)
     assert flat["algorithm.opd.task_diag"] is True
@@ -184,8 +204,8 @@ def test_the_script_and_the_lock_agree_on_the_step_count():
     assert "trainer.total_training_steps=300" in s
     assert "trainer.total_epochs=300" in s
     assert "--total_training_steps 300" in s, "data prep must match"
-    # 300 total with test_freq 150 evaluates at 150 AND at 300 (last step)
-    assert "trainer.test_freq=150" in s
+    # and validation does NOT run inside training -- see the next test
+    assert "trainer.test_freq=-1" in s
 
 
 # ---------------------------------------------------------------------------

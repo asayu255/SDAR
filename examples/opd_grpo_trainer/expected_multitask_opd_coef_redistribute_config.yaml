@@ -228,6 +228,16 @@
 # cancel), so what a move to another machine changes is the sampling -- which
 # is enough, and which nothing else in this file would have caught.
 "trainer.n_gpus_per_node": 2
+# NO VALIDATION INSIDE TRAINING. Pinned, not left as a performance knob:
+# training alone peaks at 183 GB of 251 GB on this host and the validation pass
+# adds its own environments for 126 instances a task, which has exhausted host
+# RAM before -- and the loop validates BEFORE it saves
+# (opd_ray_trainer.py:1579 then :1586), so that OOM would take the step-150
+# checkpoint with it. The evaluations are separate VAL_ONLY runs off the saved
+# checkpoints. -1 disables the last-step validation as well.
+"trainer.test_freq": -1
+# 12 saves at 25-step intervals, so 150 and 300 are both on disk to evaluate.
+"trainer.save_freq": 25
 # 300, matching every other beta=0.01 arm in this project. The total is the
 # cosine schedule's denominator, so it is not a duration knob: at step 150 a
 # 150-step run has decayed to zero while a 300-step run is at 59% of peak,
