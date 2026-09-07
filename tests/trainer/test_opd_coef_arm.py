@@ -90,7 +90,7 @@ def test_every_arm_pins_the_readout_and_the_step_count(arm):
     flat = _flat(arm)
     assert flat["algorithm.opd.task_diag"] is True
     assert flat["actor_rollout_ref.actor.teacher_kl_task_diag"] is True
-    assert flat["trainer.total_training_steps"] == 150
+    assert flat["trainer.total_training_steps"] == 300
     # The arms are only comparable on one machine: sampled rollouts make the GPU
     # count part of the experiment, not a performance knob.
     assert flat["trainer.n_gpus_per_node"] == 2
@@ -177,10 +177,15 @@ def test_the_control_branch_says_null_rather_than_saying_nothing():
 
 
 def test_the_script_and_the_lock_agree_on_the_step_count():
+    """The total is the cosine schedule's denominator, not a duration knob: an
+    arm declared over 150 steps and one over 300 are at different learning
+    rates at every shared step number."""
     s = _script()
-    assert "trainer.total_training_steps=150" in s
-    # and the data prep is deliberately NOT re-cut at 150
-    assert "--total_training_steps 300" in s
+    assert "trainer.total_training_steps=300" in s
+    assert "trainer.total_epochs=300" in s
+    assert "--total_training_steps 300" in s, "data prep must match"
+    # 300 total with test_freq 150 evaluates at 150 AND at 300 (last step)
+    assert "trainer.test_freq=150" in s
 
 
 # ---------------------------------------------------------------------------

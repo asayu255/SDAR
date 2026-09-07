@@ -157,7 +157,7 @@ $\beta$ の時間変化を入れるなら $\beta(t)$ 減衰として $C$ とは�
 
 ## 3. 実験設計（3 アーム、A を pilot として固定）
 
-0 → 150 step、**各条件 1 学習 run の pilot**。
+0 → 300 step、**各条件 1 学習 run の pilot**。`test_freq=150` なので評価点は **150 と 300 の 2 つ**（trainer は最終 step で必ず val を回す）。当初 150 step で設計したが、`total_training_steps` は cosine スケジュールの分母であって期間ノブではない: step 150 の時点で 150 step 宣言の run は LR 0 まで減衰済み、300 step 宣言の run はピークの 59% にいて、step 0–149 の平均 LR が **1.56 倍**違う。$b$ の一次寄与は RL 自身の 0.25〜0.99% なので、この差は測りたい効果より桁が大きい。**このプロジェクトの他の $\beta$=0.01 アーム（klw / klw_control / signweight）が揃って 300 step である**ことも合わせ、300 に統一する。1 アーム約 49 時間（実測 590 秒/step）。
 
 | アーム | $b$ | 実効 $\beta b_j$ | 役割 |
 |---|---|---|---|
@@ -380,17 +380,18 @@ CPU で済むものは試験に落としてある（左列が担保する試験�
   タスク $j$ の行にしか触らないので、「他タスクへの害を減らす」ための唯一の操作が「そのタスク自身の
   蒸留を減らす」になる。(source teacher, target task) の重みが要るが、この損失にその自由度は無い。
 * **各条件 1 学習 run。** 評価 3 回は評価雑音の見積もりで、学習 seed の変動を含まない。
-* **1 step は実測 632 秒**（RTX PRO 6000 ×2、`rollout.n=8`、3 タスク）。150 step で
-  約 26 時間/アーム、3 アームで約 79 時間。update の peak reserved は 103 GB。
+* **1 step は実測 590 秒**（RTX PRO 6000 ×2、`rollout.n=8`、3 タスク。4 step の平均 588 秒）。
+  300 step で **約 49 時間/アーム**、3 アームで約 147 時間。update の peak reserved は 103 GB。
 * **step 0 の信号分布は校正時（step 300）と大きく違う。** 実測の `adv_zero_frac` は
   alfworld 0.000・search 0.000・webshop 0.223 で、校正時の 0.215 / 0.761 / 0.623 とは
   別物である。$b$ は step 300 の測定から作られているので、これは §3.1 の
   「測定点と適用点が一致しない」が具体的にどれだけ効くかの実測値になる。
-* **`total_training_steps=150` は cosine スケジュールも 150 で終わらせる**（`fsdp_workers.py:498`）。
-  3 アームは同じスケジュールを共有するのでアーム間の対比には影響しないが、
-  **既に走り終えた 300 step の klw_control は control アームの代用にならない**（係数と学習率が交絡する）。
-  データ準備は `--total_training_steps 300` のままにする —— 150 で切り直すと最初の 150 step が
-  見るプロンプト列自体が変わる。
+* **`total_training_steps` は cosine スケジュールの分母である**（`ray_trainer.py:819` → `fsdp_workers.py:498`）。
+  300 に揃えたので、既に走り終えた `verl_agent_opd_grpo_cross_teacher_klw_control_multitask_xt1`
+  （$\beta$=0.01、`cross_teacher_kl_weight.enable=False`、すなわち機構的には素の OPD+GRPO、step 300 完走）と
+  **スケジュールが一致する**。ただしスケジュール一致は流用可能を意味しない: 別ホスト（A6000×3）で、
+  コード版が違い、`opd_diag` の readout を持たない。流用するなら、その 3 点を明記した上で
+  「参考」ではなく対照として使う根拠を別に示す必要がある。
 * **走行中の readout は対角しか測れない。** トークンは 1 つのタスクに属するので、
   トークンごとの量に非対角 $C_{ij}\ (i\ne j)$ は載らない。アームが前提にしている干渉そのものを
   学習中に測る手段は、いまも 6 倍の backward を要する測定 step しかない（下記）。

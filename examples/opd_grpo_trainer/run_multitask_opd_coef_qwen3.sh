@@ -42,19 +42,31 @@ set -x
 #     not a halving the data measured.
 #
 # ---------------------------------------------------------------------------
-# WHY 150 STEPS, AND WHAT THAT COSTS
+# WHY 300 STEPS
 #
-# The design runs 0 -> 150 for each arm, and total_training_steps=150 here.
-# optim.total_training_steps drives a COSINE schedule (fsdp_workers.py:498), so
-# these runs complete their decay at 150 while the existing 300-step
-# klw_control run is only half way down its own at step 150. The three arms
-# share the schedule, so the contrast between them is unaffected -- but the
-# already-finished 300-step control is NOT a substitute for ARM=control, and
-# reusing it would confound the coefficient with the learning rate.
+# optim.total_training_steps drives a COSINE schedule with a 10% warmup
+# (fsdp_workers.py:498, ray_trainer.py:819), and the total is the schedule's
+# DENOMINATOR -- so the same step number means a different learning rate
+# depending on what total was declared. At step 150 a 150-step run has decayed
+# to zero; a 300-step run is still at 59% of peak, and its mean learning rate
+# over steps 0-149 is 1.56x the other's.
 #
-# Data prep stays at --total_training_steps 300 on purpose: it fixes the sample
-# stream, and regenerating it at 150 would change which prompts the first 150
-# steps see.
+# That is why these arms run 300 and not 150. Every other beta=0.01 arm in this
+# project (klw, klw_control, signweight) ran 300, so at 150 these arms would
+# have been comparable only to each other -- and the finished klw_control run,
+# which is plain OPD+GRPO at beta=0.01 and therefore mechanically this arm's
+# control, would have differed from it by the learning rate as well as by b.
+# b's first-order contribution is 0.25-0.99% of the RL term (design doc
+# section 5); a 1.56x difference in mean learning rate is orders larger, so it
+# cannot sit on the control side of this comparison.
+#
+# test_freq=150 with a 300-step total gives an evaluation at BOTH 150 and 300
+# (the trainer always validates on the last step), so the 150-step measurement
+# the design was built around is not lost -- it is a waypoint now.
+#
+# Cost: about 590 s/step measured on 2x RTX PRO 6000, so ~49 h per arm.
+#
+# Data prep stays at --total_training_steps 300, which now matches.
 #
 # ---------------------------------------------------------------------------
 # WHAT THE RUN REPORTS  (algorithm.opd.task_diag=True)
@@ -467,6 +479,6 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_opd_coef_${ARM}_qwen3_1.7b$RUN_TAG_SUFFIX \
     trainer.save_freq=25 \
     trainer.test_freq=150 \
-    trainer.total_training_steps=150 \
-    trainer.total_epochs=150 \
+    trainer.total_training_steps=300 \
+    trainer.total_epochs=300 \
     trainer.val_before_train=False "$@" "${VAL_ONLY_ARGS[@]}"
