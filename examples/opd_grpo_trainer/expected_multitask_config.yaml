@@ -34,6 +34,11 @@
 "actor_rollout_ref.actor.use_teacher_kl_loss": true
 "actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
 "actor_rollout_ref.actor.teacher_kl_loss_coef": 1.0
+# null = every task at the same coefficient. Pinned so a run that sets the
+# per-task multiplier has to say so: the arm that distils one teacher less
+# than another is a different objective, and the lock is where that is
+# declared rather than inferred from a launch line.
+"actor_rollout_ref.actor.teacher_kl_loss_coef_by_task": null
 "actor_rollout_ref.actor.teacher_kl_topk": 20
 "actor_rollout_ref.actor.normalize_loss_by_task": true
 

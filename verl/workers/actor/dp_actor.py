@@ -1555,6 +1555,49 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs, topk_out
 
+    def teacher_kl_row_coef(self, task_ids, task_id_names, n_rows, *, device, dtype):
+        """Per-row multiplier on the teacher-KL term, or ``None`` when unset.
+
+        WHAT THIS IS FOR. ``teacher_kl_loss_coef`` is one scalar for all three
+        tasks, so the only way to distil one task less than another was to change
+        the data. The cross-effect measurement (theory doc section 4.14) reads a
+        per-teacher quantity -- how much task j's teacher moves the OTHER tasks'
+        reward -- and acting on it needs a per-task coefficient. This supplies
+        ``b_task``, multiplying the row's contribution, so the effective
+        coefficient for task j is ``teacher_kl_loss_coef * b_j`` and every
+        existing config is unchanged at ``b = 1``.
+
+        WHY IT RAISES INSTEAD OF FALLING BACK. Configured-but-inapplicable is the
+        failure this whole line of work kept producing: a mask that reached
+        nothing, a save path that was always non-empty, a precision check that
+        described a different forward. If the coefficients are set and the rows
+        cannot be attributed to tasks, the run must stop rather than train at a
+        uniform coefficient while the config says otherwise.
+        """
+        by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
+        if not by_task:
+            return None
+        by_task = {str(k): float(v) for k, v in dict(by_task).items()}
+        if task_ids is None or not task_id_names:
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task={by_task} is set, but this batch carries "
+                f"{'no task_ids' if task_ids is None else 'no task_id_names'}; the "
+                f"per-task coefficient cannot be applied and training at a uniform "
+                f"coefficient would contradict the config."
+            )
+        unknown = sorted(set(by_task) - set(task_id_names))
+        if unknown:
+            raise AssertionError(
+                f"teacher_kl_loss_coef_by_task names {unknown}, which are not tasks in "
+                f"this run ({list(task_id_names)}). A typo here is a silent no-op."
+            )
+        coef = torch.ones(n_rows, device=device, dtype=dtype)
+        flat = task_ids.reshape(-1).to(torch.long)
+        for tid, name in enumerate(task_id_names):
+            if name in by_task:
+                coef[flat == tid] = by_task[name]
+        return coef
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
@@ -4324,8 +4367,34 @@ class DataParallelPPOActor(BasePPOActor):
                                 )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
+                        # PER-TASK, ON TOP OF THE GLOBAL COEFFICIENT. b_task
+                        # multiplies the row, so the effective coefficient is
+                        # teacher_kl_loss_coef * b_task and b = 1 reproduces every
+                        # existing run bit for bit. None when unset.
+                        _kl_row_coef = self.teacher_kl_row_coef(
+                            task_ids, task_id_names, teacher_kld.size(0),
+                            device=teacher_kld.device, dtype=teacher_kld.dtype,
+                        )
+                        if _kl_row_coef is not None:
+                            for _tid, _nm in enumerate(task_id_names):
+                                _r = task_ids.reshape(-1).to(torch.long) == _tid
+                                if bool(_r.any()):
+                                    metrics[f"actor/teacher_kl_coef_effective/{_nm}"] = float(
+                                        teacher_kl_coef * _kl_row_coef[_r][0]
+                                    )
                         if task_loss_weight is None:
-                            policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                            if _kl_row_coef is None:
+                                policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                            else:
+                                # Scaled BEFORE the token mean, so each token is
+                                # weighted by its own task's coefficient. The mask
+                                # denominator is untouched, and teacher_kl_loss
+                                # itself stays unscaled for the metric below.
+                                _scaled = agg_loss(
+                                    loss_mat=teacher_kld * _kl_row_coef.reshape(-1, 1),
+                                    loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                                )
+                                policy_loss = policy_loss + _scaled * teacher_kl_coef
                         else:
                             # Per-task normalised variant: the driver put a weight on
                             # every row such that summing weight * row-KL over the whole
@@ -4337,7 +4406,9 @@ class DataParallelPPOActor(BasePPOActor):
                             # gradient_accumulation, but the weights already carry the
                             # full normalisation.
                             row_kl = (teacher_kld * response_mask).sum(-1)
-                            weighted_teacher_kl = (row_kl * task_loss_weight).sum()
+                            _row_w = (task_loss_weight if _kl_row_coef is None
+                                      else task_loss_weight * _kl_row_coef)
+                            weighted_teacher_kl = (row_kl * _row_w).sum()
                             weighted_teacher_kl = weighted_teacher_kl * (
                                 self.task_dp_world_size * self.gradient_accumulation
                             )

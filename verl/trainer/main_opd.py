@@ -39,6 +39,16 @@ def inject_distillation_config(config) -> None:
     with open_dict(config):
         config.actor_rollout_ref.actor.use_teacher_kl_loss = True
         config.actor_rollout_ref.actor.teacher_kl_loss_coef = opd_cfg.get("kl_loss_coef", 1.0)
+        # PER-TASK MULTIPLIER ON THE TEACHER-KL COEFFICIENT. One dict of
+        # {task: b_task}; the effective coefficient for task j becomes
+        # kl_loss_coef * b_j and an absent task keeps b = 1, so leaving this
+        # unset reproduces every existing run. Surfaced under algorithm.opd
+        # beside kl_loss_coef because it is the same scientific knob split by
+        # task, not a plumbing detail -- and because the cross-effect
+        # measurement it exists to act on is per teacher, not global.
+        config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task = opd_cfg.get(
+            "kl_loss_coef_by_task", None
+        )
         config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
         # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.
         config.actor_rollout_ref.actor.teacher_kl_topk = opd_cfg.get("topk", 20)
@@ -348,6 +358,13 @@ def build_and_fit(config, *, inject_fn, trainer_cls, tag: str, label: str, examp
     )
     print(f"[{label}] teacher_paths: {teacher_paths_plain}")
     print(f"[{label}] teacher_kl_loss_coef: {config.actor_rollout_ref.actor.teacher_kl_loss_coef}")
+    _b = config.actor_rollout_ref.actor.get("teacher_kl_loss_coef_by_task", None)
+    if _b:
+        _base = float(config.actor_rollout_ref.actor.teacher_kl_loss_coef)
+        _eff = {k: round(_base * float(v), 6) for k, v in dict(_b).items()}
+        print(f"[{label}] teacher_kl_loss_coef_by_task: {dict(_b)} -> effective {_eff}")
+    else:
+        print(f"[{label}] teacher_kl_loss_coef_by_task: (unset -- uniform)")
     print(f"[{label}] teacher_kl_loss_type: {config.actor_rollout_ref.actor.teacher_kl_loss_type}")
     # Printed on both arms: on pure OPD it is the injection's receipt that the
     # policy gradient really is off, and on OPD+GRPO it is the ratio between the
