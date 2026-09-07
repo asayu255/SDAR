@@ -304,6 +304,28 @@ export ROLLOUT_WINDOW_FORWARD_TOKENS=${ROLLOUT_WINDOW_FORWARD_TOKENS:-0}
 export RUN_TAG=${RUN_TAG:-}
 export RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
 
+# ---------------------------------------------------------------------------
+# NCCL FLIGHT RECORDER.
+#
+# The first attempt at this arm died at step 17 on a 30-minute collective
+# timeout, and the log said what was missing: "Stack trace of the failed
+# collective not found, potentially because FlightRecorder is disabled". Both
+# ranks reported a work sequence id and nothing else -- no op, no shape, no
+# caller -- so "the ranks disagreed about the collective order" and "one
+# collective genuinely hung" could not be told apart from the evidence.
+#
+# The buffer holds the last N collectives per rank with their Python stacks and
+# is dumped when the watchdog fires. At roughly 10k collectives a step, 20000
+# entries is about two steps of history for a few MB of host memory.
+#
+# TORCH_NCCL_TRACE_CPP_STACK is deliberately left off: it symbolizes C++ frames
+# on every record, and the Python stack already names the caller, which is the
+# thing that was missing.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-20000}
+export TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-$HOME/nccl_trace/opd_coef${RUN_TAG_SUFFIX}_rank}
+mkdir -p "$(dirname "$TORCH_NCCL_DEBUG_INFO_TEMP_FILE")"
+
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"

@@ -1761,6 +1761,7 @@ class TrajectoryCollector:
                     text_actions[idx] = active_actions[pos]
             _m_decode = _now()  # end of CPU decode (+ scatter/union glue)
 
+            _teacher_wait_lp = 0.0
             if self._logprob_prefetch_enabled and self._logprob_pending:
                 # Overlap: envs.step (CPU/HTTP/IPC, GPU idle) runs in a background
                 # thread while the GPU prefetches old_log_prob for finished
@@ -1770,6 +1771,31 @@ class TrajectoryCollector:
                 if self._env_step_executor is None:
                     self._env_step_executor = ThreadPoolExecutor(max_workers=1)
                 env_future = self._env_step_executor.submit(envs.step, text_actions)
+                # THE TEACHER CHUNK IS JOINED FIRST, and this is a correctness
+                # requirement rather than a scheduling preference.
+                #
+                # _join_teacher_prefetch's own docstring already says why the
+                # teacher chunk must not be outstanding across a
+                # generate_sequences: both land on the same colocated
+                # WorkerDict. The same is true of THIS call, and it was the one
+                # place the rule was not applied -- the teacher chunk runs on
+                # _teacher_executor while this line runs on the driver thread,
+                # and RayWorkerGroup dispatches to the ranks in a plain
+                # unsynchronised loop (single_controller/ray/base.py). Two
+                # threads interleaving in that loop can leave rank 0 with
+                # teacher-then-actor and rank 1 with actor-then-teacher. Each
+                # worker still runs ITS queue in order; what differs is the
+                # order across ranks, and both calls drive FSDP collectives on
+                # the same process group. That is a collective mismatch, and it
+                # ends as a watchdog timeout half an hour later with no stack
+                # naming either caller.
+                #
+                # The overlap the launch was for is kept: the teacher chunk has
+                # been running under the scatter/decode/tokenize glue since
+                # _launch_teacher_prefetch above. Only the last sliver is waited
+                # on here, and it is reported separately (tchwait_lp) rather
+                # than charged to envstep.
+                _teacher_wait_lp = self._join_teacher_prefetch()
                 self._prefetch_pending_log_probs(actor_rollout_wg)
                 next_obs, rewards, dones, infos = env_future.result()
             else:
@@ -1787,7 +1813,11 @@ class TrajectoryCollector:
                     "gen": _m_gen - _m_preproc - _teacher_wait,
                     "tchwait": _teacher_wait,
                     "decode": _m_decode - _m_gen,
-                    "envstep": _m_env - _m_decode,
+                    # The log-prob prefetch's join sits inside this window too,
+                    # so it comes out for the same reason the generation one
+                    # does: the columns still sum to the turn's wall clock.
+                    "envstep": _m_env - _m_decode - _teacher_wait_lp,
+                    "tchwait_lp": _teacher_wait_lp,
                     "gen_util": gpu_profiler.mean_util_between(_gw0, _gw1),
                     "gen_util_per_gpu": gpu_profiler.per_gpu_util_between(_gw0, _gw1),
                 })
