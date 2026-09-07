@@ -3576,7 +3576,8 @@ class DataParallelPPOActor(BasePPOActor):
                             # deferred separately below.
                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                             _defer("actor/pg_loss_weighted", pg_term)
-                        if xt_grad_stats is not None or opd_grad_stats is not None:
+                        if (xt_grad_stats is not None or opd_grad_stats is not None
+                                or opd_diag_stats is not None):
                             # d(pg_losses)/d(log_prob), from the SAME inputs the
                             # loss above was built from rather than from a copy
                             # reconstructed in the diagnostic. Outside the
@@ -3727,6 +3728,31 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_kld = torch.where(
                                 finite_kl, teacher_kld, torch.zeros_like(teacher_kld)
                             )
+                        # PER-TASK, ON TOP OF THE GLOBAL COEFFICIENT. b_task
+                        # multiplies the row, so the effective coefficient is
+                        # teacher_kl_loss_coef * b_task and b = 1 reproduces
+                        # every existing run bit for bit. None when unset.
+                        #
+                        # Computed HERE rather than at the loss line below,
+                        # because the arm-independent attribution columns are
+                        # built in between and they describe the term the
+                        # optimizer takes. Read with the GLOBAL coefficient
+                        # only, they reported webshop's OPD push at its
+                        # un-halved size on a run that halved it.
+                        _kl_row_coef = self.teacher_kl_row_coef(
+                            task_ids, task_id_names, teacher_kld.size(0),
+                            device=teacher_kld.device, dtype=teacher_kld.dtype,
+                        )
+                        _teacher_kl_coef_scalar = float(
+                            self.config.get("teacher_kl_loss_coef", 1.0)
+                        )
+                        # What the loss actually applies to this row's OPD term.
+                        # Stays a plain float when b is unset, so every existing
+                        # diagnostic takes the identical code path.
+                        _opd_effective_coef = (
+                            _teacher_kl_coef_scalar if _kl_row_coef is None
+                            else _teacher_kl_coef_scalar * _kl_row_coef
+                        )
                         # Read BEFORE the position weight multiplies it. The
                         # unweighted KL is what makes w_kl/kl the factor the arm
                         # applied to the total; taking the weighted one would
@@ -4285,7 +4311,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     student_logprob=student_topk_logprobs,
                                     teacher_logprob=sign_on_task_logprobs,
                                     teacher_kl=teacher_kld,
-                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                    coef=_opd_effective_coef,
                                 )
                                 if opd_push_tokens is not None
                                 else None
@@ -4313,7 +4339,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     teacher_kl=teacher_kld,
                                     pg_grad_coef=xt_pg_grad_coef,
                                     sampled_onehot=_opd_sampled,
-                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                    coef=_opd_effective_coef,
                                     pg_coef=float(pg_loss_coef),
                                     row_weight=task_loss_weight,
                                     push=opd_push,
@@ -4406,15 +4432,10 @@ class DataParallelPPOActor(BasePPOActor):
                                     task_ids=task_ids,
                                 )
                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        teacher_kl_coef = self.config.get("teacher_kl_loss_coef", 1.0)
-                        # PER-TASK, ON TOP OF THE GLOBAL COEFFICIENT. b_task
-                        # multiplies the row, so the effective coefficient is
-                        # teacher_kl_loss_coef * b_task and b = 1 reproduces every
-                        # existing run bit for bit. None when unset.
-                        _kl_row_coef = self.teacher_kl_row_coef(
-                            task_ids, task_id_names, teacher_kld.size(0),
-                            device=teacher_kld.device, dtype=teacher_kld.dtype,
-                        )
+                        # Both built above, before the attribution columns, so
+                        # the loss and the diagnostics cannot disagree about what
+                        # coefficient this row carried.
+                        teacher_kl_coef = _teacher_kl_coef_scalar
                         if opd_diag_stats is not None:
                             # Collected now, consumed after the backward: the OPD
                             # push is a (bs, T, k) tensor and building it here
@@ -4434,8 +4455,11 @@ class DataParallelPPOActor(BasePPOActor):
                                         ),
                                         "response_ids": responses,
                                         "log_prob": log_prob,
-                                        "old_log_prob": data.get("old_log_probs", None),
-                                        "advantages": data.get("advantages", None),
+                                        # dL_pg/dlog p, clip branches included.
+                                        # -A*rho would report a position the
+                                        # clip has zeroed as a full-magnitude
+                                        # conflict.
+                                        "pg_grad_coef": xt_pg_grad_coef,
                                     }
                                     if teacher_topk_kl and log_prob is not None
                                     else None
@@ -5179,14 +5203,12 @@ class DataParallelPPOActor(BasePPOActor):
         # exactly those.
         if opd_diag_stats is not None:
             # One all-reduce and one host read for the whole table, and the only
-            # place the shares and the budget ratio are formed -- see rows().
+            # place the shares and the ratios are formed -- see rows(). No
+            # coefficient is handed in: every ratio there is eff/base on the same
+            # tokens, so it reports what the loss did rather than restating the
+            # config.
+            metrics.update(opd_diag_stats.rows(list(task_id_names or [])))
             _by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
-            metrics.update(
-                opd_diag_stats.rows(
-                    list(task_id_names or []),
-                    coefs=({str(k): float(v) for k, v in dict(_by_task).items()} if _by_task else None),
-                )
-            )
             if _by_task:
                 _coef = self.config.get("teacher_kl_loss_coef", 1.0)
                 for _nm, _b in dict(_by_task).items():

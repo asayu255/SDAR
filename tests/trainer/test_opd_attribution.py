@@ -470,7 +470,18 @@ def test_the_attribution_is_not_nested_inside_an_arm_gate():
 
 def test_the_policy_gradient_coefficient_is_shared_with_the_weighted_geometry():
     """Two coefficients would make opd/grpo/grad_cosine and
-    kl_weight/grpo/grad_cosine comparisons against different policy gradients."""
+    kl_weight/grpo/grad_cosine comparisons against different policy gradients.
+
+    The guard is asserted by its CONSUMERS rather than by its exact text: a
+    third reader (the per-task coefficient arm's readout) was added to it, which
+    is the guard widening rather than the coefficient splitting. What must stay
+    true is that there is exactly one of them.
+    """
     src = _actor_source()
-    assert "if xt_grad_stats is not None or opd_grad_stats is not None:" in src
     assert src.count("xt_pg_grad_coef = policy_loss_gradient_coef(") == 1
+    guard = next(line for line in src.splitlines()
+                 if "xt_grad_stats is not None" in line and line.strip().startswith("if "))
+    for consumer in ("xt_grad_stats", "opd_grad_stats"):
+        assert consumer in guard + src[src.index(guard):src.index(guard) + 400], consumer
+    # and every reader takes the same name
+    assert "pg_grad_coef=xt_pg_grad_coef" in src

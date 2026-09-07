@@ -179,6 +179,9 @@ def _payload_arg():
 # w_j proportional to ||d_j||. Both budgets are reported for every b.
 # ---------------------------------------------------------------------------
 MIN_BATCH_FRACTION = 0.5
+# The design's admission test: below this the ranking the coefficients encode is
+# not reproducible on its own sample, and the arm to run is the control.
+RANK_REPRO_MIN = 0.90
 # The ranking the step-300 payload gave. Used ONLY as a reference to report
 # agreement against -- never as the thing the bootstrap tests, which is the
 # distinction the old hardcoded P(search>alf>web) collapsed.
@@ -247,7 +250,15 @@ def redistribute(cos, ok, nd, S, *, budget="grad", bmin=0.5, bmax=1.5, diag=True
         for k in range(use.shape[1]):
             use[:, k, k] = False
     M, counts = masked_mean(cos, use)
-    nd_ok = np.isfinite(nd) & (nd > 0)
+    # Exactly zero is a measured magnitude, not a missing value: dropping it
+    # from the mean reports the norm of the batches where the teacher DID push,
+    # which is a larger number than the one the budget is made of. With norms
+    # (1,1,1) and (0,1,1) the mean is (0.5,1,1) and q is (0.2,0.4,0.4); treating
+    # the zero as missing gives (1,1,1) and q = (1/3,1/3,1/3).
+    #
+    # A zero makes the COSINE undefined, and that is handled per cell in
+    # cosine_cells -- two different things that were sharing one filter.
+    nd_ok = np.isfinite(nd)
     nd_mean, nd_counts = masked_mean(nd, nd_ok)
     if check:
         required = np.zeros(use.shape[1:], bool)
@@ -278,7 +289,7 @@ def budgets(b, D, nd):
                 other's name is how the uniform arm's factor came out as two
                 different numbers in two places.
     """
-    nd_ok = np.isfinite(nd) & (nd > 0)
+    nd_ok = np.isfinite(nd)
     nd_mean, _ = masked_mean(nd, nd_ok)
     lin = float((b * nd_mean).sum())
     per_batch = np.array([math.sqrt(max(b @ D[n] @ b, 0.0)) for n in range(len(D))])
@@ -307,7 +318,7 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
     unusable = int((~ok).sum())
     print(f"unusable (batch, i, j) cells: {unusable} of {ok.size}"
           + ("" if unusable == 0 else "  <- dropped from that cell's mean, not from the matrix"))
-    nd_ok = np.isfinite(nd) & (nd > 0)
+    nd_ok = np.isfinite(nd)
     nd_mean, _ = masked_mean(nd, nd_ok)
     print("mean ||d_j|| =", nd_mean, f" max/min = {nd_mean.max() / nd_mean.min():.2f}")
     lin0, rms0, mean0 = budgets(np.ones(3), D, nd)
@@ -370,8 +381,17 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
     for j, t in enumerate(TASKS):
         print(f"    {t:<9} 5-95% = [{pct[j][0]:.3f}, {pct[j][1]:.3f}]   "
               f"P(b>1) = {(boot[:, j] > 1).mean():.3f}   P(b<1) = {(boot[:, j] < 1).mean():.3f}")
-    if rank_repro < 0.90:
-        print("  GO CONDITION NOT MET: rank_reproducibility < 0.90 -> kappa = 0 (run the control only)")
+    # THE GO CONDITION GATES THE OUTPUT, it does not merely comment on it.
+    # Printing "kappa = 0" while returning and saving a non-trivial b is how a
+    # vector that failed its own admission test ends up pinned in a lock file
+    # three commands later.
+    approved = rank_repro >= RANK_REPRO_MIN
+    b_approved = b_main if approved else np.ones_like(b_main)
+    if not approved:
+        print(f"  GO CONDITION NOT MET: rank_reproducibility {rank_repro:.3f} < "
+              f"{RANK_REPRO_MIN} -> kappa = 0. approved_b = {b_approved.round(6)} "
+              f"(run the control only); the candidate is reported for inspection "
+              f"but must not be used as an arm.")
 
     print("\nleave-one-batch-out (grad budget, cosine, all rows):")
     loo = {}
@@ -395,7 +415,13 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
             "opd_grad_norm_mean": nd_mean.tolist(),
             "q": q_main.tolist(),
             "c": c_main.tolist(),
-            "b": b_main.tolist(),
+            # Two fields, deliberately. "b" was BOTH the candidate and the thing
+            # a reader would copy into a lock file, so a failed go condition had
+            # nowhere to show up.
+            "candidate_b": b_main.tolist(),
+            "approved_b": b_approved.tolist(),
+            "approved": bool(approved),
+            "rank_reproducibility_min": RANK_REPRO_MIN,
             "sum_q_b": float((q_main * b_main).sum()),
             "budget_linear": {"control": lin0, "redistributed": lin_m},
             "budget_composite_rms": {"control": rms0, "redistributed": rms_m},
@@ -413,7 +439,7 @@ def redistribution_report(path, *, min_fraction=MIN_BATCH_FRACTION, json_out=Non
         with open(json_out, "w") as fh:
             json.dump(payload, fh, indent=2)
         print(f"\nwrote {json_out}")
-    return b_main
+    return b_approved
 
 
 def _flag_value(name, default=None, cast=str):
@@ -427,10 +453,15 @@ def _flag_value(name, default=None, cast=str):
 # had not defined yet and died with a NameError the moment those helpers moved.
 if __name__ == "__main__":
     if "--redistribute" in sys.argv:
-        redistribution_report(
+        b = redistribution_report(
             _payload_arg(),
             min_fraction=_flag_value("--min-batches", MIN_BATCH_FRACTION, float),
             json_out=_flag_value("--json"),
         )
+        # Non-zero exit when the admission test failed, so a shell pipeline that
+        # feeds this into a launch cannot walk past it.
+        if np.allclose(b, 1.0):
+            print("approved_b is uniform: nothing to redistribute", file=sys.stderr)
+            sys.exit(3)
     else:
         main(_payload_arg())

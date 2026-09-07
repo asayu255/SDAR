@@ -191,3 +191,118 @@ def test_the_payload_flag_parser_does_not_eat_a_flag_value(monkeypatch):
     assert qp._payload_arg() == "payload.json"
     monkeypatch.setattr(qp.sys, "argv", ["x", "--redistribute", "--min-batches", "0.25"])
     assert qp._payload_arg().endswith("terms_n8_fixed.json")
+
+
+# ---------------------------------------------------------------------------
+# 5. the go condition, and what the script hands over when it fails
+
+
+def _payload(path, cos_target, nd_rows, nr_rows, seed=0, jitter=0.0):
+    """A terms payload in the shape load() reads, from a target cosine matrix.
+
+    Written out rather than reduced to the arrays, because the failure this
+    guards -- a non-trivial b surviving a failed admission test -- lives in
+    redistribution_report, which takes a FILE.
+    """
+    import json
+
+    rng = np.random.default_rng(seed)
+    tasks = qp.TASKS
+    batches = []
+    for n in range(len(nd_rows)):
+        nd, nr = np.asarray(nd_rows[n], float), np.asarray(nr_rows[n], float)
+        cos = np.asarray(cos_target, float) + rng.normal(0, jitter, (3, 3))
+        w = {}
+        for i, t in enumerate(tasks):
+            w[f"sq:{t}:rl"] = float(nr[i] ** 2)
+            w[f"sq:{t}:opd"] = float(nd[i] ** 2)
+        for i, ti in enumerate(tasks):
+            for j, tj in enumerate(tasks):
+                w[f"dot:{ti}:rl:{tj}:opd"] = float(cos[i, j] * nr[i] * nd[j])
+                if i < j:
+                    w[f"dot:{ti}:rl:{tj}:rl"] = 0.0
+                    w[f"dot:{ti}:opd:{tj}:opd"] = 0.0
+        batches.append(w)
+    path.write_text(json.dumps({
+        "checkpoint": "synthetic", "pg_loss_coef": 1.0, "teacher_kl_loss_coef": 0.01,
+        "batch_moments": batches,
+        "advantages": [{t: {"live_groups": 5, "prompt_groups": 5} for t in tasks}
+                       for _ in batches],
+    }))
+    return path
+
+
+def test_a_failed_go_condition_returns_the_uniform_vector_not_the_candidate(tmp_path, capsys):
+    """The bug: the script printed "kappa = 0" and returned a non-trivial b.
+
+    Columns are near-tied and the per-batch noise is large, so the ranking the
+    sample gives does not survive its own bootstrap.
+    """
+    p = _payload(tmp_path / "wobbly.json",
+                 cos_target=[[-0.02, -0.02, -0.021]] * 3,
+                 nd_rows=[[0.46, 0.89, 0.41]] * 8,
+                 nr_rows=[[1.0, 1.0, 1.0]] * 8,
+                 seed=1, jitter=0.05)
+    out = tmp_path / "out.json"
+    approved = qp.redistribution_report(str(p), json_out=str(out), n_boot=300)
+    text = capsys.readouterr().out
+    assert "GO CONDITION NOT MET" in text
+
+    import json
+    saved = json.loads(out.read_text())
+    assert saved["rank_reproducibility"] < 0.90
+    assert saved["approved"] is False
+    assert saved["approved_b"] == [1.0, 1.0, 1.0]
+    assert saved["candidate_b"] != saved["approved_b"], (
+        "the candidate must still be reported -- it is the thing under inspection"
+    )
+    assert np.allclose(approved, 1.0), "the RETURN value is what a caller would use"
+
+
+def test_a_passing_go_condition_returns_the_candidate(tmp_path):
+    p = _payload(tmp_path / "clean.json",
+                 cos_target=[[-0.02, 0.03, -0.25]] * 3,
+                 nd_rows=[[0.46, 0.89, 0.41]] * 8,
+                 nr_rows=[[1.0, 1.0, 1.0]] * 8,
+                 seed=2, jitter=0.002)
+    out = tmp_path / "out.json"
+    approved = qp.redistribution_report(str(p), json_out=str(out), n_boot=300)
+    import json
+    saved = json.loads(out.read_text())
+    assert saved["approved"] is True
+    assert saved["approved_b"] == saved["candidate_b"]
+    assert not np.allclose(approved, 1.0)
+
+
+def test_the_admission_threshold_is_the_designs_and_is_named_once():
+    assert qp.RANK_REPRO_MIN == 0.90
+
+
+# ---------------------------------------------------------------------------
+# 6. an OPD norm of exactly zero is a measurement, not a missing value
+
+
+def test_a_zero_opd_norm_counts_in_the_mean_that_builds_q():
+    """The reviewer's example, exactly: norms (1,1,1) and (0,1,1).
+
+    Dropping the zero reports the norm of the batches where the teacher DID
+    push, which is a bigger number than the one the budget is made of, and q
+    comes out uniform instead of skewed.
+    """
+    nd = np.array([[1.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+    nd_mean, counts = qp.masked_mean(nd, np.isfinite(nd))
+    assert nd_mean.tolist() == [0.5, 1.0, 1.0]
+    q = nd_mean / nd_mean.sum()
+    assert q.tolist() == pytest.approx([0.2, 0.4, 0.4])
+
+    dropped, _ = qp.masked_mean(nd, np.isfinite(nd) & (nd > 0))
+    assert dropped.tolist() == [1.0, 1.0, 1.0]
+    q_dropped = dropped / dropped.sum()
+    assert q_dropped.tolist() == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+
+
+def test_the_budgets_helper_uses_the_zero_inclusive_mean():
+    nd = np.array([[1.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+    D = np.tile(np.eye(3), (2, 1, 1))
+    lin, _, _ = qp.budgets(np.ones(3), D, nd)
+    assert lin == pytest.approx(0.5 + 1.0 + 1.0)

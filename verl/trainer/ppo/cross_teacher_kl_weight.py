@@ -4199,7 +4199,7 @@ def opd_logit_push(
     student_logprob: torch.Tensor,
     teacher_logprob: torch.Tensor,
     teacher_kl: torch.Tensor,
-    coef: float,
+    coef,
     eps: float = 1e-8,
 ) -> dict:
     """The UNWEIGHTED OPD descent direction on each logit, and the pieces of it.
@@ -4222,9 +4222,24 @@ def opd_logit_push(
     f = lp_s - lp_t
     f_tail = tail_s.log() - tail_logprob(lp_t, eps)
     d = teacher_kl.detach().to(torch.float32).unsqueeze(-1)
+    # A PER-ROW coefficient is allowed, for the arm that scales one task's whole
+    # teacher-KL term. It has to be reshaped per use: the support term is
+    # (bs, resp, k) and the tail term is (bs, resp), and one (bs,) tensor
+    # broadcast against both aligns on the wrong axis for one of them.
+    #
+    # It goes HERE and not on row_weight, which the policy-gradient side shares:
+    # folding b into row_weight would scale the reward's gradient too, and every
+    # cosine and ratio built from the pair would move for a reason the arm never
+    # applied. Because g0 carries it, an inner product picks up b and a squared
+    # norm picks up b^2, which is what those quantities do in the loss.
+    if torch.is_tensor(coef):
+        c_support = coef.detach().to(torch.float32).reshape(-1, 1, 1)
+        c_tail = c_support.reshape(-1, 1)
+    else:
+        c_support = c_tail = coef
     return {
-        "g0": coef * p_s * (d - f),
-        "g0_tail": coef * tail_s * (d.squeeze(-1) - f_tail),
+        "g0": c_support * p_s * (d - f),
+        "g0_tail": c_tail * tail_s * (d.squeeze(-1) - f_tail),
         "p_student": p_s,
         "tail_student": tail_s,
         "gap": f,

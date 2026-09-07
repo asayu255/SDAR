@@ -15,36 +15,41 @@
 """What a per-task OPD coefficient did, measured while the arm runs.
 
 The coefficients b_j are calibrated OFFLINE, on one checkpoint, from
-parameter-space gradients (``scripts/opd_cross_effect_qp.py``). Three things
-that calibration cannot say are exactly the three this module measures on every
-step of the run itself:
+PARAMETER-space gradients (``scripts/opd_cross_effect_qp.py``). Everything here
+is LOGIT-space, on this step's data, and the two are related by the model's
+Jacobian J:
 
-1. **What the arm actually reallocated.** The claim is that the rule holds a
-   budget while moving its shares. The budget it holds is
-   ``sum_j b_j ||d_j||`` on the CALIBRATION data; during training nothing
-   guarantees it. ``push_l2_logit`` is a per-step, per-task stand-in for
-   ``||d_j||`` -- the L2 norm of the OPD term's descent direction on the
-   logits -- and ``budget_ratio_logit`` is the ratio the calibration set to
-   1.000. Its drift away from 1 is the honest size of "preserved only on the
-   calibration data".
+    logit-space inner product      u_R . u_D
+    parameter-space inner product  u_R . J J^T u_D
 
-2. **Whether the on-task conflict the coefficients respond to is still there
-   at step 0-150.** The calibration is a step-300 measurement applied from
-   step 0. In logit space the on-task part of it is exact and free: at one
-   token, the reward pushes the sampled logit one way and the teacher pushes
-   the whole support another, and ``pg_dot`` is their inner product. This is
-   the DIAGONAL of the cross-effect matrix, not the off-diagonal the arm is
-   premised on -- no per-token quantity can carry the off-diagonal, because a
-   token belongs to one task. Read it as "is the teacher fighting this task's
-   own reward", which is 40% of what makes the webshop column negative.
+so no quantity below is the calibrated one measured again, and none of them is
+guaranteed to reproduce a calibrated value even on the calibration data. What
+they are is a reading of the term the optimizer actually took, on every step,
+for the price of one all-reduce.
 
-3. **Which of webshop's two paths moved.** Halving b_webshop both removes
-   interference and halves a distillation signal, and the design cannot tell
-   them apart from a success rate. It can from where the KL sits: on tokens
-   whose advantage is zero the OPD term is the ONLY gradient (nothing to
-   interfere with, so a change there is the distillation path), and on tokens
-   with a live advantage both act. ``kl_mean_adv_zero`` / ``kl_mean_adv_live``
-   split it.
+**1. Did b land, and where did the term go.** ``kl_ratio_eff_base`` and
+``push_l2_ratio_eff_base`` are eff/base on the same tokens of the same forward,
+so each equals b_task when the coefficient reached the loss -- a wiring check
+that reads the loss rather than restating the config. ``kl_share_*`` say where
+the term went; they are NOT b_task, because the denominator moves with every
+task and a uniform amplification leaves both shares unchanged.
+
+**2. How much of each signal there was.** ``adv_zero_frac`` is the token share
+with no advantage; ``pg_live_frac`` is the share where the policy gradient's
+derivative is actually non-zero, which is smaller because the PPO clip zeroes
+positions with a live advantage. Splitting the KL by advantage
+(``kl_mean_adv_zero`` / ``kl_mean_adv_live``) shows where the distillation term
+sits relative to the reward's support. It is NOT a separation of two causal
+paths: a live advantage can still be clipped to zero gradient, and the shared
+parameters are updated from every other token and task in the batch.
+
+**3. The local relation between policy and teacher.** ``pg_dot_mean`` /
+``pg_cos_mean`` are the inner product of the two descent directions on the SAME
+token's logits, clip included (see :func:`opd_pg_alignment_terms`). Read it as
+an auxiliary, logit-space alignment. It is not the diagonal of the
+parameter-space cross-effect matrix: the sign is not preserved through J J^T,
+and it cannot carry the off-diagonal at all, because a token belongs to one
+task.
 
 Sign convention throughout is DESCENT, matching :func:`opd_logit_push`:
 positive means the objective is pushing that logit UP. So ``pg_dot > 0`` is
@@ -66,10 +71,9 @@ def opd_pg_alignment_terms(
     topk_ids: torch.Tensor,
     response_ids: torch.Tensor,
     log_prob: torch.Tensor,
-    old_log_prob: torch.Tensor | None,
-    advantages: torch.Tensor | None,
+    pg_grad_coef: torch.Tensor | None,
 ) -> dict:
-    """Per-token logit-space push of the OPD term, and its overlap with the PG term.
+    """Per-token logit-space overlap between the OPD push and the PG push.
 
     With ``p`` the student's distribution, ``D`` the per-token KL and
     ``f(v) = log p(v) - log p_teacher(v)``, the descent direction of the KL on
@@ -77,23 +81,32 @@ def opd_pg_alignment_terms(
 
         g_opd(v) = p(v) * (D - f(v))
 
-    (derived in :func:`opd_logit_push`, checked there against autograd), and the
-    unclipped PPO surrogate ``-A * rho`` with ``rho = exp(log p(a) - log p_old(a))``
-    gives
+    (derived in :func:`opd_logit_push`, checked there against autograd). The
+    policy gradient's descent direction is
 
-        g_pg(v) = A * rho * (delta_{v,a} - p(v))
+        g_pg(v) = -dL_pg/dlog p * (delta_{v,a} - p(v))
 
     so their inner product over the vocabulary collapses to two support sums:
 
-        <g_pg, g_opd> = A * rho * [ g_opd(a) - sum_v p(v) g_opd(v) ]
+        <g_pg, g_opd> = -dL_pg/dlog p * [ g_opd(a) - sum_v p(v) g_opd(v) ]
 
-    **Three approximations, all on the tail and all named in the metric keys.**
-    The sums run over the teacher's top-k support only: outside it the KL keeps
-    a single lumped tail bucket, whose per-symbol split is not represented, and
-    the terms it drops carry p(v)^2 with p(v) tiny. A token whose SAMPLED id
-    fell outside the support has no ``g_opd(a)``; it is excluded, and the
-    fraction that survives is reported as ``align_cover``. Clipping is ignored:
-    where the PPO clip binds, the true PG gradient is zero and this over-counts.
+    **The PG coefficient is passed in, not rebuilt from A and the ratio.**
+    ``-A*rho`` is the coefficient only outside the PPO clip; inside a bound clip
+    branch, or the dual-clip branch, the true derivative is exactly ZERO and a
+    metric using ``-A*rho`` reports a position the objective has stopped pushing
+    as a full-magnitude conflict. :func:`policy_loss_gradient_coef` is that
+    derivative in closed form, differentiated from the loss and checked against
+    autograd, so the caller hands it over rather than this file keeping a second
+    opinion about what the objective is.
+
+    **Two approximations, both on the tail, both named in the metric keys.** The
+    sums run over the KL's own top-k support only: outside it the KL keeps a
+    single lumped tail bucket whose per-symbol split is not represented, and the
+    terms it drops carry p(v)^2 with p(v) tiny. A token whose SAMPLED id fell
+    outside the support has no ``g_opd(a)``; it is excluded, and the share that
+    survives is reported as ``align_cover``. Which model's top-k the support is
+    is the caller's business (student-indexed or teacher-indexed) -- this
+    function reads whatever ids it is given.
 
     Returns per-token ``(bs, response_length)`` tensors. Everything is detached:
     this is a measurement, never a term in the loss.
@@ -108,8 +121,8 @@ def opd_pg_alignment_terms(
 
     p_s = lp_s.exp()
     # g_opd over the support. Same expression as opd_logit_push's g0 at coef=1;
-    # the coefficient is deliberately left out so the norm below is a b = 1
-    # basis and the arm's own b can be applied to it afterwards.
+    # the coefficient is deliberately left out so the norm is a b = 1 basis and
+    # the row weights the loss applies can be put on it afterwards.
     g_opd = p_s * (d - (lp_s - lp_t))
     opd_sq = (g_opd * g_opd).sum(dim=-1)
 
@@ -119,8 +132,9 @@ def opd_pg_alignment_terms(
         "cos": torch.zeros_like(opd_sq),
         "pg_sq": torch.zeros_like(opd_sq),
         "align_mask": torch.zeros_like(opd_sq),
+        "pg_live": torch.zeros_like(opd_sq),
     }
-    if advantages is None or old_log_prob is None or log_prob is None or topk_ids is None:
+    if pg_grad_coef is None or log_prob is None or topk_ids is None:
         # No policy gradient to overlap with (pure distillation), or no support
         # ids to locate the sampled token in. Reporting a zero cosine would read
         # as "measured, and they are orthogonal"; the caller sees
@@ -138,22 +152,27 @@ def opd_pg_alignment_terms(
     p_dot_g = (p_s * g_opd).sum(dim=-1)
     p_sq = (p_s * p_s).sum(dim=-1)
 
-    adv = advantages.detach().to(dt)
-    ratio = (log_prob.detach().to(dt) - old_log_prob.detach().to(dt)).exp()
-    pg_scale = adv * ratio
+    # Descent convention: positive means the objective pushes this logit UP.
+    pg_scale = -pg_grad_coef.detach().to(dt)
+    pg_live = pg_scale != 0
 
     dot = pg_scale * (g_opd_a - p_dot_g)
-    # ||g_pg||^2 = (A rho)^2 * sum_v (delta_{v,a} - p(v))^2 = (A rho)^2 (1 - 2 p_a + sum_v p^2)
+    # ||g_pg||^2 = (dL/dlogp)^2 * sum_v (delta_{v,a} - p(v))^2
+    #            = (dL/dlogp)^2 (1 - 2 p_a + sum_v p^2)
     pg_sq = pg_scale * pg_scale * (1.0 - 2.0 * p_a + p_sq).clamp(min=0.0)
 
-    live = in_support & (adv != 0)
-    denom = (pg_sq.sqrt() * opd_sq.sqrt()).clamp(min=1e-20)
-    cos = torch.where(live, dot / denom, torch.zeros_like(dot))
+    # A cosine needs both norms. Where either is zero it is UNDEFINED, and
+    # averaging a zero in its place would pull the mean toward "orthogonal" with
+    # positions that carry no direction at all.
+    live = in_support & pg_live & (pg_sq > 0) & (opd_sq > 0)
+    denom = (pg_sq.clamp(min=0).sqrt() * opd_sq.clamp(min=0).sqrt()).clamp(min=1e-30)
+    zero = torch.zeros_like(dot)
 
-    out["dot"] = torch.where(live, dot, torch.zeros_like(dot))
-    out["cos"] = cos
-    out["pg_sq"] = torch.where(live, pg_sq, torch.zeros_like(pg_sq))
+    out["dot"] = torch.where(live, dot, zero)
+    out["cos"] = torch.where(live, dot / denom, zero)
+    out["pg_sq"] = torch.where(live, pg_sq, zero)
     out["align_mask"] = live.to(opd_sq.dtype)
+    out["pg_live"] = pg_live.to(opd_sq.dtype)
     return out
 
 
@@ -162,11 +181,18 @@ def opd_pg_alignment_terms(
 _COLS = (
     "n_tok",
     "n_tok_adv_zero",
+    "n_pg_live",
     "kl_sum",
     "kl_sum_adv_zero",
     "kl_base_sum",
     "kl_eff_sum",
-    "push_sq_sum",
+    # The OPD push's squared norm carries the ROW WEIGHT the loss applies, so
+    # base and eff are the norms of the term that is actually in the objective.
+    # Squared, because a norm's square takes the weight squared -- putting the
+    # weight on linearly here is how a budget ratio comes out as the square root
+    # of the one the loss took.
+    "push_sq_base_sum",
+    "push_sq_eff_sum",
     "n_align",
     "dot_sum",
     "cos_sum",
@@ -239,7 +265,10 @@ class OpdTaskDiagStats:
             per_row[:, _IDX["kl_eff_sum"]] = row_kl * basis * coef
             if terms is not None:
                 live = terms["align_mask"] * mask
-                per_row[:, _IDX["push_sq_sum"]] = (terms["opd_sq"] * mask).sum(dim=-1)
+                opd_sq = (terms["opd_sq"] * mask).sum(dim=-1)
+                per_row[:, _IDX["push_sq_base_sum"]] = opd_sq * basis * basis
+                per_row[:, _IDX["push_sq_eff_sum"]] = opd_sq * (basis * coef) ** 2
+                per_row[:, _IDX["n_pg_live"]] = (terms["pg_live"] * mask).sum(dim=-1)
                 per_row[:, _IDX["n_align"]] = live.sum(dim=-1)
                 per_row[:, _IDX["dot_sum"]] = (terms["dot"] * live).sum(dim=-1)
                 per_row[:, _IDX["cos_sum"]] = (terms["cos"] * live).sum(dim=-1)
@@ -254,12 +283,17 @@ class OpdTaskDiagStats:
             onehot = onehot.to(per_row.dtype) * (flat >= 0).to(per_row.dtype).unsqueeze(-1)
             self.buf += (onehot.transpose(0, 1) @ per_row).to(torch.float64)
 
-    def rows(self, task_names, coefs=None) -> dict:
+    def rows(self, task_names) -> dict:
         """One all-reduce, one host read, and the ratios the sums are for.
 
         Ratios are formed AFTER the reduction, never per micro-batch and never
         per rank: a mean of per-rank shares is not the share, and a mean of
         per-micro-batch shares weighs a short micro-batch like a full one.
+
+        The coefficient is NOT taken from the config here. Every ratio below is
+        eff/base on the same tokens of the same forward, so ``kl_ratio`` and
+        ``push_l2_ratio`` are what the loss did with b, not a restatement of
+        what the config asked for -- which is what makes them a wiring check.
         """
         buf = self.buf
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -271,7 +305,7 @@ class OpdTaskDiagStats:
             return float(num) / float(den) if den > 0 else 0.0
 
         out = {}
-        push_l2 = {}
+        l2_base, l2_eff = {}, {}
         for tid, name in enumerate(task_names[: self.n_tasks]):
             row = table[tid]
             n_tok = row[_IDX["n_tok"]]
@@ -279,20 +313,30 @@ class OpdTaskDiagStats:
                 continue
             n_zero = row[_IDX["n_tok_adv_zero"]]
             n_live = n_tok - n_zero
+            n_pg = row[_IDX["n_pg_live"]]
             kl_zero = row[_IDX["kl_sum_adv_zero"]]
             n_align = row[_IDX["n_align"]]
-            l2 = row[_IDX["push_sq_sum"]] ** 0.5
-            push_l2[name] = l2
+            base = row[_IDX["push_sq_base_sum"]] ** 0.5
+            eff = row[_IDX["push_sq_eff_sum"]] ** 0.5
+            l2_base[name], l2_eff[name] = base, eff
 
             out[f"actor/opd_diag/tokens/{name}"] = n_tok
-            out[f"actor/opd_diag/adv_zero_frac/{name}"] = _safe(n_zero, n_tok)
             out[f"actor/opd_diag/kl_mean/{name}"] = _safe(row[_IDX["kl_sum"]], n_tok)
+            # ---- did b actually reach the loss? Both must equal b_task. ----
+            out[f"actor/opd_diag/kl_ratio_eff_base/{name}"] = _safe(
+                row[_IDX["kl_eff_sum"]], row[_IDX["kl_base_sum"]]
+            )
+            out[f"actor/opd_diag/push_l2_ratio_eff_base/{name}"] = _safe(eff, base)
+            out[f"actor/opd_diag/push_l2_logit_base/{name}"] = base
+            out[f"actor/opd_diag/push_l2_logit_eff/{name}"] = eff
+            # ---- how much signal each side had -----------------------------
+            out[f"actor/opd_diag/adv_zero_frac/{name}"] = _safe(n_zero, n_tok)
+            out[f"actor/opd_diag/pg_live_frac/{name}"] = _safe(n_pg, n_tok)
             out[f"actor/opd_diag/kl_mean_adv_zero/{name}"] = _safe(kl_zero, n_zero)
             out[f"actor/opd_diag/kl_mean_adv_live/{name}"] = _safe(row[_IDX["kl_sum"]] - kl_zero, n_live)
-            out[f"actor/opd_diag/push_l2_logit/{name}"] = l2
-            out[f"actor/opd_diag/push_rms_logit/{name}"] = _safe(row[_IDX["push_sq_sum"]], n_tok) ** 0.5
+            # ---- the logit-space alignment, on its own population ----------
             out[f"actor/opd_diag/align_tokens/{name}"] = n_align
-            out[f"actor/opd_diag/align_cover/{name}"] = _safe(n_align, n_live)
+            out[f"actor/opd_diag/align_cover/{name}"] = _safe(n_align, n_pg)
             out[f"actor/opd_diag/pg_dot_mean/{name}"] = _safe(row[_IDX["dot_sum"]], n_align)
             out[f"actor/opd_diag/pg_cos_mean/{name}"] = _safe(row[_IDX["cos_sum"]], n_align)
             out[f"actor/opd_diag/pg_dot_neg_frac/{name}"] = _safe(row[_IDX["dot_neg"]], n_align)
@@ -308,16 +352,22 @@ class OpdTaskDiagStats:
         for tid, name in enumerate(task_names[: self.n_tasks]):
             if table[tid][_IDX["n_tok"]] <= 0:
                 continue
+            # NOT b_task: the denominator moves with every task. A uniform
+            # amplification leaves both shares unchanged. Read these for WHERE
+            # the term went, and kl_ratio_eff_base above for whether b landed.
             out[f"actor/opd_diag/kl_share_base/{name}"] = _safe(table[tid][_IDX["kl_base_sum"]], base_total)
             out[f"actor/opd_diag/kl_share_eff/{name}"] = _safe(table[tid][_IDX["kl_eff_sum"]], eff_total)
 
-        # The invariant the rule is built on, read on THIS step's data instead of
-        # the calibration set: 1.000 means the reallocation moved shares without
-        # moving the total, and the distance from 1 is how far the guarantee
-        # travelled. Uniform b gives exactly b, which is what makes the uniform
-        # arm's number interpretable next to the redistributed one.
-        if coefs and push_l2:
-            plain = sum(push_l2.values())
-            scaled = sum(push_l2[n] * float(coefs.get(n, 1.0)) for n in push_l2)
+        # sum_j b_j L_j / sum_j L_j in LOGIT space, on this step's data, with the
+        # loss's own row weights. Under a uniform arm it is exactly that arm's b.
+        #
+        # It is NOT the quantity the offline rule set to 1.000: that budget was
+        # computed on PARAMETER-space gradient norms, and the two are related by
+        # the model's Jacobian, so nothing makes this read 1 even on the
+        # calibration data. Read it as "how much OPD gradient, in logit space,
+        # the coefficients added or removed this step".
+        if l2_base:
+            plain = sum(l2_base.values())
+            scaled = sum(l2_eff.values())
             out["actor/opd_diag/budget_ratio_logit"] = _safe(scaled, plain)
         return out

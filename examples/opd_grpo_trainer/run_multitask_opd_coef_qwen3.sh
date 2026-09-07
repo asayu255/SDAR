@@ -104,11 +104,19 @@ set -x
 ARM=${ARM:-redistribute}
 case "$ARM" in
     control)
-        # No by-task key at all, so teacher_kl_loss_coef_by_task stays null and
-        # dp_actor takes the original expressions. Passing {1,1,1} would take
-        # the b-aware branch and reach the same number by a different path;
-        # the control has to be the path too, not just the value.
-        OPD_COEF_ARGS=()
+        # EXPLICITLY null, not absent. The injection turns this into
+        # teacher_kl_loss_coef_by_task = None on the actor, so dp_actor still
+        # takes the original expressions -- passing {1,1,1} would take the
+        # b-aware branch and reach the same number by a different path, and the
+        # control has to be the path too, not just the value.
+        #
+        # Absent does NOT work: the key is not in the base config, so omitting
+        # it leaves algorithm.opd.kl_loss_coef_by_task at <<MISSING>> and the
+        # intent lock -- which pins it to null on all three arms, because the
+        # control has to DECLARE that it did not use per-task coefficients --
+        # fails the run in seconds. That is the lock doing its job; the fix is
+        # to say null rather than to stop asking.
+        OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task=null" )
         ;;
     uniform)
         OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task={alfworld:1.110833,search:1.110833,webshop:1.110833}" )

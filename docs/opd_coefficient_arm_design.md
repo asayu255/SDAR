@@ -232,14 +232,22 @@ OPD の効果が観測された区間（§4.3）を含めるためである。
 | アームの readout | `verl/trainer/ppo/opd_task_diag.py`（§4.2）。既定 off、config だけで構築（`rows()` が collective を回すため） |
 | lock | `expected_multitask_config.yaml` 2 ファイルに `teacher_kl_loss_coef_by_task: null` を固定。アーム 3 本の期待値ファイル `expected_multitask_opd_coef_{control,uniform,redistribute}_config.yaml` |
 | 起動スクリプト | `examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh`（`ARM=control\|uniform\|redistribute`）。`run_multitask_cross_teacher_klw_control_qwen3.sh`（$\beta$=0.01）から派生。`run_multitask_qwen3.sh` は $\beta$=1.0 なので使えない |
+| control は `null` を**明示的に渡す** | キーを省くと `algorithm.opd.kl_loss_coef_by_task` が `<<MISSING>>` のままで、3 アームすべてに `null` を固定した lock が起動を止める。actor 側では `None` になり従来の損失経路を通る |
 | 算出スクリプト | `scripts/opd_cross_effect_qp.py`（別 worktree から移送し、下記 3 点を修正） |
-| 試験 | `tests/trainer/test_teacher_kl_coef_by_task.py` 22 件、`test_opd_task_diag.py` 22 件、`test_opd_coef_arm.py` 29 件、`test_opd_cross_effect_qp.py` 9 件。`tests/trainer` 全体 1223 passed（既存の失敗 1 件 `test_cross_teacher_kl_weight.py::test_the_reliability_pass_...` は base 39bfffe から存在し、この作業とは無関係） |
+| 試験 | `tests/trainer/test_teacher_kl_coef_by_task.py` 22 件、`test_opd_task_diag.py` 29 件、`test_opd_coef_arm.py` 33 件、`test_opd_cross_effect_qp.py` 14 件。既存の失敗 1 件（`test_cross_teacher_kl_weight.py::test_the_reliability_pass_...`）は base 39bfffe から存在し、この作業とは無関係 |
 
 **アーム同士の差が $b$ だけであることは、読み比べではなく試験で固定した**:
 `test_opd_coef_arm.py` が 3 つの期待値ファイルを平坦化して差分を取り、
 `kl_loss_coef_by_task.*` と `trainer.experiment_name` 以外に差があれば落ちる。
-control は**キーを置かない**（`null`）—— $\{1,1,1\}$ を渡すと $b$ 対応の分岐を通り、
+control は $\{1,1,1\}$ ではなく `null` を渡す —— $\{1,1,1\}$ は $b$ 対応の分岐を通り、
 同じ値に別経路で到達してしまうため。
+
+**ただし lock 同士の差分だけでは足りなかった。** スクリプトが**渡さない**キーは
+ファイル比較では捕まらず、実際に control だけが `<<MISSING>>` で lock に落ちていた
+（ファイル側の試験は全部通ったまま、アームは起動時に死ぬ）。そこで
+「実引数 → Hydra 合成 → 設定注入 → lock 照合」を 3 条件で回す試験を足した。
+実引数はスクリプトのテキストを読み直すのではなく、`python3` をシムに差し替えて
+スクリプト自身に答えさせる。
 
 **算出スクリプトの修正 3 点**（いずれもレビュー指摘、実行前に発見）:
 
@@ -260,33 +268,56 @@ control は**キーを置かない**（`null`）—— $\{1,1,1\}$ を渡すと 
 ### 4.2 走行中の readout（`algorithm.opd.task_diag=True`）
 
 `verl/trainer/ppo/opd_task_diag.py`。update あたり all-reduce 1 回・host read 1 回。
-オフライン校正が答えられない 3 つを、走らせながら測る。
+
+**校正はパラメータ空間の勾配で行い、ここで測るのはロジット空間である。** ロジット勾配を
+$u_R,u_D$、モデルの Jacobian を $J$ とすると、ロジット上の内積は $u_R^\top u_D$、
+パラメータ上は $u_R^\top JJ^\top u_D$ で、**同一タスクでも符号は保証されない**。
+したがって以下のどの量も「校正した量をもう一度測ったもの」ではなく、校正データ上でさえ
+校正値を再現する保証はない。これらが与えるのは、**optimizer が実際に取った項の読み**である。
 
 | 指標 | 何を答えるか |
 |---|---|
-| `actor/opd_diag/budget_ratio_logit` | $\sum_j b_j\|g_{\rm opd,j}\| / \sum_j \|g_{\rm opd,j}\|$ を**その step のデータ**で、ロジット空間で。校正はこれを 1.000 に置いた。1 からのずれが「予算は校正データ上でしか保たれない」の実測値。一様アームでは構成上 1.110833 になる |
-| `kl_share_eff/{task}`, `kl_share_base/{task}` | 各タスクが教師 KL 項に実際に出した割合、$b$ 込みと $b=1$ 基準。**設定した再配分ではなく、実現した再配分** |
-| `kl_sum_eff/{task}`, `kl_sum_base/{task}` | その絶対量。割合だけでは「両アームで割合は同じだが総量が動いた」を無変化と報告してしまう |
-| `pg_dot_mean/{task}`, `pg_cos_mean`, `pg_dot_neg_frac` | 同一トークンのロジット上で、報酬の押しと教師の押しの内積（降下規約、負 = 対立）。**交差効果行列の対角**を step 0–150 で live に測る。校正は step 300 しか持たない |
-| `adv_zero_frac/{task}`, `kl_mean_adv_zero`, `kl_mean_adv_live` | webshop の 2 経路の分離。$A=0$ のトークンでは OPD が唯一の勾配（＝蒸留経路）、$A\ne0$ では両方が働く（＝干渉経路） |
-| `align_cover/{task}` | 上の整列指標が定義されているトークンの割合（サンプルされた id が教師 top-20 に入った割合）。これが落ちれば、整列指標は縮む部分集合を語っている |
-| `push_l2_logit/{task}`, `push_rms_logit/{task}` | $\|d_j\|$ のロジット空間での代理。予算比の分子・分母 |
+| `kl_ratio_eff_base/{task}`、`push_l2_ratio_eff_base/{task}` | **$b$ が損失に届いたか。** 同一 forward・同一トークンの eff/base なので、分母が非ゼロなら $b_j$ に一致する。config を言い直したものではなく、損失が何をしたかの読み |
+| `kl_share_eff/{task}`、`kl_share_base/{task}` | 項が**どこへ**行ったか。**$b_j$ ではない** —— 分母が全タスク合計で動くので、一様増幅では両方の割合が変わらず比は 1 になる |
+| `kl_sum_eff/{task}`、`kl_sum_base/{task}` | その絶対量。割合だけでは「割合は同じだが総量が動いた」を無変化と報告してしまう |
+| `push_l2_logit_base/{task}`、`push_l2_logit_eff/{task}` | ロジット空間での OPD 押しの L2。**損失の行重み（`task_loss_weight`）込み**で、二乗和には重みの二乗が入る |
+| `budget_ratio_logit` | $\sum_j b_j L_j / \sum_j L_j$（$L_j$ は上の base）。一様アームでは構成上そのアームの $b$。**校正が 1.000 に置いた量ではない**（上記のとおり空間が違う）。読み方は「その step にロジット空間で OPD 勾配をどれだけ増減させたか」 |
+| `adv_zero_frac/{task}`、`pg_live_frac/{task}` | advantage が非ゼロのトークン割合と、**clip 後の PG 導関数が非ゼロ**のトークン割合。後者の方が小さい |
+| `kl_mean_adv_zero`、`kl_mean_adv_live` | 蒸留項が報酬の台に対してどこに乗っているか。**2 つの因果経路の分離ではない**（下記） |
+| `pg_dot_mean/{task}`、`pg_cos_mean`、`pg_dot_neg_frac` | 同一トークンのロジット上で、報酬の押しと教師の押しの内積（降下規約、負 = 対立）。**clip 反映済み**。位置づけは補助的なロジット整列 |
+| `align_tokens`、`align_cover/{task}` | 上の整列指標が定義されているトークン数と、PG 生存トークンに対するその割合 |
 
 **この readout が言えないこと**:
 
-* **対角であって非対角ではない。** トークンは 1 つのタスクに属するので、
-  トークンごとの量に $C_{ij}\ (i\ne j)$ は載らない。読み方は「教師がそのタスク自身の
-  報酬と争っているか」—— webshop 列の負性の 40% を占める成分であって、アームが
-  前提にしている干渉そのものではない。
-* **top-k 台の外は落ちている。** 内積・ノルムは教師 top-k 上の和で、KL 自身が
-  tail を 1 個の塊にしている以上その per-symbol 分割は無い。落ちる項は $p(v)^2$ を
-  持つので実際の方策では小さく、試験はその**減衰の速さ**を測っている（`align_cover`
-  が母集団を、`test_opd_task_diag.py` が落差そのものを固定）。
-* **clip を無視している。** PPO の clip が効いた位置では真の PG 勾配は 0 で、
-  この内積は過大に数える。`actor/pg_clipfrac` と併読する。
-* $g_{\rm opd}$ の式は autograd と照合済み（`test_opd_task_diag.py`)。
-  top-k+tail KL の tail が台の各ロジットに持つ依存は厳密に相殺するので、
-  台の上では近似ではなく厳密。
+* **交差効果行列の対角ではない。** 符号が $JJ^\top$ を通って保存されないうえ、
+  トークンは 1 つのタスクに属するので非対角 $C_{ij}\ (i\ne j)$ は原理的に載らない。
+  「同一トークンのロジット上での方策と教師の局所的な関係」として読む。
+* **advantage による KL 分割は 2 経路の分離ではない。** advantage が生きていても clip で
+  PG 勾配が消えるし（だから `pg_live_frac` を併記する）、共有パラメータは同じ batch の
+  他トークン・他タスクからも更新される。信号の分布を示す**補助分析**として有用。
+* **`align_cover` は tail 近似の精度指標ではない。** この recipe は
+  `student_indexed_topk=True` なので支持集合は**学生の** top-20 で、サンプルされた
+  トークンはほぼ常にその中にある（実測 0.999〜1.000）。近似の精度を主張するには
+  被覆率ではなく**支持集合外の確率質量**が必要で、それは測っていない。
+* **落ちるのは台の外。** 内積・ノルムは KL 自身の支持集合上の和で、KL が tail を
+  1 個の塊にしている以上その per-symbol 分割は無い。落ちる項は $p(v)^2$ を持つので
+  peaked な方策では小さく、`test_opd_task_diag.py` がその減衰の速さを固定している。
+* $g_{\rm opd}$ の式は autograd と照合済み。top-k+tail KL の tail が台の各ロジットに
+  持つ依存は厳密に相殺するので、台の上では近似ではなく厳密。
+
+**PG 側は $-A\rho$ ではなく `policy_loss_gradient_coef()` を使う。** $-A\rho$ は clip の
+外でしか導関数ではなく、clip 枝・dual-clip 枝では真の導関数は厳密にゼロである。
+$-A\rho$ で読むと、目的関数がもう押していない位置を**全振幅の対立**として報告する。
+実際に起きた: 修正前の実機 step 1 で `pg_cos_mean` が $3.3\times10^{10}$ になった
+（cosine は $[-1,1]$）。両ノルムが 0 の位置を整列母集団に入れ、分母を $10^{-20}$ で
+clamp していたためで、いまはノルム 0 を**評価不能として除外**する。
+
+**既存の `opd/…` 系にも $b_j$ が届く。** `opd_logit_push()` / `opd_attribution_terms()` は
+行ごとの係数を受けるようにし、`_opd_effective_coef = \beta \cdot b_{\rm row}` を渡す。
+$b$ は **OPD 側だけ**に入る —— `row_weight` は PG 側と共有なので、そこに $b$ を折り込むと
+報酬側の勾配まで動き、対から作る cosine と比が「アームが適用していない理由で」動く。
+$g_0$ が $b$ を持つので、内積は $b$、二乗ノルムは $b^2$ で変わる（損失中でそうなる通り）。
+klw / signweight アームの event 系はスカラーのままで、この recipe では無効。
 
 ### 4.3 起動前の確認
 
@@ -302,10 +333,12 @@ CPU で済むものは試験に落としてある（左列が担保する試験�
 | readout が損失に入らない・config だけで gate される | `test_opd_task_diag.py` |
 | $g_{\rm opd}$ が autograd と一致、内積が真の内積から落とす分が明示できる | 同上 |
 | RUN_TAG がアームごとに正しく効く | `test_run_tag_paths.py`（アーム対応に一般化した） |
-| **dry-run（`--cfg job`）で `kl_loss_coef_by_task` と `kl_loss_coef=0.01` が両方出る** | 未（GPU 不要だが未実施） |
-| **`teacher_kl_loss_coef` の全消費箇所を grep し、損失経路が 1 つだけ** | 未 |
-| **最初の 2 step で `kl_share_eff` の比が $b$ に一致する** | 未（実機） |
+| 実引数 → 合成 → 注入 → lock 照合が 3 条件で通る | `test_opd_coef_arm.py`（control の起動失敗を捕まえた試験） |
+| dry-run（`--cfg job`）で `kl_loss_coef_by_task` と `kl_loss_coef=0.01` が両方出る | 済（redistribute で確認） |
+| `teacher_kl_loss_coef` の全消費箇所を grep し、損失経路が 1 つだけ | 済。損失は 1 箇所（`teacher_kl_coef`）、他は診断で、うち arm-independent な OPD attribution には $b$ を通した（§4.2） |
+| **最初の step で `kl_sum_eff/kl_sum_base` が $b$ に一致する** | **済（実機、redistribute step 1）**: 1.0764 / 1.1911 / 0.5000 |
 | **3 アームが同じ初期条件から出る**（同じ base、同じデータ順、同じ評価 seed） | 未（実機） |
+| 修正後の readout が有限（`pg_cos_mean` $\in[-1,1]$）であること | 未（実機。修正前は $3.3\times10^{10}$ を出した） |
 
 ---
 
@@ -347,6 +380,12 @@ CPU で済むものは試験に落としてある（左列が担保する試験�
   タスク $j$ の行にしか触らないので、「他タスクへの害を減らす」ための唯一の操作が「そのタスク自身の
   蒸留を減らす」になる。(source teacher, target task) の重みが要るが、この損失にその自由度は無い。
 * **各条件 1 学習 run。** 評価 3 回は評価雑音の見積もりで、学習 seed の変動を含まない。
+* **1 step は実測 632 秒**（RTX PRO 6000 ×2、`rollout.n=8`、3 タスク）。150 step で
+  約 26 時間/アーム、3 アームで約 79 時間。update の peak reserved は 103 GB。
+* **step 0 の信号分布は校正時（step 300）と大きく違う。** 実測の `adv_zero_frac` は
+  alfworld 0.000・search 0.000・webshop 0.223 で、校正時の 0.215 / 0.761 / 0.623 とは
+  別物である。$b$ は step 300 の測定から作られているので、これは §3.1 の
+  「測定点と適用点が一致しない」が具体的にどれだけ効くかの実測値になる。
 * **`total_training_steps=150` は cosine スケジュールも 150 で終わらせる**（`fsdp_workers.py:498`）。
   3 アームは同じスケジュールを共有するのでアーム間の対比には影響しないが、
   **既に走り終えた 300 step の klw_control は control アームの代用にならない**（係数と学習率が交絡する）。
@@ -369,6 +408,15 @@ CPU で済むものは試験に落としてある（左列が担保する試験�
   試験で固定してあり、ファイルを分けるとその担保が読み比べに戻る。
 * 走行中の readout を 3 アームすべてで on にする（lock に固定）。片方だけ計測した比較は、
   後から埋められない穴になる。
-* 撤回した主張: 「負の内積は有益な正則化の証拠」「総量を委ねると必ず縮む（定理として）」
+* 撤回した主張（機構・理論）: 「負の内積は有益な正則化の証拠」「総量を委ねると必ず縮む（定理として）」
   「一次寄与が小さいから固定点だけが経路」「150→300 では区別できない」「cosine が小さい = 信頼度割引済み」
   「対角を除いても $b$ に効かない」「同じ順位なら同じ $b$」「null で機構族を閉じる」「5pp 未満は決められない」。
+* 撤回した主張（readout）:
+  「`budget_ratio_logit` は校正が 1.000 に置いた量で、1 からのずれが予算保存の崩れである」
+  —— 校正はパラメータ空間、これはロジット空間で、$JJ^\top$ を挟むので同じ量ではない。
+  「`pg_dot_mean` は交差効果行列の対角である」—— 符号が保存されず、非対角は原理的に載らない。
+  「`kl_share_eff/kl_share_base` で $b$ の適用が確認できる」—— 分母が動くので一様増幅では比が 1。
+  適用確認は `kl_sum_eff/kl_sum_base`（実機 step 1 で $b$ に一致）。
+  「advantage ゼロ／非ゼロの KL 分割が 2 つの因果経路を分ける」—— clip と共有パラメータがあるので分けない。
+  「`align_cover` は tail 近似の精度を示す」「支持集合は教師の top-20」
+  —— `student_indexed_topk=True` では**学生の** top-20 で、被覆率は近似精度の指標にならない。

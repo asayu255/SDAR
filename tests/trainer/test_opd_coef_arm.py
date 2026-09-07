@@ -158,11 +158,19 @@ def test_the_script_selects_the_lock_by_arm_and_turns_the_readout_on():
     assert 'expected_multitask_opd_coef_${ARM}_config.yaml' in s
     assert "+algorithm.opd.task_diag=True" in s
     assert '"${OPD_COEF_ARGS[@]}"' in s
-    # the control branch must pass nothing at all
-    control_branch = s.split("    control)")[1].split(";;")[0]
-    assert "OPD_COEF_ARGS=()" in control_branch
-    assert "kl_loss_coef_by_task" not in control_branch.replace(
-        "teacher_kl_loss_coef_by_task stays null", "")
+
+
+def test_the_control_branch_says_null_rather_than_saying_nothing():
+    """Omitting the key leaves it at <<MISSING>>, which the lock rejects.
+
+    The lock pins it to null on all three arms on purpose -- the control has to
+    DECLARE that it did not use per-task coefficients -- so the control branch
+    has to say null. This assertion used to require the opposite, and the arm
+    would have died at startup.
+    """
+    branch = _script().split("    control)")[1].split(";;")[0]
+    assert "+algorithm.opd.kl_loss_coef_by_task=null" in branch
+    assert "OPD_COEF_ARGS=()" not in branch
 
 
 def test_the_script_and_the_lock_agree_on_the_step_count():
@@ -204,3 +212,71 @@ def test_the_box_is_the_designs_box_and_not_a_mean_one_constraint():
     # sum(b) = 2.767 for the redistributed arm: a mean-1 check would reject it
     assert sum(B["redistribute"].values()) == pytest.approx(2.767532, abs=1e-5)
     assert validate_kl_coef_by_task(B["redistribute"]) is not None
+
+
+# ---------------------------------------------------------------------------
+# 5. the arms as the shell actually launches them: real args -> Hydra compose
+#    -> config injection -> intent lock.
+#
+# Diffing the lock files against each other cannot catch a key the SCRIPT never
+# passes, and that is exactly how the control arm came to fail its own lock:
+# every file-level test passed while the arm died at startup.
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _real_overrides(arm, tmp_path):
+    """The override list the shell hands to main_opd_grpo, via a python3 shim.
+
+    Reading the script's text would be a second parser. Running it with a stub
+    python3 is the script's own answer, and it costs nothing: every python3 call
+    it makes -- the model check, the data prep, the trainer -- is stubbed.
+    """
+    import subprocess
+
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    dump = tmp_path / "args.txt"
+    (shim / "python3").write_text(
+        "#!/bin/bash\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "verl.trainer.main_opd_grpo" ]; then\n'
+        '  shift 2; printf "%s\\n" "$@" > "$ARGDUMP"; exit 0\n'
+        "fi\nexit 0\n"
+    )
+    (shim / "python3").chmod(0o755)
+    env = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}", ARM=arm, ARGDUMP=str(dump))
+    subprocess.run(["bash", SCRIPT], env=env, cwd=ROOT,
+                   capture_output=True, check=True, timeout=300)
+    return [line for line in dump.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_the_arm_the_shell_launches_passes_its_own_intent_lock(arm, tmp_path):
+    import pathlib
+
+    from hydra import compose, initialize_config_dir
+
+    from verl.trainer.main_opd import inject_distillation_config
+    from verl.utils.expected_config import check_expected_config
+
+    overrides = _real_overrides(arm, tmp_path)
+    lock = next(o.split("=", 1)[1] for o in overrides
+                if o.startswith("+trainer.expected_config="))
+    overrides = [o for o in overrides if not o.startswith("+trainer.expected_config=")]
+    assert f"opd_coef_{arm}_config.yaml" in lock
+
+    cfgdir = str(pathlib.Path(ROOT, "verl/trainer/config").resolve())
+    os.environ.setdefault("RUN_TAG_SUFFIX", "")
+    with initialize_config_dir(config_dir=cfgdir, version_base=None):
+        cfg = compose(config_name="ppo_trainer", overrides=overrides)
+    inject_distillation_config(cfg)
+    mismatches = check_expected_config(cfg, os.path.join(ROOT, lock))
+    assert not mismatches, [(k, g, w) for k, g, w in mismatches]
+
+    # and the actor ends up with exactly this arm's b
+    got = cfg.actor_rollout_ref.actor.get("teacher_kl_loss_coef_by_task", "MISSING")
+    if B[arm] is None:
+        assert got is None, "control must reach the actor as None, i.e. the original path"
+    else:
+        assert dict(got) == B[arm]
+    assert cfg.actor_rollout_ref.actor.teacher_kl_task_diag is True
