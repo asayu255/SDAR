@@ -124,6 +124,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     state_shift_metrics,
     state_shift_terms as xt_state_shift_terms,
 )
+from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import actor_capture, gpu_profiler
@@ -2364,6 +2365,16 @@ class DataParallelPPOActor(BasePPOActor):
             torch.zeros((1 + n_task, 2), dtype=torch.float64, device=sign_dev)
             if notice_cfg is not None and notice_cfg.to_student and n_task else None
         )
+        # The OPD coefficient arm's readout. Built on the CONFIG alone, like the
+        # accumulators above and for the same reason: rows() runs an all-reduce,
+        # so a rank that skipped it because its micro-batches held no teacher-KL
+        # would hang the rest. Off by default -- unset it and update_policy
+        # allocates nothing and computes nothing.
+        opd_diag_stats = (
+            OpdTaskDiagStats(n_tasks=n_task, device=sign_dev)
+            if (bool(self.config.get("teacher_kl_task_diag", False)) and use_teacher_kl_loss and n_task)
+            else None
+        )
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
         # The parameter-free arm's three accumulators, built on the config alone
@@ -2948,6 +2959,8 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
                     responses = data["responses"]
+                    # Filled by the teacher-KL block and read after the backward.
+                    _opd_diag_pending = None
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
@@ -4402,13 +4415,32 @@ class DataParallelPPOActor(BasePPOActor):
                             task_ids, task_id_names, teacher_kld.size(0),
                             device=teacher_kld.device, dtype=teacher_kld.dtype,
                         )
-                        if _kl_row_coef is not None:
-                            for _tid, _nm in enumerate(task_id_names):
-                                _r = task_ids.reshape(-1).to(torch.long) == _tid
-                                if bool(_r.any()):
-                                    metrics[f"actor/teacher_kl_coef_effective/{_nm}"] = float(
-                                        teacher_kl_coef * _kl_row_coef[_r][0]
-                                    )
+                        if opd_diag_stats is not None:
+                            # Collected now, consumed after the backward: the OPD
+                            # push is a (bs, T, k) tensor and building it here
+                            # would add its own peak to the step's.
+                            _opd_diag_pending = {
+                                "teacher_kl": teacher_kld,
+                                "row_basis": task_loss_weight,
+                                "row_coef": _kl_row_coef,
+                                "align": (
+                                    {
+                                        "student_topk_logprob": student_topk_logprobs,
+                                        "teacher_topk_logprob": teacher_topk_lp,
+                                        "teacher_kl": teacher_kld,
+                                        "topk_ids": (
+                                            student_topk_ids if student_indexed_topk
+                                            else data.get("teacher_topk_ids", None)
+                                        ),
+                                        "response_ids": responses,
+                                        "log_prob": log_prob,
+                                        "old_log_prob": data.get("old_log_probs", None),
+                                        "advantages": data.get("advantages", None),
+                                    }
+                                    if teacher_topk_kl and log_prob is not None
+                                    else None
+                                ),
+                            }
                         if task_loss_weight is None:
                             if _kl_row_coef is None:
                                 policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
@@ -4467,6 +4499,25 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     with _actor_phase("actor.bwd"):
                         loss.backward()
+
+                    if opd_diag_stats is not None and _opd_diag_pending is not None and task_ids is not None:
+                        # After the backward, so the graph the (bs, T, k) push is
+                        # built from has already been freed. Diagnostics only: no
+                        # host sync here, and nothing touches the loss.
+                        with _actor_phase("actor.opd_diag"), torch.no_grad():
+                            _pend = _opd_diag_pending
+                            opd_diag_stats.update(
+                                task_ids=task_ids,
+                                response_mask=response_mask,
+                                teacher_kl=_pend["teacher_kl"],
+                                advantages=data.get("advantages", None),
+                                terms=(
+                                    opd_pg_alignment_terms(**_pend["align"])
+                                    if _pend["align"] is not None else None
+                                ),
+                                row_basis=_pend["row_basis"],
+                                row_coef=_pend["row_coef"],
+                            )
 
                     if task_ids is not None:
                         # Same losses, re-aggregated over the rows of one task at a
@@ -5126,6 +5177,20 @@ class DataParallelPPOActor(BasePPOActor):
         # presence weight are summed and divided by how many micro-batches
         # actually held the task, which is the mean the unweighted path took over
         # exactly those.
+        if opd_diag_stats is not None:
+            # One all-reduce and one host read for the whole table, and the only
+            # place the shares and the budget ratio are formed -- see rows().
+            _by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
+            metrics.update(
+                opd_diag_stats.rows(
+                    list(task_id_names or []),
+                    coefs=({str(k): float(v) for k, v in dict(_by_task).items()} if _by_task else None),
+                )
+            )
+            if _by_task:
+                _coef = self.config.get("teacher_kl_loss_coef", 1.0)
+                for _nm, _b in dict(_by_task).items():
+                    metrics[f"actor/teacher_kl_coef_effective/{_nm}"] = float(_coef) * float(_b)
         for name, entries in deferred_metrics.items():
             values = torch.stack([value for value, _ in entries])
             if entries[0][1] is None:

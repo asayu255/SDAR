@@ -37,38 +37,57 @@ def _assign(text, key):
     return m.group(1)
 
 
-def _expand(value, home, tag):
+def _expand(value, home, tag, arm=""):
     """What the shell would produce for this assignment.
 
     RUN_TAG_SUFFIX is derived exactly as the scripts derive it, so the test is
-    reading the same definition rather than a second copy of it.
+    reading the same definition rather than a second copy of it. ARM rides along
+    for the scripts that carry several arms in one file -- see _arms.
     """
     out = subprocess.run(
         ["bash", "-c",
-         f'HOME={home} RUN_TAG={tag!r}; RUN_TAG_SUFFIX="${{RUN_TAG:+_$RUN_TAG}}"; echo "{value}"'],
+         f'HOME={home} RUN_TAG={tag!r} ARM={arm!r}; RUN_TAG_SUFFIX="${{RUN_TAG:+_$RUN_TAG}}"; echo "{value}"'],
         capture_output=True, text=True, check=True,
     )
     return out.stdout.strip()
+
+
+def _arms(text):
+    """The ARM values a script offers, or [""] when it is a single-arm script.
+
+    A script whose arms differ only in a coefficient keeps them in one file --
+    that is how "the arms differ in nothing else" stays true -- so the checks
+    below have to run once per arm rather than once per file, or two of three
+    arms would go unchecked.
+    """
+    if "ARM=${ARM:-" not in text:
+        return [""]
+    block = text.split('case "$ARM" in', 1)[1].split("esac", 1)[0]
+    arms = re.findall(r"^\s+([a-z][a-z0-9_]*)\)\s*$", block, re.M)
+    assert arms, "the script has an ARM switch with no branches"
+    return arms
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
     """Byte-for-byte, or an existing run stops resuming the moment this lands."""
     text = script.read_text()
-    for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
-        raw = _assign(text, key)
-        assert "$RUN_TAG_SUFFIX" in raw, key
-        plain = raw.replace("$RUN_TAG_SUFFIX", "")
-        assert _expand(raw, "/h", "") == _expand(plain, "/h", "")
-        assert not _expand(raw, "/h", "").endswith("_")
+    for arm in _arms(text):
+        for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
+            raw = _assign(text, key)
+            assert "$RUN_TAG_SUFFIX" in raw, key
+            plain = raw.replace("$RUN_TAG_SUFFIX", "")
+            assert _expand(raw, "/h", "", arm) == _expand(plain, "/h", "", arm)
+            assert not _expand(raw, "/h", "", arm).endswith("_")
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_a_set_tag_moves_every_tagged_value(script):
     text = script.read_text()
-    for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
-        raw = _assign(text, key)
-        assert _expand(raw, "/h", "v2") == _expand(raw, "/h", "") + "_v2"
+    for arm in _arms(text):
+        for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
+            raw = _assign(text, key)
+            assert _expand(raw, "/h", "v2", arm) == _expand(raw, "/h", "", arm) + "_v2"
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
@@ -81,13 +100,19 @@ def test_the_lock_expects_the_same_suffixed_name_the_script_passes(script):
     text = script.read_text()
     lock = _re.search(r"\+trainer\.expected_config=(\S+)", text)
     assert lock, "the arm does not pin an expectations file"
-    expected = (ROOT / lock.group(1)).read_text()
-    for key in ("trainer.project_name", "trainer.experiment_name"):
-        passed = _assign(text, key).strip('"')
-        pinned = _re.search(rf'^"{_re.escape(key)}":\s*(\S+)\s*$', expected, _re.M)
-        assert pinned, f"{key} is not pinned in {lock.group(1)}"
-        assert pinned.group(1) == passed, (key, pinned.group(1), passed)
-        assert passed.endswith("$RUN_TAG_SUFFIX"), key
+    lock_path = lock.group(1).strip('"')
+    for arm in _arms(text):
+        # A multi-arm script names its lock by $ARM, so the path is resolved the
+        # same way the shell would resolve it rather than read literally.
+        resolved = _expand(lock_path, "/h", "", arm)
+        expected = (ROOT / resolved).read_text()
+        for key in ("trainer.project_name", "trainer.experiment_name"):
+            passed = _expand(_assign(text, key).strip('"'), "/h", "", arm)
+            pinned = _re.search(rf'^"{_re.escape(key)}":\s*(\S+)\s*$', expected, _re.M)
+            assert pinned, f"{key} is not pinned in {resolved}"
+            want = _expand(pinned.group(1), "/h", "", arm)
+            assert want == passed, (resolved, key, want, passed)
+            assert pinned.group(1).endswith("$RUN_TAG_SUFFIX"), key
 
 
 def test_every_arm_still_has_its_own_untagged_directory():
@@ -95,7 +120,10 @@ def test_every_arm_still_has_its_own_untagged_directory():
     be a different bug, and this is where it would show up."""
     dirs = {}
     for script in SCRIPTS:
-        d = _assign(script.read_text(), "trainer.default_local_dir")
-        dirs.setdefault(d, []).append(script.name)
+        text = script.read_text()
+        raw = _assign(text, "trainer.default_local_dir")
+        for arm in _arms(text):
+            d = _expand(raw, "/h", "", arm)
+            dirs.setdefault(d, []).append(f"{script.name}{':' + arm if arm else ''}")
     clashes = {d: names for d, names in dirs.items() if len(names) > 1}
     assert not clashes, clashes

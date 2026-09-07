@@ -125,7 +125,9 @@ def test_the_config_is_plumbed_from_algorithm_opd():
 
     src = inspect.getsource(inject_distillation_config)
     assert "teacher_kl_loss_coef_by_task" in src
-    assert 'opd_cfg.get(\n            "kl_loss_coef_by_task", None\n        )' in src
+    assert 'validate_kl_coef_by_task(\n            opd_cfg.get("kl_loss_coef_by_task", None)\n        )' in src, (
+        "the value must pass through the startup validator on its way to the actor"
+    )
 
 
 def test_hydra_passes_the_dict_form_this_reads():
@@ -161,6 +163,33 @@ def test_injection_reaches_the_actor_and_the_default_stays_uniform():
     # the base coefficient is untouched: the effective one is the product
     assert float(a.teacher_kl_loss_coef) == 0.01
 
+    # the readout rides the same injection, and is off unless asked for
+    assert build({}).teacher_kl_task_diag is False
+    assert build({"task_diag": True}).teacher_kl_task_diag is True
+
+
+def test_a_coefficient_outside_the_box_is_refused_at_startup_not_at_step_150():
+    """The box is the design's clip. A value outside it is an intervention
+    strength nobody chose, and it must not survive config injection."""
+    import pytest
+    from omegaconf import OmegaConf
+
+    from verl.trainer.main_opd import inject_distillation_config
+
+    def build(by_task):
+        c = OmegaConf.create({
+            "algorithm": {"opd": {"kl_loss_coef": 0.01, "kl_loss_coef_by_task": by_task}},
+            "actor_rollout_ref": {"actor": {}, "model": {}, "rollout": {}, "ref": {}},
+            "data": {}, "trainer": {},
+        })
+        inject_distillation_config(c)
+        return c
+
+    build({"alfworld": 1.076431, "search": 1.191101, "webshop": 0.5})  # the arm
+    for bad in ({"webshop": 1.6}, {"webshop": 0.49}, {"webshop": float("nan")}, {}):
+        with pytest.raises(ValueError):
+            build(bad)
+
 
 def test_the_expectations_files_pin_it_to_null():
     """The control has to declare that it did NOT use per-task coefficients."""
@@ -189,9 +218,14 @@ def test_unset_takes_the_original_expressions_in_both_branches():
         "policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef" in src)
     assert ("_row_w = task_loss_weight if _kl_row_coef is None "
             "else task_loss_weight * _kl_row_coef") in src
-    # and the metric is only emitted when the coefficient is actually set
-    assert "if _kl_row_coef is not None:" in src
-    assert src.index("if _kl_row_coef is not None:") < src.index("if task_loss_weight is None:")
+    # and the effective-coefficient metric is only emitted when b is set. It is
+    # built from the CONFIG at the end of the call rather than read off the row
+    # tensor per micro-batch: b_task is a constant, and the read was three host
+    # syncs a micro-batch for a number nothing measured.
+    assert "if _by_task:" in src
+    assert "_coef = self.config.get('teacher_kl_loss_coef', 1.0)" in src
+    assert "actor/teacher_kl_coef_effective/" in src
+    assert "_kl_row_coef[" not in src, "the effective coefficient must not be read back off the device"
 
 
 # ---------------------------------------------------------------------------

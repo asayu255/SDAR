@@ -18,6 +18,63 @@ from verl.utils import actor_capture
 def main(config):
     run_opd(config)
 
+# The box the redistribution rule clips to. NOT a mean-1 constraint: the rule
+# holds sum_j q_j b_j = 1 with q_j the gradient-norm shares, and the actor has no
+# way to know those -- checking sum_j b_j == n here would reject the very vector
+# the calibration produces (its sum is 2.767) and accept vectors that break the
+# budget. What can be checked without the norms is the range, which is the
+# design's own clip, and that is what this does.
+KL_COEF_BY_TASK_BOX = (0.5, 1.5)
+
+
+def validate_kl_coef_by_task(by_task, box=KL_COEF_BY_TASK_BOX):
+    """Refuse a coefficient vector at startup rather than 150 steps in.
+
+    Returns the value unchanged (None passes through) so the caller can assign
+    it in one expression. Every failure here is one that would otherwise show up
+    as a silently different arm: a name typo makes a task keep b = 1, a string
+    value makes the row coefficient a string, and a value outside the box is an
+    intervention strength nobody chose.
+    """
+    if by_task is None:
+        return None
+    try:
+        items = list(dict(by_task).items())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"algorithm.opd.kl_loss_coef_by_task must be a mapping of task name to "
+            f"coefficient; got {by_task!r}"
+        ) from exc
+    if not items:
+        raise ValueError(
+            "algorithm.opd.kl_loss_coef_by_task is empty; leave it unset for the "
+            "uniform arm rather than passing {} -- an empty map and an absent one "
+            "would otherwise be the same run under two names"
+        )
+    lo, hi = box
+    for name, value in items:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"algorithm.opd.kl_loss_coef_by_task has a non-string task name {name!r}"
+            )
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"algorithm.opd.kl_loss_coef_by_task[{name}] must be a number; got {value!r}"
+            )
+        value = float(value)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(
+                f"algorithm.opd.kl_loss_coef_by_task[{name}] is not finite: {value!r}"
+            )
+        if not (lo <= value <= hi):
+            raise ValueError(
+                f"algorithm.opd.kl_loss_coef_by_task[{name}]={value} is outside the box "
+                f"[{lo}, {hi}] the redistribution rule clips to; a coefficient outside it "
+                f"is an intervention strength the calibration never chose"
+            )
+    return by_task
+
+
 
 def inject_distillation_config(config) -> None:
     """Apply the settings BOTH OPD arms share: what the teacher KL is, and what
@@ -46,8 +103,16 @@ def inject_distillation_config(config) -> None:
         # beside kl_loss_coef because it is the same scientific knob split by
         # task, not a plumbing detail -- and because the cross-effect
         # measurement it exists to act on is per teacher, not global.
-        config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task = opd_cfg.get(
-            "kl_loss_coef_by_task", None
+        config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task = validate_kl_coef_by_task(
+            opd_cfg.get("kl_loss_coef_by_task", None)
+        )
+        # The arm's readout: per-task allocation, the advantage-zero split, the
+        # logit-space OPD budget and its overlap with the policy gradient. Off by
+        # default; see verl/trainer/ppo/opd_task_diag.py for what each number can
+        # and cannot answer. Surfaced here rather than defaulted in the actor so
+        # a run that reports these says so in its config.
+        config.actor_rollout_ref.actor.teacher_kl_task_diag = bool(
+            opd_cfg.get("task_diag", False)
         )
         config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
         # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.

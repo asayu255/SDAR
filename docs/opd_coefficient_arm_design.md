@@ -219,42 +219,93 @@ OPD の効果が観測された区間（§4.3）を含めるためである。
 
 ## 4. 実装状況
 
-### 4.1 完了（このブランチ）
+### 4.1 実装済み（このブランチ）
 
 | 項目 | 内容 |
 |---|---|
-| 設定 | `algorithm.opd.kl_loss_coef_by_task` → `actor.teacher_kl_loss_coef_by_task`（`main_opd.py`。両エントリを覆う） |
+| 設定 | `algorithm.opd.kl_loss_coef_by_task` → `actor.teacher_kl_loss_coef_by_task`、`algorithm.opd.task_diag` → `actor.teacher_kl_task_diag`（`main_opd.py`。両エントリを覆う） |
 | 損失 | `dp_actor.teacher_kl_row_coef()` が行ごとの $b$ を作り、両集約経路に適用。per-task 重み付き経路は `row_kl * task_loss_weight * b`、素の token-mean 経路は `agg_loss(teacher_kld * b)`（分母は不変） |
-| 不適用時に落ちる | `task_ids` / `task_id_names` 欠落、タスク名の打ち間違い、**範囲外の ID（3 タスクで id=3）、非整数の ID（2.9）、行数不一致**で AssertionError。padding の負 ID は除外 |
+| 起動時の拒否 | `validate_kl_coef_by_task`（`main_opd.py`）が非マッピング・空マップ・非数値・非有限・box $[0.5,1.5]$ 外を **起動時に** 落とす。**「平均 1」は検査しない** —— 規則が保つのは $\sum_j q_j b_j = 1$ であって $\sum_j b_j = 3$ ではなく（実際 2.767）、学習側は $q$ を知らない |
+| 実行時の拒否 | `task_ids` / `task_id_names` 欠落、タスク名の打ち間違い、範囲外の ID（3 タスクで id=3）、非整数の ID（2.9）、行数不一致で AssertionError。padding の負 ID は除外 |
 | PG 項に触れない | 変更なし |
-| 計測 | `actor/teacher_kl_coef_effective/{task}` |
-| lock | `expected_multitask_config.yaml` 2 ファイルに `teacher_kl_loss_coef_by_task: null` を固定 |
-| 試験 | `tests/trainer/test_teacher_kl_coef_by_task.py` **20 件**。$b$ 未設定で従来式に戻る（AST）、**同一 forward での係数前後の比**、**小モデルで実際の勾配がタスク別に $b_j$ 倍**、ID 検証 |
+| 実効係数の計測 | `actor/teacher_kl_coef_effective/{task}`。**config から**構成する（$b$ は定数なので、行テンソルから読み戻していた旧実装は micro-batch あたり 3 回の host sync を払って測っていないものを測っていた） |
+| アームの readout | `verl/trainer/ppo/opd_task_diag.py`（§4.2）。既定 off、config だけで構築（`rows()` が collective を回すため） |
+| lock | `expected_multitask_config.yaml` 2 ファイルに `teacher_kl_loss_coef_by_task: null` を固定。アーム 3 本の期待値ファイル `expected_multitask_opd_coef_{control,uniform,redistribute}_config.yaml` |
+| 起動スクリプト | `examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh`（`ARM=control\|uniform\|redistribute`）。`run_multitask_cross_teacher_klw_control_qwen3.sh`（$\beta$=0.01）から派生。`run_multitask_qwen3.sh` は $\beta$=1.0 なので使えない |
+| 算出スクリプト | `scripts/opd_cross_effect_qp.py`（別 worktree から移送し、下記 3 点を修正） |
+| 試験 | `tests/trainer/test_teacher_kl_coef_by_task.py` 22 件、`test_opd_task_diag.py` 22 件、`test_opd_coef_arm.py` 29 件、`test_opd_cross_effect_qp.py` 9 件。`tests/trainer` 全体 1223 passed（既存の失敗 1 件 `test_cross_teacher_kl_weight.py::test_the_reliability_pass_...` は base 39bfffe から存在し、この作業とは無関係） |
 
-### 4.2 残り
+**アーム同士の差が $b$ だけであることは、読み比べではなく試験で固定した**:
+`test_opd_coef_arm.py` が 3 つの期待値ファイルを平坦化して差分を取り、
+`kl_loss_coef_by_task.*` と `trainer.experiment_name` 以外に差があれば落ちる。
+control は**キーを置かない**（`null`）—— $\{1,1,1\}$ を渡すと $b$ 対応の分岐を通り、
+同じ値に別経路で到達してしまうため。
 
-| 項目 | 内容 |
+**算出スクリプトの修正 3 点**（いずれもレビュー指摘、実行前に発見）:
+
+1. **RL 勾配ゼロの行で $b=\mathrm{NaN}$ になっていた。** $C_{ij}/(\|r_i\|\|d_j\|)$ は
+   そのバッチでタスク $i$ に方策勾配が無いとき 0/0 になる —— 付則が落とせと言っている
+   まさにその場合。セルごとに使用可能バッチ数を持ち、使えないバッチはそのセルの平均から
+   落とす。有効数が閾値（既定 $N/2$、`--min-batches`）を切れば **b を出さずに落ちる**。
+   `diag=False` で意図的に除いた対角は「欠測」と数えない。
+2. **bootstrap の順位判定が search > alfworld > webshop に固定されていた。**
+   標本自身が与える順位の再現率（`rank_reproducibility`）と、参照順位との一致率
+   （`agreement_with_reference`）を**別項目**として出す。go 条件が要求するのは前者。
+3. **合成ノルムがバッチ単純平均だったが文書は RMS を引いていた。** 両方を別名で出し、
+   一様アームの倍率は RMS 由来（1.110833）と明示する。
+
+`--json` で $C$・$\|d\|$・$q$・$c$・$b$・$\sum q_j b_j$・両不変量・バッチ別線形比・
+順位再現率・leave-one-out を書き出す。step 300 payload での出力は §2 の表と一致する。
+
+### 4.2 走行中の readout（`algorithm.opd.task_diag=True`）
+
+`verl/trainer/ppo/opd_task_diag.py`。update あたり all-reduce 1 回・host read 1 回。
+オフライン校正が答えられない 3 つを、走らせながら測る。
+
+| 指標 | 何を答えるか |
 |---|---|
-| box 検証 | 起動時に $b_j\in[0.5,1.5]$ を検査。「平均 1」は検査しない（$\sum b_j=2.767$ になり、学習側は $\|d_j\|$ を知らない） |
-| per-task KL 計測 | `actor/teacher_kl_loss_weighted_{task}`。配線検証は**同一 forward で計算した係数適用前後の KL 寄与**を比べる（別アームの KL 損失同士はモデルが分岐した後には $b$ 倍にならない） |
-| **算出スクリプト**（別 worktree） | (i) 付則「RL ゼロ batch を行平均から除外」が未実装 —— 1 行を未定義にすると現在は $b=(\mathrm{NaN},\mathrm{NaN},\mathrm{NaN})$。OPD ゼロ・非有限値・有効件数不足も明示処理。(ii) bootstrap の順位判定が search > alfworld > webshop に固定 —— 「その測定での順位の再現率」と「step 300 との一致率」を別項目に。(iii) 合成ノルムを RMS に揃える。(iv) $C$・$\|d\|$・$q$・両不変量・順位再現率を JSON に残す |
-| スクリプト | `examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh`。`run_multitask_cross_teacher_klw_control_qwen3.sh`（$\beta$=0.01）から派生。`run_multitask_qwen3.sh` は $\beta$=1.0 なので使えない |
-| アーム lock | `expected_multitask_opd_coef_config.yaml` + `tests/trainer/test_opd_coef_arm.py`。control との差が `kl_loss_coef_by_task` だけであることを固定 |
-| 文書 | 別 worktree の設計書と検討をこのブランチへ移送（または相互参照を維持） |
+| `actor/opd_diag/budget_ratio_logit` | $\sum_j b_j\|g_{\rm opd,j}\| / \sum_j \|g_{\rm opd,j}\|$ を**その step のデータ**で、ロジット空間で。校正はこれを 1.000 に置いた。1 からのずれが「予算は校正データ上でしか保たれない」の実測値。一様アームでは構成上 1.110833 になる |
+| `kl_share_eff/{task}`, `kl_share_base/{task}` | 各タスクが教師 KL 項に実際に出した割合、$b$ 込みと $b=1$ 基準。**設定した再配分ではなく、実現した再配分** |
+| `kl_sum_eff/{task}`, `kl_sum_base/{task}` | その絶対量。割合だけでは「両アームで割合は同じだが総量が動いた」を無変化と報告してしまう |
+| `pg_dot_mean/{task}`, `pg_cos_mean`, `pg_dot_neg_frac` | 同一トークンのロジット上で、報酬の押しと教師の押しの内積（降下規約、負 = 対立）。**交差効果行列の対角**を step 0–150 で live に測る。校正は step 300 しか持たない |
+| `adv_zero_frac/{task}`, `kl_mean_adv_zero`, `kl_mean_adv_live` | webshop の 2 経路の分離。$A=0$ のトークンでは OPD が唯一の勾配（＝蒸留経路）、$A\ne0$ では両方が働く（＝干渉経路） |
+| `align_cover/{task}` | 上の整列指標が定義されているトークンの割合（サンプルされた id が教師 top-20 に入った割合）。これが落ちれば、整列指標は縮む部分集合を語っている |
+| `push_l2_logit/{task}`, `push_rms_logit/{task}` | $\|d_j\|$ のロジット空間での代理。予算比の分子・分母 |
 
-`teacher_kl_loss_coef` を受け取る他の 6 箇所（`xt_position_terms`、`opd_logit_push`、channel-loss の列）は
-klw / signweight アームの診断で、control 系のスクリプトでは無効。このアームでも無効のままにし、
-「診断はスカラー $\beta$ を報告する」を lock に書く。
+**この readout が言えないこと**:
+
+* **対角であって非対角ではない。** トークンは 1 つのタスクに属するので、
+  トークンごとの量に $C_{ij}\ (i\ne j)$ は載らない。読み方は「教師がそのタスク自身の
+  報酬と争っているか」—— webshop 列の負性の 40% を占める成分であって、アームが
+  前提にしている干渉そのものではない。
+* **top-k 台の外は落ちている。** 内積・ノルムは教師 top-k 上の和で、KL 自身が
+  tail を 1 個の塊にしている以上その per-symbol 分割は無い。落ちる項は $p(v)^2$ を
+  持つので実際の方策では小さく、試験はその**減衰の速さ**を測っている（`align_cover`
+  が母集団を、`test_opd_task_diag.py` が落差そのものを固定）。
+* **clip を無視している。** PPO の clip が効いた位置では真の PG 勾配は 0 で、
+  この内積は過大に数える。`actor/pg_clipfrac` と併読する。
+* $g_{\rm opd}$ の式は autograd と照合済み（`test_opd_task_diag.py`)。
+  top-k+tail KL の tail が台の各ロジットに持つ依存は厳密に相殺するので、
+  台の上では近似ではなく厳密。
 
 ### 4.3 起動前の確認
 
-1. dry-run（`--cfg job`）で config dump に `kl_loss_coef_by_task` と `kl_loss_coef=0.01` が両方出ること
-2. `teacher_kl_loss_coef` の全消費箇所を grep し、損失経路が 1 つだけであること
-3. CPU 試験: $b=\mathbf1$ で損失が control と bit-identical、$b$ 設定時にタスク $j$ の KL 項だけが $b_j$ 倍、
-   PG 項が不変、box 外・名前不一致・ID 不正で起動拒否
-4. 最初の 2 step で、**同一 forward の**係数適用前後の KL 寄与の比が $b$ に一致すること
-5. インテントロックがアーム専用の期待値ファイルで通ること
-6. 3 アームが**同じ初期条件**（同じ base checkpoint、同じデータ順、同じ評価 seed）から出ること
+CPU で済むものは試験に落としてある（左列が担保する試験）。残りは GPU が要る。
+
+| 確認 | 状態 |
+|---|---|
+| $b$ 未設定で従来式に戻る（AST + 小モデルの実勾配） | `test_teacher_kl_coef_by_task.py` |
+| $b$ 設定時にタスク $j$ の KL 項だけが $b_j$ 倍、PG 項は不変 | 同上（**同一 forward** の前後比） |
+| box 外・名前不一致・ID 不正（範囲外・非整数・行数不一致）で拒否 | 同上 + `test_opd_coef_arm.py` |
+| 3 つの lock が $b$ 以外で一致 | `test_opd_coef_arm.py` |
+| スクリプトが渡す $b$ と lock の $b$ が数値として一致 | 同上 |
+| readout が損失に入らない・config だけで gate される | `test_opd_task_diag.py` |
+| $g_{\rm opd}$ が autograd と一致、内積が真の内積から落とす分が明示できる | 同上 |
+| RUN_TAG がアームごとに正しく効く | `test_run_tag_paths.py`（アーム対応に一般化した） |
+| **dry-run（`--cfg job`）で `kl_loss_coef_by_task` と `kl_loss_coef=0.01` が両方出る** | 未（GPU 不要だが未実施） |
+| **`teacher_kl_loss_coef` の全消費箇所を grep し、損失経路が 1 つだけ** | 未 |
+| **最初の 2 step で `kl_share_eff` の比が $b$ に一致する** | 未（実機） |
+| **3 アームが同じ初期条件から出る**（同じ base、同じデータ順、同じ評価 seed） | 未（実機） |
 
 ---
 
@@ -296,6 +347,14 @@ klw / signweight アームの診断で、control 系のスクリプトでは無�
   タスク $j$ の行にしか触らないので、「他タスクへの害を減らす」ための唯一の操作が「そのタスク自身の
   蒸留を減らす」になる。(source teacher, target task) の重みが要るが、この損失にその自由度は無い。
 * **各条件 1 学習 run。** 評価 3 回は評価雑音の見積もりで、学習 seed の変動を含まない。
+* **`total_training_steps=150` は cosine スケジュールも 150 で終わらせる**（`fsdp_workers.py:498`）。
+  3 アームは同じスケジュールを共有するのでアーム間の対比には影響しないが、
+  **既に走り終えた 300 step の klw_control は control アームの代用にならない**（係数と学習率が交絡する）。
+  データ準備は `--total_training_steps 300` のままにする —— 150 で切り直すと最初の 150 step が
+  見るプロンプト列自体が変わる。
+* **走行中の readout は対角しか測れない。** トークンは 1 つのタスクに属するので、
+  トークンごとの量に非対角 $C_{ij}\ (i\ne j)$ は載らない。アームが前提にしている干渉そのものを
+  学習中に測る手段は、いまも 6 倍の backward を要する測定 step しかない（下記）。
 * **適応版（学習中に $C$ を測って $b$ を更新する）は採らない。** backward が 6 倍になる測定 step が要り、
   FSDP の勾配取得は 2 度の取り違え（mini-batch 1 つ分、gathered buffer）を起こした経路である。
 
@@ -306,6 +365,10 @@ klw / signweight アームの診断で、control 系のスクリプトでは無�
 * $S$ は全 3 タスク（等しい票）。
 * 一様アームを足す（3 アーム）。倍率は RMS 基準の 1.111。
 * **A を pilot として固定。** B1/B2 は起動条件にせず、早期の $C$ は B' の形で別実験にする。
+* 3 アームは 1 本のスクリプト（`ARM=...`）に置く。アーム間の差が $b$ だけであることは
+  試験で固定してあり、ファイルを分けるとその担保が読み比べに戻る。
+* 走行中の readout を 3 アームすべてで on にする（lock に固定）。片方だけ計測した比較は、
+  後から埋められない穴になる。
 * 撤回した主張: 「負の内積は有益な正則化の証拠」「総量を委ねると必ず縮む（定理として）」
   「一次寄与が小さいから固定点だけが経路」「150→300 では区別できない」「cosine が小さい = 信頼度割引済み」
   「対角を除いても $b$ に効かない」「同じ順位なら同じ $b$」「null で機構族を閉じる」「5pp 未満は決められない」。
