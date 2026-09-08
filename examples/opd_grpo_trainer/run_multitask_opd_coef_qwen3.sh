@@ -247,7 +247,7 @@ export ROLLOUT_ASYNC_GENERATE=${ROLLOUT_ASYNC_GENERATE:-1}
 # not on any arm without it.
 #
 # What still moves is floating-point summation order, the same class as
-# ppo_micro_batch_size_per_gpu 10 -> 5 above. Both arms of the A/B therefore have
+# ppo_micro_batch_size_per_gpu 5 -> 10 above. Both arms of the A/B therefore have
 # to carry the same value, which is why it is exported here and in the control
 # script and not left to a launch command. 0 restores index order.
 export BALANCE_MINIBATCH_COLUMNS=${BALANCE_MINIBATCH_COLUMNS:-1}
@@ -344,6 +344,27 @@ mkdir -p "$(dirname "$TORCH_NCCL_DEBUG_INFO_TEMP_FILE")"
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
+# NO speculative decoding here, and unlike the sibling scripts the reason is no
+# longer the V0 blocker they record. This stack is already V1 (vllm 0.9.2,
+# core=v1), spec decode lives in v1/spec_decode with sleep supported, the
+# args compose through engine_kwargs.vllm.speculative_config, and
+# SpeculativeConfig builds on CPU with method=ngram. It would very likely start.
+# It stays out because it changes the SAMPLED TOKENS. The RNG consumption
+# pattern differs and the target logits come from a verification batch shape
+# rather than a single-token decode, so an arm running it draws different
+# trajectories from every arm already run -- all of which sampled with
+# ppo_micro_batch_size_per_gpu=5 and no speculation. The sibling scripts reach
+# the same conclusion from the other direction: it is "its own experiment on
+# every arm at once, not a knob to flip here".
+# The measurement that makes it tempting, so it need not be redone: the turn
+# table decomposes the gen phase as engine 72.1%, envstep 18.6%, preproc 5.5%,
+# tchWait 3.4%, decode 0.4%, and 72% of the engine's own time sits at <=40% of
+# peak concurrency at 65 ms/seq/turn against the head's 24. That tail is 29% of
+# the step with SM at 60-73%, which is the memory-bound regime speculation
+# addresses. If it is ever taken up, rollout_probs_diff (ray_trainer.py:1856,
+# needs rollout.return_rollout_log_probs=True, a pure diagnostic) tests the
+# exactness claim on this data rather than on vLLM's word.
+
 
 # Data prep. These literals are shared with the training command below and are
 # also cross-checked there via the expectations file (per_task_batch_size=15,
@@ -424,7 +445,7 @@ python3 -m verl.trainer.main_opd_grpo \
     actor_rollout_ref.model.use_fused_kernels=False \
     +actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.ppo_mini_batch_size=60 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=5 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     +actor_rollout_ref.actor.dynamic_bsz_token_scale=True \

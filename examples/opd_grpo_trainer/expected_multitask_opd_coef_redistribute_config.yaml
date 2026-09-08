@@ -135,12 +135,30 @@
 # or the two arms are not training on the same rows.
 "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
 # ---- what bounds the training forward ----------------------------------------
-# Halved from 10 after this arm's first launch: it holds four models per row in
-# the hidden-state cache (teacher_cache/gb 16.3 against pure OPD's 4.1) while
-# vLLM is awake and holding its KV cache. Unlike the rollout key above it does
-# NOT enter adjust_batch's divisor, so it moves no rows and drops no data --
-# only how much is resident at once.
-"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
+# NOTE: this arm is RETIRED. Its completed 90-step run used the knobs as they
+# stood before 2026-09-08 (micro-batch 5), so that
+# run is not comparable with anything launched from this file today. The two
+# blocks below are kept in step with the live arms only so the cross-arm
+# invariant in tests/trainer/test_opd_coef_arm.py still means something.
+# Raised 5 -> 10 on 2026-09-08. It had been halved from 10 after this arm's
+# first launch because the hidden-state cache held four models per row
+# (teacher_cache/gb 16.3 against pure OPD's 4.1) while vLLM was awake and
+# holding its KV cache. NEITHER condition holds now: teacher_cache/gb measures
+# 3.673 with teacher_cache/device_gb 0.000 (host RAM, not device), and vLLM
+# sleeps before the update -- 95.5 GB during the rollout, 30.0 GB between
+# phases, 53.6/45.6 GB of 97.9 during the update, so 44 GB is free where the
+# original OOM was recorded.
+# The motive for raising it is the per-micro-batch parameter all-gather. This
+# host has no NVLink: `nvidia-smi topo -m` reports SYS between GPU0 and GPU1,
+# on different NUMA nodes. SHARD_GRAD_OP therefore moves 1.89 GiB per
+# micro-batch, and at the measured 564 micro-batches per rank per step that is
+# 1,066 GiB. Sampled rxpci averages 4.6-5.1 GB/s against the 5.34 GB/s that
+# volume requires, so the gather is essentially all of the update phase's PCIe
+# traffic; halving the count is worth 20-27 s/step.
+# Unlike the rollout key above it does NOT enter adjust_batch's divisor, so it
+# moves no rows and drops no data. What it changes is floating-point summation
+# order, which is why every compared arm has to carry the same value.
+"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 10
 
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
