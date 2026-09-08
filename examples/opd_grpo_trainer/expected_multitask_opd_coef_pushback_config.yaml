@@ -303,16 +303,28 @@
 
 # ---- the online controller: THE arm ------------------------------------------
 # Every knob pinned on both sides of the injection. eps is a statement of how much
-# pushback is tolerated (a fraction of the reward's own descent), not a value
-# known to be optimal. The static coefficient stays null: the gate replaces it and
-# the injection refuses both at once.
+# pushback is tolerated (a fraction of the reward's own descent). Set from nine
+# measured steps at eps=0.1, where the controller was inert: the open-loop ratio
+# C-/R, recovered from pushback/bound and de-lagged out of the decay-0.9 EMA,
+# sits at 0.004454 (alfworld), 0.004278 (search), 0.002116 (webshop), flat rather
+# than trending -- each task's first half matches its second, and search's EMA
+# had already turned down by step 6. 0.003 is the geometric midpoint of the two
+# clusters {0.00445, 0.00428} and {0.00212}, so no task sits on the boundary:
+# alfworld and search run at 1.48x and 1.43x of eps and are held to a = 0.67 and
+# 0.70, webshop at 0.71x keeps a = 1. Per-step noise is 7-13%, which the EMA
+# smooths to 3-4%, so the gate does not flicker. NOT a value known to be optimal,
+# and the effect is bounded: the gate removes 9.3% and 5.6% of those two tasks'
+# OPD magnitude, because at beta=0.01 the conflicting component is only 0.4% of
+# the reward's own descent to begin with.
+# The static coefficient stays null: the gate replaces it and the injection
+# refuses both at once.
 "algorithm.opd.pushback_control.enable": true
-"algorithm.opd.pushback_control.eps": 0.1
+"algorithm.opd.pushback_control.eps": 0.003
 "algorithm.opd.pushback_control.ema_decay": 0.9
 "algorithm.opd.pushback_control.min_live_groups": 4
 "algorithm.opd.pushback_control.min_ctl_tokens": 256
 "actor_rollout_ref.actor.teacher_kl_pushback.enable": true
-"actor_rollout_ref.actor.teacher_kl_pushback.eps": 0.1
+"actor_rollout_ref.actor.teacher_kl_pushback.eps": 0.003
 "actor_rollout_ref.actor.teacher_kl_pushback.ema_decay": 0.9
 "actor_rollout_ref.actor.teacher_kl_pushback.min_live_groups": 4
 "actor_rollout_ref.actor.teacher_kl_pushback.min_ctl_tokens": 256

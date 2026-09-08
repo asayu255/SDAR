@@ -155,7 +155,7 @@ case "$ARM" in
         OPD_COEF_ARGS=(
             "+algorithm.opd.kl_loss_coef_by_task=null"
             "+algorithm.opd.pushback_control.enable=True"
-            "+algorithm.opd.pushback_control.eps=0.1"
+            "+algorithm.opd.pushback_control.eps=0.003"
             "+algorithm.opd.pushback_control.ema_decay=0.9"
             "+algorithm.opd.pushback_control.min_live_groups=4"
             "+algorithm.opd.pushback_control.min_ctl_tokens=256"
