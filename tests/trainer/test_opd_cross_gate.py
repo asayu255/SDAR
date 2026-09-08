@@ -605,3 +605,97 @@ def test_config_parsing_and_validation():
         _cfg(ema_decay=1.0).validate()
     m = _cfg().control_role_mask()
     assert bool(m[ROLE_FORMAT]) and bool(m[ROLE_ENV_ACTION]) and not bool(m[ROLE_TAG])
+
+
+# ---------------------------------------------------------------------------
+# 6. the gate only ever attenuates
+#
+# w = 1 - lambda*h with h in [0, 1] is the design's central safety property:
+# the gate removes teacher signal, it never amplifies it and never flips its
+# sign. Three guards enforce it -- [.]_+ on the per-side conflict, the clamp on
+# q, the clamp on h -- and each is redundant given the others on WELL-FORMED
+# input, so a mutation to any one of them survives every other test in this
+# file. These assert the invariant itself, on input built to break it.
+
+
+def _reference_aligned_with(fwd, b, scale, R_value, nT=3):
+    """A reference deliberately equal to +scale * d at every token's support.
+
+    Nothing in the population produces this -- it is the adversarial case. With
+    scale > 0 the inner product v.d is POSITIVE everywhere, which is the input
+    that turns [-x]_+ into a negative number the moment its clamp is dropped.
+    R is passed in rather than derived, so it can also be set small enough to
+    violate ||v||^2 <= R and drive q above 1.
+    """
+    v = torch.zeros(nT, N_ROLES, N_SIDES, V)
+    bs, T = b["roles"].shape
+    for i in range(bs):
+        for t in range(T):
+            c = int(b["roles"][i, t])
+            for task in range(nT):
+                for s in range(N_SIDES):
+                    v[task, c, s].index_add_(
+                        0, b["topk_ids"][i, t], scale * fwd["d"][i, t].float())
+    R = torch.full((nT, N_ROLES, N_SIDES), float(R_value))
+    sw = torch.full((nT, N_ROLES, N_SIDES), 0.5)
+    valid = torch.ones(nT, N_ROLES, dtype=torch.bool)
+    return v, R, sw, valid
+
+
+@pytest.mark.parametrize("scale,R_value", [
+    (+1.0, 1.0),     # aligned: v.d > 0 everywhere -- [-x]_+ must be 0, not negative
+    (-1.0, 1.0),     # opposed: the gate fires, and must still stop at 1
+    (-1.0, 1e-12),   # opposed with an R that breaks Jensen -- q must be capped at 1
+    (+1.0, 1e-12),   # both at once
+])
+def test_the_gate_only_ever_attenuates(scale, R_value):
+    b = _batch(seed=11, bs=6, T=7)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, scale, R_value)
+    lam_max = 0.2
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                         lam=torch.full((3, N_ROLES), lam_max),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    f = _fwd(b, refs)
+
+    assert torch.isfinite(f["q"]).all() and torch.isfinite(f["h"]).all() and torch.isfinite(f["w"]).all()
+    assert float(f["q"].min()) >= 0.0, "a per-receiver gate went negative"
+    assert float(f["q"].max()) <= 1.0 + 1e-6, "a per-receiver gate exceeded 1"
+    assert float(f["h"].min()) >= 0.0, "the gate went negative -- w would amplify"
+    assert float(f["h"].max()) <= 1.0 + 1e-6, "the gate exceeded 1 -- w could go below 1 - lambda_max"
+    # THE property: the OPD term is attenuated, never amplified, never flipped.
+    assert float(f["w"].max()) <= 1.0 + 1e-6, "the gate amplified the teacher term"
+    assert float(f["w"].min()) >= 1.0 - lam_max - 1e-6, "the gate cut deeper than lambda_max"
+    assert float(f["w"].min()) > 0.0, "the teacher term changed sign"
+
+
+def test_an_aligned_reference_does_not_fire_the_gate_at_all():
+    """Where the other task's reward direction AGREES with this task's teacher,
+    there is nothing to protect: h must be exactly 0, w exactly 1."""
+    b = _batch(seed=12)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, +1.0, 1.0)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                         lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    f = _fwd(b, refs)
+    assert float(f["h"].abs().max()) == 0.0
+    assert torch.equal(f["w"], torch.ones_like(f["w"]))
+
+
+def test_the_bound_holds_for_every_lambda_in_the_box():
+    """w in [1 - lambda_max, 1] for any lambda the solver can return, on the
+    adversarial reference. lambda_max is an experimental condition (design §4.2);
+    the gate must respect it whatever the references say."""
+    b = _batch(seed=13)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, -1.0, 1e-12)
+    for lam_max in (0.0, 0.05, 0.2, 1.0):
+        refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                             lam=torch.full((3, N_ROLES), lam_max),
+                             control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+        f = _fwd(b, refs)
+        assert float(f["w"].max()) <= 1.0 + 1e-6
+        assert float(f["w"].min()) >= 1.0 - lam_max - 1e-6
+        if lam_max == 0.0:
+            assert torch.equal(f["w"], torch.ones_like(f["w"])), "lambda_max = 0 must be inert"

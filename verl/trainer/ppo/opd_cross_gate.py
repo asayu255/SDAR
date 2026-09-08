@@ -49,8 +49,16 @@ with B = E_{j,c}[v_i . d], D = E_{j,c}[h v_i . d] the SIGNED cross quantities
 receiver k shows up as cost), and K the squared norm of what the gate removes,
 normalised per sender. The slack is eliminated analytically; what remains is a
 box-constrained convex piecewise-quadratic in at most n_task variables per
-role, solved by projected gradient with backtracking in float64 on the CPU,
-on one rank, and broadcast.
+role, solved by EXACT CYCLIC COORDINATE DESCENT in float64 on the CPU (see
+:func:`solve_role`, which also records why projected gradient was dropped).
+
+There is NO broadcast, and none is needed: the solver's inputs are the
+all-reduced sums (the module's only collective, in
+:meth:`CrossGateStats.reduced`) plus the driver's meta_info, so every rank
+solves the same problem, and the descent is deterministic -- same iterate order,
+same breakpoints, same float64 arithmetic -- so every rank lands on the same
+lambda. A broadcast would be the alternative to that determinism, not an
+addition to it.
 
 What follows from the definitions: if every valid receiver's condition is
 already met at lambda = 0 (s_i(0) = 0), lambda = 0 is optimal. What does NOT
@@ -434,6 +442,17 @@ def cross_gate_forward(
         # Zero out where the side's R is 0 (no reference energy): the formula
         # would divide by delta and manufacture a gate out of nothing.
         q = torch.where((R_tok > 0).all(dim=-1), q, torch.zeros_like(q))
+        # THE LOAD-BEARING GUARD. w = 1 - lambda*h only attenuates while
+        # h in [0, 1], and h inherits that from q: the [.]_+ above is exactly
+        # redundant with this line's lower clamp (min_k [a_k]_+ == [min_k a_k]_+
+        # for every a), and the clamp on h below is redundant with its upper one
+        # (h is a convex combination of the q's). So the other two can be removed
+        # with no observable effect and this one cannot -- do not "simplify" it
+        # away by analogy with them. The upper clamp is not implied by Jensen
+        # either: q <= sqrt(kappa) <= 1 holds only while v and R are updated over
+        # the same population with the same weights, which a hand-set or
+        # part-resumed reference need not respect.
+        # tests/trainer/test_opd_cross_gate.py section 6 asserts the invariant.
         q = q.clamp(min=0.0, max=1.0)
 
         # valid receivers: (i, c(t)) usable, i != sender, and the role is controlled
