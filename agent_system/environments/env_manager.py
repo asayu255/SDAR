@@ -395,7 +395,21 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # infos = [None] * self.envs.num_envs
         observations = {'text': self.build_text_obs(obs, infos, init=True), 
                         'image': None, 
-                        'anchor': obs.copy()
+                        # The GOAL TEXT, not just the screen. The cross gate takes
+                        # a GRPO group's prompt identity from its turn-0 anchor
+                        # (opd_cross_gate.prompt_side), and format_obs above keeps
+                        # only the parts that FOLLOW the instruction -- on
+                        # WebShop's landing page that is the single token
+                        # "'Search'" for every task. So every shopping goal hashed
+                        # to ONE key on ONE side: the reference never reached
+                        # min_prompts, WebShop was never a valid receiver, and its
+                        # own OPD stayed eligible for attenuation on behalf of
+                        # tasks that could not reciprocate. Reproduced on CPU:
+                        # 5 distinct goals -> 1 anchor -> 1 key.
+                        # self.tasks is what extract_task pulled out of the same
+                        # observation, so it is available here and is stable
+                        # across steps for a given episode seed.
+                        'anchor': [f"{t} [SEP] {o}" for t, o in zip(self.tasks, obs)],
                         }
         self.pre_text_obs = obs
         self.memory.reset(batch_size = len(infos))
