@@ -1,0 +1,607 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The cross gate (MOPD v1): the split, the gate's bound, the stats, the solver, the
+controller's window and resume. Everything on the CPU, most of it against a dense
+recomputation rather than against itself."""
+
+import math
+
+import numpy as np
+import pytest
+import torch
+
+from verl.trainer.ppo.opd_cross_gate import (
+    INVALID_FEW_PROMPTS,
+    INVALID_NEVER_SEEN,
+    INVALID_STALE,
+    N_ROLES,
+    N_SIDES,
+    ROLE_ID,
+    CrossGateConfig,
+    CrossGateController,
+    CrossGateRefs,
+    CrossGateStats,
+    cross_gate_forward,
+    cross_gate_prompt_columns,
+    prompt_side,
+    solve_role,
+)
+from verl.trainer.ppo.sign_weights import ROLE_ENV_ACTION, ROLE_FORMAT, ROLE_TAG
+
+TASKS = ["alfworld", "search", "webshop"]
+V, K = 40, 5
+
+
+def _cfg(**kw):
+    base = dict(enable=True, eps_cross=0.0, rho=1.0e4, lambda_max=0.2, ema_decay=0.0,
+                window_steps=3, min_prompts=2, min_pg_prompts=1, min_tokens=4, max_staleness=2)
+    base.update(kw)
+    return CrossGateConfig(**base)
+
+
+def _batch(bs=6, T=7, seed=0, coef_scale=1.0):
+    """Random top-k inputs of the shapes the actor hands over."""
+    g = torch.Generator().manual_seed(seed)
+    lp_full_s = torch.log_softmax(torch.randn(bs, T, V, generator=g, dtype=torch.float64), -1)
+    lp_full_t = torch.log_softmax(torch.randn(bs, T, V, generator=g, dtype=torch.float64), -1)
+    topk_ids = torch.topk(lp_full_s, K, dim=-1).indices
+    lp_s = torch.gather(lp_full_s, -1, topk_ids)
+    lp_t = torch.gather(lp_full_t, -1, topk_ids)
+    # sampled id: mostly inside the support, a few outside
+    resp = topk_ids[..., 0].clone()
+    resp[0, 0] = (topk_ids[0, 0].max() + 1) % V
+    while resp[0, 0] in topk_ids[0, 0]:
+        resp[0, 0] = (resp[0, 0] + 1) % V
+    kl = (lp_s.exp() * (lp_s - lp_t)).sum(-1).clamp(min=0.0)
+    coef = coef_scale * torch.randn(bs, T, generator=g, dtype=torch.float64)
+    task_ids = torch.tensor([i % 3 for i in range(bs)])
+    roles = torch.full((bs, T), ROLE_FORMAT, dtype=torch.long)
+    roles[:, 2:4] = ROLE_ENV_ACTION
+    roles[:, 6] = ROLE_TAG
+    return dict(student_topk_logprob=lp_s, teacher_topk_logprob=lp_t, teacher_kl=kl,
+                topk_ids=topk_ids, response_ids=resp, pg_grad_coef=coef,
+                task_ids=task_ids, roles=roles)
+
+
+def _zero_refs(nT=3, valid=None, lam=None, ctrl=None):
+    v = torch.zeros(nT, N_ROLES, N_SIDES, V)
+    R = torch.zeros(nT, N_ROLES, N_SIDES)
+    sw = torch.zeros(nT, N_ROLES, N_SIDES)
+    valid_t = torch.zeros(nT, N_ROLES, dtype=torch.bool) if valid is None else valid
+    lam_t = torch.zeros(nT, N_ROLES) if lam is None else lam
+    ctrl_t = _cfg().control_role_mask() if ctrl is None else ctrl
+    return CrossGateRefs(v=v, R=R, side_w=sw, valid=valid_t, lam=lam_t, control_roles=ctrl_t)
+
+
+def _fwd(b, refs, opd_coef=0.01, delta=1e-30):
+    return cross_gate_forward(
+        student_topk_logprob=b["student_topk_logprob"], teacher_topk_logprob=b["teacher_topk_logprob"],
+        teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], response_ids=b["response_ids"],
+        pg_grad_coef=b["pg_grad_coef"], opd_coef=opd_coef, task_ids=b["task_ids"], roles=b["roles"],
+        refs=refs, delta=delta,
+    )
+
+
+def _refs_from_population(b, fwd, side_of_row, nT=3):
+    """v = E[r], R = E[||r||^2] per (task, role, side) from the batch itself --
+    the same weights on both, so Jensen's bound is in force."""
+    v = torch.zeros(nT, N_ROLES, N_SIDES, V, dtype=torch.float64)
+    R = torch.zeros(nT, N_ROLES, N_SIDES, dtype=torch.float64)
+    n = torch.zeros(nT, N_ROLES, N_SIDES, dtype=torch.float64)
+    bs, T = b["roles"].shape
+    for i in range(bs):
+        for t in range(T):
+            if fwd["in_support"][i, t] <= 0:
+                continue
+            ti, c, s = int(b["task_ids"][i]), int(b["roles"][i, t]), int(side_of_row[i])
+            v[ti, c, s].index_add_(0, b["topk_ids"][i, t], fwd["r"][i, t].double())
+            R[ti, c, s] += float(fwd["r_sq"][i, t])
+            n[ti, c, s] += 1
+    nz = n > 0
+    v[nz] = v[nz] / n[nz].unsqueeze(-1)
+    R[nz] = R[nz] / n[nz]
+    sw = torch.zeros(nT, N_ROLES, N_SIDES, dtype=torch.float64)
+    both = nz.all(dim=-1)
+    sw[both] = 0.5
+    one = nz & ~both.unsqueeze(-1)
+    sw[one] = 1.0
+    return v.float(), R.float(), sw.float(), both
+
+
+# ---------------------------------------------------------------------------
+# 1. the prompt split
+
+
+def test_prompt_side_is_deterministic_and_process_stable():
+    k1, s1 = prompt_side("alfworld", "You are in the middle of a room.", seed=1)
+    k2, s2 = prompt_side("alfworld", "You are in the middle of a room.", seed=1)
+    assert k1 == k2 and s1 == s2 and s1 in (0, 1)
+    # the documented digest, so a different hash library or encoding cannot
+    # silently re-split every prompt
+    import hashlib
+    d = hashlib.sha256(b"1|1|alfworld|You are in the middle of a room.").digest()
+    assert k1 == d.hex() and s1 == int.from_bytes(d[:8], "big") % 2
+
+
+def test_task_and_seed_enter_the_split_and_the_rank_does_not():
+    ka, _ = prompt_side("alfworld", "q", seed=1)
+    kb, _ = prompt_side("webshop", "q", seed=1)
+    kc, _ = prompt_side("alfworld", "q", seed=2)
+    assert len({ka, kb, kc}) == 3
+    # over many prompts the two sides are both populated
+    sides = [prompt_side("search", f"question {i}", seed=1)[1] for i in range(200)]
+    assert 60 < sum(sides) < 140
+
+
+def test_prompt_columns_take_the_groups_turn0_anchor_and_count_a_prompt_once():
+    uids = ["g1", "g1", "g1", "g2", "g2", "g3", "g3", "g1"]
+    turns = [0, 1, 2, 1, 0, 1, 2, 0]
+    anchors = ["A", "obs1", "obs2", "obsB", "B", "obsC1", "obsC2", "A"]
+    tasks = ["alfworld"] * 8
+    real = [True] * 8
+    out = cross_gate_prompt_columns(uids=uids, turn_steps=turns, anchors=anchors, task_names=tasks,
+                                    real=real, seed=1)
+    side, pidx, keys = out["side"], out["prompt_idx"], out["keys"]
+    # g1 and g2 have a turn-0 row, g3 does not
+    assert (side[[0, 1, 2, 7]] >= 0).all() and (side[[3, 4]] >= 0).all()
+    assert (side[[5, 6]] == -1).all() and (pidx[[5, 6]] == -1).all()
+    assert out["unkeyed_rows"] == 2
+    # all rows of a group share side and dense index, from the turn-0 anchor
+    assert len(set(side[[0, 1, 2, 7]].tolist())) == 1 and len(set(pidx[[0, 1, 2, 7]].tolist())) == 1
+    assert pidx[0] != pidx[3]
+    assert len(keys) == 2
+    assert keys[int(pidx[0])] == prompt_side("alfworld", "A", seed=1)[0]
+
+
+def test_prompt_columns_ignore_padding_rows_and_a_second_group_of_the_same_prompt_is_one_prompt():
+    uids = ["g1", "g1", "g2", "g2", "pad"]
+    turns = [0, 1, 0, 1, 0]
+    anchors = ["A", "x", "A", "y", "A"]
+    tasks = ["webshop"] * 5
+    real = [True, True, True, True, False]
+    out = cross_gate_prompt_columns(uids=uids, turn_steps=turns, anchors=anchors, task_names=tasks,
+                                    real=real, seed=1)
+    assert out["prompt_idx"][0] == out["prompt_idx"][2] and len(out["keys"]) == 1
+    assert out["side"][4] == -1 and out["prompt_idx"][4] == -1 and out["unkeyed_rows"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 2. the gate
+
+
+def test_without_references_the_gate_is_off_and_nothing_is_touched():
+    b = _batch()
+    f = _fwd(b, _zero_refs())
+    assert torch.equal(f["w"], torch.ones_like(f["w"]))
+    assert float(f["h"].abs().max()) == 0.0
+    assert not f["w"].requires_grad and not f["h"].requires_grad
+
+
+def test_r_is_the_clipped_pg_direction_on_the_support_and_off_support_tokens_are_excluded():
+    b = _batch()
+    f = _fwd(b, _zero_refs())
+    p = b["student_topk_logprob"].exp()
+    hit = (b["topk_ids"] == b["response_ids"].unsqueeze(-1)).double()
+    r_dense = (-b["pg_grad_coef"]).unsqueeze(-1) * (hit - p)
+    r_dense = r_dense * f["in_support"].unsqueeze(-1)
+    assert torch.allclose(f["r"], r_dense, atol=1e-10)
+    assert f["in_support"][0, 0] == 0 and float(f["r"][0, 0].abs().sum()) == 0.0
+    assert torch.allclose(f["r_sq"], (r_dense ** 2).sum(-1), atol=1e-10)
+
+
+def test_d_is_beta_times_the_opd_descent_direction():
+    b = _batch()
+    f = _fwd(b, _zero_refs(), opd_coef=0.01)
+    lp_s, lp_t = b["student_topk_logprob"], b["teacher_topk_logprob"]
+    d_dense = 0.01 * lp_s.exp() * (b["teacher_kl"].unsqueeze(-1) - (lp_s - lp_t))
+    assert torch.allclose(f["d"], d_dense, atol=1e-12)
+
+
+def test_x_is_the_inner_product_with_the_pooled_reference_gathered_at_the_support():
+    b = _batch(seed=3)
+    side_of_row = torch.tensor([0, 1, 0, 1, 0, 1])
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, side_of_row)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=both, lam=torch.zeros(3, N_ROLES),
+                         control_roles=_cfg().control_role_mask())
+    f = _fwd(b, refs)
+    bs, T = b["roles"].shape
+    for i in range(3):
+        for r_ in range(bs):
+            for t in range(T):
+                c = int(b["roles"][r_, t])
+                vp = (v[i, c] * sw[i, c].unsqueeze(-1)).sum(0)          # pooled reference (V,)
+                want = float((vp[b["topk_ids"][r_, t]] * f["d"][r_, t].float()).sum())
+                assert math.isclose(float(f["x"][r_, t, i]), want, rel_tol=1e-4, abs_tol=1e-9)
+
+
+def test_q_is_bounded_by_the_weaker_sides_sqrt_kappa_and_zero_unless_both_sides_oppose():
+    b = _batch(seed=5, bs=9, T=8)
+    side_of_row = torch.tensor([i % 2 for i in range(9)])
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, side_of_row)
+    # Jensen: ||E r||^2 <= E ||r||^2 on every populated cell
+    vn2 = (v.double() ** 2).sum(-1)
+    assert bool((vn2 <= R.double() + 1e-9)[R > 0].all())
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=both, lam=torch.zeros(3, N_ROLES),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    # a DIFFERENT batch, so the bound is not an artefact of testing on the training data
+    b2 = _batch(seed=6, bs=9, T=8)
+    f = _fwd(b2, refs)
+    kappa = torch.where(R > 0, vn2 / R.double().clamp(min=1e-30), torch.zeros_like(vn2))  # (nT, nR, nS)
+    bs, T = b2["roles"].shape
+    for i in range(3):
+        for r_ in range(bs):
+            for t in range(T):
+                c = int(b2["roles"][r_, t])
+                bound = float(kappa[i, c].min().sqrt())
+                assert float(f["q"][r_, t, i]) <= bound + 1e-6
+    # both-sides rule: q > 0 only where the inner product with EACH side is negative
+    x_side = []
+    for s in range(N_SIDES):
+        vs = v[:, :, s]
+        xs = torch.zeros(bs, T, 3, dtype=torch.float64)
+        for i in range(3):
+            for r_ in range(bs):
+                for t in range(T):
+                    c = int(b2["roles"][r_, t])
+                    xs[r_, t, i] = float((vs[i, c][b2["topk_ids"][r_, t]] * f["d"][r_, t].float()).sum())
+        x_side.append(xs)
+    both_neg = (x_side[0] < 0) & (x_side[1] < 0)
+    pos = f["q"] > 0
+    assert bool((~pos | both_neg).all()), "q > 0 somewhere a side did not oppose"
+
+
+def test_h_averages_uniformly_over_valid_receivers_excluding_the_sender_and_uncontrolled_roles():
+    b = _batch(seed=7)
+    side_of_row = torch.tensor([0, 1, 0, 1, 0, 1])
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, side_of_row)
+    valid = both.clone()
+    valid[:, ROLE_TAG] = True     # even if valid, tag is not a controlled role
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid, lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=_cfg().control_role_mask())
+    f = _fwd(b, refs)
+    bs, T = b["roles"].shape
+    for r_ in range(bs):
+        j = int(b["task_ids"][r_])
+        for t in range(T):
+            c = int(b["roles"][r_, t])
+            recv = [i for i in range(3) if i != j and bool(valid[i, c]) and c in (ROLE_FORMAT, ROLE_ENV_ACTION)]
+            om = f["omega"][r_, t]
+            if not recv:
+                assert float(f["h"][r_, t]) == 0.0 and float(om.sum()) == 0.0
+                assert float(f["w"][r_, t]) == 1.0
+                continue
+            assert om[j] == 0.0
+            for i in recv:
+                assert math.isclose(float(om[i]), 1.0 / len(recv), rel_tol=1e-6)
+            want = sum(float(f["q"][r_, t, i]) for i in recv) / len(recv)
+            assert math.isclose(float(f["h"][r_, t]), want, rel_tol=1e-5, abs_tol=1e-9)
+            assert math.isclose(float(f["w"][r_, t]), 1.0 - 0.2 * float(f["h"][r_, t]), rel_tol=1e-6)
+    # roles off control never see lambda
+    assert bool((f["lam_t"][b["roles"] == ROLE_TAG] == 0).all())
+
+
+def test_the_beta_scale_identity_behind_rho():
+    """d = beta * dtilde: x and B, D scale with beta; h, q and K's ratio do not."""
+    b = _batch(seed=8)
+    side_of_row = torch.tensor([0, 1, 0, 1, 0, 1])
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, side_of_row)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=both, lam=torch.zeros(3, N_ROLES),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    f1 = _fwd(b, refs, opd_coef=0.01)
+    f2 = _fwd(b, refs, opd_coef=0.1)
+    assert torch.allclose(f2["x"], 10.0 * f1["x"], rtol=1e-6, atol=1e-12)
+    assert torch.allclose(f2["d_sq"], 100.0 * f1["d_sq"], rtol=1e-6, atol=1e-12)
+    assert torch.allclose(f2["h"], f1["h"], rtol=1e-6, atol=1e-9)
+    assert torch.allclose(f2["q"], f1["q"], rtol=1e-6, atol=1e-9)
+    k1 = (f1["h"] ** 2 * f1["d_sq"]).sum() / f1["d_sq"].sum()
+    k2 = (f2["h"] ** 2 * f2["d_sq"]).sum() / f2["d_sq"].sum()
+    assert math.isclose(float(k1), float(k2), rel_tol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 3. the accumulators, against a dense recomputation
+
+
+def test_stats_scatter_the_reference_sums_and_bitmaps_exactly():
+    b = _batch(seed=9)
+    side = torch.tensor([0, 1, 0, 1, -1, 1])       # row 4: no stable key
+    pidx = torch.tensor([0, 1, 2, 3, -1, 0])       # rows 0 and 5 are the same prompt
+    basis = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0])   # row 5 is a duplicated padding row
+    f = _fwd(b, _zero_refs())
+    st = CrossGateStats(n_tasks=3, vocab_size=V, device=torch.device("cpu"), n_prompts=8)
+    st.update(fwd=f, task_ids=b["task_ids"], roles=b["roles"], response_mask=torch.ones(6, 7),
+              teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], side=side, prompt_idx=pidx, row_basis=basis)
+    red = st.reduced()
+    # dense recomputation over real rows with a side
+    want = torch.zeros(3, N_ROLES, N_SIDES, V, dtype=torch.float64)
+    n_tok = torch.zeros(3, N_ROLES, N_SIDES, dtype=torch.float64)
+    for i in range(6):
+        if basis[i] == 0 or side[i] < 0:
+            continue
+        for t in range(7):
+            if f["in_support"][i, t] <= 0:
+                continue
+            ti, c, s = int(b["task_ids"][i]), int(b["roles"][i, t]), int(side[i])
+            want[ti, c, s].index_add_(0, b["topk_ids"][i, t], f["r"][i, t].double())
+            n_tok[ti, c, s] += 1
+    assert torch.allclose(red["ref_sum"].double(), want, atol=1e-5)
+    assert torch.allclose(red["side"][..., 0], n_tok)
+    # the bitmap: row 0 (task 0, side 0, prompt 0) contributed at format and env_action
+    assert red["pbm_contrib"][0, ROLE_FORMAT, 0, 0] == 1.0 and red["pbm_contrib"][0, ROLE_ENV_ACTION, 0, 0] == 1.0
+    # row 5 is padding: prompt 0 on side 1 must NOT be marked by it
+    assert red["pbm_contrib"][2, ROLE_FORMAT, 1, 0] == 0.0
+    # row 4 has no side: counted as unkeyed on the sender side, absent from references
+    assert red["send"][1, ROLE_FORMAT, 11] > 0        # n_unkeyed for task 1 format
+    assert math.isclose(float(red["ref_sum"][1].abs().sum()), float(want[1].abs().sum()), rel_tol=1e-5)
+
+
+def test_stats_cross_columns_are_sums_of_the_forward_outputs():
+    b = _batch(seed=10)
+    side_of_row = torch.tensor([0, 1, 0, 1, 0, 1])
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, side_of_row)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=both, lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=_cfg().control_role_mask())
+    f = _fwd(b, refs)
+    st = CrossGateStats(n_tasks=3, vocab_size=V, device=torch.device("cpu"), n_prompts=8)
+    st.update(fwd=f, task_ids=b["task_ids"], roles=b["roles"], response_mask=torch.ones(6, 7),
+              teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], side=side_of_row,
+              prompt_idx=torch.arange(6), row_basis=None)
+    red = st.reduced()
+    for i in range(3):
+        for j in range(3):
+            for c in range(N_ROLES):
+                m = (b["task_ids"].unsqueeze(-1).expand(6, 7) == j) & (b["roles"] == c)
+                if not m.any():
+                    continue
+                x = f["x"][:, :, i][m]
+                assert math.isclose(float(red["cross"][i, j, c, 1]), float(x.sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, 2]), float((f["h"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, 3]), float((-x).clamp(min=0).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, 4]), float((f["w"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
+    for j in range(3):
+        for c in range(N_ROLES):
+            m = (b["task_ids"].unsqueeze(-1).expand(6, 7) == j) & (b["roles"] == c)
+            if not m.any():
+                continue
+            assert math.isclose(float(red["send"][j, c, 1]), float((f["h"][m] ** 2 * f["d_sq"][m]).sum()), rel_tol=1e-6)
+            assert math.isclose(float(red["send"][j, c, 5]), float(((1 - f["w"][m] ** 2) * f["d_sq"][m]).sum()), rel_tol=1e-6, abs_tol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 4. the solver
+
+
+def test_no_intervention_is_optimal_when_every_condition_already_holds():
+    K = np.array([1.0, 2.0, 3.0])
+    B = np.array([[0, 1.0, 2.0], [0.5, 0, 0.5], [1.0, 1.0, 0]])     # all positive: s(0) = 0
+    D = -np.ones((3, 3))
+    R = np.ones(3)
+    sol = solve_role(K, B, D, R, np.ones(3, bool), eps=0.0, rho=1e4, lam_max=0.2, delta=1e-30)
+    assert sol["converged"] and np.allclose(sol["lam"], 0.0) and np.allclose(sol["s0"], 0.0)
+
+
+def _brute(K, B, D, R, valid, eps, rho, lam_max, delta, grid=41):
+    n = len(K)
+    off = ~np.eye(n, dtype=bool)
+    axes = np.meshgrid(*[np.linspace(0, lam_max, grid)] * n, indexing="ij")
+    L = np.stack([a.reshape(-1) for a in axes], -1)
+    best, bl = np.inf, None
+    for l in L:
+        s = np.maximum(-eps * R - (B * off).sum(1) + (D * off) @ l, 0.0) * valid
+        fv = (K * l * l).sum() + rho * ((s / (R + delta)) ** 2).sum()
+        if fv < best:
+            best, bl = fv, l
+    return bl, best
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_solver_matches_a_grid_search_on_random_instances(seed):
+    g = np.random.default_rng(seed)
+    n = 3
+    K = g.uniform(0.0, 2.0, n)
+    B = g.normal(0.0, 1.0, (n, n)) * 0.02
+    D = -np.abs(g.normal(0.0, 1.0, (n, n))) * 0.02      # attenuation removes conflict
+    R = g.uniform(0.5, 2.0, n)
+    valid = g.uniform(size=n) > 0.3
+    if not valid.any():
+        valid[0] = True
+    args = dict(eps=0.0, rho=1e4, lam_max=0.2, delta=1e-30)
+    sol = solve_role(K, B, D, R, valid, **args)
+    bl, bf = _brute(K, B, D, R, valid, **args)
+    assert sol["converged"]
+    assert sol["f"] <= bf + 1e-9, "the solver found a worse point than a 41^3 grid"
+    assert (sol["lam"] >= -1e-12).all() and (sol["lam"] <= 0.2 + 1e-12).all()
+
+
+def test_a_negative_baseline_asks_for_attenuation_from_the_sender_that_removes_it():
+    K = np.array([1.0, 1.0, 1.0])
+    B = np.zeros((3, 3)); B[0, 2] = -0.05           # receiver 0 is hurt by sender 2
+    D = np.zeros((3, 3)); D[0, 2] = -0.05           # ...and attenuating sender 2 removes it
+    R = np.ones(3)
+    sol = solve_role(K, B, D, R, np.array([True, False, False]), eps=0.0, rho=1e4, lam_max=0.2, delta=1e-30)
+    assert sol["lam"][2] > 0.0 and sol["lam"][0] == 0.0 and sol["lam"][1] == 0.0
+    assert sol["s0"][0] == pytest.approx(0.05)
+    assert sol["s"][0] < sol["s0"][0]
+
+
+def test_solver_refuses_nonfinite_input_and_idles_without_a_valid_receiver():
+    K = np.array([1.0, np.nan]); B = np.zeros((2, 2)); D = np.zeros((2, 2)); R = np.ones(2)
+    sol = solve_role(K, B, D, R, np.ones(2, bool), eps=0.0, rho=1.0, lam_max=0.2, delta=1e-30)
+    assert sol["reason"] == "nonfinite_input" and np.allclose(sol["lam"], 0.0)
+    sol = solve_role(np.ones(2), B, -np.ones((2, 2)), R, np.zeros(2, bool), eps=0.0, rho=1.0, lam_max=0.2, delta=1e-30)
+    assert sol["reason"] == "no_valid_receiver" and np.allclose(sol["lam"], 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 5. the controller: references, the window, validity, lambda, resume
+
+
+def _step(ctl, names, seed, side_of_row, prompt_idx, keys, lam_override=None, bs=6, T=7):
+    """One training step: forward with the previous references, fold, update."""
+    b = _batch(seed=seed, bs=bs, T=T)
+    refs = ctl.refs_to_device(names, torch.device("cpu"))
+    f = _fwd(b, refs)
+    st = CrossGateStats(n_tasks=3, vocab_size=V, device=torch.device("cpu"), n_prompts=16)
+    st.update(fwd=f, task_ids=b["task_ids"], roles=b["roles"], response_mask=torch.ones(bs, T),
+              teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], side=side_of_row,
+              prompt_idx=prompt_idx, row_basis=None)
+    return ctl.update(names, st.reduced(), keys), f
+
+
+def test_references_become_valid_after_the_window_fills_and_a_repeated_prompt_counts_once():
+    ctl = CrossGateController(_cfg(min_prompts=2, min_pg_prompts=1, min_tokens=1), V, TASKS)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])      # task i%3, side i%2 -> each (task) sees both sides
+    # step 1: one prompt per row, distinct keys
+    m1, _ = _step(ctl, TASKS, 1, side, torch.arange(6), [f"k{i}" for i in range(6)])
+    # each (task, role=format, side) has seen exactly ONE prompt -> below min_prompts=2
+    assert m1["actor/cross/valid/alfworld/format"] == 0.0
+    assert m1["actor/cross/invalid_reason/alfworld/format"] == float(INVALID_FEW_PROMPTS)
+    # step 2: the SAME prompts again -> still one prompt per cell
+    m2, _ = _step(ctl, TASKS, 2, side, torch.arange(6), [f"k{i}" for i in range(6)])
+    assert m2["actor/cross/prompts_side1/alfworld/format"] == 1.0
+    assert m2["actor/cross/valid/alfworld/format"] == 0.0
+    # step 3: new prompts -> two distinct per cell -> valid
+    m3, _ = _step(ctl, TASKS, 3, side, torch.arange(6), [f"n{i}" for i in range(6)])
+    assert m3["actor/cross/prompts_side1/alfworld/format"] == 2.0
+    assert m3["actor/cross/valid/alfworld/format"] == 1.0
+    assert m3["actor/cross/invalid_reason/alfworld/format"] == 0.0
+
+
+def test_a_missing_task_holds_its_reference_and_goes_stale_rather_than_learning_zero():
+    ctl = CrossGateController(_cfg(min_prompts=1, min_pg_prompts=0, min_tokens=1, max_staleness=1), V, TASKS)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])
+    _step(ctl, TASKS, 1, side, torch.arange(6), [f"k{i}" for i in range(6)])
+    v_before = ctl.refs[("webshop", ROLE_FORMAT, 0)].v.clone()
+    n_before = ctl.refs[("webshop", ROLE_FORMAT, 0)].n_obs
+    # a step where webshop has no rows: task ids only 0 and 1
+    b = _batch(seed=2)
+    b["task_ids"] = torch.tensor([0, 1, 0, 1, 0, 1])
+    refs = ctl.refs_to_device(TASKS, torch.device("cpu"))
+    f = _fwd(b, refs)
+    st = CrossGateStats(n_tasks=3, vocab_size=V, device=torch.device("cpu"), n_prompts=16)
+    st.update(fwd=f, task_ids=b["task_ids"], roles=b["roles"], response_mask=torch.ones(6, 7),
+              teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], side=side, prompt_idx=torch.arange(6), row_basis=None)
+    m = ctl.update(TASKS, st.reduced(), [f"k{i}" for i in range(6)])
+    st_w = ctl.refs[("webshop", ROLE_FORMAT, 0)]
+    assert torch.equal(st_w.v, v_before) and st_w.n_obs == n_before, "missing is not zero"
+    assert m["actor/cross/staleness_side1/webshop/format"] == 1.0
+    # one more absent step exceeds max_staleness=1 -> invalid for staleness
+    m = ctl.update(TASKS, st.reduced(), [f"k{i}" for i in range(6)])
+    assert m["actor/cross/invalid_reason/webshop/format"] == float(INVALID_STALE)
+
+
+def test_lambda_is_zero_off_control_roles_and_within_the_cap_and_zero_when_nothing_is_negative():
+    ctl = CrossGateController(_cfg(min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])
+    for s in range(1, 4):
+        m, f = _step(ctl, TASKS, s, side, torch.arange(6), [f"k{s}_{i}" for i in range(6)])
+    for n in TASKS:
+        assert m[f"actor/cross/lambda_next/{n}/tag"] == 0.0
+        for rn in ("format", "env_action"):
+            lam = m[f"actor/cross/lambda_next/{n}/{rn}"]
+            assert 0.0 <= lam <= 0.2 + 1e-12
+    # force every baseline positive: the solver must return 0 everywhere
+    for key in list(ctl.cross):
+        if key[3] == "B":
+            ctl.cross[key].val = abs(ctl.cross[key].val) + 1e-3
+    m, _ = _step(ctl, TASKS, 9, side, torch.arange(6), [f"z{i}" for i in range(6)])
+    # B is re-folded from this step with ema_decay=0, so make the check on the solver's own report
+    for rn in ("format", "env_action"):
+        assert m[f"actor/cross/solver_converged/{rn}"] == 1.0
+
+
+def test_lambda_moves_when_a_valid_receiver_reports_a_negative_baseline():
+    ctl = CrossGateController(_cfg(min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])
+    for s in range(1, 3):
+        _step(ctl, TASKS, s, side, torch.arange(6), [f"k{s}_{i}" for i in range(6)])
+    # plant a conflict: alfworld (receiver) vs webshop (sender) at format
+    c = ROLE_FORMAT
+    ctl.cross[("alfworld", "webshop", c, "B")].val = -0.05
+    ctl.cross[("alfworld", "webshop", c, "D")].val = -0.05
+    ctl.cross[("alfworld", "search", c, "B")].val = 0.0
+    ctl.cross[("alfworld", "search", c, "D")].val = 0.0
+    ctl.validity[("alfworld", c)] = (True, 0, 0)
+    ctl.k_num[("webshop", c)].val = 1e-3
+    # solve directly with the planted EMAs (update() would re-fold them)
+    names = TASKS
+    K = np.array([ctl.k_num.get((j, c)).val / (ctl.d_sq.get(j).val + 1e-30) for j in names])
+    Bm = np.zeros((3, 3)); Dm = np.zeros((3, 3))
+    for ti, i in enumerate(names):
+        for tj, j in enumerate(names):
+            if i != j:
+                Bm[ti, tj] = ctl.cross.get((i, j, c, "B")).val
+                Dm[ti, tj] = ctl.cross.get((i, j, c, "D")).val
+    Rv = np.array([np.mean([ctl.refs[(i, c, s)].R for s in range(2)]) for i in names])
+    valid = np.array([ctl.validity.get((i, c), (False, 0, 0))[0] for i in names])
+    sol = solve_role(K, Bm, Dm, Rv, valid, eps=0.0, rho=1e4, lam_max=0.2, delta=1e-30)
+    assert sol["lam"][2] > 0.0, "webshop's lambda must rise for alfworld's negative baseline"
+
+
+def test_refs_to_device_pools_sides_that_exist_and_zeroes_lambda_off_control_roles():
+    ctl = CrossGateController(_cfg(min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    # only side 0 for every row
+    _step(ctl, TASKS, 1, torch.zeros(6, dtype=torch.long), torch.arange(6), [f"k{i}" for i in range(6)])
+    refs = ctl.refs_to_device(TASKS, torch.device("cpu"))
+    assert refs.v.shape == (3, N_ROLES, N_SIDES, V)
+    assert bool((refs.side_w[:, ROLE_FORMAT, 0] == 1.0).all()) and bool((refs.side_w[:, ROLE_FORMAT, 1] == 0.0).all())
+    assert not bool(refs.valid.any()), "one side only is never valid"
+    ctl.lam[("alfworld", ROLE_TAG)] = 0.2
+    refs = ctl.refs_to_device(TASKS, torch.device("cpu"))
+    assert refs.lam[0, ROLE_TAG] == 0.0
+
+
+def test_state_round_trips_and_a_changed_config_is_refused():
+    ctl = CrossGateController(_cfg(ema_decay=0.5, min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])
+    for s in range(1, 3):
+        _step(ctl, TASKS, s, side, torch.arange(6), [f"k{s}_{i}" for i in range(6)])
+    sd = ctl.state_dict()
+    d = CrossGateController(_cfg(ema_decay=0.5, min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    d.load_state_dict(sd)
+    assert d.step == ctl.step
+    for key, st in ctl.refs.items():
+        st2 = d.refs[key]
+        assert (st.v is None and st2.v is None) or torch.equal(st.v, st2.v)
+        assert st.R == st2.R and st.n_obs == st2.n_obs and list(st.prompts) == list(st2.prompts)
+    assert d.lam == ctl.lam and d.validity == ctl.validity
+    r1 = ctl.refs_to_device(TASKS, torch.device("cpu"))
+    r2 = d.refs_to_device(TASKS, torch.device("cpu"))
+    assert torch.equal(r1.v, r2.v) and torch.equal(r1.lam, r2.lam) and torch.equal(r1.valid, r2.valid)
+    e = CrossGateController(_cfg(ema_decay=0.5, rho=1.0, min_prompts=1, min_pg_prompts=0, min_tokens=1), V, TASKS)
+    with pytest.raises(ValueError, match="changed across resume"):
+        e.load_state_dict(sd)
+
+
+def test_config_parsing_and_validation():
+    c = CrossGateConfig.from_mapping({"enable": True, "roles": ["format", "env_action"], "rho": "10000"})
+    assert c.roles == ("format", "env_action") and c.rho == 1e4
+    c = CrossGateConfig.from_mapping({"enable": True, "roles": "format,env_action"})
+    assert c.roles == ("format", "env_action")
+    with pytest.raises(ValueError):
+        CrossGateConfig.from_mapping({"enable": True, "epsilon": 0.1})
+    with pytest.raises(ValueError):
+        _cfg(lambda_max=1.5).validate()
+    with pytest.raises(ValueError):
+        _cfg(roles=("format", "thinking")).validate()
+    with pytest.raises(ValueError):
+        _cfg(ema_decay=1.0).validate()
+    m = _cfg().control_role_mask()
+    assert bool(m[ROLE_FORMAT]) and bool(m[ROLE_ENV_ACTION]) and not bool(m[ROLE_TAG])

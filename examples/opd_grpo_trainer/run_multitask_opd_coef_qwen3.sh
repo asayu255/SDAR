@@ -171,8 +171,39 @@ case "$ARM" in
             "+algorithm.opd.pushback_control.min_ctl_tokens=256"
         )
         ;;
+    cross)
+        # MOPD v1. Pure OPD+GRPO underneath (static coefficient null, self gate
+        # OFF), plus a soft cross-task gate on the OPD term driven by OTHER
+        # tasks' role-wise RL references. Conditions fixed in advance on scale,
+        # not searched (docs/opd_output_space_cross_gate_design.md §8):
+        # eps_cross=0 puts any net negative cross contribution under control;
+        # rho=1/beta^2=1e4 corrects the one known scale gap (the slack is linear
+        # in beta, the removal cost is not); lambda_max=0.2 caps what the
+        # constraint may take; EMA 0.8 everywhere; validity over an 8-step
+        # window per prompt-split side. See verl/trainer/ppo/opd_cross_gate.py.
+        # pushback_control is said to be null EXPLICITLY, for the reason the
+        # control branch says kl_loss_coef_by_task=null: the lock pins it, and an
+        # absent key is <<MISSING>>, not null.
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control=null"
+            "+algorithm.opd.cross_gate.enable=True"
+            "+algorithm.opd.cross_gate.eps_cross=0.0"
+            "+algorithm.opd.cross_gate.rho=10000.0"
+            "+algorithm.opd.cross_gate.lambda_max=0.2"
+            "+algorithm.opd.cross_gate.ema_decay=0.8"
+            "+algorithm.opd.cross_gate.window_steps=8"
+            "+algorithm.opd.cross_gate.min_prompts=4"
+            "+algorithm.opd.cross_gate.min_pg_prompts=2"
+            "+algorithm.opd.cross_gate.min_tokens=64"
+            "+algorithm.opd.cross_gate.max_staleness=2"
+            "+algorithm.opd.cross_gate.delta=1e-30"
+            "+algorithm.opd.cross_gate.split_seed=1"
+            "+algorithm.opd.cross_gate.roles=[format,env_action]"
+        )
+        ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross, got: $ARM" >&2
         exit 1
         ;;
 esac

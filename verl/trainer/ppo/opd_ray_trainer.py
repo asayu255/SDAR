@@ -39,12 +39,14 @@ from verl.trainer.ppo.privileged_notice import (
     prepend_prefix as notice_prepend_prefix,
     verify_doc_hashes as notice_verify_doc_hashes,
 )
+from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 from verl.trainer.ppo.metric_utils import (
     _compute_response_info,
     compute_metrics_by_task,
     compute_trajectory_response_tokens,
     compute_throughout_metrics,
     compute_timing_metrics,
+    get_task_names,
 )
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
@@ -1493,6 +1495,34 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch.batch["pushback_group_idx"] = group_index_column(
                             batch.non_tensor_batch["uid"], len(batch)
                         )
+                    # The cross gate's prompt split (MOPD v1). A stable key per
+                    # prompt -- the GRPO group's turn-0 anchor observation, hashed
+                    # with the task -- decides which of the two reference halves
+                    # the group feeds, and the same key is what the actor's
+                    # validity window counts prompts by. Only the driver has the
+                    # uids, the turn indices and the anchors, so the columns are
+                    # built here and the key list rides in meta_info.
+                    _cg_cfg = self.config.algorithm.get("opd", {}).get("cross_gate", None)
+                    if _cg_cfg is not None and bool(_cg_cfg.get("enable", False)):
+                        from verl.trainer.ppo.opd_cross_gate import cross_gate_prompt_columns
+
+                        _nt = batch.non_tensor_batch
+                        _real = np.ones(len(batch), dtype=bool)
+                        _pad = batch.batch.get(PADDING_ROW_KEY, None)
+                        if _pad is not None:
+                            _real &= ~_pad.reshape(-1).to(torch.bool).cpu().numpy()
+                        _cols = cross_gate_prompt_columns(
+                            uids=_nt["uid"],
+                            turn_steps=_nt.get("turn_step", np.zeros(len(batch), dtype=np.int64)),
+                            anchors=_nt.get("anchor_obs", [None] * len(batch)),
+                            task_names=get_task_names(batch),
+                            real=_real,
+                            seed=int(_cg_cfg.get("split_seed", 1)),
+                        )
+                        batch.batch["cross_side"] = _cols["side"]
+                        batch.batch["cross_prompt_idx"] = _cols["prompt_idx"]
+                        batch.meta_info["cross_prompt_keys"] = list(_cols["keys"])
+                        batch.meta_info["cross_unkeyed_rows"] = int(_cols["unkeyed_rows"])
                     # The notice's own readouts (leak floor, truncation floor).
                     metrics.update(self._notice_metrics(batch))
 

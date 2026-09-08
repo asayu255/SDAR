@@ -126,6 +126,13 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
 )
 from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
 from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, conflict_gate
+from verl.trainer.ppo.opd_cross_gate import (
+    CrossGateConfig,
+    CrossGateController,
+    CrossGateStats,
+    cross_gate_forward,
+)
+from verl.trainer.ppo.sign_weights import ROLE_NAMES as _CG_ROLE_NAMES
 
 # Columns of the per-task group bitmap (see OpdTaskDiagStats).
 PUSHBACK_MAX_GROUPS = 4096
@@ -1685,22 +1692,72 @@ class DataParallelPPOActor(BasePPOActor):
         # and a new one enters at 1.
         return ctl
 
+    def cross_gate_controller(self, task_id_names):
+        """The cross-task gate's controller (MOPD v1), built once and kept across steps.
+
+        Same lifecycle as :meth:`pushback_controller`: it holds the references
+        and lambda that step s applies and step s recomputes, so it outlives
+        update_policy; the task names arrive with the first batch, and a
+        checkpoint loaded before that is parked and applied on construction.
+        The vocabulary size comes from the module, because the references are
+        vectors over it.
+        """
+        cfg_map = self.config.get("teacher_kl_cross_gate", None)
+        if not cfg_map or not bool(dict(cfg_map).get("enable", False)):
+            return None
+        ctl = getattr(self, "_cross_gate", None)
+        names = list(task_id_names or [])
+        if ctl is None:
+            if not names:
+                raise AssertionError(
+                    "teacher_kl_cross_gate is enabled but the batch carries no task_id_names; "
+                    "the gate is per task and cannot be built."
+                )
+            vocab = model_vocab_size(self.actor_module)
+            if vocab is None:
+                raise AssertionError(
+                    "teacher_kl_cross_gate needs the model's vocab_size for its references "
+                    "and the module does not report one."
+                )
+            ctl = CrossGateController(CrossGateConfig.from_mapping(cfg_map), int(vocab), names)
+            pending = getattr(self, "_cross_gate_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending)
+                self._cross_gate_pending_state = None
+            self._cross_gate = ctl
+        return ctl
+
     def actor_extra_state_dict(self) -> dict:
         """Small per-rank state the checkpoint manager stores beside lr/rng."""
+        out = {}
         ctl = getattr(self, "_pushback", None)
-        return {"pushback": ctl.state_dict()} if ctl is not None else {}
+        if ctl is not None:
+            out["pushback"] = ctl.state_dict()
+        cg = getattr(self, "_cross_gate", None)
+        if cg is not None:
+            # The references (22 MB at Qwen3's vocabulary), the EMAs, the
+            # validity windows and lambda. A resume without them would restart
+            # every reference from nothing and apply lambda = 0 for a window.
+            out["cross_gate"] = cg.state_dict()
+        return out
 
     def load_actor_extra_state_dict(self, sd) -> None:
         if not sd:
             return
         pb = sd.get("pushback", None)
-        if not pb:
-            return
-        ctl = getattr(self, "_pushback", None)
-        if ctl is not None:
-            ctl.load_state_dict(pb)
-        else:
-            self._pushback_pending_state = pb
+        if pb:
+            ctl = getattr(self, "_pushback", None)
+            if ctl is not None:
+                ctl.load_state_dict(pb)
+            else:
+                self._pushback_pending_state = pb
+        cg = sd.get("cross_gate", None)
+        if cg:
+            ctl = getattr(self, "_cross_gate", None)
+            if ctl is not None:
+                ctl.load_state_dict(cg)
+            else:
+                self._cross_gate_pending_state = cg
 
     def validate_teacher_kl_task_ids(self, task_ids, task_id_names):
         """Check the ids ONCE, on the arranged batch, before the micro-batch loop.
@@ -2044,6 +2101,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        # The cross gate's dense-index -> stable-prompt-key list for THIS step,
+        # read here and nowhere later: `data` is rebound three times below
+        # (micro-batch dict, TensorDict, metrics dict) and none of those has a
+        # meta_info -- the defect that killed the pushback arm's first update.
+        _cg_prompt_keys = list(data.meta_info.get("cross_prompt_keys", []) or [])
+        _cg_unkeyed_rows = int(data.meta_info.get("cross_unkeyed_rows", 0) or 0)
 
         pg_loss_coef = self.config.get("pg_loss_coef", 1.0)
         use_teacher_kl_loss = self.config.get("use_teacher_kl_loss", False)
@@ -2334,6 +2397,13 @@ class DataParallelPPOActor(BasePPOActor):
                 and bool(dict(self.config.get("teacher_kl_pushback")).get("enable", False))
                 and "pushback_group_idx" in data.batch.keys()):
             select_keys.append("pushback_group_idx")
+        # The cross gate's per-row prompt side and dense prompt index, attached
+        # by the driver next to the group index above.
+        if (self.config.get("teacher_kl_cross_gate", None)
+                and bool(dict(self.config.get("teacher_kl_cross_gate")).get("enable", False))):
+            for _k in ("cross_side", "cross_prompt_idx"):
+                if _k in data.batch.keys():
+                    select_keys.append(_k)
         self.validate_teacher_kl_task_ids(
             data.batch.get("task_ids", None) if "task_ids" in data.batch.keys() else None,
             task_id_names,
@@ -2538,6 +2608,22 @@ class DataParallelPPOActor(BasePPOActor):
             pushback.a_tensor(list(task_id_names or []), device=sign_dev)
             if pushback is not None else None
         )
+        # The cross-task gate (MOPD v1). Built on the config alone like every
+        # accumulator here, and exclusive with the pushback controller (the
+        # injection refuses both; this is the belt to that suspender). Its
+        # references and lambda for THIS step are read ONCE here and fixed for
+        # every micro-batch; the step's own statistics update them at the end.
+        cross_gate = self.cross_gate_controller(task_id_names) if use_teacher_kl_loss else None
+        if cross_gate is not None and pushback is not None:
+            raise AssertionError(
+                "teacher_kl_cross_gate and teacher_kl_pushback are both enabled; one at a time."
+            )
+        cross_stats = None
+        _cg_refs = None
+        _cg_names = list(task_id_names or [])
+        if cross_gate is not None:
+            cross_stats = CrossGateStats(n_tasks=len(_cg_names), vocab_size=cross_gate.V, device=sign_dev)
+            _cg_refs = cross_gate.refs_to_device(_cg_names, sign_dev)
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
         # The parameter-free arm's three accumulators, built on the config alone
@@ -3126,6 +3212,8 @@ class DataParallelPPOActor(BasePPOActor):
                     _opd_diag_pending = None
                     # The per-token OPD weight the gate applied, or None.
                     _pb_w = None
+                    # The cross gate's forward outputs for this micro-batch, or None.
+                    _cg_pending = None
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
@@ -3742,7 +3830,8 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                             _defer("actor/pg_loss_weighted", pg_term)
                         if (xt_grad_stats is not None or opd_grad_stats is not None
-                                or opd_diag_stats is not None or pushback is not None):
+                                or opd_diag_stats is not None or pushback is not None
+                                or cross_gate is not None):
                             # d(pg_losses)/d(log_prob), from the SAME inputs the
                             # loss above was built from rather than from a copy
                             # reconstructed in the diagnostic. Outside the
@@ -4648,6 +4737,39 @@ class DataParallelPPOActor(BasePPOActor):
                         # inputs keep their meaning. The gate NEVER touches the
                         # aggregation denominator -- a mean of w is not
                         # renormalised back to 1.
+                        if (cross_gate is not None and teacher_topk_kl and log_prob is not None
+                                and task_ids is not None):
+                            # MOPD v1: the soft cross-task gate, from OTHER tasks'
+                            # role-wise references fixed for this step. Everything
+                            # it returns is detached -- a measurement of this
+                            # forward the loss multiplies by, not a term in it.
+                            # The (bs, T, k) intermediates die inside the call.
+                            _cg_roles = token_roles(responses, sign_role_tags)
+                            _cg_topk_ids = (
+                                student_topk_ids if student_indexed_topk
+                                else data.get("teacher_topk_ids", None)
+                            )
+                            _cg = cross_gate_forward(
+                                student_topk_logprob=student_topk_logprobs,
+                                teacher_topk_logprob=teacher_topk_lp,
+                                teacher_kl=teacher_kld,
+                                topk_ids=_cg_topk_ids,
+                                response_ids=responses,
+                                # dL_pg/dlog p, clip branches included -- the
+                                # reference is built from this, never from A.
+                                pg_grad_coef=xt_pg_grad_coef,
+                                # beta in, lambda out.
+                                opd_coef=_teacher_kl_coef_scalar,
+                                task_ids=task_ids,
+                                roles=_cg_roles,
+                                refs=_cg_refs,
+                                delta=cross_gate.cfg.delta,
+                            )
+                            _pb_w = _cg["w"].to(teacher_kld.dtype)
+                            _cg_pending = {
+                                "fwd": _cg, "roles": _cg_roles, "topk_ids": _cg_topk_ids,
+                                "teacher_kl": teacher_kld, "row_basis": task_loss_weight,
+                            }
                         _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
                         if task_loss_weight is None:
                             if _kl_row_coef is None and _pb_w is None:
@@ -4727,6 +4849,21 @@ class DataParallelPPOActor(BasePPOActor):
                                 row_coef=_pend["row_coef"],
                                 gate_w=_pend["gate_w"],
                                 group_idx=data.get("pushback_group_idx", None),
+                            )
+
+                    if cross_stats is not None and _cg_pending is not None and task_ids is not None:
+                        # After the backward, like the readout: the gate needed
+                        # the forward before the loss; this only folds it into
+                        # the tables. No host sync, nothing touches the loss.
+                        with _actor_phase("actor.cross_gate"), torch.no_grad():
+                            _p = _cg_pending
+                            cross_stats.update(
+                                fwd=_p["fwd"], task_ids=task_ids, roles=_p["roles"],
+                                response_mask=response_mask, teacher_kl=_p["teacher_kl"],
+                                topk_ids=_p["topk_ids"],
+                                side=data.get("cross_side", None),
+                                prompt_idx=data.get("cross_prompt_idx", None),
+                                row_basis=_p["row_basis"],
                             )
 
                     if task_ids is not None:
@@ -5426,6 +5563,18 @@ class DataParallelPPOActor(BasePPOActor):
                 _coef = self.config.get("teacher_kl_loss_coef", 1.0)
                 for _nm, _b in dict(_by_task).items():
                     metrics[f"actor/teacher_kl_coef_effective/{_nm}"] = float(_coef) * float(_b)
+        if cross_gate is not None and cross_stats is not None:
+            # lambda as APPLIED this step, then this step's reduced sums into
+            # the controller and lambda for the next one. One collective per
+            # buffer, run on every rank; the solve is deterministic on the
+            # reduced values so every rank lands on the same lambda.
+            _lam_applied = _cg_refs.lam.detach().cpu()
+            for _tid, _nm in enumerate(_cg_names):
+                for _c, _rn in _CG_ROLE_NAMES.items():
+                    metrics[f"actor/cross/lambda_applied/{_nm}/{_rn}"] = float(_lam_applied[_tid, _c])
+            metrics.update(cross_gate.update(
+                _cg_names, cross_stats.reduced(), _cg_prompt_keys, unkeyed_rows=_cg_unkeyed_rows,
+            ))
         for name, entries in deferred_metrics.items():
             values = torch.stack([value for value, _ in entries])
             if entries[0][1] is None:

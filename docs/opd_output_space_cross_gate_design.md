@@ -194,7 +194,10 @@ $$
 * 第 2 項は教師信号を残すことと交差条件の未達を減らすことの明示的な比較。$\rho$ は実験条件（§8）。
 * **各役割で最大 3 変数の box 制約付き凸問題**。スラック消去後は単一の二次式ではなく**区分的二次の凸目的**。
   一つの送り手の減衰量が複数の受け手制約に入るので、一般に複数の制約が結合する —— 単一乗数の探索で解ける問題ではない。
-  CPU の float64 で、backtracking 付き射影勾配法などで十分小さく解ける。
+  CPU の float64 で解く。**実装は厳密な座標降下**（§13）: 1 座標に沿った目的は、各受け手のスラックがゼロを横切る点を
+  区切りとする凸区分二次で、区分ごとに閉形式の最小点を持つので 1 次元ステップが厳密になる。backtracking 付き射影勾配法を先に試したが、
+  この目的では条件数が $\rho/R^2\sim10^4$ で 500 反復では収束しなかった。目的が平坦な座標（未観測、助けられる受け手が無い）は
+  同点なら小さい $\lambda$ を選ぶので 0 に置かれる。
 
 ### 4.2 減衰の上限
 
@@ -397,37 +400,44 @@ $\lambda=0.2$ に張り付いていても $h$ が小さければ実際の介入�
 
 ## 9. 記録する指標
 
+すべて `actor/cross/` 配下。`{i}` は受け手、`{j}` は送り手、`{role}` は役割名、`_{k}` は分割側（1 / 2）。
+
 **介入で失ったもの**（シーソーが起きた理由を、self gate を再導入せずに確認する）
 
 | 指標 | 何を答えるか |
 |---|---|
-| `cross/lambda/{task}/{role}`、`cross/K/{task}/{role}` | 適用した減衰と介入コスト |
-| `cross/strength_lost/{task}/{role}`、`cross/kl_lost/{task}/{role}` | 各タスク・役割で失った OPD の強度と KL |
-| `cross/lost_self_aligned/{task}/{role}` | 減衰対象のうち、**自タスク RL と整列していた部分**の強度（指標であって条件ではない） |
-| `cross/lost_by_receiver/{j}/{i}/{role}` | どの受け手の参照がその減衰を引き起こしたか（$\omega q$ の分解） |
-| `cross/slack/{i}/{role}`、`cross/predicted_vs_realized/{i}/{role}` | 受け手別の条件未達と、次 step の実測 |
-| `episode/{task}_success_rate` | 学習時の成功率。推移の把握用であって、採否の判定には使わない |
-| 共通条件の評価 | 3 タスクの改善判定。**採否はこれで決める**（§8.6） |
+| `lambda_applied/{task}/{role}`、`lambda_next/{task}/{role}` | この step に適用した減衰と、次 step のために解いた減衰 |
+| `K/{task}/{role}` | 介入コストの係数（除去二乗ノルム / 送り手の OPD エネルギー、役割割合込み） |
+| `strength_lost_frac/{task}/{role}`、`kl_lost_frac/{task}/{role}` | 各タスク・役割で失った OPD の強度と KL（その役割の総量に対する比） |
+| `strength_lost_self_aligned_frac/{task}/{role}` | 失った強度のうち、**自タスク RL と整列していた部分**の割合（指標であって条件ではない） |
+| `lost_by_receiver/{j}/{i}/{role}` | 送り手 $j$ の減衰のうち、受け手 $i$ の参照が引き起こした分（$\omega_i q_i/h$ による分解） |
+| `slack/{i}/{role}`、`slack_at_zero/{i}/{role}` | 受け手別の条件未達（解いた $\lambda$ で / $\lambda=0$ で） |
+| `predicted/{i}/{role}`、`realized/{i}/{j}/{role}` | 次 step の予測 $\sum_j(\bar B-\lambda\bar D)$ と、この step で実際に適用後に測った $\mathbb E[w\,v_i^\top d]$ |
+| `w_mean/{task}/{role}`、`h_mean/{task}/{role}`、`h_nonzero_frac/{task}/{role}` | 適用した重みの平均、ゲートの大きさ、発火範囲 |
+| 共通条件の評価 | 3 タスクの改善判定。**採否はこれで決める**（§8.6）。`episode/*_success_rate` は推移の把握用 |
 
-**参照の再現性と強さ**
+**参照の再現性と強さ**（§1.2 の 4 指標）
 
 | 指標 | 何を答えるか |
 |---|---|
-| `cross/kappa_{k}/{i}/{role}`、`cross/n_eff/{i}/{role}`、`cross/n_distinct/{i}/{role}` | 各側の κ と、その分母になっている支持の広さ |
-| `cross/ref_cos_sides/{i}/{role}` | $\cos(v^{(1)},v^{(2)})$。プロンプト集合を分けた参照の再現性 |
-| `cross/groups_side{k}/{i}/{role}`、`cross/valid/{i}/{role}`、`cross/staleness/{i}/{role}` | 各側の群数、有効性、鮮度 |
-| `cross/invalid_reason/{i}/{role}`、`cross/invalid_steps/{i}/{role}` | 無効だった**理由**（プロンプト数 / PG 信号 / token 数 / 鮮度 / 非有限）と、その期間（§2.3） |
-| `cross/n_valid_receivers/{j}/{role}` | $\lvert\mathcal V_{j,c}\rvert$ |
-| `cross/h_mean/{task}/{role}`、`cross/h_nonzero_frac/{task}/{role}` | ゲートの大きさと発火範囲 |
+| `kappa_{k}/{i}/{role}`、`R_{k}/{i}/{role}` | 各側の $\kappa=\|v\|^2/R$ と $R$。$\sqrt\kappa$ が $q$ の上界（§3） |
+| `n_eff_{k}/{i}/{role}`、`n_distinct_{k}/{i}/{role}` | 参照の実効座標数 $(\sum\lvert v\rvert)^2/\sum v^2$ と非ゼロ座標数。κ の分母になっている支持の広さ |
+| `ref_cos_sides/{i}/{role}` | $\cos(v^{(1)},v^{(2)})$。プロンプト集合を分けた参照の再現性 |
+| `prompts_side{k}/{i}/{role}`、`pg_prompts_side{k}/{i}/{role}`、`tokens_window_side{k}/{i}/{role}` | 窓内の相異なるプロンプト数、うち PG 信号を持つもの、token 数（§2.3 の条件の材料） |
+| `staleness_side{k}/{i}/{role}` | 最終観測からの経過 step |
+| `valid/{i}/{role}`、`invalid_reason/{i}/{role}`、`invalid_steps/{i}/{role}` | 有効性、無効の**理由**（1 未観測 / 2 プロンプト不足 / 3 PG プロンプト不足 / 4 token 不足 / 5 鮮度 / 6 非有限 / 7 $R=0$）、無効の継続 step 数 |
+| `n_valid_receivers/{j}/{role}` | $\lvert\mathcal V_{j,c}\rvert$ の token 平均 |
+| `unkeyed_rows`、`unkeyed_token_frac/{task}/{role}` | 安定 prompt key を持てなかった行（群に turn-0 行が無い）。参照に入らず、プロンプトにも数えられない |
+| `solver_converged/{role}`、`solver_reason_code/{role}` | 役割別の解の状態（0 ok / 1 反復上限 / 2 有効受け手なし / 3 $\lambda_{\max}=0$ / 4–5 非有限 → $\lambda=0$） |
 
 **共通支持の実体**
 
 | 指標 | 何を答えるか |
 |---|---|
-| `cross/support_overlap/{i}/{j}/{role}`、`cross/energy_on_shared/{i}/{j}/{role}` | 参照の支持と $t$ の支持の重なりと、そこに載る勾配エネルギー（**ID 個数ではなく重み**） |
-| `cross/B/{i}/{j}/{role}`、`cross/D/{i}/{j}/{role}`、`cross/A_neg/{i}/{j}/{role}` | 符号付き交差量、除去量、負の部分の総量（診断） |
+| `support_overlap/{i}/{j}/{role}`、`energy_on_shared/{i}/{j}/{role}` | 参照の支持と $t$ の支持の重なりと、そこに載る OPD エネルギーの割合（**ID 個数ではなく重み**） |
+| `B/{i}/{j}/{role}`、`D/{i}/{j}/{role}`、`A_neg/{i}/{j}/{role}` | 符号付き交差量、除去量、負の部分の総量（診断） |
 
-すべて既存の all-reduce に相乗りする。ベクトル集計・保存・通信は増えるが、追加 forward / backward は無い。
+すべて既存の all-reduce に相乗りする。ベクトル集計・保存・通信は増える（参照 22 MB の all-reduce と checkpoint）が、追加 forward / backward は無い。
 
 ---
 
@@ -482,3 +492,25 @@ step 300 のパラメータ空間 $C_{ij}=\langle r_i,d_j\rangle$（N=8、非正
 * 参照が不安定だった場合の結論は「この役割分割・集約・標本数では安定した参照が得られなかった」まで。
   「他タスクに使える RL 方向が存在しない」とは言えない。
 * 採否は 3 タスクの評価精度で決める。ここで記録する量はどれも代理である。
+
+---
+
+## 13. 実装（2026-09-08）
+
+* 機構: [`verl/trainer/ppo/opd_cross_gate.py`](../verl/trainer/ppo/opd_cross_gate.py) —— 設定、プロンプト分割（SHA-256）、
+  `cross_gate_forward`（§3 の $q$・$h$・$w$ と統計の材料、すべて detached）、`CrossGateStats`（step 内の device 累積、all-reduce 1 回/バッファ）、
+  `solve_role`（§4.1、厳密座標降下）、`CrossGateController`（参照 EMA・窓・有効性・$\lambda$・checkpoint）。
+* 配線: [`dp_actor.py`](../verl/workers/actor/dp_actor.py)（step 頭で参照を 1 回読み、損失前にゲート、backward 後に累積、末尾で解く）、
+  [`opd_ray_trainer.py`](../verl/trainer/ppo/opd_ray_trainer.py)（GRPO 群の turn-0 anchor から `cross_side` / `cross_prompt_idx` と key 列を付与）、
+  [`main_opd.py`](../verl/trainer/main_opd.py)（`algorithm.opd.cross_gate` → actor、排他検証）。
+* アーム: `ARM=cross bash examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh`。intent lock は
+  `examples/opd_grpo_trainer/expected_multitask_opd_coef_cross_config.yaml`（§8 の値を両側に固定、self gate は null と明示）。
+* 検証（CPU）: `tests/trainer/test_opd_cross_gate.py`（29: 分割、$q\le\sqrt\kappa$ の上界、両側規則、β 尺度恒等式、累積の密な再計算との一致、
+  ソルバのグリッド一致、窓・欠測・鮮度、resume）、`tests/trainer/test_opd_cross_gate_arm.py`（11: 順序、同一行での乗算、
+  clip 後係数、再バインド名の非参照、列の到達、checkpoint、排他、実 Hydra 注入、挿入ブロックの名前解決）、
+  `tests/trainer/test_opd_coef_arm.py`（cross を含む 5 アームの lock と shell 起動）。
+* **安定 prompt key の実体。** 学習行の `index` はバッチ内位置で dataset index ではない。step を跨いで安定なのは環境の初期観測
+  （ゲーム・ゴール・質問）で、GRPO 群の 8 rollout は同じ seed でリセットされるためそれを共有する。よって key は
+  `sha256(version | seed | task | 群の turn-0 anchor_obs)`。turn-0 行がバッチに無い群は side=−1（ゲートは受けるが参照には入らない）で、
+  その行数を `unkeyed_rows` に記録する。
+* **GPU 上で未実行。** 起動前に §8.6 の 5 / 10 / 20 / 40 step の確認項目を読む。

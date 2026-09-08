@@ -62,6 +62,47 @@ def validate_pushback_exclusivity(pushback, by_task, task_diag, opd_cfg):
             "pushback_control needs algorithm.opd.task_diag=True: the controller reads R and "
             "C^- off the task readout's reduced table and has no collective of its own."
         )
+    cg = opd_cfg.get("cross_gate", None)
+    if cg is not None and bool(dict(cg).get("enable", False)):
+        raise ValueError(
+            "pushback_control is enabled together with cross_gate.enable=True; both multiply "
+            "the teacher-KL term. One at a time."
+        )
+
+
+def validate_cross_gate_exclusivity(cross_gate, by_task, task_diag, opd_cfg):
+    """Refuse a configuration in which the cross gate would stack on another weighting.
+
+    MOPD v1 is pure OPD+GRPO plus the cross-task gate and nothing else: no
+    static per-task coefficient, no pushback (self) gate, no cross-teacher
+    weighting. Each of those multiplies the same term; stacking them makes the
+    arm something other than what its name says, and the gate's own inputs --
+    measured at the base coefficient -- would no longer be.
+    """
+    if not cross_gate or not bool(dict(cross_gate).get("enable", False)):
+        return
+    from verl.trainer.ppo.opd_cross_gate import CrossGateConfig
+
+    CrossGateConfig.from_mapping(cross_gate).validate()
+    if by_task:
+        vals = {str(k): float(v) for k, v in dict(by_task).items()}
+        if any(v != 1.0 for v in vals.values()):
+            raise ValueError(
+                f"cross_gate is enabled together with kl_loss_coef_by_task={vals}; the gate sits "
+                f"on pure OPD+GRPO, it does not stack on a static coefficient. Unset it."
+            )
+    for other in ("sign_weight", "cross_teacher_kl_weight", "cross_teacher_target", "pushback_control"):
+        o = opd_cfg.get(other, None)
+        if o is not None and bool(dict(o).get("enable", False)):
+            raise ValueError(
+                f"cross_gate is enabled together with {other}.enable=True; both multiply "
+                f"the teacher-KL term. One at a time."
+            )
+    if not task_diag:
+        raise ValueError(
+            "cross_gate needs algorithm.opd.task_diag=True: the policy-gradient coefficient the "
+            "gate's references are built from is computed on that path."
+        )
 
 
 def validate_kl_coef_by_task(by_task, box=KL_COEF_BY_TASK_BOX):
@@ -164,6 +205,21 @@ def inject_distillation_config(config) -> None:
         )
         validate_pushback_exclusivity(
             config.actor_rollout_ref.actor.teacher_kl_pushback,
+            config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task,
+            config.actor_rollout_ref.actor.teacher_kl_task_diag,
+            opd_cfg,
+        )
+        # MOPD v1: the cross-task soft gate on the OPD term, driven by OTHER
+        # tasks' role-wise RL references. Pure OPD+GRPO underneath -- no self
+        # gate, no static coefficient -- and validate_cross_gate_exclusivity
+        # refuses any of those alongside it. See verl/trainer/ppo/opd_cross_gate.py
+        # and docs/opd_output_space_cross_gate_design.md.
+        _cg = opd_cfg.get("cross_gate", None)
+        config.actor_rollout_ref.actor.teacher_kl_cross_gate = (
+            dict(_cg) if _cg is not None else None
+        )
+        validate_cross_gate_exclusivity(
+            config.actor_rollout_ref.actor.teacher_kl_cross_gate,
             config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task,
             config.actor_rollout_ref.actor.teacher_kl_task_diag,
             opd_cfg,

@@ -27,7 +27,7 @@ import pytest
 from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
-ARMS = ("control", "uniform", "redistribute", "pushback")
+ARMS = ("control", "uniform", "redistribute", "pushback", "cross")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -37,6 +37,7 @@ B = {
     "uniform": {"alfworld": 1.110833, "search": 1.110833, "webshop": 1.110833},
     "redistribute": {"alfworld": 1.076431, "search": 1.191101, "webshop": 0.5},
     "pushback": None,          # no static coefficient: the online gate replaces it
+    "cross": None,             # MOPD v1: pure OPD+GRPO plus the cross-task gate
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -55,15 +56,22 @@ def _is_pushback_key(key):
     return "pushback" in key
 
 
+def _is_cross_key(key):
+    # the cross gate's own knobs, and the self gate it DECLARES off (the
+    # control lock does not mention pushback at all, so "null" differs from
+    # "absent" and has to be allowed here -- and checked below)
+    return "cross_gate" in key or "pushback" in key
+
+
 # ---------------------------------------------------------------------------
 # 1. the arms differ in b and in their own name, and in nothing else
 
 
-@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback"))
+@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross"))
 def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
-    own = _is_pushback_key if arm == "pushback" else _is_coef_key
+    own = {"pushback": _is_pushback_key, "cross": _is_cross_key}.get(arm, _is_coef_key)
     differing = {
         k for k in set(control) | set(other)
         if control.get(k, "<absent>") != other.get(k, "<absent>")
@@ -73,10 +81,23 @@ def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     # and it really does differ -- a test that passes because both files are
     # identical would be worse than no test.
     assert any(own(k) for k in differing)
-    if arm == "pushback":
+    if arm in ("pushback", "cross"):
         # the static coefficient stays null on this arm, on both sides
         assert other["actor_rollout_ref.actor.teacher_kl_loss_coef_by_task"] is None
         assert other["algorithm.opd.kl_loss_coef_by_task"] is None
+    if arm == "cross":
+        # pure OPD+GRPO underneath: the self gate is declared OFF, on both sides
+        assert other["algorithm.opd.pushback_control"] is None
+        assert other["actor_rollout_ref.actor.teacher_kl_pushback"] is None
+        assert other["algorithm.opd.cross_gate.enable"] is True
+        assert other["actor_rollout_ref.actor.teacher_kl_cross_gate.enable"] is True
+        # the pre-fixed conditions (design doc §8), pinned on both sides
+        for side in ("algorithm.opd.cross_gate", "actor_rollout_ref.actor.teacher_kl_cross_gate"):
+            assert other[f"{side}.eps_cross"] == 0.0
+            assert other[f"{side}.rho"] == 10000.0
+            assert other[f"{side}.lambda_max"] == 0.2
+            assert other[f"{side}.ema_decay"] == 0.8
+            assert other[f"{side}.window_steps"] == 8
 
 
 def test_the_control_arm_leaves_the_key_unset_rather_than_setting_it_to_one():
