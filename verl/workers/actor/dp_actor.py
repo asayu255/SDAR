@@ -4764,6 +4764,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 roles=_cg_roles,
                                 refs=_cg_refs,
                                 delta=cross_gate.cfg.delta,
+                                gate_version=cross_gate.cfg.gate_version,
                             )
                             _pb_w = _cg["w"].to(teacher_kld.dtype)
                             _cg_pending = {

@@ -243,8 +243,65 @@ case "$ARM" in
             "+algorithm.opd.kl_loss_coef_by_task=null"
             "+algorithm.opd.pushback_control=null"
             "+algorithm.opd.cross_gate.enable=True"
+            # EXPLICIT, on both arms: the gate's basis is what separates them.
+            "+algorithm.opd.cross_gate.gate_version=1"
             "+algorithm.opd.cross_gate.eps_cross=0.0"
             "+algorithm.opd.cross_gate.rho=10000.0"
+            "+algorithm.opd.cross_gate.rho_rel=1.0"
+            "+algorithm.opd.cross_gate.lambda_max=0.2"
+            "+algorithm.opd.cross_gate.ema_decay=0.8"
+            "+algorithm.opd.cross_gate.window_steps=8"
+            "+algorithm.opd.cross_gate.min_prompts=4"
+            "+algorithm.opd.cross_gate.min_pg_prompts=2"
+            "+algorithm.opd.cross_gate.min_tokens=64"
+            "+algorithm.opd.cross_gate.max_staleness=2"
+            "+algorithm.opd.cross_gate.delta=1e-30"
+            "+algorithm.opd.cross_gate.split_seed=1"
+            "+algorithm.opd.cross_gate.roles=[format,env_action]"
+        )
+        ;;
+    cross2)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        # MOPD v2. Same pure OPD+GRPO underneath as `cross`, same lambda_max,
+        # same eps, same split and validity, no self gate, no budget transfer,
+        # no extra forward or backward. TWO things change, and they change the
+        # CONTROL BASIS rather than a unit:
+        #
+        #   gate_version=2  q = gamma_{i,c} * min_k [negative cosine(v^k, d)]_+
+        #     The denominator becomes ||v^k|| instead of sqrt(R^k), so q is a
+        #     cosine bounded by 1 and a reference spread over many vocabulary
+        #     items is no longer shrunk for that alone -- v1 bounded q by
+        #     sqrt(kappa) = ||v||/sqrt(R) and so paid a penalty for support
+        #     diversity. Reliability moves to gamma = [cos(v^1, v^2)]_+, the two
+        #     prompt-disjoint halves' agreement. gamma is a HEURISTIC weight,
+        #     not a significance test: no null is subtracted, because there is
+        #     no basis for cos ~ N(0, 1/n_eff) on correlated, frequency-skewed,
+        #     sparse vocabulary gradients, and n_eff in the metrics is a
+        #     participation ratio, not a sample count.
+        #
+        #   rho_rel=1.0     penalty (s_i / S_{i,c})^2 instead of (s_i / R_i)^2
+        #     S_{i,c} = sum_{j!=i} E_{j,c}|v_i . d| = sum_j (B + 2 A^-), so no
+        #     new statistic is needed. v1 asked "is the cross effect small
+        #     against RL's own energy"; v2 asks "what share of the observed
+        #     cross effect is net conflict". An absolutely tiny cross effect
+        #     that is relatively adverse becomes an object of control. That is
+        #     the reason this can move the experiment and also the risk; it is
+        #     NOT a unit fix. rho_rel = 1 because S already is the scale of the
+        #     constrained quantity.
+        #
+        # What decides FIRING is still the signed B. A^- only sets the scale --
+        # this is not a return to "any negative part attenuates".
+        # D and K are recomputed from THIS gate's h by construction: the stats
+        # come from the same forward that produced h, so v1's numbers cannot
+        # leak in.
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control=null"
+            "+algorithm.opd.cross_gate.enable=True"
+            "+algorithm.opd.cross_gate.gate_version=2"
+            "+algorithm.opd.cross_gate.eps_cross=0.0"
+            "+algorithm.opd.cross_gate.rho=10000.0"
+            "+algorithm.opd.cross_gate.rho_rel=1.0"
             "+algorithm.opd.cross_gate.lambda_max=0.2"
             "+algorithm.opd.cross_gate.ema_decay=0.8"
             "+algorithm.opd.cross_gate.window_steps=8"
@@ -258,7 +315,7 @@ case "$ARM" in
         )
         ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2, got: $ARM" >&2
         exit 1
         ;;
 esac

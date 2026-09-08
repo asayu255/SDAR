@@ -1,3 +1,35 @@
+# MOPD v2. Identical to the `cross` lock beside it except for ONE pinned value
+# on each side of the injection: cross_gate.gate_version 1 -> 2. Everything the
+# experiment holds fixed is unchanged -- beta 0.01, lambda_max 0.2,
+# eps_cross 0, rho_rel 1.0, the split, the validity windows, the EMA, no self
+# gate, no per-task coefficient, no budget transfer, no extra forward or
+# backward -- so the two arms differ in the gate's CONTROL BASIS and nothing
+# else, and both start from the same initial checkpoint.
+#
+# What version 2 changes, and why it is not a unit fix:
+#   * q = gamma_{i,c} * min_k [negative cosine(v^k_{i,c}, d_{j,t})]_+, i.e. the
+#     denominator is ||v^k|| rather than sqrt(R^k). v1's q was bounded by
+#     sqrt(kappa) = ||v||/sqrt(R), so a reference merely SPREAD over many
+#     vocabulary items was shrunk for its diversity. Reliability now sits in
+#     gamma = [cos(v^1, v^2)]_+, the agreement of the two prompt-disjoint
+#     halves -- a heuristic weight, with no null subtracted: cos ~ N(0, 1/n_eff)
+#     has no basis for correlated, frequency-skewed, sparse vocabulary
+#     gradients, and the logged n_eff is a participation ratio, not a sample
+#     count. A bias common to both halves also raises gamma. This removes v1's
+#     direct penalty on support diversity; it does not solve reliability.
+#   * the penalty is (s_i / S_{i,c})^2, with
+#     S_{i,c} = sum_{j!=i} E_{j,c}|v_i . d| = sum_j (B_ij + 2 A^-_ij), so no new
+#     statistic is needed. v1 asked whether the cross effect was small against
+#     RL's own energy R; v2 asks what share of the OBSERVED cross effect is net
+#     conflict. An absolutely tiny cross effect that is relatively adverse
+#     becomes an object of control. That is why this can move the experiment and
+#     equally why it is a risk.
+#   * firing is still decided by the SIGNED B. A^- only sets the scale, so this
+#     is not a return to "a negative part anywhere attenuates".
+#
+# Both slack normalisations are recorded (slack_over_S and slack_over_R) so the
+# two arms are readable against each other.
+#
 # Expected effective config for the OPD + GRPO multitask run with a PER-TASK
 # OPD COEFFICIENT -- arm: cross.
 #
@@ -291,7 +323,7 @@
 # is unset, so an untagged run pins exactly the name it always did. What the
 # suffix does NOT do is unpin the name: the base is still checked, so a typo
 # fails the run in seconds rather than after two hours in the wrong chart.
-"trainer.experiment_name": opd_grpo_multitask_opd_coef_cross_qwen3_1.7b$RUN_TAG_SUFFIX
+"trainer.experiment_name": opd_grpo_multitask_opd_coef_cross2_qwen3_1.7b$RUN_TAG_SUFFIX
 # ---- cross-teacher sign agreement --------------------------------------------
 # THE CONTROL. Same code path, same seed, same rollouts, same 0.01 coefficient;
 # the weight is off. It is not an ablation -- it is the only run this arm can be
@@ -352,7 +384,7 @@
 # Nothing here is a claim of optimality. A null accuracy result has to be read
 # against the retention metrics (actor/cross/*) before it means anything.
 "algorithm.opd.cross_gate.enable": true
-"algorithm.opd.cross_gate.gate_version": 1
+"algorithm.opd.cross_gate.gate_version": 2
 "algorithm.opd.cross_gate.rho_rel": 1.0
 "algorithm.opd.cross_gate.eps_cross": 0.0
 "algorithm.opd.cross_gate.rho": 10000.0
@@ -367,7 +399,7 @@
 "algorithm.opd.cross_gate.split_seed": 1
 "algorithm.opd.cross_gate.roles": [format, env_action]
 "actor_rollout_ref.actor.teacher_kl_cross_gate.enable": true
-"actor_rollout_ref.actor.teacher_kl_cross_gate.gate_version": 1
+"actor_rollout_ref.actor.teacher_kl_cross_gate.gate_version": 2
 "actor_rollout_ref.actor.teacher_kl_cross_gate.rho_rel": 1.0
 "actor_rollout_ref.actor.teacher_kl_cross_gate.eps_cross": 0.0
 "actor_rollout_ref.actor.teacher_kl_cross_gate.rho": 10000.0

@@ -699,3 +699,326 @@ def test_the_bound_holds_for_every_lambda_in_the_box():
         assert float(f["w"].min()) >= 1.0 - lam_max - 1e-6
         if lam_max == 0.0:
             assert torch.equal(f["w"], torch.ones_like(f["w"])), "lambda_max = 0 must be inert"
+
+
+# --------------------------------------------------------------------------- #
+# 7. MOPD v2: gamma * negative cosine, and the S-normalised objective
+
+
+def _v2_make_refs(v, R, *, gamma, lam, nR=1, nS=2):
+    """Refs with v2's two extra fields set explicitly."""
+    import torch
+
+    from verl.trainer.ppo.opd_cross_gate import CrossGateRefs
+
+    nT = v.shape[0]
+    return CrossGateRefs(
+        v=v, R=R,
+        side_w=torch.full((nT, nR, nS), 1.0 / nS),
+        valid=torch.ones(nT, nR, dtype=torch.bool),
+        lam=torch.full((nT, nR), lam),
+        control_roles=torch.ones(nR, dtype=torch.bool),
+        v_norm=v.double().norm(dim=-1).float(),
+        gamma=torch.full((nT, nR), gamma),
+    )
+
+
+def _v2_fwd(refs, *, version, k=4, V=32, bs=2, T=3):
+    import torch
+
+    from verl.trainer.ppo.opd_cross_gate import cross_gate_forward
+
+    torch.manual_seed(0)
+    ids = torch.arange(k).repeat(bs, T, 1) % V
+    return cross_gate_forward(
+        student_topk_logprob=torch.log_softmax(torch.randn(bs, T, k), dim=-1),
+        teacher_topk_logprob=torch.log_softmax(torch.randn(bs, T, k), dim=-1),
+        teacher_kl=torch.rand(bs, T),
+        topk_ids=ids, response_ids=ids[..., 0],
+        pg_grad_coef=torch.ones(bs, T), opd_coef=0.01,
+        task_ids=torch.ones(bs, dtype=torch.long),
+        roles=torch.zeros(bs, T, dtype=torch.long),
+        refs=refs, delta=1e-30, gate_version=version,
+    )
+
+
+def test_v2_gamma_zero_makes_the_receiver_inert():
+    """Opposed halves must not drive an intervention."""
+    import torch
+
+    V, nT = 32, 2
+    v = torch.zeros(nT, 1, 2, V)
+    v[0, 0, :, :4] = -1.0                      # opposes the sender's OPD
+    refs0 = _v2_make_refs(v, torch.full((nT, 1, 2), 1e-4), gamma=0.0, lam=0.2)
+    refs1 = _v2_make_refs(v, torch.full((nT, 1, 2), 1e-4), gamma=1.0, lam=0.2)
+    h0 = _v2_fwd(refs0, version=2)["h"]
+    h1 = _v2_fwd(refs1, version=2)["h"]
+    assert float(h0.abs().max()) == 0.0, "gamma = 0 must leave h at zero"
+    assert float(h1.abs().max()) > 0.0, "gamma = 1 with an opposing reference must fire"
+
+
+def test_v2_drops_the_kappa_shrinkage_that_v1_applied():
+    """Same reference, same OPD: v2's q is the cosine, v1's is scaled by
+    sqrt(kappa) = ||v||/sqrt(R). With R >> ||v||^2 the v1 gate is crushed and
+    the v2 gate is not -- that is the whole point of the change."""
+    import torch
+
+    V, nT = 32, 2
+    v = torch.zeros(nT, 1, 2, V)
+    v[0, 0, :, :4] = -1.0
+    R_big = torch.full((nT, 1, 2), 1.0e4)      # kappa = ||v||^2/R = 4e-4
+    refs = _v2_make_refs(v, R_big, gamma=1.0, lam=0.2)
+    h1 = float(_v2_fwd(refs, version=1)["h"].max())
+    h2 = float(_v2_fwd(refs, version=2)["h"].max())
+    assert h2 > h1 * 10, f"v2 should not inherit the kappa shrinkage (v1={h1:g}, v2={h2:g})"
+    assert h2 <= 1.0 + 1e-6
+
+
+def test_v2_still_only_attenuates():
+    """The invariant section 6 pins, under the new gate as well."""
+    import torch
+
+    V, nT = 32, 2
+    for sign in (-1.0, 1.0):
+        for gamma in (0.0, 0.5, 1.0):
+            v = torch.zeros(nT, 1, 2, V)
+            v[0, 0, :, :4] = sign
+            refs = _v2_make_refs(v, torch.full((nT, 1, 2), 1e-4), gamma=gamma, lam=0.2)
+            out = _v2_fwd(refs, version=2)
+            h, w = out["h"], out["w"]
+            assert float(h.min()) >= 0.0 and float(h.max()) <= 1.0
+            assert float(w.max()) <= 1.0 + 1e-6
+            assert float(w.min()) >= 1.0 - 0.2 - 1e-6
+
+
+def test_the_S_scale_is_the_mean_absolute_cross_effect():
+    """S = sum_j (B + 2 A^-) is sum_j E|v_i . d|, because |x| = x + 2[-x]_+."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=200_000) * 1e-8
+    B = x.mean()
+    Aneg = np.maximum(-x, 0.0).mean()
+    assert np.isclose(B + 2 * Aneg, np.abs(x).mean(), rtol=1e-12, atol=0.0)
+
+
+def test_the_objective_scale_changes_the_solution():
+    """s/S and s/R are different control bases, not a change of units."""
+    import numpy as np
+
+    from verl.trainer.ppo.opd_cross_gate import solve_role
+
+    n = 3
+    rng = np.random.default_rng(3)
+    K = rng.random(n) * 1e-6 + 1e-9
+    B = -(rng.random((n, n)) * 1e-9 + 1e-11)
+    D = -(rng.random((n, n)) * 1e-8 + 1e-10)
+    R = rng.random(n) * 1e-3 + 1e-6                 # RL energy: large
+    S = np.abs(B).sum(axis=1) * 3.0                 # cross magnitude: tiny
+    valid = np.ones(n, dtype=bool)
+    kw = dict(eps=0.0, lam_max=0.2, delta=1e-30)
+    v1 = solve_role(K, B, D, R, valid, rho=1.0, **kw)
+    v2 = solve_role(K, B, D, R, valid, rho=1.0, scale=S, **kw)
+    assert not np.allclose(v1["lam"], v2["lam"]), (
+        "the S normalisation must move the solution; if it does not, the two "
+        "arms are the same experiment"
+    )
+    # Aggregate, not per component. lambda is a JOINT solution -- one sender's
+    # lambda enters several receivers' conditions -- so weighting the constraint
+    # more can reallocate: here two senders rise and the third goes to 0.
+    # Per-component monotonicity is not a property of the change; better
+    # constraint satisfaction is.
+    assert v2["s"].sum() <= v1["s"].sum() + 1e-30, (
+        f"S-normalised should satisfy the condition at least as well: "
+        f"s_v2={v2['s'].sum():.3e} vs s_v1={v1['s'].sum():.3e}"
+    )
+    assert v2["lam"].sum() > v1["lam"].sum(), (
+        f"and spend more intervention doing it: "
+        f"sum lam_v2={v2['lam'].sum():.4f} vs v1={v1['lam'].sum():.4f}"
+    )
+
+
+def test_a_uniform_gate_rescaling_is_absorbed_but_rho_is_not():
+    """h -> ch with D -> cD and K -> c^2 K leaves lambda*h alone IN THE
+    INTERIOR; changing rho does not have that invariance. The box does not
+    transform, which is why the qualification matters."""
+    import numpy as np
+
+    from verl.trainer.ppo.opd_cross_gate import solve_role
+
+    n = 3
+    rng = np.random.default_rng(3)
+    K = rng.random(n) * 1e-6 + 1e-9
+    B = -(rng.random((n, n)) * 1e-9 + 1e-11)
+    D = -(rng.random((n, n)) * 1e-8 + 1e-10)
+    R = rng.random(n) * 1e-3 + 1e-6
+    valid = np.ones(n, dtype=bool)
+    kw = dict(eps=0.0, lam_max=0.2, delta=1e-30)
+    base = solve_role(K, B, D, R, valid, rho=1e4, **kw)
+    assert not np.isclose(base["lam"], 0.2).any(), "set up an interior solution"
+    for c in (10.0, 100.0):
+        got = solve_role(K * c * c, B, D * c, R, valid, rho=1e4, **kw)
+        assert np.allclose(base["lam"], got["lam"] * c, rtol=1e-6, atol=1e-18)
+    lams = [solve_role(K, B, D, R, valid, rho=r, **kw)["lam"] for r in (1e0, 1e4, 1e8)]
+    assert not np.allclose(lams[0], lams[1]) and not np.allclose(lams[1], lams[2]), (
+        "rho must move the solution; it is not a reparameterisation"
+    )
+
+
+def test_the_controller_really_solves_v2s_objective_end_to_end():
+    """The gate is only half of v2. This pins the OTHER half: that the
+    controller hands solve_role the S scale and rho_rel, not R and rho.
+
+    Reconstructed the way the review reconstructed it -- take the controller's
+    own EMAs, rebuild S = sum_{j!=i}(B + 2 A^-), re-run the solver on the CPU,
+    and require the recorded lambda to match. Three mutations survived without
+    this: dropping 2*A^- from S, ignoring rho_rel, and passing scale=None.
+    """
+    import numpy as np
+
+    from verl.trainer.ppo.opd_cross_gate import ROLE_NAMES, solve_role, _Ema
+
+    # lambda_max well above the solution: at 0.2 this fixture saturates and
+    # every scale/rho looks identical, which let two controller mutations
+    # survive (S without 2*A^-, and rho instead of rho_rel).
+    cfg_kw = dict(min_prompts=1, min_pg_prompts=0, min_tokens=1, lambda_max=1.0)
+    side = torch.tensor([0, 1, 0, 1, 0, 1])
+    pidx = torch.arange(6)
+    keys = [f"k{i}" for i in range(16)]
+
+    ctl2 = CrossGateController(_cfg(gate_version=2, rho_rel=1.0, **cfg_kw), V, TASKS)
+    ctl1 = CrossGateController(_cfg(gate_version=1, rho=1.0e4, **cfg_kw), V, TASKS)
+    for s in range(4):
+        _step(ctl2, TASKS, 10 + s, side, pidx, keys)
+        _step(ctl1, TASKS, 10 + s, side, pidx, keys)
+
+    nT = len(TASKS)
+    moved = False
+    for c, rn in ROLE_NAMES.items():
+        if not bool(ctl2.cfg.control_role_mask()[c]):
+            continue
+        K = np.array([
+            (ctl2.k_num.get((j, c), _Ema()).val / (ctl2.d_sq.get(j, _Ema()).val + ctl2.cfg.delta))
+            if ctl2.d_sq.get(j) is not None else 0.0 for j in TASKS], dtype=np.float64)
+        Bm = np.zeros((nT, nT)); Dm = np.zeros((nT, nT)); Am = np.zeros((nT, nT))
+        for ti, i in enumerate(TASKS):
+            for tj, j in enumerate(TASKS):
+                if i == j:
+                    continue
+                Bm[ti, tj] = ctl2.cross.get((i, j, c, "B"), _Ema()).val
+                Dm[ti, tj] = ctl2.cross.get((i, j, c, "D"), _Ema()).val
+                Am[ti, tj] = ctl2.cross.get((i, j, c, "Aneg"), _Ema()).val
+        Rv = np.array([float(np.mean([ctl2._ref(i, c, s).R for s in range(2)]))
+                       for i in TASKS], dtype=np.float64)
+        off = ~np.eye(nT, dtype=bool)
+        Sv = np.maximum(((Bm + 2.0 * Am) * off).sum(axis=1), 0.0)
+        valid = np.array([bool(ctl2.validity.get((i, c), (False, 0, 0))[0]) for i in TASKS])
+
+        want = solve_role(K, Bm, Dm, Rv, valid, eps=0.0, rho=1.0, scale=Sv,
+                          lam_max=ctl2.cfg.lambda_max, delta=ctl2.cfg.delta,
+                          iters=ctl2.cfg.solver_iters, tol=ctl2.cfg.solver_tol)
+        got = np.array([float(ctl2.lam.get((j, c), 0.0)) for j in TASKS])
+        # The basis the controller actually handed the solver. Asserted directly
+        # because lambda cannot separate it here: with rho_rel/S^2 ~ 1e8 against
+        # K ~ 1e-6, any net conflict drives lambda to the cap whatever the cap
+        # is, so an equality on lambda saturates and two mutations (S without
+        # 2*A^-, and rho instead of rho_rel) survived it.
+        used = ctl2.last_solver[c]
+        assert float(used["rho"]) == float(ctl2.cfg.rho_rel), (
+            f"role {rn}: solver got rho={used['rho']}, expected rho_rel="
+            f"{ctl2.cfg.rho_rel}"
+        )
+        assert np.allclose(used["scale"], Sv, rtol=1e-12, atol=0.0), (
+            f"role {rn}: solver got scale={used['scale']}, expected S={Sv}"
+        )
+        assert np.allclose(got, want["lam"], rtol=1e-9, atol=1e-18), (
+            f"role {rn}: controller lambda {got} != solve_role with S and rho_rel {want['lam']}"
+        )
+        # and the R-normalised objective is a DIFFERENT problem on the same data
+        alt = solve_role(K, Bm, Dm, Rv, valid, eps=0.0, rho=1.0e4, scale=None,
+                         lam_max=ctl2.cfg.lambda_max, delta=ctl2.cfg.delta,
+                         iters=ctl2.cfg.solver_iters, tol=ctl2.cfg.solver_tol)
+        if not np.allclose(alt["lam"], want["lam"], rtol=1e-6, atol=1e-18):
+            moved = True
+    assert moved, (
+        "on this data the two objectives agree everywhere, so the test cannot "
+        "tell them apart -- strengthen the fixture rather than trusting it"
+    )
+
+
+def _reference_solve(K, B, D, R, valid, *, eps, rho, scale, lam_max, delta):
+    """An INDEPENDENT minimiser of the same objective, for cross-checking.
+
+    Deliberately not solve_role's algorithm: plain projected gradient with a
+    tiny step and many iterations, written out here so a mutation inside
+    solve_role cannot hide by also changing the expected value. Slow and only
+    used on 3-variable fixtures.
+    """
+    import numpy as np
+
+    n = len(K)
+    off = ~np.eye(n, dtype=bool)
+    Bo, Do = B * off, D * off
+    sc = R if scale is None else scale
+
+    def s_of(l):
+        return np.maximum(-eps * R - Bo.sum(axis=1) + Do @ l, 0.0) * valid
+
+    def grad(l):
+        return 2.0 * K * l + Do.T @ (2.0 * rho * s_of(l) / (sc + delta) ** 2)
+
+    l = np.zeros(n)
+    lip = 2.0 * K.max() + 2.0 * rho * (np.abs(Do) ** 2).sum() / (sc.min() + delta) ** 2
+    step = 1.0 / max(lip, 1e-300)
+    for _ in range(400_000):
+        l = np.clip(l - step * grad(l), 0.0, lam_max)
+    return l
+
+
+def test_the_controller_matches_an_independent_minimiser_of_v2s_objective():
+    """Catches a mutation INSIDE solve_role, which the reconstruction test
+    cannot: that one calls solve_role for the expected value too, so a change
+    to the descent moves both sides equally. Run with lam_max well above the
+    solution so the cap does not mask the comparison -- at lam_max = 0.2 this
+    fixture saturates and every scale looks the same.
+    """
+    import numpy as np
+
+    from verl.trainer.ppo.opd_cross_gate import solve_role
+
+    n = 3
+    rng = np.random.default_rng(11)
+    K = rng.random(n) * 1e-3 + 1e-4          # a removal cost that actually bites
+    B = -(rng.random((n, n)) * 1e-4 + 1e-6)
+    D = -(rng.random((n, n)) * 1e-3 + 1e-5)
+    R = rng.random(n) * 1.0 + 0.5            # RL energy: O(1)
+    S = np.abs(B).sum(axis=1) * 3.0          # cross magnitude: O(1e-4)
+    valid = np.ones(n, dtype=bool)
+    kw = dict(eps=0.0, lam_max=1.0, delta=1e-30)
+
+    for tag, scale, rho in (("S, rho_rel=1", S, 1.0), ("R, rho=1e4", None, 1.0e4)):
+        got = solve_role(K, B, D, R, valid, rho=rho, scale=scale, **kw)["lam"]
+        want = _reference_solve(K, B, D, R, valid, rho=rho, scale=scale, **kw)
+        assert not np.isclose(got, kw["lam_max"]).any(), f"{tag}: fixture saturated"
+        # Compared on the OBJECTIVE, not on lambda. At v2's conditioning
+        # (rho_rel/S^2 ~ 1e8) the surface is flat enough that two minimisers
+        # land ~1e-3 apart in lambda while agreeing to ~1e-5 in f, so a lambda
+        # tolerance would be testing the solver's path rather than its answer.
+        # The measured gaps are 2e-16 at v1's conditioning and 8e-6 at v2's.
+        off = ~np.eye(n, dtype=bool)
+        Bo, Do = B * off, D * off
+        sc = R if scale is None else scale
+
+        def obj(l):
+            sl = np.maximum(-Bo.sum(axis=1) + Do @ l, 0.0) * valid
+            return float((K * l * l).sum() + rho * ((sl / (sc + kw["delta"])) ** 2).sum())
+
+        f_got, f_want = obj(got), obj(want)
+        assert f_got <= f_want * (1.0 + 1e-4) + 1e-300, (
+            f"{tag}: solve_role's objective {f_got:.6e} is worse than the "
+            f"independent minimiser's {f_want:.6e} by more than 1e-4 relative"
+        )
+    # and the two bases really are different problems on this fixture
+    a = solve_role(K, B, D, R, valid, rho=1.0, scale=S, **kw)["lam"]
+    b = solve_role(K, B, D, R, valid, rho=1.0, scale=None, **kw)["lam"]
+    assert not np.allclose(a, b, rtol=1e-3), "S and R must not coincide here"

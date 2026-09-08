@@ -132,6 +132,11 @@ INVALID_NAMES = {
 @dataclass
 class CrossGateConfig:
     enable: bool = False
+    # 1 = the gate as first run: q scaled by sqrt(kappa) through the sqrt(R)
+    # denominator, penalty (s/R)^2. 2 = MOPD v2: q = gamma * [negative cosine],
+    # penalty (s/S)^2 against the OBSERVED cross magnitude. Selectable so the
+    # v1 run stays reproducible from this file; the arms differ in their locks.
+    gate_version: int = 1
     # Tolerated NEGATIVE net cross contribution, as a fraction of the receiver's
     # R_{i,c}. 0 makes any net negative contribution the object of control.
     eps_cross: float = 0.0
@@ -139,6 +144,11 @@ class CrossGateConfig:
     # scale gap: at eps_cross = 0 the slack is linear in beta while the removal
     # cost is beta-free (design doc §8.2). Not a balance claim.
     rho: float = 1.0e4
+    # v2's penalty weight, against s/S instead of s/R. 1.0 because S already IS
+    # the scale of the quantity being constrained, so the two terms of the
+    # objective are comparable without a conversion factor -- unlike rho above,
+    # which exists to bridge beta's scale gap between s/R and K.
+    rho_rel: float = 1.0
     # Cap on the per-token attenuation. An experimental condition the constraint
     # is not allowed to override.
     lambda_max: float = 0.2
@@ -175,8 +185,8 @@ class CrossGateConfig:
                 kw[k] = bool(v)
             elif k == "roles":
                 kw[k] = tuple(str(x) for x in (list(v) if not isinstance(v, str) else v.split(",")))
-            elif k in ("window_steps", "min_prompts", "min_pg_prompts", "min_tokens",
-                       "max_staleness", "split_seed", "solver_iters"):
+            elif k in ("gate_version", "window_steps", "min_prompts", "min_pg_prompts",
+                       "min_tokens", "max_staleness", "split_seed", "solver_iters"):
                 kw[k] = int(v)
             else:
                 kw[k] = float(v)
@@ -187,6 +197,10 @@ class CrossGateConfig:
             raise ValueError(f"cross_gate.eps_cross must be >= 0, got {self.eps_cross}")
         if self.rho < 0.0:
             raise ValueError(f"cross_gate.rho must be >= 0, got {self.rho}")
+        if int(self.gate_version) not in (1, 2):
+            raise ValueError(f"cross_gate.gate_version must be 1 or 2, got {self.gate_version}")
+        if self.rho_rel < 0.0:
+            raise ValueError(f"cross_gate.rho_rel must be >= 0, got {self.rho_rel}")
         if not (0.0 <= self.lambda_max <= 1.0):
             raise ValueError(f"cross_gate.lambda_max must be in [0, 1], got {self.lambda_max}")
         if not (0.0 <= self.ema_decay < 1.0):
@@ -332,6 +346,19 @@ class CrossGateRefs:
     valid: torch.Tensor      # (nT, nR) bool -- both sides usable this step
     lam: torch.Tensor        # (nT, nR) float32 -- lambda applied this step (0 off control roles)
     control_roles: torch.Tensor  # (nR,) bool
+    # v2 only, and defaulted so a v1 construction stays valid: the reference
+    # norms it divides by, and the two halves' agreement it scales by. When
+    # absent they are derived from v (norms) and left at 0 (gamma), which makes
+    # a v2 gate inert rather than wrong if someone builds refs by hand.
+    v_norm: torch.Tensor | None = None
+    gamma: torch.Tensor | None = None
+
+    def __post_init__(self):
+        if self.v_norm is None:
+            self.v_norm = self.v.double().norm(dim=-1).to(self.R.dtype)
+        if self.gamma is None:
+            self.gamma = torch.zeros(self.v.shape[0], self.v.shape[1],
+                                     dtype=self.R.dtype, device=self.R.device)
 
 
 def cross_gate_forward(
@@ -347,6 +374,7 @@ def cross_gate_forward(
     roles: torch.Tensor,
     refs: CrossGateRefs,
     delta: float,
+    gate_version: int = 1,
 ) -> dict:
     """Per-token gate and everything the step's statistics need, detached.
 
@@ -408,18 +436,21 @@ def cross_gate_forward(
         ids = topk_ids.to(torch.long).clamp(min=0, max=V - 1)                     # (bs, T, k)
         vflat = refs.v.reshape(-1)
         Rr = refs.R                                                                # (nT, nR, 2)
+        VNr = refs.v_norm                                                          # (nT, nR, 2)
         sw = refs.side_w                                                           # (nT, nR, 2)
 
         x_side = torch.zeros(bs, T, nT, nS, device=dev, dtype=dt)
         nonzero_share = torch.zeros(bs, T, nT, device=dev, dtype=dt)
         energy_shared = torch.zeros(bs, T, nT, device=dev, dtype=dt)
         R_tok = torch.zeros(bs, T, nT, nS, device=dev, dtype=dt)
+        v_norm_tok = torch.zeros(bs, T, nT, nS, device=dev, dtype=dt)
         for i in range(nT):
             for s in range(nS):
                 base = ((i * nR + rol) * nS + s) * V                                # (bs, T)
                 vg = vflat[base.unsqueeze(-1) + ids]                                # (bs, T, k)
                 x_side[:, :, i, s] = (vg * d).sum(dim=-1)
                 R_tok[:, :, i, s] = Rr[i][rol, s]
+                v_norm_tok[:, :, i, s] = VNr[i][rol, s]
                 nz = (vg != 0).to(dt)
                 # pooled support overlap / energy, weighted by the side weights
                 wgt = sw[i][rol, s].unsqueeze(-1)                                  # (bs, T, 1)
@@ -436,12 +467,29 @@ def cross_gate_forward(
         # --- the soft gate --------------------------------------------------
         # q per side, then the weaker: zero unless BOTH sides oppose.
         neg = (-x_side).clamp(min=0.0)                                             # (bs, T, nT, nS)
-        denom = R_tok.clamp(min=0.0).sqrt() * d_norm.unsqueeze(-1).unsqueeze(-1) + float(delta)
+        if int(gate_version) >= 2:
+            # v2. The denominator is the reference's own norm, so q is a NEGATIVE
+            # COSINE: bounded by 1 through Cauchy-Schwarz whatever the support's
+            # diversity. v1 divided by sqrt(R) instead, which bounds q by
+            # sqrt(kappa) = ||v||/sqrt(R) and so shrank the gate for a reference
+            # merely spread over many vocabulary items -- diversity, not
+            # unreliability. Reliability is carried separately, by gamma.
+            scale_tok = v_norm_tok
+        else:
+            scale_tok = R_tok.clamp(min=0.0).sqrt()
+        denom = scale_tok * d_norm.unsqueeze(-1).unsqueeze(-1) + float(delta)
         q_side = neg / denom
         q = q_side.min(dim=-1).values                                              # (bs, T, nT)
-        # Zero out where the side's R is 0 (no reference energy): the formula
-        # would divide by delta and manufacture a gate out of nothing.
-        q = torch.where((R_tok > 0).all(dim=-1), q, torch.zeros_like(q))
+        # Zero out where the side has no reference to speak of: the formula would
+        # divide by delta and manufacture a gate out of nothing. Branched on the
+        # same quantity the denominator uses.
+        q = torch.where((scale_tok > 0).all(dim=-1), q, torch.zeros_like(q))
+        if int(gate_version) >= 2:
+            # gamma_{i,c}: the two prompt-disjoint halves' agreement. Opposed
+            # halves give 0 and the receiver is inert; agreeing halves that both
+            # oppose the sender's OPD are what the gate acts on.
+            gam = torch.stack([refs.gamma.to(dev)[i][rol] for i in range(nT)], dim=-1)
+            q = q * gam.clamp(min=0.0, max=1.0)
         # THE LOAD-BEARING GUARD. w = 1 - lambda*h only attenuates while
         # h in [0, 1], and h inherits that from q: the [.]_+ above is exactly
         # redundant with this line's lower clamp (min_k [a_k]_+ == [min_k a_k]_+
@@ -673,12 +721,20 @@ def solve_role(
     *,
     eps: float,
     rho: float,
+    scale: np.ndarray | None = None,
     lam_max: float,
     delta: float,
     iters: int = 500,
     tol: float = 1e-12,
 ) -> dict:
-    """min sum_j K_j l_j^2 + rho sum_{i valid} (s_i(l)/(R_i+delta))^2, 0 <= l <= lam_max.
+    """min sum_j K_j l_j^2 + rho sum_{i valid} (s_i(l)/(scale_i+delta))^2, 0 <= l <= lam_max.
+
+    ``scale`` defaults to ``R`` (v1: the receiver's own reward energy, so the
+    rule reads "leave a cross effect alone while it is small against RL"). v2
+    passes S = sum_{j!=i} E_{j,c}|v_i . d| -- the OBSERVED cross magnitude -- so
+    the rule reads "control by what share of the cross effect is net conflict".
+    That is a change of control basis, not a unit fix: a cross effect that is
+    absolutely tiny but relatively adverse becomes an object of control.
 
     ``K`` (n,), ``B``/``D`` (n_i, n_j) with the sender on the second axis,
     ``R`` (n,), ``valid_recv`` (n,) bool. Diagonal entries of B and D are
@@ -703,6 +759,9 @@ def solve_role(
     B = np.asarray(B, dtype=np.float64).reshape(n, n)
     D = np.asarray(D, dtype=np.float64).reshape(n, n)
     R = np.asarray(R, dtype=np.float64).reshape(n)
+    # eps * R stays on the slack (the tolerance is a fraction of R by
+    # definition); only the PENALTY's denominator moves to `scale`.
+    sc = R if scale is None else np.asarray(scale, dtype=np.float64).reshape(n)
     valid = np.asarray(valid_recv, dtype=bool).reshape(n)
     off = ~np.eye(n, dtype=bool)
     Bo, Do = B * off, D * off
@@ -713,23 +772,27 @@ def solve_role(
 
     def f(l):
         s = slack(l)
-        return float((K * l * l).sum() + rho * ((s / (R + delta)) ** 2).sum())
+        return float((K * l * l).sum() + rho * ((s / (sc + delta)) ** 2).sum())
 
     def grad(l):
         s = slack(l)
         g = 2.0 * K * l
-        coef = 2.0 * rho * s / (R + delta) ** 2          # (n_i,)
+        coef = 2.0 * rho * s / (sc + delta) ** 2          # (n_i,)
         return g + Do.T @ coef
 
     finite_in = np.isfinite(K).all() and np.isfinite(Bo).all() and np.isfinite(Do).all() and np.isfinite(R).all()
     if not finite_in:
         return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": False,
-                "reason": "nonfinite_input", "f": float("nan")}
+                "reason": "nonfinite_input", "f": float("nan"), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
     if not valid.any() or lam_max <= 0.0:
         return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": True,
-                "reason": "no_valid_receiver" if not valid.any() else "lambda_max_zero", "f": f(lam0)}
+                "reason": "no_valid_receiver" if not valid.any() else "lambda_max_zero", "f": f(lam0), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
 
-    wgt_all = rho / (R + delta) ** 2 * valid          # per receiver
+    # THE penalty weight the coordinate descent actually uses. `sc`, not R:
+    # f() and grad() above are for reporting and convergence, so patching only
+    # those left the v2 objective unsolved -- three mutations survived saying
+    # exactly that before this line was changed.
+    wgt_all = rho / (sc + delta) ** 2 * valid          # per receiver
     lam = lam0.copy()
     fx = f(lam)
     converged = False
@@ -774,9 +837,56 @@ def solve_role(
             break
     if not np.isfinite(lam).all() or not np.isfinite(fx):
         return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": False,
-                "reason": "nonfinite_iterate", "f": float("nan")}
+                "reason": "nonfinite_iterate", "f": float("nan"), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
+
+    # A PROJECTED-GRADIENT POLISH, and the better of the two points is kept.
+    #
+    # Cyclic coordinate descent can stop where no SINGLE coordinate move
+    # improves while a joint move still does: the objective is non-smooth
+    # (each s_i is a positive part) and the coordinates are coupled through
+    # D, so a coordinate-wise optimum need not be a stationary point of the
+    # joint problem. v1 never showed this because rho/R^2 is about 1e4; v2's
+    # rho_rel/S^2 is about 1e8, and at that conditioning the descent stalled
+    # 0.5% above the optimum on a 3-task fixture (found by cross-checking
+    # against an independent minimiser in the tests, not by inspection).
+    #
+    # Cheap: at most n_task variables, float64, a fixed iteration count, no
+    # branching on data, so it stays deterministic on every rank. It can only
+    # improve the answer -- the polished point is accepted solely when its
+    # objective is lower.
+    if valid.any() and lam_max > 0.0:
+        lip = 2.0 * float(np.max(K)) + 2.0 * rho * float((Do * Do).sum()) / (float(np.min(sc)) + delta) ** 2
+        if np.isfinite(lip) and lip > 0.0:
+            step = 1.0 / lip
+            pol = lam.copy()
+            f_prev = fx
+            # Stops on RELATIVE objective improvement, not on a step-size
+            # threshold: at rho/S^2 ~ 1e8 the iterates move by ~1e-6 per step
+            # for thousands of steps while the objective is still falling, so a
+            # displacement test either exits far too early or never. The cap is
+            # generous because the problem has at most n_task variables; a
+            # well-conditioned role exits in a few hundred iterations.
+            for it in range(200 * max(iters, 1)):
+                g = grad(pol)
+                if not np.isfinite(g).all():
+                    break
+                nxt = np.clip(pol - step * g, 0.0, lam_max)
+                if not np.isfinite(nxt).all():
+                    break
+                pol = nxt
+                if (it & 0x3FF) == 0x3FF:            # every 1024 iterations
+                    f_now = f(pol)
+                    if not np.isfinite(f_now):
+                        break
+                    if f_prev - f_now <= 1e-9 * max(abs(f_prev), 1e-300):
+                        break
+                    f_prev = f_now
+            fp = f(pol)
+            if np.isfinite(fp) and fp < fx - 1e-18:
+                lam, fx, converged = pol, fp, True
+
     return {"lam": lam, "s": slack(lam), "s0": slack(lam0), "converged": converged,
-            "reason": "ok" if converged else "max_iters", "f": fx}
+            "reason": "ok" if converged else "max_iters", "f": fx, "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
 
 
 # --------------------------------------------------------------------------- #
@@ -808,6 +918,7 @@ class CrossGateController:
         self.cfg = cfg
         self.V = int(vocab_size)
         self.step = 0
+        self.gamma: dict = {}
         # keyed by (task, role, side) -> _RefSide
         self.refs: dict = {}
         # (i, j, role) -> {"B","D","Aneg"} EMAs
@@ -855,6 +966,8 @@ class CrossGateController:
         nT, nR, nS = len(names), N_ROLES, N_SIDES
         v = torch.zeros(nT, nR, nS, self.V, dtype=dtype)
         R = torch.zeros(nT, nR, nS, dtype=dtype)
+        v_norm = torch.zeros(nT, nR, nS, dtype=dtype)
+        gamma = torch.zeros(nT, nR, dtype=dtype)
         side_w = torch.zeros(nT, nR, nS, dtype=dtype)
         valid = torch.zeros(nT, nR, dtype=torch.bool)
         lam = torch.zeros(nT, nR, dtype=dtype)
@@ -866,15 +979,36 @@ class CrossGateController:
                     if st is not None and st.v is not None and st.n_obs > 0:
                         v[ti, c, s] = st.v.to(dtype)
                         R[ti, c, s] = float(st.R)
+                        v_norm[ti, c, s] = float(st.v.double().norm())
                         seen.append(s)
                 for s in seen:
                     side_w[ti, c, s] = 1.0 / len(seen)
                 valid[ti, c] = bool(self.validity.get((n, c), (False, INVALID_NEVER_SEEN, 0))[0])
                 lam[ti, c] = float(self.lam.get((n, c), 0.0))
+                # gamma: how far the two prompt-disjoint halves agree on a
+                # direction. [.]_+ so opposed halves are inert rather than
+                # sign-flipped. A HEURISTIC reliability weight, NOT a
+                # significance test: no null is subtracted, because
+                # cos(v1, v2) ~ N(0, 1/n_eff) has no basis for correlated,
+                # frequency-skewed, sparse vocabulary gradients -- and n_eff
+                # here is a participation ratio (||v||_1^2 / ||v||_2^2), which
+                # measures how spread the vocabulary components are, not a count
+                # of independent directions or of samples. A bias common to both
+                # halves also raises gamma. This removes the v1 gate's DIRECT
+                # penalty on support diversity; it does not solve reliability.
+                if len(seen) == nS:
+                    a = self.refs[(n, c, 0)].v.double()
+                    b = self.refs[(n, c, 1)].v.double()
+                    na, nb = float(a.norm()), float(b.norm())
+                    if na > 0.0 and nb > 0.0:
+                        cs = float((a @ b).item() / (na * nb))
+                        gamma[ti, c] = max(0.0, cs) if math.isfinite(cs) else 0.0
+                self.gamma[(n, c)] = float(gamma[ti, c])
         ctrl = self.cfg.control_role_mask()
         lam = lam * ctrl.to(dtype).unsqueeze(0)
         return CrossGateRefs(
-            v=v.to(device), R=R.to(device), side_w=side_w.to(device),
+            v=v.to(device), R=R.to(device), v_norm=v_norm.to(device),
+            gamma=gamma.to(device), side_w=side_w.to(device),
             valid=valid.to(device), lam=lam.to(device), control_roles=ctrl.to(device),
         )
 
@@ -983,21 +1117,46 @@ class CrossGateController:
                 (self.k_num.get((j, c), _Ema()).val / (self.d_sq.get(j, _Ema()).val + cfg.delta))
                 if self.d_sq.get(j) is not None else 0.0
                 for j in names], dtype=np.float64)
-            Bm = np.zeros((nT, nT)); Dm = np.zeros((nT, nT))
+            Bm = np.zeros((nT, nT)); Dm = np.zeros((nT, nT)); Am = np.zeros((nT, nT))
             for ti, i in enumerate(names):
                 for tj, j in enumerate(names):
                     if i == j:
                         continue
                     Bm[ti, tj] = self.cross.get((i, j, c, "B"), _Ema()).val
                     Dm[ti, tj] = self.cross.get((i, j, c, "D"), _Ema()).val
+                    Am[ti, tj] = self.cross.get((i, j, c, "Aneg"), _Ema()).val
             Rv = np.array([
                 float(np.mean([self._ref(i, c, s).R for s in range(nS)]))
                 for i in names], dtype=np.float64)
+            # v2's penalty scale: the OBSERVED cross magnitude per receiver.
+            #   E|x| = E[x] + 2 E[[-x]_+]  =  B + 2 A^-      (|x| = x + 2[-x]_+)
+            # so S_i = sum_{j != i} (B_ij + 2 A^-_ij) needs no new statistic.
+            # A^- only sets the SCALE here; what decides firing is still the
+            # signed sum B, so this is not a return to "any negative part
+            # attenuates". Clamped at 0 because a float sum of a non-negative
+            # quantity can go slightly negative.
+            off = ~np.eye(nT, dtype=bool)
+            Sv = np.maximum(((Bm + 2.0 * Am) * off).sum(axis=1), 0.0)
             valid = np.array([bool(self.validity.get((i, c), (False, 0, 0))[0]) for i in names])
-            sol = solve_role(K, Bm, Dm, Rv, valid, eps=cfg.eps_cross, rho=cfg.rho,
+            _v2 = int(cfg.gate_version) >= 2
+            sol = solve_role(K, Bm, Dm, Rv, valid, eps=cfg.eps_cross,
+                             rho=(cfg.rho_rel if _v2 else cfg.rho),
+                             scale=(Sv if _v2 else None),
                              lam_max=cfg.lambda_max, delta=cfg.delta,
                              iters=cfg.solver_iters, tol=cfg.solver_tol)
             self.last_solver[c] = sol
+            # Both scales, always: s/S is what v2 controls on, s/R is the v1
+            # basis kept so the two arms are readable against each other. Also
+            # gamma and S themselves, since they are what v2 added.
+            for ti, i in enumerate(names):
+                rn = ROLE_NAMES[c]
+                _s, _s0 = float(sol["s"][ti]), float(sol["s0"][ti])
+                metrics[f"actor/cross/S/{i}/{rn}"] = float(Sv[ti])
+                metrics[f"actor/cross/gamma/{i}/{rn}"] = float(self.gamma.get((i, c), 0.0))
+                metrics[f"actor/cross/slack_over_S/{i}/{rn}"] = _s / (float(Sv[ti]) + cfg.delta)
+                metrics[f"actor/cross/slack_over_R/{i}/{rn}"] = _s / (float(Rv[ti]) + cfg.delta)
+                metrics[f"actor/cross/slack0_over_S/{i}/{rn}"] = _s0 / (float(Sv[ti]) + cfg.delta)
+                metrics[f"actor/cross/slack0_over_R/{i}/{rn}"] = _s0 / (float(Rv[ti]) + cfg.delta)
             for tj, j in enumerate(names):
                 new_lam[(j, c)] = float(sol["lam"][tj]) if sol["reason"] in ("ok", "max_iters", "no_valid_receiver", "lambda_max_zero") else 0.0
                 if sol["reason"] not in ("ok", "no_valid_receiver", "lambda_max_zero"):
