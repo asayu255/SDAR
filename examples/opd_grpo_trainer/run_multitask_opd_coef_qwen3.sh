@@ -123,7 +123,17 @@ set -x
 # speed knob does.
 # ---------------------------------------------------------------------------
 
-ARM=${ARM:-redistribute}
+# ARM IS REQUIRED. There is deliberately no default: four arms exist, three of
+# them are still to be launched, and whichever one were the default would make a
+# forgotten ARM= silently run the wrong experiment -- with the matching intent
+# lock selected too, so nothing downstream would object. The old default was
+# redistribute, which is retired, so a forgotten ARM= would have run a dead arm
+# for 300 steps.
+if [ -z "${ARM:-}" ]; then
+    echo "ARM is required. Set one of: control | uniform | redistribute | pushback" >&2
+    echo "  e.g.  ARM=pushback bash $0" >&2
+    exit 1
+fi
 case "$ARM" in
     control)
         # EXPLICITLY null, not absent. The injection turns this into
