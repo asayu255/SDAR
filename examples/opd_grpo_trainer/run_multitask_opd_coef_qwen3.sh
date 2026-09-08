@@ -413,6 +413,16 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
     )
     echo "[val-only] scoring $VAL_CKPT -- no training, no checkpoint written"
 fi
+# The retriever does NOT run on this host. It lives on 100.86.45.30 (wakaba),
+# where its 61 GB e5_Flat index sits on that machine's two A6000s -- faiss_gpu
+# shards it at float16, so it needs ~15 GB per card there and would otherwise
+# have to fight vLLM for memory here. tamago reaches it directly over the
+# tailnet (POST /retrieve answers in ~3 ms), so no tunnel is involved.
+# 0.0.0.0 was the old literal and it is a trap: as a client address it means
+# localhost, so a run launched without an override retries a dead local port
+# for as long as env.search.max_retries=null allows, which is forever. Set
+# SEARCH_URL to point somewhere else.
+
 
 python3 -m verl.trainer.main_opd_grpo \
     "+trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_opd_coef_${ARM}_config.yaml" \
@@ -522,7 +532,7 @@ python3 -m verl.trainer.main_opd_grpo \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
-    env.search.search_url='http://0.0.0.0:8000/retrieve' \
+    env.search.search_url="${SEARCH_URL:-http://100.86.45.30:8000/retrieve}" \
     env.search.timeout=600 \
     env.search.max_retries=null \
     env.multitask.tasks=[alfworld,search,webshop] \
