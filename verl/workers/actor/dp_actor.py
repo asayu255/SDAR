@@ -126,6 +126,9 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
 )
 from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
 from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, conflict_gate
+
+# Columns of the per-task group bitmap (see OpdTaskDiagStats).
+PUSHBACK_MAX_GROUPS = 4096
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import actor_capture, gpu_profiler
@@ -1675,10 +1678,11 @@ class DataParallelPPOActor(BasePPOActor):
                 ctl.load_state_dict(pending)
                 self._pushback_pending_state = None
             self._pushback = ctl
-        elif ctl.task_names != names:
-            raise AssertionError(
-                f"task_id_names changed under the pushback controller: {ctl.task_names} -> {names}"
-            )
+        # No assertion on the name list. The driver builds task_id_names from
+        # the tasks PRESENT in the batch, so it legitimately shortens when a
+        # task has no rows -- which is the STATE_ABSENT the controller exists to
+        # handle. State is keyed by name, so an absent task keeps its retention
+        # and a new one enters at 1.
         return ctl
 
     def actor_extra_state_dict(self) -> dict:
@@ -2324,6 +2328,12 @@ class DataParallelPPOActor(BasePPOActor):
         # student's forward -- so the micro-batch loop below does a lookup and
         # nothing else. Padding rows carry a negative id and are exempt, so a
         # padded micro-batch cannot introduce an id this did not see.
+        # The dense prompt-group id the driver attached, for the pushback
+        # controller's group coverage. Selected only when the controller is on.
+        if (self.config.get("teacher_kl_pushback", None)
+                and bool(dict(self.config.get("teacher_kl_pushback")).get("enable", False))
+                and "pushback_group_idx" in data.batch.keys()):
+            select_keys.append("pushback_group_idx")
         self.validate_teacher_kl_task_ids(
             data.batch.get("task_ids", None) if "task_ids" in data.batch.keys() else None,
             task_id_names,
@@ -2502,8 +2512,12 @@ class DataParallelPPOActor(BasePPOActor):
         # so a rank that skipped it because its micro-batches held no teacher-KL
         # would hang the rest. Off by default -- unset it and update_policy
         # allocates nothing and computes nothing.
+        # PUSHBACK_MAX_GROUPS columns of bitmap: a (n_task, 4096) float64
+        # buffer is 98 KB and bounds the union exactly for any batch this recipe
+        # produces (45 prompts). Groups beyond it are dropped rather than
+        # aliased -- the bounds check in update() sees to that.
         opd_diag_stats = (
-            OpdTaskDiagStats(n_tasks=n_task, device=sign_dev)
+            OpdTaskDiagStats(n_tasks=n_task, device=sign_dev, n_groups=PUSHBACK_MAX_GROUPS)
             if (bool(self.config.get("teacher_kl_task_diag", False)) and use_teacher_kl_loss and n_task)
             else None
         )
@@ -2518,7 +2532,12 @@ class DataParallelPPOActor(BasePPOActor):
                 "inputs off the readout's all-reduced table."
             )
         # a_i for THIS step, fixed for every micro-batch of it. Read once.
-        _pb_a = pushback.a_tensor(device=sign_dev) if pushback is not None else None
+        # a for THIS batch's id order -- the gate indexes it with this batch's
+        # task ids, and the driver's id numbering is per batch.
+        _pb_a = (
+            pushback.a_tensor(list(task_id_names or []), device=sign_dev)
+            if pushback is not None else None
+        )
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
         # The parameter-free arm's three accumulators, built on the config alone
@@ -4707,6 +4726,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 row_basis=_pend["row_basis"],
                                 row_coef=_pend["row_coef"],
                                 gate_w=_pend["gate_w"],
+                                group_idx=data.get("pushback_group_idx", None),
                             )
 
                     if task_ids is not None:
@@ -5383,15 +5403,24 @@ class DataParallelPPOActor(BasePPOActor):
                 # controller holds a = 1 rather than acting on nothing.
                 for _tid, _nm in enumerate(_names):
                     metrics[f"actor/pushback/a_applied/{_nm}"] = float(_pb_a[_tid])
-                _lg = dict(data.meta_info.get("pushback_live_groups", {}) or {})
+                # Group coverage from the reduced bitmap. NOT from `data`:
+                # inside this function that name has been rebound to a
+                # micro-batch dict, a TensorDict and a metrics dict, none of
+                # which has meta_info -- reading it here raised AttributeError
+                # at the end of the very first update.
+                _lg = opd_diag_stats.reduced_groups(_names)
                 col = OpdTaskDiagStats.column
                 metrics.update(pushback.update(
                     R={n: col(_table, "ctl_rr_sum", t) for t, n in enumerate(_names)},
                     C_neg={n: col(_table, "ctl_cneg_sum", t) for t, n in enumerate(_names)},
-                    ctl_tokens={n: col(_table, "ctl_n", t) for t, n in enumerate(_names)},
+                    # Tokens the loss actually weights: a duplicated row carries
+                    # weight 0 and is not evidence.
+                    ctl_tokens={n: col(_table, "ctl_n_w", t) for t, n in enumerate(_names)},
                     live_groups={n: int(_lg.get(n, 0)) for n in _names},
                     present={n: col(_table, "n_tok", t) > 0 for t, n in enumerate(_names)},
                 ))
+                for _tid, _nm in enumerate(_names):
+                    metrics[f"actor/pushback/live_groups/{_nm}"] = float(_lg.get(_nm, 0))
             _by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
             if _by_task:
                 _coef = self.config.get("teacher_kl_loss_coef", 1.0)

@@ -1482,19 +1482,17 @@ class OPDRayTrainer(RayPPOTrainer):
                     # its off-task planes under these ids, and rebuilding the
                     # numbering separately would drift from this one.
                     self._attach_task_ids(batch)
-                    # Group coverage for the online pushback controller, from the
-                    # one place that has both the group ids and the whole batch.
-                    # Cheap, always computed: absent, the controller holds a = 1.
-                    if "uid" in batch.non_tensor_batch and "advantages" in batch.batch:
-                        from verl.trainer.ppo.metric_utils import get_task_names
-                        from verl.trainer.ppo.opd_pushback import live_groups_by_task
+                    # A dense per-row prompt-group id for the online pushback
+                    # controller. Only the driver has the uids; the actor turns
+                    # these into a per-task bitmap over groups that actually
+                    # reached R, which is both the right filter and the only way
+                    # to union group sets across ranks.
+                    if "uid" in batch.non_tensor_batch:
+                        from verl.trainer.ppo.opd_pushback import group_index_column
 
-                        _tn = get_task_names(batch)
-                        if _tn is not None:
-                            batch.meta_info["pushback_live_groups"] = live_groups_by_task(
-                                batch.non_tensor_batch["uid"], _tn,
-                                batch.batch["advantages"], batch.batch["response_mask"],
-                            )
+                        batch.batch["pushback_group_idx"] = group_index_column(
+                            batch.non_tensor_batch["uid"], len(batch)
+                        )
                     # The notice's own readouts (leak floor, truncation floor).
                     metrics.update(self._notice_metrics(batch))
 

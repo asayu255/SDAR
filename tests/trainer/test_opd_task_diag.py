@@ -295,6 +295,7 @@ def _stats_with(rows, names=("alfworld", "search", "webshop"), terms=None):
             "ctl_rd": torch.zeros(n, t),
             "ctl_dd": torch.ones(n, t),
             "ctl_c_neg": torch.zeros(n, t),
+            "ctl_conflict": torch.zeros(n, t),
         }
     st = OpdTaskDiagStats(n_tasks=len(names), device=torch.device("cpu"))
     st.update(task_ids=task_ids, response_mask=mask, teacher_kl=kl, advantages=adv,
@@ -423,7 +424,7 @@ def test_the_readout_is_off_by_default_and_gated_on_the_config_alone():
     src = ast.unparse(fn)
     assert "self.config.get('teacher_kl_task_diag', False)" in src
     # config-only, because rows() runs a collective
-    assert "opd_diag_stats = OpdTaskDiagStats(n_tasks=n_task, device=sign_dev) if" in src
+    assert "opd_diag_stats = OpdTaskDiagStats(n_tasks=n_task, device=sign_dev, n_groups=PUSHBACK_MAX_GROUPS) if" in src
     assert "data.batch" not in src.split("opd_diag_stats = ")[1].split("else None")[0]
     # and it is read once, after the backward, not inside the loss
     assert src.index("opd_diag_stats.update(") > src.index("loss.backward()")
@@ -710,6 +711,7 @@ def test_the_aggregate_is_not_the_mean_of_per_token_cosines():
         "pg_live": torch.zeros(n, t), "tail_mass": torch.zeros(n, t),
         "ctl_mask": torch.ones(n, t), "ctl_rr": rr, "ctl_rd": rd, "ctl_dd": dd,
         "ctl_c_neg": torch.clamp(-rd, min=0.0),
+        "ctl_conflict": (rd < 0).to(rd.dtype),
     }
     st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
@@ -723,7 +725,8 @@ def test_the_aggregate_is_not_the_mean_of_per_token_cosines():
     )
     # and a zero-norm token needs no special case: it adds 0 to all three
     terms2 = dict(terms, ctl_rr=torch.zeros(n, t), ctl_rd=torch.zeros(n, t),
-                  ctl_dd=torch.zeros(n, t), ctl_c_neg=torch.zeros(n, t))
+                  ctl_dd=torch.zeros(n, t), ctl_c_neg=torch.zeros(n, t),
+                  ctl_conflict=torch.zeros(n, t))
     st2 = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st2.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
                teacher_kl=torch.ones(n, t), advantages=torch.ones(n, t),
@@ -743,6 +746,7 @@ def test_the_pushback_fraction_is_what_a_limit_would_threshold():
         "ctl_mask": torch.ones(n, t), "ctl_rr": torch.tensor([[4.0]]),
         "ctl_rd": torch.tensor([[-1.0]]), "ctl_dd": torch.tensor([[1.0]]),
         "ctl_c_neg": torch.tensor([[1.0]]),
+        "ctl_conflict": torch.ones(n, t),
     }
     st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
@@ -760,7 +764,8 @@ def test_the_dropped_probability_mass_is_reported():
     logits, t_lp, ids, sampled = _case(vocab=200, k=20, seed=7, peaked=False)
     terms = _ctl_terms(logits, t_lp, ids, sampled, adv=1.0, old_lp=-2.0)
     lp = torch.log_softmax(logits, dim=-1)
-    off = torch.ones(200, dtype=torch.bool); off[ids] = False
+    off = torch.ones(200, dtype=torch.bool)
+    off[ids] = False
     assert float(terms["tail_mass"].reshape(())) == pytest.approx(
         float(lp.exp()[off].sum()), abs=1e-9)
     assert float(terms["tail_mass"].reshape(())) > 0.5, "flat policy, most mass off-support"

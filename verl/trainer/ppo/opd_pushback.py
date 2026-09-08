@@ -76,7 +76,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
-__all__ = ["PushbackConfig", "PushbackController", "pushback_retention", "conflict_gate", "live_groups_by_task"]
+__all__ = ["PushbackConfig", "PushbackController", "pushback_retention", "conflict_gate", "group_index_column"]
 
 # The four signal states. Kept apart because they call for different handling
 # and because collapsing them was the reviewer's specific objection to "R below
@@ -191,17 +191,40 @@ class PushbackController:
     and needs no collective of its own.
     """
 
-    def __init__(self, cfg: PushbackConfig, task_names):
+    def __init__(self, cfg: PushbackConfig, task_names=()):
         cfg.validate()
         self.cfg = cfg
-        self.task_names = list(task_names)
-        self.tasks = {n: _TaskState() for n in self.task_names}
+        # STATE IS KEYED BY TASK NAME, never by the batch's id order. The driver
+        # builds task_id_names from the tasks PRESENT in that batch
+        # (ray_trainer._attach_task_ids), so a batch with no search rows
+        # shortens the list and renumbers the rest. Holding state by position
+        # would then apply webshop's retention to search; asserting on the list
+        # would turn an absent task into a crash instead of the STATE_ABSENT it
+        # is meant to be.
+        self.tasks: dict = {}
         self.step = 0
+        self._ensure(task_names)
+
+    def _ensure(self, names) -> None:
+        """Register any task seen for the first time, at a = 1."""
+        for n in names or ():
+            self.tasks.setdefault(str(n), _TaskState())
+
+    @property
+    def task_names(self):
+        """Every task the controller has ever seen, in a stable order."""
+        return sorted(self.tasks)
 
     # ---- what the loss reads -------------------------------------------
-    def a_tensor(self, device=None, dtype=torch.float32) -> torch.Tensor:
-        """a_i in task order, as applied to THIS step. Fixed until update()."""
-        return torch.tensor([self.tasks[n].a for n in self.task_names], device=device, dtype=dtype)
+    def a_tensor(self, names, device=None, dtype=torch.float32) -> torch.Tensor:
+        """a for THIS batch's task ids, in THIS batch's order.
+
+        ``names`` is the batch's own task_id_names, so index i of the result is
+        the retention for task id i of that batch -- which is what the gate
+        indexes with. A task appearing for the first time enters at a = 1.
+        """
+        self._ensure(names)
+        return torch.tensor([self.tasks[str(n)].a for n in names], device=device, dtype=dtype)
 
     # ---- once per step -------------------------------------------------
     def update(self, *, R, C_neg, ctl_tokens, live_groups, present) -> dict:
@@ -214,15 +237,24 @@ class PushbackController:
         """
         cfg = self.cfg
         out = {}
+        self._ensure(present.keys())
         for n in self.task_names:
             st = self.tasks[n]
             if not present.get(n, False):
-                # Missing is not zero. Do not feed the EMA, do not change a.
+                # Missing is not zero, and it is not an error either: the batch
+                # simply had no rows of this task. Do not feed the EMA, do not
+                # change a -- the next batch carrying the task resumes from
+                # where it left off.
                 st.state = STATE_ABSENT
             elif R.get(n, 0.0) <= cfg.tiny:
                 st.state = STATE_NO_PG
                 st.a = 1.0
             elif int(live_groups.get(n, 0)) < cfg.min_live_groups or int(ctl_tokens.get(n, 0)) < cfg.min_ctl_tokens:
+                # live_groups counts groups that reached R/C^- through the loss
+                # mask, the clip and the top-k support -- not groups that merely
+                # had a non-zero advantage somewhere. ctl_tokens counts only
+                # rows the loss weights. Both come from the actor, where those
+                # filters are; see OpdTaskDiagStats' group bitmap.
                 # Signal exists but rests on too few independent groups or too
                 # few measured tokens. The EMA still learns from it; a does not
                 # move on it.
@@ -289,23 +321,25 @@ class PushbackController:
                 self.tasks[n] = _TaskState(**d)
 
 
-def live_groups_by_task(uids, task_names, advantages: torch.Tensor, response_mask: torch.Tensor) -> dict:
-    """Independent prompt groups per task with at least one live-advantage token.
+def group_index_column(uids, n_rows: int) -> torch.Tensor:
+    """A dense 0..G-1 group id per row, -1 where the uid is missing.
 
-    Computed on the DRIVER, which is the only place that sees the whole batch
-    with its group ids: the actor sees micro-batches, and "distinct groups" does
-    not sum across ranks. A group whose rollouts all scored the same has
-    advantage 0 everywhere and is not evidence about the reward's direction --
-    the controller's sufficiency test counts groups that carry one.
+    The actor needs an integer it can index a per-task bitmap with; uids are
+    strings and live only on the driver. Dense so the bitmap stays small, and
+    stable within a batch so every rank maps a group to the same column.
 
-    Returns ``{task_name: n_groups}`` for the tasks present. Rows with no task
-    name (padding) are skipped.
+    Counting groups here instead -- "groups with a non-zero advantage" -- was
+    wrong twice: it never asked whether the group survived the loss mask, the
+    PPO clip and the top-k support to reach R, and per-rank counts of distinct
+    groups cannot be summed. The actor answers both by setting a bit.
     """
-    with torch.no_grad():
-        live_row = ((advantages.detach() != 0) & (response_mask.detach() > 0)).any(dim=-1).cpu()
-    seen: dict = {}
-    for uid, name, live in zip(list(uids), list(task_names), live_row.tolist()):
-        if name is None or not live:
+    out = torch.full((int(n_rows),), -1, dtype=torch.long)
+    order: dict = {}
+    for i, uid in enumerate(list(uids)[: int(n_rows)]):
+        if uid is None:
             continue
-        seen.setdefault(str(name), set()).add(str(uid))
-    return {name: len(groups) for name, groups in seen.items()}
+        key = str(uid)
+        if key not in order:
+            order[key] = len(order)
+        out[i] = order[key]
+    return out

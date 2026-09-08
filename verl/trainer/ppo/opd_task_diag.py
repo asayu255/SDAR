@@ -181,6 +181,10 @@ def opd_pg_alignment_terms(
         # [-X_t]_+ PER TOKEN. sum_t [-X_t]_+ != [-sum_t X_t]_+: the signed sum
         # lets one token's helpful distillation hide another's conflict.
         "ctl_c_neg": torch.zeros_like(opd_sq),
+        # Conflict as a FACT about the token, independent of what the
+        # controller decided to do about it. "fraction of tokens gated" is 0
+        # whenever a = 1, which is not the same statement.
+        "ctl_conflict": torch.zeros_like(opd_sq),
     }
     if pg_grad_coef is None or log_prob is None or topk_ids is None:
         # No policy gradient to overlap with (pure distillation), or no support
@@ -241,6 +245,7 @@ def opd_pg_alignment_terms(
     out["ctl_rd"] = torch.where(ctl, float(opd_coef) * dot, zero)
     out["ctl_dd"] = torch.where(ctl, float(opd_coef) ** 2 * opd_sq, zero)
     out["ctl_c_neg"] = torch.where(ctl, (-float(opd_coef) * dot).clamp(min=0.0), zero)
+    out["ctl_conflict"] = (ctl & (dot < 0) & (pg_sq > 0)).to(opd_sq.dtype)
     return out
 
 
@@ -269,6 +274,11 @@ _COLS = (
     # The control inputs: R, X, D on ONE population with ONE weighting, plus
     # that population's size and the probability mass the support drops.
     "ctl_n",
+    # Population size counted only on rows the loss actually weights. A
+    # duplicated row carries basis 0 (task_loss_weights.py): it contributes
+    # nothing to R, C^- or D, so counting it as evidence would let a task look
+    # well-observed on rows that cannot move the loss.
+    "ctl_n_w",
     "ctl_rr_sum",
     "ctl_rd_sum",
     "ctl_dd_sum",
@@ -280,9 +290,11 @@ _COLS = (
     "ctl_live_rows",
     # What an APPLIED per-token gate w did, three ways, because a mean w does
     # not fix the total: the gate correlates with the KL it gates.
-    "pb_conflict_n",     # tokens gated below 1
-    "pb_w_sum",          # sum of w over the control population (mean retention)
-    "pb_kl_w_sum",       # sum of w * KL over response tokens (KL retention numerator)
+    "pb_conflict_n",     # tokens where the teacher opposes a live reward (a-independent)
+    "pb_gated_n",        # tokens actually gated below 1
+    "pb_w_sum",          # sum of w over the weighted control population
+    "pb_kl_w_sum",       # sum of w * KL, UNWEIGHTED by the row weight
+    "pb_kl_w_base_sum",  # sum of basis * w * KL: the loss's own KL retention
     "pb_dd_w2_sum",      # sum of w^2 * ||u_D||^2 over control (strength retention num.)
     "pb_cneg_w_sum",     # sum of w * [-X]_+ : the pushback that REMAINED after the gate
 )
@@ -299,9 +311,20 @@ class OpdTaskDiagStats:
     value back to the host until the single read in :meth:`rows`.
     """
 
-    def __init__(self, n_tasks: int, device):
+    def __init__(self, n_tasks: int, device, n_groups: int = 0):
         self.n_tasks = int(n_tasks)
         self.buf = torch.zeros(self.n_tasks, len(_COLS), dtype=torch.float64, device=device)
+        # A per-task bitmap over prompt groups: 1 where a row of that group
+        # actually reached R through the loss mask, the clip and the top-k
+        # support. Counted this way because "distinct groups" does not sum
+        # across ranks -- two ranks holding rows of one group would count it
+        # twice. A (n_task, n_groups) buffer all-reduced once per update, then
+        # thresholded, gives the exact union.
+        self.n_groups = int(n_groups)
+        self.gbuf = (
+            torch.zeros(self.n_tasks, self.n_groups, dtype=torch.float64, device=device)
+            if self.n_groups > 0 else None
+        )
 
     def update(
         self,
@@ -314,6 +337,7 @@ class OpdTaskDiagStats:
         row_basis: torch.Tensor | None,
         row_coef: torch.Tensor | None,
         gate_w: torch.Tensor | None = None,
+        group_idx: torch.Tensor | None = None,
     ) -> None:
         """Fold one micro-batch in.
 
@@ -373,29 +397,45 @@ class OpdTaskDiagStats:
                 # (task_loss_weights.py), so basis is not constant within a task.
                 ctl = terms["ctl_mask"] * mask
                 b2 = (basis * basis).unsqueeze(-1)
+                # Rows the loss actually weights. The sums below already vanish
+                # on zero-weight rows through b2; the COUNTS did not, which is
+                # what made a task look observed on rows that cannot move it.
+                ctl_w = ctl * (basis > 0).to(ctl.dtype).unsqueeze(-1)
                 per_row[:, _IDX["ctl_n"]] = ctl.sum(dim=-1)
+                per_row[:, _IDX["ctl_n_w"]] = ctl_w.sum(dim=-1)
                 per_row[:, _IDX["ctl_rr_sum"]] = (terms["ctl_rr"] * ctl * b2).sum(dim=-1)
                 per_row[:, _IDX["ctl_rd_sum"]] = (terms["ctl_rd"] * ctl * b2).sum(dim=-1)
                 per_row[:, _IDX["ctl_dd_sum"]] = (terms["ctl_dd"] * ctl * b2).sum(dim=-1)
                 per_row[:, _IDX["tail_mass_sum"]] = (terms["tail_mass"] * mask).sum(dim=-1)
                 per_row[:, _IDX["ctl_cneg_sum"]] = (terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
-                per_row[:, _IDX["ctl_live_rows"]] = ((terms["ctl_rr"] * ctl).sum(dim=-1) > 0).to(mask.dtype)
+                per_row[:, _IDX["ctl_live_rows"]] = ((terms["ctl_rr"] * ctl_w).sum(dim=-1) > 0).to(mask.dtype)
+                per_row[:, _IDX["pb_conflict_n"]] = (terms["ctl_conflict"] * ctl_w).sum(dim=-1)
                 if gate_w is not None:
                     w = gate_w.detach().to(mask.dtype)
-                    per_row[:, _IDX["pb_conflict_n"]] = ((w < 1.0).to(mask.dtype) * ctl).sum(dim=-1)
-                    per_row[:, _IDX["pb_w_sum"]] = (w * ctl).sum(dim=-1)
+                    per_row[:, _IDX["pb_gated_n"]] = ((w < 1.0).to(mask.dtype) * ctl_w).sum(dim=-1)
+                    per_row[:, _IDX["pb_w_sum"]] = (w * ctl_w).sum(dim=-1)
                     per_row[:, _IDX["pb_kl_w_sum"]] = (w * kl).sum(dim=-1)
+                    per_row[:, _IDX["pb_kl_w_base_sum"]] = (w * kl).sum(dim=-1) * basis
                     per_row[:, _IDX["pb_dd_w2_sum"]] = (w * w * terms["ctl_dd"] * ctl * b2).sum(dim=-1)
                     per_row[:, _IDX["pb_cneg_w_sum"]] = (w * terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
                 else:
                     # No gate in force: the retention accounting reads as 1.
-                    per_row[:, _IDX["pb_w_sum"]] = ctl.sum(dim=-1)
+                    per_row[:, _IDX["pb_gated_n"]] = 0.0
+                    per_row[:, _IDX["pb_w_sum"]] = ctl_w.sum(dim=-1)
                     per_row[:, _IDX["pb_kl_w_sum"]] = row_kl
+                    per_row[:, _IDX["pb_kl_w_base_sum"]] = row_kl * basis
                     per_row[:, _IDX["pb_dd_w2_sum"]] = (terms["ctl_dd"] * ctl * b2).sum(dim=-1)
                     per_row[:, _IDX["pb_cneg_w_sum"]] = (terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
 
             flat = task_ids.reshape(-1)
             flat = flat.round().to(torch.long) if flat.is_floating_point() else flat.to(torch.long)
+            if self.gbuf is not None and group_idx is not None and terms is not None:
+                g = group_idx.reshape(-1)
+                g = g.round().to(torch.long) if g.is_floating_point() else g.to(torch.long)
+                contributed = (terms["ctl_rr"] * ctl_w).sum(dim=-1) > 0
+                ok = contributed & (flat >= 0) & (flat < self.n_tasks) & (g >= 0) & (g < self.n_groups)
+                if bool(ok.any()):
+                    self.gbuf[flat[ok], g[ok]] = 1.0
             # Padding rows carry a negative id and must land nowhere. clamp puts
             # them on task 0, so the one-hot is zeroed for them instead.
             onehot = torch.nn.functional.one_hot(flat.clamp(min=0), num_classes=self.n_tasks)
@@ -411,6 +451,17 @@ class OpdTaskDiagStats:
             buf = buf.clone()
             torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
         return buf.detach().cpu()
+
+    def reduced_groups(self, task_names) -> dict:
+        """``{task: n_groups}`` -- the exact union across ranks, or {} if unused."""
+        if self.gbuf is None:
+            return {}
+        g = self.gbuf
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            g = g.clone()
+            torch.distributed.all_reduce(g, op=torch.distributed.ReduceOp.SUM)
+        counts = (g > 0).sum(dim=1).detach().cpu().tolist()
+        return {str(n): int(counts[t]) for t, n in enumerate(task_names[: self.n_tasks])}
 
     @staticmethod
     def column(table: torch.Tensor, name: str, tid: int) -> float:
@@ -488,6 +539,7 @@ class OpdTaskDiagStats:
             out[f"actor/opd_diag/ctl_X/{name}"] = X
             out[f"actor/opd_diag/ctl_D/{name}"] = D
             out[f"actor/opd_diag/ctl_tokens/{name}"] = n_ctl
+            out[f"actor/opd_diag/ctl_tokens_weighted/{name}"] = row[_IDX["ctl_n_w"]]
             out[f"actor/opd_diag/ctl_cover/{name}"] = _safe(n_ctl, n_tok)
             out[f"actor/opd_diag/ctl_a/{name}"] = (
                 X / ((R * D) ** 0.5) if R > 0 and D > 0 else 0.0
@@ -507,9 +559,21 @@ class OpdTaskDiagStats:
             out[f"actor/opd_diag/ctl_pushback_neg_frac/{name}"] = _safe(C_neg, R)
             out[f"actor/opd_diag/ctl_live_rows/{name}"] = row[_IDX["ctl_live_rows"]]
             # ---- what an applied gate did (all 1.0 when no gate) -----------
-            out[f"actor/pushback/conflict_frac/{name}"] = _safe(row[_IDX["pb_conflict_n"]], n_ctl)
-            out[f"actor/pushback/w_mean/{name}"] = _safe(row[_IDX["pb_w_sum"]], n_ctl)
-            out[f"actor/pushback/kl_retained/{name}"] = _safe(row[_IDX["pb_kl_w_sum"]], row[_IDX["kl_sum"]])
+            n_ctl_w = row[_IDX["ctl_n_w"]]
+            # Two different statements, kept apart: how often the teacher
+            # opposes a live reward, and how often the controller acted on it.
+            # The second is 0 whenever a = 1, however much conflict there is.
+            out[f"actor/pushback/conflict_frac/{name}"] = _safe(row[_IDX["pb_conflict_n"]], n_ctl_w)
+            out[f"actor/pushback/gated_frac/{name}"] = _safe(row[_IDX["pb_gated_n"]], n_ctl_w)
+            out[f"actor/pushback/w_mean/{name}"] = _safe(row[_IDX["pb_w_sum"]], n_ctl_w)
+            # The loss's own KL retention: basis on numerator AND denominator.
+            out[f"actor/pushback/kl_retained/{name}"] = _safe(
+                row[_IDX["pb_kl_w_base_sum"]], row[_IDX["kl_base_sum"]]
+            )
+            # The same ratio without the row weight, under its own name.
+            out[f"actor/pushback/kl_retained_unweighted/{name}"] = _safe(
+                row[_IDX["pb_kl_w_sum"]], row[_IDX["kl_sum"]]
+            )
             out[f"actor/pushback/strength_retained/{name}"] = _safe(row[_IDX["pb_dd_w2_sum"]], D)
             # pushback fraction AFTER the gate, on this step's own tokens
             out[f"actor/pushback/ratio_after/{name}"] = _safe(row[_IDX["pb_cneg_w_sum"]], R)

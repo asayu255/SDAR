@@ -52,6 +52,7 @@ a_i^* = \begin{cases}1 & C_i^-=0\\ \min\!\left(1, \dfrac{\varepsilon R_i}{C_i^-}
 * **母集団・重み・$\beta$ を揃える。**$R$, $C^-$ は同じ token 集合（control 母集団 = response token かつ生成 token が support 内）、同じ行重み（`basis²`、両方向が線形に持つため）、$\beta$ 込み・$a$ 抜きで作る。行重みはタスク内で一定でない（重複行が重み 0）ので約分されない。
 * **clip された token は母集団に残す。**$u_R=0$ は定義された値で、$R$, $C^-$ に 0、$D$ に実量を寄与する。除外すると 3 量の母集団が再び分かれる。
 * **ゲートは二値。**soft gate $w = 1-(1-a)q_t$ では制御後の押し戻しが $C^- - (1-a)C_q^-$ となり、閾値は $a \le 1 - (C^--\varepsilon R)/C_q^-$ に変わって $a=0$ でも達成不能になり得る。二値なら $C_q^-=C^-$ で元の閉形式に戻る。soft 化は閉形式の変更を伴う**別条件**として評価する。
+* **信頼度は「制御に寄与した観測」で数える。**token 数は損失が実際に重み付ける行（`basis > 0`）に限る —— 重複行は重み 0 で $R, C^-$ に寄与しないので、証拠として数えない。群数は**タスク別の群ビットマップ**で数える: driver が行ごとの密な群 ID を付け、actor が「loss mask・clip・top-k を通って $R$ に届いた行」のビットを立て、all-reduce してから非ゼロを数える。rank ごとの群数を単純加算すると、1 群を 2 rank が持つと 2 と数えてしまう。
 * **1 step 遅れ、step 内固定。**$a_i$ は step $s-1$ までの統計から決め、step $s$ の全 micro-batch に同じ値を適用する。token の対立判定だけは step $s$ の forward で行う。
 * **EMA は $R$, $C^-$ の和に掛け、比はその後に取る。**比の EMA ではない。欠測タスクは EMA に 0 を投入しない。
 * **増幅しない。**v1 は $a\le1$。
@@ -94,13 +95,16 @@ a_i^* = \begin{cases}1 & C_i^-=0\\ \min\!\left(1, \dfrac{\varepsilon R_i}{C_i^-}
 | `pushback/state/{task}`、`n_obs` | 4 状態と EMA の観測数 |
 | `pushback/ema_R`、`ema_C_neg`、`ema_ratio`、`bound` | 制御入力と閾値 |
 | `pushback/constraint_met/{task}` | 床 $a_{\min}$ に当たって制約未達なら 0 |
-| `pushback/conflict_frac/{task}` | control 母集団のうちゲートされた割合 |
+| `pushback/conflict_frac/{task}` | 教師が生きた報酬に対立している token の割合。**$a$ に依存しない事実** |
+| `pushback/gated_frac/{task}` | 実際に減衰された token の割合。$a=1$ なら対立があっても 0 |
+| `pushback/live_groups/{task}` | $R$ に寄与した独立プロンプト群の数（rank 横断の和集合） |
 | `pushback/w_mean/{task}` | 集約重み基準の平均保持率 |
-| `pushback/kl_retained/{task}` | KL 量の保持率 $\sum wKL/\sum KL$ |
+| `pushback/kl_retained/{task}` | **損失自身の** KL 保持率 $\sum b\,wKL/\sum b\,KL$（分子・分母とも行重み込み） |
+| `pushback/kl_retained_unweighted/{task}` | 行重み無しの同比。別名で残す |
 | `pushback/strength_retained/{task}` | 出力空間 OPD 強度の保持率 $\sum w^2\|u_D\|^2/\sum\|u_D\|^2$ |
 | `pushback/ratio_after/{task}` | ゲート後の押し戻し率（その step の token 上） |
 | `opd_diag/ctl_pushback_neg_frac/{task}` | ゲート前の $C^-/R$ |
-| `opd_diag/ctl_cover`、`ctl_live_rows`、`tail_mass_mean` | 測定被覆（token・行・確率質量） |
+| `opd_diag/ctl_cover`、`ctl_tokens_weighted`、`ctl_live_rows`、`tail_mass_mean` | 測定被覆（token・重み付き token・行・確率質量） |
 
 保持率を 3 種に分けるのは、$\bar w$ を揃えても $\sum_t w_t L_{{\rm OPD},t}$ は揃わない（減衰対象と KL 量が相関する）ため。
 
@@ -113,6 +117,19 @@ a_i^* = \begin{cases}1 & C_i^-=0\\ \min\!\left(1, \dfrac{\varepsilon R_i}{C_i^-}
 | （事後）一様 replay | `pushback` が実現した保持率スケジュールを一様に適用。「選択的」と「単に少ない」を分ける **近似的**対照。訪問状態が変わるので総量一致でも因果分離でもない |
 
 採用判断は診断指標ではなく **alfworld・search・webshop それぞれの評価精度**で行う。
+
+## 4.1 実行前に潰した不具合
+
+初回実装をレビューで指摘され、CPU で再現・修正した 4 件。
+
+| | 症状 | 原因 | 対処 |
+|---|---|---|---|
+| **P1** | 初回 update の末尾で `AttributeError` | `update_policy` 内で `data` が micro-batch dict → TensorDict → メトリクス dict と **3 回再束縛**され、末尾で `data.meta_info` が存在しない | 群数は reduced ビットマップから取る。`data` を末尾で読まないことを AST テストで固定 |
+| **P2** | 実効 token 1 個でも重み 0 の重複行で `ctl_n=300` になり `state=ok` | 被覆カウントに行重みが入っていなかった／群数が advantage 非ゼロだけで判定していた | 重み付き token 数と群ビットマップ |
+| **P3** | タスクが batch から欠けると `AssertionError` | 制御器が初回の `task_id_names` を固定していたが、driver は**存在するタスクだけ**から一覧を作る | 状態をタスク名で保持。欠測は `STATE_ABSENT`、新規は $a=1$ で参入 |
+| **P4** | `kl_retained` が 0.2421、実損失は 0.2800 | 行重みが分子・分母に入っていなかった | 重み込みを `kl_retained`、無しを `kl_retained_unweighted` に分離 |
+
+いずれも変異検査つき: 元の実装に戻すと対応するテストだけが落ちる。
 
 ## 5. 言えないこと
 
