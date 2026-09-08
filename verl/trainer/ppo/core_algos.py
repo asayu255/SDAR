@@ -820,20 +820,42 @@ def topk_kl_per_token(
     """Dense per-token reverse KL over a top-k support (+ a tail bucket).
 
     Approximates the exact per-token reverse KL ``KL(p_student || p_teacher)`` by
-    restricting the support to the teacher's top-k token ids and lumping the
-    remaining vocabulary mass into a single "tail" bucket. Uses the plain (k1)
-    KL definition ``sum_v p_s(v) (log p_s(v) - log p_t(v))`` rather than a
-    single-sample estimator, so it is low-variance and dense.
+    restricting the support to k token ids and lumping the remaining vocabulary
+    mass into a single "tail" bucket. Uses the plain (k1) KL definition
+    ``sum_v p_s(v) (log p_s(v) - log p_t(v))`` rather than a single-sample
+    estimator, so it is low-variance and dense.
 
-    Both inputs are full-vocabulary log-softmax values gathered at the *teacher's*
-    top-k ids, so ``exp(.).sum(-1) <= 1`` and the leftover is the tail mass.
+    **This function is agnostic to WHOSE top-k the support is.** Both inputs are
+    full-vocabulary log-softmax values gathered at the SAME ids, whichever model
+    chose them, so ``exp(.).sum(-1) <= 1`` and the leftover is the tail mass in
+    either case. ``actor.student_indexed_topk`` picks the support at the call
+    site; the OPD coefficient arms pin it to true.
+
+    Which choice is right follows from the direction of the KL, and is not the
+    same statement as "this is a reverse KL". Exactly,
+
+        KL(p_s||p_t) = sum_{v in A} p_s(v)[log p_s - log p_t]
+                     + sum_{v not in A} p_s(v)[log p_s - log p_t]
+
+    and this keeps the first sum while replacing the second with one bucket,
+    ``tail_s (log tail_s - log tail_t)``. The APPROXIMATED part is therefore
+    weighted by ``tail_s``, the student's mass outside the support, so a support
+    taken from the student's own top-k makes it tight (measured tail_mass_mean
+    0.000-0.001 on the multitask mixture) and one taken from the teacher does
+    not. Under a FORWARD KL the approximated part would carry ``tail_t`` and the
+    teacher's top-k would be the tight choice instead. Both supports are valid
+    lower bounds on the same full KL, so they are different objectives: arms
+    compared across the setting are not comparable, which is why it is pinned.
+
     Only ``student_topk_logprob`` carries gradients; the teacher is detached.
 
     Args:
         student_topk_logprob: (bs, response_length, k) student log-probs at the
-            teacher's top-k ids.
-        teacher_topk_logprob: (bs, response_length, k) teacher log-probs at its
-            own top-k ids (detached upstream).
+            support ids.
+        teacher_topk_logprob: (bs, response_length, k) teacher log-probs at the
+            SAME support ids (detached upstream). Under student-indexed support
+            these are resolved from cached teacher hidden states rather than
+            pre-scored; see verl/workers/teacher_cache.py.
     Returns:
         (bs, response_length) per-token KL (>= 0 up to the tail approximation).
     """
