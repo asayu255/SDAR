@@ -4541,6 +4541,10 @@ class DataParallelPPOActor(BasePPOActor):
                                         # clip has zeroed as a full-magnitude
                                         # conflict.
                                         "pg_grad_coef": xt_pg_grad_coef,
+                                        # beta ONLY -- not beta * b. The control
+                                        # inputs must not carry the coefficient a
+                                        # controller would be setting from them.
+                                        "opd_coef": _teacher_kl_coef_scalar,
                                     }
                                     if teacher_topk_kl and log_prob is not None
                                     else None

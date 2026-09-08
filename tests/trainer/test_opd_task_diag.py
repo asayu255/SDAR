@@ -289,6 +289,11 @@ def _stats_with(rows, names=("alfworld", "search", "webshop"), terms=None):
             "pg_sq": torch.zeros(n, t),
             "align_mask": torch.zeros(n, t),
             "pg_live": torch.zeros(n, t),
+            "tail_mass": torch.zeros(n, t),
+            "ctl_mask": torch.ones(n, t),
+            "ctl_rr": torch.ones(n, t),
+            "ctl_rd": torch.zeros(n, t),
+            "ctl_dd": torch.ones(n, t),
         }
     st = OpdTaskDiagStats(n_tasks=len(names), device=torch.device("cpu"))
     st.update(task_ids=task_ids, response_mask=mask, teacher_kl=kl, advantages=adv,
@@ -582,3 +587,189 @@ def test_the_per_row_coefficient_reaches_the_attribution_push_with_the_right_pow
         n_scalar = float((scalar["g0"][i] ** 2).sum())
         n_row = float((per_row["g0"][i] ** 2).sum())
         assert n_row == pytest.approx(n_scalar * float(b[i]) ** 2, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 6. the control inputs: one population, one weighting, beta in, b out
+#
+# The diagnostics above are for reading. These three are for feeding a rule, and
+# a rule needs its inputs commensurable -- which the diagnostics are not: R and
+# X ran over the clipped-and-nonzero subset while D ran over everything, and
+# only D carried the row weight.
+
+
+def _ctl_terms(logits, t_lp_full, topk_ids, sampled, adv, old_lp, beta=1.0, cliprange=None):
+    lp_full = torch.log_softmax(logits, dim=-1)
+    s_topk = lp_full[topk_ids].reshape(1, 1, -1)
+    t_topk = t_lp_full[topk_ids].reshape(1, 1, -1)
+    kl = topk_kl_per_token(student_topk_logprob=s_topk, teacher_topk_logprob=t_topk)
+    return opd_pg_alignment_terms(
+        student_topk_logprob=s_topk,
+        teacher_topk_logprob=t_topk,
+        teacher_kl=kl,
+        topk_ids=topk_ids.reshape(1, 1, -1),
+        response_ids=torch.tensor([[sampled]]),
+        log_prob=lp_full[sampled].reshape(1, 1),
+        pg_grad_coef=_pg_coef(logits, sampled, adv, old_lp, cliprange),
+        opd_coef=beta,
+    )
+
+
+def test_beta_scales_X_linearly_and_D_quadratically():
+    """ctl_a is invariant to beta; ctl_pushback_frac is linear in it. Leaving
+    beta out would move any threshold on the pushback by 1/beta -- 100x at the
+    0.01 this arm runs."""
+    logits, t_lp, ids, sampled = _case(seed=3)
+    one = _ctl_terms(logits, t_lp, ids, sampled, adv=0.7, old_lp=-2.0, beta=1.0)
+    hun = _ctl_terms(logits, t_lp, ids, sampled, adv=0.7, old_lp=-2.0, beta=0.01)
+    f = lambda d, k: float(d[k].reshape(()))
+
+    assert f(hun, "ctl_rr") == pytest.approx(f(one, "ctl_rr"))          # u_R has no beta
+    assert f(hun, "ctl_rd") == pytest.approx(0.01 * f(one, "ctl_rd"))   # linear
+    assert f(hun, "ctl_dd") == pytest.approx(0.01**2 * f(one, "ctl_dd"))  # quadratic
+
+    a = lambda d: f(d, "ctl_rd") / (f(d, "ctl_rr") * f(d, "ctl_dd")) ** 0.5
+    assert a(hun) == pytest.approx(a(one), rel=1e-9), "ctl_a must be beta-invariant"
+    pb = lambda d: -f(d, "ctl_rd") / f(d, "ctl_rr")
+    assert pb(hun) == pytest.approx(0.01 * pb(one)), "the pushback fraction is NOT"
+
+
+def test_b_never_enters_the_control_inputs():
+    """A rule that reads its own output back is a feedback loop. b reaches the
+    loss through row_coef; it must not reach R, X or D."""
+    rows = [(0, [1.0], [1.0], 1.0, 1.0), (1, [1.0], [1.0], 1.0, 0.5)]
+    a = _stats_with(rows, terms="flat")
+    b = _stats_with([(0, [1.0], [1.0], 1.0, 0.5), (1, [1.0], [1.0], 1.0, 1.5)], terms="flat")
+    for k in ("ctl_R", "ctl_X", "ctl_D"):
+        assert a[f"actor/opd_diag/{k}/alfworld"] == pytest.approx(b[f"actor/opd_diag/{k}/alfworld"]), k
+    # ...while the thing b DOES control still moves
+    assert a["actor/opd_diag/kl_ratio_eff_base/alfworld"] != pytest.approx(
+        b["actor/opd_diag/kl_ratio_eff_base/alfworld"])
+
+
+def test_all_three_share_one_population():
+    """The defect: R and X excluded clipped tokens, D did not. A clipped token
+    has u_R = 0 -- a defined value -- so it belongs in all three sums."""
+    logits, t_lp, ids, sampled = _conflict_state()
+    lp = float(torch.log_softmax(logits, -1)[sampled])
+    clipped = _ctl_terms(logits, t_lp, ids, sampled, adv=1.0,
+                         old_lp=lp - math.log(1.5), cliprange=0.2)
+    assert float(clipped["ctl_mask"].reshape(())) == 1.0, "in the population"
+    assert float(clipped["ctl_rr"].reshape(())) == 0.0, "u_R is zero there"
+    assert float(clipped["ctl_rd"].reshape(())) == 0.0
+    assert float(clipped["ctl_dd"].reshape(())) > 0.0, "but the teacher still pushes"
+    # the diagnostics still exclude it, and that is fine -- two names, two things
+    assert float(clipped["align_mask"].reshape(())) == 0.0
+
+
+def test_a_sampled_token_outside_the_support_is_out_of_the_population():
+    """Forced, not chosen: u_R . u_D needs u_D at the sampled id."""
+    vocab, k = 8, 3
+    logits = torch.zeros(vocab, dtype=torch.float64)
+    t_lp = torch.log_softmax(torch.arange(vocab, dtype=torch.float64), dim=-1)
+    ids = torch.topk(t_lp, k).indices
+    outside = int((set(range(vocab)) - set(ids.tolist())).pop())
+    terms = _ctl_terms(logits, t_lp, ids, outside, adv=1.0, old_lp=-2.0)
+    for key in ("ctl_mask", "ctl_rr", "ctl_rd", "ctl_dd"):
+        assert float(terms[key].reshape(())) == 0.0, key
+
+
+def test_the_row_weight_reaches_all_three_and_does_not_cancel():
+    """basis^2 on each, because both directions carry it linearly. It does not
+    divide out: a duplicated row carries weight 0, so basis is not constant
+    within a task."""
+    plain = _stats_with([(0, [1.0], [1.0], 1.0, 1.0)], terms="flat")
+    heavy = _stats_with([(0, [1.0], [1.0], 3.0, 1.0)], terms="flat")
+    for k in ("ctl_R", "ctl_X", "ctl_D"):
+        want = 9.0 * plain[f"actor/opd_diag/{k}/alfworld"]
+        assert heavy[f"actor/opd_diag/{k}/alfworld"] == pytest.approx(want, rel=1e-5), k
+
+    # a duplicated row (weight 0) contributes nothing, so the task's basis is
+    # NOT a single constant that could be factored out
+    mixed = _stats_with([(0, [1.0], [1.0], 1.0, 1.0), (0, [1.0], [1.0], 0.0, 1.0)],
+                        terms="flat")
+    assert mixed["actor/opd_diag/ctl_R/alfworld"] == pytest.approx(
+        plain["actor/opd_diag/ctl_R/alfworld"], rel=1e-5)
+    assert mixed["actor/opd_diag/ctl_tokens/alfworld"] == pytest.approx(2.0), (
+        "the row is in the population; it is its weight that is zero"
+    )
+
+
+def test_the_aggregate_is_not_the_mean_of_per_token_cosines():
+    """The point of aggregating: one strong-signal token should outweigh many
+    weak ones. Two tokens, one with a large aligned push and one with a tiny
+    opposed push -- the mean cosine says 'balanced', the aggregate does not."""
+    n, t = 1, 2
+    rr = torch.tensor([[100.0, 0.01]])
+    dd = torch.tensor([[100.0, 0.01]])
+    rd = torch.tensor([[100.0, -0.01]])          # per-token cosines: +1 and -1
+    terms = {
+        "opd_sq": torch.zeros(n, t), "dot": torch.zeros(n, t), "cos": torch.zeros(n, t),
+        "pg_sq": torch.zeros(n, t), "align_mask": torch.zeros(n, t),
+        "pg_live": torch.zeros(n, t), "tail_mass": torch.zeros(n, t),
+        "ctl_mask": torch.ones(n, t), "ctl_rr": rr, "ctl_rd": rd, "ctl_dd": dd,
+    }
+    st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
+    st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
+              teacher_kl=torch.ones(n, t), advantages=torch.ones(n, t),
+              terms=terms, row_basis=torch.ones(n), row_coef=torch.ones(n))
+    out = st.rows(["alfworld"])
+    mean_of_cosines = (1.0 + -1.0) / 2
+    assert mean_of_cosines == 0.0
+    assert out["actor/opd_diag/ctl_a/alfworld"] > 0.99, (
+        "the aggregate must follow the strong token, not average the votes"
+    )
+    # and a zero-norm token needs no special case: it adds 0 to all three
+    terms2 = dict(terms, ctl_rr=torch.zeros(n, t), ctl_rd=torch.zeros(n, t),
+                  ctl_dd=torch.zeros(n, t))
+    st2 = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
+    st2.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
+               teacher_kl=torch.ones(n, t), advantages=torch.ones(n, t),
+               terms=terms2, row_basis=torch.ones(n), row_coef=torch.ones(n))
+    o2 = st2.rows(["alfworld"])
+    assert o2["actor/opd_diag/ctl_a/alfworld"] == 0.0
+
+
+def test_the_pushback_fraction_is_what_a_limit_would_threshold():
+    """-X/R is the share of the reward's own descent the teacher cancels at
+    b = 1, so a limit 'no more than eps of it' reads b <= eps / (-X/R)."""
+    n, t = 1, 1
+    terms = {
+        "opd_sq": torch.zeros(n, t), "dot": torch.zeros(n, t), "cos": torch.zeros(n, t),
+        "pg_sq": torch.zeros(n, t), "align_mask": torch.zeros(n, t),
+        "pg_live": torch.zeros(n, t), "tail_mass": torch.zeros(n, t),
+        "ctl_mask": torch.ones(n, t), "ctl_rr": torch.tensor([[4.0]]),
+        "ctl_rd": torch.tensor([[-1.0]]), "ctl_dd": torch.tensor([[1.0]]),
+    }
+    st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
+    st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
+              teacher_kl=torch.ones(n, t), advantages=torch.ones(n, t),
+              terms=terms, row_basis=torch.ones(n), row_coef=torch.ones(n))
+    out = st.rows(["alfworld"])
+    assert out["actor/opd_diag/ctl_pushback_frac/alfworld"] == pytest.approx(0.25)
+    # eps = 0.1 would cap b at 0.4 here
+    assert 0.1 / out["actor/opd_diag/ctl_pushback_frac/alfworld"] == pytest.approx(0.4)
+
+
+def test_the_dropped_probability_mass_is_reported():
+    """align_cover counts tokens; a claim about the tail approximation needs the
+    mass the support does not cover, which nothing measured before."""
+    logits, t_lp, ids, sampled = _case(vocab=200, k=20, seed=7, peaked=False)
+    terms = _ctl_terms(logits, t_lp, ids, sampled, adv=1.0, old_lp=-2.0)
+    lp = torch.log_softmax(logits, dim=-1)
+    off = torch.ones(200, dtype=torch.bool); off[ids] = False
+    assert float(terms["tail_mass"].reshape(())) == pytest.approx(
+        float(lp.exp()[off].sum()), abs=1e-9)
+    assert float(terms["tail_mass"].reshape(())) > 0.5, "flat policy, most mass off-support"
+
+
+def test_beta_reaches_the_terms_from_the_actor_and_b_does_not():
+    import ast
+    import inspect
+
+    import verl.workers.actor.dp_actor as m
+
+    src = ast.unparse(next(n for n in ast.walk(ast.parse(inspect.getsource(m)))
+                           if isinstance(n, ast.FunctionDef) and n.name == "update_policy"))
+    assert "'opd_coef': _teacher_kl_coef_scalar" in src, "beta must be handed over"
+    assert "'opd_coef': _opd_effective_coef" not in src, "that one carries b"

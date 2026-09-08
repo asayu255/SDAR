@@ -51,6 +51,37 @@ parameter-space cross-effect matrix: the sign is not preserved through J J^T,
 and it cannot carry the off-diagonal at all, because a token belongs to one
 task.
 
+**Control inputs, kept apart from the diagnostics above.** The metrics named so
+far are for reading; ``ctl_R``, ``ctl_X``, ``ctl_D`` are for feeding a rule that
+sets the coefficient. A control rule needs its three inputs to be commensurable,
+and the diagnostics are not:
+
+* **One population.** ``ctl_*`` run over response tokens whose sampled id is
+  inside the KL's support, and nothing else. The support restriction is forced
+  -- ``u_R . u_D`` needs ``u_D`` at the sampled id, which only the support
+  carries -- but the diagnostics additionally drop clipped tokens and zero-norm
+  tokens, which left R and X on a subset (``align_cover`` measured 0.23-0.53)
+  while D ran over everything. A ratio built from those is a subset numerator
+  over a full-set denominator.
+* **One weighting.** All three carry ``basis^2``, the per-task row weight the
+  loss applies, squared because both directions carry it linearly. It does NOT
+  divide out of the ratios: a duplicated row gets weight 0
+  (``task_loss_weights.py``), so ``basis`` is not constant within a task.
+* **Beta in, b out.** ``u_D`` is the gradient of ``beta * L_OPD``. ``ctl_a =
+  X/sqrt(RD)`` is invariant to beta, but ``ctl_pushback_frac = -X/R`` is linear
+  in it, so any threshold on that would move by 1/beta. ``b`` is excluded
+  because a rule reading its own output back is a feedback loop, not a
+  measurement.
+* **Aggregates, not a mean of per-token cosines.** ``ctl_a`` is
+  ``X/sqrt(R D)`` over the summed quantities, so a token with a weak signal does
+  not get the same vote as a strong one -- and a zero-norm token contributes 0 to
+  all three sums instead of needing a special case.
+
+What they still cannot do is reach across tasks: ``r_i . P d_j`` for i != j is
+``u_R,i . J_i P J_j^T u_D,j``, and no per-token quantity carries the Jacobians.
+A rule built on these balances each task's own reward against its own teacher; it
+does not resolve cross-task interference, and should not be described as doing so.
+
 Sign convention throughout is DESCENT, matching :func:`opd_logit_push`:
 positive means the objective is pushing that logit UP. So ``pg_dot > 0`` is
 agreement between reward and teacher, and ``pg_dot < 0`` is conflict.
@@ -72,6 +103,7 @@ def opd_pg_alignment_terms(
     response_ids: torch.Tensor,
     log_prob: torch.Tensor,
     pg_grad_coef: torch.Tensor | None,
+    opd_coef: float = 1.0,
 ) -> dict:
     """Per-token logit-space overlap between the OPD push and the PG push.
 
@@ -125,6 +157,10 @@ def opd_pg_alignment_terms(
     # the row weights the loss applies can be put on it afterwards.
     g_opd = p_s * (d - (lp_s - lp_t))
     opd_sq = (g_opd * g_opd).sum(dim=-1)
+    # The probability the support does NOT cover. align_cover says what share of
+    # tokens the metric is defined on; this says how much of the distribution the
+    # sums drop, which is the quantity a claim about the tail approximation needs.
+    tail_mass = (1.0 - p_s.sum(dim=-1)).clamp(min=0.0, max=1.0)
 
     out = {
         "opd_sq": opd_sq,
@@ -133,6 +169,15 @@ def opd_pg_alignment_terms(
         "pg_sq": torch.zeros_like(opd_sq),
         "align_mask": torch.zeros_like(opd_sq),
         "pg_live": torch.zeros_like(opd_sq),
+        "tail_mass": tail_mass,
+        # --- the CONTROL inputs, kept separate from the diagnostics above ----
+        # One population, one weighting, beta folded in, b deliberately absent.
+        # See the module docstring's "control inputs" note for why each of those
+        # four is not a matter of taste.
+        "ctl_mask": torch.zeros_like(opd_sq),
+        "ctl_rr": torch.zeros_like(opd_sq),
+        "ctl_rd": torch.zeros_like(opd_sq),
+        "ctl_dd": torch.zeros_like(opd_sq),
     }
     if pg_grad_coef is None or log_prob is None or topk_ids is None:
         # No policy gradient to overlap with (pure distillation), or no support
@@ -173,6 +218,25 @@ def opd_pg_alignment_terms(
     out["pg_sq"] = torch.where(live, pg_sq, zero)
     out["align_mask"] = live.to(opd_sq.dtype)
     out["pg_live"] = pg_live.to(opd_sq.dtype)
+
+    # ---- control inputs -------------------------------------------------
+    # POPULATION: response tokens whose sampled id is inside the support, and
+    # nothing else. The support restriction is forced, not chosen -- u_R . u_D
+    # needs u_D at the sampled id, which only the support carries. What is NOT
+    # required is pg_live or a non-zero norm: a token the PPO clip has zeroed has
+    # u_R = 0, which is a defined value that contributes 0 to R and X and its
+    # real amount to D. Dropping it would make R, X and D three different
+    # populations again, which is the defect this exists to fix.
+    ctl = in_support
+    # BETA IS IN, b IS OUT. a = X/sqrt(R D) happens to be invariant to beta, but
+    # the pushback fraction -X/R is linear in it, so leaving beta out would move
+    # any threshold on that by a factor of 1/beta (100x at beta = 0.01). b is out
+    # because a controller that reads its own output back is a feedback loop, not
+    # a measurement.
+    out["ctl_mask"] = ctl.to(opd_sq.dtype)
+    out["ctl_rr"] = torch.where(ctl, pg_sq, zero)
+    out["ctl_rd"] = torch.where(ctl, float(opd_coef) * dot, zero)
+    out["ctl_dd"] = torch.where(ctl, float(opd_coef) ** 2 * opd_sq, zero)
     return out
 
 
@@ -198,6 +262,13 @@ _COLS = (
     "cos_sum",
     "dot_neg",
     "pg_sq_sum",
+    # The control inputs: R, X, D on ONE population with ONE weighting, plus
+    # that population's size and the probability mass the support drops.
+    "ctl_n",
+    "ctl_rr_sum",
+    "ctl_rd_sum",
+    "ctl_dd_sum",
+    "tail_mass_sum",
 )
 _IDX = {name: i for i, name in enumerate(_COLS)}
 
@@ -274,6 +345,18 @@ class OpdTaskDiagStats:
                 per_row[:, _IDX["cos_sum"]] = (terms["cos"] * live).sum(dim=-1)
                 per_row[:, _IDX["dot_neg"]] = ((terms["dot"] < 0).to(mask.dtype) * live).sum(dim=-1)
                 per_row[:, _IDX["pg_sq_sum"]] = (terms["pg_sq"] * live).sum(dim=-1)
+                # ONE population, ONE weighting, for all three. basis^2 because
+                # both u_R and u_D carry the row weight linearly, so a squared
+                # norm and an inner product both take it squared. It does not
+                # cancel out of the ratios: a duplicated row carries weight 0
+                # (task_loss_weights.py), so basis is not constant within a task.
+                ctl = terms["ctl_mask"] * mask
+                b2 = (basis * basis).unsqueeze(-1)
+                per_row[:, _IDX["ctl_n"]] = ctl.sum(dim=-1)
+                per_row[:, _IDX["ctl_rr_sum"]] = (terms["ctl_rr"] * ctl * b2).sum(dim=-1)
+                per_row[:, _IDX["ctl_rd_sum"]] = (terms["ctl_rd"] * ctl * b2).sum(dim=-1)
+                per_row[:, _IDX["ctl_dd_sum"]] = (terms["ctl_dd"] * ctl * b2).sum(dim=-1)
+                per_row[:, _IDX["tail_mass_sum"]] = (terms["tail_mass"] * mask).sum(dim=-1)
 
             flat = task_ids.reshape(-1)
             flat = flat.round().to(torch.long) if flat.is_floating_point() else flat.to(torch.long)
@@ -346,6 +429,30 @@ class OpdTaskDiagStats:
             # share alone would report that as no change.
             out[f"actor/opd_diag/kl_sum_base/{name}"] = row[_IDX["kl_base_sum"]]
             out[f"actor/opd_diag/kl_sum_eff/{name}"] = row[_IDX["kl_eff_sum"]]
+
+            # ---- the control inputs ------------------------------------
+            # R, X and D as aggregates, NOT as a mean of per-token cosines: a
+            # token with a weak signal must not get the same vote as a strong
+            # one. The aggregate form also removes the per-token zero-norm
+            # special case -- a zero-norm token adds 0 to all three sums, so
+            # nothing divides by zero.
+            R, X, D = (row[_IDX[k]] for k in ("ctl_rr_sum", "ctl_rd_sum", "ctl_dd_sum"))
+            n_ctl = row[_IDX["ctl_n"]]
+            out[f"actor/opd_diag/ctl_R/{name}"] = R
+            out[f"actor/opd_diag/ctl_X/{name}"] = X
+            out[f"actor/opd_diag/ctl_D/{name}"] = D
+            out[f"actor/opd_diag/ctl_tokens/{name}"] = n_ctl
+            out[f"actor/opd_diag/ctl_cover/{name}"] = _safe(n_ctl, n_tok)
+            out[f"actor/opd_diag/ctl_a/{name}"] = (
+                X / ((R * D) ** 0.5) if R > 0 and D > 0 else 0.0
+            )
+            # -X/R: the share of the reward's own descent that the teacher
+            # cancels at b = 1. This is the quantity a pushback limit thresholds
+            # (b <= eps / (-X/R)), which is why beta is inside X and b is not.
+            out[f"actor/opd_diag/ctl_pushback_frac/{name}"] = _safe(-X, R)
+            # What the support does not cover, so a claim about the tail
+            # approximation rests on mass rather than on token counts.
+            out[f"actor/opd_diag/tail_mass_mean/{name}"] = _safe(row[_IDX["tail_mass_sum"]], n_tok)
 
         base_total = sum(table[t][_IDX["kl_base_sum"]] for t in range(self.n_tasks))
         eff_total = sum(table[t][_IDX["kl_eff_sum"]] for t in range(self.n_tasks))
