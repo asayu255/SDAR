@@ -60,7 +60,12 @@ def _arms(text):
     below have to run once per arm rather than once per file, or two of three
     arms would go unchecked.
     """
-    if "ARM=${ARM:-" not in text:
+    # Detected by the switch, not by a default assignment: the coef script has
+    # no ARM default any more (a forgotten ARM= used to run the retired
+    # redistribute arm silently), and keying off "ARM=${ARM:-" made this helper
+    # report a multi-arm script as single-arm and then resolve the lock path
+    # with an empty arm.
+    if 'case "$ARM" in' not in text:
         return [""]
     block = text.split('case "$ARM" in', 1)[1].split("esac", 1)[0]
     arms = re.findall(r"^\s+([a-z][a-z0-9_]*)\)\s*$", block, re.M)
