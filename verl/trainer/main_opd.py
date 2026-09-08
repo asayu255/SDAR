@@ -27,6 +27,43 @@ def main(config):
 KL_COEF_BY_TASK_BOX = (0.5, 1.5)
 
 
+def validate_pushback_exclusivity(pushback, by_task, task_diag, opd_cfg):
+    """Refuse a configuration in which the online gate would stack on another weighting.
+
+    The gate multiplies the OPD term per token. A static per-task coefficient
+    other than 1 would multiply it again (b * w), and the controller's own
+    inputs -- which must be measured at the base coefficient -- would no longer
+    be. The cross-teacher weightings multiply the same term for a third reason.
+    One mechanism on the teacher-KL term at a time, or the arm is not the arm
+    its name says.
+    """
+    if not pushback or not bool(dict(pushback).get("enable", False)):
+        return
+    from verl.trainer.ppo.opd_pushback import PushbackConfig
+
+    PushbackConfig.from_mapping(pushback).validate()
+    if by_task:
+        vals = {str(k): float(v) for k, v in dict(by_task).items()}
+        if any(v != 1.0 for v in vals.values()):
+            raise ValueError(
+                f"pushback_control is enabled together with kl_loss_coef_by_task={vals}; the "
+                f"online gate replaces the static coefficient, it does not stack on it. Unset "
+                f"the static one (or set every task to 1.0)."
+            )
+    for other in ("sign_weight", "cross_teacher_kl_weight", "cross_teacher_target"):
+        o = opd_cfg.get(other, None)
+        if o is not None and bool(dict(o).get("enable", False)):
+            raise ValueError(
+                f"pushback_control is enabled together with {other}.enable=True; both multiply "
+                f"the teacher-KL term. One at a time."
+            )
+    if not task_diag:
+        raise ValueError(
+            "pushback_control needs algorithm.opd.task_diag=True: the controller reads R and "
+            "C^- off the task readout's reduced table and has no collective of its own."
+        )
+
+
 def validate_kl_coef_by_task(by_task, box=KL_COEF_BY_TASK_BOX):
     """Refuse a coefficient vector at startup rather than 150 steps in.
 
@@ -113,6 +150,23 @@ def inject_distillation_config(config) -> None:
         # a run that reports these says so in its config.
         config.actor_rollout_ref.actor.teacher_kl_task_diag = bool(
             opd_cfg.get("task_diag", False)
+        )
+        # Online pushback control: a per-task, per-step retention on the OPD
+        # term, applied only where the teacher opposes the reward's own descent.
+        # Replaces the static per-task coefficient rather than stacking on it --
+        # validate_pushback_exclusivity refuses both at once, because b * w would
+        # attenuate twice and the control inputs would no longer be at the base
+        # coefficient. Needs the task readout on: the controller reads R and C^-
+        # off the same reduced table. See verl/trainer/ppo/opd_pushback.py.
+        _pb = opd_cfg.get("pushback_control", None)
+        config.actor_rollout_ref.actor.teacher_kl_pushback = (
+            dict(_pb) if _pb is not None else None
+        )
+        validate_pushback_exclusivity(
+            config.actor_rollout_ref.actor.teacher_kl_pushback,
+            config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task,
+            config.actor_rollout_ref.actor.teacher_kl_task_diag,
+            opd_cfg,
         )
         config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")
         # top-k (+tail) dense KL support size; only used when kl_loss_type=topk_kl.

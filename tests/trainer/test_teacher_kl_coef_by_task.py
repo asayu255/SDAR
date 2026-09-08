@@ -114,7 +114,11 @@ def test_both_aggregation_paths_are_wired_in_update_policy():
     src = ast.unparse(fn)
     assert "_kl_row_coef = self.teacher_kl_row_coef(" in src
     # the token-mean branch
-    assert "loss_mat=teacher_kld * _kl_row_coef.reshape(-1, 1)" in src
+    # The token-mean path scales BEFORE the mean. Since the online gate landed the
+    # tensor it scales is _kld_for_loss, which IS teacher_kld whenever no gate is
+    # in force -- the same expression, one indirection earlier.
+    assert "_kld_for_loss * _kl_row_coef.reshape(-1, 1)" in src
+    assert "_kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w" in src
     # the per-task-weighted branch
     assert "task_loss_weight * _kl_row_coef" in src
 

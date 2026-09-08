@@ -178,6 +178,9 @@ def opd_pg_alignment_terms(
         "ctl_rr": torch.zeros_like(opd_sq),
         "ctl_rd": torch.zeros_like(opd_sq),
         "ctl_dd": torch.zeros_like(opd_sq),
+        # [-X_t]_+ PER TOKEN. sum_t [-X_t]_+ != [-sum_t X_t]_+: the signed sum
+        # lets one token's helpful distillation hide another's conflict.
+        "ctl_c_neg": torch.zeros_like(opd_sq),
     }
     if pg_grad_coef is None or log_prob is None or topk_ids is None:
         # No policy gradient to overlap with (pure distillation), or no support
@@ -237,6 +240,7 @@ def opd_pg_alignment_terms(
     out["ctl_rr"] = torch.where(ctl, pg_sq, zero)
     out["ctl_rd"] = torch.where(ctl, float(opd_coef) * dot, zero)
     out["ctl_dd"] = torch.where(ctl, float(opd_coef) ** 2 * opd_sq, zero)
+    out["ctl_c_neg"] = torch.where(ctl, (-float(opd_coef) * dot).clamp(min=0.0), zero)
     return out
 
 
@@ -269,6 +273,18 @@ _COLS = (
     "ctl_rd_sum",
     "ctl_dd_sum",
     "tail_mass_sum",
+    "ctl_cneg_sum",
+    # Rows with at least one live-reward token in the control population: a
+    # rank-summable stand-in for "how much of the task had a signal". Group
+    # coverage proper is counted on the driver, where the group ids are.
+    "ctl_live_rows",
+    # What an APPLIED per-token gate w did, three ways, because a mean w does
+    # not fix the total: the gate correlates with the KL it gates.
+    "pb_conflict_n",     # tokens gated below 1
+    "pb_w_sum",          # sum of w over the control population (mean retention)
+    "pb_kl_w_sum",       # sum of w * KL over response tokens (KL retention numerator)
+    "pb_dd_w2_sum",      # sum of w^2 * ||u_D||^2 over control (strength retention num.)
+    "pb_cneg_w_sum",     # sum of w * [-X]_+ : the pushback that REMAINED after the gate
 )
 _IDX = {name: i for i, name in enumerate(_COLS)}
 
@@ -297,8 +313,13 @@ class OpdTaskDiagStats:
         terms: dict | None,
         row_basis: torch.Tensor | None,
         row_coef: torch.Tensor | None,
+        gate_w: torch.Tensor | None = None,
     ) -> None:
         """Fold one micro-batch in.
+
+        ``gate_w`` is the per-token OPD weight the loss actually applied this
+        micro-batch (None when no gate is in force). It is recorded, never used
+        to build the control inputs -- those stay at the base coefficient.
 
         ``row_basis`` is the per-row factor the loss already applies at b = 1
         (the per-task loss weight, or None for the plain token mean), and
@@ -357,6 +378,21 @@ class OpdTaskDiagStats:
                 per_row[:, _IDX["ctl_rd_sum"]] = (terms["ctl_rd"] * ctl * b2).sum(dim=-1)
                 per_row[:, _IDX["ctl_dd_sum"]] = (terms["ctl_dd"] * ctl * b2).sum(dim=-1)
                 per_row[:, _IDX["tail_mass_sum"]] = (terms["tail_mass"] * mask).sum(dim=-1)
+                per_row[:, _IDX["ctl_cneg_sum"]] = (terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
+                per_row[:, _IDX["ctl_live_rows"]] = ((terms["ctl_rr"] * ctl).sum(dim=-1) > 0).to(mask.dtype)
+                if gate_w is not None:
+                    w = gate_w.detach().to(mask.dtype)
+                    per_row[:, _IDX["pb_conflict_n"]] = ((w < 1.0).to(mask.dtype) * ctl).sum(dim=-1)
+                    per_row[:, _IDX["pb_w_sum"]] = (w * ctl).sum(dim=-1)
+                    per_row[:, _IDX["pb_kl_w_sum"]] = (w * kl).sum(dim=-1)
+                    per_row[:, _IDX["pb_dd_w2_sum"]] = (w * w * terms["ctl_dd"] * ctl * b2).sum(dim=-1)
+                    per_row[:, _IDX["pb_cneg_w_sum"]] = (w * terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
+                else:
+                    # No gate in force: the retention accounting reads as 1.
+                    per_row[:, _IDX["pb_w_sum"]] = ctl.sum(dim=-1)
+                    per_row[:, _IDX["pb_kl_w_sum"]] = row_kl
+                    per_row[:, _IDX["pb_dd_w2_sum"]] = (terms["ctl_dd"] * ctl * b2).sum(dim=-1)
+                    per_row[:, _IDX["pb_cneg_w_sum"]] = (terms["ctl_c_neg"] * ctl * b2).sum(dim=-1)
 
             flat = task_ids.reshape(-1)
             flat = flat.round().to(torch.long) if flat.is_floating_point() else flat.to(torch.long)
@@ -366,7 +402,21 @@ class OpdTaskDiagStats:
             onehot = onehot.to(per_row.dtype) * (flat >= 0).to(per_row.dtype).unsqueeze(-1)
             self.buf += (onehot.transpose(0, 1) @ per_row).to(torch.float64)
 
-    def rows(self, task_names) -> dict:
+    def reduced(self) -> torch.Tensor:
+        """The all-rank sums, as a CPU tensor indexed [task, column]. One
+        collective; the same one rows() performs. A controller reads this so it
+        needs no collective of its own and runs identically on every rank."""
+        buf = self.buf
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            buf = buf.clone()
+            torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        return buf.detach().cpu()
+
+    @staticmethod
+    def column(table: torch.Tensor, name: str, tid: int) -> float:
+        return float(table[tid, _IDX[name]])
+
+    def rows(self, task_names, table: torch.Tensor | None = None) -> dict:
         """One all-reduce, one host read, and the ratios the sums are for.
 
         Ratios are formed AFTER the reduction, never per micro-batch and never
@@ -378,11 +428,7 @@ class OpdTaskDiagStats:
         ``push_l2_ratio`` are what the loss did with b, not a restatement of
         what the config asked for -- which is what makes them a wiring check.
         """
-        buf = self.buf
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            buf = buf.clone()
-            torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
-        table = buf.tolist()
+        table = (self.reduced() if table is None else table).tolist()
 
         def _safe(num, den):
             return float(num) / float(den) if den > 0 else 0.0
@@ -453,6 +499,20 @@ class OpdTaskDiagStats:
             # What the support does not cover, so a claim about the tail
             # approximation rests on mass rather than on token counts.
             out[f"actor/opd_diag/tail_mass_mean/{name}"] = _safe(row[_IDX["tail_mass_sum"]], n_tok)
+            # C^- and the pushback fraction the RULE thresholds. Distinct from
+            # ctl_pushback_frac above, which is -X/R on the SIGNED sum and
+            # therefore lets aligned tokens cancel conflicting ones.
+            C_neg = row[_IDX["ctl_cneg_sum"]]
+            out[f"actor/opd_diag/ctl_C_neg/{name}"] = C_neg
+            out[f"actor/opd_diag/ctl_pushback_neg_frac/{name}"] = _safe(C_neg, R)
+            out[f"actor/opd_diag/ctl_live_rows/{name}"] = row[_IDX["ctl_live_rows"]]
+            # ---- what an applied gate did (all 1.0 when no gate) -----------
+            out[f"actor/pushback/conflict_frac/{name}"] = _safe(row[_IDX["pb_conflict_n"]], n_ctl)
+            out[f"actor/pushback/w_mean/{name}"] = _safe(row[_IDX["pb_w_sum"]], n_ctl)
+            out[f"actor/pushback/kl_retained/{name}"] = _safe(row[_IDX["pb_kl_w_sum"]], row[_IDX["kl_sum"]])
+            out[f"actor/pushback/strength_retained/{name}"] = _safe(row[_IDX["pb_dd_w2_sum"]], D)
+            # pushback fraction AFTER the gate, on this step's own tokens
+            out[f"actor/pushback/ratio_after/{name}"] = _safe(row[_IDX["pb_cneg_w_sum"]], R)
 
         base_total = sum(table[t][_IDX["kl_base_sum"]] for t in range(self.n_tasks))
         eff_total = sum(table[t][_IDX["kl_eff_sum"]] for t in range(self.n_tasks))

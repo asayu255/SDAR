@@ -1,5 +1,10 @@
 # OPD 係数の再配分アーム: 探索実験としての設計（改訂 2）
 
+> **後継: `docs/opd_pushback_control_design.md`。** この文書の静的係数 $b$ は step 300 で一度測って
+> step 0 から適用する。走行中の実測でその前提が崩れていること（§6 の `adv_zero_frac`、対角の符号反転）が
+> 分かったため、毎 step 更新するタスク別保持率を対立 token にだけ適用する機構（`ARM=pushback`）に置き換えた。
+> この文書は静的版の記録として残す。`ARM=redistribute` の run はその記録のために完走させる。
+
 状態: **機構は確定。A を pilot として固定する。実装は途中（§4）。GPU 未実行。**
 
 このブランチ（`claude/opd-per-task-coef`）は `claude/privileged-notice` を base にした実装用である。

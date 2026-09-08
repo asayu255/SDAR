@@ -745,6 +745,12 @@ class ActorRolloutRefWorker(Worker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
+                # The online pushback controller's a_i and running statistics.
+                # Without these a resume would restart every task at a = 1 and
+                # re-learn the EMA from nothing, on a run whose earlier steps
+                # were trained under different coefficients.
+                extra_state_provider=self.actor.actor_extra_state_dict,
+                extra_state_consumer=self.actor.load_actor_extra_state_dict,
             )
 
         # Everything alive at this point -- the module tree, the sharded

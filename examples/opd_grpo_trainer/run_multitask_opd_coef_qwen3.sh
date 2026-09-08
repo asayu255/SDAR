@@ -146,8 +146,23 @@ case "$ARM" in
     redistribute)
         OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task={alfworld:1.076431,search:1.191101,webshop:0.5}" )
         ;;
+    pushback)
+        # The online arm. No static coefficient (null, explicitly, for the same
+        # reason as control), and a per-task, per-step retention applied only
+        # where the teacher opposes the reward's own descent. No calibration
+        # step; nothing crosses tasks. See verl/trainer/ppo/opd_pushback.py and
+        # docs/opd_pushback_control_design.md.
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control.enable=True"
+            "+algorithm.opd.pushback_control.eps=0.1"
+            "+algorithm.opd.pushback_control.ema_decay=0.9"
+            "+algorithm.opd.pushback_control.min_live_groups=4"
+            "+algorithm.opd.pushback_control.min_ctl_tokens=256"
+        )
+        ;;
     *)
-        echo "ARM must be control | uniform | redistribute, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback, got: $ARM" >&2
         exit 1
         ;;
 esac

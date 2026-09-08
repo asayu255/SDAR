@@ -27,7 +27,7 @@ import pytest
 from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
-ARMS = ("control", "uniform", "redistribute")
+ARMS = ("control", "uniform", "redistribute", "pushback")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -36,6 +36,7 @@ B = {
     "control": None,
     "uniform": {"alfworld": 1.110833, "search": 1.110833, "webshop": 1.110833},
     "redistribute": {"alfworld": 1.076431, "search": 1.191101, "webshop": 0.5},
+    "pushback": None,          # no static coefficient: the online gate replaces it
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -50,23 +51,32 @@ def _is_coef_key(key):
     return "kl_loss_coef_by_task" in key
 
 
+def _is_pushback_key(key):
+    return "pushback" in key
+
+
 # ---------------------------------------------------------------------------
 # 1. the arms differ in b and in their own name, and in nothing else
 
 
-@pytest.mark.parametrize("arm", ("uniform", "redistribute"))
-def test_the_lock_files_differ_in_nothing_but_the_coefficient(arm):
+@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback"))
+def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
+    own = _is_pushback_key if arm == "pushback" else _is_coef_key
     differing = {
         k for k in set(control) | set(other)
         if control.get(k, "<absent>") != other.get(k, "<absent>")
     }
-    unexpected = {k for k in differing if k not in allowed and not _is_coef_key(k)}
-    assert not unexpected, f"{arm} differs from control outside b: {sorted(unexpected)}"
-    # and it really does differ in b -- a test that passes because both files
-    # are identical would be worse than no test.
-    assert any(_is_coef_key(k) for k in differing)
+    unexpected = {k for k in differing if k not in allowed and not own(k)}
+    assert not unexpected, f"{arm} differs from control outside its own knob: {sorted(unexpected)}"
+    # and it really does differ -- a test that passes because both files are
+    # identical would be worse than no test.
+    assert any(own(k) for k in differing)
+    if arm == "pushback":
+        # the static coefficient stays null on this arm, on both sides
+        assert other["actor_rollout_ref.actor.teacher_kl_loss_coef_by_task"] is None
+        assert other["algorithm.opd.kl_loss_coef_by_task"] is None
 
 
 def test_the_control_arm_leaves_the_key_unset_rather_than_setting_it_to_one():

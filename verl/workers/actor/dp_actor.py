@@ -125,6 +125,7 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
     state_shift_terms as xt_state_shift_terms,
 )
 from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
+from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, conflict_gate
 from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import actor_capture, gpu_profiler
@@ -1647,6 +1648,56 @@ class DataParallelPPOActor(BasePPOActor):
         flat = raw.round().to(torch.long) if raw.is_floating_point() else raw.to(torch.long)
         return table[torch.where((flat >= 0) & (flat < n_task), flat, n_task)]
 
+    def pushback_controller(self, task_id_names):
+        """The online pushback controller, built once and kept across steps.
+
+        It holds a_i, which is applied in step s and recomputed at the end of
+        step s from that step's statistics -- so it has to outlive
+        update_policy. Built here rather than in __init__ because the task names
+        arrive with the first batch's meta_info; a checkpoint's state loaded
+        before that is parked in _pushback_pending_state and applied on
+        construction.
+        """
+        cfg_map = self.config.get("teacher_kl_pushback", None)
+        if not cfg_map or not bool(dict(cfg_map).get("enable", False)):
+            return None
+        ctl = getattr(self, "_pushback", None)
+        names = list(task_id_names or [])
+        if ctl is None:
+            if not names:
+                raise AssertionError(
+                    "teacher_kl_pushback is enabled but the batch carries no task_id_names; "
+                    "the controller is per task and cannot be built."
+                )
+            ctl = PushbackController(PushbackConfig.from_mapping(cfg_map), names)
+            pending = getattr(self, "_pushback_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending)
+                self._pushback_pending_state = None
+            self._pushback = ctl
+        elif ctl.task_names != names:
+            raise AssertionError(
+                f"task_id_names changed under the pushback controller: {ctl.task_names} -> {names}"
+            )
+        return ctl
+
+    def actor_extra_state_dict(self) -> dict:
+        """Small per-rank state the checkpoint manager stores beside lr/rng."""
+        ctl = getattr(self, "_pushback", None)
+        return {"pushback": ctl.state_dict()} if ctl is not None else {}
+
+    def load_actor_extra_state_dict(self, sd) -> None:
+        if not sd:
+            return
+        pb = sd.get("pushback", None)
+        if not pb:
+            return
+        ctl = getattr(self, "_pushback", None)
+        if ctl is not None:
+            ctl.load_state_dict(pb)
+        else:
+            self._pushback_pending_state = pb
+
     def validate_teacher_kl_task_ids(self, task_ids, task_id_names):
         """Check the ids ONCE, on the arranged batch, before the micro-batch loop.
 
@@ -2456,6 +2507,18 @@ class DataParallelPPOActor(BasePPOActor):
             if (bool(self.config.get("teacher_kl_task_diag", False)) and use_teacher_kl_loss and n_task)
             else None
         )
+        # The online pushback controller. Its per-token gate multiplies the OPD
+        # term inside the loss, so it is built on the config alone like every
+        # other accumulator here, and it REQUIRES the readout: R and C^- come
+        # off opd_diag_stats' reduced table, and it runs no collective itself.
+        pushback = self.pushback_controller(task_id_names) if use_teacher_kl_loss else None
+        if pushback is not None and opd_diag_stats is None:
+            raise AssertionError(
+                "teacher_kl_pushback needs teacher_kl_task_diag=True: the controller reads its "
+                "inputs off the readout's all-reduced table."
+            )
+        # a_i for THIS step, fixed for every micro-batch of it. Read once.
+        _pb_a = pushback.a_tensor(device=sign_dev) if pushback is not None else None
         pair_stats = SignPairCounts(n_tasks=n_task, device=sign_dev) if (pair_on and n_task) else None
         student_resid_deadzone = float((sign_cfg or {}).get("student_resid_deadzone", 0.0)) if sign_cfg_on else 0.0
         # The parameter-free arm's three accumulators, built on the config alone
@@ -3042,6 +3105,8 @@ class DataParallelPPOActor(BasePPOActor):
                     responses = data["responses"]
                     # Filled by the teacher-KL block and read after the backward.
                     _opd_diag_pending = None
+                    # The per-token OPD weight the gate applied, or None.
+                    _pb_w = None
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
@@ -3658,7 +3723,7 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                             _defer("actor/pg_loss_weighted", pg_term)
                         if (xt_grad_stats is not None or opd_grad_stats is not None
-                                or opd_diag_stats is not None):
+                                or opd_diag_stats is not None or pushback is not None):
                             # d(pg_losses)/d(log_prob), from the SAME inputs the
                             # loss above was built from rather than from a copy
                             # reconstructed in the diagnostic. Outside the
@@ -4517,49 +4582,66 @@ class DataParallelPPOActor(BasePPOActor):
                         # the loss and the diagnostics cannot disagree about what
                         # coefficient this row carried.
                         teacher_kl_coef = _teacher_kl_coef_scalar
-                        if opd_diag_stats is not None:
-                            # Collected now, consumed after the backward: the OPD
-                            # push is a (bs, T, k) tensor and building it here
-                            # would add its own peak to the step's.
+                        if opd_diag_stats is not None or pushback is not None:
+                            # The logit-space terms, computed ONCE here and reused
+                            # after the backward. They are needed before the loss
+                            # now: the gate decides which tokens this step's OPD
+                            # term is attenuated on. The (bs, T, k) intermediates
+                            # die inside opd_pg_alignment_terms; what survives is
+                            # a handful of (bs, T) tensors, all detached.
+                            _pb_terms = (
+                                opd_pg_alignment_terms(
+                                    student_topk_logprob=student_topk_logprobs,
+                                    teacher_topk_logprob=teacher_topk_lp,
+                                    teacher_kl=teacher_kld,
+                                    topk_ids=(
+                                        student_topk_ids if student_indexed_topk
+                                        else data.get("teacher_topk_ids", None)
+                                    ),
+                                    response_ids=responses,
+                                    log_prob=log_prob,
+                                    # dL_pg/dlog p, clip branches included.
+                                    pg_grad_coef=xt_pg_grad_coef,
+                                    # beta ONLY -- not beta * b, and never the
+                                    # gate. The control inputs are measured at
+                                    # the base coefficient.
+                                    opd_coef=_teacher_kl_coef_scalar,
+                                )
+                                if teacher_topk_kl and log_prob is not None
+                                else None
+                            )
+                            if pushback is not None and _pb_terms is not None and task_ids is not None:
+                                # a[task] where the teacher pushes back against a
+                                # live reward descent, 1 everywhere else. Detached;
+                                # it is a measurement of this forward, not a
+                                # differentiable part of the loss.
+                                _pb_w = conflict_gate(_pb_terms, task_ids, _pb_a, len(task_id_names))
                             _opd_diag_pending = {
                                 "teacher_kl": teacher_kld,
                                 "row_basis": task_loss_weight,
                                 "row_coef": _kl_row_coef,
-                                "align": (
-                                    {
-                                        "student_topk_logprob": student_topk_logprobs,
-                                        "teacher_topk_logprob": teacher_topk_lp,
-                                        "teacher_kl": teacher_kld,
-                                        "topk_ids": (
-                                            student_topk_ids if student_indexed_topk
-                                            else data.get("teacher_topk_ids", None)
-                                        ),
-                                        "response_ids": responses,
-                                        "log_prob": log_prob,
-                                        # dL_pg/dlog p, clip branches included.
-                                        # -A*rho would report a position the
-                                        # clip has zeroed as a full-magnitude
-                                        # conflict.
-                                        "pg_grad_coef": xt_pg_grad_coef,
-                                        # beta ONLY -- not beta * b. The control
-                                        # inputs must not carry the coefficient a
-                                        # controller would be setting from them.
-                                        "opd_coef": _teacher_kl_coef_scalar,
-                                    }
-                                    if teacher_topk_kl and log_prob is not None
-                                    else None
-                                ),
+                                "terms": _pb_terms,
+                                "gate_w": _pb_w,
                             }
+                        # What the loss takes: the KL, gated per token when the
+                        # controller is on. teacher_kld itself stays ungated so
+                        # the unweighted metric above and the readout's base
+                        # inputs keep their meaning. The gate NEVER touches the
+                        # aggregation denominator -- a mean of w is not
+                        # renormalised back to 1.
+                        _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
                         if task_loss_weight is None:
-                            if _kl_row_coef is None:
+                            if _kl_row_coef is None and _pb_w is None:
                                 policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
                             else:
                                 # Scaled BEFORE the token mean, so each token is
-                                # weighted by its own task's coefficient. The mask
-                                # denominator is untouched, and teacher_kl_loss
-                                # itself stays unscaled for the metric below.
+                                # weighted by its own task's coefficient and by the
+                                # gate. The mask denominator is untouched, and
+                                # teacher_kl_loss itself stays unscaled for the
+                                # metric below.
                                 _scaled = agg_loss(
-                                    loss_mat=teacher_kld * _kl_row_coef.reshape(-1, 1),
+                                    loss_mat=(_kld_for_loss if _kl_row_coef is None
+                                              else _kld_for_loss * _kl_row_coef.reshape(-1, 1)),
                                     loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
                                 )
                                 policy_loss = policy_loss + _scaled * teacher_kl_coef
@@ -4573,7 +4655,7 @@ class DataParallelPPOActor(BasePPOActor):
                             # ranks, and the mini-batch loss is divided by
                             # gradient_accumulation, but the weights already carry the
                             # full normalisation.
-                            row_kl = (teacher_kld * response_mask).sum(-1)
+                            row_kl = (_kld_for_loss * response_mask).sum(-1)
                             _row_w = (task_loss_weight if _kl_row_coef is None
                                       else task_loss_weight * _kl_row_coef)
                             weighted_teacher_kl = (row_kl * _row_w).sum()
@@ -4610,9 +4692,10 @@ class DataParallelPPOActor(BasePPOActor):
                         loss.backward()
 
                     if opd_diag_stats is not None and _opd_diag_pending is not None and task_ids is not None:
-                        # After the backward, so the graph the (bs, T, k) push is
-                        # built from has already been freed. Diagnostics only: no
-                        # host sync here, and nothing touches the loss.
+                        # After the backward. The terms were built before the loss
+                        # (the gate needed them); this only folds them into the
+                        # table. Diagnostics only: no host sync, nothing touches
+                        # the loss.
                         with _actor_phase("actor.opd_diag"), torch.no_grad():
                             _pend = _opd_diag_pending
                             opd_diag_stats.update(
@@ -4620,12 +4703,10 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=response_mask,
                                 teacher_kl=_pend["teacher_kl"],
                                 advantages=data.get("advantages", None),
-                                terms=(
-                                    opd_pg_alignment_terms(**_pend["align"])
-                                    if _pend["align"] is not None else None
-                                ),
+                                terms=_pend["terms"],
                                 row_basis=_pend["row_basis"],
                                 row_coef=_pend["row_coef"],
+                                gate_w=_pend["gate_w"],
                             )
 
                     if task_ids is not None:
@@ -5292,7 +5373,25 @@ class DataParallelPPOActor(BasePPOActor):
             # coefficient is handed in: every ratio there is eff/base on the same
             # tokens, so it reports what the loss did rather than restating the
             # config.
-            metrics.update(opd_diag_stats.rows(list(task_id_names or [])))
+            _names = list(task_id_names or [])
+            _table = opd_diag_stats.reduced()
+            metrics.update(opd_diag_stats.rows(_names, table=_table))
+            if pushback is not None:
+                # a as APPLIED this step, then a for the next one from this
+                # step's reduced sums. Group coverage comes from the driver's
+                # meta_info, where the group ids live; absent -> 0 -> the
+                # controller holds a = 1 rather than acting on nothing.
+                for _tid, _nm in enumerate(_names):
+                    metrics[f"actor/pushback/a_applied/{_nm}"] = float(_pb_a[_tid])
+                _lg = dict(data.meta_info.get("pushback_live_groups", {}) or {})
+                col = OpdTaskDiagStats.column
+                metrics.update(pushback.update(
+                    R={n: col(_table, "ctl_rr_sum", t) for t, n in enumerate(_names)},
+                    C_neg={n: col(_table, "ctl_cneg_sum", t) for t, n in enumerate(_names)},
+                    ctl_tokens={n: col(_table, "ctl_n", t) for t, n in enumerate(_names)},
+                    live_groups={n: int(_lg.get(n, 0)) for n in _names},
+                    present={n: col(_table, "n_tok", t) > 0 for t, n in enumerate(_names)},
+                ))
             _by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
             if _by_task:
                 _coef = self.config.get("teacher_kl_loss_coef", 1.0)

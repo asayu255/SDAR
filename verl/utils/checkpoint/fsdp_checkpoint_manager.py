@@ -55,8 +55,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin] = None,
         checkpoint_contents: Optional[list] = None,
+        extra_state_provider=None,
+        extra_state_consumer=None,
         **kwargs,
     ):
+        # Small per-rank state that is neither model, optimizer nor scheduler but
+        # must survive a resume with them -- e.g. an online controller's
+        # coefficients and running statistics. Provider returns a dict that is
+        # stored under "actor_extra"; consumer receives it back on load (or None
+        # when the checkpoint predates it). Both optional, both plain callables,
+        # so this file stays ignorant of what the state means.
+        self._extra_state_provider = extra_state_provider
+        self._extra_state_consumer = extra_state_consumer
         if checkpoint_contents is None:
             checkpoint_contents = ["model", "optimizer", "extra"]
         if processing_class is None:
@@ -126,6 +136,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
+        if self._extra_state_consumer is not None:
+            # None for a checkpoint written before this existed; the consumer
+            # decides whether that is acceptable.
+            self._extra_state_consumer(extra_state_dict.get("actor_extra", None))
+
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
         Save an FSDP checkpoint for this rank.
@@ -173,6 +188,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     "lr_scheduler": lr_scheduler_state_dict,
                     "rng": self.get_rng_state(),
                 }
+                if self._extra_state_provider is not None:
+                    extra_state_dict["actor_extra"] = self._extra_state_provider()
                 model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")

@@ -294,6 +294,7 @@ def _stats_with(rows, names=("alfworld", "search", "webshop"), terms=None):
             "ctl_rr": torch.ones(n, t),
             "ctl_rd": torch.zeros(n, t),
             "ctl_dd": torch.ones(n, t),
+            "ctl_c_neg": torch.zeros(n, t),
         }
     st = OpdTaskDiagStats(n_tasks=len(names), device=torch.device("cpu"))
     st.update(task_ids=task_ids, response_mask=mask, teacher_kl=kl, advantages=adv,
@@ -708,6 +709,7 @@ def test_the_aggregate_is_not_the_mean_of_per_token_cosines():
         "pg_sq": torch.zeros(n, t), "align_mask": torch.zeros(n, t),
         "pg_live": torch.zeros(n, t), "tail_mass": torch.zeros(n, t),
         "ctl_mask": torch.ones(n, t), "ctl_rr": rr, "ctl_rd": rd, "ctl_dd": dd,
+        "ctl_c_neg": torch.clamp(-rd, min=0.0),
     }
     st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
@@ -721,7 +723,7 @@ def test_the_aggregate_is_not_the_mean_of_per_token_cosines():
     )
     # and a zero-norm token needs no special case: it adds 0 to all three
     terms2 = dict(terms, ctl_rr=torch.zeros(n, t), ctl_rd=torch.zeros(n, t),
-                  ctl_dd=torch.zeros(n, t))
+                  ctl_dd=torch.zeros(n, t), ctl_c_neg=torch.zeros(n, t))
     st2 = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st2.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
                teacher_kl=torch.ones(n, t), advantages=torch.ones(n, t),
@@ -740,6 +742,7 @@ def test_the_pushback_fraction_is_what_a_limit_would_threshold():
         "pg_live": torch.zeros(n, t), "tail_mass": torch.zeros(n, t),
         "ctl_mask": torch.ones(n, t), "ctl_rr": torch.tensor([[4.0]]),
         "ctl_rd": torch.tensor([[-1.0]]), "ctl_dd": torch.tensor([[1.0]]),
+        "ctl_c_neg": torch.tensor([[1.0]]),
     }
     st = OpdTaskDiagStats(n_tasks=1, device=torch.device("cpu"))
     st.update(task_ids=torch.tensor([0]), response_mask=torch.ones(n, t),
@@ -771,5 +774,41 @@ def test_beta_reaches_the_terms_from_the_actor_and_b_does_not():
 
     src = ast.unparse(next(n for n in ast.walk(ast.parse(inspect.getsource(m)))
                            if isinstance(n, ast.FunctionDef) and n.name == "update_policy"))
-    assert "'opd_coef': _teacher_kl_coef_scalar" in src, "beta must be handed over"
-    assert "'opd_coef': _opd_effective_coef" not in src, "that one carries b"
+    assert "opd_coef=_teacher_kl_coef_scalar" in src, "beta must be handed over"
+    assert "opd_coef=_opd_effective_coef" not in src, "that one carries b"
+
+
+def test_c_neg_is_the_positive_part_per_token_not_of_the_sum():
+    """One row, two tokens: aligned (+) and conflicting (-). The signed sum
+    nearly cancels; C^- must still see the conflicting token in full."""
+    vocab = 6
+    logits = torch.zeros(vocab, dtype=torch.float64)
+    # token A: teacher agrees with a positive advantage; token B: the same teacher
+    # state but the advantage flipped, so the dot flips sign
+    p_t = torch.tensor([0.12, 0.30, 0.145, 0.145, 0.145, 0.145], dtype=torch.float64)
+    t_lp = p_t.log()
+    ids = torch.topk(t_lp, vocab).indices
+    lp = torch.log_softmax(logits, dim=-1)
+    old_lp = float(lp[0])
+    coef = torch.cat([
+        _pg_coef(logits, 0, adv=-1.0, old_lp=old_lp),   # aligned token
+        _pg_coef(logits, 0, adv=+1.0, old_lp=old_lp),   # conflicting token
+    ], dim=1)
+    terms = opd_pg_alignment_terms(
+        student_topk_logprob=lp[ids].reshape(1, 1, -1).expand(1, 2, -1),
+        teacher_topk_logprob=t_lp[ids].reshape(1, 1, -1).expand(1, 2, -1),
+        teacher_kl=topk_kl_per_token(student_topk_logprob=lp[ids].reshape(1, 1, -1),
+                                     teacher_topk_logprob=t_lp[ids].reshape(1, 1, -1)).expand(1, 2),
+        topk_ids=ids.reshape(1, 1, -1).expand(1, 2, -1),
+        response_ids=torch.tensor([[0, 0]]),
+        log_prob=lp[0].reshape(1, 1).expand(1, 2),
+        pg_grad_coef=coef,
+        opd_coef=1.0,
+    )
+    rd = terms["ctl_rd"][0]
+    assert rd[0] > 0 and rd[1] < 0, "fixture: one aligned, one conflicting"
+    assert float(rd.sum()) == pytest.approx(0.0, abs=1e-9), "the signed sum cancels exactly here"
+    c_neg = terms["ctl_c_neg"][0]
+    assert float(c_neg[0]) == 0.0
+    assert float(c_neg[1]) == pytest.approx(float(-rd[1]))
+    assert float(c_neg.sum()) > 0, "and C^- does not"
