@@ -232,6 +232,30 @@
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
 "actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
 
+# ---- speculative decoding (pinned although engine knobs are exempt) ----------
+# ON, because this arm belongs to the CROSS family (control + cross), and the
+# two arms of a comparison have to sample the same way. It is not covered by
+# the performance-knob exemption at the top of this file: it changes which
+# tokens are SAMPLED. Rejection sampling preserves the target distribution --
+# vLLM's RejectionSampler follows 2211.17192, the n-gram proposer supplies no
+# draft probabilities so the draft is deterministic and accept-plus-recover is
+# exact, and training samples at temperature 1.0 with no top_p or top_k, the
+# one case vLLM's own docstring says spec decode does not support. What changes
+# is which tokens get drawn, the same class as enable_prefix_caching=True and
+# enforce_eager=False, which are already on here and in the August baseline.
+# acceptance_method is pinned rather than left to a default a vLLM upgrade
+# could move.
+# The three arms of the coefficient family pin this to null instead: the live
+# pushback run and the August baseline (wandb ktrcnege) both sampled without
+# it. That is also why the coefficient family has no in-file control any more.
+# Not yet run on a GPU: coexistence with sleep mode and the rollout pump is
+# unverified, and the failure mode is a startup crash.
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method": ngram
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens": 4
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min": 2
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max": 5
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.acceptance_method": rejection_sampler
+
 # ---- run identity ------------------------------------------------------------------
 # PINNED, because the three arms are only comparable if they ran on the same
 # hardware. The rollouts are SAMPLED: a different GPU count changes the FSDP

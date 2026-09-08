@@ -134,8 +134,59 @@ if [ -z "${ARM:-}" ]; then
     echo "  e.g.  ARM=pushback bash $0" >&2
     exit 1
 fi
+# ---- speculative decoding: which arms carry it, and why it is per-family ----
+# n-gram speculative decoding goes on the CROSS FAMILY only -- the cross gate
+# arm and the pure OPD+GRPO control it is compared against -- and is declared
+# OFF on the three arms of the earlier coefficient family.
+#
+# It is not a performance knob in the sense of the intent locks' exemption: it
+# changes which tokens are SAMPLED. Rejection sampling preserves the target
+# distribution (vLLM's RejectionSampler follows 2211.17192, the n-gram proposer
+# supplies no draft probabilities so the draft is deterministic and the
+# accept-plus-recover split is exact, and training samples at temperature 1.0
+# with no top_p or top_k -- the one case vLLM's own docstring says spec decode
+# does not support). What changes is which tokens get drawn, the same class as
+# enable_prefix_caching=True and enforce_eager=False, both of which are already
+# on in every arm here and in the August baseline.
+#
+# Same class or not, it has to be IDENTICAL ACROSS COMPARED ARMS, which is why
+# it is per family rather than global:
+#   cross family        control, cross            -- ON
+#   coefficient family  uniform, redistribute,
+#                       pushback                  -- OFF (null, explicitly)
+# The live pushback run and the August baseline sdar_multitask_opd_grpo
+# (wandb ktrcnege) both sampled WITHOUT it, so turning it on for them would
+# make this file describe runs that do not exist.
+#
+# CONSEQUENCE, and it is not small: with control in the cross family, the
+# coefficient family loses its in-file control. The pushback arm's baseline is
+# ktrcnege, not this control -- see docs/opd_output_space_cross_gate_design.md
+# on why that comparison already carries an era shift.
+#
+# UNVERIFIED: coexistence with sleep mode and the rollout pump. The sibling
+# scripts record a V0 blocker (SpecDecodeWorker has no sleep(), and the engine
+# is built with enable_sleep_mode=True); this stack is core=v1, where spec
+# decode lives in v1/spec_decode and sleep is supported, the args compose
+# through engine_kwargs.vllm, and SpeculativeConfig builds on CPU with
+# method=ngram. Failure is therefore a startup crash, not a silent wrong run.
+# Do NOT put this on the cross gate's FIRST GPU launch: run the design's
+# 5/10/20/40-step check without it, so a crash names one cause and not two.
+_SPEC_ON=(
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min=2"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max=5"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.acceptance_method=rejection_sampler"
+)
+# EXPLICITLY null, not absent, for the same reason the control arm says null to
+# kl_loss_coef_by_task: an absent key leaves the lock comparing <absent> against
+# a pinned value and fails the run in seconds. vllm_rollout_spmd drops None
+# entries from engine_kwargs, so null reaches the engine as "no spec decode".
+_SPEC_OFF=( "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config=null" )
+
 case "$ARM" in
     control)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
         # EXPLICITLY null, not absent. The injection turns this into
         # teacher_kl_loss_coef_by_task = None on the actor, so dp_actor still
         # takes the original expressions -- passing {1,1,1} would take the
@@ -151,12 +202,15 @@ case "$ARM" in
         OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task=null" )
         ;;
     uniform)
+        SPEC_ARGS=( "${_SPEC_OFF[@]}" )
         OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task={alfworld:1.110833,search:1.110833,webshop:1.110833}" )
         ;;
     redistribute)
+        SPEC_ARGS=( "${_SPEC_OFF[@]}" )
         OPD_COEF_ARGS=( "+algorithm.opd.kl_loss_coef_by_task={alfworld:1.076431,search:1.191101,webshop:0.5}" )
         ;;
     pushback)
+        SPEC_ARGS=( "${_SPEC_OFF[@]}" )
         # The online arm. No static coefficient (null, explicitly, for the same
         # reason as control), and a per-task, per-step retention applied only
         # where the teacher opposes the reward's own descent. No calibration
@@ -172,6 +226,7 @@ case "$ARM" in
         )
         ;;
     cross)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
         # MOPD v1. Pure OPD+GRPO underneath (static coefficient null, self gate
         # OFF), plus a soft cross-task gate on the OPD term driven by OTHER
         # tasks' role-wise RL references. Conditions fixed in advance on scale,
@@ -385,26 +440,6 @@ mkdir -p "$(dirname "$TORCH_NCCL_DEBUG_INFO_TEMP_FILE")"
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
 
 python3 -c "from transformers import AutoConfig, AutoTokenizer; m='Qwen/Qwen3-1.7B'; AutoConfig.from_pretrained(m); AutoTokenizer.from_pretrained(m); print(f'Validated {m}')"
-# NO speculative decoding here, and unlike the sibling scripts the reason is no
-# longer the V0 blocker they record. This stack is already V1 (vllm 0.9.2,
-# core=v1), spec decode lives in v1/spec_decode with sleep supported, the
-# args compose through engine_kwargs.vllm.speculative_config, and
-# SpeculativeConfig builds on CPU with method=ngram. It would very likely start.
-# It stays out because it changes the SAMPLED TOKENS. The RNG consumption
-# pattern differs and the target logits come from a verification batch shape
-# rather than a single-token decode, so an arm running it draws different
-# trajectories from every arm already run -- all of which sampled with
-# ppo_micro_batch_size_per_gpu=5 and no speculation. The sibling scripts reach
-# the same conclusion from the other direction: it is "its own experiment on
-# every arm at once, not a knob to flip here".
-# The measurement that makes it tempting, so it need not be redone: the turn
-# table decomposes the gen phase as engine 72.1%, envstep 18.6%, preproc 5.5%,
-# tchWait 3.4%, decode 0.4%, and 72% of the engine's own time sits at <=40% of
-# peak concurrency at 65 ms/seq/turn against the head's 24. That tail is 29% of
-# the step with SM at 60-73%, which is the memory-bound regime speculation
-# addresses. If it is ever taken up, rollout_probs_diff (ray_trainer.py:1856,
-# needs rollout.return_rollout_log_probs=True, a pure diagnostic) tests the
-# exactness claim on this data rather than on vLLM's word.
 
 
 # Data prep. These literals are shared with the training command below and are
@@ -543,6 +578,7 @@ python3 -m verl.trainer.main_opd_grpo \
     +algorithm.opd.teacher_paths.webshop=$HOME/checkpoints/teachers/webshop_step300 \
     +algorithm.opd.kl_loss_coef=0.01 \
     "${OPD_COEF_ARGS[@]}" \
+    "${SPEC_ARGS[@]}" \
     +algorithm.opd.task_diag=True \
     +algorithm.opd.kl_loss_type=topk_kl \
     +algorithm.opd.topk=20 \

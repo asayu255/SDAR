@@ -56,6 +56,22 @@ def _is_pushback_key(key):
     return "pushback" in key
 
 
+# Speculative decoding is pinned per FAMILY, not per arm: the cross family
+# (control + cross) samples with it, the coefficient family (uniform,
+# redistribute, pushback) without, because the live pushback run and the August
+# pure OPD+GRPO baseline both sampled without it. It changes which tokens are
+# drawn, so it has to be identical within a comparison -- which is exactly what
+# test_speculative_decoding_is_uniform_within_each_family asserts. Here it is
+# allowed to differ from control so the coefficient arms are not reported as
+# having drifted.
+SPEC_ROOT = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
+CROSS_FAMILY = ("control", "cross")
+
+
+def _is_spec_key(key):
+    return key == SPEC_ROOT or key.startswith(SPEC_ROOT + ".")
+
+
 def _is_cross_key(key):
     # the cross gate's own knobs, and the self gate it DECLARES off (the
     # control lock does not mention pushback at all, so "null" differs from
@@ -71,12 +87,13 @@ def _is_cross_key(key):
 def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
+    own_or_family = lambda k: _is_spec_key(k) or own(k)
     own = {"pushback": _is_pushback_key, "cross": _is_cross_key}.get(arm, _is_coef_key)
     differing = {
         k for k in set(control) | set(other)
         if control.get(k, "<absent>") != other.get(k, "<absent>")
     }
-    unexpected = {k for k in differing if k not in allowed and not own(k)}
+    unexpected = {k for k in differing if k not in allowed and not own_or_family(k)}
     assert not unexpected, f"{arm} differs from control outside its own knob: {sorted(unexpected)}"
     # and it really does differ -- a test that passes because both files are
     # identical would be worse than no test.
@@ -339,3 +356,30 @@ def test_the_arm_the_shell_launches_passes_its_own_intent_lock(arm, tmp_path):
     else:
         assert dict(got) == B[arm]
     assert cfg.actor_rollout_ref.actor.teacher_kl_task_diag is True
+
+
+def test_speculative_decoding_is_uniform_within_each_family():
+    """Both arms of a comparison must sample the same way, or the comparison is
+    between two sampling processes rather than two objectives.
+
+    Rejection sampling preserves the target distribution, but which tokens get
+    drawn still changes, so this is not covered by the performance-knob
+    exemption. The cross family carries it; the coefficient family does not,
+    because the live pushback run and the August baseline (wandb ktrcnege) both
+    sampled without it.
+    """
+    locks = {a: _flat(a) for a in ARMS}
+    on = {a: locks[a].get(SPEC_ROOT + ".method") for a in CROSS_FAMILY}
+    assert set(on.values()) == {"ngram"}, f"cross family disagrees on spec decode: {on}"
+    for a in CROSS_FAMILY:
+        assert locks[a][SPEC_ROOT + ".num_speculative_tokens"] == 4
+        assert locks[a][SPEC_ROOT + ".acceptance_method"] == "rejection_sampler"
+    for a in ARMS:
+        if a in CROSS_FAMILY:
+            continue
+        assert locks[a][SPEC_ROOT] is None, (
+            f"{a} is in the coefficient family and must declare spec decode null, "
+            f"got {locks[a][SPEC_ROOT]!r}"
+        )
+    # and the two families really do differ on it, or this test is vacuous
+    assert locks["control"].get(SPEC_ROOT + ".method") != locks["pushback"].get(SPEC_ROOT + ".method")
