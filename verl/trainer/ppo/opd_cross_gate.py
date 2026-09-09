@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import itertools
 import math
 from dataclasses import asdict, dataclass, field
 
@@ -152,11 +153,15 @@ class CrossGateConfig:
     # Cap on the per-token attenuation. An experimental condition the constraint
     # is not allowed to override.
     lambda_max: float = 0.2
-    # STRENGTH KNOB. q_tilde = min(1, q_scale * q), applied per receiver AFTER
-    # gamma and the [0, 1] clamp, so h = sum_i omega_i q_tilde_i keeps both
-    # h <= 1 and the identity the receiver attribution divides by. In the
-    # non-saturating region this is exactly q_scale * h, so 1 - w scales with
-    # it; where q_scale * q >= 1 the clamp holds the token at lambda_max.
+    # STRENGTH KNOB. Applied to the DIRECTION RESPONSE a_i = min_s[-cos]_+,
+    # before gamma and before omega pools it:
+    #     a_tilde_i = min(1, q_scale * a_i),  q_tilde_i = gamma_i * a_tilde_i
+    # so q_tilde_i <= gamma_i at every strength -- amplifying the response to an
+    # opposed direction never amplifies a low RELIABILITY. (min(1, k*gamma*a)
+    # would: gamma 0.01 with a 0.5 is q 0.005, and k = 100 makes it 0.5, a
+    # decision to trust an unreliable reference dressed as a strength change.)
+    # h = sum_i omega_i q_tilde_i still satisfies h <= 1 and is still the
+    # omega-weighted mean the receiver attribution divides by.
     #
     # Why here and not on lambda_max: 1 - w = lambda * h_tilde <= lambda_max
     # whatever q_scale is, so the per-token floor (80% of the teacher signal at
@@ -517,6 +522,25 @@ def cross_gate_forward(
         # divide by delta and manufacture a gate out of nothing. Branched on the
         # same quantity the denominator uses.
         q = torch.where((scale_tok > 0).all(dim=-1), q, torch.zeros_like(q))
+
+        # THE STRENGTH KNOB, applied here: to a_i = min_s [-cos(v_i^s, d)]_+, the
+        # DIRECTION response, BEFORE gamma multiplies it.
+        #
+        #     a_tilde_i = min(1, q_scale * a_i),   q_tilde_i = gamma_i a_tilde_i
+        #
+        # so q_tilde_i <= gamma_i at every strength: amplifying the response to
+        # an opposed direction never amplifies a LOW RELIABILITY. Applying it
+        # after gamma instead -- min(1, k gamma a) -- would: gamma = 0.01 with a
+        # = 0.5 gives q = 0.005, and k = 100 turns that into 0.5, which is not a
+        # strength change but a decision to trust an unreliable reference. In v1
+        # there is no gamma and the two placements coincide.
+        #
+        # Still before omega pools q into h, which is what keeps D = E[h x] and
+        # K = E[h^2 d^2] re-aggregated from the SAME gate the loss applies, and
+        # keeps h the omega-weighted mean that lost_by_recv divides by.
+        if float(q_scale) != 1.0:
+            q = (q * float(q_scale)).clamp(min=0.0, max=1.0)
+
         if int(gate_version) >= 2:
             # gamma_{i,c}: the two prompt-disjoint halves' agreement. Opposed
             # halves give 0 and the receiver is inert; agreeing halves that both
@@ -535,17 +559,6 @@ def cross_gate_forward(
         # part-resumed reference need not respect.
         # tests/trainer/test_opd_cross_gate.py section 6 asserts the invariant.
         q = q.clamp(min=0.0, max=1.0)
-
-        # THE STRENGTH KNOB, applied here and only here: on the per-receiver q,
-        # after gamma and after the guard above, before omega pools it into h.
-        # Placing it here is what makes every downstream consumer -- w, the
-        # solver's D and K, strength_lost, every diagnostic -- read the SAME
-        # scaled gate, so the priced intervention and the executed one agree.
-        # The re-clamp keeps q_tilde <= 1, hence h <= 1, hence the lambda_max
-        # floor on w; and h stays the omega-weighted mean of the q's, which the
-        # lost_by_recv attribution divides by. See CrossGateConfig.q_scale.
-        if float(q_scale) != 1.0:
-            q = (q * float(q_scale)).clamp(min=0.0, max=1.0)
 
         # valid receivers: (i, c(t)) usable, i != sender, and the role is controlled
         valid_ic = refs.valid.to(dev)                                              # (nT, nR)
@@ -583,6 +596,21 @@ _CROSS_COLS = (
     "n_tok",           # tokens of (j, c) the receiver i was evaluated on
     "B_sum",           # sum v_i . d            (signed)
     "D_sum",           # sum h v_i . d          (signed)
+    # D SPLIT BY THE SIGN OF THE CROSS EFFECT, and D_sum = Dpos_sum - Dneg_sum.
+    # D is what the solver prices attenuation by, and it pools two opposite
+    # things at token level: where x_i < 0 the attenuation HELPS receiver i,
+    # where x_i > 0 (a token some OTHER receiver raised h on) it destroys a
+    # POSITIVE transfer to i. A net D that looks like help can still be paying
+    # for it out of transfer that was working. Only the split can say so:
+    #   lost positive    = sum_j lambda_j Dpos_ij
+    #   removed negative = sum_j lambda_j Dneg_ij
+    # Diagnostics in this version -- NOT a constraint. A "lose no positive
+    # transfer at all" rule would stop nearly every intervention whose
+    # receivers disagree in sign, which is the road back to a mechanism that
+    # does nothing. And these are OUTPUT-SPACE proxies: Dpos > 0 is not
+    # evidence that useful knowledge was transferred.
+    "Dpos_sum",        # sum h [v_i . d]_+
+    "Dneg_sum",        # sum h [-v_i . d]_+
     "Aneg_sum",        # sum [-v_i . d]_+       (diagnostic only)
     "realized_sum",    # sum w v_i . d          (after the gate applied this step)
     "lost_by_recv",    # sum (omega_i q_i / h) (1 - w^2) ||d||^2  -- receiver i's share of removed strength
@@ -598,6 +626,22 @@ _SEND_COLS = (
     "kl_lost",         # sum (1 - w) KL
     "strength_lost",   # sum (1 - w^2) ||d||^2
     "strength_lost_self_aligned",   # ... restricted to r . d > 0
+    # THE SENDER'S OWN COST, which nothing in the objective sees. T_j =
+    # E[h r_j . d_j] is the OPD component aligned with this task's OWN RL that
+    # the attenuation is about to remove: at lambda_j the predicted self-cost is
+    # lambda_j T_j. Split by sign because the signed mean pools "removing OPD
+    # that pushes against this task's RL" (sd < 0, a gain) with "removing OPD
+    # that agrees with it" (sd > 0, a loss), and strength_lost_self_aligned
+    # already shows those are both present -- it is a MAGNITUDE share, so it
+    # cannot give the sign of the net.
+    #
+    # Measured, not constrained, and deliberately NOT wired to token selection:
+    # choosing tokens by self-conflict is the old self gate, which this arm
+    # replaced. The cross gate still picks the tokens; this only prices what
+    # picking them costs the sender.
+    "T_num",           # sum h (r . d)          (signed)
+    "T_pos",           # sum h [r . d]_+
+    "T_neg",           # sum h [-(r . d)]_+
     "h_sum",
     "h_nonzero",
     "w_sum",
@@ -724,6 +768,9 @@ class CrossGateStats:
             _add_send("kl_lost", (1.0 - w) * kl)
             _add_send("strength_lost", (1.0 - w * w) * d_sq)
             _add_send("strength_lost_self_aligned", (1.0 - w * w) * d_sq * (sd > 0).to(torch.float32))
+            _add_send("T_num", h * sd)
+            _add_send("T_pos", h * sd.clamp(min=0.0))
+            _add_send("T_neg", h * (-sd).clamp(min=0.0))
             _add_send("h_sum", h)
             _add_send("h_nonzero", (h > 0).to(torch.float32))
             _add_send("h_ge_half", (h >= 0.5).to(torch.float32))
@@ -746,6 +793,8 @@ class CrossGateStats:
                 _add_cross("n_tok", one)
                 _add_cross("B_sum", xi)
                 _add_cross("D_sum", h * xi)
+                _add_cross("Dpos_sum", h * xi.clamp(min=0.0))
+                _add_cross("Dneg_sum", h * (-xi).clamp(min=0.0))
                 _add_cross("Aneg_sum", (-xi).clamp(min=0.0))
                 _add_cross("realized_sum", w * xi)
                 _add_cross("lost_by_recv", (oi * qi / h_safe) * removed * (h > 0).to(torch.float32))
@@ -782,8 +831,9 @@ def solve_role(
     delta: float,
     iters: int = 500,
     tol: float = 1e-12,
+    gamma: np.ndarray | None = None,
 ) -> dict:
-    """min sum_j K_j l_j^2 + rho sum_{i valid} (s_i(l)/(scale_i+delta))^2, 0 <= l <= lam_max.
+    """min sum_j K_j l_j^2 + rho sum_i g_i (s_i(l)/(scale_i+delta))^2, 0 <= l <= lam_max.
 
     ``scale`` defaults to ``R`` (v1: the receiver's own reward energy, so the
     rule reads "leave a cross effect alone while it is small against RL"). v2
@@ -792,157 +842,257 @@ def solve_role(
     That is a change of control basis, not a unit fix: a cross effect that is
     absolutely tiny but relatively adverse becomes an object of control.
 
+    ``gamma`` (n,) is the RECEIVER'S RELIABILITY, the same [cos(v^1, v^2)]_+ the
+    gate multiplies q by, and it weights that receiver's demand here. Default
+    ones, which is v1 (no gamma exists there) and is also what every caller
+    that predates this argument gets. It sits OUTSIDE the square on purpose:
+    inside the numerator it would weight by gamma^2, a different design. This
+    is a design choice -- "how much of a receiver's demand to believe, given how
+    far its two prompt-disjoint halves agree" -- not a derived optimum. Before
+    it, a reference too unreliable to attenuate a single token (gamma = 0 makes
+    q = 0) still carried its full B, D and S into the decision of WHOSE lambda
+    to raise.
+
     ``K`` (n,), ``B``/``D`` (n_i, n_j) with the sender on the second axis,
     ``R`` (n,), ``valid_recv`` (n,) bool. Diagonal entries of B and D are
     ignored (a task is never its own receiver). Returns ``lam`` (n,), the slack
-    ``s`` (n,) at the solution, ``s0`` at lambda = 0, ``converged`` and ``reason``.
+    ``s`` (n,) at the solution, ``s0`` at lambda = 0, ``f``, the optimality
+    certificate ``opt_gap``, the gradient, the partials of any coordinate
+    sitting at lambda_max, ``converged`` and ``reason``.
 
-    Convex: each s_i is the positive part of an affine function of lambda, its
-    square is convex, and K >= 0. Piecewise quadratic, so no single closed form
-    -- and one sender's lambda enters several receivers' conditions, so it is
-    not a single-multiplier problem either.
+    SOLVED BY ACTIVE-SET ENUMERATION FOR A STARTING POINT, THEN EXACT CYCLIC
+    COORDINATE DESCENT, AND ACCEPTED ONLY ON A CERTIFICATE.
 
-    SOLVED BY EXACT CYCLIC COORDINATE DESCENT, not projected gradient. Along one
-    coordinate the objective is a convex piecewise quadratic whose breakpoints
-    are where a receiver's slack crosses zero; each piece has a closed-form
-    minimiser, so the 1-D step is exact. Projected gradient was tried first and
-    needs O(rho / R^2) ~ 1e4 iterations on this objective; this converges in a
-    handful of sweeps. A coordinate whose objective is flat (unobserved, or no
-    receiver it can help) is placed at 0 -- the smaller lambda wins a tie.
+    The objective is convex and C^1: each s_i is a positive part, so s_i^2 is
+    continuously differentiable (d/dx [x]_+^2 = 2[x]_+), and K >= 0. On a fixed
+    active set A = {i : s_i > 0} it is a plain convex quadratic, so the problem
+    is a finite union of box-constrained least-squares problems -- 2^n active
+    sets by 3^n box faces, 216 of them at n = 3.
+
+    ENUMERATION ALONE IS NOT ENOUGH, and that is measured rather than assumed.
+    Scoring every (active set, face) candidate on the true objective looks like
+    it must return the optimum, since the optimum's own pair is among them. It
+    does not, because the per-face least-squares solve is ILL-CONDITIONED
+    exactly where this problem lives: a valid receiver with S = 0 gives
+    w = rho/delta^2 ~ 1e60, its rows enter at 1e30, and lstsq's relative
+    singular-value cutoff then discards the sqrt(K) ~ 1e-4 rows as noise -- the
+    removal cost drops out of the solve. On 300 random problems drawn at the
+    conditioning the live run shows, enumeration alone returned a point WORSE
+    than a 41^3 grid search on one of them, with a relative certificate gap up
+    to 3e10. Column scaling improves this and does not fix it.
+
+    Coordinate descent does not have that failure mode: each step is a 1-D
+    exact minimisation of a convex piecewise quadratic -- its breakpoints are
+    where a receiver's slack crosses zero, and each piece has a closed-form
+    minimiser -- so no matrix is ever inverted. That is why the OLD solver
+    reached the optimum on all 300 saved steps despite its broken stopping test.
+    So enumeration is kept for what it is good at, a globally informed starting
+    point that a cyclic path can otherwise need many sweeps to reach, and the
+    descent does the conditioning-sensitive work. Neither is trusted: the
+    certificate decides.
+
+    WHY NOT THE OLD CYCLIC DESCENT PLUS POLISH. Two defects, both found by
+    re-solving the 150 saved steps against an independent minimiser:
+
+      - ``converged`` meant "the polish improved the objective by more than
+        1e-18", not "this point is optimal". On a fixture with the iteration
+        budget cut to one, it returned converged=True on a point 27.2% above
+        the optimum.
+      - the polish step was 1/L with L built from ``min(scale)`` over ALL
+        receivers, INVALID ONES INCLUDED. One receiver with S = 0 -- which is
+        the ordinary state of a task whose reference is not usable -- put
+        1/(0+1e-30)^2 in L and drove the step to zero. That was live: in 150 of
+        the 300 saved (step, role) cases the polish could not move at all.
+        Enumeration has no step size, and invalid receivers are dropped from
+        ``wgt`` before any reduction, so neither can recur.
+
+    The old code blamed the 0.5% stall on non-smoothness ("a coordinate-wise
+    optimum need not be a stationary point"). That reasoning was wrong -- the
+    objective is differentiable and coordinate-wise optimality of a convex C^1
+    function on a box IS global optimality. The stall was numerical, in the
+    stopping test or the iteration budget, and the exact cause is not
+    established here; enumeration removes the question rather than answering it.
+
+    ``iters`` is accepted and ignored: there is no iteration to budget. ``tol``
+    is now a RELATIVE optimality tolerance on ``opt_gap``, not a displacement
+    threshold.
     """
     n = int(K.shape[0])
     K = np.asarray(K, dtype=np.float64).reshape(n)
     B = np.asarray(B, dtype=np.float64).reshape(n, n)
     D = np.asarray(D, dtype=np.float64).reshape(n, n)
     R = np.asarray(R, dtype=np.float64).reshape(n)
-    # eps * R stays on the slack (the tolerance is a fraction of R by
-    # definition); only the PENALTY's denominator moves to `scale`.
     sc = R if scale is None else np.asarray(scale, dtype=np.float64).reshape(n)
+    sc = np.asarray(sc, dtype=np.float64).reshape(n)
     valid = np.asarray(valid_recv, dtype=bool).reshape(n)
+    gam = np.ones(n, dtype=np.float64) if gamma is None else np.asarray(gamma, dtype=np.float64).reshape(n)
     off = ~np.eye(n, dtype=bool)
     Bo, Do = B * off, D * off
     lam0 = np.zeros(n)
+    # the slack's constant part: eps * R stays on the slack (the tolerance is a
+    # fraction of R by definition); only the PENALTY's denominator moves to `scale`.
+    a0 = -eps * R - Bo.sum(axis=1)
+
+    # Per-receiver penalty weight. An INVALID receiver is zeroed here and so
+    # never reaches any reduction -- and its `scale` is replaced before the
+    # division, because np.where evaluates both branches and 0/0 would seed a
+    # nan that a later multiply by zero does not clear.
+    den = np.where(valid, sc, 1.0) + delta
+    wgt = np.where(valid, rho * np.maximum(gam, 0.0) / (den * den), 0.0)
 
     def slack(l):
-        return np.maximum(-eps * R - Bo.sum(axis=1) + Do @ l, 0.0) * valid
+        return np.maximum(a0 + Do @ l, 0.0) * valid
 
     def f(l):
         s = slack(l)
-        return float((K * l * l).sum() + rho * ((s / (sc + delta)) ** 2).sum())
+        return float((K * l * l).sum() + (wgt * s * s).sum())
 
     def grad(l):
         s = slack(l)
-        g = 2.0 * K * l
-        coef = 2.0 * rho * s / (sc + delta) ** 2          # (n_i,)
-        return g + Do.T @ coef
+        return 2.0 * K * l + Do.T @ (2.0 * wgt * s)
 
-    finite_in = np.isfinite(K).all() and np.isfinite(Bo).all() and np.isfinite(Do).all() and np.isfinite(R).all()
+    def _kkt_res(l, g=None):
+        """How far lambda is from optimal, IN LAMBDA UNITS.
+
+        The projected-gradient residual with each coordinate's own curvature
+        alpha_j = K_j + sum_i w_i D_ij^2 as the step:
+
+            r_j = l_j - clip(l_j - g_j / alpha_j, 0, lam_max)
+
+        Zero exactly at a KKT point of the box problem, and -- because the
+        gradient is divided by the curvature -- it is a DISPLACEMENT, so it
+        carries lambda's units and is comparable across the eight orders of
+        magnitude w spans here. The objective gap is reported too, but it is
+        not what convergence is judged on: at w ~ 1e60 the gap's natural scale
+        is ~1e60 as well, so a threshold relative to it passes anything.
+        """
+        g = grad(l) if g is None else g
+        # alpha_j = K_j + sum_i w_i D_ij^2. The weight indexes the RECEIVER, so
+        # it has to be broadcast down the rows -- `wgt * (Do * Do)` would scale
+        # column j by w_j instead, which understates the curvature of any
+        # coordinate whose receivers are not itself and turns a converged point
+        # into a false KKT violation.
+        alpha = K + (wgt[:, None] * (Do * Do)).sum(axis=0)
+        step = np.where(alpha > 0.0, g / np.where(alpha > 0.0, alpha, 1.0), 0.0)
+        r = l - np.clip(l - step, 0.0, lam_max)
+        return float(np.max(np.abs(r))) if np.isfinite(r).all() else float("inf")
+
+    def _out(lam, converged, reason, extra_gap=None):
+        g = grad(lam)
+        # THE CERTIFICATE. For a convex f on a box, the linearisation gap
+        #   f(l) - min_{u in box} [f(l) + g.(u - l)]
+        #     = sum_j [g_j]_+ l_j + sum_j [-g_j]_+ (lam_max - l_j)
+        # is >= f(l) - f* and vanishes exactly at a KKT point. Non-negative by
+        # construction, so it is reported as-is rather than as an absolute
+        # value, and it is what `converged` is judged on.
+        gap = float((np.maximum(g, 0.0) * lam).sum()
+                    + (np.maximum(-g, 0.0) * (lam_max - lam)).sum()) if extra_gap is None else extra_gap
+        cap = np.where(lam >= lam_max - 1e-15, g, np.nan)
+        return {"lam": lam, "s": slack(lam), "s0": slack(lam0), "converged": converged,
+                "reason": reason, "f": f(lam), "rho": float(rho),
+                "scale": np.array(sc, dtype=np.float64),
+                "gamma": np.array(gam, dtype=np.float64),
+                "opt_gap": gap, "kkt_res": _kkt_res(lam, g), "grad": g, "cap_partials": cap}
+
+    finite_in = (np.isfinite(K).all() and np.isfinite(Bo).all() and np.isfinite(Do).all()
+                 and np.isfinite(R).all() and np.isfinite(wgt).all() and np.isfinite(gam).all())
     if not finite_in:
         return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": False,
-                "reason": "nonfinite_input", "f": float("nan"), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
+                "reason": "nonfinite_input", "f": float("nan"), "rho": float(rho),
+                "scale": np.array(sc, dtype=np.float64), "gamma": np.array(gam, dtype=np.float64),
+                "opt_gap": float("nan"), "kkt_res": float("nan"),
+                "grad": np.full(n, np.nan), "cap_partials": np.full(n, np.nan)}
     if not valid.any() or lam_max <= 0.0:
-        return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": True,
-                "reason": "no_valid_receiver" if not valid.any() else "lambda_max_zero", "f": f(lam0), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
+        return _out(lam0, True, "no_valid_receiver" if not valid.any() else "lambda_max_zero", extra_gap=0.0)
 
-    # THE penalty weight the coordinate descent actually uses. `sc`, not R:
-    # f() and grad() above are for reporting and convergence, so patching only
-    # those left the v2 objective unsolved -- three mutations survived saying
-    # exactly that before this line was changed.
-    wgt_all = rho / (sc + delta) ** 2 * valid          # per receiver
-    lam = lam0.copy()
-    fx = f(lam)
-    converged = False
-    for _ in range(int(iters)):
-        max_move = 0.0
+    # ---- the enumeration -------------------------------------------------
+    # rows of the least-squares problem, per active set:
+    #   sqrt(K_j) * l_j                      (n rows, the removal cost)
+    #   sqrt(w_i) * (a0_i + (Do l)_i)        (one row per ACTIVE receiver)
+    sqrtK = np.sqrt(np.maximum(K, 0.0))
+    sqrtW = np.sqrt(np.maximum(wgt, 0.0))
+    faces = list(itertools.product((0, 1, 2), repeat=n))       # 0 -> 0, 1 -> free, 2 -> lam_max
+    best_lam, best_f = lam0.copy(), f(lam0)
+    for bits in range(1 << n):
+        act = np.array([bool((bits >> i) & 1) and valid[i] for i in range(n)], dtype=bool)
+        rows_pen = np.nonzero(act)[0]
+        # M l = y  in the least-squares sense
+        M = np.zeros((n + rows_pen.size, n), dtype=np.float64)
+        y = np.zeros(n + rows_pen.size, dtype=np.float64)
+        M[:n, :] = np.diag(sqrtK)
+        for r, i in enumerate(rows_pen):
+            M[n + r, :] = sqrtW[i] * Do[i, :]
+            y[n + r] = -sqrtW[i] * a0[i]
+        for face in faces:
+            free = [j for j in range(n) if face[j] == 1]
+            lam = np.array([0.0 if face[j] == 0 else (lam_max if face[j] == 2 else 0.0)
+                            for j in range(n)], dtype=np.float64)
+            if free:
+                fixed = [j for j in range(n) if face[j] != 1]
+                rhs = y - (M[:, fixed] @ lam[fixed] if fixed else 0.0)
+                try:
+                    sol, *_ = np.linalg.lstsq(M[:, free], rhs, rcond=None)
+                except np.linalg.LinAlgError:
+                    continue
+                if not np.isfinite(sol).all():
+                    continue
+                # clipped to stay feasible: every candidate is scored on the
+                # TRUE objective, so an out-of-box face minimiser can only ever
+                # contribute a worse feasible point, never a wrong answer
+                lam[free] = np.clip(sol, 0.0, lam_max)
+            fc = f(lam)
+            if not np.isfinite(fc):
+                continue
+            # smaller lambda wins a tie, as in every earlier version
+            if fc < best_f - 1e-18 or (abs(fc - best_f) <= 1e-18 and lam.sum() < best_lam.sum()):
+                best_lam, best_f = lam, fc
+
+    # ---- exact cyclic coordinate descent from there -----------------------
+    # Along one coordinate the objective is a convex piecewise quadratic whose
+    # breakpoints are the lambda_j at which some receiver's slack crosses zero.
+    # Each piece has a closed-form minimiser, so the 1-D step is exact and
+    # needs no matrix -- which is the whole reason this stage exists next to the
+    # enumeration. Sweeps run until the CERTIFICATE is met, not until the
+    # iterate stops moving: at rho/S^2 ~ 1e8 a displacement test fires while
+    # the objective is still falling, which is what let the old solver report
+    # convergence 27.2% above the optimum.
+    lam = best_lam.copy()
+    for _ in range(max(int(iters), 1)):
         for j in range(n):
             dj = Do[:, j]
-            # receivers this coordinate can touch: valid, not itself, D != 0
-            touch = valid & off[:, j] & (dj != 0.0)
+            touch = valid & off[:, j] & (dj != 0.0) & (wgt > 0.0)
             # the slack's affine part with lambda_j's own contribution removed
-            a = -eps * R - Bo.sum(axis=1) + Do @ lam - dj * lam[j]
+            a = a0 + Do @ lam - dj * lam[j]
             pts = {0.0, float(lam_max)}
             for i in np.nonzero(touch)[0]:
                 bp = -a[i] / dj[i]
                 if 0.0 < bp < lam_max:
                     pts.add(float(bp))
-            pts = sorted(pts)
-            best_x, best_f = lam[j], None
-            for lo, hi in zip(pts[:-1], pts[1:]):
+            best_x, best_fx = lam[j], None
+            for lo, hi in zip(sorted(pts)[:-1], sorted(pts)[1:]):
                 mid = 0.5 * (lo + hi)
                 active = touch & (a + dj * mid > 0.0)
-                w = wgt_all * active
-                alpha = float(K[j] + (w * dj * dj).sum())
-                beta = float(2.0 * (w * a * dj).sum())
-                if alpha > 0.0:
-                    x = min(max(-beta / (2.0 * alpha), lo), hi)
-                else:
-                    # flat or linear on this piece: the smaller lambda on a tie
-                    x = lo if beta >= 0.0 else hi
+                wa = wgt * active
+                alpha = float(K[j] + (wa * dj * dj).sum())
+                beta = float(2.0 * (wa * a * dj).sum())
+                x = min(max(-beta / (2.0 * alpha), lo), hi) if alpha > 0.0 else (lo if beta >= 0.0 else hi)
                 cand = lam.copy()
                 cand[j] = x
                 fc = f(cand)
-                if best_f is None or fc < best_f - 1e-18 or (abs(fc - best_f) <= 1e-18 and x < best_x):
-                    best_f, best_x = fc, x
-            max_move = max(max_move, abs(best_x - lam[j]))
-            lam[j] = best_x
-        fx = f(lam)
-        if not np.isfinite(fx):
+                if best_fx is None or fc < best_fx - 1e-18 or (abs(fc - best_fx) <= 1e-18 and x < best_x):
+                    best_fx, best_x = fc, x
+            if np.isfinite(best_x):
+                lam[j] = best_x
+        if _kkt_res(lam) <= max(float(tol), 0.0):
             break
-        if max_move < tol:
-            converged = True
-            break
-    if not np.isfinite(lam).all() or not np.isfinite(fx):
-        return {"lam": lam0, "s": slack(lam0), "s0": slack(lam0), "converged": False,
-                "reason": "nonfinite_iterate", "f": float("nan"), "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
+    if np.isfinite(lam).all() and np.isfinite(f(lam)) and f(lam) <= best_f + 1e-18:
+        best_lam, best_f = lam, f(lam)
 
-    # A PROJECTED-GRADIENT POLISH, and the better of the two points is kept.
-    #
-    # Cyclic coordinate descent can stop where no SINGLE coordinate move
-    # improves while a joint move still does: the objective is non-smooth
-    # (each s_i is a positive part) and the coordinates are coupled through
-    # D, so a coordinate-wise optimum need not be a stationary point of the
-    # joint problem. v1 never showed this because rho/R^2 is about 1e4; v2's
-    # rho_rel/S^2 is about 1e8, and at that conditioning the descent stalled
-    # 0.5% above the optimum on a 3-task fixture (found by cross-checking
-    # against an independent minimiser in the tests, not by inspection).
-    #
-    # Cheap: at most n_task variables, float64, a fixed iteration count, no
-    # branching on data, so it stays deterministic on every rank. It can only
-    # improve the answer -- the polished point is accepted solely when its
-    # objective is lower.
-    if valid.any() and lam_max > 0.0:
-        lip = 2.0 * float(np.max(K)) + 2.0 * rho * float((Do * Do).sum()) / (float(np.min(sc)) + delta) ** 2
-        if np.isfinite(lip) and lip > 0.0:
-            step = 1.0 / lip
-            pol = lam.copy()
-            f_prev = fx
-            # Stops on RELATIVE objective improvement, not on a step-size
-            # threshold: at rho/S^2 ~ 1e8 the iterates move by ~1e-6 per step
-            # for thousands of steps while the objective is still falling, so a
-            # displacement test either exits far too early or never. The cap is
-            # generous because the problem has at most n_task variables; a
-            # well-conditioned role exits in a few hundred iterations.
-            for it in range(200 * max(iters, 1)):
-                g = grad(pol)
-                if not np.isfinite(g).all():
-                    break
-                nxt = np.clip(pol - step * g, 0.0, lam_max)
-                if not np.isfinite(nxt).all():
-                    break
-                pol = nxt
-                if (it & 0x3FF) == 0x3FF:            # every 1024 iterations
-                    f_now = f(pol)
-                    if not np.isfinite(f_now):
-                        break
-                    if f_prev - f_now <= 1e-9 * max(abs(f_prev), 1e-300):
-                        break
-                    f_prev = f_now
-            fp = f(pol)
-            if np.isfinite(fp) and fp < fx - 1e-18:
-                lam, fx, converged = pol, fp, True
-
-    return {"lam": lam, "s": slack(lam), "s0": slack(lam0), "converged": converged,
-            "reason": "ok" if converged else "max_iters", "f": fx, "rho": float(rho), "scale": np.array(sc, dtype=np.float64)}
+    # ---- the certificate -------------------------------------------------
+    out = _out(best_lam, False, "not_optimal")
+    if out["kkt_res"] <= max(float(tol), 0.0):
+        out["converged"], out["reason"] = True, "ok"
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -977,11 +1127,16 @@ class CrossGateController:
         self.gamma: dict = {}
         # keyed by (task, role, side) -> _RefSide
         self.refs: dict = {}
-        # (i, j, role) -> {"B","D","Aneg"} EMAs
+        # (i, j, role) -> {"B","D","Aneg","Dpos","Dneg"} EMAs
         self.cross: dict = {}
         # (j, role) -> K numerator EMA ; j -> d_sq EMA (K denominator)
         self.k_num: dict = {}
         self.d_sq: dict = {}
+        # (j, role, {"T","Tpos","Tneg"}) -> the SENDER'S OWN cost EMAs. Reported,
+        # never in the objective: the diagonal of B and D is masked out, so what
+        # attenuating task j costs task j is invisible to the solver by
+        # construction. Recording it is the prerequisite for ever pricing it.
+        self.self_cost: dict = {}
         # (j, role) -> lambda applied NEXT step
         self.lam: dict = {}
         # (i, role) -> (valid, reason, invalid_steps)
@@ -1151,7 +1306,8 @@ class CrossGateController:
                     n_tok = float(cross[ti, tj, c, _CROSS_IDX["n_tok"]])
                     if n_tok <= 0:
                         continue
-                    for col, nm in (("B_sum", "B"), ("D_sum", "D"), ("Aneg_sum", "Aneg")):
+                    for col, nm in (("B_sum", "B"), ("D_sum", "D"), ("Aneg_sum", "Aneg"),
+                                    ("Dpos_sum", "Dpos"), ("Dneg_sum", "Dneg")):
                         self._ema_scalar(self.cross, (i, j, c, nm), float(cross[ti, tj, c, _CROSS_IDX[col]]) / n_tok)
         for tj, j in enumerate(names):
             tot = float(send[tj, :, _SEND_IDX["n_tok"]].sum())
@@ -1160,6 +1316,12 @@ class CrossGateController:
                 for c in range(nR):
                     # K's numerator carries the role share: sum over (j, c) / n_j
                     self._ema_scalar(self.k_num, (j, c), float(send[tj, c, _SEND_IDX["K_num"]]) / tot)
+                    # the sender's own cost, on the same EMA and the same share
+                    # basis as K so lambda_j T_j and K_j lambda_j^2 are readable
+                    # against each other
+                    for col, nm in (("T_num", "T"), ("T_pos", "Tpos"), ("T_neg", "Tneg")):
+                        self._ema_scalar(self.self_cost, (j, c, nm),
+                                         float(send[tj, c, _SEND_IDX[col]]) / tot)
 
         # 4. solve per controlled role
         ctrl = cfg.control_role_mask()
@@ -1174,6 +1336,7 @@ class CrossGateController:
                 if self.d_sq.get(j) is not None else 0.0
                 for j in names], dtype=np.float64)
             Bm = np.zeros((nT, nT)); Dm = np.zeros((nT, nT)); Am = np.zeros((nT, nT))
+            Dp = np.zeros((nT, nT)); Dn = np.zeros((nT, nT))
             for ti, i in enumerate(names):
                 for tj, j in enumerate(names):
                     if i == j:
@@ -1181,6 +1344,8 @@ class CrossGateController:
                     Bm[ti, tj] = self.cross.get((i, j, c, "B"), _Ema()).val
                     Dm[ti, tj] = self.cross.get((i, j, c, "D"), _Ema()).val
                     Am[ti, tj] = self.cross.get((i, j, c, "Aneg"), _Ema()).val
+                    Dp[ti, tj] = self.cross.get((i, j, c, "Dpos"), _Ema()).val
+                    Dn[ti, tj] = self.cross.get((i, j, c, "Dneg"), _Ema()).val
             Rv = np.array([
                 float(np.mean([self._ref(i, c, s).R for s in range(nS)]))
                 for i in names], dtype=np.float64)
@@ -1195,11 +1360,31 @@ class CrossGateController:
             Sv = np.maximum(((Bm + 2.0 * Am) * off).sum(axis=1), 0.0)
             valid = np.array([bool(self.validity.get((i, c), (False, 0, 0))[0]) for i in names])
             _v2 = int(cfg.gate_version) >= 2
+            # THE RECEIVER'S RELIABILITY, now on both sides of the mechanism.
+            #
+            # gamma_{i,c} = [cos(v_i^1, v_i^2)]_+ already multiplies q in the
+            # gate, so gamma = 0 means "this reference may not attenuate a
+            # single token". Until this line it did NOT weight the same
+            # reference's demand in the objective: a receiver whose two
+            # prompt-disjoint halves disagree still carried its full B, D and S
+            # into the choice of WHOSE lambda to raise, and so could have its
+            # demand met through the gate some OTHER receiver opened. Passing it
+            # here makes the two agree on what is believable.
+            #
+            # gamma_USED, not gamma_next: this is the gamma that produced the h
+            # in this step's forward and therefore the B, D and S being read.
+            # Those are multi-step EMAs while gamma is this step's value, so the
+            # pairing is an APPROXIMATION, not an identity -- the weight is
+            # current and the statistics it weights are not. v1 has no gamma and
+            # passes None, which is ones.
+            gam_used = np.array([float(self.gamma.get((i, c), 0.0)) for i in names], dtype=np.float64) \
+                if _v2 else None
             sol = solve_role(K, Bm, Dm, Rv, valid, eps=cfg.eps_cross,
                              rho=(cfg.rho_rel if _v2 else cfg.rho),
                              scale=(Sv if _v2 else None),
                              lam_max=cfg.lambda_max, delta=cfg.delta,
-                             iters=cfg.solver_iters, tol=cfg.solver_tol)
+                             iters=cfg.solver_iters, tol=cfg.solver_tol,
+                             gamma=gam_used)
             self.last_solver[c] = sol
             # Both scales, always: s/S is what v2 controls on, s/R is the v1
             # basis kept so the two arms are readable against each other. Also
@@ -1214,22 +1399,46 @@ class CrossGateController:
                 metrics[f"actor/cross/slack0_over_S/{i}/{rn}"] = _s0 / (float(Sv[ti]) + cfg.delta)
                 metrics[f"actor/cross/slack0_over_R/{i}/{rn}"] = _s0 / (float(Rv[ti]) + cfg.delta)
             for tj, j in enumerate(names):
-                new_lam[(j, c)] = float(sol["lam"][tj]) if sol["reason"] in ("ok", "max_iters", "no_valid_receiver", "lambda_max_zero") else 0.0
-                if sol["reason"] not in ("ok", "no_valid_receiver", "lambda_max_zero"):
-                    # max_iters keeps the (feasible) iterate; non-finite falls to 0
-                    if sol["reason"].startswith("nonfinite"):
-                        new_lam[(j, c)] = 0.0
+                # AN UNCERTIFIED SOLVE ATTENUATES NOTHING. The old code kept a
+                # "max_iters" iterate, which was safe only because `converged`
+                # meant "improved a little" and so almost never came back false.
+                # Now it means "the KKT residual is within tol", and a solve
+                # that cannot say that has not established which lambda is
+                # right -- so lambda is 0 and solver_reason_code says why. The
+                # cost of the conservative branch is a step with no cross
+                # attenuation; the cost of the other is attenuating on a number
+                # nothing vouches for.
+                new_lam[(j, c)] = (float(sol["lam"][tj])
+                                   if sol["reason"] in ("ok", "no_valid_receiver", "lambda_max_zero")
+                                   else 0.0)
             rn = ROLE_NAMES[c]
             metrics[f"actor/cross/solver_converged/{rn}"] = 1.0 if sol["converged"] else 0.0
             metrics[f"actor/cross/solver_reason_code/{rn}"] = float(
-                {"ok": 0, "max_iters": 1, "no_valid_receiver": 2, "lambda_max_zero": 3,
+                {"ok": 0, "not_optimal": 1, "no_valid_receiver": 2, "lambda_max_zero": 3,
                  "nonfinite_input": 4, "nonfinite_iterate": 5}.get(sol["reason"], 9))
+            # the certificate itself, so a run can be audited without re-solving
+            metrics[f"actor/cross/solver_kkt_res/{rn}"] = float(sol.get("kkt_res", float("nan")))
+            metrics[f"actor/cross/solver_opt_gap/{rn}"] = float(sol.get("opt_gap", float("nan")))
+            metrics[f"actor/cross/solver_f/{rn}"] = float(sol.get("f", float("nan")))
             for ti, i in enumerate(names):
                 metrics[f"actor/cross/slack/{i}/{rn}"] = float(sol["s"][ti])
                 metrics[f"actor/cross/slack_at_zero/{i}/{rn}"] = float(sol["s0"][ti])
                 # predicted post-control quantity for receiver i under the NEW lambda
                 pred = float(sum(Bm[ti, tj] - sol["lam"][tj] * Dm[ti, tj] for tj in range(nT) if tj != ti))
                 metrics[f"actor/cross/predicted/{i}/{rn}"] = pred
+                # THE TWO HALVES OF THAT ONE NUMBER, which it cannot show.
+                # `predicted` moving the right way is compatible with paying for
+                # it out of transfer that was working: D pools E[h [x]_+] with
+                # E[h [-x]_+]. Under the new lambda, receiver i is predicted to
+                # LOSE sum_j lambda_j Dpos_ij of positive cross contribution and
+                # to have sum_j lambda_j Dneg_ij of negative contribution
+                # REMOVED. Reported, not constrained: a "lose nothing positive"
+                # rule would stop almost every intervention whose receivers
+                # disagree in sign. Output-space proxies either way.
+                metrics[f"actor/cross/pred_lost_positive/{i}/{rn}"] = float(
+                    sum(sol["lam"][tj] * Dp[ti, tj] for tj in range(nT) if tj != ti))
+                metrics[f"actor/cross/pred_removed_negative/{i}/{rn}"] = float(
+                    sum(sol["lam"][tj] * Dn[ti, tj] for tj in range(nT) if tj != ti))
         self.lam.update(new_lam)
 
         # 5. metrics
@@ -1290,6 +1499,26 @@ class CrossGateController:
                     K_here = self.k_num.get((n, c), _Ema()).val / (self.d_sq.get(n, _Ema()).val + cfg.delta) \
                         if self.d_sq.get(n) is not None else 0.0
                     metrics[f"actor/cross/K/{n}/{rn}"] = float(K_here)
+                    # THE SENDER'S OWN COST, which the objective does not see.
+                    # T_j = E[h r_j . d_j] is the OPD component aligned with
+                    # task j's OWN RL that the attenuation removes; at the new
+                    # lambda_j the predicted self-cost is lambda_j T_j. Split
+                    # because the signed mean pools a gain (removing OPD that
+                    # pushes against this task's RL, sd < 0) with a loss
+                    # (removing OPD that agrees, sd > 0), and the existing
+                    # strength_lost_self_aligned share is a MAGNITUDE, so it
+                    # cannot give the sign of the net. Diagonal-masked B and D
+                    # mean none of this reaches the solver: measured first, on
+                    # purpose, and not wired to token selection -- choosing
+                    # tokens by self-conflict is the old self gate.
+                    T_j = float(self.self_cost.get((n, c, "T"), _Ema()).val)
+                    metrics[f"actor/cross/self_T/{n}/{rn}"] = T_j
+                    metrics[f"actor/cross/self_T_pos/{n}/{rn}"] = float(
+                        self.self_cost.get((n, c, "Tpos"), _Ema()).val)
+                    metrics[f"actor/cross/self_T_neg/{n}/{rn}"] = float(
+                        self.self_cost.get((n, c, "Tneg"), _Ema()).val)
+                    metrics[f"actor/cross/pred_self_cost/{n}/{rn}"] = float(
+                        new_lam.get((n, c), 0.0)) * T_j
         for ti, i in enumerate(names):
             for tj, j in enumerate(names):
                 if i == j:
@@ -1303,6 +1532,8 @@ class CrossGateController:
                     metrics[f"actor/cross/B/{i}/{j}/{rn}"] = g("B_sum") / n_tok
                     metrics[f"actor/cross/D/{i}/{j}/{rn}"] = g("D_sum") / n_tok
                     metrics[f"actor/cross/A_neg/{i}/{j}/{rn}"] = g("Aneg_sum") / n_tok
+                    metrics[f"actor/cross/D_pos/{i}/{j}/{rn}"] = g("Dpos_sum") / n_tok
+                    metrics[f"actor/cross/D_neg/{i}/{j}/{rn}"] = g("Dneg_sum") / n_tok
                     metrics[f"actor/cross/realized/{i}/{j}/{rn}"] = g("realized_sum") / n_tok
                     metrics[f"actor/cross/lost_by_receiver/{j}/{i}/{rn}"] = g("lost_by_recv") / n_tok
                     metrics[f"actor/cross/support_overlap/{i}/{j}/{rn}"] = g("overlap_sum") / n_tok
@@ -1331,6 +1562,7 @@ class CrossGateController:
             "refs": refs,
             "cross": {f"{i}|{j}|{c}|{nm}": asdict(e) for (i, j, c, nm), e in self.cross.items()},
             "k_num": {f"{j}|{c}": asdict(e) for (j, c), e in self.k_num.items()},
+            "self_cost": {f"{j}|{c}|{nm}": asdict(e) for (j, c, nm), e in self.self_cost.items()},
             "d_sq": {j: asdict(e) for j, e in self.d_sq.items()},
             "lam": {f"{j}|{c}": float(v) for (j, c), v in self.lam.items()},
             "validity": {f"{i}|{c}": list(v) for (i, c), v in self.validity.items()},
@@ -1371,6 +1603,13 @@ class CrossGateController:
             j, c = key.split("|")
             self.k_num[(j, int(c))] = _Ema(**d)
         self.d_sq = {j: _Ema(**d) for j, d in sd.get("d_sq", {}).items()}
+        # absent in checkpoints written before the self-cost accounting existed;
+        # an empty dict rebuilds from the next step's observations, which is
+        # correct for a REPORTED quantity and would not be for one the solver reads
+        self.self_cost = {}
+        for key, d in sd.get("self_cost", {}).items():
+            j, c, nm = key.split("|")
+            self.self_cost[(j, int(c), nm)] = _Ema(**d)
         self.lam = {}
         for key, v in sd.get("lam", {}).items():
             j, c = key.split("|")

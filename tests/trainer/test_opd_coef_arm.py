@@ -27,7 +27,7 @@ import pytest
 from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
-ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2", "cross2k50")
+ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -40,9 +40,6 @@ B = {
     "cross": None,
     # v2: same pure OPD+GRPO underneath, so the static coefficient is null too
     "cross2": None,             # MOPD v1: pure OPD+GRPO plus the cross-task gate
-    # the strength arm: cross2 with q_scale=50, so the static coefficient
-    # is null for the same reason cross2's is
-    "cross2k50": None,
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -70,7 +67,7 @@ def _is_pushback_key(key):
 # allowed to differ from control so the coefficient arms are not reported as
 # having drifted.
 SPEC_ROOT = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
-CROSS_FAMILY = ("control", "cross", "cross2", "cross2k50")
+CROSS_FAMILY = ("control", "cross", "cross2")
 
 
 def _is_spec_key(key):
@@ -104,11 +101,11 @@ def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     # and it really does differ -- a test that passes because both files are
     # identical would be worse than no test.
     assert any(own(k) for k in differing)
-    if arm in ("pushback", "cross", "cross2", "cross2k50"):
+    if arm in ("pushback", "cross", "cross2"):
         # the static coefficient stays null on this arm, on both sides
         assert other["actor_rollout_ref.actor.teacher_kl_loss_coef_by_task"] is None
         assert other["algorithm.opd.kl_loss_coef_by_task"] is None
-    if arm in ("cross", "cross2", "cross2k50"):
+    if arm in ("cross", "cross2"):
         # pure OPD+GRPO underneath: the self gate is declared OFF, on both sides
         assert other["algorithm.opd.pushback_control"] is None
         assert other["actor_rollout_ref.actor.teacher_kl_pushback"] is None

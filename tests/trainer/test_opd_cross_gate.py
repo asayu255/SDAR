@@ -16,6 +16,7 @@
 controller's window and resume. Everything on the CPU, most of it against a dense
 recomputation rather than against itself."""
 
+import itertools
 import math
 
 import numpy as np
@@ -23,6 +24,8 @@ import pytest
 import torch
 
 from verl.trainer.ppo.opd_cross_gate import (
+    _CROSS_IDX,
+    _SEND_IDX,
     INVALID_FEW_PROMPTS,
     INVALID_NEVER_SEEN,
     INVALID_STALE,
@@ -85,12 +88,12 @@ def _zero_refs(nT=3, valid=None, lam=None, ctrl=None):
     return CrossGateRefs(v=v, R=R, side_w=sw, valid=valid_t, lam=lam_t, control_roles=ctrl_t)
 
 
-def _fwd(b, refs, opd_coef=0.01, delta=1e-30, q_scale=1.0):
+def _fwd(b, refs, opd_coef=0.01, delta=1e-30, q_scale=1.0, gate_version=1):
     return cross_gate_forward(
         student_topk_logprob=b["student_topk_logprob"], teacher_topk_logprob=b["teacher_topk_logprob"],
         teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], response_ids=b["response_ids"],
         pg_grad_coef=b["pg_grad_coef"], opd_coef=opd_coef, task_ids=b["task_ids"], roles=b["roles"],
-        refs=refs, delta=delta, q_scale=q_scale,
+        refs=refs, delta=delta, q_scale=q_scale, gate_version=gate_version,
     )
 
 
@@ -347,7 +350,7 @@ def test_stats_scatter_the_reference_sums_and_bitmaps_exactly():
     # row 5 is padding: prompt 0 on side 1 must NOT be marked by it
     assert red["pbm_contrib"][2, ROLE_FORMAT, 1, 0] == 0.0
     # row 4 has no side: counted as unkeyed on the sender side, absent from references
-    assert red["send"][1, ROLE_FORMAT, 11] > 0        # n_unkeyed for task 1 format
+    assert red["send"][1, ROLE_FORMAT, _SEND_IDX["n_unkeyed"]] > 0   # task 1 format
     assert math.isclose(float(red["ref_sum"][1].abs().sum()), float(want[1].abs().sum()), rel_tol=1e-5)
 
 
@@ -371,17 +374,35 @@ def test_stats_cross_columns_are_sums_of_the_forward_outputs():
                 if not m.any():
                     continue
                 x = f["x"][:, :, i][m]
-                assert math.isclose(float(red["cross"][i, j, c, 1]), float(x.sum()), rel_tol=1e-6, abs_tol=1e-9)
-                assert math.isclose(float(red["cross"][i, j, c, 2]), float((f["h"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
-                assert math.isclose(float(red["cross"][i, j, c, 3]), float((-x).clamp(min=0).sum()), rel_tol=1e-6, abs_tol=1e-9)
-                assert math.isclose(float(red["cross"][i, j, c, 4]), float((f["w"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, _CROSS_IDX["B_sum"]]), float(x.sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, _CROSS_IDX["D_sum"]]), float((f["h"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, _CROSS_IDX["Aneg_sum"]]), float((-x).clamp(min=0).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(float(red["cross"][i, j, c, _CROSS_IDX["realized_sum"]]), float((f["w"][m] * x).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                # the sign split, and D = D+ - D- exactly
+                dp = float(red["cross"][i, j, c, _CROSS_IDX["Dpos_sum"]])
+                dn = float(red["cross"][i, j, c, _CROSS_IDX["Dneg_sum"]])
+                assert math.isclose(dp, float((f["h"][m] * x.clamp(min=0)).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert math.isclose(dn, float((f["h"][m] * (-x).clamp(min=0)).sum()), rel_tol=1e-6, abs_tol=1e-9)
+                assert dp >= -1e-12 and dn >= -1e-12, "a sign-split removal went negative"
+                assert math.isclose(dp - dn, float(red["cross"][i, j, c, _CROSS_IDX["D_sum"]]),
+                                    rel_tol=1e-9, abs_tol=1e-12), "D != D+ - D-"
     for j in range(3):
         for c in range(N_ROLES):
             m = (b["task_ids"].unsqueeze(-1).expand(6, 7) == j) & (b["roles"] == c)
             if not m.any():
                 continue
-            assert math.isclose(float(red["send"][j, c, 1]), float((f["h"][m] ** 2 * f["d_sq"][m]).sum()), rel_tol=1e-6)
-            assert math.isclose(float(red["send"][j, c, 5]), float(((1 - f["w"][m] ** 2) * f["d_sq"][m]).sum()), rel_tol=1e-6, abs_tol=1e-12)
+            assert math.isclose(float(red["send"][j, c, _SEND_IDX["K_num"]]), float((f["h"][m] ** 2 * f["d_sq"][m]).sum()), rel_tol=1e-6)
+            assert math.isclose(float(red["send"][j, c, _SEND_IDX["strength_lost"]]), float(((1 - f["w"][m] ** 2) * f["d_sq"][m]).sum()), rel_tol=1e-6, abs_tol=1e-12)
+            # the sender's own cost, and T = T+ - T-
+            sd = (f["r"][m] * f["d"][m]).sum(-1)
+            tp = float(red["send"][j, c, _SEND_IDX["T_pos"]])
+            tn = float(red["send"][j, c, _SEND_IDX["T_neg"]])
+            assert math.isclose(float(red["send"][j, c, _SEND_IDX["T_num"]]), float((f["h"][m] * sd).sum()),
+                                rel_tol=1e-6, abs_tol=1e-12)
+            assert math.isclose(tp, float((f["h"][m] * sd.clamp(min=0)).sum()), rel_tol=1e-6, abs_tol=1e-12)
+            assert math.isclose(tn, float((f["h"][m] * (-sd).clamp(min=0)).sum()), rel_tol=1e-6, abs_tol=1e-12)
+            assert math.isclose(tp - tn, float(red["send"][j, c, _SEND_IDX["T_num"]]),
+                                rel_tol=1e-9, abs_tol=1e-12), "T != T+ - T-"
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +935,15 @@ def test_the_controller_really_solves_v2s_objective_end_to_end():
         Sv = np.maximum(((Bm + 2.0 * Am) * off).sum(axis=1), 0.0)
         valid = np.array([bool(ctl2.validity.get((i, c), (False, 0, 0))[0]) for i in TASKS])
 
+        # v2 weights each receiver's demand by ITS OWN gamma -- the same
+        # [cos(v^1, v^2)]_+ the gate multiplies q by. Reproduced here, because a
+        # recomputation that leaves it out is solving a different objective and
+        # would pass while the controller believed an unreliable receiver.
+        gam = np.array([float(ctl2.gamma.get((i, c), 0.0)) for i in TASKS], dtype=np.float64)
         want = solve_role(K, Bm, Dm, Rv, valid, eps=0.0, rho=1.0, scale=Sv,
                           lam_max=ctl2.cfg.lambda_max, delta=ctl2.cfg.delta,
-                          iters=ctl2.cfg.solver_iters, tol=ctl2.cfg.solver_tol)
+                          iters=ctl2.cfg.solver_iters, tol=ctl2.cfg.solver_tol,
+                          gamma=gam)
         got = np.array([float(ctl2.lam.get((j, c), 0.0)) for j in TASKS])
         # The basis the controller actually handed the solver. Asserted directly
         # because lambda cannot separate it here: with rho_rel/S^2 ~ 1e8 against
@@ -924,6 +951,9 @@ def test_the_controller_really_solves_v2s_objective_end_to_end():
         # is, so an equality on lambda saturates and two mutations (S without
         # 2*A^-, and rho instead of rho_rel) survived it.
         used = ctl2.last_solver[c]
+        assert np.allclose(used["gamma"], gam, rtol=1e-12, atol=0.0), (
+            f"role {rn}: solver got gamma={used['gamma']}, expected the gate's {gam}"
+        )
         assert float(used["rho"]) == float(ctl2.cfg.rho_rel), (
             f"role {rn}: solver got rho={used['rho']}, expected rho_rel="
             f"{ctl2.cfg.rho_rel}"
@@ -1120,3 +1150,195 @@ def test_q_scale_survives_from_mapping_and_the_checkpoint_refuses_a_silent_chang
     other = CrossGateController(_cfg(q_scale=50.0), vocab_size=V, task_names=("a", "b", "c"))
     with pytest.raises(ValueError, match="config changed across resume"):
         other.load_state_dict(sd)
+
+
+# --------------------------------------------------------------------------- #
+# 9. the revised objective: a certified solver, gamma on both sides, and the
+#    accounting that says what an intervention costs
+
+
+def _rand_problem(rng, n=3):
+    """A problem shaped like the live one: S DERIVED from B and A^-, as the
+    controller derives it, so "a receiver with S = 0" also has B = D = 0 rather
+    than being an inconsistent fixture that no run can produce."""
+    K = 10.0 ** rng.uniform(-8, 1, n)
+    R = 10.0 ** rng.uniform(-3, 1, n)
+    sig = 10.0 ** rng.uniform(-6, -1)
+    B = rng.normal(0, sig, (n, n))
+    A = np.abs(rng.normal(0, sig, (n, n)))
+    D = rng.normal(0, sig, (n, n))
+    if rng.random() < 0.3:                       # a receiver that saw no cross effect
+        i = int(rng.integers(n)); B[i, :] = 0.0; A[i, :] = 0.0; D[i, :] = 0.0
+    off = ~np.eye(n, dtype=bool)
+    S = np.maximum(((B + 2.0 * A) * off).sum(axis=1), 0.0)
+    return dict(K=K, B=B, D=D, R=R, S=S,
+                gamma=rng.uniform(0, 1, n),
+                valid=rng.random(n) < 0.8,
+                rho=10.0 ** rng.uniform(0, 4),
+                lam_max=float(rng.choice([0.2, 1.0])))
+
+
+def _obj(p, lam):
+    off = ~np.eye(len(lam), dtype=bool)
+    Do = p["D"] * off
+    a0 = -(p["B"] * off).sum(axis=1)
+    den = np.where(p["valid"], p["S"], 1.0) + 1e-30
+    w = np.where(p["valid"], p["rho"] * np.maximum(p["gamma"], 0.0) / den ** 2, 0.0)
+    s = np.maximum(a0 + Do @ lam, 0.0) * p["valid"]
+    return float((p["K"] * lam * lam).sum() + (w * s * s).sum())
+
+
+def test_the_solver_never_reports_optimal_on_a_point_a_grid_beats():
+    """The defect this replaces: `converged` meant "the polish improved the
+    objective", so a solve one iteration deep came back True 27.2% above the
+    optimum. It now means "the KKT residual is within tol", and the claim is
+    checked against an independent search."""
+    rng = np.random.default_rng(7)
+    grid = None
+    for _ in range(60):
+        p = _rand_problem(rng)
+        sol = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                         scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200,
+                         tol=1e-12, gamma=p["gamma"])
+        if sol["reason"] == "nonfinite_input":
+            continue
+        if grid is None:
+            grid = np.linspace(0.0, 1.0, 21)
+        best = min(_obj(p, np.array(l) * p["lam_max"]) for l in itertools.product(grid, repeat=3))
+        if sol["converged"]:
+            assert sol["f"] <= best + 1e-9 * max(abs(best), 1.0), (
+                f"reported optimal at f={sol['f']:.6e} while a grid found {best:.6e}")
+            assert sol["kkt_res"] <= 1e-12
+
+
+def test_an_uncertified_solve_is_reported_and_not_dressed_as_optimal():
+    """iters is accepted and ignored -- there is no budget to run out of -- so a
+    solve that cannot certify says so rather than returning a plausible number.
+    The controller turns that into lambda = 0."""
+    rng = np.random.default_rng(8)
+    for _ in range(40):
+        p = _rand_problem(rng)
+        a = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                       scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=1,
+                       tol=1e-12, gamma=p["gamma"])
+        b = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                       scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=500,
+                       tol=1e-12, gamma=p["gamma"])
+        if a["reason"] == "nonfinite_input":
+            continue
+        assert a["converged"] == (a["kkt_res"] <= 1e-12), "converged must BE the certificate"
+        if a["converged"] and b["converged"]:
+            assert abs(a["f"] - b["f"]) <= 1e-9 * max(abs(b["f"]), 1.0), (
+                "one iteration and five hundred disagree on a certified optimum")
+
+
+def test_an_invalid_receiver_cannot_reach_the_numerics():
+    """The polish took its step from 1/L with L built on min(scale) over ALL
+    receivers, invalid included, so one unusable reference with S = 0 froze the
+    solve -- live in 150 of the 300 saved cases. Adding such a receiver must now
+    change nothing at all."""
+    rng = np.random.default_rng(9)
+    for _ in range(40):
+        p = _rand_problem(rng)
+        p["valid"][:] = True
+        base = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                          scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200,
+                          tol=1e-12, gamma=p["gamma"])
+        S2, v2 = p["S"].copy(), p["valid"].copy()
+        S2[1] = 0.0
+        v2[1] = False                      # an unusable reference, zero scale
+        withz = solve_role(p["K"], p["B"], p["D"], p["R"], v2, eps=0.0, rho=p["rho"],
+                           scale=S2, lam_max=p["lam_max"], delta=1e-30, iters=200,
+                           tol=1e-12, gamma=p["gamma"])
+        if base["reason"] == "nonfinite_input" or withz["reason"] == "nonfinite_input":
+            continue
+        assert withz["converged"], "an invalid receiver with S = 0 broke the solve"
+        assert np.isfinite(withz["lam"]).all()
+
+
+def test_gamma_weights_the_receivers_demand_and_zero_gamma_silences_it():
+    """The inconsistency this closes: gamma = 0 already meant "this reference
+    may not attenuate a single token" in the gate, while the objective still
+    read its full B, D and S when choosing whose lambda to raise."""
+    rng = np.random.default_rng(10)
+    moved = 0
+    for _ in range(40):
+        p = _rand_problem(rng)
+        p["valid"][:] = True
+        ones = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                          scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200, tol=1e-12)
+        g = np.ones(3); g[0] = 0.0
+        off0 = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                          scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200,
+                          tol=1e-12, gamma=g)
+        # silencing receiver 0 must equal deleting it
+        v = p["valid"].copy(); v[0] = False
+        dele = solve_role(p["K"], p["B"], p["D"], p["R"], v, eps=0.0, rho=p["rho"],
+                          scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200, tol=1e-12)
+        if not (off0["converged"] and dele["converged"]):
+            continue
+        assert np.allclose(off0["lam"], dele["lam"], rtol=1e-7, atol=1e-12), (
+            "gamma = 0 must silence a receiver exactly as invalidating it does")
+        if not np.allclose(ones["lam"], off0["lam"], rtol=1e-7, atol=1e-12):
+            moved += 1
+    assert moved > 0, "gamma never changed the answer -- the fixture proves nothing"
+
+
+def test_gamma_sits_outside_the_square_not_in_the_numerator():
+    """gamma * (s/S)^2, not (gamma*s/S)^2. The second is a gamma^2 weight and a
+    different design; they are only equal at gamma in {0, 1}."""
+    rng = np.random.default_rng(11)
+    p = _rand_problem(rng)
+    p["valid"][:] = True
+    g = np.array([0.25, 0.5, 0.75])
+    sol = solve_role(p["K"], p["B"], p["D"], p["R"], p["valid"], eps=0.0, rho=p["rho"],
+                     scale=p["S"], lam_max=p["lam_max"], delta=1e-30, iters=200, tol=1e-12, gamma=g)
+    off = ~np.eye(3, dtype=bool)
+    a0 = -(p["B"] * off).sum(axis=1)
+    s = np.maximum(a0 + (p["D"] * off) @ sol["lam"], 0.0)
+    want = float((p["K"] * sol["lam"] ** 2).sum()
+                 + (p["rho"] * g * (s / (p["S"] + 1e-30)) ** 2).sum())
+    assert math.isclose(sol["f"], want, rel_tol=1e-9, abs_tol=1e-300)
+
+
+def test_the_amplifier_never_raises_a_low_reliability():
+    """q_tilde = gamma * min(1, k a), so q_tilde <= gamma at any strength. The
+    rejected placement, min(1, k gamma a), turns gamma = 0.01 into 0.5 at k=100
+    -- a decision to trust an unreliable reference wearing a strength knob's
+    name."""
+    b = _batch(seed=31)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, -1.0, 1e-12)
+    gam = torch.full((3, N_ROLES), 0.01)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid, gamma=gam,
+                         lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    for k in (1.0, 5.0, 50.0, 1000.0):
+        f = _fwd(b, refs, q_scale=k, gate_version=2)     # gamma exists only in v2
+        assert float(f["q"].max()) <= 0.01 + 1e-9, (
+            f"q_scale={k} pushed q past gamma=0.01 -- the amplifier is scaling reliability")
+        assert float(f["h"].max()) <= 0.01 + 1e-9
+        assert float(f["w"].min()) >= 1.0 - 0.2 - 1e-9
+
+
+def test_the_self_cost_is_recorded_and_still_absent_from_the_objective():
+    """T_j = E[h r_j . d_j] is what attenuating task j costs task j. The
+    diagonal of B and D is masked, so the solver cannot see it; the point of
+    recording it is that it becomes possible to."""
+    b = _batch(seed=32)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, both = _refs_from_population(b, f0, torch.tensor([0, 1, 0, 1, 0, 1]))
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=both, lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=_cfg().control_role_mask())
+    f = _fwd(b, refs)
+    st = CrossGateStats(n_tasks=3, vocab_size=V, device=torch.device("cpu"), n_prompts=8)
+    st.update(fwd=f, task_ids=b["task_ids"], roles=b["roles"], response_mask=torch.ones(6, 7),
+              teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], side=torch.tensor([0, 1, 0, 1, 0, 1]),
+              prompt_idx=torch.arange(6), row_basis=None)
+    red = st.reduced()
+    assert float(red["send"][:, :, _SEND_IDX["T_pos"]].sum()) > 0.0, "no self-aligned removal at all"
+    # the solver's matrices still have a zero diagonal: the cost is not priced
+    lam = solve_role(np.ones(3) * 1e-6, np.ones((3, 3)), np.ones((3, 3)), np.ones(3),
+                     np.ones(3, dtype=bool), eps=0.0, rho=1.0, scale=np.ones(3),
+                     lam_max=0.2, delta=1e-30, iters=200, tol=1e-12)
+    assert lam["converged"]
