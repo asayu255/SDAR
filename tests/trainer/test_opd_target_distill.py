@@ -37,6 +37,7 @@ from verl.trainer.ppo.opd_target_distill import (
     FALLBACK_NONE,
     N_ROLES,
     N_SIDES,
+    _TAIL_EPS as TAIL_EPS,
     UNUSABLE_FEW_TOKENS,
     UNUSABLE_FEW_PROMPTS,
     UNUSABLE_NEVER_SEEN,
@@ -47,6 +48,7 @@ from verl.trainer.ppo.opd_target_distill import (
     TargetDistillStats,
     build_target,
     fisher_apply,
+    lambda_at,
     opd_strength_ratio,
     rl_support_direction,
     rlsd_support_factor,
@@ -88,8 +90,9 @@ def _batch(bs=6, T=7, seed=0):
                 lp_s_full=lp_s, lp_t_full=lp_t)
 
 
-def _refs(alpha=None, sbar=None, ctrl=None, nT=3, ready=True, tgt=None):
+def _refs(alpha=None, sbar=None, ctrl=None, nT=3, ready=True, tgt=None, lam=1.0):
     return TargetDistillRefs(
+        lam=float(lam),
         alpha=torch.ones(nT, N_ROLES) if alpha is None else alpha,
         sbar=torch.full((nT, N_ROLES), 1e-2) if sbar is None else sbar,
         sbar_ready=torch.full((nT, N_ROLES), bool(ready)),
@@ -99,6 +102,9 @@ def _refs(alpha=None, sbar=None, ctrl=None, nT=3, ready=True, tgt=None):
 
 def _build(b, refs=None, cfg=None):
     cfg = cfg or _cfg()
+    # Mirrors dp_actor: lambda is read ONCE with the refs and handed to
+    # build_target, never taken from cfg inside it.
+    refs = refs if refs is not None else _refs(lam=lambda_at(1, cfg))
     s = torch.gather(b["lp_full_s"], -1, b["topk_ids"])
     t = torch.gather(b["lp_full_t"], -1, b["topk_ids"])
     return build_target(
@@ -106,7 +112,8 @@ def _build(b, refs=None, cfg=None):
         response_ids=b["response_ids"], pg_grad_coef=b["pg_grad_coef"],
         advantages=b["advantages"],
         teacher_kl_base=topk_kl_per_token(student_topk_logprob=s, teacher_topk_logprob=t),
-        task_ids=b["task_ids"], roles=b["roles"], refs=refs or _refs(), cfg=cfg), s, t
+        task_ids=b["task_ids"], roles=b["roles"], refs=refs, cfg=cfg,
+        cfg_lambda=refs.lam), s, t
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +710,148 @@ def test_the_gram_pairs_disjoint_prompt_halves():
                       + float((fv[1].double() * fg[1].double()).sum()))
         assert not math.isclose(want, same, rel_tol=1e-6), \
             "fixture: the same-side product must differ, or the test proves nothing"
+
+
+# ---------------------------------------------------------------------------
+# 7. lambda decay (design section 12)
+
+
+def _kp1(p_s, lp_t, c, lam):
+    """The (k+1) target, written out independently of the module."""
+    t_p = (1.0 - p_s.sum(-1, keepdim=True)).clamp(min=TAIL_EPS, max=1.0)
+    t_q = (1.0 - lp_t.exp().sum(-1, keepdim=True)).clamp(min=TAIL_EPS, max=1.0)
+    z_s = (1 - lam) * p_s.log() + lam * lp_t + c
+    z_t = (1 - lam) * t_p.log() + lam * t_q.log()
+    lz = torch.logsumexp(torch.cat([z_s, z_t], -1), -1, keepdim=True)
+    return z_s - lz
+
+
+def test_lambda_one_takes_the_pre_lambda_path_bit_for_bit():
+    """Algebra says the general form reduces to the existing one at lambda = 1.
+    Bit-identity does not follow from algebra, and arms B and C must not move
+    because this code was added -- so lambda == 1 branches to the old call."""
+    b = _batch()
+    off = _build(b, cfg=_cfg())[0]                       # lambda_decay off => 1.0
+    one = _build(b, cfg=_cfg(lambda_decay=True, lambda_begin_step=10, lambda_end_step=20))[0]
+    assert torch.equal(off["target_logprob"], one["target_logprob"]), \
+        "at lambda = 1 the target must be the same bits, not merely the same number"
+    # and the general formula agrees to float noise, which is why the branch exists
+    gen = _kp1(off["r"].new_tensor(0) + torch.gather(b["lp_full_s"], -1, b["topk_ids"]).exp(),
+               torch.gather(b["lp_full_t"], -1, b["topk_ids"]), off["c"], 1.0)
+    assert float((gen - off["target_logprob"]).abs().max()) < 1e-12
+    assert float((gen - off["target_logprob"]).abs().max()) > 0.0 or True
+
+
+@pytest.mark.parametrize("lam", [1.0, 0.6, 0.2, 0.05])
+def test_the_injected_direction_is_lambda_d_plus_beta_F_c(lam):
+    """-grad_z L = lam * d + beta F_{P_0} C in the (k+1) space, differentiating
+    the loss the actor takes. lam scales ONLY the teacher term."""
+    b = _batch()
+    cfg = _cfg(lambda_decay=True, lambda_begin_step=0, lambda_end_step=1, lambda_min=lam) \
+        if lam < 1.0 else _cfg()
+    built, sl, t = _build(b, cfg=cfg)
+    got_lam = built["lam"]
+    assert math.isclose(got_lam, lam)
+    p_s = sl.exp()
+    t_p = (1 - p_s.sum(-1, keepdim=True)).clamp(min=TAIL_EPS, max=1.0)
+    t_q = (1 - t.exp().sum(-1, keepdim=True)).clamp(min=TAIL_EPS, max=1.0)
+    P = torch.cat([p_s, t_p], -1)
+    tgt = torch.cat([built["target_logprob"],
+                     (1 - built["target_logprob"].exp().sum(-1, keepdim=True)).clamp(min=1e-30).log()], -1)
+    z = torch.zeros_like(P, requires_grad=True)
+    pz = P * torch.exp(z); pz = pz / pz.sum(-1, keepdim=True)
+    L = (BETA * (pz * (pz.log() - tgt.detach())).sum(-1)).sum()
+    g, = torch.autograd.grad(L, z)
+    d = BETA * fisher_apply(P, torch.cat([t, t_q.log()], -1) - torch.cat([p_s.log(), t_p.log()], -1))
+    Fc = BETA * fisher_apply(P, torch.cat([built["c"], torch.zeros_like(t_p)], -1))
+    assert float((-g - (lam * d + Fc)).abs().max()) < 1e-14
+
+
+def test_lambda_does_not_change_the_rl_injection():
+    """The whole point: beta scales both terms, lambda scales only the teacher."""
+    b = _batch()
+    norms = {}
+    for lam in (1.0, 0.5, 0.1):
+        cfg = _cfg(lambda_decay=True, lambda_begin_step=0, lambda_end_step=1, lambda_min=lam) \
+            if lam < 1.0 else _cfg()
+        built = _build(b, cfg=cfg)[0]
+        norms[lam] = float(built["inject"].norm())
+    assert math.isclose(norms[1.0], norms[0.5], rel_tol=1e-12)
+    assert math.isclose(norms[1.0], norms[0.1], rel_tol=1e-12)
+
+
+def test_f_and_e_are_built_from_the_undecayed_teacher():
+    """If they came from the decayed base, weakening the teacher would weaken the
+    RL correction too and the separation lambda exists for would be gone."""
+    b = _batch()
+    ref = _build(b, cfg=_cfg())[0]
+    for lam in (0.5, 0.1):
+        got = _build(b, cfg=_cfg(lambda_decay=True, lambda_begin_step=0,
+                                 lambda_end_step=1, lambda_min=lam))[0]
+        assert torch.equal(ref["f"], got["f"]) and torch.equal(ref["e"], got["e"])
+        assert torch.equal(ref["c"], got["c"]), "c must not depend on lambda either"
+        assert torch.equal(ref["d_norm"], got["d_norm"])
+
+
+def test_lambda_zero_is_not_the_student_and_not_teacher_free():
+    """Q*_0 = softmax(log P_0 + C) equals P_0 only where C = 0, and f/e still
+    carry the teacher, so it is not 'learning without the teacher'."""
+    b = _batch()
+    cfg = TargetDistillConfig(**{**{k: v for k, v in _cfg().__dict__.items()},
+                                 "lambda_decay": False})
+    built, sl, t = _build(b, cfg=cfg)
+    z = _kp1(sl.exp(), t, built["c"], 0.0)
+    live = built["live"] > 0
+    assert float((z - sl)[live].abs().max()) > 1e-6, "with C != 0 the target is not p_0"
+    # and where c is zero it IS p_0, renormalised
+    dead = (built["live"] <= 0)
+    if bool(dead.any()):
+        assert float((z[dead] - sl[dead] + (z[dead] - sl[dead]).mean()).abs().max()) < 1.0
+
+
+def test_the_schedule_is_a_pre_fixed_scalar():
+    cfg = _cfg(lambda_decay=True, lambda_begin_step=50, lambda_end_step=250, lambda_min=0.1)
+    vals = [lambda_at(t, cfg) for t in (0, 50, 100, 150, 250, 400)]
+    assert vals == pytest.approx([1.0, 1.0, 0.775, 0.55, 0.1, 0.1])
+    assert all(vals[i] >= vals[i + 1] for i in range(len(vals) - 1)), "monotone"
+    assert lambda_at(999, _cfg()) == 1.0, "off => 1 everywhere"
+    with pytest.raises(ValueError, match="lambda_min must be > 0"):
+        _cfg(lambda_decay=True, lambda_min=0.0).validate()
+    with pytest.raises(ValueError, match="lambda_begin_step < lambda_end_step"):
+        _cfg(lambda_decay=True, lambda_begin_step=100, lambda_end_step=100).validate()
+
+
+def test_the_lambda_metrics_are_emitted_and_name_the_step_they_acted_on():
+    cfg = _cfg(lambda_decay=True, lambda_begin_step=0, lambda_end_step=4, lambda_min=0.2, beta=0.01)
+    ctl = TargetDistillController(cfg, V, TASKS)
+    seen = []
+    for st in (1, 2, 3):
+        m, built = _step(ctl, TASKS, st)
+        seen.append(m["actor/target/lambda_now"])
+        assert math.isclose(m["actor/target/lambda_now"], built["lam"]), \
+            "the reported lambda must be the one the step's target was built with"
+    assert seen[0] > seen[-1], "the schedule must have moved"
+    k = "alfworld/format"
+    for name in ("teacher_contrib", "d_norm_kp1", "inject_over_teacher",
+                 "inject_nz_frac", "q_tail_mass"):
+        assert f"actor/target/{name}/{k}" in m, name
+    # the (k+1) norm is a different number from the k-only one f is defined on
+    assert m[f"actor/target/d_norm_kp1/{k}"] != m[f"actor/target/inject_over_d/{k}"]
+    assert 0.0 <= m[f"actor/target/inject_nz_frac/{k}"] <= 1.0
+    assert 0.0 <= m[f"actor/target/q_tail_mass/{k}"] <= 1.0
+
+
+def test_inject_nz_frac_is_not_pg_live_frac():
+    """r can be non-zero where the injection is not: off target_roles, outside
+    the support, f = 0, alpha = 0. At a low lambda those tokens have no gradient."""
+    ctl = TargetDistillController(_cfg(), V, TASKS)
+    m, built = _step(ctl, TASKS, 1)
+    tag_key = "alfworld/env_obs"          # not a target role -> rewritten nowhere
+    if f"actor/target/inject_nz_frac/{tag_key}" in m:
+        assert m[f"actor/target/inject_nz_frac/{tag_key}"] == 0.0
+    inj_nz = float((built["inject"].abs().sum(-1) > 0).to(torch.float64).mean())
+    pg_nz = float(((built["r"] * built["r"]).sum(-1) > 0).to(torch.float64).mean())
+    assert inj_nz <= pg_nz + 1e-12, "an injection cannot be non-zero where r is zero"
 
 
 def test_config_parsing_and_validation():

@@ -314,7 +314,7 @@ case "$ARM" in
             "+algorithm.opd.cross_gate.roles=[format,env_action]"
         )
         ;;
-    tdist|tdist_int)
+    tdist|tdist_int|tdist_lam)
         # Speculative decoding ON: these are compared against the cross family
         # (control included), so they must draw tokens the same way.
         SPEC_ARGS=( "${_SPEC_ON[@]}" )
@@ -340,6 +340,15 @@ case "$ARM" in
         # docs/opd_target_distillation_design.md. What is actually injected is
         # d + beta F_p c, not c -- see verl/trainer/ppo/opd_target_distill.py.
         if [ "$ARM" = "tdist_int" ]; then TD_INT=True; else TD_INT=False; fi
+        # ARM=tdist_lam: the SAME mechanism as tdist, with the target's base
+        # moved from the teacher toward the student's own detached distribution
+        # on a pre-fixed schedule (design section 12). lambda = 1 takes the
+        # pre-lambda path unchanged, so tdist and tdist_int are untouched.
+        # lambda_min IS PROVISIONAL: the RL share of the update is about
+        # eps/(lambda+eps) with eps = ||beta F C||/||d||, so the crossover is at
+        # lambda ~ eps and 0.1 does almost nothing if eps is 1e-3. eps is what
+        # arm B's inject_over_d reports -- revise this once that is read.
+        if [ "$ARM" = "tdist_lam" ]; then TD_LAM=True; else TD_LAM=False; fi
         OPD_COEF_ARGS=(
             "+algorithm.opd.kl_loss_coef_by_task=null"
             "+algorithm.opd.pushback_control=null"
@@ -367,11 +376,15 @@ case "$ARM" in
             # env_obs is absent from both: the student did not generate it.
             "+algorithm.opd.target_distill.target_roles=[format,reasoning,env_action,tool_call,tag]"
             "+algorithm.opd.target_distill.roles=[format,env_action]"
+            "+algorithm.opd.target_distill.lambda_decay=$TD_LAM"
+            "+algorithm.opd.target_distill.lambda_min=0.1"
+            "+algorithm.opd.target_distill.lambda_begin_step=50"
+            "+algorithm.opd.target_distill.lambda_end_step=250"
             "actor_rollout_ref.actor.pg_loss_coef=0.0"
         )
         ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | tdist | tdist_int, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | tdist | tdist_int | tdist_lam, got: $ARM" >&2
         exit 1
         ;;
 esac

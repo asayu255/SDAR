@@ -28,7 +28,7 @@ from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
 ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2",
-        "tdist", "tdist_int")
+        "tdist", "tdist_int", "tdist_lam")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -42,7 +42,8 @@ B = {
     # v2: same pure OPD+GRPO underneath, so the static coefficient is null too
     "cross2": None,
     "tdist": None,             # MOPD v3: the RL direction becomes the distillation target
-    "tdist_int": None,         # ...with the cross-task integration on             # MOPD v1: pure OPD+GRPO plus the cross-task gate
+    "tdist_int": None,         # ...with the cross-task integration on
+    "tdist_lam": None,         # ...with the teacher's direct contribution decayed             # MOPD v1: pure OPD+GRPO plus the cross-task gate
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -72,7 +73,7 @@ def _is_pushback_key(key):
 SPEC_ROOT = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
 # tdist / tdist_int are compared against control (design §6: A vs B vs C), so
 # they must draw tokens the way control does.
-CROSS_FAMILY = ("control", "cross", "cross2", "tdist", "tdist_int")
+CROSS_FAMILY = ("control", "cross", "cross2", "tdist", "tdist_int", "tdist_lam")
 
 
 def _is_spec_key(key):
@@ -98,14 +99,15 @@ def _is_cross_key(key):
 # 1. the arms differ in b and in their own name, and in nothing else
 
 
-@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross", "tdist", "tdist_int"))
+@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross", "tdist",
+                                 "tdist_int", "tdist_lam"))
 def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
     own_or_family = lambda k: _is_spec_key(k) or own(k)
     own = {"pushback": _is_pushback_key, "cross": _is_cross_key,
            "cross2": _is_cross_key, "tdist": _is_tdist_key,
-           "tdist_int": _is_tdist_key}.get(arm, _is_coef_key)
+           "tdist_int": _is_tdist_key, "tdist_lam": _is_tdist_key}.get(arm, _is_coef_key)
     differing = {
         k for k in set(control) | set(other)
         if control.get(k, "<absent>") != other.get(k, "<absent>")
@@ -132,7 +134,7 @@ def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
             assert other[f"{side}.lambda_max"] == 0.2
             assert other[f"{side}.ema_decay"] == 0.8
             assert other[f"{side}.window_steps"] == 8
-    if arm in ("tdist", "tdist_int"):
+    if arm in ("tdist", "tdist_int", "tdist_lam"):
         # THE defining property: no GRPO term. Pinned so a copy-paste cannot
         # silently restore the double count the arm exists to avoid.
         assert other["actor_rollout_ref.actor.pg_loss_coef"] == 0.0
@@ -160,6 +162,27 @@ def test_the_two_target_arms_differ_in_the_integration_and_nothing_else():
     assert differing <= allowed, f"unexpected: {sorted(differing - allowed)}"
     assert bool(b["algorithm.opd.target_distill.integrate"]) is False
     assert bool(c["algorithm.opd.target_distill.integrate"]) is True
+
+
+def test_the_lambda_arm_differs_from_tdist_in_the_decay_and_nothing_else():
+    """B vs B': lambda is the only pinned difference, and the checkpoint dir and
+    experiment name that follow from the arm's own name. Anything else would put
+    a second variable into a one-variable comparison."""
+    b, lam = _flat("tdist"), _flat("tdist_lam")
+    differing = {k for k in set(b) | set(lam) if b.get(k, "<absent>") != lam.get(k, "<absent>")}
+    allowed = {"trainer.experiment_name", "trainer.default_local_dir",
+               "trainer.val_instance_log_dir", "trainer.sign_token_dump_dir",
+               "algorithm.opd.target_distill.lambda_decay",
+               "actor_rollout_ref.actor.teacher_kl_target_distill.lambda_decay"}
+    assert differing <= allowed, f"unexpected: {sorted(differing - allowed)}"
+    assert bool(b["algorithm.opd.target_distill.lambda_decay"]) is False
+    assert bool(lam["algorithm.opd.target_distill.lambda_decay"]) is True
+    # the schedule itself is pinned identically on both, so turning the flag on
+    # is the whole intervention
+    for k in ("lambda_min", "lambda_begin_step", "lambda_end_step"):
+        assert b[f"algorithm.opd.target_distill.{k}"] == lam[f"algorithm.opd.target_distill.{k}"]
+    # and the integration is off on both: lambda is a single-task question
+    assert bool(lam["algorithm.opd.target_distill.integrate"]) is False
 
 
 def test_the_control_arm_leaves_the_key_unset_rather_than_setting_it_to_one():

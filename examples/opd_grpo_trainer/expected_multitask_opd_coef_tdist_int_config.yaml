@@ -363,6 +363,15 @@
 # role outside it gets no reward at all. roles is the subset whose alpha is solved.
 "algorithm.opd.target_distill.target_roles": [format, reasoning, env_action, tool_call, tag]
 "algorithm.opd.target_distill.roles": [format, env_action]
+# lambda moves the target's BASE between the teacher and the student's own
+# detached distribution. Lowering beta instead would scale the RL injection with
+# it, because beta multiplies both terms of d + beta F c. lambda = 1 takes the
+# pre-lambda target path unchanged. lambda_min is PROVISIONAL: revise it once
+# arm B reports inject_over_d (= eps), since the crossover is at lambda ~ eps.
+"algorithm.opd.target_distill.lambda_decay": false
+"algorithm.opd.target_distill.lambda_min": 0.1
+"algorithm.opd.target_distill.lambda_begin_step": 50
+"algorithm.opd.target_distill.lambda_end_step": 250
 "actor_rollout_ref.actor.teacher_kl_target_distill.enable": true
 "actor_rollout_ref.actor.teacher_kl_target_distill.eta": 1.0
 "actor_rollout_ref.actor.teacher_kl_target_distill.integrate": true
@@ -371,6 +380,8 @@
 "actor_rollout_ref.actor.teacher_kl_target_distill.target_roles": [format, reasoning, env_action, tool_call, tag]
 "actor_rollout_ref.actor.teacher_kl_target_distill.min_prompts": 4
 "actor_rollout_ref.actor.teacher_kl_target_distill.min_pg_prompts": 2
+"actor_rollout_ref.actor.teacher_kl_target_distill.lambda_decay": false
+"actor_rollout_ref.actor.teacher_kl_target_distill.lambda_min": 0.1
 # and every other mechanism on the teacher-KL term is declared off
 "algorithm.opd.cross_gate": null
 "actor_rollout_ref.actor.teacher_kl_cross_gate": null

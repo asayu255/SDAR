@@ -88,6 +88,7 @@ __all__ = [
     "rl_support_direction",
     "opd_strength_ratio",
     "rlsd_support_factor",
+    "lambda_at",
     "build_target",
     "solve_alpha",
     "fisher_apply",
@@ -109,6 +110,11 @@ def needs_policy_gradient_inputs(cfg_map) -> bool:
     """
     return bool(cfg_map) and bool(dict(cfg_map).get("enable", False))
 
+
+# The tail floor. MUST match topk_kl_per_token's eps: the loss and the target
+# have to agree about a bucket that carries real mass, or the KL is taken against
+# a distribution the target generator never built.
+_TAIL_EPS = 1.0e-8
 
 N_ROLES = len(ROLE_NAMES)
 ROLE_ID = {name: rid for rid, name in ROLE_NAMES.items()}
@@ -202,6 +208,18 @@ class TargetDistillConfig:
     roles: tuple = ("format", "env_action")
     solver_iters: int = 500
     solver_tol: float = 1.0e-12
+    # LAMBDA DECAY (design section 12): move the target's base between the
+    # teacher and the student's own detached distribution. OFF by default, and
+    # when off lambda == 1 takes the EXISTING target path unchanged, so arms B
+    # and C do not move by a single bit.
+    #
+    # ONE SCALAR FOR EVERY TASK, deliberately. A per-task lambda_i is a new
+    # task-priority knob; choosing it from success rates or cosines brings back
+    # the self gate's credit-assignment problem.
+    lambda_decay: bool = False
+    lambda_min: float = 0.1
+    lambda_begin_step: int = 50
+    lambda_end_step: int = 250
     # Seed of the prompt -> side hash. The driver reads it off whichever arm is
     # enabled and passes it to cross_gate_prompt_columns, so the two halves are
     # built the same way here as in the cross gate.
@@ -218,12 +236,13 @@ class TargetDistillConfig:
             raise ValueError(f"target_distill: unknown keys {bad}; allowed {sorted(allowed)}")
         kw = {}
         for k, v in m.items():
-            if k in ("enable", "integrate"):
+            if k in ("enable", "integrate", "lambda_decay"):
                 kw[k] = bool(v)
             elif k in ("roles", "target_roles"):
                 kw[k] = tuple(str(x) for x in (list(v) if not isinstance(v, str) else v.split(",")))
             elif k in ("window_steps", "min_tokens", "max_staleness", "solver_iters",
-                       "min_prompts", "min_pg_prompts", "split_seed"):
+                       "min_prompts", "min_pg_prompts", "split_seed",
+                       "lambda_begin_step", "lambda_end_step"):
                 kw[k] = int(v)
             else:
                 kw[k] = float(v)
@@ -244,6 +263,18 @@ class TargetDistillConfig:
             raise ValueError("target_distill.min_prompts must be >= 1 and min_pg_prompts >= 0")
         if self.beta < 0.0:
             raise ValueError(f"target_distill.beta must be >= 0, got {self.beta}")
+        if not (0.0 <= self.lambda_min <= 1.0):
+            raise ValueError(f"target_distill.lambda_min must be in [0, 1], got {self.lambda_min}")
+        if self.lambda_decay and self.lambda_min <= 0.0:
+            raise ValueError(
+                "target_distill.lambda_min must be > 0: at lambda = 0 a token whose injection is "
+                "also zero (clipped, off-support, f = 0) gets no gradient at all. Design 12.5."
+            )
+        if self.lambda_begin_step < 0 or self.lambda_end_step <= self.lambda_begin_step:
+            raise ValueError(
+                "target_distill needs 0 <= lambda_begin_step < lambda_end_step, got "
+                f"{self.lambda_begin_step} / {self.lambda_end_step}"
+            )
         if self.delta <= 0.0:
             raise ValueError("target_distill.delta must be > 0")
         for name, val in (("roles", self.roles), ("target_roles", self.target_roles)):
@@ -278,6 +309,31 @@ class TargetDistillConfig:
 
 # --------------------------------------------------------------------------- #
 # The three per-token pieces
+
+
+def lambda_at(step: int, cfg: TargetDistillConfig) -> float:
+    """The step's lambda: 1 -> lambda_min, linearly, between the two step bounds.
+
+    A PRE-FIXED schedule, not a controller. Nothing about the run feeds into it:
+    a lambda chosen from success rates or from a measured cosine is the self
+    gate's credit-assignment problem again, and this arm exists partly because
+    that failed. One scalar for every task, so no new task priority is introduced.
+
+    THE FLOOR IS PROVISIONAL. The RL share of the update is about
+    eps / (lambda + eps) with eps = ||beta F C|| / ||d||, so the crossover sits at
+    lambda ~ eps and a floor of 0.1 does almost nothing if eps is 1e-3. eps is
+    exactly what arm B's ``inject_over_d`` reports, so the floor is meant to be
+    revised once that is read (design 12.4).
+    """
+    if not cfg.lambda_decay:
+        return 1.0
+    t0, t1 = int(cfg.lambda_begin_step), int(cfg.lambda_end_step)
+    if step <= t0:
+        return 1.0
+    if step >= t1:
+        return float(cfg.lambda_min)
+    frac = (float(step) - t0) / float(t1 - t0)
+    return 1.0 - (1.0 - float(cfg.lambda_min)) * frac
 
 
 def rl_support_direction(*, p_s: torch.Tensor, sampled_onehot: torch.Tensor,
@@ -379,6 +435,7 @@ def build_target(
     roles: torch.Tensor,
     refs: "TargetDistillRefs",
     cfg: TargetDistillConfig,
+    cfg_lambda: float = 1.0,
 ) -> dict:
     """The tilted target and everything the step's statistics need. All detached.
 
@@ -421,6 +478,18 @@ def build_target(
         D = teacher_kl_base.detach().to(dt).unsqueeze(-1)
         g_opd = p_s * (D - (lp_s - lp_t))
         d_norm = (g_opd * g_opd).sum(dim=-1).clamp(min=0.0).sqrt()
+        # THE SAME DIRECTION IN THE (k+1) SPACE, which is what the lambda
+        # decomposition -grad = lam d + beta F C is written on (design 12.2).
+        # d_norm above is the k-only norm and is a DIFFERENT NUMBER; it stays as
+        # it is because f is defined on it and changing f would make this arm
+        # incomparable with the one already specified. Reported side by side.
+        _tp = (1.0 - p_s.sum(dim=-1, keepdim=True)).clamp(min=_TAIL_EPS, max=1.0)
+        _tq = (1.0 - lp_t.exp().sum(dim=-1, keepdim=True)).clamp(min=_TAIL_EPS, max=1.0)
+        _P = torch.cat([p_s, _tp], dim=-1)
+        _dlog = torch.cat([lp_t - lp_s, _tq.log() - _tp.log()], dim=-1)
+        _d_kp1 = fisher_apply(_P, _dlog)
+        d_norm_kp1 = (_d_kp1 * _d_kp1).sum(dim=-1).clamp(min=0.0).sqrt()
+        q_tail = _tq.squeeze(-1)
 
         # --- f, the OPD strength ratio --------------------------------------
         tid = task_ids.reshape(-1)
@@ -481,8 +550,38 @@ def build_target(
         clamped_frac = (c_base_raw - centre).abs().gt(float(cfg.clamp)).to(dt).mean(dim=-1)
 
         c = alpha_t.unsqueeze(-1) * c_base
-        built = normalized_weight(c=c, p_on=lp_t.exp(), clamp=None)
-        target_logprob = lp_t + built["log_w"].to(lp_t.dtype)
+
+        # --- the target -------------------------------------------------------
+        # The (k+1) categories the loss actually uses: the support, plus one tail
+        # bucket. lambda moves the BASE between the teacher and the student's own
+        # detached distribution (design 12.2):
+        #
+        #   Q*_lam = softmax( (1-lam) log P_0 + lam log Q + C ),  C_tail = 0
+        #
+        # This is NOT the full-vocabulary mixture aggregated into a bucket -- it
+        # does not use the shape inside the tail, and the two do not agree. Only
+        # this one is computable from top-k, so it is the definition, not an
+        # approximation. The tail floor is the loss's own (topk_kl_per_token's
+        # eps), or the two would disagree about a bucket that carries real mass.
+        lam = float(cfg_lambda)
+        if lam == 1.0:
+            # EXACTLY the existing path, called unchanged. Algebra says the
+            # general form reduces to it here; bit-identity does not follow from
+            # algebra, and arms B and C must not move because this code was added.
+            built = normalized_weight(c=c, p_on=lp_t.exp(), clamp=None)
+            target_logprob = lp_t + built["log_w"].to(lp_t.dtype)
+            tv = built["moved"].to(dt)
+        else:
+            t_p = (1.0 - p_s.sum(dim=-1, keepdim=True)).clamp(min=_TAIL_EPS, max=1.0)
+            t_q = (1.0 - lp_t.exp().sum(dim=-1, keepdim=True)).clamp(min=_TAIL_EPS, max=1.0)
+            z_s = (1.0 - lam) * lp_s + lam * lp_t + c            # (bs, T, k)
+            z_t = (1.0 - lam) * t_p.log() + lam * t_q.log()      # (bs, T, 1), C_tail = 0
+            log_z = torch.logsumexp(torch.cat([z_s, z_t], dim=-1), dim=-1, keepdim=True)
+            target_logprob = (z_s - log_z).to(lp_t.dtype)
+            # TV over the whole (k+1) space, tail included, so it is comparable
+            # with the lam = 1 branch's "moved".
+            tv = 0.5 * ((target_logprob.to(dt).exp() - lp_t.exp()).abs().sum(dim=-1)
+                        + ((z_t - log_z).exp().squeeze(-1) - t_q.squeeze(-1)).abs())
 
         # --- what is actually injected ---------------------------------------
         c_eff = c
@@ -492,8 +591,9 @@ def build_target(
             "target_logprob": target_logprob,
             "r": r, "c": c, "c_eff": c_eff, "inject": inject,
             "f": f, "e": e, "alpha_t": alpha_t, "d_norm": d_norm,
+            "d_norm_kp1": d_norm_kp1, "q_tail": q_tail, "lam": lam,
             "in_support": in_support.to(dt), "live": live.to(dt),
-            "tv": built["moved"].to(dt),
+            "tv": tv,
             "clamped": clamped_frac,
             "recenter_residual": centre.squeeze(-1).abs() * k,
             "c_base": c_base,
@@ -507,7 +607,8 @@ def build_target(
 # Per-step accumulators
 
 _TOK_COLS = (
-    "n_tok", "n_live", "n_live_pg", "d_norm_sum", "d_norm_sum_live", "d_sq_sum",
+    "n_tok", "n_live", "n_live_pg", "n_inject_nz", "d_norm_sum", "d_norm_sum_live", "d_sq_sum",
+    "d_kp1_norm_sum", "q_tail_sum",
     "f_sum", "e_sum", "fe_sum", "e_sum_adv_neg", "n_adv_neg", "e_sum_adv_pos", "n_adv_pos",
     "e_clip_sum", "inject_sq_sum", "r_sq_sum", "rtilde_sq_sum", "inject_dot_r_sum",
     "inject_norm_sum", "inject_base_norm_sum", "inject_base_sq_sum", "removed_norm_sum",
@@ -582,6 +683,13 @@ class TargetDistillStats:
             add("n_tok", one)
             add("n_live", built["live"].to(torch.float32))
             add("n_live_pg", built["live"].to(torch.float32) * has_pg)
+            # NOT the same as n_live_pg. r can be non-zero while the injection is
+            # zero -- off target_roles, outside the support, f = 0, alpha = 0. At
+            # a low lambda a token with no injection has no gradient at all, so
+            # this is the count that decides whether the floor is safe (12.6).
+            add("n_inject_nz", (inj_sq > 0).to(torch.float32))
+            add("d_kp1_norm_sum", built["d_norm_kp1"].to(torch.float32))
+            add("q_tail_sum", built["q_tail"].to(torch.float32))
             add("d_norm_sum", built["d_norm"].to(torch.float32))
             add("d_norm_sum_live", built["d_norm"].to(torch.float32) * built["live"].to(torch.float32))
             add("d_sq_sum", built["d_norm"].to(torch.float32) ** 2)
@@ -820,6 +928,7 @@ class TargetDistillRefs:
     sbar_ready: torch.Tensor     # (nT, nR) bool -- false until the first step's aggregate
     control_roles: torch.Tensor  # (nR,) bool -- where alpha is solved
     target_roles: torch.Tensor   # (nR,) bool -- where the target is rewritten
+    lam: float = 1.0             # this step's lambda, one scalar for every task
 
 
 @dataclass
@@ -889,7 +998,8 @@ class TargetDistillController:
         return TargetDistillRefs(alpha=alpha.to(device), sbar=sbar.to(device),
                                  sbar_ready=ready.to(device),
                                  control_roles=self.cfg.control_role_mask().to(device),
-                                 target_roles=self.cfg.target_role_mask().to(device))
+                                 target_roles=self.cfg.target_role_mask().to(device),
+                                 lam=lambda_at(self.step, self.cfg))
 
     def update(self, names, reduced: dict) -> dict:
         """Fold this step's reduced sums in; solve alpha for the NEXT step."""
@@ -1128,6 +1238,18 @@ class TargetDistillController:
                 # numerator and its real ||d|| to the denominator, which is the
                 # honest statement of how much of the update the arm touches.
                 metrics[f"actor/target/inject_over_d/{n}/{rn}"] = inj_all / (d_all + cfg.delta)
+                # The (k+1) OPD norm, which is what the lambda decomposition is
+                # written on -- a DIFFERENT number from d_all, which is k-only and
+                # is what f is defined on. Both are reported so neither is read as
+                # the other (design 12.2).
+                _lam = lambda_at(step - 1, cfg)
+                d_kp1 = g(ti, c, "d_kp1_norm_sum") / n_tok
+                metrics[f"actor/target/d_norm_kp1/{n}/{rn}"] = d_kp1
+                metrics[f"actor/target/teacher_contrib/{n}/{rn}"] = _lam * d_kp1
+                metrics[f"actor/target/inject_over_teacher/{n}/{rn}"] = \
+                    inj_all / (_lam * d_kp1 + cfg.delta)
+                metrics[f"actor/target/inject_nz_frac/{n}/{rn}"] = g(ti, c, "n_inject_nz") / n_tok
+                metrics[f"actor/target/q_tail_mass/{n}/{rn}"] = g(ti, c, "q_tail_sum") / n_tok
                 if n_live > 0:
                     inj_live = beta * g(ti, c, "inject_norm_sum") / n_live
                     d_live = g(ti, c, "d_norm_sum_live") / n_live
@@ -1150,6 +1272,9 @@ class TargetDistillController:
                     dot = g(ti, c, "inject_dot_r_sum")
                     if isq > 0 and rsq > 0:
                         metrics[f"actor/target/cos_inject_r/{n}/{rn}"] = dot / math.sqrt(isq * rsq)
+        # The lambda the loss USED this step -- read before the increment above,
+        # like alpha, so the number names the step it acted on.
+        metrics["actor/target/lambda_now"] = lambda_at(step - 1, cfg)
         metrics["actor/target/unkeyed_rows"] = float(reduced["unkeyed"].reshape(-1)[0])
         return metrics
 

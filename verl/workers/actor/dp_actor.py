@@ -4087,6 +4087,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     roles=token_roles(responses, sign_role_tags),
                                     refs=_td_refs,
                                     cfg=target_distill.cfg,
+                                    # This step's lambda, read once with the refs
+                                    # so every micro-batch of the step uses the
+                                    # same one. At lambda = 1 build_target takes
+                                    # the pre-lambda path unchanged.
+                                    cfg_lambda=_td_refs.lam,
                                 )
                                 # The one line the arm exists to reach: the loss
                                 # is taken against the tilted target, and the
@@ -5741,6 +5746,7 @@ class DataParallelPPOActor(BasePPOActor):
             for _tid, _nm in enumerate(_td_names):
                 for _c, _rn in _CG_ROLE_NAMES.items():
                     metrics[f"actor/target/alpha_read/{_nm}/{_rn}"] = float(_a_applied[_tid, _c])
+            metrics["actor/target/lambda_read"] = float(_td_refs.lam)
             metrics.update(target_distill.update(_td_names, td_stats.reduced()))
 
         if cross_gate is not None and cross_stats is not None:

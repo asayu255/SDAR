@@ -397,6 +397,40 @@ def test_the_prompt_split_columns_are_selected_and_attached_for_this_arm():
     assert "prompt_idx=data.get('cross_prompt_idx', None)" in src
 
 
+def test_lambda_is_read_once_with_the_refs_and_handed_to_build_target():
+    """One lambda per step, for every micro-batch and every task. Reading it
+    inside build_target from cfg would make it a function of nothing the step
+    knows, and reading it per micro-batch would let it drift within a step."""
+    src, _ = _update_policy_src()
+    assert "cfg_lambda=_td_refs.lam" in src, "the target must be built with the step's lambda"
+    i_refs = src.index("_td_refs = target_distill.refs_to_device(")
+    i_use = src.index("cfg_lambda=_td_refs.lam")
+    assert i_refs < i_use
+    assert src.count("cfg_lambda=") == 1, "exactly one place decides the step's lambda"
+    # and the controller derives it from the schedule, not from anything measured
+    import inspect as _i
+
+    from verl.trainer.ppo.opd_target_distill import TargetDistillController
+    rsrc = _i.getsource(TargetDistillController.refs_to_device)
+    assert "lam=lambda_at(self.step, self.cfg)" in rsrc
+
+
+def test_the_lambda_arm_is_the_same_lock_plus_one_flag():
+    from verl.utils.expected_config import load_expectations
+    import os
+
+    os.environ.setdefault("RUN_TAG_SUFFIX", "")
+    b = load_expectations("examples/opd_grpo_trainer/expected_multitask_opd_coef_tdist_config.yaml")
+    lam = load_expectations("examples/opd_grpo_trainer/expected_multitask_opd_coef_tdist_lam_config.yaml")
+    assert b["algorithm.opd.target_distill.lambda_decay"] is False
+    assert lam["algorithm.opd.target_distill.lambda_decay"] is True
+    # the arm must still be the distillation-only arm, and still un-integrated
+    for f in (b, lam):
+        assert f["actor_rollout_ref.actor.pg_loss_coef"] == 0.0
+        assert f["algorithm.opd.target_distill.integrate"] is False
+        assert f["algorithm.opd.target_distill.lambda_min"] > 0.0
+
+
 def test_the_failure_mode_itself_produces_a_dead_target():
     """What the three fast paths would have delivered: no advantages, no
     coefficient. c = 0 and q* = q -- named here so the regression is legible."""
