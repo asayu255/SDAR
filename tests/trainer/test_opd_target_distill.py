@@ -168,8 +168,21 @@ def test_dropping_the_mean_subtraction_is_a_real_error_not_a_detail():
     base = fisher_apply(q, c)
     want = base + 7.0 * q * (1.0 - q.sum(-1, keepdim=True))
     assert torch.allclose(shifted, want, atol=1e-14), "F_p 1 must be p (1 - m)"
-    assert (shifted - base).norm() > base.norm(), (
-        "on a partial support a constant shift is a change of mechanism, not a re-parameterisation")
+    # HOW MUCH it matters is a property of the support, not a constant of the
+    # mechanism. At this arm's pin (student-indexed top-k, measured tail mass
+    # 0.000-0.002) it is negligible; a teacher-indexed support would not be.
+    # and the shift that ACTUALLY happens is the re-centring, mean(c), not an
+    # arbitrary constant -- its size is what decides whether this is a big effect
+    got = {}
+    for m in (0.5, 0.999):
+        pm = p * m
+        cc = c - c.mean(-1, keepdim=True)
+        got[m] = float((fisher_apply(pm, cc) - fisher_apply(pm, c)).norm()
+                       / fisher_apply(pm, c).norm())
+    assert got[0.5] > 0.10, "on a half-mass support the re-centring is a real change of direction"
+    assert got[0.999] < 0.01, (
+        "at this arm's pin (student-indexed top-k, measured tail mass 0.000-0.002) it is not. "
+        "Do not justify the re-centring by its size -- justify it by the clamp.")
     # and on a full support it IS killed -- which is why the claim was plausible
     assert torch.allclose(fisher_apply(p, c + 7.0), exact, atol=1e-14)
 

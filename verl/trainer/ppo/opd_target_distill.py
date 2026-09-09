@@ -342,12 +342,22 @@ def fisher_apply(p: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     both of which a "Fisher matrix" reading gets wrong:
 
       * ``<p, c>`` is not an expectation -- it is m times one.
-      * **F_p DOES NOT KILL A CONSTANT.** ``F_p 1 = p(1 - m)``, which on a
-        measured support (m ~ 0.5) shifts the direction by several times its own
-        norm. Adding k to every component of c is therefore a change of
-        mechanism, not a re-parameterisation. An earlier version of this file
-        claimed the opposite and re-centred c on that basis; the test that
-        "checked" it had normalised p and so tested a case that never occurs.
+      * **F_p DOES NOT KILL A CONSTANT.** ``F_p 1 = p(1 - m)`` exactly, so adding
+        a constant to c is in principle a change of mechanism, not a
+        re-parameterisation. HOW MUCH IT MATTERS DEPENDS ENTIRELY ON THE PINNED
+        SUPPORT, and at this arm's pin it is negligible: ``student_indexed_topk``
+        is true, so S is the student's own top-k and the measured tail mass is
+        0.000-0.002 (``actor/opd_diag/tail_mass_mean``, cross2 run). At m = 0.999
+        re-centring moves the injected direction by 0.02%; it would be 23% at
+        m = 0.5, which is what a TEACHER-indexed support could give and the lock
+        forbids. So the re-centring below is NOT justified by "F_p kills it
+        anyway" -- that reasoning is unsound -- but neither is it a large
+        correction here: its real job is to keep the clamp from acting on an
+        arbitrary offset. Two earlier versions of this file got this wrong in
+        opposite directions: the first claimed F_p kills a constant (its test had
+        normalised p, the one case that never occurs), the second claimed the
+        effect was several times the direction's own norm (it quoted a support
+        mass that is not this quantity).
 
     Everything here is the component INSIDE the support. The tilt does not reach
     the tail (it has no per-symbol c), so this is not the whole-vocabulary
