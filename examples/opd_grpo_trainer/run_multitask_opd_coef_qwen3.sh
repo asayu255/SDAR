@@ -314,8 +314,68 @@ case "$ARM" in
             "+algorithm.opd.cross_gate.roles=[format,env_action]"
         )
         ;;
+    cross2k100)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        # THE STRENGTH ARM on the REVISED objective. Identical to cross2 except
+        # cross_gate.q_scale=100.
+        #
+        # Note what "identical to cross2" now means in THIS tree: cross2 itself
+        # runs the revised objective -- gamma weights each receiver's demand,
+        # the solver is accepted only on a KKT certificate, and an uncertified
+        # solve attenuates nothing. The intent locks pin CONFIG, not code, so no
+        # lock can catch that; the arm that produced the first 150 steps was the
+        # un-weighted objective at commit 60dc45b and is not this one.
+        #
+        # WHY A STRENGTH ARM. cross2 ran 150 steps with lambda pinned at
+        # lambda_max=0.2 and a MEAN attenuation of 0.019% on WebShop format --
+        # 1 - w = lambda * h, and h averaged ~0.001, so what ran was, in the
+        # mean, a mechanism that was off. This arm asks the prior question:
+        # does the gate do anything at a strength that is visible at all?
+        #
+        # WHY 100. Not an optimum -- an arithmetic target. Solving the revised
+        # objective offline against the step-150 state gives a realised mean
+        # attenuation of 1.03% on WebShop format and 0.61% on Alfworld
+        # env_action at this value; k=50 leaves WebShop at 0.27%, below the
+        # 0.5-1% band the strength condition was specified in. There is NO
+        # established threshold at which attenuation becomes visible in
+        # accuracy; the band is a way to be clearly distant from 0.019%.
+        #
+        # WHAT 100 DOES NOT BUY. The realised strength is not 100x. D = E[h x]
+        # and K = E[h^2 d^2] are re-aggregated from the scaled h, and the
+        # objective is invariant under (D -> kD, K -> k^2 K, lambda -> lambda/k),
+        # so the solver pulls lambda back wherever the box does not bind. READ
+        # actor/cross/attenuation_mean. If it has not moved off 0.019%, this arm
+        # has not run the experiment, whatever q_scale says.
+        #
+        # WHAT TO READ BESIDE THE MEAN, because the 80% per-token floor is
+        # unchanged while the number of tokens pressed against it is not:
+        # atten_at_cap_frac, atten_ge_9_10_frac, strength_lost_frac. And the
+        # accounting the mechanism was missing: pred_lost_positive against
+        # pred_removed_negative per receiver, and self_T / pred_self_cost for
+        # what attenuating a task costs that same task.
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control=null"
+            "+algorithm.opd.cross_gate.enable=True"
+            "+algorithm.opd.cross_gate.gate_version=2"
+            "+algorithm.opd.cross_gate.eps_cross=0.0"
+            "+algorithm.opd.cross_gate.rho=10000.0"
+            "+algorithm.opd.cross_gate.rho_rel=1.0"
+            "+algorithm.opd.cross_gate.lambda_max=0.2"
+            "+algorithm.opd.cross_gate.q_scale=100.0"
+            "+algorithm.opd.cross_gate.ema_decay=0.8"
+            "+algorithm.opd.cross_gate.window_steps=8"
+            "+algorithm.opd.cross_gate.min_prompts=4"
+            "+algorithm.opd.cross_gate.min_pg_prompts=2"
+            "+algorithm.opd.cross_gate.min_tokens=64"
+            "+algorithm.opd.cross_gate.max_staleness=2"
+            "+algorithm.opd.cross_gate.delta=1e-30"
+            "+algorithm.opd.cross_gate.split_seed=1"
+            "+algorithm.opd.cross_gate.roles=[format,env_action]"
+        )
+        ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | cross2k100, got: $ARM" >&2
         exit 1
         ;;
 esac
