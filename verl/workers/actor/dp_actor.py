@@ -1752,6 +1752,31 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self._pushback_pending_state = pb
         cg = sd.get("cross_gate", None)
+        if cg and os.environ.get("CROSS_GATE_RESET_ON_LOAD", "0") == "1":
+            # Starting a NEW strength arm from an existing checkpoint's weights.
+            #
+            # The gate's own state cannot come along. Its cfg is compared field
+            # by field on load and any drift is refused (opd_cross_gate.py:1349),
+            # deliberately: D = E[h x] and K = E[h^2 ||d||^2] are EMAs at decay
+            # 0.8, so a q_scale change would leave the solver pricing ~10-20
+            # steps of statistics gathered at the OLD scale while the loss
+            # already executes the new one -- the exact mismatch the re-
+            # aggregation requirement exists to prevent. Blending is worse than
+            # rebuilding.
+            #
+            # So this discards references, EMAs, validity windows and lambda,
+            # and keeps the weights, optimizer, lr schedule and dataloader
+            # position. Lambda is 0 until the references pass their window
+            # again (window_steps steps), the same warm-up the arm being
+            # compared against went through from its own step 0.
+            #
+            # Launch-time and one-shot ON PURPOSE: it is not a field of
+            # CrossGateConfig, because a cfg field would be checkpointed and
+            # would then reset the gate on every ordinary crash-resume of this
+            # arm too.
+            print("[cross_gate] CROSS_GATE_RESET_ON_LOAD=1: discarding the checkpoint's "
+                  "gate state (references, EMAs, lambda); weights and optimizer are kept")
+            cg = None
         if cg:
             ctl = getattr(self, "_cross_gate", None)
             if ctl is not None:
@@ -4765,6 +4790,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 refs=_cg_refs,
                                 delta=cross_gate.cfg.delta,
                                 gate_version=cross_gate.cfg.gate_version,
+                                q_scale=cross_gate.cfg.q_scale,
                             )
                             _pb_w = _cg["w"].to(teacher_kld.dtype)
                             _cg_pending = {

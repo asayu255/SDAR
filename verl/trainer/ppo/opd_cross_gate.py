@@ -152,6 +152,34 @@ class CrossGateConfig:
     # Cap on the per-token attenuation. An experimental condition the constraint
     # is not allowed to override.
     lambda_max: float = 0.2
+    # STRENGTH KNOB. q_tilde = min(1, q_scale * q), applied per receiver AFTER
+    # gamma and the [0, 1] clamp, so h = sum_i omega_i q_tilde_i keeps both
+    # h <= 1 and the identity the receiver attribution divides by. In the
+    # non-saturating region this is exactly q_scale * h, so 1 - w scales with
+    # it; where q_scale * q >= 1 the clamp holds the token at lambda_max.
+    #
+    # Why here and not on lambda_max: 1 - w = lambda * h_tilde <= lambda_max
+    # whatever q_scale is, so the per-token floor (80% of the teacher signal at
+    # lambda_max = 0.2) survives any value of this knob, while raising
+    # lambda_max toward 1 would let a single token's OPD vanish. In the MEAN the
+    # two are the same amplification while the box binds; they differ in the
+    # tail, and the tail is what the cap is for.
+    #
+    # Why it is not a post-hoc multiply on the loss: D = E[h x] and
+    # K = E[h^2 d^2] feed the solver, and both are accumulated from the h this
+    # returns. Scaling q here re-aggregates them by construction, so the
+    # intervention the solver prices is the one that executes. The consequence
+    # is that the solver will pull lambda back down where the box is not
+    # binding -- the objective is invariant under (D -> kD, K -> k^2 K,
+    # lambda -> lambda/k) -- so the realised strength is min(lambda_hat,
+    # q_scale * lambda_max) * h, NOT q_scale times the old attenuation. Read
+    # actor/cross/attenuation_mean, never q_scale, for what actually happened.
+    #
+    # It also amplifies a SMALL gamma: q carries gamma as a factor, so a large
+    # q_scale weakens the reliability suppression rather than only raising the
+    # strength. That is the reason not to jump to a value large enough to
+    # saturate everything.
+    q_scale: float = 1.0
     # One decay for the references, R, B, D and K's two halves.
     ema_decay: float = 0.8
     # Reference validity, judged over a window of steps, per side.
@@ -203,6 +231,10 @@ class CrossGateConfig:
             raise ValueError(f"cross_gate.rho_rel must be >= 0, got {self.rho_rel}")
         if not (0.0 <= self.lambda_max <= 1.0):
             raise ValueError(f"cross_gate.lambda_max must be in [0, 1], got {self.lambda_max}")
+        if not (self.q_scale >= 1.0) or not math.isfinite(self.q_scale):
+            # Below 1 would be a WEAKER gate wearing a strength knob's name, and
+            # the arm it would produce is already available as lambda_max.
+            raise ValueError(f"cross_gate.q_scale must be finite and >= 1, got {self.q_scale}")
         if not (0.0 <= self.ema_decay < 1.0):
             raise ValueError(f"cross_gate.ema_decay must be in [0, 1), got {self.ema_decay}")
         if self.window_steps < 1 or self.min_prompts < 1 or self.min_tokens < 1:
@@ -375,6 +407,7 @@ def cross_gate_forward(
     refs: CrossGateRefs,
     delta: float,
     gate_version: int = 1,
+    q_scale: float = 1.0,
 ) -> dict:
     """Per-token gate and everything the step's statistics need, detached.
 
@@ -503,6 +536,17 @@ def cross_gate_forward(
         # tests/trainer/test_opd_cross_gate.py section 6 asserts the invariant.
         q = q.clamp(min=0.0, max=1.0)
 
+        # THE STRENGTH KNOB, applied here and only here: on the per-receiver q,
+        # after gamma and after the guard above, before omega pools it into h.
+        # Placing it here is what makes every downstream consumer -- w, the
+        # solver's D and K, strength_lost, every diagnostic -- read the SAME
+        # scaled gate, so the priced intervention and the executed one agree.
+        # The re-clamp keeps q_tilde <= 1, hence h <= 1, hence the lambda_max
+        # floor on w; and h stays the omega-weighted mean of the q's, which the
+        # lost_by_recv attribution divides by. See CrossGateConfig.q_scale.
+        if float(q_scale) != 1.0:
+            q = (q * float(q_scale)).clamp(min=0.0, max=1.0)
+
         # valid receivers: (i, c(t)) usable, i != sender, and the role is controlled
         valid_ic = refs.valid.to(dev)                                              # (nT, nR)
         ctrl = refs.control_roles.to(dev)[rol]                                     # (bs, T)
@@ -559,6 +603,15 @@ _SEND_COLS = (
     "w_sum",
     "n_valid_recv_sum",
     "n_unkeyed",       # tokens on rows whose side is -1
+    # The TAIL of the attenuation, not just its mean. 1 - w = lambda * h, so at
+    # a fixed lambda these three are quantile crossings of the attenuation
+    # itself: h >= 1 is the token sitting at the lambda_max cap. A strength
+    # experiment that moves the mean by raising q_scale moves these too, and by
+    # more -- the 80% per-token floor is unchanged but the number of tokens
+    # pressed against it is not, so "same floor" is not "same risk".
+    "h_ge_half",       # tokens with h >= 0.5   (1 - w >= lambda/2)
+    "h_ge_9_10",       # tokens with h >= 0.9
+    "h_sat",           # tokens with h >= 1 - 1e-6, i.e. attenuated at lambda
 )
 _SEND_IDX = {n: i for i, n in enumerate(_SEND_COLS)}
 
@@ -673,6 +726,9 @@ class CrossGateStats:
             _add_send("strength_lost_self_aligned", (1.0 - w * w) * d_sq * (sd > 0).to(torch.float32))
             _add_send("h_sum", h)
             _add_send("h_nonzero", (h > 0).to(torch.float32))
+            _add_send("h_ge_half", (h >= 0.5).to(torch.float32))
+            _add_send("h_ge_9_10", (h >= 0.9).to(torch.float32))
+            _add_send("h_sat", (h >= 1.0 - 1e-6).to(torch.float32))
             _add_send("w_sum", w)
             _add_send("n_valid_recv_sum", fwd["n_valid"])
             _add_send("n_unkeyed", (~side_ok).to(torch.float32).unsqueeze(-1).expand(bs, T) * one)
@@ -1216,6 +1272,15 @@ class CrossGateController:
                     metrics[f"actor/cross/h_mean/{n}/{rn}"] = g("h_sum") / n_tok
                     metrics[f"actor/cross/h_nonzero_frac/{n}/{rn}"] = g("h_nonzero") / n_tok
                     metrics[f"actor/cross/w_mean/{n}/{rn}"] = g("w_sum") / n_tok
+                    # THE READOUT OF THE STRENGTH EXPERIMENT. Redundant with
+                    # 1 - w_mean by construction and recorded anyway, because
+                    # q_scale is not the realised strength: the solver rescales
+                    # lambda against the amplified D and K, so this is the only
+                    # number that says what the intervention actually was.
+                    metrics[f"actor/cross/attenuation_mean/{n}/{rn}"] = 1.0 - g("w_sum") / n_tok
+                    metrics[f"actor/cross/atten_ge_half_frac/{n}/{rn}"] = g("h_ge_half") / n_tok
+                    metrics[f"actor/cross/atten_ge_9_10_frac/{n}/{rn}"] = g("h_ge_9_10") / n_tok
+                    metrics[f"actor/cross/atten_at_cap_frac/{n}/{rn}"] = g("h_sat") / n_tok
                     metrics[f"actor/cross/n_valid_receivers/{n}/{rn}"] = g("n_valid_recv_sum") / n_tok
                     metrics[f"actor/cross/kl_lost_frac/{n}/{rn}"] = g("kl_lost") / max(g("kl_sum"), 1e-30)
                     metrics[f"actor/cross/strength_lost_frac/{n}/{rn}"] = g("strength_lost") / max(g("d_sq_sum"), 1e-30)

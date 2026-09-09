@@ -85,12 +85,12 @@ def _zero_refs(nT=3, valid=None, lam=None, ctrl=None):
     return CrossGateRefs(v=v, R=R, side_w=sw, valid=valid_t, lam=lam_t, control_roles=ctrl_t)
 
 
-def _fwd(b, refs, opd_coef=0.01, delta=1e-30):
+def _fwd(b, refs, opd_coef=0.01, delta=1e-30, q_scale=1.0):
     return cross_gate_forward(
         student_topk_logprob=b["student_topk_logprob"], teacher_topk_logprob=b["teacher_topk_logprob"],
         teacher_kl=b["teacher_kl"], topk_ids=b["topk_ids"], response_ids=b["response_ids"],
         pg_grad_coef=b["pg_grad_coef"], opd_coef=opd_coef, task_ids=b["task_ids"], roles=b["roles"],
-        refs=refs, delta=delta,
+        refs=refs, delta=delta, q_scale=q_scale,
     )
 
 
@@ -1022,3 +1022,101 @@ def test_the_controller_matches_an_independent_minimiser_of_v2s_objective():
     a = solve_role(K, B, D, R, valid, rho=1.0, scale=S, **kw)["lam"]
     b = solve_role(K, B, D, R, valid, rho=1.0, scale=None, **kw)["lam"]
     assert not np.allclose(a, b, rtol=1e-3), "S and R must not coincide here"
+
+
+# --------------------------------------------------------------------------- #
+# 8. q_scale: the strength knob, and the three things it must not break
+
+
+def test_q_scale_one_is_bit_for_bit_the_unscaled_gate():
+    """The default must be a no-op, or every earlier arm's numbers move."""
+    b = _batch(seed=21)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, -1.0, 1e-12)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                         lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    a, c = _fwd(b, refs), _fwd(b, refs, q_scale=1.0)
+    for k in ("q", "h", "w"):
+        assert torch.equal(a[k], c[k]), f"q_scale=1.0 changed {k}"
+
+
+def test_q_scale_multiplies_the_gate_exactly_where_it_does_not_saturate():
+    """min(1, k q) = k q below the clamp, so h -- an omega-weighted mean of the
+    q's -- is exactly k times the unscaled h there. This is the whole claim the
+    strength arm rests on; if it fails, q_scale is not a strength knob."""
+    b = _batch(seed=22)
+    f0 = _fwd(b, _zero_refs())
+    # tiny alignment => tiny q, so k q stays far below 1 and nothing clamps
+    v, R, sw, valid = _reference_aligned_with(f0, b, -1.0, 1.0)
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                         lam=torch.full((3, N_ROLES), 0.2),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    f1 = _fwd(b, refs)
+    k = 7.0
+    fk = _fwd(b, refs, q_scale=k)
+    unsat = (f1["q"] * k) < 1.0 - 1e-9
+    assert bool(unsat.any()), "fixture saturates everywhere -- it proves nothing"
+    assert torch.allclose(fk["q"][unsat], f1["q"][unsat] * k, rtol=1e-10, atol=1e-12)
+    # and the attenuation follows: 1 - w = lambda * h
+    rows = (fk["h"] > 0) & ((f1["h"] * k) < 1.0 - 1e-9)
+    if bool(rows.any()):
+        assert torch.allclose((1.0 - fk["w"])[rows], (1.0 - f1["w"])[rows] * k, rtol=1e-8, atol=1e-12)
+
+
+@pytest.mark.parametrize("k", [1.0, 5.0, 50.0, 1000.0])
+def test_q_scale_cannot_break_the_floor_or_the_attribution(k):
+    """Three invariants, at any strength, on the adversarial reference:
+
+    1. w >= 1 - lambda_max. The per-token floor is what makes a large q_scale a
+       different animal from a large lambda_max; if it can be breached the knob
+       is unsafe at exactly the values it is meant for.
+    2. h <= 1, which is what (1) rests on.
+    3. h == sum_i omega_i q_i EXACTLY. lost_by_recv divides the removal by h to
+       attribute it per receiver, and the audit's "98.7% from Alfworld" is that
+       statistic. Scaling h after the pooling would break this identity;
+       scaling q before it does not.
+    """
+    b = _batch(seed=23)
+    f0 = _fwd(b, _zero_refs())
+    v, R, sw, valid = _reference_aligned_with(f0, b, -1.0, 1e-12)
+    lam_max = 0.2
+    refs = CrossGateRefs(v=v, R=R, side_w=sw, valid=valid,
+                         lam=torch.full((3, N_ROLES), lam_max),
+                         control_roles=torch.ones(N_ROLES, dtype=torch.bool))
+    f = _fwd(b, refs, q_scale=k)
+    assert torch.isfinite(f["q"]).all() and torch.isfinite(f["h"]).all() and torch.isfinite(f["w"]).all()
+    assert float(f["q"].max()) <= 1.0 + 1e-6, "a scaled per-receiver gate exceeded 1"
+    assert float(f["h"].max()) <= 1.0 + 1e-6, "the pooled gate exceeded 1"
+    assert float(f["h"].min()) >= 0.0
+    assert float(f["w"].max()) <= 1.0 + 1e-6, "the gate amplified the teacher term"
+    assert float(f["w"].min()) >= 1.0 - lam_max - 1e-6, (
+        f"q_scale={k} cut deeper than lambda_max -- the per-token floor is gone")
+    assert float(f["w"].min()) > 0.0, "the teacher term changed sign"
+    pooled = (f["omega"] * f["q"]).sum(dim=-1)
+    assert torch.allclose(f["h"], pooled, rtol=1e-10, atol=1e-12), (
+        "h is no longer the omega-weighted mean of the q's; lost_by_receiver is invalid")
+
+
+def test_q_scale_below_one_is_refused():
+    """A weaker gate is lambda_max's job. A knob named for strength that can
+    also weaken invites an arm whose lock reads as the opposite of what it did."""
+    _cfg(q_scale=1.0).validate()
+    _cfg(q_scale=50.0).validate()
+    for bad in (0.5, 0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="q_scale"):
+            _cfg(q_scale=bad).validate()
+
+
+def test_q_scale_survives_from_mapping_and_the_checkpoint_refuses_a_silent_change():
+    """The knob has to arrive through hydra, and a resume must NOT blend an EMA
+    gathered at another scale (dp_actor's CROSS_GATE_RESET_ON_LOAD is the
+    deliberate way to change it)."""
+    cfg = CrossGateConfig.from_mapping({"enable": True, "q_scale": 50})
+    assert cfg.q_scale == 50.0 and isinstance(cfg.q_scale, float)
+    ctl = CrossGateController(_cfg(q_scale=1.0), vocab_size=V, task_names=("a", "b", "c"))
+    sd = ctl.state_dict()
+    assert sd["cfg"]["q_scale"] == 1.0, "q_scale must be in the checkpointed cfg"
+    other = CrossGateController(_cfg(q_scale=50.0), vocab_size=V, task_names=("a", "b", "c"))
+    with pytest.raises(ValueError, match="config changed across resume"):
+        other.load_state_dict(sd)

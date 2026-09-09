@@ -314,8 +314,72 @@ case "$ARM" in
             "+algorithm.opd.cross_gate.roles=[format,env_action]"
         )
         ;;
+    cross2k50)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        # THE STRENGTH EXPERIMENT on cross2. Byte-for-byte the cross2 arm above
+        # plus one value: cross_gate.q_scale=50.
+        #
+        # WHY A STRENGTH ARM EXISTS AT ALL. cross2 ran 150 steps with lambda
+        # pinned at lambda_max=0.2 and a MEAN attenuation of 0.019% on WebShop
+        # format -- about 1/1000 of the per-token cap -- because 1 - w =
+        # lambda * h and h averaged ~0.001. Nothing in that run tested the
+        # mechanism at a strength that could move accuracy; it tested a
+        # mechanism that was, in the mean, off. This arm asks the prior
+        # question: does the gate do ANYTHING at a strength that is visible?
+        #
+        # WHY q_scale AND NOT lambda_max. 1 - w = lambda * min(1, q_scale*q)
+        # <= lambda_max whatever q_scale is, so the per-token floor (80% of the
+        # teacher signal) survives; lambda_max -> 1 would let a token's OPD
+        # vanish outright. In the mean, while the box binds, the two are the
+        # same amplification -- they differ only in the tail, and the tail is
+        # what the cap is for.
+        #
+        # WHY 50 AND NOT 5. 50 is an arithmetic target, not an optimum: at
+        # E[h] ~ 0.001 it aims the mean attenuation at ~1%, two orders off
+        # 0.019% and clear of it. It is NOT a claim that 1% is where accuracy
+        # becomes detectable -- no such threshold is established here.
+        #
+        # WHAT 50 DOES NOT BUY. The realised strength is NOT 50x. D = E[h x]
+        # and K = E[h^2 d^2] are re-aggregated from the scaled h (that is the
+        # point of scaling q inside the forward rather than multiplying the
+        # loss), and the solver's objective is invariant under (D -> kD,
+        # K -> k^2 K, lambda -> lambda/k). So it pulls lambda back wherever the
+        # box is not binding, and the realised attenuation is
+        # min(lambda_hat, 50*lambda_max) * h. READ actor/cross/attenuation_mean.
+        # If that number has not moved off 0.019%, this arm has not yet run the
+        # experiment, whatever q_scale says.
+        #
+        # ALSO NOT FREE: q carries gamma as a factor, so scaling q amplifies a
+        # SMALL reliability weight along with the strength. At 50 the gate is
+        # therefore also a weaker-reliability gate, which is a reason to read
+        # atten_at_cap_frac and the tail metrics, not only the mean.
+        #
+        # LAUNCH: this arm starts from cross2's step-150 weights with
+        # CROSS_GATE_RESET_ON_LOAD=1. The gate's own EMAs cannot be inherited
+        # across a q_scale change -- see dp_actor.load_actor_extra_state_dict.
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control=null"
+            "+algorithm.opd.cross_gate.enable=True"
+            "+algorithm.opd.cross_gate.gate_version=2"
+            "+algorithm.opd.cross_gate.eps_cross=0.0"
+            "+algorithm.opd.cross_gate.rho=10000.0"
+            "+algorithm.opd.cross_gate.rho_rel=1.0"
+            "+algorithm.opd.cross_gate.lambda_max=0.2"
+            "+algorithm.opd.cross_gate.q_scale=50.0"
+            "+algorithm.opd.cross_gate.ema_decay=0.8"
+            "+algorithm.opd.cross_gate.window_steps=8"
+            "+algorithm.opd.cross_gate.min_prompts=4"
+            "+algorithm.opd.cross_gate.min_pg_prompts=2"
+            "+algorithm.opd.cross_gate.min_tokens=64"
+            "+algorithm.opd.cross_gate.max_staleness=2"
+            "+algorithm.opd.cross_gate.delta=1e-30"
+            "+algorithm.opd.cross_gate.split_seed=1"
+            "+algorithm.opd.cross_gate.roles=[format,env_action]"
+        )
+        ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | cross2k50, got: $ARM" >&2
         exit 1
         ;;
 esac
