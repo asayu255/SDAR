@@ -344,7 +344,31 @@ $c$ は $(bs,T,k)$ のテンソル演算、$\mathrm{KL}(p\Vert q^\star)$ は `to
 **未修正の既存失敗が 1 件**: `test_cross_teacher_kl_weight.py::test_the_reliability_pass_...`。
 `claude/cross-gate-v2` の時点で失敗しており、この変更とは無関係（クリーンな作業ツリーで確認）。
 
-### 11.3 GPU 上で未実行
+### 11.3 修正: `pg_loss_coef = 0` が機構を無効化していた
+
+初版の実装は **GPU 上で一切発火しなかった。** このアームが必須とする `pg_loss_coef = 0` を、
+actor の既存 3 経路が「方策勾配の信号が一切ない」と解釈するため。
+
+| 経路 | 条件 | 帰結 |
+|---|---|---|
+| `select_keys` | `if pg_loss_coef != 0` | `advantages` が micro-batch に入らず **$e\equiv1$** |
+| `need_log_prob` | `pg_loss_coef == 0 and teacher_topk_kl and ...` | **`log_prob = None`** → `build_target` のガードが通らない |
+| `xt_pg_grad_coef` | `if pg_loss_coef != 0:` の内側 | **`None`** → $r=0$ |
+
+3 つ揃うと $c=0$、$q^\star=q$。**アームは純 OPD として 300 step 回り、しかも `alpha`・`sbar`・`usable` などの
+メトリクスは出続ける** —— commit が `pg_loss_coef` について警告したのと同じ「正常に学習して見える」失敗形である。
+
+**AST 検査では捕まらなかった。** `assert "pg_grad_coef=xt_pg_grad_coef" in call` は名前が書かれていることしか見ず、
+実行時にそれが `None` であることを検出しない。
+
+修正は 3 経路すべてを `needs_policy_gradient_inputs(cfg)` という**単一の述語**に依らせた（3 箇所が独立に drift しないため）。
+併せて `xt_pg_grad_coef` を要求する機構のリストに `target_distill` を加えたので、
+**`task_diag` が偶然有効であることに依存しなくなった**（lock は pin しているが、検証は要求していなかった）。
+
+回帰テストは**条件式を実際に評価する**形にした（`need_log_prob` と select ガードを AST から取り出して eval）。
+3 つの修正それぞれを元に戻す変異試験で、3 つとも失敗することを確認済み。
+
+### 11.4 GPU 上で未実行
 
 比較は §6 の 3 アーム。**A vs B は単タスクの問い、B vs C だけが多タスク機構の効果。**
 最初に読むのは精度ではなく `inject_over_r`、`tv_qstar_q`、`fe_mean`、そして `alpha` が 1 から動くかどうか。

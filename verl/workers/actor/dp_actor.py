@@ -134,6 +134,7 @@ from verl.trainer.ppo.opd_cross_gate import (
 )
 from verl.trainer.ppo.sign_weights import ROLE_NAMES as _CG_ROLE_NAMES
 from verl.trainer.ppo.opd_target_distill import (
+    needs_policy_gradient_inputs,
     TargetDistillConfig,
     TargetDistillController,
     TargetDistillStats,
@@ -2173,7 +2174,12 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         # advantages / old_log_probs are only needed by the policy-gradient (and SDL) paths.
         # Pure teacher-KL distillation (pg_loss_coef==0) does not produce them, so don't require them.
-        if pg_loss_coef != 0:
+        # MOPD v3 IS pg_loss_coef == 0 and still needs both: it takes the GRPO
+        # term away but keeps the reward, routing it through the distillation
+        # target. Without them r = 0 and e = 1, so the target is the teacher and
+        # the arm runs as pure OPD while still logging every metric.
+        _td_needs_pg = needs_policy_gradient_inputs(self.config.get("teacher_kl_target_distill", None))
+        if pg_loss_coef != 0 or _td_needs_pg:
             select_keys += ["old_log_probs", "advantages"]
         elif self.config.get("use_sdl_loss", False):
             select_keys.append("old_log_probs")
@@ -3325,6 +3331,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # and .dtype off the result.
                     need_log_prob = not (
                         pg_loss_coef == 0
+                        and not _td_needs_pg          # v3 reads log_prob for r
                         and teacher_topk_kl
                         and use_teacher_kl_loss
                         and not self.config.use_kl_loss
@@ -3861,9 +3868,51 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_mat=loss_mat, loss_mask=response_mask, row_weights=task_agg_scale
                         )
 
-                    if pg_loss_coef != 0:
+                    if pg_loss_coef != 0 or _td_needs_pg:
+                        # Bound for BOTH branches: v3 runs at pg_loss_coef == 0 and
+                        # still needs them for the coefficient below.
                         old_log_prob = data["old_log_probs"]
                         advantages = data["advantages"]
+                    else:
+                        old_log_prob = advantages = None
+                    # d(pg_losses)/d(log_prob), from the SAME inputs the loss below is
+                    # built from. ONE coefficient, hoisted above the branch: it does
+                    # not depend on pg_loss_coef -- that scales the loss, not this
+                    # derivative -- and MOPD v3 runs at pg_loss_coef = 0 and still
+                    # needs it, because the reward reaches the update through the
+                    # distillation target instead of through the policy-gradient term.
+                    # Two coefficients would make opd/grpo/grad_cosine and
+                    # kl_weight/grpo/grad_cosine comparisons against different policy
+                    # gradients, which is the one thing the pair exists to hold fixed.
+                    if ((xt_grad_stats is not None or opd_grad_stats is not None
+                            or opd_diag_stats is not None or pushback is not None
+                            or cross_gate is not None or target_distill is not None)
+                            and log_prob is not None and old_log_prob is not None):
+                        # d(pg_losses)/d(log_prob), from the SAME inputs the
+                        # loss above was built from rather than from a copy
+                        # reconstructed in the diagnostic. Outside the
+                        # task-weighting branch, because both paths minimise
+                        # the same clipped objective and only differ in how
+                        # they aggregate it. Read in the cross-teacher block
+                        # below, which is a sibling and cannot see these
+                        # names.
+                        #
+                        # ONE coefficient for both geometries. Two would
+                        # make kl_weight/grpo/grad_cosine and
+                        # opd/grpo/grad_cosine comparisons against different
+                        # policy gradients, which is the one thing the pair
+                        # exists to hold fixed.
+                        xt_pg_grad_coef = policy_loss_gradient_coef(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                        ).detach()
+
+                    if pg_loss_coef != 0:
                         if task_agg_scale is None:
                             pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                                 old_log_prob=old_log_prob,
@@ -3898,37 +3947,13 @@ class DataParallelPPOActor(BasePPOActor):
                             # deferred separately below.
                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                             _defer("actor/pg_loss_weighted", pg_term)
-                        if (xt_grad_stats is not None or opd_grad_stats is not None
-                                or opd_diag_stats is not None or pushback is not None
-                                or cross_gate is not None):
-                            # d(pg_losses)/d(log_prob), from the SAME inputs the
-                            # loss above was built from rather than from a copy
-                            # reconstructed in the diagnostic. Outside the
-                            # task-weighting branch, because both paths minimise
-                            # the same clipped objective and only differ in how
-                            # they aggregate it. Read in the cross-teacher block
-                            # below, which is a sibling and cannot see these
-                            # names.
-                            #
-                            # ONE coefficient for both geometries. Two would
-                            # make kl_weight/grpo/grad_cosine and
-                            # opd/grpo/grad_cosine comparisons against different
-                            # policy gradients, which is the one thing the pair
-                            # exists to hold fixed.
-                            xt_pg_grad_coef = policy_loss_gradient_coef(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                cliprange=clip_ratio,
-                                cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,
-                                clip_ratio_c=clip_ratio_c,
-                            ).detach()
                     else:
-                        # Pure teacher-KL distillation: no policy-gradient signal.
-                        # Take device/dtype from whichever tensor the forward
-                        # actually produced -- log_prob is None when it was skipped.
-                        old_log_prob = data.get("old_log_probs", None)
+                        # Pure teacher-KL distillation: no policy-gradient TERM.
+                        # v3 still wants the reward's DIRECTION, so the clipped
+                        # coefficient is computed here too -- it does not depend
+                        # on pg_loss_coef, which scales the loss and not this.
+                        if not _td_needs_pg:
+                            old_log_prob = data.get("old_log_probs", None)
                         probe = log_prob if log_prob is not None else student_topk_logprobs
                         zero = torch.zeros((), device=probe.device, dtype=probe.dtype)
                         pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero

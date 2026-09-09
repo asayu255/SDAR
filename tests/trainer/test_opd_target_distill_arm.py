@@ -230,3 +230,162 @@ def test_the_injection_reaches_the_actor(tmp_path):
                        overrides=[o for o in base if "pg_loss_coef" not in o])
     with pytest.raises(ValueError, match="pg_loss_coef"):
         inject_distillation_config(cfg2)
+
+
+# ---------------------------------------------------------------------------
+# 4. THE regression: pg_loss_coef == 0 must not switch the mechanism off
+#
+# The arm REQUIRES pg_loss_coef = 0, and the actor has three fast paths that
+# read that as "no policy-gradient signal at all": select_keys drops advantages
+# and old_log_probs, need_log_prob skips the full-vocabulary log_prob, and the
+# clipped coefficient is computed only inside the pg branch. With all three
+# taken, r = 0 and e = 1, so c = 0 and q* = q -- the arm runs as pure OPD while
+# emitting every metric, which is silent.
+#
+# The AST tests above did NOT catch this: they assert that
+# "pg_grad_coef=xt_pg_grad_coef" appears in the call, which stayed true while the
+# value was None. So these evaluate the real conditions instead of reading them.
+
+
+def _assign_expr(fn_name, target):
+    """The source expression of `target = ...` inside `fn_name`, as an ast.Expression."""
+    import verl.workers.actor.dp_actor as m
+
+    fn = next(n for n in ast.walk(ast.parse(inspect.getsource(m)))
+              if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == target:
+            return ast.Expression(body=node.value)
+    raise AssertionError(f"no assignment to {target} in {fn_name}")
+
+
+class _Cfg(dict):
+    def get(self, k, d=None):
+        return dict.get(self, k, d)
+
+
+def test_need_log_prob_is_true_for_this_arm():
+    """log_prob is what r is built from, and the guard on build_target requires
+    it. If the fast path takes it, the mechanism never runs."""
+    expr = _assign_expr("update_policy", "need_log_prob")
+    ns = dict(pg_loss_coef=0, teacher_topk_kl=True, use_teacher_kl_loss=True,
+              self=type("S", (), {"config": _Cfg(use_kl_loss=False, use_sdl_loss=False,
+                                                 use_sdar_loss=False)})())
+    ns["self"].config.use_kl_loss = False
+    assert eval(compile(ast.fix_missing_locations(expr), "<t>", "eval"),
+                {}, dict(ns, _td_needs_pg=True)) is True, \
+        "with the arm on, the full-vocabulary log_prob must still be computed"
+    # and without it the fast path is still taken, so the exemption is narrow
+    assert eval(compile(ast.fix_missing_locations(expr), "<t>", "eval"),
+                {}, dict(ns, _td_needs_pg=False)) is False
+
+
+def test_the_reward_inputs_are_selected_for_this_arm():
+    """advantages feed e and old_log_probs feed the clip ratio. Dropped, e = 1
+    and r = 0 -- and `data.get("advantages", None)` returns None silently rather
+    than raising, so nothing downstream complains."""
+    src, _ = _update_policy_src()
+    assert "_td_needs_pg = needs_policy_gradient_inputs(" in src
+    # The guard on the select must admit this arm. Evaluated, not read: the
+    # condition is what decides, and a reverted `if pg_loss_coef != 0:` looks
+    # perfectly reasonable in a diff.
+    expr = _assign_guard_of("select_keys += ['old_log_probs', 'advantages']")
+    assert eval(expr, {}, dict(pg_loss_coef=0, _td_needs_pg=True)) is True, \
+        "at pg_loss_coef = 0 with the arm on, the reward's inputs must still be selected"
+    assert eval(expr, {}, dict(pg_loss_coef=0, _td_needs_pg=False)) is False, \
+        "and the exemption must stay narrow"
+    assert eval(expr, {}, dict(pg_loss_coef=1.0, _td_needs_pg=False)) is True
+    # bound for both branches -- the coefficient below needs them at pg_loss_coef = 0
+    i_bind = src.index("old_log_prob = data['old_log_probs']")
+    i_coef = src.index("xt_pg_grad_coef = policy_loss_gradient_coef(")
+    assert i_bind < i_coef
+
+
+def _assign_guard_of(stmt_src):
+    """The `if` test that guards the statement whose unparse is `stmt_src`."""
+    import verl.workers.actor.dp_actor as m
+
+    fn = next(n for n in ast.walk(ast.parse(inspect.getsource(m)))
+              if isinstance(n, ast.FunctionDef) and n.name == "update_policy")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.If) and any(
+                ast.unparse(b).strip() == stmt_src for b in node.body):
+            return compile(ast.Expression(body=node.test), "<t>", "eval")
+    raise AssertionError(f"no if-statement guarding {stmt_src!r}")
+
+
+def test_the_clipped_coefficient_is_computed_when_the_pg_branch_is_skipped():
+    """policy_loss_gradient_coef does not depend on pg_loss_coef -- that scales
+    the loss, not the derivative -- so ONE computation sits above the branch and
+    v3 gets it at pg_loss_coef = 0. Two computations would break the invariant
+    test_opd_attribution guards: the diagnostics and the weighted geometry must
+    read the same policy gradient."""
+    src, _ = _update_policy_src()
+    assert src.count("xt_pg_grad_coef = policy_loss_gradient_coef(") == 1
+    # the guard admits this arm, and still requires the inputs to exist
+    expr = _assign_guard_of(
+        "xt_pg_grad_coef = policy_loss_gradient_coef(old_log_prob=old_log_prob, "
+        "log_prob=log_prob, advantages=advantages, cliprange=clip_ratio, "
+        "cliprange_low=clip_ratio_low, cliprange_high=clip_ratio_high, "
+        "clip_ratio_c=clip_ratio_c).detach()")
+    off = dict(xt_grad_stats=None, opd_grad_stats=None, opd_diag_stats=None,
+               pushback=None, cross_gate=None, target_distill=None,
+               log_prob=object(), old_log_prob=object())
+    assert eval(expr, {}, dict(off, target_distill=object())) is True, \
+        "the arm must get the coefficient even when the pg branch is skipped"
+    assert eval(expr, {}, off) is False, "and nothing else asks for it"
+    assert eval(expr, {}, dict(off, target_distill=object(), log_prob=None)) is False
+    assert eval(expr, {}, dict(off, target_distill=object(), old_log_prob=None)) is False
+    # it is computed BEFORE either branch, so both reach it
+    i_coef = src.index("xt_pg_grad_coef = policy_loss_gradient_coef(")
+    assert i_coef < src.index("if pg_loss_coef != 0:")
+
+
+def test_the_predicate_is_true_for_the_arms_own_lock():
+    from verl.trainer.ppo.opd_target_distill import needs_policy_gradient_inputs
+    from verl.utils.expected_config import load_expectations
+    import os
+
+    os.environ.setdefault("RUN_TAG_SUFFIX", "")
+    for arm in ("tdist", "tdist_int"):
+        flat = load_expectations(f"examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml")
+        assert flat["actor_rollout_ref.actor.pg_loss_coef"] == 0.0
+        assert needs_policy_gradient_inputs(
+            {"enable": flat["actor_rollout_ref.actor.teacher_kl_target_distill.enable"]}) is True
+    assert needs_policy_gradient_inputs(None) is False
+    assert needs_policy_gradient_inputs({"enable": False}) is False
+
+
+def test_the_failure_mode_itself_produces_a_dead_target():
+    """What the three fast paths would have delivered: no advantages, no
+    coefficient. c = 0 and q* = q -- named here so the regression is legible."""
+    import torch
+
+    from verl.trainer.ppo.core_algos import topk_kl_per_token
+    from verl.trainer.ppo.opd_target_distill import (
+        N_ROLES, TargetDistillConfig, TargetDistillRefs, build_target,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    V, K, bs, T = 40, 5, 4, 5
+    lp_s = torch.log_softmax(torch.randn(bs, T, V, generator=g, dtype=torch.float64), -1)
+    lp_t = torch.log_softmax(torch.randn(bs, T, V, generator=g, dtype=torch.float64), -1)
+    ids = torch.topk(lp_s, K, dim=-1).indices
+    s, t = torch.gather(lp_s, -1, ids), torch.gather(lp_t, -1, ids)
+    cfg = TargetDistillConfig(enable=True, eta=1.0, integrate=False)
+    refs = TargetDistillRefs(alpha=torch.ones(3, N_ROLES), sbar=torch.full((3, N_ROLES), 1e-2),
+                             control_roles=cfg.control_role_mask())
+    common = dict(student_topk_logprob=s, teacher_topk_logprob=t, topk_ids=ids,
+                  response_ids=ids[..., 0],
+                  teacher_kl_base=topk_kl_per_token(student_topk_logprob=s, teacher_topk_logprob=t),
+                  task_ids=torch.tensor([0, 1, 2, 0]),
+                  roles=torch.zeros(bs, T, dtype=torch.long), refs=refs, cfg=cfg)
+    dead = build_target(pg_grad_coef=None, advantages=None, **common)
+    assert float(dead["c"].abs().max()) == 0.0
+    assert torch.equal(dead["target_logprob"], t), "no coefficient => the target IS the teacher"
+    assert float(dead["e"].abs().max()) == 1.0, "no advantages => the RLSD factor is inert"
+    live = build_target(pg_grad_coef=torch.randn(bs, T, generator=g, dtype=torch.float64),
+                        advantages=torch.randn(bs, T, generator=g, dtype=torch.float64), **common)
+    assert float(live["c"].abs().max()) > 0.0
+    assert not torch.equal(live["target_logprob"], t)

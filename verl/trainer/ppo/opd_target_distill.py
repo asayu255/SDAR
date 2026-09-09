@@ -80,6 +80,7 @@ from verl.trainer.ppo.cross_teacher_target import normalized_weight
 from verl.trainer.ppo.sign_weights import ROLE_NAMES
 
 __all__ = [
+    "needs_policy_gradient_inputs",
     "TargetDistillConfig",
     "TargetDistillController",
     "TargetDistillRefs",
@@ -92,6 +93,22 @@ __all__ = [
     "fisher_apply",
     "N_ROLES",
 ]
+
+def needs_policy_gradient_inputs(cfg_map) -> bool:
+    """Does this arm need the reward's inputs even though pg_loss_coef is 0?
+
+    Yes, and it is the whole point: v3 takes the GRPO TERM away but keeps the
+    reward, routing it through the target instead. The actor has three fast
+    paths that key off ``pg_loss_coef == 0`` meaning "no policy-gradient signal
+    at all" -- it drops ``advantages`` and ``old_log_probs`` from select_keys,
+    it skips the full-vocabulary log_prob, and it computes
+    ``policy_loss_gradient_coef`` only inside the pg branch. With all three
+    taken, r = 0 and e = 1, so c = 0 and q* = q: the arm runs as pure OPD while
+    still emitting every metric. That is silent, so the condition lives here,
+    once, and the three sites call it.
+    """
+    return bool(cfg_map) and bool(dict(cfg_map).get("enable", False))
+
 
 N_ROLES = len(ROLE_NAMES)
 ROLE_ID = {name: rid for rid, name in ROLE_NAMES.items()}
