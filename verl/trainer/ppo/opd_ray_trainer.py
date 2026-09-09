@@ -1495,14 +1495,25 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch.batch["pushback_group_idx"] = group_index_column(
                             batch.non_tensor_batch["uid"], len(batch)
                         )
-                    # The cross gate's prompt split (MOPD v1). A stable key per
-                    # prompt -- the GRPO group's turn-0 anchor observation, hashed
-                    # with the task -- decides which of the two reference halves
-                    # the group feeds, and the same key is what the actor's
-                    # validity window counts prompts by. Only the driver has the
-                    # uids, the turn indices and the anchors, so the columns are
-                    # built here and the key list rides in meta_info.
-                    _cg_cfg = self.config.algorithm.get("opd", {}).get("cross_gate", None)
+                    # The prompt split. A stable key per prompt -- the GRPO
+                    # group's turn-0 anchor observation, hashed with the task --
+                    # decides which of the two reference halves the group feeds,
+                    # and the same key is what the actor's validity window counts
+                    # prompts by. Only the driver has the uids, the turn indices
+                    # and the anchors, so the columns are built here and the key
+                    # list rides in meta_info.
+                    #
+                    # SHARED BY THE CROSS GATE (MOPD v1) AND THE TARGET ARM (v3):
+                    # both hold their references over two disjoint halves of the
+                    # prompts, and the two arms are mutually exclusive anyway, so
+                    # one split serves whichever is on. The seed comes from
+                    # whichever config is enabled -- they cannot both be.
+                    _opd_cfg = self.config.algorithm.get("opd", {})
+                    _cg_cfg = _opd_cfg.get("cross_gate", None)
+                    _td_cfg = _opd_cfg.get("target_distill", None)
+                    if not (_cg_cfg is not None and bool(_cg_cfg.get("enable", False))):
+                        _cg_cfg = _td_cfg if (_td_cfg is not None
+                                              and bool(_td_cfg.get("enable", False))) else None
                     if _cg_cfg is not None and bool(_cg_cfg.get("enable", False)):
                         from verl.trainer.ppo.opd_cross_gate import cross_gate_prompt_columns
 

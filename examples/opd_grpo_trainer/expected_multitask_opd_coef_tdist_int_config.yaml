@@ -353,15 +353,24 @@
 "algorithm.opd.target_distill.integrate": true
 "algorithm.opd.target_distill.ema_decay": 0.8
 "algorithm.opd.target_distill.window_steps": 8
+"algorithm.opd.target_distill.min_prompts": 4
+"algorithm.opd.target_distill.min_pg_prompts": 2
 "algorithm.opd.target_distill.min_tokens": 64
 "algorithm.opd.target_distill.max_staleness": 2
+"algorithm.opd.target_distill.split_seed": 1
 "algorithm.opd.target_distill.delta": 1.0e-30
+# target_roles is where the target is rewritten at all -- with pg_loss_coef = 0 a
+# role outside it gets no reward at all. roles is the subset whose alpha is solved.
+"algorithm.opd.target_distill.target_roles": [format, reasoning, env_action, tool_call, tag]
 "algorithm.opd.target_distill.roles": [format, env_action]
 "actor_rollout_ref.actor.teacher_kl_target_distill.enable": true
 "actor_rollout_ref.actor.teacher_kl_target_distill.eta": 1.0
 "actor_rollout_ref.actor.teacher_kl_target_distill.integrate": true
 "actor_rollout_ref.actor.teacher_kl_target_distill.clamp": 2.0
 "actor_rollout_ref.actor.teacher_kl_target_distill.roles": [format, env_action]
+"actor_rollout_ref.actor.teacher_kl_target_distill.target_roles": [format, reasoning, env_action, tool_call, tag]
+"actor_rollout_ref.actor.teacher_kl_target_distill.min_prompts": 4
+"actor_rollout_ref.actor.teacher_kl_target_distill.min_pg_prompts": 2
 # and every other mechanism on the teacher-KL term is declared off
 "algorithm.opd.cross_gate": null
 "actor_rollout_ref.actor.teacher_kl_cross_gate": null

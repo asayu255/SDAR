@@ -40,8 +40,41 @@ $$
 \qquad F_p=\mathrm{diag}(p)-pp^\top\;}
 $$
 
-成分では $\beta\,p\odot(c-\mathbb E_p[c])$。autograd 一致 5.4e-19。**平均を引く項を落とすと相対誤差 24.4%** になるので、
+成分では $\beta\,p\odot(c-\langle p,c\rangle)$。autograd 一致 5.4e-19。**平均を引く項を落とすと相対誤差 24.4%** になるので、
 統合も記録もこの $F_pc$ の方向で行う（§3、§7）。
+
+**$\mathbb E_p[\cdot]$ ではなく $\langle p,\cdot\rangle$ と書く理由（訂正）。** 損失の支持は top-k で、$p$ は
+その上の**非正規化**確率（$\sum_S p=m<1$、実測 $m\sim0.5$）である。したがって
+
+$$F_p\mathbf 1=p\,(1-m)\neq 0$$
+
+で、**$F_p$ は定数を消さない。** 初版の docstring とテストは「消す」と書いていたが、それは $m=1$ の場合だけ成り立つ主張で、
+その テストは $p$ を正規化していたために通っていた。$c$ に定数を足すのは再パラメータ化ではなく**機構の変更**である。
+$c$ の再中心化（下記）は「$F_p$ が消すから無害」ではなく、**clamp を任意のオフセットに依存させないため**に行う、
+向きを変える操作として置く。
+
+**$c$ の構成順序（clamp と $\alpha$ の順序は仕様である）。**
+
+$$
+c^{\text{base}}_{i,t}=\mathrm{clip}\Big(\eta\,\mathrm{center}\big(f_{i,t}e_{i,t}r_{i,t}\big),\ \pm c_{\max}\Big),
+\qquad c_{i,t}=\alpha_{i,c(t)}\;c^{\text{base}}_{i,t}
+$$
+
+**$\alpha$ は clamp の後に掛ける。** clamp は斉次でないので $\mathrm{clip}(\alpha x)\neq\alpha\,\mathrm{clip}(x)$ であり、
+先に $\alpha$ を掛けて clamp すると、統合の統計が積み上げる $F_pc^{\text{base}}$ と損失が実際に取った方向が
+clamp が効く token でずれる。この順序なら注入は $\alpha$ について厳密に線形:
+$\;\beta F_pc=\alpha\cdot\beta F_pc^{\text{base}}$（テストで float32 相対 3e-8 まで確認）。
+
+**目標を書き換える役割と、統合係数を解く役割は別である。**
+
+| 集合 | 中身 | 意味 |
+|---|---|---|
+| `target_roles` | format, reasoning, env_action, tool_call, tag | **目標をそもそも書き換える範囲。** `pg_loss_coef=0` なので、ここから外れた役割は報酬経路が一つも無く純 OPD になる。学生が生成する役割は全て入れる（`env_obs` は生成物ではないので入らない） |
+| `roles` | format, env_action | **$\alpha$ を解く範囲。** 共通参照を作れる役割だけ。`target_roles` の部分集合であることを `validate()` が要求する |
+
+$\alpha$ が定義されない役割は $\alpha=1$、すなわち**自タスクの RL をそのまま残す**。0 ではない。
+`tool_call` は search にしか無く交差相手が存在しないので、ここを 0 にすると
+search の `<search>` / `<answer>` から報酬が消える — search の課題そのものが消える。
 
 ---
 
@@ -91,9 +124,13 @@ $$
 役割 $c$ ごとに、損失の正規化に合わせた平均:
 
 $$
-v_{i,c}=\mathbb E_{i,c}[r_{i,t}]\quad(\text{保護対象の元 RL 方向}),\qquad
-g_{i,c}=\mathbb E_{i,c}[\tilde r_{i,t}]\quad(\text{候補方向})
+v_{i,c}^{(k)}=\mathbb E_{i,c,k}\big[F_pr_{i,t}\big]\quad(\text{保護対象の元 RL 方向}),\qquad
+g_{i,c}^{(k)}=\mathbb E_{i,c,k}\big[F_pc^{\text{base}}_{i,t}\big]\quad(\text{候補方向})
 $$
+
+$k\in\{1,2\}$ は**プロンプトを 2 分割した半分**。分割鍵は v1/v2 と同じ（turn-0 anchor をタスクとともに hash）。
+$g$ は $\tilde r$ ではなく $c^{\text{base}}$ の平均である — 再中心化と clamp を通した後の、
+$\alpha=1$ で損失が実際に注入する方向そのもの。
 
 ### 2.2 制約付き最適化
 
@@ -103,9 +140,26 @@ $$
 \big(\beta F\,v_{i,c}\big)^\top\Big(\sum_j\alpha_{j,c}\,\beta F g_{j,c}\Big)\ \ge\ 0\quad\forall i\ \text{valid}
 $$
 
-$K_{j,c}=\mathbb E_{j,c}\|\tilde r_{j,t}\|^2$。目的は**重み付け後の RL 信号を削る量**を小さくすること。
+$K_{j,c}=\beta^2\,\mathbb E_{j,c}\|F_pc^{\text{base}}_{j,t}\|^2$。目的は**重み付け後の RL 信号を削る量**を小さくすること。
+削られる量は $(1-\alpha_j)\,\beta F_pc^{\text{base}}_j$ なので、$K$ はその二乗ノルムに一致させる。
 
 **制約は $F$ を通した方向で評価する**（§0）。$v$ と $g$ の生の内積ではない。
+
+**Gram は必ず異なる半分どうしで組む。**
+
+$$
+G_{ij,c}=\tfrac12\Big[\big(v_{i,c}^{(1)}\big)^\top g_{j,c}^{(2)}+\big(v_{i,c}^{(2)}\big)^\top g_{j,c}^{(1)}\Big]
+$$
+
+問題になるのは対角 $G_{ii}$ で、同じ token を内積の両側に置けば条件は自分自身を確認するだけになる。
+非対角は元々プロンプトが交わらないが、規則は一つにして全体へ適用する。
+
+**QP は自分のスケールで正規化して解く。** 実測の $G$ は $10^{-24}$ 以下で、絶対量のまま扱うと
+(a) 受け手の行に対する実行可能性判定が全ての点を受理し、(b) $K$ への ridge が $K$ 自体を上書きし、
+(c) 目的値の改善判定（絶対 $10^{-15}$）が効かず**列挙が最初に見つけた実行可能点を返す**。
+(c) は真の最適が $\alpha=0.5$ の場合に $\alpha=0$ を返す — 蒸留のみでは「RL 半分」と「RL 皆無」の差である。
+したがって受け手の行は単位ノルムへ正規化して残差を `solver_tol` と比べ、ridge は $\max|K|$ に対する比、
+目的は $\max|K|$ で割る（正の定数倍なので argmin は動かない）。$10^{3}$ から $10^{-30}$ まで同一解を返すことをテストで固定。
 
 性質:
 
@@ -127,6 +181,18 @@ $$
 $$
 
 **保護条件を満たしたとは扱わず、フォールバックとして記録する。**
+取る行動は同じでも、**run について言っていることが違う**ので理由は分けて記録する:
+
+| code | 意味 |
+|---|---|
+| `no_receiver` | 有効な受け手が一つも無い |
+| `nonfinite` | $K$ か $G$ に非有限値 |
+| `no_signal` | 全ての $K_j=0$。目的が実行可能点を順序づけられず、答えは ridge の産物にしかならない |
+| `unsolved` | 数値が破綻し、実行可能な KKT 点が一つも得られなかった（**答えは不明**） |
+| `no_common_dir` | 解けた上で答えが「全送り手を切れ」だった。**非零の共通方向が存在しない**という所見であり、`unsolved` とは別の事実 |
+
+`no_common_dir` の検出は厳密である: $\alpha=0$ は常に実行可能で、$K>0$ なら他に実行可能点があれば必ず目的が下がるので、
+最適解が $0$ であることと「$0$ 以外に実行可能点が無い」ことは同値。
 
 ### 2.4 既存の MTL 統合手法を採らない理由
 
@@ -252,19 +318,37 @@ $$
 
 **タスク間統合**
 
+**規約 1: 大きさの指標は $\beta$ 込みで出す。** 更新が見るのは $d+\beta F_pc$ なので介入は $\beta F_pc$ であり、
+$\|F_pc\|$ 単体は $\beta=0.01$ で 100 倍ずれる。$\beta$ 抜きの値は別名（`*_nobeta`）でのみ残す。
+
+**規約 2: 比の分子と分母は同じ母集団で取る。** 分子を live token 平均、分母を全 token 平均にすると何の比でもない。
+既定は**全損失 token 基準**（書き換えなかった token は分子に 0、分母に自分の $\|d\|$ を出す — 更新のどれだけに触れたかの素直な言明）。
+live token だけに限った版は `_live` を付けて補助として併記する。
+
 | 指標 | 何を答えるか |
 |---|---|
 | `target/alpha/{task}/{role}` | 統合係数。$\equiv1$ なら不活性 |
-| `target/alpha_at_bound_frac` | $\alpha$ が 0 か 1 に張り付いた割合 |
+| `target/alpha_at_bound_frac/{role}` | $\alpha$ が 0 か 1 に張り付いた割合 |
 | `target/constraint_slack/{i}/{role}` | $\big(\beta Fv_i\big)^\top\sum_j\alpha_j\beta Fg_j$。**$\alpha=1$ での値も記録**（縛るかどうか） |
-| `target/gram_vg/{i}/{j}/{role}` | $(\beta Fv_i)^\top(\beta Fg_j)$。**$v$ の Gram ではなく $g$ の Gram** |
-| `target/fallback_frac/{task}/{role}`、`target/fallback_reason` | §2.3 のフォールバック発火率と理由 |
-| `target/K/{task}/{role}` | 除去コスト係数 |
-| `target/removed_by_integration/{task}/{role}` | $\|\beta F(c_{\alpha=1}-c_\alpha)\|$。統合が実際に削った量 |
+| `target/gram_vg/{i}/{j}/{role}` | $G_{ij}$（§2.2、異なる半分どうし）。**$v$ の Gram ではなく $g$ の Gram** |
+| `target/cos_vg/{i}/{j}/{role}` | 同じ Gram を角度で。$10^{-12}$ の値が「揃っているが小さい」のか「直交」なのかを分ける |
+| `target/alpha_fallback/{role}`、`target/alpha_converged/{role}` | §2.3 の code（0=solved）と収束 |
+| `target/K_side{k}/{task}/{role}` | 除去コスト係数 $\beta^2\mathbb E\|F_pc^{\text{base}}\|^2$ |
+| `target/removed_by_integration/{task}/{role}` | $\beta(1-\alpha)\|F_pc^{\text{base}}\|$ の live 平均。統合が実際に削った量 |
+| `target/removed_frac/{task}/{role}` | 同じものを $\|F_pc^{\text{base}}\|$ 比で |
+| `target/inject_norm`、`target/inject_norm_nobeta` | $\beta\|F_pc\|$（既定）と $\beta$ 抜き |
+| `target/inject_over_d`、`target/inject_over_d_live` | 全 token 基準（既定）と live 基準（補助） |
+| `target/inject_over_r`、`target/cos_inject_r` | 注入が元 RL 方向に対してどれだけ／どちら向きか |
+| `target/f_mean`、`f_p10`、`f_p50`、`f_p90` | $f$ の中心と裾。平均だけでは重みか switch かが分からない |
+| `target/e_mean`、`e_mean_adv_pos/neg`、`e_clip_frac` | $e$ の水準と、clip に張り付いて定数化した割合 |
+| `target/clamped_frac`、`recenter_residual`、`tv_qstar_q` | clamp が効いた割合、再中心化の大きさ、$q^\star$ と $q$ の TV |
+| `target/sbar`、`sbar_ready` | $f$ の基準スケールと、それが立ち上がったか |
 
-**参照の健全性**（v2 から流用）
+**参照の健全性**（v2 から流用、両半分について）
 
-`ref_cos_sides`、`kappa_k`、`n_eff_k`、`n_distinct_k`、`prompts_side{k}`、`valid`、`invalid_reason`
+`ref_cos_sides_fv` / `ref_cos_sides_fg`（**分割半分間の再現性**）、`n_eff_side{k}`（参加率であってサンプル数ではない）、
+`n_distinct_side{k}`、`ref_norm_fv_side{k}` / `ref_norm_fg_side{k}`、`prompts_side{k}`、`pg_prompts_side{k}`、
+`tokens_window_side{k}`、`staleness_side{k}`、`valid`、`invalid_reason`、`invalid_steps`、`unkeyed_rows`
 
 **精度**: 共通条件の評価で採否を決める。`episode/*_success_rate` は推移把握用。
 
@@ -279,7 +363,9 @@ $$
 | $c$ の clamp | **$\lvert c\rvert\le2$** | §3。恒等式は既に捨てているので、目標の集中を縛る側で決める |
 | $\bar s$ の EMA | **0.8** | v2 と同じ |
 | 役割 | **format, env_action** | v2 と同じ |
-| 参照の有効性 | v2 と同じ（8 step 窓、4/2/64、鮮度 2） | |
+| 参照の有効性 | v2 と同じ（8 step 窓、`min_prompts`=4 / `min_pg_prompts`=2 / `min_tokens`=64、鮮度 2）。**両半分が満たすこと**を要求する | 片側だけで通ると再現性が測れない |
+| `target_roles` | **format, reasoning, env_action, tool_call, tag** | §0。`pg_loss_coef=0` なので、外れた役割は報酬が消える |
+| 分割鍵 | `split_seed`=1、v1/v2 と同じ turn-0 anchor hash | |
 | $\beta$ | **0.01** | 変えない |
 
 ---
@@ -328,9 +414,9 @@ $c$ は $(bs,T,k)$ のテンソル演算、$\mathrm{KL}(p\Vert q^\star)$ は `to
 （制約を満たすために $\alpha$ を下げ、戻る経路が無い）。$n\le4$ なので**全 KKT 候補の列挙**が可能で、そちらに置き換えた。
 
 **フォールバックは必ず $\alpha=1$。** §2.3 のとおり、蒸留のみでは $\alpha=0$ が RL 信号を消す。
-`solve_alpha` の全経路（非有限、受け手なし、未解決）が 1 を返すことをテストで固定した。
+`solve_alpha` の全経路（非有限、受け手なし、信号なし、未解決、共通方向なし）が 1 を返すことをテストで固定した。
 
-### 11.2 検証（CPU、97 テスト）
+### 11.2 検証（CPU、初版）
 
 * `tests/trainer/test_opd_target_distill.py`（24）: **注入方向 $d+\beta F_pc$ を autograd と照合**（残差 1e-12 以下、
   かつ平均を引かない形が実際に誤りであることも主張）、clip 済み token が目標を動かさないこと、
@@ -368,7 +454,52 @@ actor の既存 3 経路が「方策勾配の信号が一切ない」と解釈�
 回帰テストは**条件式を実際に評価する**形にした（`need_log_prob` と select ガードを AST から取り出して eval）。
 3 つの修正それぞれを元に戻す変異試験で、3 つとも失敗することを確認済み。
 
-### 11.4 GPU 上で未実行
+### 11.4 修正: 2 回目のレビューが挙げた 8 件（機構 4・診断 5・記述 1）
+
+`pg_loss_coef` の件とは別に、外部レビューが以下を指摘した。**全て修正済み**、各項目に回帰テストを 1 本ずつ付けた。
+
+**機構**
+
+1. **`tool_call` / `tag` から報酬が消えていた。** 目標を書き換える範囲と $\alpha$ を解く範囲が同じ集合
+   （`roles`）だったので、`format` / `env_action` 以外は $\alpha=0$ 扱い、すなわち
+   `pg_loss_coef=0` の下で報酬経路が一つも無い純 OPD になっていた。search の `<search>` / `<answer>` は
+   `tool_call` なので、**search の課題そのものから報酬が消える**。§0 のとおり 2 集合に分離し、
+   `target_roles`∖`roles` は $\alpha=1$（自タスクの RL を残す）とした。
+2. **clamp と $\alpha$ の順序が統計と食い違っていた。** $\mathrm{clip}(\alpha x)\neq\alpha\,\mathrm{clip}(x)$ なので、
+   統合の統計が積み上げる方向を損失が取っていなかった。$c^{\text{base}}$ を先に中心化・clamp し、
+   $\alpha$ は後から掛ける（§0）。参照も $F_p\tilde r$ ではなく $F_pc^{\text{base}}$ を積む。**仕様変更である。**
+3. **QP のスケール。** §2.2 に記述を追加。実測スケールでは真の最適 $\alpha=0.5$ に対して $\alpha=0$ を返していた。
+4. **「解けなかった」と「非零の共通方向が存在しない」を区別。** §2.3 の表。行動は同じ $\alpha=1$ でも所見が違う。
+
+**診断**
+
+5. $\beta$ 込みを既定に（§7 規約 1）。`inject_over_r` も $\beta$ を含める。
+6. 比の母集団を明示（§7 規約 2）。全 token 基準を既定、live 基準を `_live` で併記。
+7. $\bar s$ が立つまで $f=1$。$\bar s=0$ では比が全 token で 2（上限）になり、初回 step が倍の強さで注入されていた。
+   EMA の初期化は**step 集計**から行う（micro-batch 平均だと rank 配置と行順に依存する）。順序不変性をテストで固定。
+8. `v_sum` / `g_sum` を削除。各 10.9 MiB を device に確保し毎 step all-reduce していたが、**誰も読んでいなかった**。
+9. 不足していた指標を追加: `ref_cos_sides_*`、`prompts_side{k}` / `pg_prompts_side{k}`、
+   `removed_by_integration` / `removed_frac`、`f_p10` / `f_p50` / `f_p90`、`e_clip_frac`、`cos_vg`、`unkeyed_rows`。
+   併せて**有効性条件を文書（4/2/64）に合わせて実装**した —— 参照を 2 分割し、プロンプト数を数え、両半分に条件を課す。
+   分割列はドライバが v1/v2 と同じ鍵で付ける（`cross_side` / `cross_prompt_idx` を v3 でも要求するようにした）。
+
+**記述**
+
+10. **「$F_p$ は定数を消す」を撤回。** §0 のとおり支持上では $F_p\mathbf 1=p(1-m)\neq0$。
+    docstring と、それを「確認」していたテスト（$p$ を正規化していた）を直し、
+    正規化した場合との差が自分のノルムを超えることを主張するテストに置き換えた。
+
+**副次的な配線**: $\beta$ は `teacher_kl_loss_coef` から controller へ渡す（yaml で別に置くことは拒否する）。
+checkpoint は参照の意味が変わったので **version 2**、v1 の state は読まずに拒否する。
+
+### 11.5 検証（CPU）
+
+`test_opd_target_distill.py` 43 + `test_opd_target_distill_arm.py` 17 + 近傍アーム 208 = **268 件 pass**。
+新規の固定: $\alpha$ 線形性（clamp が 96% の token で効く条件下で相対 3e-8）、QP のスケール不変性（$10^3$〜$10^{-30}$）、
+フォールバック 3 種の区別、$\bar s$ の順序不変性、初回 step の $f=1$、削除したバッファの不在、
+$\beta$ に比例する大きさ指標、Gram が異なる半分どうしであること、片側が枯れた参照が無効になること。
+
+### 11.6 GPU 上で未実行
 
 比較は §6 の 3 アーム。**A vs B は単タスクの問い、B vs C だけが多タスク機構の効果。**
 最初に読むのは精度ではなく `inject_over_r`、`tv_qstar_q`、`fe_mean`、そして `alpha` が 1 から動くかどうか。

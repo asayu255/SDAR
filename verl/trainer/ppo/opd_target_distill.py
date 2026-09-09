@@ -120,17 +120,45 @@ UNUSABLE_FEW_TOKENS = 2
 UNUSABLE_STALE = 3
 UNUSABLE_NONFINITE = 4
 UNUSABLE_ZERO_NORM = 5
+UNUSABLE_FEW_PROMPTS = 6
+UNUSABLE_FEW_PG_PROMPTS = 7
 UNUSABLE_NAMES = {
     UNUSABLE_NONE: "ok", UNUSABLE_NEVER_SEEN: "never_seen", UNUSABLE_FEW_TOKENS: "few_tokens",
     UNUSABLE_STALE: "stale", UNUSABLE_NONFINITE: "nonfinite", UNUSABLE_ZERO_NORM: "zero_norm",
+    UNUSABLE_FEW_PROMPTS: "few_prompts", UNUSABLE_FEW_PG_PROMPTS: "few_pg_prompts",
 }
 # Why alpha fell back to 1 rather than being solved. 0 = solved.
+#
+# EVERY ONE OF THESE FALLS BACK TO alpha = 1, NEVER 0. Under distillation-only
+# there is no GRPO term beside the KL, so alpha = 0 does not mean "no cross-task
+# adjustment", it means NO REWARD AT ALL for that (task, role) -- the arm
+# silently becomes pure OPD. 1 is the value the objective wants; the codes exist
+# so the metric can say which of these happened rather than leaving one number.
 FALLBACK_NONE = 0
 FALLBACK_NO_RECEIVER = 1
 FALLBACK_NONFINITE = 2
-FALLBACK_UNSOLVED = 3
+FALLBACK_UNSOLVED = 3          # the QP itself failed: no KKT point was feasible
+FALLBACK_NO_SIGNAL = 4         # every K_j = 0, so the objective cannot rank points
+FALLBACK_NO_COMMON_DIR = 5     # feasible only at alpha = 0: no non-zero direction
+                               # satisfies every receiver at once
 FALLBACK_NAMES = {FALLBACK_NONE: "solved", FALLBACK_NO_RECEIVER: "no_receiver",
-                  FALLBACK_NONFINITE: "nonfinite", FALLBACK_UNSOLVED: "unsolved"}
+                  FALLBACK_NONFINITE: "nonfinite", FALLBACK_UNSOLVED: "unsolved",
+                  FALLBACK_NO_SIGNAL: "no_signal", FALLBACK_NO_COMMON_DIR: "no_common_dir"}
+
+# Two disjoint halves of the prompts, as in the cross gate: a reference built on
+# one half is applied to the other, so the Gram is never an inner product of a
+# direction with the very tokens that produced it. Off the diagonal the halves
+# are disjoint anyway (a prompt belongs to one task), but G[i, i] is a real
+# self-confirmation risk and the same rule is applied everywhere rather than
+# only there.
+N_SIDES = 2
+# Columns in the per-(task, role, side) prompt bitmaps. The dense prompt index
+# comes from the driver's stable anchor key; anything past this cannot be
+# counted for validity and is reported as unkeyed, never hidden.
+MAX_PROMPTS = 1024
+# f in [0, 2] by construction (opd_strength_ratio), so a fixed grid gives exact
+# percentiles to one bin without a sort or a host sync.
+F_BINS = 40
 
 
 @dataclass
@@ -149,15 +177,35 @@ class TargetDistillConfig:
     integrate: bool = False
     # EMA for sbar (the OPD strength scale), the references and the Gram terms.
     ema_decay: float = 0.8
-    # A reference (i, c) is usable after this many control tokens in the window
-    # and while it is no more than max_staleness steps old.
+    # beta, the teacher-KL loss coefficient. NOT used to build the target -- it
+    # cancels in f, which is a ratio -- but the injected direction is beta F_p c
+    # and every magnitude metric is reported on that, so the readout needs it.
+    # Passed from the actor, never set independently of teacher_kl_loss_coef.
+    beta: float = 1.0
+    # A reference (i, c, side) is usable after this many prompts, PG prompts and
+    # control tokens in the window, and while it is no more than max_staleness
+    # steps old. Same conditions as the cross gate (design section 8).
     window_steps: int = 8
+    min_prompts: int = 4
+    min_pg_prompts: int = 2
     min_tokens: int = 64
     max_staleness: int = 2
     delta: float = 1.0e-30
+    # WHERE THE TARGET IS REWRITTEN AT ALL. Every generated role by default: with
+    # pg_loss_coef = 0 there is no other path for the reward, so a role left out
+    # of this set gets NO reward signal whatsoever and becomes pure OPD.
+    target_roles: tuple = ("format", "reasoning", "env_action", "tool_call", "tag")
+    # WHERE THE CROSS-TASK COEFFICIENT IS SOLVED. A subset. Only roles that can
+    # carry a shared reference belong here: tool_call exists for search alone and
+    # has no cross-task partner, so it stays at alpha = 1 and keeps its own
+    # task's RL rather than being zeroed by a solve it cannot participate in.
     roles: tuple = ("format", "env_action")
     solver_iters: int = 500
     solver_tol: float = 1.0e-12
+    # Seed of the prompt -> side hash. The driver reads it off whichever arm is
+    # enabled and passes it to cross_gate_prompt_columns, so the two halves are
+    # built the same way here as in the cross gate.
+    split_seed: int = 1
 
     @classmethod
     def from_mapping(cls, m) -> TargetDistillConfig:
@@ -172,9 +220,10 @@ class TargetDistillConfig:
         for k, v in m.items():
             if k in ("enable", "integrate"):
                 kw[k] = bool(v)
-            elif k == "roles":
+            elif k in ("roles", "target_roles"):
                 kw[k] = tuple(str(x) for x in (list(v) if not isinstance(v, str) else v.split(",")))
-            elif k in ("window_steps", "min_tokens", "max_staleness", "solver_iters"):
+            elif k in ("window_steps", "min_tokens", "max_staleness", "solver_iters",
+                       "min_prompts", "min_pg_prompts", "split_seed"):
                 kw[k] = int(v)
             else:
                 kw[k] = float(v)
@@ -191,17 +240,38 @@ class TargetDistillConfig:
             raise ValueError(f"target_distill.ema_decay must be in [0, 1), got {self.ema_decay}")
         if self.window_steps < 1 or self.min_tokens < 1 or self.max_staleness < 0:
             raise ValueError("target_distill.window_steps/min_tokens must be >= 1, max_staleness >= 0")
+        if self.min_prompts < 1 or self.min_pg_prompts < 0:
+            raise ValueError("target_distill.min_prompts must be >= 1 and min_pg_prompts >= 0")
+        if self.beta < 0.0:
+            raise ValueError(f"target_distill.beta must be >= 0, got {self.beta}")
         if self.delta <= 0.0:
             raise ValueError("target_distill.delta must be > 0")
-        unknown = [r for r in self.roles if r not in ROLE_ID]
-        if unknown:
-            raise ValueError(f"target_distill.roles has unknown roles {unknown}; known {sorted(ROLE_ID)}")
+        for name, val in (("roles", self.roles), ("target_roles", self.target_roles)):
+            unknown = [r for r in val if r not in ROLE_ID]
+            if unknown:
+                raise ValueError(f"target_distill.{name} has unknown roles {unknown}; "
+                                 f"known {sorted(ROLE_ID)}")
+        extra = [r for r in self.roles if r not in self.target_roles]
+        if extra:
+            raise ValueError(
+                f"target_distill.roles {extra} are integrated but not in target_roles, so their "
+                f"alpha would be solved and then never applied. Integration is a subset of rewriting."
+            )
         if self.solver_iters < 1 or self.solver_tol <= 0.0:
             raise ValueError("target_distill.solver_iters must be >= 1 and solver_tol > 0")
 
     def control_role_mask(self) -> torch.Tensor:
+        """Roles whose alpha is SOLVED. A subset of :meth:`target_role_mask`."""
         m = torch.zeros(N_ROLES, dtype=torch.bool)
         for r in self.roles:
+            m[ROLE_ID[r]] = True
+        return m
+
+    def target_role_mask(self) -> torch.Tensor:
+        """Roles where the target is rewritten at all. Outside it the reward is
+        gone entirely, because pg_loss_coef = 0 leaves no other path."""
+        m = torch.zeros(N_ROLES, dtype=torch.bool)
+        for r in self.target_roles:
             m[ROLE_ID[r]] = True
         return m
 
@@ -260,12 +330,28 @@ def rlsd_support_factor(*, teacher_logprob_a: torch.Tensor, student_logprob_a: t
 
 
 def fisher_apply(p: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """``F_p c = p .* (c - E_p[c])`` -- the logit direction a tilt c actually injects.
+    """``F_p c = p .* (c - <p, c>)`` -- the logit direction a tilt c actually injects.
 
     ``-grad_z[beta KL(p||softmax(log q + c))]|_p = d + beta F_p c``. The
     mean-subtraction is not decoration: without it the direction is wrong by 24%
     on a realistic support, and the whole point of the arm is which direction is
     injected.
+
+    ``p`` IS THE UNNORMALISED full-vocabulary softmax at the support, summing to
+    m < 1, because the loss keeps the tail as its own bucket. Two consequences,
+    both of which a "Fisher matrix" reading gets wrong:
+
+      * ``<p, c>`` is not an expectation -- it is m times one.
+      * **F_p DOES NOT KILL A CONSTANT.** ``F_p 1 = p(1 - m)``, which on a
+        measured support (m ~ 0.5) shifts the direction by several times its own
+        norm. Adding k to every component of c is therefore a change of
+        mechanism, not a re-parameterisation. An earlier version of this file
+        claimed the opposite and re-centred c on that basis; the test that
+        "checked" it had normalised p and so tested a case that never occurs.
+
+    Everything here is the component INSIDE the support. The tilt does not reach
+    the tail (it has no per-symbol c), so this is not the whole-vocabulary
+    gradient of the loss -- only the part the arm can steer.
     """
     return p * (c - (p * c).sum(dim=-1, keepdim=True))
 
@@ -333,7 +419,14 @@ def build_target(
         tid_c = tid.clamp(min=0, max=max(nT - 1, 0))
         rol = roles.to(torch.long).clamp(min=0, max=nR - 1)
         sbar_t = refs.sbar.to(dev)[tid_c.unsqueeze(-1).expand(bs, T), rol]
-        f = opd_strength_ratio(d_norm=d_norm, sbar=sbar_t, delta=cfg.delta)
+        ready = refs.sbar_ready.to(dev)[tid_c.unsqueeze(-1).expand(bs, T), rol]
+        # Until sbar exists, f = 1 (neutral). With sbar = 0 the ratio would be 2
+        # for every token -- the cap -- so the first step would inject at double
+        # strength. Initialising from the first MICRO-batch instead would make
+        # the value depend on row order and rank placement, so the controller
+        # seeds the EMA from the step's all-reduced aggregate at the end.
+        f = torch.where(ready, opd_strength_ratio(d_norm=d_norm, sbar=sbar_t, delta=cfg.delta),
+                        torch.ones_like(d_norm))
 
         # --- e, the RLSD support factor -------------------------------------
         lp_t_a = (hit_f * lp_t).sum(dim=-1)
@@ -341,35 +434,61 @@ def build_target(
         e = rlsd_support_factor(teacher_logprob_a=lp_t_a, student_logprob_a=lp_s_a,
                                 advantages=advantages, epsilon_w=cfg.epsilon_w)
         e = torch.where(in_support, e, torch.ones_like(e))
+        # At a bound the RLSD factor stopped carrying the teacher/student gap and
+        # became a constant: how often that happens decides whether e is a weight
+        # or a switch.
+        _eb = 1.0e-6 * max(float(cfg.epsilon_w), 1.0e-6)
+        e_clipped = in_support & ((e <= 1.0 - float(cfg.epsilon_w) + _eb)
+                                 | (e >= 1.0 + float(cfg.epsilon_w) - _eb))
 
-        # --- alpha, per (sender task, role), fixed for the step --------------
-        alpha_t = refs.alpha.to(dev)[tid_c.unsqueeze(-1).expand(bs, T), rol]
+        # --- where the target is rewritten, and where alpha is solved --------
+        tgt = refs.target_roles.to(dev)[rol]
         ctrl = refs.control_roles.to(dev)[rol]
-        # Off a controlled role, or on a padding row, the target is the teacher.
-        live = ctrl & tid_ok.view(bs, 1) & in_support
+        # OUTSIDE target_roles there is no reward at all: pg_loss_coef = 0 leaves
+        # no other path, so a role left out becomes pure OPD.
+        live = tgt & tid_ok.view(bs, 1) & in_support
+        alpha_t = refs.alpha.to(dev)[tid_c.unsqueeze(-1).expand(bs, T), rol]
+        # A role that is rewritten but NOT integrated keeps its own task's RL:
+        # alpha = 1, not 0. tool_call is the case that matters -- search alone
+        # has it, so it can never have a cross-task partner.
+        alpha_t = torch.where(ctrl, alpha_t, torch.ones_like(alpha_t))
         alpha_t = torch.where(live, alpha_t, torch.zeros_like(alpha_t))
 
-        # --- c, re-centred on the support ------------------------------------
-        c_raw = float(cfg.eta) * (alpha_t * f * e).unsqueeze(-1) * r
-        # r sums to c_t * tail_mass over the support, not to zero; F_p c drops
-        # any constant, but the CLAMP does not, so re-centre before clamping.
-        recenter = c_raw.mean(dim=-1, keepdim=True)
-        c = c_raw - recenter
+        # --- the BASE tilt: centred and clamped ONCE, before alpha ------------
+        # alpha multiplies AFTER the clamp so that the injected direction is
+        # linear in it: inject = alpha * F_p c_base. Clamping alpha*c instead
+        # (the first version) made the integration statistics describe a
+        # direction the loss never took, because the clamp is not homogeneous.
+        #
+        # The centring is a deliberate change of direction, not a normalisation:
+        # F_p does not kill a constant on a partial support (see fisher_apply).
+        # It is applied so the clamp acts on a quantity with no arbitrary offset,
+        # and the SAME centred, clamped base is what the statistics accumulate.
+        c_base_raw = float(cfg.eta) * (f * e).unsqueeze(-1) * r
+        centre = c_base_raw.mean(dim=-1, keepdim=True)
+        c_base = (c_base_raw - centre) * live.unsqueeze(-1).to(dt)
+        c_base = c_base.clamp(min=-float(cfg.clamp), max=float(cfg.clamp))
+        clamped_frac = (c_base_raw - centre).abs().gt(float(cfg.clamp)).to(dt).mean(dim=-1)
 
-        built = normalized_weight(c=c, p_on=lp_t.exp(), clamp=float(cfg.clamp))
+        c = alpha_t.unsqueeze(-1) * c_base
+        built = normalized_weight(c=c, p_on=lp_t.exp(), clamp=None)
         target_logprob = lp_t + built["log_w"].to(lp_t.dtype)
 
         # --- what is actually injected ---------------------------------------
-        c_eff = built["c_eff"].to(dt)
+        c_eff = c
         inject = fisher_apply(p_s, c_eff)          # F_p c ; beta is applied by the loss
+        inject_base = fisher_apply(p_s, c_base)    # the alpha = 1 direction, for the Gram
         return {
             "target_logprob": target_logprob,
             "r": r, "c": c, "c_eff": c_eff, "inject": inject,
             "f": f, "e": e, "alpha_t": alpha_t, "d_norm": d_norm,
             "in_support": in_support.to(dt), "live": live.to(dt),
             "tv": built["moved"].to(dt),
-            "clamped": built["clamped"].to(dt).mean(dim=-1),
-            "recenter_residual": recenter.squeeze(-1).abs() * k,
+            "clamped": clamped_frac,
+            "recenter_residual": centre.squeeze(-1).abs() * k,
+            "c_base": c_base,
+            "inject_base": inject_base,
+            "e_clipped": e_clipped.to(dt),
             "rtilde": (f * e).unsqueeze(-1) * r,   # the candidate direction, alpha-free
         }
 
@@ -378,9 +497,10 @@ def build_target(
 # Per-step accumulators
 
 _TOK_COLS = (
-    "n_tok", "n_live", "d_norm_sum", "d_sq_sum",
+    "n_tok", "n_live", "n_live_pg", "d_norm_sum", "d_norm_sum_live", "d_sq_sum",
     "f_sum", "e_sum", "fe_sum", "e_sum_adv_neg", "n_adv_neg", "e_sum_adv_pos", "n_adv_pos",
-    "inject_sq_sum", "r_sq_sum", "rtilde_sq_sum", "inject_dot_r_sum", "inject_norm_sum",
+    "e_clip_sum", "inject_sq_sum", "r_sq_sum", "rtilde_sq_sum", "inject_dot_r_sum",
+    "inject_norm_sum", "inject_base_norm_sum", "inject_base_sq_sum", "removed_norm_sum",
     "r_norm_sum", "tv_sum", "clamped_sum", "recenter_sum", "c_abs_sum", "alpha_sum",
 )
 _TOK_IDX = {n: i for i, n in enumerate(_TOK_COLS)}
@@ -392,22 +512,35 @@ class TargetDistillStats:
 
     def __init__(self, n_tasks: int, vocab_size: int, device):
         self.n_tasks, self.V = int(n_tasks), int(vocab_size)
-        nT, nR = self.n_tasks, N_ROLES
+        nT, nR, nS = self.n_tasks, N_ROLES, N_SIDES
         self.tok = torch.zeros(nT, nR, len(_TOK_COLS), dtype=torch.float64, device=device)
-        # v = E[r] and g = E[rtilde] per (task, role), over the vocabulary.
-        self.v_sum = torch.zeros(nT, nR, self.V, dtype=torch.float32, device=device)
-        self.g_sum = torch.zeros(nT, nR, self.V, dtype=torch.float32, device=device)
-        # The same two after F_p, which is what the constraint is written on.
-        self.fv_sum = torch.zeros(nT, nR, self.V, dtype=torch.float32, device=device)
-        self.fg_sum = torch.zeros(nT, nR, self.V, dtype=torch.float32, device=device)
+        # The references, per (task, role, SIDE), in the space the constraint is
+        # written on -- after F_p, and on c_base rather than on rtilde, so they
+        # describe the direction the loss actually injected at alpha = 1 (the
+        # centring and the clamp are both inside c_base). The raw pre-F sums are
+        # NOT kept: nothing read them, and at (nT, nR, V) each cost 10 MiB of
+        # device memory and one all-reduce per step.
+        self.fv_sum = torch.zeros(nT, nR, nS, self.V, dtype=torch.float32, device=device)
+        self.fg_sum = torch.zeros(nT, nR, nS, self.V, dtype=torch.float32, device=device)
+        self.side_tok = torch.zeros(nT, nR, nS, dtype=torch.float64, device=device)
+        # Which prompts fed each (task, role, side) this step, and which of them
+        # carried a non-zero PG direction. Counted as a bitmap so the window can
+        # take a union across steps rather than adding duplicates.
+        self.prompts = torch.zeros(nT, nR, nS, MAX_PROMPTS, dtype=torch.float32, device=device)
+        self.pg_prompts = torch.zeros(nT, nR, nS, MAX_PROMPTS, dtype=torch.float32, device=device)
+        self.unkeyed = torch.zeros(1, dtype=torch.float64, device=device)
+        # f's distribution, for the percentiles. f in [0, 2] by construction.
+        self.fhist = torch.zeros(nT, nR, F_BINS, dtype=torch.float64, device=device)
 
     def update(self, *, built: dict, task_ids: torch.Tensor, roles: torch.Tensor,
                response_mask: torch.Tensor, topk_ids: torch.Tensor,
                advantages: torch.Tensor | None, row_basis: torch.Tensor | None,
-               p_s: torch.Tensor) -> None:
+               p_s: torch.Tensor, side: torch.Tensor | None = None,
+               prompt_idx: torch.Tensor | None = None) -> None:
         with torch.no_grad():
-            nT, nR = self.n_tasks, N_ROLES
+            nT, nR, nS = self.n_tasks, N_ROLES, N_SIDES
             bs, T = response_mask.shape
+            dev = response_mask.device
             mask = response_mask.to(torch.float32)
             if row_basis is not None:
                 # A duplicated padding row carries basis 0 and is not evidence.
@@ -425,9 +558,12 @@ class TargetDistillStats:
             r = built["r"].to(torch.float32)
             rt = built["rtilde"].to(torch.float32)
             inj = built["inject"].to(torch.float32)
+            inj_b = built["inject_base"].to(torch.float32)
             r_sq = (r * r).sum(-1)
             rt_sq = (rt * rt).sum(-1)
             inj_sq = (inj * inj).sum(-1)
+            inj_b_norm = (inj_b * inj_b).sum(-1).clamp(min=0).sqrt()
+            has_pg = (r_sq > 0).to(torch.float32)
 
             def add(name, val):
                 self.tok.view(ncell, -1)[:, _TOK_IDX[name]].index_add_(
@@ -435,16 +571,24 @@ class TargetDistillStats:
             one = torch.ones_like(mask)
             add("n_tok", one)
             add("n_live", built["live"].to(torch.float32))
+            add("n_live_pg", built["live"].to(torch.float32) * has_pg)
             add("d_norm_sum", built["d_norm"].to(torch.float32))
+            add("d_norm_sum_live", built["d_norm"].to(torch.float32) * built["live"].to(torch.float32))
             add("d_sq_sum", built["d_norm"].to(torch.float32) ** 2)
             add("f_sum", built["f"].to(torch.float32))
             add("e_sum", built["e"].to(torch.float32))
             add("fe_sum", (built["f"] * built["e"]).to(torch.float32))
+            add("e_clip_sum", built["e_clipped"].to(torch.float32))
             add("inject_sq_sum", inj_sq)
             add("r_sq_sum", r_sq)
             add("rtilde_sq_sum", rt_sq)
             add("inject_dot_r_sum", (inj * r).sum(-1))
             add("inject_norm_sum", inj_sq.clamp(min=0).sqrt())
+            add("inject_base_norm_sum", inj_b_norm)
+            add("inject_base_sq_sum", inj_b_norm * inj_b_norm)
+            # ||F(c_1 - c_alpha)|| = (1 - alpha) ||F c_base||, exactly, because
+            # c_alpha = alpha c_base after the A2 fix and F is linear.
+            add("removed_norm_sum", (1.0 - built["alpha_t"].to(torch.float32)) * inj_b_norm)
             add("r_norm_sum", r_sq.clamp(min=0).sqrt())
             add("tv_sum", built["tv"].to(torch.float32))
             add("clamped_sum", built["clamped"].to(torch.float32))
@@ -459,28 +603,69 @@ class TargetDistillStats:
                 add("e_sum_adv_pos", built["e"].to(torch.float32) * pos)
                 add("n_adv_pos", pos)
 
-            # --- the vocabulary-space means, on LIVE tokens only -------------
+            # --- f's histogram, on the same all-token basis as f_mean ---------
+            fb = (built["f"].to(torch.float32) * (F_BINS / 2.0)).floor().to(torch.long).clamp(0, F_BINS - 1)
+            self.fhist.view(ncell * F_BINS).index_add_(
+                0, (cell * F_BINS + fb).reshape(-1),
+                mask.reshape(-1).to(torch.float64))
+
+            # --- the vocabulary-space references, per side, on LIVE tokens ----
+            if side is None:
+                sd = torch.zeros(bs, dtype=torch.long, device=dev)
+                keyed = torch.zeros(bs, dtype=torch.bool, device=dev)
+            else:
+                sd = side.detach().reshape(-1).to(torch.long)
+                keyed = (sd >= 0) & (sd < nS)
+                sd = sd.clamp(0, nS - 1)
+            self.unkeyed += (~keyed & (mask.sum(-1) > 0)).sum().to(torch.float64)
+            klive = live * keyed.to(torch.float32).unsqueeze(-1)
+            cell_s = (tid_c.unsqueeze(-1) * nR + rol) * nS + sd.unsqueeze(-1)
+            self.side_tok.view(-1).index_add_(
+                0, cell_s.reshape(-1), klive.reshape(-1).to(torch.float64))
             ids = topk_ids.to(torch.long).clamp(min=0, max=self.V - 1)
-            flat = (cell.unsqueeze(-1) * self.V + ids).reshape(-1)
-            lw = live.unsqueeze(-1)
+            flat = (cell_s.unsqueeze(-1) * self.V + ids).reshape(-1)
+            lw = klive.unsqueeze(-1)
             fv = fisher_apply(p_s.to(torch.float32), r)
-            fg = fisher_apply(p_s.to(torch.float32), rt)
-            for buf, val in ((self.v_sum, r), (self.g_sum, rt), (self.fv_sum, fv), (self.fg_sum, fg)):
+            fg = built["inject_base"].to(torch.float32)   # = F_p c_base
+            for buf, val in ((self.fv_sum, fv), (self.fg_sum, fg)):
                 buf.view(-1).index_add_(0, flat, (val * lw).reshape(-1).to(torch.float32))
+
+            # --- the prompt bitmaps -------------------------------------------
+            if prompt_idx is not None:
+                pidx = prompt_idx.detach().reshape(-1).to(torch.long)
+                pok = keyed & (pidx >= 0) & (pidx < MAX_PROMPTS)
+                pidx = pidx.clamp(0, MAX_PROMPTS - 1)
+                rowok = pok.to(torch.float32).unsqueeze(-1)
+                pflat = (cell_s * MAX_PROMPTS + pidx.unsqueeze(-1)).reshape(-1)
+                self.prompts.view(-1).index_add_(
+                    0, pflat, (live * rowok).reshape(-1).to(torch.float32))
+                self.pg_prompts.view(-1).index_add_(
+                    0, pflat, (live * rowok * has_pg).reshape(-1).to(torch.float32))
 
     def reduced(self) -> dict:
         out = {}
-        for name in ("tok", "v_sum", "g_sum", "fv_sum", "fg_sum"):
+        for name in ("tok", "fv_sum", "fg_sum", "side_tok", "prompts", "pg_prompts",
+                     "unkeyed", "fhist"):
             buf = getattr(self, name)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 buf = buf.clone()
                 torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
             out[name] = buf.detach().cpu()
+        # A prompt is present or it is not; the sums above counted its tokens.
+        out["prompts"] = (out["prompts"] > 0)
+        out["pg_prompts"] = (out["pg_prompts"] > 0)
         return out
 
 
 # --------------------------------------------------------------------------- #
 # The per-role constrained integration
+
+
+# Below this an alpha is "off". The QP lives on [0, 1] and 0 is always feasible
+# (G 0 = 0 >= 0), so a solution at 0 does not mean 0 is good -- it means nothing
+# else was feasible.
+_ALPHA_ZERO = 1.0e-9
+_RIDGE_REL = 1.0e-9
 
 
 def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
@@ -489,7 +674,7 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
 
     ``Gvg[i, j] = (F v_i)^T (F g_j)`` -- the constraint is written on the
     directions the distillation actually injects, not on the raw reference inner
-    products, because those differ by F_p (design §0).
+    products, because those differ by F_p (design section 0).
 
     SOLVED EXACTLY BY ACTIVE-SET ENUMERATION, not by a penalty. The problem is a
     strictly convex QP whose feasible set is a polytope with at most n_task + 2
@@ -500,11 +685,25 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
     worse than a coarse grid -- it drove alpha down to satisfy the constraint and
     had no way back up.
 
+    SCALE. The receiver rows are inner products of two EMAs of F_p c and carry
+    whatever units those have -- measured at 1e-12 and below, so an absolute
+    feasibility slack would accept every point and an absolute ridge would swamp
+    K. Both are therefore relative: each receiver row is normalised to unit
+    length before the enumeration (which changes no constraint, since its
+    right-hand side is 0), feasibility is judged on that normalised residual
+    against ``tol``, and the ridge on K is a fraction of ``max|K|``. The bound
+    rows are already unit-norm with O(1) right-hand sides.
+
     a = 1 is what the objective wants and is returned whenever it is feasible.
     Returns ``alpha``, the constraint value at the solution and at a = 1, and a
-    fallback code: a caller that gets anything but FALLBACK_NONE must use
+    fallback code: A CALLER THAT GETS ANYTHING BUT FALLBACK_NONE MUST USE
     alpha = 1, NOT 0 -- with distillation-only, alpha = 0 removes the RL signal
-    entirely (design §2.3).
+    entirely (design section 2.3). The codes separate the two ways this ends
+    badly: FALLBACK_UNSOLVED means the arithmetic failed and the answer is
+    unknown, FALLBACK_NO_COMMON_DIR means the arithmetic succeeded and its answer
+    was "switch every sender off" -- there is no non-zero combination that no
+    valid receiver objects to. They are different findings about the run and the
+    metric must not blur them, even though the action taken is the same.
     """
     n = int(np.asarray(K).reshape(-1).shape[0])
     K = np.asarray(K, dtype=np.float64).reshape(n)
@@ -519,26 +718,47 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
                 "fallback": FALLBACK_NO_RECEIVER, "converged": True}
 
     s1 = G @ one
-    if (s1[valid] >= 0.0).all():
+    # The rows as the enumeration sees them: unit length, so the tolerance below
+    # is a relative one. A receiver whose row is identically zero constrains
+    # nothing and is dropped rather than normalised by 0.
+    rown = np.linalg.norm(G, axis=1)
+    act = np.nonzero(valid & (rown > 0.0))[0]
+    Gn = np.zeros_like(G)
+    Gn[act] = G[act] / rown[act, None]
+    if (s1[act] >= -float(tol) * rown[act]).all():
         return {"alpha": one, "slack": s1, "slack_at_one": s1,
                 "fallback": FALLBACK_NONE, "converged": True}
 
+    scale = float(np.abs(K).max())
+    if not (scale > 0.0):
+        # No sender has any measured magnitude, so the objective cannot rank the
+        # feasible points at all. Any answer would be an artefact of the ridge.
+        return {"alpha": one, "slack": s1, "slack_at_one": s1,
+                "fallback": FALLBACK_NO_SIGNAL, "converged": False}
     # A sender with no observed signal has K_j = 0 and the objective would not
-    # care where its alpha lands. Ridge it so the tie is broken toward 1, which
-    # is the direction that keeps the RL signal.
-    scale = max(float(np.abs(K).max()), 1.0)
-    Kp = np.maximum(K, 0.0) + 1e-9 * scale
+    # care where its alpha lands -- but its column of G is zero as well (K = 0
+    # means every c_base was 0, hence g_j = 0), so it appears in no constraint
+    # and the ridge leaves it at 1, which is the direction that keeps the RL.
+    #
+    # DIVIDED BY ITS OWN SCALE. A positive factor on the objective moves no
+    # argmin, but it decides whether the arithmetic below means anything: K is
+    # measured at 1e-24 and smaller, so the "is this candidate better" test had
+    # been comparing objective values of that size against an absolute 1e-15 and
+    # was keeping whichever feasible point the enumeration reached FIRST. At
+    # beta^2 ||F c||^2 scale that silently returned alpha = 0 where the true
+    # optimum was 0.5. It also conditions the KKT systems, whose matrices are
+    # built from 1/Kp.
+    Kp = (np.maximum(K, 0.0) + _RIDGE_REL * scale) / scale
 
-    # rows of  A a >= b :  the receivers' conditions, then 0 <= a <= 1
-    rows = [G[i] for i in np.nonzero(valid)[0]] + \
-           [np.eye(n)[j] for j in range(n)] + [-np.eye(n)[j] for j in range(n)]
-    rhs = [0.0] * int(valid.sum()) + [0.0] * n + [-1.0] * n
+    # rows of  A a >= b :  the receivers' normalised conditions, then 0 <= a <= 1
+    rows = [Gn[i] for i in act] + [np.eye(n)[j] for j in range(n)] + [-np.eye(n)[j] for j in range(n)]
+    rhs = [0.0] * int(act.size) + [0.0] * n + [-1.0] * n
     A = np.asarray(rows, dtype=np.float64)
     b = np.asarray(rhs, dtype=np.float64)
     m = A.shape[0]
 
     def feasible(a):
-        return bool(np.isfinite(a).all() and (A @ a >= b - 1e-9 * max(scale, 1.0)).all())
+        return bool(np.isfinite(a).all() and (A @ a >= b - float(tol)).all())
 
     def obj(a):
         return 0.5 * float((Kp * (1.0 - a) ** 2).sum())
@@ -567,6 +787,13 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
     if best_a is None:
         return {"alpha": one, "slack": s1, "slack_at_one": s1,
                 "fallback": FALLBACK_UNSOLVED, "converged": False}
+    if float(np.abs(best_a).max()) <= _ALPHA_ZERO:
+        # The solve worked and said: turn everything off. Under distillation-only
+        # that is not a weaker intervention, it is no reward at all, so the arm
+        # keeps alpha = 1 and the metric records that the constraint could not be
+        # met by any non-zero combination.
+        return {"alpha": one, "slack": s1, "slack_at_one": s1,
+                "fallback": FALLBACK_NO_COMMON_DIR, "converged": True}
     return {"alpha": best_a, "slack": G @ best_a, "slack_at_one": s1,
             "fallback": FALLBACK_NONE, "converged": True}
 
@@ -580,17 +807,21 @@ class TargetDistillRefs:
     """Previous-step quantities in THIS batch's task order, on the device."""
     alpha: torch.Tensor          # (nT, nR) cross-task coefficient, 1 where not integrated
     sbar: torch.Tensor           # (nT, nR) EMA of ||d||, the scale f is relative to
-    control_roles: torch.Tensor  # (nR,) bool
+    sbar_ready: torch.Tensor     # (nT, nR) bool -- false until the first step's aggregate
+    control_roles: torch.Tensor  # (nR,) bool -- where alpha is solved
+    target_roles: torch.Tensor   # (nR,) bool -- where the target is rewritten
 
 
 @dataclass
 class _RefState:
-    fv: torch.Tensor | None = None      # (V,) EMA of E[F_p r]
-    fg: torch.Tensor | None = None      # (V,) EMA of E[F_p rtilde]
-    sbar: float = 0.0
-    k: float = 0.0                      # EMA of E||rtilde||^2
+    """One (task, role, side). The two sides never share a prompt."""
+    fv: torch.Tensor | None = None      # (V,) EMA of E[F_p r]         (receiver)
+    fg: torch.Tensor | None = None      # (V,) EMA of E[F_p c_base]    (sender)
+    k: float = 0.0                      # EMA of E||F_p c_base||^2
     n_obs: int = 0
     last_step: int = -1
+    prompts: collections.deque = None
+    pg_prompts: collections.deque = None
     tokens: collections.deque = None
 
 
@@ -608,7 +839,9 @@ class TargetDistillController:
         self.cfg = cfg
         self.V = int(vocab_size)
         self.step = 0
-        self.refs: dict = {}                # (task, role) -> _RefState
+        self.refs: dict = {}                # (task, role, side) -> _RefState
+        self.sbar: dict = {}                # (task, role) -> float
+        self.sbar_n: dict = {}              # (task, role) -> observations folded in
         self.alpha: dict = {}               # (task, role) -> float
         self.usable: dict = {}              # (task, role) -> (ok, reason, n_steps)
         self.last_solve: dict = {}
@@ -622,11 +855,12 @@ class TargetDistillController:
                 self.tasks.append(n)
                 self.tasks.sort()
 
-    def _ref(self, task, role) -> _RefState:
-        key = (str(task), int(role))
+    def _ref(self, task, role, side) -> _RefState:
+        key = (str(task), int(role), int(side))
         st = self.refs.get(key)
         if st is None:
-            st = _RefState(tokens=collections.deque())
+            st = _RefState(prompts=collections.deque(), pg_prompts=collections.deque(),
+                           tokens=collections.deque())
             self.refs[key] = st
         return st
 
@@ -636,21 +870,28 @@ class TargetDistillController:
         nT, nR = len(names), N_ROLES
         alpha = torch.ones(nT, nR, dtype=dtype)
         sbar = torch.zeros(nT, nR, dtype=dtype)
+        ready = torch.zeros(nT, nR, dtype=torch.bool)
         for ti, n in enumerate(names):
             for c in range(nR):
                 alpha[ti, c] = float(self.alpha.get((n, c), 1.0))
-                sbar[ti, c] = float(self._ref(n, c).sbar)
-        ctrl = self.cfg.control_role_mask()
+                sbar[ti, c] = float(self.sbar.get((n, c), 0.0))
+                ready[ti, c] = int(self.sbar_n.get((n, c), 0)) > 0
         return TargetDistillRefs(alpha=alpha.to(device), sbar=sbar.to(device),
-                                 control_roles=ctrl.to(device))
+                                 sbar_ready=ready.to(device),
+                                 control_roles=self.cfg.control_role_mask().to(device),
+                                 target_roles=self.cfg.target_role_mask().to(device))
 
     def update(self, names, reduced: dict) -> dict:
         """Fold this step's reduced sums in; solve alpha for the NEXT step."""
         cfg = self.cfg
         names = [str(n) for n in names]
         self._ensure(names)
-        nT, nR = len(names), N_ROLES
-        tok, fv_s, fg_s = reduced["tok"], reduced["fv_sum"], reduced["fg_sum"]
+        nT, nR, nS = len(names), N_ROLES, N_SIDES
+        tok = reduced["tok"]
+        fv_s, fg_s, side_tok = reduced["fv_sum"], reduced["fg_sum"], reduced["side_tok"]
+        prm, pgp = reduced["prompts"], reduced["pg_prompts"]
+        fhist = reduced["fhist"]
+        beta = float(cfg.beta)
         metrics: dict = {}
         self.step += 1
         step = self.step
@@ -659,22 +900,41 @@ class TargetDistillController:
         def g(ti, c, col):
             return float(tok[ti, c, _TOK_IDX[col]])
 
-        # 1. sbar, the references and K. Missing is not zero: a (task, role) with
-        #    no tokens this step holds its state and ages.
+        # 1. sbar, per (task, role). SEEDED FROM THE STEP AGGREGATE, never from a
+        #    micro-batch: the all-reduced sum is the same on every rank and does
+        #    not depend on which rows landed where, and until it exists f is held
+        #    at 1 by build_target rather than at the cap of 2 that sbar = 0 gives.
         for ti, n in enumerate(names):
             for c in range(nR):
-                st = self._ref(n, c)
-                n_tok, n_live = g(ti, c, "n_tok"), g(ti, c, "n_live")
-                st.tokens.append(int(n_live))
-                while len(st.tokens) > cfg.window_steps:
-                    st.tokens.popleft()
-                if n_tok > 0:
-                    sb = g(ti, c, "d_norm_sum") / n_tok
-                    st.sbar = sb if (st.n_obs == 0 or dec == 0.0) else dec * st.sbar + (1 - dec) * sb
-                if n_live > 0:
-                    mfv = (fv_s[ti, c] / n_live).to(torch.float32)
-                    mfg = (fg_s[ti, c] / n_live).to(torch.float32)
-                    kk = g(ti, c, "rtilde_sq_sum") / n_live
+                n_tok = g(ti, c, "n_tok")
+                if n_tok <= 0:
+                    continue          # missing is not zero: hold the value and age
+                sb = g(ti, c, "d_norm_sum") / n_tok
+                seen = int(self.sbar_n.get((n, c), 0))
+                self.sbar[(n, c)] = sb if (seen == 0 or dec == 0.0) else \
+                    dec * float(self.sbar[(n, c)]) + (1 - dec) * sb
+                self.sbar_n[(n, c)] = seen + 1
+
+        # 2. the references and K, per (task, role, side)
+        for ti, n in enumerate(names):
+            for c in range(nR):
+                for sd in range(nS):
+                    st = self._ref(n, c, sd)
+                    n_live = float(side_tok[ti, c, sd])
+                    st.tokens.append(int(n_live))
+                    st.prompts.append(frozenset(torch.nonzero(prm[ti, c, sd]).reshape(-1).tolist()))
+                    st.pg_prompts.append(frozenset(torch.nonzero(pgp[ti, c, sd]).reshape(-1).tolist()))
+                    while len(st.tokens) > cfg.window_steps:
+                        st.tokens.popleft(); st.prompts.popleft(); st.pg_prompts.popleft()
+                    if n_live <= 0:
+                        continue
+                    mfv = (fv_s[ti, c, sd] / n_live).to(torch.float32)
+                    mfg = (fg_s[ti, c, sd] / n_live).to(torch.float32)
+                    # K weighs how much is lost by turning sender j down, so it is
+                    # the magnitude of the very thing alpha scales: ||F c_base||^2.
+                    # Split across the sides only by which tokens fed it.
+                    denom = max(g(ti, c, "n_live"), 1.0)
+                    kk = g(ti, c, "inject_base_sq_sum") / denom
                     if st.n_obs == 0 or dec == 0.0 or st.fv is None:
                         st.fv, st.fg, st.k = mfv.clone(), mfg.clone(), kk
                     else:
@@ -684,26 +944,35 @@ class TargetDistillController:
                     st.n_obs += 1
                     st.last_step = step
 
-        # 2. usability per (i, c)
+        # 3. usability per (i, c): BOTH sides must pass, on the same conditions
+        #    as the cross gate (design section 8) -- 4 prompts, 2 of them with a
+        #    non-zero PG direction, 64 tokens, over an 8-step window, no more
+        #    than 2 steps stale.
         for n in names:
             for c in range(nR):
-                st = self._ref(n, c)
                 reason = UNUSABLE_NONE
-                if st.n_obs == 0 or st.fv is None:
-                    reason = UNUSABLE_NEVER_SEEN
-                elif not (torch.isfinite(st.fv).all() and torch.isfinite(st.fg).all()):
-                    reason = UNUSABLE_NONFINITE
-                elif float(st.fv.double().norm()) <= 0.0:
-                    reason = UNUSABLE_ZERO_NORM
-                elif step - st.last_step > cfg.max_staleness:
-                    reason = UNUSABLE_STALE
-                elif sum(st.tokens) < cfg.min_tokens:
-                    reason = UNUSABLE_FEW_TOKENS
+                for sd in range(nS):
+                    st = self._ref(n, c, sd)
+                    if st.n_obs == 0 or st.fv is None or st.fg is None:
+                        reason = UNUSABLE_NEVER_SEEN; break
+                    if not (torch.isfinite(st.fv).all() and torch.isfinite(st.fg).all()
+                            and math.isfinite(st.k)):
+                        reason = UNUSABLE_NONFINITE; break
+                    if float(st.fv.double().norm()) <= 0.0:
+                        reason = UNUSABLE_ZERO_NORM; break
+                    if step - st.last_step > cfg.max_staleness:
+                        reason = UNUSABLE_STALE; break
+                    if len(set().union(*st.prompts) if st.prompts else set()) < cfg.min_prompts:
+                        reason = UNUSABLE_FEW_PROMPTS; break
+                    if len(set().union(*st.pg_prompts) if st.pg_prompts else set()) < cfg.min_pg_prompts:
+                        reason = UNUSABLE_FEW_PG_PROMPTS; break
+                    if sum(st.tokens) < cfg.min_tokens:
+                        reason = UNUSABLE_FEW_TOKENS; break
                 prev = self.usable.get((n, c), (False, UNUSABLE_NEVER_SEEN, 0))
                 self.usable[(n, c)] = (reason == UNUSABLE_NONE, reason,
                                        0 if reason == UNUSABLE_NONE else prev[2] + 1)
 
-        # 3. solve alpha per controlled role
+        # 4. solve alpha per controlled role
         ctrl = cfg.control_role_mask()
         for c in range(nR):
             rn = ROLE_NAMES[c]
@@ -713,14 +982,25 @@ class TargetDistillController:
                 if bool(ctrl[c]):
                     metrics[f"actor/target/alpha_fallback/{rn}"] = float(FALLBACK_NONE)
                 continue
-            K = np.array([self._ref(n, c).k for n in names], dtype=np.float64)
+            # K on the injected scale, so the objective and the constraint are in
+            # the same units: both carry beta^2.
+            K = np.array([beta * beta * sum(self._ref(n, c, sd).k for sd in range(nS)) / nS
+                          for n in names], dtype=np.float64)
+            # CROSS-SIDE ONLY. G[i, j] pairs receiver i's reference from one half
+            # of the prompts with sender j's from the other, averaged over the two
+            # pairings. Off the diagonal the halves are disjoint anyway (a prompt
+            # belongs to one task); G[i, i] is where it matters, and the same rule
+            # is applied everywhere rather than only there.
             G = np.zeros((nT, nT))
             for ti, i in enumerate(names):
-                a = self._ref(i, c).fv
                 for tj, j in enumerate(names):
-                    b = self._ref(j, c).fg
-                    if a is not None and b is not None:
-                        G[ti, tj] = float((a.double() * b.double()).sum())
+                    acc, cnt = 0.0, 0
+                    for sd in range(nS):
+                        a = self._ref(i, c, sd).fv
+                        b = self._ref(j, c, 1 - sd).fg
+                        if a is not None and b is not None:
+                            acc += float((a.double() * b.double()).sum()); cnt += 1
+                    G[ti, tj] = beta * beta * acc / cnt if cnt else 0.0
             valid = np.array([self.usable.get((i, c), (False, 0, 0))[0] for i in names])
             sol = solve_alpha(K, G, valid, delta=cfg.delta, iters=cfg.solver_iters, tol=cfg.solver_tol)
             self.last_solve[c] = sol
@@ -728,76 +1008,166 @@ class TargetDistillController:
                 self.alpha[(j, c)] = float(sol["alpha"][tj])
             metrics[f"actor/target/alpha_fallback/{rn}"] = float(sol["fallback"])
             metrics[f"actor/target/alpha_converged/{rn}"] = 1.0 if sol["converged"] else 0.0
+            _al = np.asarray(sol["alpha"], dtype=np.float64)
+            metrics[f"actor/target/alpha_at_bound_frac/{rn}"] = float(
+                np.mean((_al <= 1e-9) | (_al >= 1.0 - 1e-9)))
             for ti, i in enumerate(names):
                 metrics[f"actor/target/constraint_slack/{i}/{rn}"] = float(sol["slack"][ti])
                 metrics[f"actor/target/constraint_slack_at_one/{i}/{rn}"] = float(sol["slack_at_one"][ti])
                 for tj, j in enumerate(names):
                     metrics[f"actor/target/gram_vg/{i}/{j}/{rn}"] = float(G[ti, tj])
+                    # The same Gram as an angle, so a number at 1e-12 can be read
+                    # as "aligned but tiny" or "orthogonal" rather than only small.
+                    na = math.sqrt(sum(float(self._ref(i, c, sd).fv.double().pow(2).sum())
+                                       for sd in range(nS) if self._ref(i, c, sd).fv is not None) / nS)
+                    nb = math.sqrt(sum(float(self._ref(j, c, sd).fg.double().pow(2).sum())
+                                       for sd in range(nS) if self._ref(j, c, sd).fg is not None) / nS)
+                    if na > 0 and nb > 0:
+                        metrics[f"actor/target/cos_vg/{i}/{j}/{rn}"] = float(
+                            G[ti, tj] / (beta * beta * na * nb))
 
-        # 4. metrics
+        # 5. metrics
+        edges = torch.linspace(0.0, 2.0, F_BINS + 1, dtype=torch.float64)
         for ti, n in enumerate(names):
             for c in range(nR):
                 rn = ROLE_NAMES[c]
-                st = self._ref(n, c)
                 n_tok, n_live = g(ti, c, "n_tok"), g(ti, c, "n_live")
                 ok, reason, nsteps = self.usable.get((n, c), (False, UNUSABLE_NEVER_SEEN, 0))
-                metrics[f"actor/target/usable/{n}/{rn}"] = 1.0 if ok else 0.0
-                metrics[f"actor/target/unusable_reason/{n}/{rn}"] = float(reason)
-                metrics[f"actor/target/unusable_steps/{n}/{rn}"] = float(nsteps)
+                metrics[f"actor/target/valid/{n}/{rn}"] = 1.0 if ok else 0.0
+                metrics[f"actor/target/invalid_reason/{n}/{rn}"] = float(reason)
+                metrics[f"actor/target/invalid_steps/{n}/{rn}"] = float(nsteps)
                 metrics[f"actor/target/alpha/{n}/{rn}"] = float(self.alpha.get((n, c), 1.0))
-                metrics[f"actor/target/sbar/{n}/{rn}"] = float(st.sbar)
-                metrics[f"actor/target/K/{n}/{rn}"] = float(st.k)
+                metrics[f"actor/target/sbar/{n}/{rn}"] = float(self.sbar.get((n, c), 0.0))
+                metrics[f"actor/target/sbar_ready/{n}/{rn}"] = float(int(self.sbar_n.get((n, c), 0)) > 0)
+                for sd in range(nS):
+                    st = self._ref(n, c, sd)
+                    metrics[f"actor/target/K_side{sd + 1}/{n}/{rn}"] = beta * beta * float(st.k)
+                    metrics[f"actor/target/prompts_side{sd + 1}/{n}/{rn}"] = float(
+                        len(set().union(*st.prompts)) if st.prompts else 0)
+                    metrics[f"actor/target/pg_prompts_side{sd + 1}/{n}/{rn}"] = float(
+                        len(set().union(*st.pg_prompts)) if st.pg_prompts else 0)
+                    metrics[f"actor/target/tokens_window_side{sd + 1}/{n}/{rn}"] = float(sum(st.tokens))
+                    metrics[f"actor/target/staleness_side{sd + 1}/{n}/{rn}"] = float(
+                        step - st.last_step if st.last_step >= 0 else -1)
+                    if st.fv is not None and st.fg is not None:
+                        metrics[f"actor/target/ref_norm_fv_side{sd + 1}/{n}/{rn}"] = \
+                            beta * float(st.fv.double().norm())
+                        metrics[f"actor/target/ref_norm_fg_side{sd + 1}/{n}/{rn}"] = \
+                            beta * float(st.fg.double().norm())
+                        metrics[f"actor/target/n_distinct_side{sd + 1}/{n}/{rn}"] = float((st.fg != 0).sum())
+                        a1 = float(st.fg.double().abs().sum())
+                        a2 = float(st.fg.double().pow(2).sum())
+                        # A participation ratio, NOT a sample count: it says how
+                        # many coordinates carry the mass, and nothing about how
+                        # many independent observations produced it.
+                        metrics[f"actor/target/n_eff_side{sd + 1}/{n}/{rn}"] = (a1 * a1 / a2) if a2 > 0 else 0.0
+                # THE reproducibility check the design asks for: the same
+                # reference built on two disjoint halves of the prompts. If this
+                # is near 0 the direction is noise and a constraint written on it
+                # says nothing, however tight the slack looks.
+                for nm, sel in (("fv", lambda t: t.fv), ("fg", lambda t: t.fg)):
+                    v0, v1 = sel(self._ref(n, c, 0)), sel(self._ref(n, c, 1))
+                    if v0 is not None and v1 is not None:
+                        n0, n1 = float(v0.double().norm()), float(v1.double().norm())
+                        if n0 > 0 and n1 > 0:
+                            metrics[f"actor/target/ref_cos_sides_{nm}/{n}/{rn}"] = \
+                                float((v0.double() * v1.double()).sum()) / (n0 * n1)
                 if n_tok <= 0:
                     continue
                 metrics[f"actor/target/live_frac/{n}/{rn}"] = n_live / n_tok
+                # Of the rewritten tokens, how many carried a non-zero PG direction
+                # at all: the rest sit inside a clip branch or in a group whose
+                # rewards all tied, and their target is the teacher exactly.
+                metrics[f"actor/target/pg_live_frac/{n}/{rn}"] = g(ti, c, "n_live_pg") / n_tok
+                # ||d||'s spread, so sbar can be read as a scale rather than a point
+                _d1 = g(ti, c, "d_norm_sum") / n_tok
+                _d2 = g(ti, c, "d_sq_sum") / n_tok
+                metrics[f"actor/target/d_norm_sd/{n}/{rn}"] = math.sqrt(max(_d2 - _d1 * _d1, 0.0))
                 metrics[f"actor/target/f_mean/{n}/{rn}"] = g(ti, c, "f_sum") / n_tok
                 metrics[f"actor/target/e_mean/{n}/{rn}"] = g(ti, c, "e_sum") / n_tok
                 metrics[f"actor/target/fe_mean/{n}/{rn}"] = g(ti, c, "fe_sum") / n_tok
+                metrics[f"actor/target/e_clip_frac/{n}/{rn}"] = g(ti, c, "e_clip_sum") / n_tok
                 metrics[f"actor/target/tv_qstar_q/{n}/{rn}"] = g(ti, c, "tv_sum") / n_tok
                 metrics[f"actor/target/clamped_frac/{n}/{rn}"] = g(ti, c, "clamped_sum") / n_tok
                 metrics[f"actor/target/c_absmean/{n}/{rn}"] = g(ti, c, "c_abs_sum") / n_tok
                 metrics[f"actor/target/recenter_residual/{n}/{rn}"] = g(ti, c, "recenter_sum") / n_tok
                 metrics[f"actor/target/alpha_applied/{n}/{rn}"] = g(ti, c, "alpha_sum") / n_tok
+                h = fhist[ti, c].double()
+                tot = float(h.sum())
+                if tot > 0:
+                    cdf = torch.cumsum(h, dim=0) / tot
+                    for q, nm in ((0.10, "f_p10"), (0.50, "f_p50"), (0.90, "f_p90")):
+                        idx = int(torch.searchsorted(cdf, torch.tensor(q, dtype=torch.float64)).item())
+                        metrics[f"actor/target/{nm}/{n}/{rn}"] = float(edges[min(idx + 1, F_BINS)])
                 nn_ = g(ti, c, "n_adv_neg")
                 if nn_ > 0:
                     metrics[f"actor/target/e_mean_adv_neg/{n}/{rn}"] = g(ti, c, "e_sum_adv_neg") / nn_
                 np_ = g(ti, c, "n_adv_pos")
                 if np_ > 0:
                     metrics[f"actor/target/e_mean_adv_pos/{n}/{rn}"] = g(ti, c, "e_sum_adv_pos") / np_
+                # THE MAGNITUDE METRICS ARE beta-INCLUSIVE. What the update sees
+                # is d + beta F_p c, so beta F_p c is the intervention and
+                # ||F_p c|| alone is off by a factor of 100 at beta = 0.01. The
+                # beta-free form is kept under its own name for the arithmetic.
+                inj_all = beta * g(ti, c, "inject_norm_sum") / n_tok
+                d_all = g(ti, c, "d_norm_sum") / n_tok
+                metrics[f"actor/target/inject_norm/{n}/{rn}"] = inj_all
+                metrics[f"actor/target/inject_norm_nobeta/{n}/{rn}"] = g(ti, c, "inject_norm_sum") / n_tok
+                # PRIMARY: both sides over EVERY loss token, the population the
+                # loss is averaged over. A non-live token contributes 0 to the
+                # numerator and its real ||d|| to the denominator, which is the
+                # honest statement of how much of the update the arm touches.
+                metrics[f"actor/target/inject_over_d/{n}/{rn}"] = inj_all / (d_all + cfg.delta)
                 if n_live > 0:
-                    inj = g(ti, c, "inject_norm_sum") / n_live
+                    inj_live = beta * g(ti, c, "inject_norm_sum") / n_live
+                    d_live = g(ti, c, "d_norm_sum_live") / n_live
                     rn_ = g(ti, c, "r_norm_sum") / n_live
-                    dn = g(ti, c, "d_norm_sum") / max(n_tok, 1)
-                    metrics[f"actor/target/inject_norm/{n}/{rn}"] = inj
-                    metrics[f"actor/target/inject_over_r/{n}/{rn}"] = inj / (rn_ + cfg.delta)
-                    metrics[f"actor/target/inject_over_d/{n}/{rn}"] = inj / (dn + cfg.delta)
+                    # AUXILIARY: the same ratio restricted to the tokens the arm
+                    # actually rewrote, numerator and denominator on that one mask.
+                    metrics[f"actor/target/inject_over_d_live/{n}/{rn}"] = inj_live / (d_live + cfg.delta)
+                    metrics[f"actor/target/inject_over_r/{n}/{rn}"] = inj_live / (rn_ + cfg.delta)
+                    ib = g(ti, c, "inject_base_norm_sum")
+                    # what the centring and the clamp cost: the candidate's RMS
+                    # before either, against the injected magnitude after both
+                    metrics[f"actor/target/rtilde_rms/{n}/{rn}"] = math.sqrt(
+                        max(g(ti, c, "rtilde_sq_sum") / n_live, 0.0))
+                    metrics[f"actor/target/inject_base_norm/{n}/{rn}"] = beta * ib / n_live
+                    metrics[f"actor/target/removed_by_integration/{n}/{rn}"] = \
+                        beta * g(ti, c, "removed_norm_sum") / n_live
+                    metrics[f"actor/target/removed_frac/{n}/{rn}"] = \
+                        g(ti, c, "removed_norm_sum") / (ib + cfg.delta)
                     isq, rsq = g(ti, c, "inject_sq_sum"), g(ti, c, "r_sq_sum")
                     dot = g(ti, c, "inject_dot_r_sum")
                     if isq > 0 and rsq > 0:
                         metrics[f"actor/target/cos_inject_r/{n}/{rn}"] = dot / math.sqrt(isq * rsq)
-                if st.fv is not None and st.fg is not None:
-                    a, b = st.fv.double(), st.fg.double()
-                    na, nb = float(a.norm()), float(b.norm())
-                    metrics[f"actor/target/ref_norm_fv/{n}/{rn}"] = na
-                    metrics[f"actor/target/ref_norm_fg/{n}/{rn}"] = nb
-                    if na > 0 and nb > 0:
-                        metrics[f"actor/target/cos_fv_fg/{n}/{rn}"] = float((a * b).sum()) / (na * nb)
+        metrics["actor/target/unkeyed_rows"] = float(reduced["unkeyed"].reshape(-1)[0])
         return metrics
 
     # ---- checkpoint ----------------------------------------------------
+    # VERSION 2. Version 1 held one _RefState per (task, role) whose ``fg`` was
+    # the mean of rtilde; the references are now per (task, role, SIDE) and fg is
+    # the mean of F_p c_base -- centred, clamped, after F. The numbers are not
+    # comparable, so a v1 state is refused rather than reinterpreted. No run has
+    # produced one.
+    STATE_VERSION = 2
+
     def state_dict(self) -> dict:
         return {
-            "version": 1,
+            "version": self.STATE_VERSION,
             "cfg": asdict(self.cfg),
             "vocab_size": self.V,
             "step": self.step,
             "tasks": list(self.tasks),
-            "refs": {f"{t}|{c}": {
+            "refs": {f"{t}|{c}|{sd}": {
                 "fv": None if st.fv is None else st.fv.detach().cpu(),
                 "fg": None if st.fg is None else st.fg.detach().cpu(),
-                "sbar": float(st.sbar), "k": float(st.k), "n_obs": int(st.n_obs),
-                "last_step": int(st.last_step), "tokens": list(st.tokens),
-            } for (t, c), st in self.refs.items()},
+                "k": float(st.k), "n_obs": int(st.n_obs), "last_step": int(st.last_step),
+                "tokens": list(st.tokens),
+                "prompts": [sorted(x) for x in st.prompts],
+                "pg_prompts": [sorted(x) for x in st.pg_prompts],
+            } for (t, c, sd), st in self.refs.items()},
+            "sbar": {f"{t}|{c}": float(v) for (t, c), v in self.sbar.items()},
+            "sbar_n": {f"{t}|{c}": int(v) for (t, c), v in self.sbar_n.items()},
             "alpha": {f"{t}|{c}": float(v) for (t, c), v in self.alpha.items()},
             "usable": {f"{t}|{c}": list(v) for (t, c), v in self.usable.items()},
         }
@@ -805,10 +1175,13 @@ class TargetDistillController:
     def load_state_dict(self, sd: dict) -> None:
         if not sd:
             return
-        if sd.get("version") != 1:
-            raise ValueError(f"target_distill state version {sd.get('version')} is not 1")
+        if sd.get("version") != self.STATE_VERSION:
+            raise ValueError(
+                f"target_distill state version {sd.get('version')} is not {self.STATE_VERSION}")
         saved = dict(sd.get("cfg", {}))
-        saved["roles"] = tuple(saved.get("roles", ()))
+        for _k in ("roles", "target_roles"):
+            if _k in saved:
+                saved[_k] = tuple(saved[_k])
         live = asdict(self.cfg)
         drift = {k: (saved.get(k), live[k]) for k in live if saved.get(k) != live[k]}
         if drift:
@@ -819,18 +1192,22 @@ class TargetDistillController:
         self._ensure(sd.get("tasks", []))
         self.refs = {}
         for key, d in sd.get("refs", {}).items():
-            t, c = key.split("|")
+            t, c, side = key.split("|")
             st = _RefState(
                 fv=None if d["fv"] is None else d["fv"].to(torch.float32),
                 fg=None if d["fg"] is None else d["fg"].to(torch.float32),
-                sbar=float(d["sbar"]), k=float(d["k"]), n_obs=int(d["n_obs"]),
-                last_step=int(d["last_step"]), tokens=collections.deque(int(x) for x in d.get("tokens", [])))
-            self.refs[(t, int(c))] = st
-        self.alpha = {}
+                k=float(d["k"]), n_obs=int(d["n_obs"]), last_step=int(d["last_step"]),
+                tokens=collections.deque(int(x) for x in d.get("tokens", [])),
+                prompts=collections.deque(frozenset(x) for x in d.get("prompts", [])),
+                pg_prompts=collections.deque(frozenset(x) for x in d.get("pg_prompts", [])),
+            )
+            self.refs[(t, int(c), int(side))] = st
+        self.sbar, self.sbar_n, self.alpha, self.usable = {}, {}, {}, {}
+        for key, v in sd.get("sbar", {}).items():
+            t, c = key.split("|"); self.sbar[(t, int(c))] = float(v)
+        for key, v in sd.get("sbar_n", {}).items():
+            t, c = key.split("|"); self.sbar_n[(t, int(c))] = int(v)
         for key, v in sd.get("alpha", {}).items():
-            t, c = key.split("|")
-            self.alpha[(t, int(c))] = float(v)
-        self.usable = {}
+            t, c = key.split("|"); self.alpha[(t, int(c))] = float(v)
         for key, v in sd.get("usable", {}).items():
-            t, c = key.split("|")
-            self.usable[(t, int(c))] = (bool(v[0]), int(v[1]), int(v[2]))
+            t, c = key.split("|"); self.usable[(t, int(c))] = (bool(v[0]), int(v[1]), int(v[2]))

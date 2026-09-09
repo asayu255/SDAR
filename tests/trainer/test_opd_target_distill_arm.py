@@ -357,6 +357,46 @@ def test_the_predicate_is_true_for_the_arms_own_lock():
     assert needs_policy_gradient_inputs({"enable": False}) is False
 
 
+def test_beta_comes_from_the_loss_coefficient_and_cannot_be_set_twice():
+    """The injected direction is beta F_p c and every magnitude metric is on that.
+    A second copy of beta in the arm's own config could drift from the coefficient
+    the loss actually uses, and the metrics would then describe a different run."""
+    src = inspect.getsource(
+        __import__("verl.workers.actor.dp_actor", fromlist=["x"]).DataParallelPPOActor
+        .target_distill_controller)
+    assert '_tdc["beta"] = float(self.config.get("teacher_kl_loss_coef"' in src
+    assert 'if "beta" in _tdc:' in src, "a beta in the yaml must be refused, not silently ignored"
+    from verl.trainer.ppo.opd_target_distill import TargetDistillConfig
+    assert TargetDistillConfig.from_mapping({"enable": True, "beta": 0.01}).beta == 0.01
+
+
+def test_the_prompt_split_columns_are_selected_and_attached_for_this_arm():
+    """The references are held over two disjoint halves of the prompts and the
+    validity window counts prompts, so the arm needs the driver's split columns --
+    not only the cross gate, which is what the condition used to say."""
+    src, _ = _update_policy_src()
+    expr = _assign_guard_of("for _k in ('cross_side', 'cross_prompt_idx'):\n"
+                            "    if _k in data.batch.keys():\n"
+                            "        select_keys.append(_k)")
+    self_cg_off = type("S", (), {"config": _Cfg(teacher_kl_cross_gate=None)})()
+    assert eval(expr, {}, dict(self=self_cg_off, _td_needs_pg_cols=True)) is True, \
+        "with the target arm on, the split columns must be selected"
+    assert eval(expr, {}, dict(self=self_cg_off, _td_needs_pg_cols=False)) is False
+    i_bind = src.index("_td_needs_pg_cols = needs_policy_gradient_inputs(")
+    i_use = src.index("_td_needs_pg_cols", i_bind + 1)
+    assert i_bind < i_use, "the predicate must be bound before the guard reads it"
+    # and the driver builds them for either arm
+    import inspect as _i
+
+    from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
+    dsrc = _i.getsource(OPDRayTrainer)
+    assert '_td_cfg = _opd_cfg.get("target_distill", None)' in dsrc
+    assert 'batch.batch["cross_prompt_idx"] = _cols["prompt_idx"]' in dsrc
+    # the stats call passes them through
+    assert "side=data.get('cross_side', None)" in src
+    assert "prompt_idx=data.get('cross_prompt_idx', None)" in src
+
+
 def test_the_failure_mode_itself_produces_a_dead_target():
     """What the three fast paths would have delivered: no advantages, no
     coefficient. c = 0 and q* = q -- named here so the regression is legible."""
@@ -375,7 +415,9 @@ def test_the_failure_mode_itself_produces_a_dead_target():
     s, t = torch.gather(lp_s, -1, ids), torch.gather(lp_t, -1, ids)
     cfg = TargetDistillConfig(enable=True, eta=1.0, integrate=False)
     refs = TargetDistillRefs(alpha=torch.ones(3, N_ROLES), sbar=torch.full((3, N_ROLES), 1e-2),
-                             control_roles=cfg.control_role_mask())
+                             sbar_ready=torch.ones(3, N_ROLES, dtype=torch.bool),
+                             control_roles=cfg.control_role_mask(),
+                             target_roles=cfg.target_role_mask())
     common = dict(student_topk_logprob=s, teacher_topk_logprob=t, topk_ids=ids,
                   response_ids=ids[..., 0],
                   teacher_kl_base=topk_kl_per_token(student_topk_logprob=s, teacher_topk_logprob=t),

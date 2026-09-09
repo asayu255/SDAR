@@ -1757,7 +1757,18 @@ class DataParallelPPOActor(BasePPOActor):
                     "teacher_kl_target_distill needs the model's vocab_size for its "
                     "references and the module does not report one."
                 )
-            ctl = TargetDistillController(TargetDistillConfig.from_mapping(cfg_map), int(vocab), names)
+            _tdc = dict(cfg_map)
+            # beta is not a knob of this arm: the injected direction is
+            # beta F_p c and every magnitude metric is reported on that, so the
+            # controller is handed the loss's own coefficient rather than a
+            # second copy that could drift from it.
+            if "beta" in _tdc:
+                raise AssertionError(
+                    "teacher_kl_target_distill.beta is not settable: it is taken from "
+                    "actor.teacher_kl_loss_coef so the two cannot disagree."
+                )
+            _tdc["beta"] = float(self.config.get("teacher_kl_loss_coef", 1.0))
+            ctl = TargetDistillController(TargetDistillConfig.from_mapping(_tdc), int(vocab), names)
             pending = getattr(self, "_target_distill_pending_state", None)
             if pending:
                 ctl.load_state_dict(pending)
@@ -2442,6 +2453,8 @@ class DataParallelPPOActor(BasePPOActor):
         task_id_names = data.meta_info.get("task_id_names", None)
         if "task_ids" in data.batch.keys():
             select_keys.append("task_ids")
+        _td_needs_pg_cols = needs_policy_gradient_inputs(
+            self.config.get("teacher_kl_target_distill", None))
         # Once, here, on the whole arranged batch. Every check inside reads a
         # device value back to the host, and none of the answers depends on the
         # student's forward -- so the micro-batch loop below does a lookup and
@@ -2454,9 +2467,12 @@ class DataParallelPPOActor(BasePPOActor):
                 and "pushback_group_idx" in data.batch.keys()):
             select_keys.append("pushback_group_idx")
         # The cross gate's per-row prompt side and dense prompt index, attached
-        # by the driver next to the group index above.
-        if (self.config.get("teacher_kl_cross_gate", None)
-                and bool(dict(self.config.get("teacher_kl_cross_gate")).get("enable", False))):
+        # by the driver next to the group index above. MOPD v3 counts prompts by
+        # the same columns -- its references are split over the same two halves
+        # and its validity window is the same 4 / 2 / 64.
+        if ((self.config.get("teacher_kl_cross_gate", None)
+             and bool(dict(self.config.get("teacher_kl_cross_gate")).get("enable", False)))
+                or _td_needs_pg_cols):
             for _k in ("cross_side", "cross_prompt_idx"):
                 if _k in data.batch.keys():
                     select_keys.append(_k)
@@ -4997,6 +5013,12 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=response_mask, topk_ids=_p["topk_ids"],
                                 advantages=data.get("advantages", None),
                                 row_basis=_p["row_basis"], p_s=_p["p_s"],
+                                # The two disjoint prompt halves and the dense
+                                # prompt index, from the driver's stable anchor
+                                # key. Absent -> no reference is built and the
+                                # arm stays at alpha = 1, which is arm B.
+                                side=data.get("cross_side", None),
+                                prompt_idx=data.get("cross_prompt_idx", None),
                             )
 
                     if cross_stats is not None and _cg_pending is not None and task_ids is not None:

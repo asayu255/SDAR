@@ -351,9 +351,21 @@ case "$ARM" in
             "+algorithm.opd.target_distill.integrate=$TD_INT"
             "+algorithm.opd.target_distill.ema_decay=0.8"
             "+algorithm.opd.target_distill.window_steps=8"
+            "+algorithm.opd.target_distill.min_prompts=4"
+            "+algorithm.opd.target_distill.min_pg_prompts=2"
             "+algorithm.opd.target_distill.min_tokens=64"
             "+algorithm.opd.target_distill.max_staleness=2"
+            "+algorithm.opd.target_distill.split_seed=1"
             "+algorithm.opd.target_distill.delta=1e-30"
+            # TWO ROLE SETS, and the difference is not cosmetic. target_roles is
+            # where the target is rewritten at all: with pg_loss_coef=0 a role
+            # left out of it gets NO reward, so it must cover every role the
+            # student generates. roles is the subset whose alpha is SOLVED --
+            # only roles that can carry a shared reference. tool_call is search's
+            # alone and has no cross-task partner, so it stays at alpha=1 and
+            # keeps search's own RL on <search>/<answer> instead of losing it.
+            # env_obs is absent from both: the student did not generate it.
+            "+algorithm.opd.target_distill.target_roles=[format,reasoning,env_action,tool_call,tag]"
             "+algorithm.opd.target_distill.roles=[format,env_action]"
             "actor_rollout_ref.actor.pg_loss_coef=0.0"
         )
