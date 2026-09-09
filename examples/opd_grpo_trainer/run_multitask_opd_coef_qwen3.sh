@@ -363,6 +363,11 @@ case "$ARM" in
             "+algorithm.opd.target_distill.min_prompts=4"
             "+algorithm.opd.target_distill.min_pg_prompts=2"
             "+algorithm.opd.target_distill.min_tokens=64"
+            # A reference must agree with itself across the two disjoint prompt
+            # halves before it may take part in the protection constraint. 0.0 is
+            # the minimum defensible bar (refuse one that anti-correlates with
+            # itself); a positive threshold has no measured basis yet.
+            "+algorithm.opd.target_distill.min_ref_cos=0.0"
             "+algorithm.opd.target_distill.max_staleness=2"
             "+algorithm.opd.target_distill.split_seed=1"
             "+algorithm.opd.target_distill.delta=1e-30"

@@ -40,6 +40,7 @@ from verl.trainer.ppo.opd_target_distill import (
     _TAIL_EPS as TAIL_EPS,
     UNUSABLE_FEW_TOKENS,
     UNUSABLE_FEW_PROMPTS,
+    UNUSABLE_UNRELIABLE_REF,
     UNUSABLE_NEVER_SEEN,
     UNUSABLE_STALE,
     TargetDistillConfig,
@@ -52,6 +53,7 @@ from verl.trainer.ppo.opd_target_distill import (
     opd_strength_ratio,
     rl_support_direction,
     rlsd_support_factor,
+    signal_kept_fraction,
     solve_alpha,
 )
 from verl.trainer.ppo.sign_weights import (
@@ -422,7 +424,7 @@ def test_every_fallback_path_returns_one_not_zero():
 # 5. the accumulator and the controller
 
 
-def _step(ctl, names, seed, bs=6, T=7, side=None, prompt_idx=None):
+def _step(ctl, names, seed, bs=6, T=7, side=None, prompt_idx=None, prompt_keys=None):
     b = _batch(seed=seed, bs=bs, T=T)
     refs = ctl.refs_to_device(names, torch.device("cpu"))
     built, s, t = _build(b, refs=refs, cfg=ctl.cfg)
@@ -432,7 +434,10 @@ def _step(ctl, names, seed, bs=6, T=7, side=None, prompt_idx=None):
               advantages=b["advantages"], row_basis=None, p_s=s.exp(),
               side=torch.arange(bs) % 2 if side is None else side,
               prompt_idx=torch.arange(bs) if prompt_idx is None else prompt_idx)
-    return ctl.update(names, st.reduced()), built
+    # The driver's dense index is batch-local; the controller needs the stable
+    # keys, exactly as the actor passes them.
+    keys = [f"k{i}" for i in range(64)] if prompt_keys is None else prompt_keys
+    return ctl.update(names, st.reduced(), keys), built
 
 
 def test_stats_match_a_dense_recomputation():
@@ -852,6 +857,187 @@ def test_inject_nz_frac_is_not_pg_live_frac():
     inj_nz = float((built["inject"].abs().sum(-1) > 0).to(torch.float64).mean())
     pg_nz = float(((built["r"] * built["r"]).sum(-1) > 0).to(torch.float64).mean())
     assert inj_nz <= pg_nz + 1e-12, "an injection cannot be non-zero where r is zero"
+
+
+# ---------------------------------------------------------------------------
+# 8. the third review's findings, one test each
+
+
+def _metrics_at_beta(beta, seed=1):
+    ctl = TargetDistillController(_cfg(beta=beta, min_prompts=1, min_pg_prompts=1), V, TASKS)
+    m, built = _step(ctl, TASKS, seed)
+    return m, built
+
+
+def test_every_ratio_is_beta_symmetric_and_every_magnitude_is_beta_inclusive():
+    """The update is d + beta F c with d = beta g_opd, so a ratio of the two is
+    beta-free. Putting beta on the numerator alone read 100x small at beta = 0.01
+    and was taken as evidence that the arm injects almost nothing."""
+    k = "alfworld/format"
+    m1, _ = _metrics_at_beta(1.0)
+    m2, _ = _metrics_at_beta(0.01)
+    for name in ("inject_over_d", "inject_over_d_live", "inject_over_teacher",
+                 "inject_over_teacher_k"):
+        assert math.isclose(m1[f"actor/target/{name}/{k}"], m2[f"actor/target/{name}/{k}"],
+                            rel_tol=1e-9), f"{name} must not depend on beta"
+    # magnitudes DO scale with beta, and their beta-free twins do not
+    for name in ("inject_norm", "inject_norm_kp1", "teacher_contrib", "d_norm_kp1",
+                 "removed_by_integration"):
+        assert math.isclose(m2[f"actor/target/{name}/{k}"],
+                            0.01 * m1[f"actor/target/{name}/{k}"], rel_tol=1e-9), name
+    for name in ("inject_norm_nobeta", "d_norm_kp1_nobeta"):
+        assert math.isclose(m1[f"actor/target/{name}/{k}"], m2[f"actor/target/{name}/{k}"],
+                            rel_tol=1e-9), name
+    # inject_over_r is the exception: r carries no beta, so beta stays
+    assert math.isclose(m2[f"actor/target/inject_over_r/{k}"],
+                        0.01 * m1[f"actor/target/inject_over_r/{k}"], rel_tol=1e-9)
+
+
+def test_the_injection_has_a_tail_component_even_though_c_tail_is_zero():
+    """F_P C at the bucket is -t_p sum_S p_v c_v, so the (k+1) norm is not the
+    k-only norm. It is negligible at the pinned support, and the ratio lambda is
+    set against must not depend on that staying true."""
+    b = _batch()
+    built, sl, t = _build(b)
+    p_s = sl.exp()
+    t_p = (1 - p_s.sum(-1, keepdim=True)).clamp(min=TAIL_EPS, max=1.0)
+    P = torch.cat([p_s, t_p], -1)
+    C = torch.cat([built["c"], torch.zeros_like(t_p)], -1)
+    full = fisher_apply(P, C)
+    assert torch.allclose(full[..., -1:], -t_p * (p_s * built["c"]).sum(-1, keepdim=True), atol=1e-14)
+    got = (full * full).sum(-1).sqrt()
+    assert torch.allclose(got, built["inject_norm_kp1"], atol=1e-12)
+    live = built["live"] > 0
+    if bool(live.any()):
+        assert float(full[..., -1][live].abs().max()) > 0.0, "the tail term is not identically zero"
+
+
+def test_the_window_counts_prompts_by_stable_key_not_by_batch_column():
+    """cross_prompt_idx is dense WITHIN ONE BATCH. Storing the column and taking
+    a union across the window counted one prompt seen four times as four, and
+    turned a starved reference valid at step 4."""
+    ctl = TargetDistillController(_cfg(min_prompts=4, min_pg_prompts=1, min_tokens=1), V, TASKS)
+    seen = []
+    for step in range(4):
+        # the SAME two prompts every step; only their batch-local column moves
+        idx = torch.tensor([step, step, step, step + 20, step + 20, step + 20])
+        keys = ["?"] * 64
+        keys[step] = "PROMPT_A"
+        keys[step + 20] = "PROMPT_B"
+        m, _ = _step(ctl, TASKS, 1, side=torch.tensor([0, 0, 0, 1, 1, 1]),
+                     prompt_idx=idx, prompt_keys=keys)
+        seen.append((m["actor/target/prompts_side1/alfworld/format"],
+                     m["actor/target/valid/alfworld/format"]))
+    assert all(c == 1.0 for c, _ in seen), f"one prompt per side must count as one: {seen}"
+    assert all(v == 0.0 for _, v in seen), "min_prompts = 4 must never be satisfied by one prompt"
+    # and genuinely different prompts DO accumulate: the same fixture with a
+    # fresh key each step reaches one per window step instead of standing at one
+    ctl2 = TargetDistillController(_cfg(min_prompts=4, min_pg_prompts=1, min_tokens=1), V, TASKS)
+    counts = []
+    for step in range(4):
+        keys = [f"P{step}_{i}" for i in range(64)]
+        m2, _ = _step(ctl2, TASKS, 1, side=torch.tensor([0, 0, 0, 1, 1, 1]),
+                      prompt_idx=torch.tensor([0, 1, 2, 3, 4, 5]), prompt_keys=keys)
+        counts.append(m2["actor/target/prompts_side1/alfworld/format"])
+    assert counts[-1] == float(_cfg().window_steps), (
+        f"distinct prompts must accumulate up to the window: {counts}")
+    assert counts[-1] > seen[-1][0], "and must exceed the one-prompt case"
+
+
+def test_no_keys_starves_the_window_rather_than_counting_columns():
+    """Without the key list a column has no identity. Counting nothing is the
+    safe direction: the reference stays unusable and alpha falls back to 1."""
+    ctl = TargetDistillController(_cfg(min_prompts=1, min_pg_prompts=1, min_tokens=1), V, TASKS)
+    for step in (1, 2, 3):
+        m, _ = _step(ctl, TASKS, step, prompt_keys=[])
+    assert m["actor/target/prompts_side1/alfworld/format"] == 0.0
+    assert m["actor/target/valid/alfworld/format"] == 0.0
+    assert m["actor/target/alpha/alfworld/format"] == 1.0
+
+
+def test_a_sender_with_no_candidate_signal_cannot_hold_the_guard_open():
+    """The measured env_action solve: search has no env_action tokens, so K = 0,
+    its column of G is zero and the ridge leaves alpha = 1. Testing max|alpha|
+    over EVERY coordinate then let it mask both tasks that do act being zeroed --
+    which under pg_loss_coef = 0 is their whole reward."""
+    K = np.array([2.5e-13, 0.0, 1.1e-13])          # search has no signal here
+    G = np.array([[-3.0e-13, 1e-18, 2e-18],
+                  [0.0, 0.0, 0.0],
+                  [4e-18, 1e-18, -8.0e-14]])
+    sol = solve_alpha(K, G, np.ones(3, bool))
+    # the solve itself drives both acting tasks to ~1e-6..1e-5, not to exactly 0,
+    # so a threshold on alpha would have missed it too -- the test is on how much
+    # candidate SIGNAL survives
+    assert signal_kept_fraction(K, np.array([3.0e-06, 1.0, 1.3e-05])) < 1e-4
+    assert sol["fallback"] == FALLBACK_NO_COMMON_DIR
+    assert np.allclose(sol["alpha"], 1.0)
+    # NOT the rule "any single alpha = 0 forces them all to 1": a genuine partial
+    # solve, where a sender WITH signal survives, must still be applied
+    K2 = np.array([1.0, 1.0])
+    G2 = np.array([[1.0, -2.0], [0.0, 1.0]])
+    sol2 = solve_alpha(K2, G2, np.ones(2, bool))
+    assert sol2["fallback"] == FALLBACK_NONE
+    assert sol2["alpha"][0] == pytest.approx(1.0) and sol2["alpha"][1] == pytest.approx(0.5)
+    assert sol2["signal_kept"] == pytest.approx(0.75)
+    # one sender crushed while another keeps its signal is an ATTENUATION and
+    # must still be applied -- the guard is on the aggregate, not on any one alpha
+    K3 = np.array([1.0, 1.0])
+    G3 = np.array([[1.0, -1e9], [0.0, 1.0]])
+    sol3 = solve_alpha(K3, G3, np.ones(2, bool))
+    assert sol3["fallback"] == FALLBACK_NONE, "a partial removal is not a fallback"
+    assert sol3["alpha"][1] < 1e-6 and sol3["alpha"][0] == pytest.approx(1.0)
+
+
+def test_a_reference_that_disagrees_with_itself_cannot_constrain():
+    """The measured env_action references had split-half cosines of -0.35 and
+    -0.04 while passing tokens, prompts and staleness -- and then drove alpha to
+    0. Reproducibility was recorded and gated nothing."""
+    ctl = TargetDistillController(_cfg(min_prompts=1, min_pg_prompts=1, min_tokens=1,
+                                       min_ref_cos=0.0), V, TASKS)
+    for st in (1, 2, 3):
+        m, _ = _step(ctl, TASKS, st)
+    c = ROLE_FORMAT
+    # force one side's sender reference to point the other way
+    ref = ctl._ref("alfworld", c, 1)
+    assert ref.fg is not None, "fixture: the reference must exist"
+    ref.fg = -ctl._ref("alfworld", c, 0).fg.clone()
+    m, _ = _step(ctl, TASKS, 4)
+    assert m["actor/target/valid/alfworld/format"] == 0.0
+    assert m["actor/target/invalid_reason/alfworld/format"] == float(UNUSABLE_UNRELIABLE_REF)
+    assert m["actor/target/alpha/alfworld/format"] == 1.0, "an unusable reference falls back to 1"
+    with pytest.raises(ValueError, match="min_ref_cos"):
+        _cfg(min_ref_cos=1.5).validate()
+
+
+def test_protection_is_judged_on_the_surviving_signal_not_on_alpha():
+    """alpha = (0, 1, 0) with the 1 on a task that contributed nothing is 100%
+    removed, not 33% kept."""
+    ctl = TargetDistillController(_cfg(min_prompts=1, min_pg_prompts=1, min_tokens=1), V, TASKS)
+    for st in (1, 2):
+        m, _ = _step(ctl, TASKS, st)
+    assert "actor/target/signal_kept_frac/format" in m
+    assert "actor/target/active_senders/format" in m
+    assert 0.0 <= m["actor/target/signal_kept_frac/format"] <= 1.0 + 1e-9
+
+
+def test_a_pre_lambda_state_resumes_at_lambda_one_and_only_there():
+    """A state written before the lambda machinery has no lambda_* keys; reading
+    'absent' as a config change refuses a resume that is in fact identical. It
+    migrates to the value that reproduces the old run -- and to nothing else."""
+    ctl = TargetDistillController(_cfg(ema_decay=0.5), V, TASKS)
+    for st in (1, 2):
+        _step(ctl, TASKS, st)
+    sd = ctl.state_dict()
+    old = {k: v for k, v in sd["cfg"].items()
+           if not k.startswith("lambda_") and k != "min_ref_cos"}
+    sd_old = dict(sd, cfg=old)
+    TargetDistillController(_cfg(ema_decay=0.5), V, TASKS).load_state_dict(sd_old)   # must not raise
+    # but it may not be switched into the lambda arm, nor pick up a gate the old
+    # run never applied
+    for bad in (_cfg(ema_decay=0.5, lambda_decay=True),
+                _cfg(ema_decay=0.5, min_ref_cos=0.5)):
+        with pytest.raises(ValueError, match="changed across resume"):
+            TargetDistillController(bad, V, TASKS).load_state_dict(sd_old)
 
 
 def test_config_parsing_and_validation():

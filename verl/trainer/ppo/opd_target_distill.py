@@ -91,6 +91,7 @@ __all__ = [
     "lambda_at",
     "build_target",
     "solve_alpha",
+    "signal_kept_fraction",
     "fisher_apply",
     "N_ROLES",
 ]
@@ -128,10 +129,12 @@ UNUSABLE_NONFINITE = 4
 UNUSABLE_ZERO_NORM = 5
 UNUSABLE_FEW_PROMPTS = 6
 UNUSABLE_FEW_PG_PROMPTS = 7
+UNUSABLE_UNRELIABLE_REF = 8
 UNUSABLE_NAMES = {
     UNUSABLE_NONE: "ok", UNUSABLE_NEVER_SEEN: "never_seen", UNUSABLE_FEW_TOKENS: "few_tokens",
     UNUSABLE_STALE: "stale", UNUSABLE_NONFINITE: "nonfinite", UNUSABLE_ZERO_NORM: "zero_norm",
     UNUSABLE_FEW_PROMPTS: "few_prompts", UNUSABLE_FEW_PG_PROMPTS: "few_pg_prompts",
+    UNUSABLE_UNRELIABLE_REF: "unreliable_ref",
 }
 # Why alpha fell back to 1 rather than being solved. 0 = solved.
 #
@@ -195,6 +198,17 @@ class TargetDistillConfig:
     min_prompts: int = 4
     min_pg_prompts: int = 2
     min_tokens: int = 64
+    # A reference must agree with itself across the two disjoint prompt halves
+    # before it may take part in the protection constraint. Token counts and a
+    # non-zero norm say nothing about whether a DIRECTION is reproducible, and
+    # the measured env_action references had split-half cosines of -0.35 and
+    # -0.04 while passing every other condition -- then drove alpha to 0.
+    #
+    # 0.0 is the minimum defensible bar (refuse a reference that anti-correlates
+    # with itself), not a claim that anything above 0 is reliable. A positive
+    # threshold has no measured basis yet; revise it from the reported
+    # distribution, the same way lambda_min is meant to be revised.
+    min_ref_cos: float = 0.0
     max_staleness: int = 2
     delta: float = 1.0e-30
     # WHERE THE TARGET IS REWRITTEN AT ALL. Every generated role by default: with
@@ -261,6 +275,8 @@ class TargetDistillConfig:
             raise ValueError("target_distill.window_steps/min_tokens must be >= 1, max_staleness >= 0")
         if self.min_prompts < 1 or self.min_pg_prompts < 0:
             raise ValueError("target_distill.min_prompts must be >= 1 and min_pg_prompts >= 0")
+        if not (-1.0 <= self.min_ref_cos <= 1.0):
+            raise ValueError(f"target_distill.min_ref_cos must be in [-1, 1], got {self.min_ref_cos}")
         if self.beta < 0.0:
             raise ValueError(f"target_distill.beta must be >= 0, got {self.beta}")
         if not (0.0 <= self.lambda_min <= 1.0):
@@ -587,11 +603,22 @@ def build_target(
         c_eff = c
         inject = fisher_apply(p_s, c_eff)          # F_p c ; beta is applied by the loss
         inject_base = fisher_apply(p_s, c_base)    # the alpha = 1 direction, for the Gram
+        # THE SAME INJECTION IN THE (k+1) SPACE. C_tail = 0 does NOT make the
+        # tail component zero: F_P C at the bucket is
+        #     j_tail = P_tail (C_tail - <P, C>) = -t_p sum_S p_v c_v
+        # so a comparison against the (k+1) teacher direction has to be written
+        # here, not on the k-only norm. At the pinned support (student-indexed
+        # top-k, tail 0.000-0.002) the two norms agree to 6 figures, but the
+        # ratio is a design input and must not depend on that staying true.
+        _C = torch.cat([c, torch.zeros_like(_tp)], dim=-1)
+        _inj_kp1 = fisher_apply(_P, _C)
+        inject_norm_kp1 = (_inj_kp1 * _inj_kp1).sum(dim=-1).clamp(min=0.0).sqrt()
         return {
             "target_logprob": target_logprob,
             "r": r, "c": c, "c_eff": c_eff, "inject": inject,
             "f": f, "e": e, "alpha_t": alpha_t, "d_norm": d_norm,
             "d_norm_kp1": d_norm_kp1, "q_tail": q_tail, "lam": lam,
+            "inject_norm_kp1": inject_norm_kp1,
             "in_support": in_support.to(dt), "live": live.to(dt),
             "tv": tv,
             "clamped": clamped_frac,
@@ -608,7 +635,7 @@ def build_target(
 
 _TOK_COLS = (
     "n_tok", "n_live", "n_live_pg", "n_inject_nz", "d_norm_sum", "d_norm_sum_live", "d_sq_sum",
-    "d_kp1_norm_sum", "q_tail_sum",
+    "d_kp1_norm_sum", "q_tail_sum", "inject_kp1_norm_sum",
     "f_sum", "e_sum", "fe_sum", "e_sum_adv_neg", "n_adv_neg", "e_sum_adv_pos", "n_adv_pos",
     "e_clip_sum", "inject_sq_sum", "r_sq_sum", "rtilde_sq_sum", "inject_dot_r_sum",
     "inject_norm_sum", "inject_base_norm_sum", "inject_base_sq_sum", "removed_norm_sum",
@@ -690,6 +717,7 @@ class TargetDistillStats:
             add("n_inject_nz", (inj_sq > 0).to(torch.float32))
             add("d_kp1_norm_sum", built["d_norm_kp1"].to(torch.float32))
             add("q_tail_sum", built["q_tail"].to(torch.float32))
+            add("inject_kp1_norm_sum", built["inject_norm_kp1"].to(torch.float32))
             add("d_norm_sum", built["d_norm"].to(torch.float32))
             add("d_norm_sum_live", built["d_norm"].to(torch.float32) * built["live"].to(torch.float32))
             add("d_sq_sum", built["d_norm"].to(torch.float32) ** 2)
@@ -779,11 +807,43 @@ class TargetDistillStats:
 # The per-role constrained integration
 
 
-# Below this an alpha is "off". The QP lives on [0, 1] and 0 is always feasible
-# (G 0 = 0 >= 0), so a solution at 0 does not mean 0 is good -- it means nothing
-# else was feasible.
+# Below this fraction of the candidate signal surviving, the solve did not
+# attenuate -- it deleted. The QP lives on [0, 1] and 0 is always feasible
+# (G 0 = 0 >= 0), so a solution there does not mean 0 is good; it means nothing
+# else was.
+#
+# JUDGED ON MAGNITUDE, NOT ON ALPHA, and for two reasons the measured run showed.
+# The alphas the solver returns at a binding constraint are not exactly zero --
+# the tiny off-diagonals put them at 1e-6..1e-5 -- so a threshold on alpha misses
+# them. And a sender with no tokens in the role sits at alpha = 1 for arithmetic
+# reasons, so counting coordinates says two of three survived when in signal
+# terms nothing did.
+_SIGNAL_KEPT_MIN = 1.0e-3
 _ALPHA_ZERO = 1.0e-9
 _RIDGE_REL = 1.0e-9
+
+
+def signal_kept_fraction(K, alpha):
+    """How much of the candidate signal survives, weighted by what each sender brought.
+
+    ``sum_j alpha_j sqrt(K_j) / sum_j sqrt(K_j)`` over the senders with
+    ``K_j > 0`` -- the ones that actually contributed a c_base in this role.
+    ``None`` when no sender has any.
+
+    This is the quantity the fallback and the readout are both written on.
+    ``alpha`` alone cannot say it: the measured env_action solve was
+    ``(0, 1, 0)`` with the 1 on search, which has no env_action tokens, so two
+    coordinates out of three looked untouched while in signal terms everything
+    had gone.
+    """
+    K = np.asarray(K, dtype=np.float64).reshape(-1)
+    a = np.asarray(alpha, dtype=np.float64).reshape(-1)
+    act = K > 0.0
+    if not act.any():
+        return None
+    w = np.sqrt(K[act])
+    tot = float(w.sum())
+    return float((a[act] * w).sum() / tot) if tot > 0 else None
 
 
 def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
@@ -830,9 +890,10 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
     one = np.ones(n)
     if not (np.isfinite(K).all() and np.isfinite(G).all()):
         return {"alpha": one, "slack": G @ one, "slack_at_one": G @ one,
-                "fallback": FALLBACK_NONFINITE, "converged": False}
+                "signal_kept": None, "fallback": FALLBACK_NONFINITE, "converged": False}
     if not valid.any():
         return {"alpha": one, "slack": G @ one, "slack_at_one": G @ one,
+                "signal_kept": signal_kept_fraction(K, one),
                 "fallback": FALLBACK_NO_RECEIVER, "converged": True}
 
     s1 = G @ one
@@ -845,13 +906,14 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
     Gn[act] = G[act] / rown[act, None]
     if (s1[act] >= -float(tol) * rown[act]).all():
         return {"alpha": one, "slack": s1, "slack_at_one": s1,
+                "signal_kept": signal_kept_fraction(K, one),
                 "fallback": FALLBACK_NONE, "converged": True}
 
     scale = float(np.abs(K).max())
     if not (scale > 0.0):
         # No sender has any measured magnitude, so the objective cannot rank the
         # feasible points at all. Any answer would be an artefact of the ridge.
-        return {"alpha": one, "slack": s1, "slack_at_one": s1,
+        return {"alpha": one, "slack": s1, "slack_at_one": s1, "signal_kept": None,
                 "fallback": FALLBACK_NO_SIGNAL, "converged": False}
     # A sender with no observed signal has K_j = 0 and the objective would not
     # care where its alpha lands -- but its column of G is zero as well (K = 0
@@ -904,16 +966,28 @@ def solve_alpha(K: np.ndarray, Gvg: np.ndarray, valid_recv: np.ndarray, *,
                 best_a, best_f = np.clip(a, 0.0, 1.0), f
     if best_a is None:
         return {"alpha": one, "slack": s1, "slack_at_one": s1,
+                "signal_kept": signal_kept_fraction(K, one),
                 "fallback": FALLBACK_UNSOLVED, "converged": False}
-    if float(np.abs(best_a).max()) <= _ALPHA_ZERO:
-        # The solve worked and said: turn everything off. Under distillation-only
-        # that is not a weaker intervention, it is no reward at all, so the arm
-        # keeps alpha = 1 and the metric records that the constraint could not be
-        # met by any non-zero combination.
-        return {"alpha": one, "slack": s1, "slack_at_one": s1,
+    # OVER THE SENDERS THAT ACTUALLY CARRY A CANDIDATE SIGNAL, not over all of
+    # them. K_j = 0 means task j contributed no c_base in this role at all -- it
+    # has no tokens there -- and its column of G is zero, so the ridge leaves its
+    # alpha at 1 and it takes no part in anything. Testing max|alpha| over every
+    # coordinate then let one such task hold the guard open: the measured
+    # env_action solve was (alpha_alf, alpha_search, alpha_web) = (0, 1, 0) with
+    # search having no env_action tokens, so max = 1, the guard stayed silent,
+    # and BOTH tasks that do act lost their reward entirely under
+    # pg_loss_coef = 0. Effectively everything was off; the test said otherwise.
+    #
+    # This is NOT "any single alpha = 0 forces them all to 1" -- that would be a
+    # different rule and would stop the arm attenuating anything. Whether a
+    # positive floor on alpha should exist at all is a separate question and is
+    # deliberately not answered here.
+    kept = signal_kept_fraction(K, best_a)
+    if kept is not None and kept <= _SIGNAL_KEPT_MIN:
+        return {"alpha": one, "slack": s1, "slack_at_one": s1, "signal_kept": kept,
                 "fallback": FALLBACK_NO_COMMON_DIR, "converged": True}
     return {"alpha": best_a, "slack": G @ best_a, "slack_at_one": s1,
-            "fallback": FALLBACK_NONE, "converged": True}
+            "signal_kept": kept, "fallback": FALLBACK_NONE, "converged": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1001,8 +1075,18 @@ class TargetDistillController:
                                  target_roles=self.cfg.target_role_mask().to(device),
                                  lam=lambda_at(self.step, self.cfg))
 
-    def update(self, names, reduced: dict) -> dict:
-        """Fold this step's reduced sums in; solve alpha for the NEXT step."""
+    def update(self, names, reduced: dict, prompt_keys=None) -> dict:
+        """Fold this step's reduced sums in; solve alpha for the NEXT step.
+
+        ``prompt_keys`` maps the bitmap's COLUMN NUMBER to a stable prompt key.
+        The driver's ``cross_prompt_idx`` is dense within one batch and nothing
+        more, so a column number means a different prompt at every step. Storing
+        the raw column and taking a union across the window therefore counts one
+        prompt seen four times as four prompts -- which is exactly the condition
+        the window exists to check, and it turned a starved reference valid after
+        four steps. Two prompts that happen to share a column undercount the same
+        way. The cross gate already does this conversion; this did not.
+        """
         cfg = self.cfg
         names = [str(n) for n in names]
         self._ensure(names)
@@ -1019,6 +1103,19 @@ class TargetDistillController:
 
         def g(ti, c, col):
             return float(tok[ti, c, _TOK_IDX[col]])
+
+        keys = list(prompt_keys or [])
+
+        def _keyset(bitmap) -> frozenset:
+            cols = torch.nonzero(bitmap).reshape(-1).tolist()
+            if not keys:
+                # No key list: a column cannot be turned into an identity, so
+                # nothing is counted rather than counting the column itself. The
+                # window then starves and the reference stays unusable, which is
+                # the safe direction -- an unusable reference falls back to
+                # alpha = 1 and keeps the task's own RL.
+                return frozenset()
+            return frozenset(keys[d] for d in cols if d < len(keys))
 
         # 1. sbar, per (task, role). SEEDED FROM THE STEP AGGREGATE, never from a
         #    micro-batch: the all-reduced sum is the same on every rank and does
@@ -1042,8 +1139,8 @@ class TargetDistillController:
                     st = self._ref(n, c, sd)
                     n_live = float(side_tok[ti, c, sd])
                     st.tokens.append(int(n_live))
-                    st.prompts.append(frozenset(torch.nonzero(prm[ti, c, sd]).reshape(-1).tolist()))
-                    st.pg_prompts.append(frozenset(torch.nonzero(pgp[ti, c, sd]).reshape(-1).tolist()))
+                    st.prompts.append(_keyset(prm[ti, c, sd]))
+                    st.pg_prompts.append(_keyset(pgp[ti, c, sd]))
                     while len(st.tokens) > cfg.window_steps:
                         st.tokens.popleft(); st.prompts.popleft(); st.pg_prompts.popleft()
                     if n_live <= 0:
@@ -1088,6 +1185,19 @@ class TargetDistillController:
                         reason = UNUSABLE_FEW_PG_PROMPTS; break
                     if sum(st.tokens) < cfg.min_tokens:
                         reason = UNUSABLE_FEW_TOKENS; break
+                # Reproducibility is a property of the PAIR of halves, so it is
+                # checked once, after both sides have passed everything else.
+                if reason == UNUSABLE_NONE:
+                    for sel in (lambda t: t.fv, lambda t: t.fg):
+                        v0, v1 = sel(self._ref(n, c, 0)), sel(self._ref(n, c, 1))
+                        if v0 is None or v1 is None:
+                            reason = UNUSABLE_NEVER_SEEN; break
+                        n0, n1 = float(v0.double().norm()), float(v1.double().norm())
+                        if n0 <= 0.0 or n1 <= 0.0:
+                            reason = UNUSABLE_ZERO_NORM; break
+                        cos = float((v0.double() * v1.double()).sum()) / (n0 * n1)
+                        if cos < cfg.min_ref_cos:
+                            reason = UNUSABLE_UNRELIABLE_REF; break
                 prev = self.usable.get((n, c), (False, UNUSABLE_NEVER_SEEN, 0))
                 self.usable[(n, c)] = (reason == UNUSABLE_NONE, reason,
                                        0 if reason == UNUSABLE_NONE else prev[2] + 1)
@@ -1129,8 +1239,24 @@ class TargetDistillController:
             metrics[f"actor/target/alpha_fallback/{rn}"] = float(sol["fallback"])
             metrics[f"actor/target/alpha_converged/{rn}"] = 1.0 if sol["converged"] else 0.0
             _al = np.asarray(sol["alpha"], dtype=np.float64)
-            metrics[f"actor/target/alpha_at_bound_frac/{rn}"] = float(
-                np.mean((_al <= 1e-9) | (_al >= 1.0 - 1e-9)))
+            # OVER THE SENDERS WITH A CANDIDATE SIGNAL. A task with no tokens in
+            # this role sits at alpha = 1 for arithmetic reasons and must not be
+            # counted as an alpha that was chosen, in either direction.
+            _act = K > 0.0
+            _n_act = int(_act.sum())
+            metrics[f"actor/target/active_senders/{rn}"] = float(_n_act)
+            if _n_act:
+                metrics[f"actor/target/alpha_at_bound_frac/{rn}"] = float(
+                    np.mean((_al[_act] <= 1e-9) | (_al[_act] >= 1.0 - 1e-9)))
+                # WHAT ACTUALLY SURVIVED, weighted by how much signal each sender
+                # brought. alpha alone cannot say this: (0, 1, 0) with the 1 on a
+                # task that contributed nothing is 100% removed, not 33%.
+                _kept = sol.get("signal_kept")
+                metrics[f"actor/target/signal_kept_frac/{rn}"] = \
+                    1.0 if _kept is None else float(_kept)
+            else:
+                metrics[f"actor/target/alpha_at_bound_frac/{rn}"] = 0.0
+                metrics[f"actor/target/signal_kept_frac/{rn}"] = 1.0
             for ti, i in enumerate(names):
                 metrics[f"actor/target/constraint_slack/{i}/{rn}"] = float(sol["slack"][ti])
                 metrics[f"actor/target/constraint_slack_at_one/{i}/{rn}"] = float(sol["slack_at_one"][ti])
@@ -1229,35 +1355,60 @@ class TargetDistillController:
                 # is d + beta F_p c, so beta F_p c is the intervention and
                 # ||F_p c|| alone is off by a factor of 100 at beta = 0.01. The
                 # beta-free form is kept under its own name for the arithmetic.
-                inj_all = beta * g(ti, c, "inject_norm_sum") / n_tok
-                d_all = g(ti, c, "d_norm_sum") / n_tok
-                metrics[f"actor/target/inject_norm/{n}/{rn}"] = inj_all
-                metrics[f"actor/target/inject_norm_nobeta/{n}/{rn}"] = g(ti, c, "inject_norm_sum") / n_tok
+                inj_nb = g(ti, c, "inject_norm_sum") / n_tok      # ||F c||, beta-free
+                d_all = g(ti, c, "d_norm_sum") / n_tok            # ||g_opd||, beta-free
+                metrics[f"actor/target/inject_norm/{n}/{rn}"] = beta * inj_nb
+                metrics[f"actor/target/inject_norm_nobeta/{n}/{rn}"] = inj_nb
                 # PRIMARY: both sides over EVERY loss token, the population the
                 # loss is averaged over. A non-live token contributes 0 to the
                 # numerator and its real ||d|| to the denominator, which is the
                 # honest statement of how much of the update the arm touches.
-                metrics[f"actor/target/inject_over_d/{n}/{rn}"] = inj_all / (d_all + cfg.delta)
+                #
+                # BETA CANCELS AND MUST NOT APPEAR ON ONE SIDE. The update is
+                # d + beta F c with d = beta g_opd, so the ratio is
+                # ||beta F c|| / ||beta g_opd|| = ||F c|| / ||g_opd||. An earlier
+                # version put beta on the numerator only, which read 100x small
+                # at beta = 0.01 and was taken as evidence that the arm injects
+                # almost nothing. It is not a magnitude -- rule 1 (beta-inclusive)
+                # applies to magnitudes, rule 2 (same population) to ratios, and
+                # a ratio of two beta-carrying quantities is beta-free.
+                metrics[f"actor/target/inject_over_d/{n}/{rn}"] = inj_nb / (d_all + cfg.delta)
                 # The (k+1) OPD norm, which is what the lambda decomposition is
                 # written on -- a DIFFERENT number from d_all, which is k-only and
                 # is what f is defined on. Both are reported so neither is read as
                 # the other (design 12.2).
                 _lam = lambda_at(step - 1, cfg)
-                d_kp1 = g(ti, c, "d_kp1_norm_sum") / n_tok
-                metrics[f"actor/target/d_norm_kp1/{n}/{rn}"] = d_kp1
-                metrics[f"actor/target/teacher_contrib/{n}/{rn}"] = _lam * d_kp1
+                d_kp1 = g(ti, c, "d_kp1_norm_sum") / n_tok        # beta-free
+                inj_kp1 = g(ti, c, "inject_kp1_norm_sum") / n_tok  # beta-free
+                metrics[f"actor/target/d_norm_kp1/{n}/{rn}"] = beta * d_kp1
+                metrics[f"actor/target/d_norm_kp1_nobeta/{n}/{rn}"] = d_kp1
+                metrics[f"actor/target/inject_norm_kp1/{n}/{rn}"] = beta * inj_kp1
+                # THE TEACHER'S CONTRIBUTION IS beta-INCLUSIVE: it is lam * d and
+                # d = beta g_opd. Without beta it read 100x large at beta = 0.01.
+                metrics[f"actor/target/teacher_contrib/{n}/{rn}"] = _lam * beta * d_kp1
+                # Both sides in the (k+1) space and both carrying beta, so beta
+                # cancels and the number is the exchange rate lambda is set against.
                 metrics[f"actor/target/inject_over_teacher/{n}/{rn}"] = \
-                    inj_all / (_lam * d_kp1 + cfg.delta)
+                    inj_kp1 / (_lam * d_kp1 + cfg.delta)
+                # the k-only reading, kept under its own name
+                metrics[f"actor/target/inject_over_teacher_k/{n}/{rn}"] = \
+                    inj_nb / (_lam * d_all + cfg.delta)
                 metrics[f"actor/target/inject_nz_frac/{n}/{rn}"] = g(ti, c, "n_inject_nz") / n_tok
                 metrics[f"actor/target/q_tail_mass/{n}/{rn}"] = g(ti, c, "q_tail_sum") / n_tok
                 if n_live > 0:
-                    inj_live = beta * g(ti, c, "inject_norm_sum") / n_live
+                    inj_live_nb = g(ti, c, "inject_norm_sum") / n_live
                     d_live = g(ti, c, "d_norm_sum_live") / n_live
                     rn_ = g(ti, c, "r_norm_sum") / n_live
                     # AUXILIARY: the same ratio restricted to the tokens the arm
                     # actually rewrote, numerator and denominator on that one mask.
-                    metrics[f"actor/target/inject_over_d_live/{n}/{rn}"] = inj_live / (d_live + cfg.delta)
-                    metrics[f"actor/target/inject_over_r/{n}/{rn}"] = inj_live / (rn_ + cfg.delta)
+                    # beta cancels here too.
+                    metrics[f"actor/target/inject_over_d_live/{n}/{rn}"] = \
+                        inj_live_nb / (d_live + cfg.delta)
+                    # inject_over_r KEEPS beta on the numerator: r is the raw PG
+                    # direction and carries none, so this really is "the
+                    # intervention against the RL direction GRPO would have taken".
+                    metrics[f"actor/target/inject_over_r/{n}/{rn}"] = \
+                        beta * inj_live_nb / (rn_ + cfg.delta)
                     ib = g(ti, c, "inject_base_norm_sum")
                     # what the centring and the clamp cost: the candidate's RMS
                     # before either, against the injected magnitude after both
@@ -1318,9 +1469,31 @@ class TargetDistillController:
             if _k in saved:
                 saved[_k] = tuple(saved[_k])
         live = asdict(self.cfg)
+        # KEYS ADDED AFTER THE STATE WAS WRITTEN. A state from before the lambda
+        # machinery existed has no lambda_* keys at all; comparing "absent"
+        # against the current default reads as a config change and refuses a
+        # resume that is in fact identical. The value each missing key MIGRATES
+        # TO is the one that reproduces the old behaviour -- lambda_decay off,
+        # i.e. lambda == 1, which is exactly what that state was trained under.
+        # A run whose live config asks for something else is NOT that run, so it
+        # is still refused: an old checkpoint may not be switched into the lambda
+        # arm, and a reference gate the old run never applied may not appear.
+        _MIGRATE = {"lambda_decay": False, "lambda_min": 0.1,
+                    "lambda_begin_step": 50, "lambda_end_step": 250,
+                    "min_ref_cos": 0.0}
+        migrated = []
+        for k, want in _MIGRATE.items():
+            if k not in saved:
+                saved[k] = want
+                migrated.append(k)
         drift = {k: (saved.get(k), live[k]) for k in live if saved.get(k) != live[k]}
         if drift:
-            raise ValueError(f"target_distill config changed across resume: {drift}")
+            raise ValueError(
+                f"target_distill config changed across resume: {drift}"
+                + (f" (keys migrated from a pre-lambda state: {sorted(migrated)}; a state "
+                   f"written before those existed can only resume at the value that "
+                   f"reproduces it)" if migrated else "")
+            )
         if int(sd.get("vocab_size", self.V)) != self.V:
             raise ValueError("target_distill: vocabulary size changed across resume")
         self.step = int(sd.get("step", 0))

@@ -356,6 +356,12 @@
 "algorithm.opd.target_distill.min_prompts": 4
 "algorithm.opd.target_distill.min_pg_prompts": 2
 "algorithm.opd.target_distill.min_tokens": 64
+# A reference that does not agree with itself across the two disjoint prompt
+# halves may not take part in the protection constraint. The measured env_action
+# references had split-half cosines of -0.35 / -0.04 while passing every other
+# condition, and then drove alpha to 0 -- which under pg_loss_coef = 0 is the
+# task's whole reward.
+"algorithm.opd.target_distill.min_ref_cos": 0.0
 "algorithm.opd.target_distill.max_staleness": 2
 "algorithm.opd.target_distill.split_seed": 1
 "algorithm.opd.target_distill.delta": 1.0e-30

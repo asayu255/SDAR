@@ -5747,7 +5747,11 @@ class DataParallelPPOActor(BasePPOActor):
                 for _c, _rn in _CG_ROLE_NAMES.items():
                     metrics[f"actor/target/alpha_read/{_nm}/{_rn}"] = float(_a_applied[_tid, _c])
             metrics["actor/target/lambda_read"] = float(_td_refs.lam)
-            metrics.update(target_distill.update(_td_names, td_stats.reduced()))
+            # The same stable keys the cross gate uses: cross_prompt_idx is dense
+            # WITHIN ONE BATCH, so the controller cannot count prompts across the
+            # window without this mapping.
+            metrics.update(target_distill.update(
+                _td_names, td_stats.reduced(), _cg_prompt_keys))
 
         if cross_gate is not None and cross_stats is not None:
             # lambda as APPLIED this step, then this step's reduced sums into
