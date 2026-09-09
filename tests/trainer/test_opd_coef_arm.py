@@ -27,7 +27,8 @@ import pytest
 from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
-ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2")
+ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2",
+        "tdist", "tdist_int")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -39,7 +40,9 @@ B = {
     "pushback": None,          # no static coefficient: the online gate replaces it
     "cross": None,
     # v2: same pure OPD+GRPO underneath, so the static coefficient is null too
-    "cross2": None,             # MOPD v1: pure OPD+GRPO plus the cross-task gate
+    "cross2": None,
+    "tdist": None,             # MOPD v3: the RL direction becomes the distillation target
+    "tdist_int": None,         # ...with the cross-task integration on             # MOPD v1: pure OPD+GRPO plus the cross-task gate
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -67,11 +70,21 @@ def _is_pushback_key(key):
 # allowed to differ from control so the coefficient arms are not reported as
 # having drifted.
 SPEC_ROOT = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
-CROSS_FAMILY = ("control", "cross", "cross2")
+# tdist / tdist_int are compared against control (design §6: A vs B vs C), so
+# they must draw tokens the way control does.
+CROSS_FAMILY = ("control", "cross", "cross2", "tdist", "tdist_int")
 
 
 def _is_spec_key(key):
     return key == SPEC_ROOT or key.startswith(SPEC_ROOT + ".")
+
+
+def _is_tdist_key(key):
+    # the arm's own knobs, the mechanisms it DECLARES off, and pg_loss_coef --
+    # which is part of this arm rather than a shared setting, because the arm is
+    # defined by the GRPO term being gone.
+    return ("target_distill" in key or "cross_gate" in key or "pushback" in key
+            or key.endswith("actor.pg_loss_coef"))
 
 
 def _is_cross_key(key):
@@ -85,13 +98,14 @@ def _is_cross_key(key):
 # 1. the arms differ in b and in their own name, and in nothing else
 
 
-@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross"))
+@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross", "tdist", "tdist_int"))
 def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
     own_or_family = lambda k: _is_spec_key(k) or own(k)
     own = {"pushback": _is_pushback_key, "cross": _is_cross_key,
-           "cross2": _is_cross_key}.get(arm, _is_coef_key)
+           "cross2": _is_cross_key, "tdist": _is_tdist_key,
+           "tdist_int": _is_tdist_key}.get(arm, _is_coef_key)
     differing = {
         k for k in set(control) | set(other)
         if control.get(k, "<absent>") != other.get(k, "<absent>")
@@ -118,6 +132,34 @@ def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
             assert other[f"{side}.lambda_max"] == 0.2
             assert other[f"{side}.ema_decay"] == 0.8
             assert other[f"{side}.window_steps"] == 8
+    if arm in ("tdist", "tdist_int"):
+        # THE defining property: no GRPO term. Pinned so a copy-paste cannot
+        # silently restore the double count the arm exists to avoid.
+        assert other["actor_rollout_ref.actor.pg_loss_coef"] == 0.0
+        assert other["algorithm.opd.target_distill.enable"] is True
+        assert other["actor_rollout_ref.actor.teacher_kl_target_distill.enable"] is True
+        assert other["algorithm.opd.target_distill.eta"] == 1.0
+        assert other["algorithm.opd.target_distill.clamp"] == 2.0
+        assert other["algorithm.opd.target_distill.epsilon_w"] == 0.2
+        # every other mechanism on the same term is declared off
+        assert other["algorithm.opd.cross_gate"] is None
+        assert other["algorithm.opd.pushback_control"] is None
+        want_int = arm == "tdist_int"
+        assert bool(other["algorithm.opd.target_distill.integrate"]) is want_int
+        assert bool(other["actor_rollout_ref.actor.teacher_kl_target_distill.integrate"]) is want_int
+
+
+def test_the_two_target_arms_differ_in_the_integration_and_nothing_else():
+    """B and C: the ONLY pinned difference is whether alpha is solved. That
+    difference is the multi-task effect; A vs B is a single-task question."""
+    b, c = _flat("tdist"), _flat("tdist_int")
+    differing = {k for k in set(b) | set(c) if b.get(k, "<absent>") != c.get(k, "<absent>")}
+    allowed = {"trainer.experiment_name",
+               "algorithm.opd.target_distill.integrate",
+               "actor_rollout_ref.actor.teacher_kl_target_distill.integrate"}
+    assert differing <= allowed, f"unexpected: {sorted(differing - allowed)}"
+    assert bool(b["algorithm.opd.target_distill.integrate"]) is False
+    assert bool(c["algorithm.opd.target_distill.integrate"]) is True
 
 
 def test_the_control_arm_leaves_the_key_unset_rather_than_setting_it_to_one():
@@ -206,7 +248,10 @@ def _script():
 @pytest.mark.parametrize("arm", ARMS)
 def test_the_script_offers_exactly_these_arms(arm):
     s = _script()
-    assert re.search(rf"^\s+{arm}\)\s*$", s, re.M), f"ARM={arm} has no case branch"
+    # a label may cover more than one arm ("tdist|tdist_int)"), which still
+    # offers both -- what this asks is whether the arm is reachable at all.
+    pat = rf"^\s+(?:[a-z0-9_]+\|)*{arm}(?:\|[a-z0-9_]+)*\)\s*$"
+    assert re.search(pat, s, re.M), f"ARM={arm} has no case branch"
 
 
 def test_the_script_refuses_an_unknown_arm():

@@ -76,7 +76,7 @@ def test_the_per_micro_batch_names_are_reset_together():
 
 def test_references_and_lambda_are_read_once_per_step_and_updated_once_from_the_reduced_sums():
     src, _ = _update_policy_src()
-    assert src.count("refs_to_device(") == 1
+    assert src.count("cross_gate.refs_to_device(") == 1
     assert src.count("cross_gate.update(") == 1
     assert src.count("cross_stats.reduced()") == 1
     # lambda as applied is reported from the refs read at the top, not recomputed

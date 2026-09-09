@@ -314,8 +314,52 @@ case "$ARM" in
             "+algorithm.opd.cross_gate.roles=[format,env_action]"
         )
         ;;
+    tdist|tdist_int)
+        # Speculative decoding ON: these are compared against the cross family
+        # (control included), so they must draw tokens the same way.
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        # MOPD v3. The reward goes into the distillation TARGET and the GRPO term
+        # goes away: L = beta*KL(p || q*) and nothing else. pg_loss_coef=0 is not
+        # a tuning choice -- with the policy-gradient term left on, the update is
+        # r + d + beta F c and the reward reaches the parameters twice, once
+        # directly and once through the target it was used to build. The startup
+        # validation refuses the arm if it is not 0, rather than trusting this file.
+        #
+        #   q* = softmax(log q + c),  c = eta * alpha * f * e * r   (re-centred, clamped)
+        #     f  OPD strength ratio 2s/(s+sbar): 1 at the running mean, 0 where OPD is silent
+        #     e  the RLSD weight clip(exp(sign(A) dlog), 1-eps, 1+eps) -- softens the penalty
+        #        on a token the teacher backs inside a FAILED trajectory, which is what
+        #        docs/opd_pushback_control_review.md §9.3 measured GRPO getting wrong
+        #     alpha  the cross-task coefficient
+        #
+        #   ARM=tdist      alpha == 1.  Does routing RL through the target change anything?
+        #                  A SINGLE-TASK question, and labelled as one.
+        #   ARM=tdist_int  alpha solved under the cross-task condition.
+        #                  The difference between the two arms IS the multi-task effect.
+        #
+        # docs/opd_target_distillation_design.md. What is actually injected is
+        # d + beta F_p c, not c -- see verl/trainer/ppo/opd_target_distill.py.
+        if [ "$ARM" = "tdist_int" ]; then TD_INT=True; else TD_INT=False; fi
+        OPD_COEF_ARGS=(
+            "+algorithm.opd.kl_loss_coef_by_task=null"
+            "+algorithm.opd.pushback_control=null"
+            "+algorithm.opd.cross_gate=null"
+            "+algorithm.opd.target_distill.enable=True"
+            "+algorithm.opd.target_distill.eta=1.0"
+            "+algorithm.opd.target_distill.epsilon_w=0.2"
+            "+algorithm.opd.target_distill.clamp=2.0"
+            "+algorithm.opd.target_distill.integrate=$TD_INT"
+            "+algorithm.opd.target_distill.ema_decay=0.8"
+            "+algorithm.opd.target_distill.window_steps=8"
+            "+algorithm.opd.target_distill.min_tokens=64"
+            "+algorithm.opd.target_distill.max_staleness=2"
+            "+algorithm.opd.target_distill.delta=1e-30"
+            "+algorithm.opd.target_distill.roles=[format,env_action]"
+            "actor_rollout_ref.actor.pg_loss_coef=0.0"
+        )
+        ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | tdist | tdist_int, got: $ARM" >&2
         exit 1
         ;;
 esac

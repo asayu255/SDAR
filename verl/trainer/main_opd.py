@@ -62,12 +62,13 @@ def validate_pushback_exclusivity(pushback, by_task, task_diag, opd_cfg):
             "pushback_control needs algorithm.opd.task_diag=True: the controller reads R and "
             "C^- off the task readout's reduced table and has no collective of its own."
         )
-    cg = opd_cfg.get("cross_gate", None)
-    if cg is not None and bool(dict(cg).get("enable", False)):
-        raise ValueError(
-            "pushback_control is enabled together with cross_gate.enable=True; both multiply "
-            "the teacher-KL term. One at a time."
-        )
+    for other in ("cross_gate", "target_distill"):
+        o = opd_cfg.get(other, None)
+        if o is not None and bool(dict(o).get("enable", False)):
+            raise ValueError(
+                f"pushback_control is enabled together with {other}.enable=True; both act on "
+                f"the teacher-KL term. One at a time."
+            )
 
 
 def validate_cross_gate_exclusivity(cross_gate, by_task, task_diag, opd_cfg):
@@ -91,11 +92,12 @@ def validate_cross_gate_exclusivity(cross_gate, by_task, task_diag, opd_cfg):
                 f"cross_gate is enabled together with kl_loss_coef_by_task={vals}; the gate sits "
                 f"on pure OPD+GRPO, it does not stack on a static coefficient. Unset it."
             )
-    for other in ("sign_weight", "cross_teacher_kl_weight", "cross_teacher_target", "pushback_control"):
+    for other in ("sign_weight", "cross_teacher_kl_weight", "cross_teacher_target",
+                  "pushback_control", "target_distill"):
         o = opd_cfg.get(other, None)
         if o is not None and bool(dict(o).get("enable", False)):
             raise ValueError(
-                f"cross_gate is enabled together with {other}.enable=True; both multiply "
+                f"cross_gate is enabled together with {other}.enable=True; both act on "
                 f"the teacher-KL term. One at a time."
             )
     if not task_diag:
@@ -103,6 +105,53 @@ def validate_cross_gate_exclusivity(cross_gate, by_task, task_diag, opd_cfg):
             "cross_gate needs algorithm.opd.task_diag=True: the policy-gradient coefficient the "
             "gate's references are built from is computed on that path."
         )
+
+
+def validate_target_distill_exclusivity(target_distill, by_task, pg_loss_coef, opd_cfg):
+    """Refuse a configuration in which the target rewrite would stack, or keep GRPO.
+
+    MOPD v3 puts the reward into the distillation TARGET and takes the GRPO term
+    away: the loss is beta*KL(p || q*) and nothing else. Two things therefore
+    have to be checked, not one.
+
+    STACKING. Every other mechanism in this repo acts on the same teacher-KL
+    term -- as a coefficient (sign_weight, cross_teacher_kl_weight,
+    pushback_control, cross_gate, kl_loss_coef_by_task) or as a different target
+    rewrite (cross_teacher_target). Two of them at once is not the arm its name
+    says.
+
+    THE GRPO TERM. pg_loss_coef must be 0. With it left at 1 the update is
+    r + d + beta F c, which double counts the reward: r reaches the parameters
+    once through the policy gradient and again through the target it was used to
+    build. The arm's whole claim is that it does not do that, so the injection
+    refuses the configuration rather than trusting the run script.
+    """
+    if not target_distill or not bool(dict(target_distill).get("enable", False)):
+        return
+    from verl.trainer.ppo.opd_target_distill import TargetDistillConfig
+
+    TargetDistillConfig.from_mapping(target_distill).validate()
+    if float(pg_loss_coef) != 0.0:
+        raise ValueError(
+            f"target_distill is enabled with pg_loss_coef={pg_loss_coef}; it must be 0. "
+            f"The reward enters through the target, and keeping the policy-gradient term "
+            f"would count it twice (design §5)."
+        )
+    if by_task:
+        vals = {str(k): float(v) for k, v in dict(by_task).items()}
+        if any(v != 1.0 for v in vals.values()):
+            raise ValueError(
+                f"target_distill is enabled together with kl_loss_coef_by_task={vals}; the arm "
+                f"sits on pure OPD, it does not stack on a static coefficient. Unset it."
+            )
+    for other in ("sign_weight", "cross_teacher_kl_weight", "cross_teacher_target",
+                  "pushback_control", "cross_gate"):
+        o = opd_cfg.get(other, None)
+        if o is not None and bool(dict(o).get("enable", False)):
+            raise ValueError(
+                f"target_distill is enabled together with {other}.enable=True; both act on "
+                f"the teacher-KL term. One at a time."
+            )
 
 
 def validate_kl_coef_by_task(by_task, box=KL_COEF_BY_TASK_BOX):
@@ -222,6 +271,19 @@ def inject_distillation_config(config) -> None:
             config.actor_rollout_ref.actor.teacher_kl_cross_gate,
             config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task,
             config.actor_rollout_ref.actor.teacher_kl_task_diag,
+            opd_cfg,
+        )
+        # MOPD v3: the RL direction becomes the distillation target and the GRPO
+        # term goes away. See verl/trainer/ppo/opd_target_distill.py and
+        # docs/opd_target_distillation_design.md.
+        _td = opd_cfg.get("target_distill", None)
+        config.actor_rollout_ref.actor.teacher_kl_target_distill = (
+            dict(_td) if _td is not None else None
+        )
+        validate_target_distill_exclusivity(
+            config.actor_rollout_ref.actor.teacher_kl_target_distill,
+            config.actor_rollout_ref.actor.teacher_kl_loss_coef_by_task,
+            config.actor_rollout_ref.actor.get("pg_loss_coef", 1.0),
             opd_cfg,
         )
         config.actor_rollout_ref.actor.teacher_kl_loss_type = opd_cfg.get("kl_loss_type", "low_var_kl")

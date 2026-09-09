@@ -133,6 +133,12 @@ from verl.trainer.ppo.opd_cross_gate import (
     cross_gate_forward,
 )
 from verl.trainer.ppo.sign_weights import ROLE_NAMES as _CG_ROLE_NAMES
+from verl.trainer.ppo.opd_target_distill import (
+    TargetDistillConfig,
+    TargetDistillController,
+    TargetDistillStats,
+    build_target,
+)
 
 # Columns of the per-task group bitmap (see OpdTaskDiagStats).
 PUSHBACK_MAX_GROUPS = 4096
@@ -1727,12 +1733,49 @@ class DataParallelPPOActor(BasePPOActor):
             self._cross_gate = ctl
         return ctl
 
+    def target_distill_controller(self, task_id_names):
+        """MOPD v3's controller: sbar, the references and alpha. Kept across steps.
+
+        Same lifecycle as the cross gate's -- the values the loss reads are the
+        previous step's, and this step's reduced sums produce the next ones.
+        """
+        cfg_map = self.config.get("teacher_kl_target_distill", None)
+        if not cfg_map or not bool(dict(cfg_map).get("enable", False)):
+            return None
+        ctl = getattr(self, "_target_distill", None)
+        names = list(task_id_names or [])
+        if ctl is None:
+            if not names:
+                raise AssertionError(
+                    "teacher_kl_target_distill is enabled but the batch carries no "
+                    "task_id_names; the arm is per task and cannot be built."
+                )
+            vocab = model_vocab_size(self.actor_module)
+            if vocab is None:
+                raise AssertionError(
+                    "teacher_kl_target_distill needs the model's vocab_size for its "
+                    "references and the module does not report one."
+                )
+            ctl = TargetDistillController(TargetDistillConfig.from_mapping(cfg_map), int(vocab), names)
+            pending = getattr(self, "_target_distill_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending)
+                self._target_distill_pending_state = None
+            self._target_distill = ctl
+        return ctl
+
     def actor_extra_state_dict(self) -> dict:
         """Small per-rank state the checkpoint manager stores beside lr/rng."""
         out = {}
         ctl = getattr(self, "_pushback", None)
         if ctl is not None:
             out["pushback"] = ctl.state_dict()
+        td = getattr(self, "_target_distill", None)
+        if td is not None:
+            # The references, sbar, alpha and the usability windows. A resume
+            # without them restarts every reference and applies alpha = 1 for a
+            # window, which is a different arm for those steps.
+            out["target_distill"] = td.state_dict()
         cg = getattr(self, "_cross_gate", None)
         if cg is not None:
             # The references (22 MB at Qwen3's vocabulary), the EMAs, the
@@ -1751,6 +1794,13 @@ class DataParallelPPOActor(BasePPOActor):
                 ctl.load_state_dict(pb)
             else:
                 self._pushback_pending_state = pb
+        td = sd.get("target_distill", None)
+        if td:
+            ctl = getattr(self, "_target_distill", None)
+            if ctl is not None:
+                ctl.load_state_dict(td)
+            else:
+                self._target_distill_pending_state = td
         cg = sd.get("cross_gate", None)
         if cg:
             ctl = getattr(self, "_cross_gate", None)
@@ -2618,6 +2668,23 @@ class DataParallelPPOActor(BasePPOActor):
             raise AssertionError(
                 "teacher_kl_cross_gate and teacher_kl_pushback are both enabled; one at a time."
             )
+        # MOPD v3: the RL direction goes into the distillation TARGET and the
+        # GRPO term is switched off at the config (pg_loss_coef = 0). Exclusive
+        # with every other mechanism on the teacher-KL term; the injection
+        # refuses them, and this is the belt to that suspender.
+        target_distill = self.target_distill_controller(task_id_names) if use_teacher_kl_loss else None
+        if target_distill is not None and (cross_gate is not None or pushback is not None):
+            raise AssertionError(
+                "teacher_kl_target_distill is enabled together with the cross gate or the "
+                "pushback controller; one mechanism on the teacher-KL term at a time."
+            )
+        td_stats = None
+        _td_refs = None
+        _td_names = list(task_id_names or [])
+        if target_distill is not None:
+            td_stats = TargetDistillStats(n_tasks=len(_td_names), vocab_size=target_distill.V, device=sign_dev)
+            _td_refs = target_distill.refs_to_device(_td_names, sign_dev)
+
         cross_stats = None
         _cg_refs = None
         _cg_names = list(task_id_names or [])
@@ -3214,6 +3281,8 @@ class DataParallelPPOActor(BasePPOActor):
                     _pb_w = None
                     # The cross gate's forward outputs for this micro-batch, or None.
                     _cg_pending = None
+                    # MOPD v3's, likewise.
+                    _td_pending = None
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
                     task_ids = data.get("task_ids", None) if task_id_names else None
@@ -3949,6 +4018,47 @@ class DataParallelPPOActor(BasePPOActor):
                                 teacher_topk_lp = xtt_built["target_logprob"].to(
                                     teacher_topk_lp.dtype
                                 )
+                            if (target_distill is not None and log_prob is not None
+                                    and task_ids is not None):
+                                # MOPD v3. The UNTILTED KL first: build_target
+                                # derives the OPD direction from it, and taking
+                                # ||d|| from opd_task_diag instead would be
+                                # circular (that module computes it from the very
+                                # KL this is about to rewrite). One extra tensor
+                                # op, no forward.
+                                _td_base_kl = topk_kl_per_token(
+                                    student_topk_logprob=student_topk_logprobs,
+                                    teacher_topk_logprob=teacher_topk_lp,
+                                )
+                                _td = build_target(
+                                    student_topk_logprob=student_topk_logprobs,
+                                    teacher_topk_logprob=teacher_topk_lp,
+                                    topk_ids=(student_topk_ids if student_indexed_topk
+                                              else data.get("teacher_topk_ids", None)),
+                                    response_ids=responses,
+                                    # dL_pg/dlog p WITH the clip branches: inside a
+                                    # clipped branch it is zero, so r = 0, c = 0 and
+                                    # the target is left at the teacher.
+                                    pg_grad_coef=xt_pg_grad_coef,
+                                    advantages=data.get("advantages", None),
+                                    teacher_kl_base=_td_base_kl,
+                                    task_ids=task_ids,
+                                    roles=token_roles(responses, sign_role_tags),
+                                    refs=_td_refs,
+                                    cfg=target_distill.cfg,
+                                )
+                                # The one line the arm exists to reach: the loss
+                                # is taken against the tilted target, and the
+                                # reward reaches the update only through it.
+                                teacher_topk_lp = _td["target_logprob"].to(teacher_topk_lp.dtype)
+                                _td_pending = {
+                                    "built": _td,
+                                    "topk_ids": (student_topk_ids if student_indexed_topk
+                                                 else data.get("teacher_topk_ids", None)),
+                                    "roles": token_roles(responses, sign_role_tags),
+                                    "p_s": student_topk_logprobs.detach().exp(),
+                                    "row_basis": task_loss_weight,
+                                }
                             teacher_kld = topk_kl_per_token(
                                 student_topk_logprob=student_topk_logprobs,
                                 teacher_topk_logprob=teacher_topk_lp,
@@ -4852,6 +4962,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 group_idx=data.get("pushback_group_idx", None),
                             )
 
+                    if td_stats is not None and _td_pending is not None and task_ids is not None:
+                        # After the backward, like every other readout here: the
+                        # target was needed before the loss, this only folds it in.
+                        with _actor_phase("actor.target_distill"), torch.no_grad():
+                            _p = _td_pending
+                            td_stats.update(
+                                built=_p["built"], task_ids=task_ids, roles=_p["roles"],
+                                response_mask=response_mask, topk_ids=_p["topk_ids"],
+                                advantages=data.get("advantages", None),
+                                row_basis=_p["row_basis"], p_s=_p["p_s"],
+                            )
+
                     if cross_stats is not None and _cg_pending is not None and task_ids is not None:
                         # After the backward, like the readout: the gate needed
                         # the forward before the loss; this only folds it into
@@ -5564,6 +5686,16 @@ class DataParallelPPOActor(BasePPOActor):
                 _coef = self.config.get("teacher_kl_loss_coef", 1.0)
                 for _nm, _b in dict(_by_task).items():
                     metrics[f"actor/teacher_kl_coef_effective/{_nm}"] = float(_coef) * float(_b)
+        if target_distill is not None and td_stats is not None:
+            # alpha as APPLIED this step, then this step's reduced sums into the
+            # controller and alpha for the next one. Deterministic on the reduced
+            # values, so every rank lands on the same alpha without a broadcast.
+            _a_applied = _td_refs.alpha.detach().cpu()
+            for _tid, _nm in enumerate(_td_names):
+                for _c, _rn in _CG_ROLE_NAMES.items():
+                    metrics[f"actor/target/alpha_read/{_nm}/{_rn}"] = float(_a_applied[_tid, _c])
+            metrics.update(target_distill.update(_td_names, td_stats.reduced()))
+
         if cross_gate is not None and cross_stats is not None:
             # lambda as APPLIED this step, then this step's reduced sums into
             # the controller and lambda for the next one. One collective per
