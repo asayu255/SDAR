@@ -97,17 +97,30 @@ def _is_cross_key(key):
 # 1. the arms differ in b and in their own name, and in nothing else
 
 
-@pytest.mark.parametrize("arm", ("uniform", "redistribute", "pushback", "cross"))
+def _is_lprec_key(k):
+    return "logit_precision" in k
+
+
+@pytest.mark.parametrize("arm", [a for a in ARMS if a != "control"])
 def test_the_lock_files_differ_in_nothing_but_the_arms_own_knob(arm):
     control, other = _flat("control"), _flat(arm)
     allowed = {"trainer.experiment_name"}
     own_or_family = lambda k: _is_spec_key(k) or own(k)
     own = {"pushback": _is_pushback_key, "cross": _is_cross_key,
-           "cross2": _is_cross_key}.get(arm, _is_coef_key)
-    differing = {
-        k for k in set(control) | set(other)
-        if control.get(k, "<absent>") != other.get(k, "<absent>")
-    }
+           "cross2": _is_cross_key, "cross2k100": _is_cross_key,
+           "lprec": _is_lprec_key, "lprecw": _is_lprec_key}.get(arm, _is_coef_key)
+    def _same(k):
+        a, b = control.get(k, "<absent>"), other.get(k, "<absent>")
+        if a == b:
+            return True
+        # DECLARING a mechanism off is not a change to the arm. The control
+        # lock predates cross_gate and pushback and leaves them absent; the
+        # later arms pin them to null so the intent is on the page. Both reach
+        # the actor as None, so this is documentation, not configuration.
+        # Not a set membership test: some pinned values are lists.
+        return (a == "<absent>" and b is None) or (b == "<absent>" and a is None)
+
+    differing = {k for k in set(control) | set(other) if not _same(k)}
     unexpected = {k for k in differing if k not in allowed and not own_or_family(k)}
     assert not unexpected, f"{arm} differs from control outside its own knob: {sorted(unexpected)}"
     # and it really does differ -- a test that passes because both files are
@@ -223,8 +236,13 @@ def test_the_script_offers_exactly_these_arms(arm):
 
 def test_the_script_refuses_an_unknown_arm():
     s = _script()
-    assert "ARM must be control | uniform | redistribute" in s
     assert "exit 1" in s.split("esac")[0]
+    # The MENU has to name every arm the case accepts. Checking only the first
+    # three words let two arms be launchable and undocumented at the same time.
+    menu = re.search(r'ARM must be ([^,]*), got', s)
+    assert menu, "no arm menu in the refusal message"
+    listed = {a.strip() for a in menu.group(1).split("|")}
+    assert listed == set(ARMS), f"menu {sorted(listed)} != arms {sorted(ARMS)}"
 
 
 @pytest.mark.parametrize("arm", ("uniform", "redistribute"))
@@ -423,3 +441,39 @@ def test_cross_and_cross2_differ_in_the_gate_basis_and_nothing_else():
         pass
     assert b["algorithm.opd.pushback_control"] is None
     assert b["algorithm.opd.kl_loss_coef_by_task"] is None
+
+
+def test_lprec_and_lprecw_differ_in_one_flag_and_the_run_name():
+    """The pair is an A/B: observe vs apply, and nothing else.
+
+    Same assertion the gate pair carries. Without it the two locks could drift
+    apart and the comparison would silently stop being one.
+    """
+    a, b = _flat("lprec"), _flat("lprecw")
+    differing = {k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")}
+    assert differing == {
+        "trainer.experiment_name",
+        "algorithm.opd.logit_precision.observe_only",
+        "actor_rollout_ref.actor.logit_precision.observe_only",
+    }, sorted(differing)
+    assert a["algorithm.opd.logit_precision.observe_only"] is True
+    assert b["algorithm.opd.logit_precision.observe_only"] is False
+    # and the injected side agrees with the algorithm side on both arms
+    for lock in (a, b):
+        for key in ("enable", "observe_only", "ema_decay", "n_strata", "max_beta_ratio",
+                    "min_residual_frac", "allow_negative_lambda", "min_tokens"):
+            assert lock[f"algorithm.opd.logit_precision.{key}"] == \
+                   lock[f"actor_rollout_ref.actor.logit_precision.{key}"], key
+
+
+def test_every_logit_precision_field_is_pinned_on_both_sides():
+    """cross2 shipped with q_scale unpinned; this is the guard against a repeat."""
+    from verl.trainer.ppo.opd_logit_precision import LogitPrecisionConfig
+
+    fields = set(LogitPrecisionConfig.__dataclass_fields__)
+    for arm in ("lprec", "lprecw"):
+        lock = _flat(arm)
+        for side in ("algorithm.opd.logit_precision",
+                     "actor_rollout_ref.actor.logit_precision"):
+            pinned = {k.split(".")[-1] for k in lock if k.startswith(side + ".")}
+            assert pinned == fields, (arm, side, sorted(fields - pinned), sorted(pinned - fields))

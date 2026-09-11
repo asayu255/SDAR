@@ -1835,6 +1835,10 @@ class DataParallelPPOActor(BasePPOActor):
             got = (cfg, names,
                    StepAccumulator(len(names), int(vocab), device=dev),
                    StepMoments(len(names), int(vocab), device=dev))
+            pending = getattr(self, "_logit_prec_pending_state", None)
+            if pending:
+                got[3].load_state_dict(pending)
+                self._logit_prec_pending_state = None
             self._logit_prec = got
         cfg, built_for, step_acc, ema_acc = got
         if names and names != built_for:
@@ -1891,6 +1895,14 @@ class DataParallelPPOActor(BasePPOActor):
             # validity windows and lambda. A resume without them would restart
             # every reference from nothing and apply lambda = 0 for a window.
             out["cross_gate"] = cg.state_dict()
+        lp = getattr(self, "_logit_prec", None)
+        if lp is not None:
+            # The smoothed moments (five vectors over the vocabulary) and the
+            # weight sums that carry the effective step count. Without them a
+            # resume restarts the average from nothing, and the first steps
+            # after it fall back to the permutation null -- so `lprecw` would
+            # apply a visibly different coefficient across the resume.
+            out["logit_precision"] = lp[3].state_dict()
         return out
 
     def load_actor_extra_state_dict(self, sd) -> None:
@@ -1935,6 +1947,13 @@ class DataParallelPPOActor(BasePPOActor):
                 ctl.load_state_dict(cg)
             else:
                 self._cross_gate_pending_state = cg
+        lp = sd.get("logit_precision", None)
+        if lp:
+            got = getattr(self, "_logit_prec", None)
+            if got is not None:
+                got[3].load_state_dict(lp)
+            else:
+                self._logit_prec_pending_state = lp
 
     def validate_teacher_kl_task_ids(self, task_ids, task_id_names):
         """Check the ids ONCE, on the arranged batch, before the micro-batch loop.
@@ -2816,6 +2835,9 @@ class DataParallelPPOActor(BasePPOActor):
             # gate has.
             _lp_ratio = getattr(self, "_lp_ratio", None) if not _lp_cfg.observe_only else None
             _lp_step.zero_()
+            # Cleared in the finally below, not just on the happy path: an
+            # exception out of update_policy would otherwise leave the forward
+            # stashing a vocabulary-sized tensor on every later call.
             self._lp_want_logits = True
         cross_gate = self.cross_gate_controller(task_id_names) if use_teacher_kl_loss else None
         if cross_gate is not None and pushback is not None:
@@ -3353,1920 +3375,1925 @@ class DataParallelPPOActor(BasePPOActor):
                         top_n=int(pair_cfg.get("top_n", int(token_cfg.get("top_n", 64)))),
                     )
 
-        for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
-                # split batch into micro_batches
-                mini_batch = data
-                # Total valid response tokens in this mini-batch (for exact token-mean
-                # scaling under dynamic bsz). Same mask rule as the per-micro loss below.
-                minibatch_valid_tokens = None
-                if dynamic_bsz_token_scale:
-                    _resp_len = mini_batch["responses"].size(1)
-                    _mb_mask = mini_batch["loss_mask"][:, -_resp_len:] if multi_turn else mini_batch["attention_mask"][:, -_resp_len:]
-                    minibatch_valid_tokens = float(_mb_mask.sum().clamp(min=1))
-                if has_multi_modal_inputs:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-                elif self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
-                else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    # split batch into micro_batches
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+        try:
+          for epoch in range(self.config.ppo_epochs):
+             for batch_idx, data in enumerate(dataloader):
+                 # split batch into micro_batches
+                 mini_batch = data
+                 # Total valid response tokens in this mini-batch (for exact token-mean
+                 # scaling under dynamic bsz). Same mask rule as the per-micro loss below.
+                 minibatch_valid_tokens = None
+                 if dynamic_bsz_token_scale:
+                     _resp_len = mini_batch["responses"].size(1)
+                     _mb_mask = mini_batch["loss_mask"][:, -_resp_len:] if multi_turn else mini_batch["attention_mask"][:, -_resp_len:]
+                     minibatch_valid_tokens = float(_mb_mask.sum().clamp(min=1))
+                 if has_multi_modal_inputs:
+                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                 elif self.config.use_dynamic_bsz:
+                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                 else:
+                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                     # split batch into micro_batches
+                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                 self.actor_optimizer.zero_grad()
 
-                # One reduce per mini-batch instead of one per micro-batch. The
-                # context is entered before the first micro-batch's forward and
-                # left before the last one's, both points where FSDP is IDLE --
-                # no_sync() asserts that, so it cannot wrap the backward alone.
-                # The last micro-batch then runs with sync on and reduces
-                # everything accumulated.
-                #
-                # Under SHARD_GRAD_OP this removes the all-gather as well, not
-                # just the reduce-scatter: _should_free_in_backward returns
-                # `state._sync_gradients or strategy in
-                # RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES`, and SHARD_GRAD_OP is
-                # not in that set -- so with sync off the parameters are left
-                # unsharded and the next micro-batch does not re-gather them.
-                # That is why this pairs with sharding_strategy=shard_grad_op.
-                n_micro = len(micro_batches)
-                accum_ctx = None
-                # enumerate(), plus the capture window and one named range per
-                # micro-batch. Wrapping the iterator leaves the body untouched;
-                # a no-op unless ACTOR_NSYS_MICRO or ACTOR_TORCH_MICRO is set.
-                for micro_idx, data in actor_capture.iter_micro_batches(micro_batches):
-                    if self.no_sync_grad_accum:
-                        if micro_idx == 0 and n_micro > 1:
-                            accum_ctx = _grad_sync_context(self.actor_module, True)
-                            if accum_ctx is not None:
-                                accum_ctx.__enter__()
-                        elif micro_idx == n_micro - 1 and accum_ctx is not None:
-                            accum_ctx.__exit__(None, None, None)
-                            accum_ctx = None
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
-                    else:
-                        data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
-                    responses = data["responses"]
-                    # Filled by the teacher-KL block and read after the backward.
-                    _opd_diag_pending = None
-                    # The per-token OPD weight the gate applied, or None.
-                    _pb_w = None
-                    # The cross gate's forward outputs for this micro-batch, or None.
-                    _cg_pending = None
-                    response_length = responses.size(1)
-                    attention_mask = data["attention_mask"]
-                    task_ids = data.get("task_ids", None) if task_id_names else None
-                    task_loss_weight = data[TASK_LOSS_WEIGHT_KEY] if task_weighted else None
-                    if multi_turn:
-                        response_mask = data["loss_mask"][:, -response_length:]
-                    else:
-                        response_mask = attention_mask[:, -response_length:]
+                 # One reduce per mini-batch instead of one per micro-batch. The
+                 # context is entered before the first micro-batch's forward and
+                 # left before the last one's, both points where FSDP is IDLE --
+                 # no_sync() asserts that, so it cannot wrap the backward alone.
+                 # The last micro-batch then runs with sync on and reduces
+                 # everything accumulated.
+                 #
+                 # Under SHARD_GRAD_OP this removes the all-gather as well, not
+                 # just the reduce-scatter: _should_free_in_backward returns
+                 # `state._sync_gradients or strategy in
+                 # RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES`, and SHARD_GRAD_OP is
+                 # not in that set -- so with sync off the parameters are left
+                 # unsharded and the next micro-batch does not re-gather them.
+                 # That is why this pairs with sharding_strategy=shard_grad_op.
+                 n_micro = len(micro_batches)
+                 accum_ctx = None
+                 # enumerate(), plus the capture window and one named range per
+                 # micro-batch. Wrapping the iterator leaves the body untouched;
+                 # a no-op unless ACTOR_NSYS_MICRO or ACTOR_TORCH_MICRO is set.
+                 for micro_idx, data in actor_capture.iter_micro_batches(micro_batches):
+                     if self.no_sync_grad_accum:
+                         if micro_idx == 0 and n_micro > 1:
+                             accum_ctx = _grad_sync_context(self.actor_module, True)
+                             if accum_ctx is not None:
+                                 accum_ctx.__enter__()
+                         elif micro_idx == n_micro - 1 and accum_ctx is not None:
+                             accum_ctx.__exit__(None, None, None)
+                             accum_ctx = None
+                     # Support all hardwares
+                     if isinstance(data, DataProto):
+                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
+                     else:
+                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
+                     responses = data["responses"]
+                     # Filled by the teacher-KL block and read after the backward.
+                     _opd_diag_pending = None
+                     # The per-token OPD weight the gate applied, or None.
+                     _pb_w = None
+                     # The cross gate's forward outputs for this micro-batch, or None.
+                     _cg_pending = None
+                     response_length = responses.size(1)
+                     attention_mask = data["attention_mask"]
+                     task_ids = data.get("task_ids", None) if task_id_names else None
+                     task_loss_weight = data[TASK_LOSS_WEIGHT_KEY] if task_weighted else None
+                     if multi_turn:
+                         response_mask = data["loss_mask"][:, -response_length:]
+                     else:
+                         response_mask = attention_mask[:, -response_length:]
 
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
+                     clip_ratio = self.config.clip_ratio
+                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+                     entropy_coeff = self.config.entropy_coeff
+                     loss_agg_mode = self.config.loss_agg_mode
 
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    # Whose top-k defines the KL's support. Teacher-indexed (the
-                    # default) hands the forward the ids the teacher already chose.
-                    # Student-indexed asks the forward for the student's OWN top-k
-                    # and resolves the teacher at those ids afterwards, from cached
-                    # hidden states -- see verl/workers/teacher_cache.py for why
-                    # that does not force the teacher to run second.
-                    fwd_topk_ids = None
-                    fwd_topk_k = None
-                    if teacher_topk_kl:
-                        if student_indexed_topk:
-                            fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
-                        else:
-                            fwd_topk_ids = data["teacher_topk_ids"]
-                    # The sampled-token log-prob is dead weight in pure top-k
-                    # distillation: the KL is built from the top-k gather, and every
-                    # other consumer here (policy gradient, reference KL, sdl, sdar,
-                    # the single-token teacher estimator) is switched off. Computing
-                    # it means a log-softmax + gather over the full vocabulary for
-                    # every row, whose only surviving use below is reading .device
-                    # and .dtype off the result.
-                    need_log_prob = not (
-                        pg_loss_coef == 0
-                        and teacher_topk_kl
-                        and use_teacher_kl_loss
-                        and not self.config.use_kl_loss
-                        and not self.config.get("use_sdl_loss", False)
-                        and not self.config.get("use_sdar_loss", False)
-                    )
-                    with _actor_phase("actor.fwd"):
-                        entropy, log_prob, student_topk_out = self._forward_micro_batch(
-                            micro_batch=data,
-                            temperature=temperature,
-                            calculate_entropy=calculate_entropy,
-                            topk_ids=fwd_topk_ids,
-                            topk_k=fwd_topk_k,
-                            need_log_prob=need_log_prob,
-                        )
-                    if student_indexed_topk and teacher_topk_kl:
-                        # The forward returned the student's own top-k: values (with
-                        # gradient) and the ids that chose them, from one logits
-                        # tensor -- there is no second student forward here.
-                        student_topk_logprobs, student_topk_ids = student_topk_out
-                        if notice_probe_on and notice_probe_sums is not None and epoch == 0 and micro_idx == 0:
-                            # DESIGN SECTION 4, DIAGNOSTIC 1: did the notice move the
-                            # policy at all? The same student, the same response
-                            # tokens, the notice stripped from the prompt, scored at
-                            # the ids the with-notice forward chose; the reverse KL
-                            # on that support is what the loss itself would read.
-                            # One no-grad forward on one micro-batch every N steps.
-                            with torch.no_grad(), _actor_phase("actor.notice_probe"):
-                                _pad = int(data["input_ids"][0, 0].item())  # left-padded: column 0 is pad
-                                _ids, _mask, _pos = _strip_notice_prefix(
-                                    data["input_ids"].cpu(), data["attention_mask"].cpu(),
-                                    data["notice_len"].cpu(), _pad)
-                                _notice_mb = {k: v for k, v in data.items()}
-                                _notice_mb.update({"input_ids": _ids.to(data["input_ids"].device),
-                                               "attention_mask": _mask.to(data["attention_mask"].device),
-                                               "position_ids": _pos.to(data["position_ids"].device)})
-                                _, _, without_lp = self._forward_micro_batch(
-                                    micro_batch=_notice_mb, temperature=temperature,
-                                    calculate_entropy=False, topk_ids=student_topk_ids,
-                                    need_log_prob=False,
-                                )
-                                _kl = topk_kl_per_token(
-                                    student_topk_logprob=student_topk_logprobs.detach(),
-                                    teacher_topk_logprob=without_lp.detach(),
-                                )
-                                _m = response_mask.to(torch.float64)
-                                _klm = _kl.to(torch.float64) * _m
-                                notice_probe_sums[0, 0] += _klm.sum(); notice_probe_sums[0, 1] += _m.sum()
-                                if task_ids is not None:
-                                    _t = task_ids.reshape(-1).to(torch.long)
-                                    for _tid in range(n_task):
-                                        _rows = _t == _tid
-                                        if bool(_rows.any()):
-                                            notice_probe_sums[1 + _tid, 0] += _klm[_rows].sum()
-                                            notice_probe_sums[1 + _tid, 1] += _m[_rows].sum()
-                        # The cross-teacher blocks below read three more models at
-                        # THIS support. Asking for them here makes it one exchange
-                        # instead of two -- see _all_teacher_planes. The cost lands
-                        # in actor.teacher_lookup rather than actor.sign_weight /
-                        # actor.cross_teacher, so those two phases get cheaper by
-                        # the amount this one gets dearer; the pair is what moved,
-                        # not either alone.
-                        with _actor_phase("actor.teacher_lookup"):
-                            if sign_enabled or xt_enabled or xtt_enabled or ladder_enabled:
-                                (fwd_teacher_topk_logprobs, xt_base_plane,
-                                 xt_off_planes) = self._all_teacher_planes(data, student_topk_ids)
-                                cross_planes = (student_topk_ids, xt_base_plane, xt_off_planes)
-                            else:
-                                cross_planes = None
-                                fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
-                                    cache_ids=data.get("teacher_cache_ids", None),
-                                    ids=student_topk_ids,
-                                    input_ids=data["input_ids"],
-                                    attention_mask=data["attention_mask"],
-                                )
-                        sign_support_ids = student_topk_ids
-                        sign_on_task_logprobs = fwd_teacher_topk_logprobs
-                    else:
-                        student_topk_logprobs = student_topk_out
-                        fwd_teacher_topk_logprobs = None
-                        # Teacher-indexed: the support and the on-task teacher's
-                        # values at it are both already on the batch, so the sign
-                        # weights need no lookup to build -- only the other three
-                        # models do. The support is then a function of the frozen
-                        # teacher alone and does not drift as the student moves,
-                        # which is the whole reason to run this variant. No on-task
-                        # exchange runs here, so there is nothing for the blocks
-                        # below to ride along with and they ask for themselves.
-                        cross_planes = None
-                        sign_support_ids = data.get("teacher_topk_ids", None) if teacher_topk_kl else None
-                        sign_on_task_logprobs = (
-                            data.get("teacher_topk_logprobs", None) if teacher_topk_kl else None
-                        )
+                     # all return: (bsz, response_length)
+                     calculate_entropy = False
+                     if entropy_coeff != 0:
+                         calculate_entropy = True
+                     # Whose top-k defines the KL's support. Teacher-indexed (the
+                     # default) hands the forward the ids the teacher already chose.
+                     # Student-indexed asks the forward for the student's OWN top-k
+                     # and resolves the teacher at those ids afterwards, from cached
+                     # hidden states -- see verl/workers/teacher_cache.py for why
+                     # that does not force the teacher to run second.
+                     fwd_topk_ids = None
+                     fwd_topk_k = None
+                     if teacher_topk_kl:
+                         if student_indexed_topk:
+                             fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
+                         else:
+                             fwd_topk_ids = data["teacher_topk_ids"]
+                     # The sampled-token log-prob is dead weight in pure top-k
+                     # distillation: the KL is built from the top-k gather, and every
+                     # other consumer here (policy gradient, reference KL, sdl, sdar,
+                     # the single-token teacher estimator) is switched off. Computing
+                     # it means a log-softmax + gather over the full vocabulary for
+                     # every row, whose only surviving use below is reading .device
+                     # and .dtype off the result.
+                     need_log_prob = not (
+                         pg_loss_coef == 0
+                         and teacher_topk_kl
+                         and use_teacher_kl_loss
+                         and not self.config.use_kl_loss
+                         and not self.config.get("use_sdl_loss", False)
+                         and not self.config.get("use_sdar_loss", False)
+                     )
+                     with _actor_phase("actor.fwd"):
+                         entropy, log_prob, student_topk_out = self._forward_micro_batch(
+                             micro_batch=data,
+                             temperature=temperature,
+                             calculate_entropy=calculate_entropy,
+                             topk_ids=fwd_topk_ids,
+                             topk_k=fwd_topk_k,
+                             need_log_prob=need_log_prob,
+                         )
+                     if student_indexed_topk and teacher_topk_kl:
+                         # The forward returned the student's own top-k: values (with
+                         # gradient) and the ids that chose them, from one logits
+                         # tensor -- there is no second student forward here.
+                         student_topk_logprobs, student_topk_ids = student_topk_out
+                         if notice_probe_on and notice_probe_sums is not None and epoch == 0 and micro_idx == 0:
+                             # DESIGN SECTION 4, DIAGNOSTIC 1: did the notice move the
+                             # policy at all? The same student, the same response
+                             # tokens, the notice stripped from the prompt, scored at
+                             # the ids the with-notice forward chose; the reverse KL
+                             # on that support is what the loss itself would read.
+                             # One no-grad forward on one micro-batch every N steps.
+                             with torch.no_grad(), _actor_phase("actor.notice_probe"):
+                                 _pad = int(data["input_ids"][0, 0].item())  # left-padded: column 0 is pad
+                                 _ids, _mask, _pos = _strip_notice_prefix(
+                                     data["input_ids"].cpu(), data["attention_mask"].cpu(),
+                                     data["notice_len"].cpu(), _pad)
+                                 _notice_mb = {k: v for k, v in data.items()}
+                                 _notice_mb.update({"input_ids": _ids.to(data["input_ids"].device),
+                                                "attention_mask": _mask.to(data["attention_mask"].device),
+                                                "position_ids": _pos.to(data["position_ids"].device)})
+                                 _, _, without_lp = self._forward_micro_batch(
+                                     micro_batch=_notice_mb, temperature=temperature,
+                                     calculate_entropy=False, topk_ids=student_topk_ids,
+                                     need_log_prob=False,
+                                 )
+                                 _kl = topk_kl_per_token(
+                                     student_topk_logprob=student_topk_logprobs.detach(),
+                                     teacher_topk_logprob=without_lp.detach(),
+                                 )
+                                 _m = response_mask.to(torch.float64)
+                                 _klm = _kl.to(torch.float64) * _m
+                                 notice_probe_sums[0, 0] += _klm.sum(); notice_probe_sums[0, 1] += _m.sum()
+                                 if task_ids is not None:
+                                     _t = task_ids.reshape(-1).to(torch.long)
+                                     for _tid in range(n_task):
+                                         _rows = _t == _tid
+                                         if bool(_rows.any()):
+                                             notice_probe_sums[1 + _tid, 0] += _klm[_rows].sum()
+                                             notice_probe_sums[1 + _tid, 1] += _m[_rows].sum()
+                         # The cross-teacher blocks below read three more models at
+                         # THIS support. Asking for them here makes it one exchange
+                         # instead of two -- see _all_teacher_planes. The cost lands
+                         # in actor.teacher_lookup rather than actor.sign_weight /
+                         # actor.cross_teacher, so those two phases get cheaper by
+                         # the amount this one gets dearer; the pair is what moved,
+                         # not either alone.
+                         with _actor_phase("actor.teacher_lookup"):
+                             if sign_enabled or xt_enabled or xtt_enabled or ladder_enabled:
+                                 (fwd_teacher_topk_logprobs, xt_base_plane,
+                                  xt_off_planes) = self._all_teacher_planes(data, student_topk_ids)
+                                 cross_planes = (student_topk_ids, xt_base_plane, xt_off_planes)
+                             else:
+                                 cross_planes = None
+                                 fwd_teacher_topk_logprobs = self._teacher_logprobs_at(
+                                     cache_ids=data.get("teacher_cache_ids", None),
+                                     ids=student_topk_ids,
+                                     input_ids=data["input_ids"],
+                                     attention_mask=data["attention_mask"],
+                                 )
+                         sign_support_ids = student_topk_ids
+                         sign_on_task_logprobs = fwd_teacher_topk_logprobs
+                     else:
+                         student_topk_logprobs = student_topk_out
+                         fwd_teacher_topk_logprobs = None
+                         # Teacher-indexed: the support and the on-task teacher's
+                         # values at it are both already on the batch, so the sign
+                         # weights need no lookup to build -- only the other three
+                         # models do. The support is then a function of the frozen
+                         # teacher alone and does not drift as the student moves,
+                         # which is the whole reason to run this variant. No on-task
+                         # exchange runs here, so there is nothing for the blocks
+                         # below to ride along with and they ask for themselves.
+                         cross_planes = None
+                         sign_support_ids = data.get("teacher_topk_ids", None) if teacher_topk_kl else None
+                         sign_on_task_logprobs = (
+                             data.get("teacher_topk_logprobs", None) if teacher_topk_kl else None
+                         )
 
-                    # ---- cross-teacher sign agreement --------------------- #
-                    sign_position_weight = None
-                    sign_target_inputs = None
-                    sign_position_inputs = None
-                    sign_cand_inputs = None
-                    sign_base_logprob = None
-                    if ladder_stats is not None and ladder_enabled and not sign_enabled:
-                        # The ladder without any weighting arm: the same four
-                        # planes, read once, folded into the same accumulator the
-                        # sign arm feeds -- so transfer/off_travel means the same
-                        # thing on an arm that never touched the loss.
-                        with _actor_phase("actor.transfer_ladder"):
-                            _lb, _lo = self._cross_teacher_planes(data, sign_support_ids, cached=cross_planes)
-                            ladder_stats.update(
-                                student_logprob=student_topk_logprobs,
-                                on_task_logprob=sign_on_task_logprobs,
-                                base_logprob=_lb,
-                                off_task_logprobs=_lo,
-                                response_mask=response_mask,
-                                task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                            )
-                    if sign_enabled:
-                        # Refuse rather than skip. This block used to be guarded on
-                        # fwd_teacher_topk_logprobs, which is None whenever
-                        # student_indexed_topk is off -- so a teacher-indexed arm
-                        # with sign_weight.enable=true ran the driver's three extra
-                        # frozen forwards (a quarter of the step) and then silently
-                        # trained plain OPD, with no sign_weight/* metrics to say so.
-                        assert sign_on_task_logprobs is not None and sign_support_ids is not None, (
-                            "sign weighting needs a top-k support and the on-task teacher's "
-                            "log-probs at it; got neither. It requires teacher_kl_loss_type=topk_kl."
-                        )
-                        with _actor_phase("actor.sign_weight"):
-                            base_logprob, off_logprobs = self._cross_teacher_planes(
-                                data, sign_support_ids, cached=cross_planes
-                            )
-                            # The rewrite decomposition runs further down, past the
-                            # end of this block, and needs the base to measure the
-                            # teacher's own travel against.
-                            sign_base_logprob = base_logprob
-                            candidate_weight, sign_state = candidate_weights(
-                                sign_on_task_logprobs,
-                                off_logprobs,
-                                base_logprob,
-                                mode=sign_mode,
-                                agree_weight=sign_agree,
-                                agree_neg_weight=sign_agree_neg,
-                                disagree_weight=sign_disagree,
-                                deadzone=sign_deadzone,
-                            )
-                            sign_stats.update_candidates(
-                                state=sign_state,
-                                on_task_logprob=sign_on_task_logprobs,
-                                off_task_logprobs=off_logprobs,
-                                base_logprob=base_logprob,
-                                response_mask=response_mask,
-                                deadzone=sign_deadzone,
-                                task_ids=task_ids,
-                                off_plane_tasks=data.get("sign_off_tasks", None),
-                            )
-                            if pair_stats is not None:
-                                # The (on-task, off-task) sign contingency table
-                                # per ordered pair, from which the pair
-                                # association, the gate's leave-one-out and the
-                                # blind-spot census are all read.
-                                pair_stats.update(
-                                    on_task_logprob=sign_on_task_logprobs,
-                                    off_task_logprobs=off_logprobs,
-                                    base_logprob=base_logprob,
-                                    student_logprob=student_topk_logprobs,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                    deadzone=sign_deadzone,
-                                    student_deadzone=student_resid_deadzone,
-                                )
-                            if ladder_stats is not None:
-                                # How far the student travelled toward the
-                                # teachers it is NOT trained on, against where
-                                # the base started and where its own teacher
-                                # sits. The headline transfer measurement.
-                                ladder_stats.update(
-                                    student_logprob=student_topk_logprobs,
-                                    on_task_logprob=sign_on_task_logprobs,
-                                    base_logprob=base_logprob,
-                                    off_task_logprobs=off_logprobs,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                )
-                            # The per-token tables and the position family both
-                            # need the KL, which is not built until the loss
-                            # below, so what happens here is only to stash the
-                            # tensors they read. sign_support_ids is whichever
-                            # model nominated the support, i.e. exactly the set
-                            # the weights were computed at.
-                            sign_cand_inputs = {
-                                "support_ids": sign_support_ids,
-                                "state": sign_state,
-                                "weight": candidate_weight,
-                                "on_task_logprob": sign_on_task_logprobs,
-                                "base_logprob": base_logprob,
-                                "off_task_logprobs": off_logprobs,
-                                "off_plane_tasks": data["sign_off_tasks"],
-                            }
-                            if sign_mode == "target":
-                                # Keep the original: the diagnostics below measure
-                                # how far the rewrite moved the target, which is a
-                                # statement about the pair.
-                                sign_target_inputs = (sign_on_task_logprobs, candidate_weight, sign_state)
-                                if not sign_measure_only:
-                                    # Assigned to fwd_teacher_topk_logprobs (not to
-                                    # the teacher-indexed column it may have come
-                                    # from) because that is the variable the loss
-                                    # reads below, and it takes precedence over
-                                    # data[...] there. One path for both supports.
-                                    fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
-                                        sign_on_task_logprobs, candidate_weight
-                                    )
-                            else:
-                                pos_w = position_weights(candidate_weight, sign_on_task_logprobs)
-                                sign_stats.update_position(
-                                    position_weight=pos_w,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                )
-                                # By the PREVIOUS call's per-task means: this one's
-                                # are not known until every micro-batch has run, and
-                                # normalising by a micro-batch's own mean would make
-                                # the objective depend on how the batch was split.
-                                # Before the first call there is no such mean, and
-                                # the micro-batch's own is exactly the wrong
-                                # fallback, so the first step runs unnormalised --
-                                # sign_weight/*/w_mean_pre_norm records by how much.
-                                pos_w_norm = (
-                                    normalize_per_task(
-                                        pos_w, response_mask, task_ids,
-                                        means=self._sign_position_means,
-                                    )
-                                    if self._sign_position_means is not None
-                                    else pos_w
-                                )
-                                # Computed either way, applied only when the arm
-                                # is live: an observer arm still has to report
-                                # the weights it declined to spend, and gating
-                                # the arithmetic instead of the assignment would
-                                # leave measure_only with nothing to measure.
-                                sign_position_inputs = (pos_w, pos_w_norm)
-                                if not sign_measure_only:
-                                    sign_position_weight = pos_w_norm
+                     # ---- cross-teacher sign agreement --------------------- #
+                     sign_position_weight = None
+                     sign_target_inputs = None
+                     sign_position_inputs = None
+                     sign_cand_inputs = None
+                     sign_base_logprob = None
+                     if ladder_stats is not None and ladder_enabled and not sign_enabled:
+                         # The ladder without any weighting arm: the same four
+                         # planes, read once, folded into the same accumulator the
+                         # sign arm feeds -- so transfer/off_travel means the same
+                         # thing on an arm that never touched the loss.
+                         with _actor_phase("actor.transfer_ladder"):
+                             _lb, _lo = self._cross_teacher_planes(data, sign_support_ids, cached=cross_planes)
+                             ladder_stats.update(
+                                 student_logprob=student_topk_logprobs,
+                                 on_task_logprob=sign_on_task_logprobs,
+                                 base_logprob=_lb,
+                                 off_task_logprobs=_lo,
+                                 response_mask=response_mask,
+                                 task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                             )
+                     if sign_enabled:
+                         # Refuse rather than skip. This block used to be guarded on
+                         # fwd_teacher_topk_logprobs, which is None whenever
+                         # student_indexed_topk is off -- so a teacher-indexed arm
+                         # with sign_weight.enable=true ran the driver's three extra
+                         # frozen forwards (a quarter of the step) and then silently
+                         # trained plain OPD, with no sign_weight/* metrics to say so.
+                         assert sign_on_task_logprobs is not None and sign_support_ids is not None, (
+                             "sign weighting needs a top-k support and the on-task teacher's "
+                             "log-probs at it; got neither. It requires teacher_kl_loss_type=topk_kl."
+                         )
+                         with _actor_phase("actor.sign_weight"):
+                             base_logprob, off_logprobs = self._cross_teacher_planes(
+                                 data, sign_support_ids, cached=cross_planes
+                             )
+                             # The rewrite decomposition runs further down, past the
+                             # end of this block, and needs the base to measure the
+                             # teacher's own travel against.
+                             sign_base_logprob = base_logprob
+                             candidate_weight, sign_state = candidate_weights(
+                                 sign_on_task_logprobs,
+                                 off_logprobs,
+                                 base_logprob,
+                                 mode=sign_mode,
+                                 agree_weight=sign_agree,
+                                 agree_neg_weight=sign_agree_neg,
+                                 disagree_weight=sign_disagree,
+                                 deadzone=sign_deadzone,
+                             )
+                             sign_stats.update_candidates(
+                                 state=sign_state,
+                                 on_task_logprob=sign_on_task_logprobs,
+                                 off_task_logprobs=off_logprobs,
+                                 base_logprob=base_logprob,
+                                 response_mask=response_mask,
+                                 deadzone=sign_deadzone,
+                                 task_ids=task_ids,
+                                 off_plane_tasks=data.get("sign_off_tasks", None),
+                             )
+                             if pair_stats is not None:
+                                 # The (on-task, off-task) sign contingency table
+                                 # per ordered pair, from which the pair
+                                 # association, the gate's leave-one-out and the
+                                 # blind-spot census are all read.
+                                 pair_stats.update(
+                                     on_task_logprob=sign_on_task_logprobs,
+                                     off_task_logprobs=off_logprobs,
+                                     base_logprob=base_logprob,
+                                     student_logprob=student_topk_logprobs,
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                     deadzone=sign_deadzone,
+                                     student_deadzone=student_resid_deadzone,
+                                 )
+                             if ladder_stats is not None:
+                                 # How far the student travelled toward the
+                                 # teachers it is NOT trained on, against where
+                                 # the base started and where its own teacher
+                                 # sits. The headline transfer measurement.
+                                 ladder_stats.update(
+                                     student_logprob=student_topk_logprobs,
+                                     on_task_logprob=sign_on_task_logprobs,
+                                     base_logprob=base_logprob,
+                                     off_task_logprobs=off_logprobs,
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                 )
+                             # The per-token tables and the position family both
+                             # need the KL, which is not built until the loss
+                             # below, so what happens here is only to stash the
+                             # tensors they read. sign_support_ids is whichever
+                             # model nominated the support, i.e. exactly the set
+                             # the weights were computed at.
+                             sign_cand_inputs = {
+                                 "support_ids": sign_support_ids,
+                                 "state": sign_state,
+                                 "weight": candidate_weight,
+                                 "on_task_logprob": sign_on_task_logprobs,
+                                 "base_logprob": base_logprob,
+                                 "off_task_logprobs": off_logprobs,
+                                 "off_plane_tasks": data["sign_off_tasks"],
+                             }
+                             if sign_mode == "target":
+                                 # Keep the original: the diagnostics below measure
+                                 # how far the rewrite moved the target, which is a
+                                 # statement about the pair.
+                                 sign_target_inputs = (sign_on_task_logprobs, candidate_weight, sign_state)
+                                 if not sign_measure_only:
+                                     # Assigned to fwd_teacher_topk_logprobs (not to
+                                     # the teacher-indexed column it may have come
+                                     # from) because that is the variable the loss
+                                     # reads below, and it takes precedence over
+                                     # data[...] there. One path for both supports.
+                                     fwd_teacher_topk_logprobs = reweight_teacher_logprobs(
+                                         sign_on_task_logprobs, candidate_weight
+                                     )
+                             else:
+                                 pos_w = position_weights(candidate_weight, sign_on_task_logprobs)
+                                 sign_stats.update_position(
+                                     position_weight=pos_w,
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                 )
+                                 # By the PREVIOUS call's per-task means: this one's
+                                 # are not known until every micro-batch has run, and
+                                 # normalising by a micro-batch's own mean would make
+                                 # the objective depend on how the batch was split.
+                                 # Before the first call there is no such mean, and
+                                 # the micro-batch's own is exactly the wrong
+                                 # fallback, so the first step runs unnormalised --
+                                 # sign_weight/*/w_mean_pre_norm records by how much.
+                                 pos_w_norm = (
+                                     normalize_per_task(
+                                         pos_w, response_mask, task_ids,
+                                         means=self._sign_position_means,
+                                     )
+                                     if self._sign_position_means is not None
+                                     else pos_w
+                                 )
+                                 # Computed either way, applied only when the arm
+                                 # is live: an observer arm still has to report
+                                 # the weights it declined to spend, and gating
+                                 # the arithmetic instead of the assignment would
+                                 # leave measure_only with nothing to measure.
+                                 sign_position_inputs = (pos_w, pos_w_norm)
+                                 if not sign_measure_only:
+                                     sign_position_weight = pos_w_norm
                     
-                    xt_built = None
-                    # Bound here, beside xt_built, because the probe and channel
-                    # readers live in a SIBLING block (under use_teacher_kl_loss)
-                    # rather than under xt_enabled. Reaching them undefined would
-                    # be a NameError on any step where this arm is off.
-                    xt_role_keep = None
-                    # Per micro-batch, so the readers below cannot see a
-                    # previous one's roles when this one produced none.
-                    xt_roles_mb = None
-                    # Likewise: absent means the policy term was switched off or
-                    # ran on a path that did not produce it, and the gradient
-                    # comparison is skipped rather than run against a stale one.
-                    xt_pg_grad_coef = None
-                    # The row-level columns two blocks below both read. Resolved
-                    # once, here, so the outcome statistics and the event rows
-                    # cannot disagree about what this row scored.
-                    _scores = data.get("token_level_scores", None)
-                    _row_adv = data.get("adv_row_value", None)
-                    _push_for_events = None
-                    # The target arm's product: log p_tilde on the support, or
-                    # None when it is off or has no scale yet. Read once, at the
-                    # line that builds teacher_kld -- it multiplies nothing.
-                    xtt_built = None
-                    # One definition of "is this the epoch that folds statistics
-                    # in", shared by both arms. Later PPO epochs re-visit the same
-                    # rows against a student that has already moved, so counting
-                    # them would fold each trajectory in once per epoch and mix
-                    # two policies into one cumulative scale.
-                    xt_collect = epoch == 0
-                    if xtt_enabled:
-                        assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
-                            "cross_teacher_target needs the top-k support and the on-task "
-                            "teacher's log-probs at it"
-                        )
-                        with _actor_phase("actor.cross_teacher_target"):
-                            base_logprob, off_logprobs = self._cross_teacher_planes(
-                                data, sign_support_ids, cached=cross_planes
-                            )
-                            if xt_collect:
-                                self._xt_rms.update(
-                                    shifts=compute_raw_policy_shifts(
-                                        on_task_logprob=sign_on_task_logprobs,
-                                        off_task_logprobs=off_logprobs,
-                                        base_logprob=base_logprob,
-                                    ),
-                                    student_logprob=student_topk_logprobs,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                )
-                            xtt_collect = xt_collect and xtt_stats is not None
-                            if xt_rms_snapshot is not None:
-                                xtt_built = xtt_build_target(
-                                    on_logprob=sign_on_task_logprobs,
-                                    off_logprob=off_logprobs,
-                                    base_logprob=base_logprob,
-                                    diag=xt_rms_snapshot[0],
-                                    diag_valid=xt_rms_snapshot[1],
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                    exponent_scale=xtt_scale,
-                                    mode=xtt_mode,
-                                    rho=xtt_rho,
-                                    # The counterfactuals ride the collecting
-                                    # epoch only: a few more elementwise
-                                    # exchanges, and nothing the loss reads.
-                                    # Each mode gets its own set -- the tilt
-                                    # path's channel split does not exist here
-                                    # (one channel), and its shuffled TV inverts
-                                    # its meaning (less corroboration means more
-                                    # subtraction), so what replaces it is the
-                                    # shared layer's retained mass.
-                                    shuffle_counterfactual=(
-                                        xtt_collect and xtt_mode == "tilt"),
-                                    channel_counterfactuals=(
-                                        xtt_collect and xtt_mode == "tilt"),
-                                    curriculum_counterfactuals=(
-                                        xtt_collect and xtt_mode == "curriculum"),
-                                    response_mask=response_mask,
-                                )
-                            if xtt_built is not None and xtt_collect:
-                                # G2's two ingredients, measured the same way as
-                                # the loss: the same dense top-k reverse KL, one
-                                # against the on-task teacher, one against base.
-                                _d_on = topk_kl_per_token(
-                                    student_topk_logprob=student_topk_logprobs,
-                                    teacher_topk_logprob=sign_on_task_logprobs,
-                                )
-                                _d_base = topk_kl_per_token(
-                                    student_topk_logprob=student_topk_logprobs,
-                                    teacher_topk_logprob=base_logprob,
-                                )
-                                xtt_stats.update(
-                                    built=xtt_built, p_on=xtt_built["p_on"],
-                                    support_ids=sign_support_ids,
-                                    response_mask=response_mask, task_ids=task_ids,
-                                    d_on=_d_on, d_base=_d_base,
-                                    # dKL = log Z - <c>_{p_s} needs the student's
-                                    # mass at the same support. It is the number
-                                    # the revision is judged on, so it is measured
-                                    # here beside the KL it belongs to.
-                                    student_logprob=student_topk_logprobs,
-                                    # H(p_tilde) - H(p_on) needs log p_on itself,
-                                    # not p_on: a student-indexed support reaches
-                                    # candidates where the teacher's probability
-                                    # underflows float32, and log(exp(x)) would
-                                    # lose exactly those.
-                                    on_logprob=sign_on_task_logprobs,
-                                    # layer x role, curriculum mode only. The
-                                    # design predicts the shared layer is format
-                                    # and tag -- the audit measured the shared
-                                    # component as format -- and the pair
-                                    # layer's content share is the number that
-                                    # says whether stage 2 teaches anything but
-                                    # structure. Nothing has measured it before.
-                                    roles=(
-                                        token_roles(data["responses"], sign_role_tags)
-                                        if (xtt_mode == "curriculum" and sign_role_tags)
-                                        else None
-                                    ),
-                                    # Which off-task teacher set the pair layer,
-                                    # named by task. Curriculum mode reads it;
-                                    # the tilt path ignores it.
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                    tag_token_ids=xtt_tag_ids,
-                                )
-                                if xtt_token_stats is not None or xtt_event_stats is not None:
-                                    _labels = xtt_sign_state_labels(
-                                        xtt_built["branch"], xtt_built["consensus_sign"]
-                                    )
-                                    # dq = p_on (w - 1): the change to the target
-                                    # distribution AT THIS CANDIDATE, which is
-                                    # exact. What it no longer is, since the
-                                    # revision replaced the exchange with a plain
-                                    # normalisation, is zero-sum over the support:
-                                    # Z != 1, and the tail moved by p_tail(1/Z - 1)
-                                    # as well. Read the column as a per-candidate
-                                    # change, not as a redistribution.
-                                    _dq = (
-                                        (xtt_built["w"] - 1.0) * xtt_built["p_on"].to(torch.float64)
-                                    )
-                                if xtt_token_stats is not None:
-                                    xtt_token_stats.update(
-                                        support_ids=sign_support_ids,
-                                        state=(
-                                            xtt_built["layer_branch"]
-                                            if xtt_mode == "curriculum" else _labels
-                                        ),
-                                        weight=xtt_built["w"],
-                                        on_task_logprob=sign_on_task_logprobs,
-                                        response_mask=response_mask,
-                                        task_ids=task_ids,
-                                        effect=_dq,
-                                    )
-                                if xtt_event_stats is not None:
-                                    _rs = data.get("token_level_scores", None)
-                                    xtt_event_stats.update(
-                                        support_ids=sign_support_ids,
-                                        state=_labels,
-                                        weight=xtt_built["w"],
-                                        effect=_dq,
-                                        on_task_logprob=sign_on_task_logprobs,
-                                        off_task_logprobs=off_logprobs,
-                                        base_logprob=base_logprob,
-                                        student_logprob=student_topk_logprobs,
-                                        response_mask=response_mask,
-                                        responses=data["responses"],
-                                        # The real Z. It was identically 1 under
-                                        # the capacity exchange and this column
-                                        # was a constant; since the revision it
-                                        # is the head's tax and belongs in the
-                                        # dump beside the candidate it scaled.
-                                        norm=xtt_built["log_z"].exp().to(_d_on.dtype),
-                                        teacher_kl=_d_on,
-                                        task_ids=task_ids,
-                                        roles=(
-                                            token_roles(data["responses"], sign_role_tags)
-                                            if sign_role_tags
-                                            else None
-                                        ),
-                                        reward=(_rs.sum(dim=-1) if _rs is not None else None),
-                                    )
-                    if xt_enabled:
-                        assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
-                            "cross_teacher_kl_weight needs the student's top-k support and the "
-                            "on-task teacher's log-probs at it"
-                        )
-                        # The weight is needed on every PPO epoch; the
-                        # STATISTICS are collected on the first only. Later
-                        # epochs re-visit the same rows against a student that
-                        # has already moved, so folding them in would count each
-                        # trajectory once per epoch and mix two policies into one
-                        # cumulative scale.
-                        with _actor_phase("actor.cross_teacher"):
-                            base_logprob, off_logprobs = self._cross_teacher_planes(
-                                data, sign_support_ids, cached=cross_planes
-                            )
-                            xt_shifts = compute_raw_policy_shifts(
-                                on_task_logprob=sign_on_task_logprobs,
-                                off_task_logprobs=off_logprobs,
-                                base_logprob=base_logprob,
-                            )
-                            # This step's contribution to the CUMULATIVE scale.
-                            # Read one step later, so nothing here reaches the
-                            # weight built below.
-                            if xt_collect:
-                                self._xt_rms.update(
-                                    shifts=xt_shifts,
-                                    student_logprob=student_topk_logprobs,
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                )
-                            # Built once per micro-batch and handed to BOTH the
-                            # weight and the normaliser: the mean has to be taken
-                            # over exactly the positions the weight was applied
-                            # to, or kl_scale leaves 1 and the arm confounds
-                            # "where it reallocates" with "how much it distils".
-                            xt_role_keep = (
-                                role_keep_mask(
-                                    roles=token_roles(data["responses"], sign_role_tags),
-                                    group=xt_role_group,
-                                )
-                                if xt_role_group
-                                else None
-                            )
-                            if xt_rms_snapshot is None:
-                                # Step 0: no scale exists, so no weight does
-                                # either. Not the raw W~ -- that would be a
-                                # silent increase in distillation strength for
-                                # as long as the RMS takes to appear.
-                                xt_built = None
-                            else:
-                                xt_built = build_position_weight(
-                                    role_keep=xt_role_keep,
-                                    shifts=xt_shifts,
-                                    on_task_logprob=sign_on_task_logprobs,
-                                    # The measure the candidate expectations are
-                                    # taken against: the loss is a reverse KL,
-                                    # so a candidate's share of it is the
-                                    # STUDENT's mass there. Detached inside.
-                                    student_logprob=student_topk_logprobs,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=data["sign_off_tasks"],
-                                    diag=xt_rms_snapshot[0],
-                                    diag_valid=xt_rms_snapshot[1],
-                                    alpha_table=xt_alpha_snapshot,
-                                    normalizer=xt_mean_snapshot,
-                                    response_mask=response_mask,
-                                    report_epsilon=xt_report_eps,
-                                )
-                                xt_nonfinite[0] += xt_built["nonfinite"]
-                                if xt_collect:
-                                    self._xt_accumulate_reliability(
-                                        data=data,
-                                        built=xt_built,
-                                        student_topk_logprob=student_topk_logprobs,
-                                        support_ids=sign_support_ids,
-                                        response_mask=response_mask,
-                                        task_ids=task_ids,
-                                        diag=xt_rms_snapshot,
-                                        outside_counter=xt_outside_topk,
-                                    )
+                     xt_built = None
+                     # Bound here, beside xt_built, because the probe and channel
+                     # readers live in a SIBLING block (under use_teacher_kl_loss)
+                     # rather than under xt_enabled. Reaching them undefined would
+                     # be a NameError on any step where this arm is off.
+                     xt_role_keep = None
+                     # Per micro-batch, so the readers below cannot see a
+                     # previous one's roles when this one produced none.
+                     xt_roles_mb = None
+                     # Likewise: absent means the policy term was switched off or
+                     # ran on a path that did not produce it, and the gradient
+                     # comparison is skipped rather than run against a stale one.
+                     xt_pg_grad_coef = None
+                     # The row-level columns two blocks below both read. Resolved
+                     # once, here, so the outcome statistics and the event rows
+                     # cannot disagree about what this row scored.
+                     _scores = data.get("token_level_scores", None)
+                     _row_adv = data.get("adv_row_value", None)
+                     _push_for_events = None
+                     # The target arm's product: log p_tilde on the support, or
+                     # None when it is off or has no scale yet. Read once, at the
+                     # line that builds teacher_kld -- it multiplies nothing.
+                     xtt_built = None
+                     # One definition of "is this the epoch that folds statistics
+                     # in", shared by both arms. Later PPO epochs re-visit the same
+                     # rows against a student that has already moved, so counting
+                     # them would fold each trajectory in once per epoch and mix
+                     # two policies into one cumulative scale.
+                     xt_collect = epoch == 0
+                     if xtt_enabled:
+                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
+                             "cross_teacher_target needs the top-k support and the on-task "
+                             "teacher's log-probs at it"
+                         )
+                         with _actor_phase("actor.cross_teacher_target"):
+                             base_logprob, off_logprobs = self._cross_teacher_planes(
+                                 data, sign_support_ids, cached=cross_planes
+                             )
+                             if xt_collect:
+                                 self._xt_rms.update(
+                                     shifts=compute_raw_policy_shifts(
+                                         on_task_logprob=sign_on_task_logprobs,
+                                         off_task_logprobs=off_logprobs,
+                                         base_logprob=base_logprob,
+                                     ),
+                                     student_logprob=student_topk_logprobs,
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                 )
+                             xtt_collect = xt_collect and xtt_stats is not None
+                             if xt_rms_snapshot is not None:
+                                 xtt_built = xtt_build_target(
+                                     on_logprob=sign_on_task_logprobs,
+                                     off_logprob=off_logprobs,
+                                     base_logprob=base_logprob,
+                                     diag=xt_rms_snapshot[0],
+                                     diag_valid=xt_rms_snapshot[1],
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                     exponent_scale=xtt_scale,
+                                     mode=xtt_mode,
+                                     rho=xtt_rho,
+                                     # The counterfactuals ride the collecting
+                                     # epoch only: a few more elementwise
+                                     # exchanges, and nothing the loss reads.
+                                     # Each mode gets its own set -- the tilt
+                                     # path's channel split does not exist here
+                                     # (one channel), and its shuffled TV inverts
+                                     # its meaning (less corroboration means more
+                                     # subtraction), so what replaces it is the
+                                     # shared layer's retained mass.
+                                     shuffle_counterfactual=(
+                                         xtt_collect and xtt_mode == "tilt"),
+                                     channel_counterfactuals=(
+                                         xtt_collect and xtt_mode == "tilt"),
+                                     curriculum_counterfactuals=(
+                                         xtt_collect and xtt_mode == "curriculum"),
+                                     response_mask=response_mask,
+                                 )
+                             if xtt_built is not None and xtt_collect:
+                                 # G2's two ingredients, measured the same way as
+                                 # the loss: the same dense top-k reverse KL, one
+                                 # against the on-task teacher, one against base.
+                                 _d_on = topk_kl_per_token(
+                                     student_topk_logprob=student_topk_logprobs,
+                                     teacher_topk_logprob=sign_on_task_logprobs,
+                                 )
+                                 _d_base = topk_kl_per_token(
+                                     student_topk_logprob=student_topk_logprobs,
+                                     teacher_topk_logprob=base_logprob,
+                                 )
+                                 xtt_stats.update(
+                                     built=xtt_built, p_on=xtt_built["p_on"],
+                                     support_ids=sign_support_ids,
+                                     response_mask=response_mask, task_ids=task_ids,
+                                     d_on=_d_on, d_base=_d_base,
+                                     # dKL = log Z - <c>_{p_s} needs the student's
+                                     # mass at the same support. It is the number
+                                     # the revision is judged on, so it is measured
+                                     # here beside the KL it belongs to.
+                                     student_logprob=student_topk_logprobs,
+                                     # H(p_tilde) - H(p_on) needs log p_on itself,
+                                     # not p_on: a student-indexed support reaches
+                                     # candidates where the teacher's probability
+                                     # underflows float32, and log(exp(x)) would
+                                     # lose exactly those.
+                                     on_logprob=sign_on_task_logprobs,
+                                     # layer x role, curriculum mode only. The
+                                     # design predicts the shared layer is format
+                                     # and tag -- the audit measured the shared
+                                     # component as format -- and the pair
+                                     # layer's content share is the number that
+                                     # says whether stage 2 teaches anything but
+                                     # structure. Nothing has measured it before.
+                                     roles=(
+                                         token_roles(data["responses"], sign_role_tags)
+                                         if (xtt_mode == "curriculum" and sign_role_tags)
+                                         else None
+                                     ),
+                                     # Which off-task teacher set the pair layer,
+                                     # named by task. Curriculum mode reads it;
+                                     # the tilt path ignores it.
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                     tag_token_ids=xtt_tag_ids,
+                                 )
+                                 if xtt_token_stats is not None or xtt_event_stats is not None:
+                                     _labels = xtt_sign_state_labels(
+                                         xtt_built["branch"], xtt_built["consensus_sign"]
+                                     )
+                                     # dq = p_on (w - 1): the change to the target
+                                     # distribution AT THIS CANDIDATE, which is
+                                     # exact. What it no longer is, since the
+                                     # revision replaced the exchange with a plain
+                                     # normalisation, is zero-sum over the support:
+                                     # Z != 1, and the tail moved by p_tail(1/Z - 1)
+                                     # as well. Read the column as a per-candidate
+                                     # change, not as a redistribution.
+                                     _dq = (
+                                         (xtt_built["w"] - 1.0) * xtt_built["p_on"].to(torch.float64)
+                                     )
+                                 if xtt_token_stats is not None:
+                                     xtt_token_stats.update(
+                                         support_ids=sign_support_ids,
+                                         state=(
+                                             xtt_built["layer_branch"]
+                                             if xtt_mode == "curriculum" else _labels
+                                         ),
+                                         weight=xtt_built["w"],
+                                         on_task_logprob=sign_on_task_logprobs,
+                                         response_mask=response_mask,
+                                         task_ids=task_ids,
+                                         effect=_dq,
+                                     )
+                                 if xtt_event_stats is not None:
+                                     _rs = data.get("token_level_scores", None)
+                                     xtt_event_stats.update(
+                                         support_ids=sign_support_ids,
+                                         state=_labels,
+                                         weight=xtt_built["w"],
+                                         effect=_dq,
+                                         on_task_logprob=sign_on_task_logprobs,
+                                         off_task_logprobs=off_logprobs,
+                                         base_logprob=base_logprob,
+                                         student_logprob=student_topk_logprobs,
+                                         response_mask=response_mask,
+                                         responses=data["responses"],
+                                         # The real Z. It was identically 1 under
+                                         # the capacity exchange and this column
+                                         # was a constant; since the revision it
+                                         # is the head's tax and belongs in the
+                                         # dump beside the candidate it scaled.
+                                         norm=xtt_built["log_z"].exp().to(_d_on.dtype),
+                                         teacher_kl=_d_on,
+                                         task_ids=task_ids,
+                                         roles=(
+                                             token_roles(data["responses"], sign_role_tags)
+                                             if sign_role_tags
+                                             else None
+                                         ),
+                                         reward=(_rs.sum(dim=-1) if _rs is not None else None),
+                                     )
+                     if xt_enabled:
+                         assert sign_support_ids is not None and sign_on_task_logprobs is not None, (
+                             "cross_teacher_kl_weight needs the student's top-k support and the "
+                             "on-task teacher's log-probs at it"
+                         )
+                         # The weight is needed on every PPO epoch; the
+                         # STATISTICS are collected on the first only. Later
+                         # epochs re-visit the same rows against a student that
+                         # has already moved, so folding them in would count each
+                         # trajectory once per epoch and mix two policies into one
+                         # cumulative scale.
+                         with _actor_phase("actor.cross_teacher"):
+                             base_logprob, off_logprobs = self._cross_teacher_planes(
+                                 data, sign_support_ids, cached=cross_planes
+                             )
+                             xt_shifts = compute_raw_policy_shifts(
+                                 on_task_logprob=sign_on_task_logprobs,
+                                 off_task_logprobs=off_logprobs,
+                                 base_logprob=base_logprob,
+                             )
+                             # This step's contribution to the CUMULATIVE scale.
+                             # Read one step later, so nothing here reaches the
+                             # weight built below.
+                             if xt_collect:
+                                 self._xt_rms.update(
+                                     shifts=xt_shifts,
+                                     student_logprob=student_topk_logprobs,
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                 )
+                             # Built once per micro-batch and handed to BOTH the
+                             # weight and the normaliser: the mean has to be taken
+                             # over exactly the positions the weight was applied
+                             # to, or kl_scale leaves 1 and the arm confounds
+                             # "where it reallocates" with "how much it distils".
+                             xt_role_keep = (
+                                 role_keep_mask(
+                                     roles=token_roles(data["responses"], sign_role_tags),
+                                     group=xt_role_group,
+                                 )
+                                 if xt_role_group
+                                 else None
+                             )
+                             if xt_rms_snapshot is None:
+                                 # Step 0: no scale exists, so no weight does
+                                 # either. Not the raw W~ -- that would be a
+                                 # silent increase in distillation strength for
+                                 # as long as the RMS takes to appear.
+                                 xt_built = None
+                             else:
+                                 xt_built = build_position_weight(
+                                     role_keep=xt_role_keep,
+                                     shifts=xt_shifts,
+                                     on_task_logprob=sign_on_task_logprobs,
+                                     # The measure the candidate expectations are
+                                     # taken against: the loss is a reverse KL,
+                                     # so a candidate's share of it is the
+                                     # STUDENT's mass there. Detached inside.
+                                     student_logprob=student_topk_logprobs,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=data["sign_off_tasks"],
+                                     diag=xt_rms_snapshot[0],
+                                     diag_valid=xt_rms_snapshot[1],
+                                     alpha_table=xt_alpha_snapshot,
+                                     normalizer=xt_mean_snapshot,
+                                     response_mask=response_mask,
+                                     report_epsilon=xt_report_eps,
+                                 )
+                                 xt_nonfinite[0] += xt_built["nonfinite"]
+                                 if xt_collect:
+                                     self._xt_accumulate_reliability(
+                                         data=data,
+                                         built=xt_built,
+                                         student_topk_logprob=student_topk_logprobs,
+                                         support_ids=sign_support_ids,
+                                         response_mask=response_mask,
+                                         task_ids=task_ids,
+                                         diag=xt_rms_snapshot,
+                                         outside_counter=xt_outside_topk,
+                                     )
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    if loss_mode == "vanilla":
-                        policy_loss_fn = compute_policy_loss
-                    elif loss_mode == "gspo":
-                        policy_loss_fn = compute_policy_loss_gspo
-                    else:
-                        raise ValueError(f"Unsupported loss_mode: {loss_mode}")
+                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                     if loss_mode == "vanilla":
+                         policy_loss_fn = compute_policy_loss
+                     elif loss_mode == "gspo":
+                         policy_loss_fn = compute_policy_loss_gspo
+                     else:
+                         raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
-                    # Under per-task normalisation every term is aggregated by the
-                    # same row weights instead of by the token-mean, so the
-                    # coefficients between them keep meaning what they say. The
-                    # weights already carry the full normalisation, so the two
-                    # divisions the sum has to survive are undone once here: FSDP
-                    # averages gradients across the DP ranks, and the mini-batch
-                    # loss is divided by gradient_accumulation below.
-                    task_agg_scale = None
-                    if task_loss_weight is not None:
-                        task_agg_scale = task_loss_weight * (
-                            self.task_dp_world_size * self.gradient_accumulation
-                        )
+                     # Under per-task normalisation every term is aggregated by the
+                     # same row weights instead of by the token-mean, so the
+                     # coefficients between them keep meaning what they say. The
+                     # weights already carry the full normalisation, so the two
+                     # divisions the sum has to survive are undone once here: FSDP
+                     # averages gradients across the DP ranks, and the mini-batch
+                     # loss is divided by gradient_accumulation below.
+                     task_agg_scale = None
+                     if task_loss_weight is not None:
+                         task_agg_scale = task_loss_weight * (
+                             self.task_dp_world_size * self.gradient_accumulation
+                         )
 
-                    def _task_agg(loss_mat):
-                        return agg_loss_by_task_weights(
-                            loss_mat=loss_mat, loss_mask=response_mask, row_weights=task_agg_scale
-                        )
+                     def _task_agg(loss_mat):
+                         return agg_loss_by_task_weights(
+                             loss_mat=loss_mat, loss_mask=response_mask, row_weights=task_agg_scale
+                         )
 
-                    if pg_loss_coef != 0:
-                        old_log_prob = data["old_log_probs"]
-                        advantages = data["advantages"]
-                        if task_agg_scale is None:
-                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                response_mask=response_mask,
-                                cliprange=clip_ratio,
-                                cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,
-                                clip_ratio_c=clip_ratio_c,
-                                loss_agg_mode=loss_agg_mode,
-                            )
-                            pg_term = pg_loss
-                        else:
-                            # Same clipped objective, aggregated by the row weights.
-                            # loss_mode is pinned to vanilla for this path (asserted
-                            # in check_task_weighting_supported), so the per-token
-                            # split of compute_policy_loss is the right one to use.
-                            pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_per_token(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                response_mask=response_mask,
-                                cliprange=clip_ratio,
-                                cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,
-                                clip_ratio_c=clip_ratio_c,
-                            )
-                            pg_term = _task_agg(pg_losses)
-                            # Reported unweighted so it stays comparable with runs
-                            # that do not normalise per task; the weighted number is
-                            # deferred separately below.
-                            pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            _defer("actor/pg_loss_weighted", pg_term)
-                        if (xt_grad_stats is not None or opd_grad_stats is not None
-                                or opd_diag_stats is not None or pushback is not None
-                                or cross_gate is not None):
-                            # d(pg_losses)/d(log_prob), from the SAME inputs the
-                            # loss above was built from rather than from a copy
-                            # reconstructed in the diagnostic. Outside the
-                            # task-weighting branch, because both paths minimise
-                            # the same clipped objective and only differ in how
-                            # they aggregate it. Read in the cross-teacher block
-                            # below, which is a sibling and cannot see these
-                            # names.
-                            #
-                            # ONE coefficient for both geometries. Two would
-                            # make kl_weight/grpo/grad_cosine and
-                            # opd/grpo/grad_cosine comparisons against different
-                            # policy gradients, which is the one thing the pair
-                            # exists to hold fixed.
-                            xt_pg_grad_coef = policy_loss_gradient_coef(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                cliprange=clip_ratio,
-                                cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,
-                                clip_ratio_c=clip_ratio_c,
-                            ).detach()
-                    else:
-                        # Pure teacher-KL distillation: no policy-gradient signal.
-                        # Take device/dtype from whichever tensor the forward
-                        # actually produced -- log_prob is None when it was skipped.
-                        old_log_prob = data.get("old_log_probs", None)
-                        probe = log_prob if log_prob is not None else student_topk_logprobs
-                        zero = torch.zeros((), device=probe.device, dtype=probe.dtype)
-                        pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
-                        pg_term = zero
+                     if pg_loss_coef != 0:
+                         old_log_prob = data["old_log_probs"]
+                         advantages = data["advantages"]
+                         if task_agg_scale is None:
+                             pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                 old_log_prob=old_log_prob,
+                                 log_prob=log_prob,
+                                 advantages=advantages,
+                                 response_mask=response_mask,
+                                 cliprange=clip_ratio,
+                                 cliprange_low=clip_ratio_low,
+                                 cliprange_high=clip_ratio_high,
+                                 clip_ratio_c=clip_ratio_c,
+                                 loss_agg_mode=loss_agg_mode,
+                             )
+                             pg_term = pg_loss
+                         else:
+                             # Same clipped objective, aggregated by the row weights.
+                             # loss_mode is pinned to vanilla for this path (asserted
+                             # in check_task_weighting_supported), so the per-token
+                             # split of compute_policy_loss is the right one to use.
+                             pg_losses, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_per_token(
+                                 old_log_prob=old_log_prob,
+                                 log_prob=log_prob,
+                                 advantages=advantages,
+                                 response_mask=response_mask,
+                                 cliprange=clip_ratio,
+                                 cliprange_low=clip_ratio_low,
+                                 cliprange_high=clip_ratio_high,
+                                 clip_ratio_c=clip_ratio_c,
+                             )
+                             pg_term = _task_agg(pg_losses)
+                             # Reported unweighted so it stays comparable with runs
+                             # that do not normalise per task; the weighted number is
+                             # deferred separately below.
+                             pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                             _defer("actor/pg_loss_weighted", pg_term)
+                         if (xt_grad_stats is not None or opd_grad_stats is not None
+                                 or opd_diag_stats is not None or pushback is not None
+                                 or cross_gate is not None):
+                             # d(pg_losses)/d(log_prob), from the SAME inputs the
+                             # loss above was built from rather than from a copy
+                             # reconstructed in the diagnostic. Outside the
+                             # task-weighting branch, because both paths minimise
+                             # the same clipped objective and only differ in how
+                             # they aggregate it. Read in the cross-teacher block
+                             # below, which is a sibling and cannot see these
+                             # names.
+                             #
+                             # ONE coefficient for both geometries. Two would
+                             # make kl_weight/grpo/grad_cosine and
+                             # opd/grpo/grad_cosine comparisons against different
+                             # policy gradients, which is the one thing the pair
+                             # exists to hold fixed.
+                             xt_pg_grad_coef = policy_loss_gradient_coef(
+                                 old_log_prob=old_log_prob,
+                                 log_prob=log_prob,
+                                 advantages=advantages,
+                                 cliprange=clip_ratio,
+                                 cliprange_low=clip_ratio_low,
+                                 cliprange_high=clip_ratio_high,
+                                 clip_ratio_c=clip_ratio_c,
+                             ).detach()
+                     else:
+                         # Pure teacher-KL distillation: no policy-gradient signal.
+                         # Take device/dtype from whichever tensor the forward
+                         # actually produced -- log_prob is None when it was skipped.
+                         old_log_prob = data.get("old_log_probs", None)
+                         probe = log_prob if log_prob is not None else student_topk_logprobs
+                         zero = torch.zeros((), device=probe.device, dtype=probe.dtype)
+                         pg_loss = pg_clipfrac = ppo_kl = pg_clipfrac_lower = zero
+                         pg_term = zero
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        entropy_term = entropy_loss if task_agg_scale is None else _task_agg(entropy)
+                     if entropy_coeff != 0:
+                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                         entropy_term = entropy_loss if task_agg_scale is None else _task_agg(entropy)
 
-                        # compute policy loss
-                        policy_loss = pg_term * pg_loss_coef - entropy_term * entropy_coeff
-                    else:
-                        policy_loss = pg_term * pg_loss_coef
+                         # compute policy loss
+                         policy_loss = pg_term * pg_loss_coef - entropy_term * entropy_coeff
+                     else:
+                         policy_loss = pg_term * pg_loss_coef
 
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        kl_loss_coef = data.get("kl_loss_coef", None)
-                        if kl_loss_coef is None:
-                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
-                        else:
-                            weighted_kl_loss = agg_loss_with_sample_weights(
-                                loss_mat=kld,
-                                loss_mask=response_mask,
-                                sample_weights=kl_loss_coef,
-                                loss_agg_mode=loss_agg_mode,
-                            )
-                            policy_loss = policy_loss + weighted_kl_loss
-                            metrics["actor/kl_coef"] = kl_loss_coef.float().mean().detach().item()
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
+                     if self.config.use_kl_loss:
+                         ref_log_prob = data["ref_log_prob"]
+                         # compute kl loss
+                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                         kl_loss_coef = data.get("kl_loss_coef", None)
+                         if kl_loss_coef is None:
+                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                             metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                         else:
+                             weighted_kl_loss = agg_loss_with_sample_weights(
+                                 loss_mat=kld,
+                                 loss_mask=response_mask,
+                                 sample_weights=kl_loss_coef,
+                                 loss_agg_mode=loss_agg_mode,
+                             )
+                             policy_loss = policy_loss + weighted_kl_loss
+                             metrics["actor/kl_coef"] = kl_loss_coef.float().mean().detach().item()
+                         metrics["actor/kl_loss"] = kl_loss.detach().item()
 
-                    if self.config.get("use_sdl_loss", False):
-                        from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
-                        teacher_log_probs = data["teacher_log_probs"]
-                        sdl_loss = compute_sdl_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_probs,
-                            old_log_probs=old_log_prob,
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        sdl_coef = self.config.get("sdl_loss_coef", 0.1)
-                        policy_loss = policy_loss + sdl_loss * sdl_coef
-                        metrics["actor/sdl_loss"] = sdl_loss.detach().item()
-                        metrics["actor/sdl_coef"] = sdl_coef
+                     if self.config.get("use_sdl_loss", False):
+                         from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
+                         teacher_log_probs = data["teacher_log_probs"]
+                         sdl_loss = compute_sdl_loss(
+                             student_log_probs=log_prob,
+                             teacher_log_probs=teacher_log_probs,
+                             old_log_probs=old_log_prob,
+                             response_mask=response_mask,
+                             loss_agg_mode=loss_agg_mode,
+                         )
+                         sdl_coef = self.config.get("sdl_loss_coef", 0.1)
+                         policy_loss = policy_loss + sdl_loss * sdl_coef
+                         metrics["actor/sdl_loss"] = sdl_loss.detach().item()
+                         metrics["actor/sdl_coef"] = sdl_coef
 
-                    if self.config.get("use_sdar_loss", False):
-                        from verl.trainer.ppo.sdar_utils import compute_sdar_loss
-                        teacher_log_probs = data["teacher_log_probs"]
-                        sdar_loss, sdar_metrics = compute_sdar_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_probs,
-                            response_mask=response_mask,
-                            gate_beta=self.config.get("sdar_gate_beta", 5.0),
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        sdar_coef = self.config.get("sdar_loss_coef", 0.1)
-                        policy_loss = policy_loss + sdar_loss * sdar_coef
-                        metrics.update(sdar_metrics)
-                        metrics["sdar/coef"] = sdar_coef
+                     if self.config.get("use_sdar_loss", False):
+                         from verl.trainer.ppo.sdar_utils import compute_sdar_loss
+                         teacher_log_probs = data["teacher_log_probs"]
+                         sdar_loss, sdar_metrics = compute_sdar_loss(
+                             student_log_probs=log_prob,
+                             teacher_log_probs=teacher_log_probs,
+                             response_mask=response_mask,
+                             gate_beta=self.config.get("sdar_gate_beta", 5.0),
+                             loss_agg_mode=loss_agg_mode,
+                         )
+                         sdar_coef = self.config.get("sdar_loss_coef", 0.1)
+                         policy_loss = policy_loss + sdar_loss * sdar_coef
+                         metrics.update(sdar_metrics)
+                         metrics["sdar/coef"] = sdar_coef
 
-                    if use_teacher_kl_loss:
-                        # On-policy distillation: KL between student and a (per-task) teacher,
-                        # evaluated on the student's own on-policy responses. Only the student
-                        # log-probs carry gradients; teacher values are detached upstream.
-                        if teacher_topk_kl:
-                            # Dense reverse KL over the top-k support (+ tail bucket).
-                            # Both sides are full-vocabulary log-softmax values at the
-                            # SAME ids, whichever model chose them, so the tail is
-                            # 1 - sum in both cases and the formula is unchanged.
-                            teacher_topk_lp = (
-                                fwd_teacher_topk_logprobs
-                                if fwd_teacher_topk_logprobs is not None
-                                else data["teacher_topk_logprobs"]
-                            )
-                            if xtt_built is not None:
-                                # The one line the TARGET arm exists to reach.
-                                # Not a factor on the KL -- the teacher's own
-                                # values, rewritten, so the fixed point moves and
-                                # the off-task teachers can carry something the
-                                # on-task one does not express. Mass on the
-                                # support is conserved exactly, so the tail term
-                                # inside topk_kl_per_token is still correct.
-                                teacher_topk_lp = xtt_built["target_logprob"].to(
-                                    teacher_topk_lp.dtype
-                                )
-                            teacher_kld = topk_kl_per_token(
-                                student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=teacher_topk_lp,
-                            )
-                        else:
-                            # Single-sampled-token estimator (low_var_kl / kl / mse / abs).
-                            teacher_kld = kl_penalty(
-                                logprob=log_prob,
-                                ref_logprob=data["teacher_log_probs"],
-                                kl_penalty=teacher_kl_loss_type,
-                            )
-                        if xt_nonfinite is not None:
-                            # W = 1 saves nothing when the KL is already NaN --
-                            # 1 * NaN is NaN, and so is 0 * NaN at a masked
-                            # position, so agg_loss carries it into backward and
-                            # the optimizer steps before the step-end check
-                            # fires. A NaN on-task teacher log-prob would destroy
-                            # the weights and only then be reported.
-                            #
-                            # Zero everywhere so nothing propagates; count only
-                            # inside the mask, because a padded position is not a
-                            # teacher failure and killing the step for one would
-                            # be a false alarm. The step still dies at the
-                            # synchronised point rather than here: raising inside
-                            # the micro-batch loop would leave the other ranks in
-                            # a collective.
-                            finite_kl = torch.isfinite(teacher_kld)
-                            xt_nonfinite[3] += (
-                                (~finite_kl) & response_mask.to(torch.bool)
-                            ).sum().to(torch.float64)
-                            teacher_kld = torch.where(
-                                finite_kl, teacher_kld, torch.zeros_like(teacher_kld)
-                            )
-                        # PER-TASK, ON TOP OF THE GLOBAL COEFFICIENT. b_task
-                        # multiplies the row, so the effective coefficient is
-                        # teacher_kl_loss_coef * b_task and b = 1 reproduces
-                        # every existing run bit for bit. None when unset.
-                        #
-                        # Computed HERE rather than at the loss line below,
-                        # because the arm-independent attribution columns are
-                        # built in between and they describe the term the
-                        # optimizer takes. Read with the GLOBAL coefficient
-                        # only, they reported webshop's OPD push at its
-                        # un-halved size on a run that halved it.
-                        _kl_row_coef = self.teacher_kl_row_coef(
-                            task_ids, task_id_names, teacher_kld.size(0),
-                            device=teacher_kld.device, dtype=teacher_kld.dtype,
-                        )
-                        _teacher_kl_coef_scalar = float(
-                            self.config.get("teacher_kl_loss_coef", 1.0)
-                        )
-                        # What the loss actually applies to this row's OPD term.
-                        # Stays a plain float when b is unset, so every existing
-                        # diagnostic takes the identical code path.
-                        _opd_effective_coef = (
-                            _teacher_kl_coef_scalar if _kl_row_coef is None
-                            else _teacher_kl_coef_scalar * _kl_row_coef
-                        )
-                        # Read BEFORE the position weight multiplies it. The
-                        # unweighted KL is what makes w_kl/kl the factor the arm
-                        # applied to the total; taking the weighted one would
-                        # make that ratio 1 by construction, and the per-token
-                        # effect table would be crediting tokens with a cost the
-                        # weighting had already inflated.
-                        if sign_position_inputs is not None and position_stats is not None:
-                            pre_w, applied_w = sign_position_inputs
-                            position_stats.update(
-                                position_decomposition_terms(
-                                    position_weight=pre_w,
-                                    applied_weight=applied_w,
-                                    candidate_weight=sign_cand_inputs["weight"],
-                                    state=sign_cand_inputs["state"],
-                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
-                                    teacher_kl=teacher_kld,
-                                    weight_range=sign_weight_range,
-                                ),
-                                response_mask=response_mask,
-                                task_ids=task_ids,
-                            )
-                        if sign_cand_inputs is not None and (
-                            token_stats is not None or pair_token_stats is not None
-                        ):
-                            # The same candidates the stats above summarise, kept
-                            # under their vocabulary ids. In position mode the
-                            # per-task normaliser is recovered as pre/applied
-                            # rather than plumbed separately: it is one number per
-                            # task and the two tensors that carry it are already
-                            # here.
-                            extra = {}
-                            if sign_position_inputs is not None:
-                                pre_w, applied_w = sign_position_inputs
-                                extra = {
-                                    "position_scale": pre_w / applied_w.clamp(min=1e-8),
-                                    "teacher_kl": teacher_kld,
-                                }
-                            # Once, for both tables. Two calls would let the two
-                            # rankings disagree about what "effect" means.
-                            cand_effect = candidate_effect(
-                                mode="target" if target_mode else "position",
-                                on_task_logprob=sign_cand_inputs["on_task_logprob"],
-                                weight=sign_cand_inputs["weight"],
-                                **extra,
-                            )
-                            if token_stats is not None:
-                                token_stats.update(
-                                    support_ids=sign_cand_inputs["support_ids"],
-                                    state=sign_cand_inputs["state"],
-                                    weight=sign_cand_inputs["weight"],
-                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    effect=cand_effect,
-                                )
-                            if event_stats is not None:
-                                # The normaliser the effect column was divided
-                                # by, so a row can be read without knowing which
-                                # mode produced it: Z in target mode, the applied
-                                # position weight in position mode. position_weights
-                                # rebuilds Z exactly -- it IS sum_v p w + tail.
-                                norm = (
-                                    sign_position_inputs[1]
-                                    if sign_position_inputs is not None
-                                    else position_weights(
-                                        sign_cand_inputs["weight"],
-                                        sign_cand_inputs["on_task_logprob"],
-                                    )
-                                )
-                                responses_mb = data["responses"]
-                                # .get, not `in data.batch`: by this point the
-                                # micro-batch is a TensorDict (or a plain dict on
-                                # the multi-modal path) and has no .batch. The
-                                # column is absent on an arm whose reward manager
-                                # failed, which is a monitoring failure and must
-                                # not take the step down.
-                                row_scores = data.get("token_level_scores", None)
-                                event_stats.update(
-                                    support_ids=sign_cand_inputs["support_ids"],
-                                    state=sign_cand_inputs["state"],
-                                    weight=sign_cand_inputs["weight"],
-                                    effect=cand_effect,
-                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
-                                    off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
-                                    base_logprob=sign_cand_inputs["base_logprob"],
-                                    student_logprob=student_topk_logprobs,
-                                    response_mask=response_mask,
-                                    responses=responses_mb,
-                                    norm=norm,
-                                    teacher_kl=teacher_kld,
-                                    task_ids=task_ids,
-                                    roles=(
-                                        token_roles(responses_mb, sign_role_tags)
-                                        if sign_role_tags
-                                        else None
-                                    ),
-                                    reward=(row_scores.sum(dim=-1) if row_scores is not None else None),
-                                )
-                            if pair_token_stats is not None and task_ids is not None:
-                                # Which tokens each off-task teacher sends into
-                                # THIS task's states. The counts answer it on
-                                # their own; the effect column says whether the
-                                # weighting acted on what was sent.
-                                pair_token_stats.update(
-                                    support_ids=sign_cand_inputs["support_ids"],
-                                    on_task_logprob=sign_cand_inputs["on_task_logprob"],
-                                    off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
-                                    base_logprob=sign_cand_inputs["base_logprob"],
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                    off_plane_tasks=sign_cand_inputs["off_plane_tasks"],
-                                    deadzone=sign_deadzone,
-                                    effect=cand_effect,
-                                )
-                        if xt_built is not None and xt_position_stats is not None and xt_collect:
-                            # Read BEFORE the weight multiplies it, everywhere.
-                            # The normaliser composes with itself if it is fed
-                            # the weighted KL -- and since the first step runs at
-                            # W = 1 it would be right exactly once and drift from
-                            # the second, where no metric is looking. kl_scale
-                            # would also be 1 by construction rather than by
-                            # measurement.
-                            self._xt_mean.update(
-                                pre_weight=xt_built["pre_weight"], teacher_kl=teacher_kld,
-                                response_mask=response_mask, task_ids=task_ids,
-                                row_weights=task_loss_weight,
-                                # Same tensor the weight was masked with, read
-                                # back off the build rather than recomputed.
-                                role_keep=xt_built["role_keep"],
-                            )
-                            # Computed once and handed to four accumulators:
-                            # the task cut, the role cut, the turn cut and the
-                            # histogram all decompose the SAME columns, and three
-                            # copies of the arithmetic is how three views of one
-                            # number come to disagree.
-                            # row_weight and coef so the channel columns come
-                            # out as objective and not only as nats: the tasks
-                            # do not enter the loss with the same share, and the
-                            # distillation term enters it at 0.01.
-                            # The SAME reverse KL against the BASE model, on the
-                            # same support. W multiplies the on-task teacher's
-                            # KL, and hat_on is that teacher measured against the
-                            # base, so wherever hat_on is small the two KLs are
-                            # the same number and raising W is a pull toward the
-                            # base rather than toward anything the RL wrote.
-                            # That is the source channel's own region by
-                            # construction; this makes it a measurement. One
-                            # top-k KL on tensors already gathered.
-                            xt_base_kl = topk_kl_per_token(
-                                student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=base_logprob,
-                            )
-                            xt_pos_cols = xt_position_terms(
-                                xt_built, teacher_kld,
-                                row_weight=task_loss_weight,
-                                coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
-                                base_kl=xt_base_kl,
-                            )
-                            xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)
-                            xt_position_stats.update(
-                                xt_pos_cols, response_mask=response_mask, task_ids=task_ids,
-                            )
-                            xt_state_stats.update(
-                                xt_state_cols, response_mask=response_mask, task_ids=task_ids,
-                            )
-                            xt_weight_hist.update(
-                                weight=xt_built["weight"], teacher_kl=teacher_kld,
-                                response_mask=response_mask, task_ids=task_ids,
-                            )
-                            # Roles are absent when the worker never handed down
-                            # the tag ids. Filing everything under "format" would
-                            # be a table that looks populated and says nothing, so
-                            # the accumulator is simply not fed.
-                            xt_roles_mb = (
-                                token_roles(data["responses"], sign_role_tags)
-                                if sign_role_tags
-                                else None
-                            )
-                            if xt_roles_mb is not None:
-                                xt_role_position_stats.update(
-                                    xt_pos_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
-                                )
-                                if xt_task_role_stats is not None:
-                                    # task * n_roles + role. Role is a property
-                                    # of the position and task of the row, so
-                                    # the cross is one index and not a second
-                                    # accumulator class. It is the cut the
-                                    # pooled role table cannot make: "the arm
-                                    # spent its source budget on tag tokens" and
-                                    # "on WebShop's tag tokens" are different
-                                    # findings, and only the second can be read
-                                    # against WebShop's own score.
-                                    xt_task_role_stats.update(
-                                        xt_pos_cols, response_mask=response_mask,
-                                        scope_ids=torch.where(
-                                            (task_ids.reshape(-1, 1) >= 0) & (xt_roles_mb >= 0),
-                                            task_ids.reshape(-1, 1) * len(XT_ROLE_SCOPE_NAMES)
-                                            + xt_roles_mb,
-                                            torch.full_like(xt_roles_mb, -1),
-                                        ),
-                                    )
-                                xt_role_state_stats.update(
-                                    xt_state_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
-                                )
-                            xt_turn_stats.update(
-                                xt_pos_cols, response_mask=response_mask,
-                                scope_ids=turn_index(response_mask).clamp(max=XT_TURN_BUCKETS - 1),
-                            )
-                            # Each source's share of W~ - 1, and of the nats that
-                            # share went on to move.
-                            src_evidence = xt_built["evidence_by_source"].sum(dim=2)
-                            xt_src_kl = (
-                                teacher_kld / xt_built["mu"].clamp(min=1e-12)
-                            ).unsqueeze(-1)
-                            xt_pair_stats.update(
-                                evidence=src_evidence,
-                                shift=src_evidence * xt_src_kl,
-                                response_mask=response_mask, task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                                # How much of each source teacher's probability
-                                # lands inside the student's top-k at all. Free:
-                                # the log-probs are already gathered there.
-                                support_mass=off_logprobs.detach().to(
-                                    torch.float32
-                                ).exp().sum(dim=-2),
-                                # The same evidence with alpha divided out. Both
-                                # near zero means the source had nothing to say;
-                                # this large and the shift near zero means alpha
-                                # refused what it did say.
-                                activity=xt_built["activity_by_source"].sum(dim=2),
-                                # AND THE SHARED CHANNEL'S OWN SPLIT. The old
-                                # corroboration was a minimum over a unanimity
-                                # and had no per-source share to give; this one
-                                # is a mean of per-teacher votes and does, so a
-                                # source that spent its whole agreement inside
-                                # the corroboration no longer reads as having
-                                # contributed nothing.
-                                corroboration=xt_built["corroboration_by_source"],
-                                corroboration_shift=(
-                                    xt_built["corroboration_by_source"] * xt_src_kl
-                                ),
-                            )
-                            # The same nats, cut by what the source was doing
-                            # relative to the on-task teacher.
-                            xt_pair_state_stats.update(
-                                state=pair_state_index(
-                                    hat_on=xt_built["hat_on"], hat_off=xt_built["hat_off"],
-                                    deadzone=xt_report_eps,
-                                ),
-                                evidence=xt_built["evidence_by_source"],
-                                shift=xt_built["evidence_by_source"]
-                                * xt_src_kl.unsqueeze(-1),
-                                response_mask=response_mask, task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                                activity=xt_built["activity_by_source"],
-                            )
-                            # And WHICH teacher set the size of that
-                            # corroboration, or cancelled it. The table
-                            # above is per source and c is not per source.
-                            xt_corr_attr_stats.update(
-                                attribution=xt_built["attribution"],
-                                common=xt_built["common"],
-                                teacher_prob=xt_built["mass"],
-                                applied_by_source=xt_built["common_soft_by_source"],
-                                response_mask=response_mask, task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                            )
-                            # Per trajectory. The row score is what separates
-                            # "spent on rollouts that worked" from "spent on the
-                            # ones that did not", which the advantage alone
-                            # cannot say -- it is group-relative.
-                            xt_outcome_stats.update(
-                                weight=xt_built["weight"], teacher_kl=teacher_kld,
-                                response_mask=response_mask,
-                                advantage=(
-                                    _row_adv
-                                    if _row_adv is not None
-                                    else torch.zeros(
-                                        teacher_kld.size(0), device=teacher_kld.device
-                                    )
-                                ),
-                                task_ids=task_ids,
-                                reward=(None if _scores is None else _scores.sum(dim=-1)),
-                            )
-                            # The same rows, cut by SOURCE. The table above sums
-                            # the sources out and the evidence table sums the
-                            # outcome out, so "Search moved 4% of AlfWorld's
-                            # budget" and "the budget went to the rollouts that
-                            # scored" cannot be joined without this.
-                            xt_source_outcome_stats.update(
-                                push_by_source=xt_built["push_by_source"],
-                                teacher_kl=teacher_kld, response_mask=response_mask,
-                                advantage=(
-                                    _row_adv
-                                    if _row_adv is not None
-                                    else torch.zeros(
-                                        teacher_kld.size(0), device=teacher_kld.device
-                                    )
-                                ),
-                                task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                                reward=(None if _scores is None else _scores.sum(dim=-1)),
-                            )
-                            # The same rows for the OTHER channel. Same class,
-                            # different column: the corroboration decomposes per
-                            # teacher now, so it has an outcome table of its own
-                            # for the first time.
-                            xt_corroboration_outcome_stats.update(
-                                push_by_source=(
-                                    xt_built["corroboration_by_source"]
-                                    / xt_built["mu"].clamp(min=1e-12).unsqueeze(-1)
-                                ),
-                                teacher_kl=teacher_kld, response_mask=response_mask,
-                                advantage=(
-                                    _row_adv
-                                    if _row_adv is not None
-                                    else torch.zeros(
-                                        teacher_kld.size(0), device=teacher_kld.device
-                                    )
-                                ),
-                                task_ids=task_ids,
-                                off_plane_tasks=data["sign_off_tasks"],
-                                reward=(None if _scores is None else _scores.sum(dim=-1)),
-                            )
-                            for name, pre in xt_built["probe_pre_weight"].items():
-                                self._xt_probe_mean[name].update(
-                                    pre_weight=pre, teacher_kl=teacher_kld,
-                                    response_mask=response_mask, task_ids=task_ids,
-                                    row_weights=task_loss_weight,
-                                    # The counterfactuals are masked like the
-                                    # live weight. They reach no loss, but an
-                                    # unmasked probe would report reallocation on
-                                    # roles this arm never touched and its
-                                    # kl_scale would not be 1 either -- two
-                                    # readings that disagree with the arm they
-                                    # are the counterfactual FOR.
-                                    role_keep=xt_role_keep,
-                                )
-                                snap = xt_probe_snapshots.get(name, None)
-                                probe_mu = _xt_normalizer_mu(pre, snap, task_ids)
-                                probe = {
-                                    "weight": _xt_role_masked(pre / probe_mu, xt_role_keep),
-                                    "pre_weight": pre,
-                                    "mu": probe_mu,
-                                    # The state partition is built from mu, not
-                                    # from the weight, so it needs the mask
-                                    # handed to it or a masked position reports
-                                    # a shift the probe did not take.
-                                    "role_keep": xt_role_keep,
-                                    # alpha changes the evidence and nothing
-                                    # else: the state labels, the teacher's
-                                    # probability and the availability mask are
-                                    # the live ones by construction.
-                                    "evidence": xt_built["probe_evidence"][name],
-                                    "state": xt_built["state"],
-                                    "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
-                                    "available": xt_built["available"],
-                                    "evidence_shared": xt_built["evidence_shared"],
-                                    "evidence_shared_offtask_only": xt_built[
-                                        "evidence_shared_offtask_only"
-                                    ],
-                                }
-                                xt_probe_stats[name].update(
-                                    xt_position_terms(probe, teacher_kld),
-                                    response_mask=response_mask, task_ids=task_ids,
-                                )
-                                # The counterfactual's own state partition,
-                                # built from the probe's OWN mu and evidence so
-                                # its columns sum to the probe's (W - 1) D and
-                                # not to the shipped arm's. The state labels and
-                                # the teacher's probability are shared because
-                                # alpha does not move them -- which is what makes
-                                # the series an alpha ablation rather than three
-                                # unrelated weightings.
-                                xt_probe_state_stats[name].update(
-                                    xt_state_shift_terms(probe, teacher_kld),
-                                    response_mask=response_mask, task_ids=task_ids,
-                                )
-                            for name, pre in xt_built["channel_pre_weight"].items():
-                                self._xt_channel_mean[name].update(
-                                    pre_weight=pre, teacher_kl=teacher_kld,
-                                    response_mask=response_mask, task_ids=task_ids,
-                                    row_weights=task_loss_weight,
-                                    role_keep=xt_role_keep,
-                                )
-                                snap = xt_channel_snapshots.get(name, None)
-                                mu_c = _xt_normalizer_mu(pre, snap, task_ids)
-                                chan = {
-                                    "weight": _xt_role_masked(pre / mu_c, xt_role_keep),
-                                    "pre_weight": pre, "mu": mu_c,
-                                    "role_keep": xt_role_keep,
-                                    "evidence": xt_built["channel_evidence"][name],
-                                    "state": xt_built["state"],
-                                    "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
-                                    "available": xt_built["available"],
-                                    "evidence_shared": xt_built["evidence_shared"],
-                                    "evidence_shared_offtask_only": xt_built[
-                                        "evidence_shared_offtask_only"
-                                    ],
-                                }
-                                xt_channel_stats[name].update(
-                                    xt_position_terms(chan, teacher_kld),
-                                    response_mask=response_mask, task_ids=task_ids,
-                                )
-                                xt_channel_state_stats[name].update(
-                                    xt_state_shift_terms(chan, teacher_kld),
-                                    response_mask=response_mask, task_ids=task_ids,
-                                )
-                        # sign_support_ids / sign_on_task_logprobs directly, NOT
-                        # sign_cand_inputs: that dict is the SIGN arm's stash and is
-                        # None whenever sign_weight.enable is off. This arm is a
-                        # different mechanism and runs with it off, so reading it here
-                        # crashed the cross-teacher arm at step 2 -- step 1 survives
-                        # only because no RMS exists yet, xt_built is None, and this
-                        # block never opens. The two names it needs are the ones
-                        # xt_enabled already asserts are present, a hundred lines up.
-                        if xt_built is not None and xt_collect:
-                            # Built once here whether or not the dense push
-                            # table is on: the event rows carry the same two
-                            # columns and must not compute them a second way.
-                            _push_for_events = (
-                                opd_logit_push(
-                                    student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_on_task_logprobs,
-                                    teacher_kl=teacher_kld,
-                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
-                                )
-                                if (xt_push_token_stats is not None or xt_pair_event_stats is not None)
-                                else None
-                            )
-                            self._xt_token_tables(
-                                built=xt_built, teacher_kl=teacher_kld, data=data,
-                                support_ids=sign_support_ids,
-                                student_topk_logprob=student_topk_logprobs,
-                                on_task_logprob=sign_on_task_logprobs,
-                                response_mask=response_mask, task_ids=task_ids,
-                                report_epsilon=xt_report_eps,
-                                tables=(
-                                    xt_token_stats, xt_pair_token_stats,
-                                    xt_event_stats, xt_pair_event_stats,
-                                ),
-                                roles=sign_role_tags,
-                                planes=(base_logprob, off_logprobs),
-                                raw_shifts=xt_shifts,
-                                alpha_table=xt_alpha_snapshot,
-                                row_reward=(None if _scores is None else _scores.sum(dim=-1)),
-                                row_advantage=_row_adv,
-                                push=_push_for_events,
-                            )
-                            if xt_role_token_stats is not None and xt_roles_mb is not None:
-                                xt_role_token_stats.update(
-                                    support_ids=sign_support_ids,
-                                    roles=xt_roles_mb,
-                                    effect=per_candidate_shift(xt_built, teacher_kld),
-                                    response_mask=response_mask,
-                                )
-                            if xt_push_token_stats is not None:
-                                # The OTHER token table. The one above names the
-                                # candidates whose evidence justified the weight;
-                                # this one names the tokens whose logit the
-                                # weight then moved, which is every token in the
-                                # support. Conflating them is how "Search
-                                # reinforced retrieve" gets written about a
-                                # position where what it reinforced is the
-                                # suppression of something else.
-                                _y1 = data["responses"].unsqueeze(-1)
-                                _push = _push_for_events
-                                xt_push_token_stats.update(
-                                    support_ids=sign_support_ids,
-                                    g0=_push["g0"],
-                                    weight=xt_built["weight"],
-                                    coef_applied_weight=xt_built["weight"],
-                                    response_mask=response_mask, task_ids=task_ids,
-                                    sampled_onehot=(
-                                        sign_support_ids == _y1
-                                    ).to(teacher_kld.dtype),
-                                    p_student=_push["p_student"],
-                                    # The tail bucket has no token to be filed
-                                    # under, so it never reaches a row above --
-                                    # and without it the token ranking is quoted
-                                    # with an unstated denominator.
-                                    g0_tail=_push["g0_tail"],
-                                    # The exact partition of W - 1, so the
-                                    # ranking splits into one list per channel
-                                    # instead of one list for the mechanism.
-                                    push_shared=xt_built["push_shared"],
-                                    push_source=xt_built["push_by_source"].sum(dim=-1),
-                                    push_normalizer=xt_built["push_normalizer"],
-                                )
-                            if xt_grad_stats is not None and xt_pg_grad_coef is not None:
-                                # Analytic, so the diagnostic cannot perturb the
-                                # update it describes. The policy side is the
-                                # real clipped objective's per-token derivative,
-                                # not A: with 360 rows at a mini-batch of 60,
-                                # five of the six mini-batches in an epoch run at
-                                # a ratio the optimizer has already moved, and a
-                                # bound clip branch has no gradient at all.
-                                y1 = data["responses"].unsqueeze(-1)
-                                xt_grad_cols = logit_gradient_terms(
-                                    student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_on_task_logprobs,
-                                    weight=xt_built["weight"],
-                                    teacher_kl=teacher_kld,
-                                    pg_grad_coef=xt_pg_grad_coef,
-                                    sampled_onehot=(
-                                        sign_support_ids == y1
-                                    ).to(teacher_kld.dtype),
-                                    coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
-                                    pg_coef=float(pg_loss_coef),
-                                    # Both terms carry it in the loss, so a pooled
-                                    # norm ratio that omits it is the ratio of a
-                                    # different objective's gradients.
-                                    row_weight=task_loss_weight,
-                                    # The exact partition of W - 1, so each
-                                    # channel's own addition to the logit push
-                                    # is scored against the policy gradient
-                                    # separately. The pooled cosine cannot: it
-                                    # is taken on W, which carries the base OPD
-                                    # direction and both channels at once.
-                                    push_shared=xt_built["push_shared"],
-                                    push_source=xt_built["push_by_source"].sum(dim=-1),
-                                    # The third one. It is the only channel that
-                                    # can be negative, so without it the two
-                                    # above do not add up to the arm's departure
-                                    # from unweighted OPD.
-                                    push_normalizer=xt_built["push_normalizer"],
-                                )
-                                xt_grad_stats.update(
-                                    xt_grad_cols, response_mask=response_mask, task_ids=task_ids,
-                                )
-                                if xt_roles_mb is not None:
-                                    xt_role_grad_stats.update(
-                                        xt_grad_cols, response_mask=response_mask,
-                                        scope_ids=xt_roles_mb,
-                                    )
-                        # ---- the arm-independent attribution ------------- #
-                        # HERE, and not one line later. Everything below this
-                        # block multiplies teacher_kld by a weight; these columns
-                        # are the unweighted term's, so they have to be taken
-                        # while teacher_kld still is one. Outside every xt_built
-                        # guard as well: a control run reaches this line with
-                        # xt_built None on every step of the run, and that is the
-                        # run these columns exist for.
-                        if opd_attr_on and epoch == 0 and (
-                            opd_grad_stats is not None or opd_push_tokens is not None
-                        ):
-                            # The row's emitted token, and g0 -- built once here
-                            # and handed to both readers below. A second copy of
-                            # opd_logit_push is how "the arm amplified this
-                            # token" and "the arm's gradient norm" come to
-                            # describe different quantities under one name.
-                            _oy1 = data["responses"].unsqueeze(-1)
-                            _opd_sampled = (sign_support_ids == _oy1).to(teacher_kld.dtype)
-                            opd_push = (
-                                opd_logit_push(
-                                    student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_on_task_logprobs,
-                                    teacher_kl=teacher_kld,
-                                    coef=_opd_effective_coef,
-                                )
-                                if opd_push_tokens is not None
-                                else None
-                            )
-                            if opd_push_tokens is not None:
-                                # Ones, in the shape the class expects, passed to
-                                # both weight arguments because they ARE the same
-                                # weight -- the assertion in update() is checking
-                                # that a caller has not handed it two.
-                                _ones = torch.ones_like(teacher_kld)
-                                opd_push_tokens.update(
-                                    support_ids=sign_support_ids,
-                                    g0=opd_push["g0"],
-                                    weight=_ones, coef_applied_weight=_ones,
-                                    response_mask=response_mask, task_ids=task_ids,
-                                    sampled_onehot=_opd_sampled,
-                                    p_student=opd_push["p_student"],
-                                    g0_tail=opd_push["g0_tail"],
-                                    gap=opd_push["gap"],
-                                )
-                            if opd_grad_stats is not None and xt_pg_grad_coef is not None:
-                                opd_cols = opd_attribution_terms(
-                                    student_logprob=student_topk_logprobs,
-                                    teacher_logprob=sign_on_task_logprobs,
-                                    teacher_kl=teacher_kld,
-                                    pg_grad_coef=xt_pg_grad_coef,
-                                    sampled_onehot=_opd_sampled,
-                                    coef=_opd_effective_coef,
-                                    pg_coef=float(pg_loss_coef),
-                                    row_weight=task_loss_weight,
-                                    push=opd_push,
-                                )
-                                opd_grad_stats.update(
-                                    opd_cols, response_mask=response_mask, task_ids=task_ids,
-                                )
-                                if opd_role_grad_stats is not None:
-                                    _opd_roles = token_roles(data["responses"], sign_role_tags)
-                                    opd_role_grad_stats.update(
-                                        opd_cols, response_mask=response_mask,
-                                        scope_ids=_opd_roles,
-                                    )
-                        if (xtt_grad_stats is not None and xtt_built is not None
-                                and xt_pg_grad_coef is not None):
-                            # The curriculum's gradient geometry. teacher_kld is
-                            # the KL to the LIVE target here (the target arm
-                            # rewrote teacher_topk_lp before it was built); the
-                            # control's KL is recomputed against the untouched
-                            # on-task teacher so both directions sit on the same
-                            # student, positions and row weights.
-                            _xtt_on_kl = topk_kl_per_token(
-                                student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=sign_on_task_logprobs,
-                            )
-                            _xtt_cols = xtt_gradient_terms(
-                                student_logprob=student_topk_logprobs,
-                                target_logprob=xtt_built["target_logprob"],
-                                on_logprob=sign_on_task_logprobs,
-                                live_kl=teacher_kld,
-                                on_kl=_xtt_on_kl,
-                                pg_grad_coef=xt_pg_grad_coef,
-                                sampled_onehot=(
-                                    sign_support_ids == data["responses"].unsqueeze(-1)
-                                ).to(teacher_kld.dtype),
-                                coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
-                                pg_coef=float(pg_loss_coef),
-                                row_weight=task_loss_weight,
-                            )
-                            xtt_grad_stats.update(
-                                _xtt_cols, response_mask=response_mask, task_ids=task_ids,
-                            )
-                            if xtt_role_grad_stats is not None:
-                                xtt_role_grad_stats.update(
-                                    _xtt_cols, response_mask=response_mask,
-                                    scope_ids=token_roles(data["responses"], sign_role_tags),
-                                )
-                        if xt_built is not None:
-                            # The one line the whole module exists to reach.
-                            teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
-                        if sign_position_weight is not None:
-                            # position mode: a positive per-token scalar, computed
-                            # from frozen models, so it scales the gradient at this
-                            # position without moving what the loss is minimised by.
-                            # target mode needs nothing here -- it rewrote the
-                            # teacher's own values above and reaches the loss
-                            # through the line that built teacher_kld.
-                            teacher_kld = teacher_kld * sign_position_weight.to(teacher_kld.dtype)
-                        if sign_target_inputs is not None:
-                            sign_stats.update_target(
-                                on_task_logprob=sign_target_inputs[0],
-                                candidate_weight=sign_target_inputs[1],
-                                response_mask=response_mask,
-                                task_ids=task_ids,
-                                teacher_kl=teacher_kld,
-                            )
-                            if rewrite_stats is not None and sign_base_logprob is not None:
-                                # The same rewrite, measured at the STUDENT's own
-                                # distribution instead of the teacher's. target_kl
-                                # says how far the target moved; these say whether
-                                # that displacement reached the student, and what
-                                # it cost the loss at the states actually visited.
-                                #
-                                # teacher_kld is passed as it stands, so under
-                                # measure_only it is the KL to the UNREWRITTEN
-                                # teacher and cf_clamp_resid picks up the whole
-                                # rewrite instead of the clamp -- which is the
-                                # correct reading for an arm whose loss the rewrite
-                                # never entered.
-                                rewrite_stats.update(
-                                    rewrite_decomposition_terms(
-                                        student_logprob=student_topk_logprobs,
-                                        on_task_logprob=sign_target_inputs[0],
-                                        base_logprob=sign_base_logprob,
-                                        candidate_weight=sign_target_inputs[1],
-                                        teacher_kl=teacher_kld,
-                                        state=sign_target_inputs[2],
-                                    ),
-                                    response_mask=response_mask,
-                                    task_ids=task_ids,
-                                )
-                        teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        # Both built above, before the attribution columns, so
-                        # the loss and the diagnostics cannot disagree about what
-                        # coefficient this row carried.
-                        teacher_kl_coef = _teacher_kl_coef_scalar
-                        if opd_diag_stats is not None or pushback is not None:
-                            # The logit-space terms, computed ONCE here and reused
-                            # after the backward. They are needed before the loss
-                            # now: the gate decides which tokens this step's OPD
-                            # term is attenuated on. The (bs, T, k) intermediates
-                            # die inside opd_pg_alignment_terms; what survives is
-                            # a handful of (bs, T) tensors, all detached.
-                            _pb_terms = (
-                                opd_pg_alignment_terms(
-                                    student_topk_logprob=student_topk_logprobs,
-                                    teacher_topk_logprob=teacher_topk_lp,
-                                    teacher_kl=teacher_kld,
-                                    topk_ids=(
-                                        student_topk_ids if student_indexed_topk
-                                        else data.get("teacher_topk_ids", None)
-                                    ),
-                                    response_ids=responses,
-                                    log_prob=log_prob,
-                                    # dL_pg/dlog p, clip branches included.
-                                    pg_grad_coef=xt_pg_grad_coef,
-                                    # beta ONLY -- not beta * b, and never the
-                                    # gate. The control inputs are measured at
-                                    # the base coefficient.
-                                    opd_coef=_teacher_kl_coef_scalar,
-                                )
-                                if teacher_topk_kl and log_prob is not None
-                                else None
-                            )
-                            if pushback is not None and _pb_terms is not None and task_ids is not None:
-                                # a[task] where the teacher pushes back against a
-                                # live reward descent, 1 everywhere else. Detached;
-                                # it is a measurement of this forward, not a
-                                # differentiable part of the loss.
-                                _pb_w = conflict_gate(_pb_terms, task_ids, _pb_a, len(task_id_names))
-                            _opd_diag_pending = {
-                                "teacher_kl": teacher_kld,
-                                "row_basis": task_loss_weight,
-                                "row_coef": _kl_row_coef,
-                                "terms": _pb_terms,
-                                "gate_w": _pb_w,
-                            }
-                        # What the loss takes: the KL, gated per token when the
-                        # controller is on. teacher_kld itself stays ungated so
-                        # the unweighted metric above and the readout's base
-                        # inputs keep their meaning. The gate NEVER touches the
-                        # aggregation denominator -- a mean of w is not
-                        # renormalised back to 1.
-                        if (cross_gate is not None and teacher_topk_kl and log_prob is not None
-                                and task_ids is not None):
-                            # MOPD v1: the soft cross-task gate, from OTHER tasks'
-                            # role-wise references fixed for this step. Everything
-                            # it returns is detached -- a measurement of this
-                            # forward the loss multiplies by, not a term in it.
-                            # The (bs, T, k) intermediates die inside the call.
-                            _cg_roles = token_roles(responses, sign_role_tags)
-                            _cg_topk_ids = (
-                                student_topk_ids if student_indexed_topk
-                                else data.get("teacher_topk_ids", None)
-                            )
-                            _cg = cross_gate_forward(
-                                student_topk_logprob=student_topk_logprobs,
-                                teacher_topk_logprob=teacher_topk_lp,
-                                teacher_kl=teacher_kld,
-                                topk_ids=_cg_topk_ids,
-                                response_ids=responses,
-                                # dL_pg/dlog p, clip branches included -- the
-                                # reference is built from this, never from A.
-                                pg_grad_coef=xt_pg_grad_coef,
-                                # beta in, lambda out.
-                                opd_coef=_teacher_kl_coef_scalar,
-                                task_ids=task_ids,
-                                roles=_cg_roles,
-                                refs=_cg_refs,
-                                delta=cross_gate.cfg.delta,
-                                gate_version=cross_gate.cfg.gate_version,
-                                q_scale=cross_gate.cfg.q_scale,
-                            )
-                            _pb_w = _cg["w"].to(teacher_kld.dtype)
-                            _cg_pending = {
-                                "fwd": _cg, "roles": _cg_roles, "topk_ids": _cg_topk_ids,
-                                "teacher_kl": teacher_kld, "row_basis": task_loss_weight,
-                            }
-                        if logit_prec is not None and pg_loss_coef != 0:
-                            self._collect_logit_precision(
-                                acc=_lp_step, cfg=_lp_cfg, data=data,
-                                log_prob=log_prob, old_log_prob=old_log_prob,
-                                advantages=advantages, response_mask=response_mask,
-                                task_ids=task_ids, task_loss_weight=task_loss_weight,
-                                student_topk_logprobs=student_topk_logprobs,
-                                student_topk_ids=student_topk_ids,
-                                teacher_topk_lp=teacher_topk_lp,
-                                clip_ratio=clip_ratio, clip_ratio_low=clip_ratio_low,
-                                clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
-                            )
-                        _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
-                        # The OPD term is assembled into _opd_term and added
-                        # ONCE below, so the per-id reweighting has a single
-                        # place to intercept it. Three branches reach it and all
-                        # three have to be interceptable: an arm that reweights
-                        # two of them and silently not the third is the failure
-                        # this shape exists to prevent.
-                        _opd_term = None
-                        if task_loss_weight is None:
-                            if _kl_row_coef is None and _pb_w is None:
-                                _opd_term = teacher_kl_loss * teacher_kl_coef
-                            else:
-                                # Scaled BEFORE the token mean, so each token is
-                                # weighted by its own task's coefficient and by the
-                                # gate. The mask denominator is untouched, and
-                                # teacher_kl_loss itself stays unscaled for the
-                                # metric below.
-                                _scaled = agg_loss(
-                                    loss_mat=(_kld_for_loss if _kl_row_coef is None
-                                              else _kld_for_loss * _kl_row_coef.reshape(-1, 1)),
-                                    loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
-                                )
-                                _opd_term = _scaled * teacher_kl_coef
-                        else:
-                            # Per-task normalised variant: the driver put a weight on
-                            # every row such that summing weight * row-KL over the whole
-                            # step gives each task an equal share of the loss (see
-                            # attach_task_loss_weights). The two divisions this sum must
-                            # survive are undone here rather than by special-casing the
-                            # shared scaling below: FSDP averages gradients across the DP
-                            # ranks, and the mini-batch loss is divided by
-                            # gradient_accumulation, but the weights already carry the
-                            # full normalisation.
-                            row_kl = (_kld_for_loss * response_mask).sum(-1)
-                            _row_w = (task_loss_weight if _kl_row_coef is None
-                                      else task_loss_weight * _kl_row_coef)
-                            weighted_teacher_kl = (row_kl * _row_w).sum()
-                            weighted_teacher_kl = weighted_teacher_kl * (
-                                self.task_dp_world_size * self.gradient_accumulation
-                            )
-                            _opd_term = weighted_teacher_kl * teacher_kl_coef
-                            _defer("actor/teacher_kl_loss_weighted", weighted_teacher_kl)
-                        if _lp_ratio is not None and teacher_topk_kl:
-                            # Per-id precision weighting. The surrogate has the
-                            # SAME gradient as _opd_term wherever the weight is
-                            # one, so an unmeasured task or id leaves the run
-                            # exactly where it was.
-                            _w = _lp_ratio[task_ids.to(_lp_ratio.device).clamp(min=0)]
-                            _w = _w.unsqueeze(1).expand(-1, response_length, -1).gather(
-                                2, student_topk_ids.to(torch.int64)
-                            )
-                            _opd_term = reweighted_opd_surrogate(
-                                _opd_term, student_topk_logprobs, _w
-                            )
-                            _defer("actor/logit_prec/applied_w_mean", _w.detach().mean())
-                        policy_loss = policy_loss + _opd_term
+                     if use_teacher_kl_loss:
+                         # On-policy distillation: KL between student and a (per-task) teacher,
+                         # evaluated on the student's own on-policy responses. Only the student
+                         # log-probs carry gradients; teacher values are detached upstream.
+                         if teacher_topk_kl:
+                             # Dense reverse KL over the top-k support (+ tail bucket).
+                             # Both sides are full-vocabulary log-softmax values at the
+                             # SAME ids, whichever model chose them, so the tail is
+                             # 1 - sum in both cases and the formula is unchanged.
+                             teacher_topk_lp = (
+                                 fwd_teacher_topk_logprobs
+                                 if fwd_teacher_topk_logprobs is not None
+                                 else data["teacher_topk_logprobs"]
+                             )
+                             if xtt_built is not None:
+                                 # The one line the TARGET arm exists to reach.
+                                 # Not a factor on the KL -- the teacher's own
+                                 # values, rewritten, so the fixed point moves and
+                                 # the off-task teachers can carry something the
+                                 # on-task one does not express. Mass on the
+                                 # support is conserved exactly, so the tail term
+                                 # inside topk_kl_per_token is still correct.
+                                 teacher_topk_lp = xtt_built["target_logprob"].to(
+                                     teacher_topk_lp.dtype
+                                 )
+                             teacher_kld = topk_kl_per_token(
+                                 student_topk_logprob=student_topk_logprobs,
+                                 teacher_topk_logprob=teacher_topk_lp,
+                             )
+                         else:
+                             # Single-sampled-token estimator (low_var_kl / kl / mse / abs).
+                             teacher_kld = kl_penalty(
+                                 logprob=log_prob,
+                                 ref_logprob=data["teacher_log_probs"],
+                                 kl_penalty=teacher_kl_loss_type,
+                             )
+                         if xt_nonfinite is not None:
+                             # W = 1 saves nothing when the KL is already NaN --
+                             # 1 * NaN is NaN, and so is 0 * NaN at a masked
+                             # position, so agg_loss carries it into backward and
+                             # the optimizer steps before the step-end check
+                             # fires. A NaN on-task teacher log-prob would destroy
+                             # the weights and only then be reported.
+                             #
+                             # Zero everywhere so nothing propagates; count only
+                             # inside the mask, because a padded position is not a
+                             # teacher failure and killing the step for one would
+                             # be a false alarm. The step still dies at the
+                             # synchronised point rather than here: raising inside
+                             # the micro-batch loop would leave the other ranks in
+                             # a collective.
+                             finite_kl = torch.isfinite(teacher_kld)
+                             xt_nonfinite[3] += (
+                                 (~finite_kl) & response_mask.to(torch.bool)
+                             ).sum().to(torch.float64)
+                             teacher_kld = torch.where(
+                                 finite_kl, teacher_kld, torch.zeros_like(teacher_kld)
+                             )
+                         # PER-TASK, ON TOP OF THE GLOBAL COEFFICIENT. b_task
+                         # multiplies the row, so the effective coefficient is
+                         # teacher_kl_loss_coef * b_task and b = 1 reproduces
+                         # every existing run bit for bit. None when unset.
+                         #
+                         # Computed HERE rather than at the loss line below,
+                         # because the arm-independent attribution columns are
+                         # built in between and they describe the term the
+                         # optimizer takes. Read with the GLOBAL coefficient
+                         # only, they reported webshop's OPD push at its
+                         # un-halved size on a run that halved it.
+                         _kl_row_coef = self.teacher_kl_row_coef(
+                             task_ids, task_id_names, teacher_kld.size(0),
+                             device=teacher_kld.device, dtype=teacher_kld.dtype,
+                         )
+                         _teacher_kl_coef_scalar = float(
+                             self.config.get("teacher_kl_loss_coef", 1.0)
+                         )
+                         # What the loss actually applies to this row's OPD term.
+                         # Stays a plain float when b is unset, so every existing
+                         # diagnostic takes the identical code path.
+                         _opd_effective_coef = (
+                             _teacher_kl_coef_scalar if _kl_row_coef is None
+                             else _teacher_kl_coef_scalar * _kl_row_coef
+                         )
+                         # Read BEFORE the position weight multiplies it. The
+                         # unweighted KL is what makes w_kl/kl the factor the arm
+                         # applied to the total; taking the weighted one would
+                         # make that ratio 1 by construction, and the per-token
+                         # effect table would be crediting tokens with a cost the
+                         # weighting had already inflated.
+                         if sign_position_inputs is not None and position_stats is not None:
+                             pre_w, applied_w = sign_position_inputs
+                             position_stats.update(
+                                 position_decomposition_terms(
+                                     position_weight=pre_w,
+                                     applied_weight=applied_w,
+                                     candidate_weight=sign_cand_inputs["weight"],
+                                     state=sign_cand_inputs["state"],
+                                     on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                     teacher_kl=teacher_kld,
+                                     weight_range=sign_weight_range,
+                                 ),
+                                 response_mask=response_mask,
+                                 task_ids=task_ids,
+                             )
+                         if sign_cand_inputs is not None and (
+                             token_stats is not None or pair_token_stats is not None
+                         ):
+                             # The same candidates the stats above summarise, kept
+                             # under their vocabulary ids. In position mode the
+                             # per-task normaliser is recovered as pre/applied
+                             # rather than plumbed separately: it is one number per
+                             # task and the two tensors that carry it are already
+                             # here.
+                             extra = {}
+                             if sign_position_inputs is not None:
+                                 pre_w, applied_w = sign_position_inputs
+                                 extra = {
+                                     "position_scale": pre_w / applied_w.clamp(min=1e-8),
+                                     "teacher_kl": teacher_kld,
+                                 }
+                             # Once, for both tables. Two calls would let the two
+                             # rankings disagree about what "effect" means.
+                             cand_effect = candidate_effect(
+                                 mode="target" if target_mode else "position",
+                                 on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                 weight=sign_cand_inputs["weight"],
+                                 **extra,
+                             )
+                             if token_stats is not None:
+                                 token_stats.update(
+                                     support_ids=sign_cand_inputs["support_ids"],
+                                     state=sign_cand_inputs["state"],
+                                     weight=sign_cand_inputs["weight"],
+                                     on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     effect=cand_effect,
+                                 )
+                             if event_stats is not None:
+                                 # The normaliser the effect column was divided
+                                 # by, so a row can be read without knowing which
+                                 # mode produced it: Z in target mode, the applied
+                                 # position weight in position mode. position_weights
+                                 # rebuilds Z exactly -- it IS sum_v p w + tail.
+                                 norm = (
+                                     sign_position_inputs[1]
+                                     if sign_position_inputs is not None
+                                     else position_weights(
+                                         sign_cand_inputs["weight"],
+                                         sign_cand_inputs["on_task_logprob"],
+                                     )
+                                 )
+                                 responses_mb = data["responses"]
+                                 # .get, not `in data.batch`: by this point the
+                                 # micro-batch is a TensorDict (or a plain dict on
+                                 # the multi-modal path) and has no .batch. The
+                                 # column is absent on an arm whose reward manager
+                                 # failed, which is a monitoring failure and must
+                                 # not take the step down.
+                                 row_scores = data.get("token_level_scores", None)
+                                 event_stats.update(
+                                     support_ids=sign_cand_inputs["support_ids"],
+                                     state=sign_cand_inputs["state"],
+                                     weight=sign_cand_inputs["weight"],
+                                     effect=cand_effect,
+                                     on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                     off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
+                                     base_logprob=sign_cand_inputs["base_logprob"],
+                                     student_logprob=student_topk_logprobs,
+                                     response_mask=response_mask,
+                                     responses=responses_mb,
+                                     norm=norm,
+                                     teacher_kl=teacher_kld,
+                                     task_ids=task_ids,
+                                     roles=(
+                                         token_roles(responses_mb, sign_role_tags)
+                                         if sign_role_tags
+                                         else None
+                                     ),
+                                     reward=(row_scores.sum(dim=-1) if row_scores is not None else None),
+                                 )
+                             if pair_token_stats is not None and task_ids is not None:
+                                 # Which tokens each off-task teacher sends into
+                                 # THIS task's states. The counts answer it on
+                                 # their own; the effect column says whether the
+                                 # weighting acted on what was sent.
+                                 pair_token_stats.update(
+                                     support_ids=sign_cand_inputs["support_ids"],
+                                     on_task_logprob=sign_cand_inputs["on_task_logprob"],
+                                     off_task_logprobs=sign_cand_inputs["off_task_logprobs"],
+                                     base_logprob=sign_cand_inputs["base_logprob"],
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                     off_plane_tasks=sign_cand_inputs["off_plane_tasks"],
+                                     deadzone=sign_deadzone,
+                                     effect=cand_effect,
+                                 )
+                         if xt_built is not None and xt_position_stats is not None and xt_collect:
+                             # Read BEFORE the weight multiplies it, everywhere.
+                             # The normaliser composes with itself if it is fed
+                             # the weighted KL -- and since the first step runs at
+                             # W = 1 it would be right exactly once and drift from
+                             # the second, where no metric is looking. kl_scale
+                             # would also be 1 by construction rather than by
+                             # measurement.
+                             self._xt_mean.update(
+                                 pre_weight=xt_built["pre_weight"], teacher_kl=teacher_kld,
+                                 response_mask=response_mask, task_ids=task_ids,
+                                 row_weights=task_loss_weight,
+                                 # Same tensor the weight was masked with, read
+                                 # back off the build rather than recomputed.
+                                 role_keep=xt_built["role_keep"],
+                             )
+                             # Computed once and handed to four accumulators:
+                             # the task cut, the role cut, the turn cut and the
+                             # histogram all decompose the SAME columns, and three
+                             # copies of the arithmetic is how three views of one
+                             # number come to disagree.
+                             # row_weight and coef so the channel columns come
+                             # out as objective and not only as nats: the tasks
+                             # do not enter the loss with the same share, and the
+                             # distillation term enters it at 0.01.
+                             # The SAME reverse KL against the BASE model, on the
+                             # same support. W multiplies the on-task teacher's
+                             # KL, and hat_on is that teacher measured against the
+                             # base, so wherever hat_on is small the two KLs are
+                             # the same number and raising W is a pull toward the
+                             # base rather than toward anything the RL wrote.
+                             # That is the source channel's own region by
+                             # construction; this makes it a measurement. One
+                             # top-k KL on tensors already gathered.
+                             xt_base_kl = topk_kl_per_token(
+                                 student_topk_logprob=student_topk_logprobs,
+                                 teacher_topk_logprob=base_logprob,
+                             )
+                             xt_pos_cols = xt_position_terms(
+                                 xt_built, teacher_kld,
+                                 row_weight=task_loss_weight,
+                                 coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                 base_kl=xt_base_kl,
+                             )
+                             xt_state_cols = xt_state_shift_terms(xt_built, teacher_kld)
+                             xt_position_stats.update(
+                                 xt_pos_cols, response_mask=response_mask, task_ids=task_ids,
+                             )
+                             xt_state_stats.update(
+                                 xt_state_cols, response_mask=response_mask, task_ids=task_ids,
+                             )
+                             xt_weight_hist.update(
+                                 weight=xt_built["weight"], teacher_kl=teacher_kld,
+                                 response_mask=response_mask, task_ids=task_ids,
+                             )
+                             # Roles are absent when the worker never handed down
+                             # the tag ids. Filing everything under "format" would
+                             # be a table that looks populated and says nothing, so
+                             # the accumulator is simply not fed.
+                             xt_roles_mb = (
+                                 token_roles(data["responses"], sign_role_tags)
+                                 if sign_role_tags
+                                 else None
+                             )
+                             if xt_roles_mb is not None:
+                                 xt_role_position_stats.update(
+                                     xt_pos_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
+                                 )
+                                 if xt_task_role_stats is not None:
+                                     # task * n_roles + role. Role is a property
+                                     # of the position and task of the row, so
+                                     # the cross is one index and not a second
+                                     # accumulator class. It is the cut the
+                                     # pooled role table cannot make: "the arm
+                                     # spent its source budget on tag tokens" and
+                                     # "on WebShop's tag tokens" are different
+                                     # findings, and only the second can be read
+                                     # against WebShop's own score.
+                                     xt_task_role_stats.update(
+                                         xt_pos_cols, response_mask=response_mask,
+                                         scope_ids=torch.where(
+                                             (task_ids.reshape(-1, 1) >= 0) & (xt_roles_mb >= 0),
+                                             task_ids.reshape(-1, 1) * len(XT_ROLE_SCOPE_NAMES)
+                                             + xt_roles_mb,
+                                             torch.full_like(xt_roles_mb, -1),
+                                         ),
+                                     )
+                                 xt_role_state_stats.update(
+                                     xt_state_cols, response_mask=response_mask, scope_ids=xt_roles_mb,
+                                 )
+                             xt_turn_stats.update(
+                                 xt_pos_cols, response_mask=response_mask,
+                                 scope_ids=turn_index(response_mask).clamp(max=XT_TURN_BUCKETS - 1),
+                             )
+                             # Each source's share of W~ - 1, and of the nats that
+                             # share went on to move.
+                             src_evidence = xt_built["evidence_by_source"].sum(dim=2)
+                             xt_src_kl = (
+                                 teacher_kld / xt_built["mu"].clamp(min=1e-12)
+                             ).unsqueeze(-1)
+                             xt_pair_stats.update(
+                                 evidence=src_evidence,
+                                 shift=src_evidence * xt_src_kl,
+                                 response_mask=response_mask, task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                                 # How much of each source teacher's probability
+                                 # lands inside the student's top-k at all. Free:
+                                 # the log-probs are already gathered there.
+                                 support_mass=off_logprobs.detach().to(
+                                     torch.float32
+                                 ).exp().sum(dim=-2),
+                                 # The same evidence with alpha divided out. Both
+                                 # near zero means the source had nothing to say;
+                                 # this large and the shift near zero means alpha
+                                 # refused what it did say.
+                                 activity=xt_built["activity_by_source"].sum(dim=2),
+                                 # AND THE SHARED CHANNEL'S OWN SPLIT. The old
+                                 # corroboration was a minimum over a unanimity
+                                 # and had no per-source share to give; this one
+                                 # is a mean of per-teacher votes and does, so a
+                                 # source that spent its whole agreement inside
+                                 # the corroboration no longer reads as having
+                                 # contributed nothing.
+                                 corroboration=xt_built["corroboration_by_source"],
+                                 corroboration_shift=(
+                                     xt_built["corroboration_by_source"] * xt_src_kl
+                                 ),
+                             )
+                             # The same nats, cut by what the source was doing
+                             # relative to the on-task teacher.
+                             xt_pair_state_stats.update(
+                                 state=pair_state_index(
+                                     hat_on=xt_built["hat_on"], hat_off=xt_built["hat_off"],
+                                     deadzone=xt_report_eps,
+                                 ),
+                                 evidence=xt_built["evidence_by_source"],
+                                 shift=xt_built["evidence_by_source"]
+                                 * xt_src_kl.unsqueeze(-1),
+                                 response_mask=response_mask, task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                                 activity=xt_built["activity_by_source"],
+                             )
+                             # And WHICH teacher set the size of that
+                             # corroboration, or cancelled it. The table
+                             # above is per source and c is not per source.
+                             xt_corr_attr_stats.update(
+                                 attribution=xt_built["attribution"],
+                                 common=xt_built["common"],
+                                 teacher_prob=xt_built["mass"],
+                                 applied_by_source=xt_built["common_soft_by_source"],
+                                 response_mask=response_mask, task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                             )
+                             # Per trajectory. The row score is what separates
+                             # "spent on rollouts that worked" from "spent on the
+                             # ones that did not", which the advantage alone
+                             # cannot say -- it is group-relative.
+                             xt_outcome_stats.update(
+                                 weight=xt_built["weight"], teacher_kl=teacher_kld,
+                                 response_mask=response_mask,
+                                 advantage=(
+                                     _row_adv
+                                     if _row_adv is not None
+                                     else torch.zeros(
+                                         teacher_kld.size(0), device=teacher_kld.device
+                                     )
+                                 ),
+                                 task_ids=task_ids,
+                                 reward=(None if _scores is None else _scores.sum(dim=-1)),
+                             )
+                             # The same rows, cut by SOURCE. The table above sums
+                             # the sources out and the evidence table sums the
+                             # outcome out, so "Search moved 4% of AlfWorld's
+                             # budget" and "the budget went to the rollouts that
+                             # scored" cannot be joined without this.
+                             xt_source_outcome_stats.update(
+                                 push_by_source=xt_built["push_by_source"],
+                                 teacher_kl=teacher_kld, response_mask=response_mask,
+                                 advantage=(
+                                     _row_adv
+                                     if _row_adv is not None
+                                     else torch.zeros(
+                                         teacher_kld.size(0), device=teacher_kld.device
+                                     )
+                                 ),
+                                 task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                                 reward=(None if _scores is None else _scores.sum(dim=-1)),
+                             )
+                             # The same rows for the OTHER channel. Same class,
+                             # different column: the corroboration decomposes per
+                             # teacher now, so it has an outcome table of its own
+                             # for the first time.
+                             xt_corroboration_outcome_stats.update(
+                                 push_by_source=(
+                                     xt_built["corroboration_by_source"]
+                                     / xt_built["mu"].clamp(min=1e-12).unsqueeze(-1)
+                                 ),
+                                 teacher_kl=teacher_kld, response_mask=response_mask,
+                                 advantage=(
+                                     _row_adv
+                                     if _row_adv is not None
+                                     else torch.zeros(
+                                         teacher_kld.size(0), device=teacher_kld.device
+                                     )
+                                 ),
+                                 task_ids=task_ids,
+                                 off_plane_tasks=data["sign_off_tasks"],
+                                 reward=(None if _scores is None else _scores.sum(dim=-1)),
+                             )
+                             for name, pre in xt_built["probe_pre_weight"].items():
+                                 self._xt_probe_mean[name].update(
+                                     pre_weight=pre, teacher_kl=teacher_kld,
+                                     response_mask=response_mask, task_ids=task_ids,
+                                     row_weights=task_loss_weight,
+                                     # The counterfactuals are masked like the
+                                     # live weight. They reach no loss, but an
+                                     # unmasked probe would report reallocation on
+                                     # roles this arm never touched and its
+                                     # kl_scale would not be 1 either -- two
+                                     # readings that disagree with the arm they
+                                     # are the counterfactual FOR.
+                                     role_keep=xt_role_keep,
+                                 )
+                                 snap = xt_probe_snapshots.get(name, None)
+                                 probe_mu = _xt_normalizer_mu(pre, snap, task_ids)
+                                 probe = {
+                                     "weight": _xt_role_masked(pre / probe_mu, xt_role_keep),
+                                     "pre_weight": pre,
+                                     "mu": probe_mu,
+                                     # The state partition is built from mu, not
+                                     # from the weight, so it needs the mask
+                                     # handed to it or a masked position reports
+                                     # a shift the probe did not take.
+                                     "role_keep": xt_role_keep,
+                                     # alpha changes the evidence and nothing
+                                     # else: the state labels, the teacher's
+                                     # probability and the availability mask are
+                                     # the live ones by construction.
+                                     "evidence": xt_built["probe_evidence"][name],
+                                     "state": xt_built["state"],
+                                     "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
+                                     "available": xt_built["available"],
+                                     "evidence_shared": xt_built["evidence_shared"],
+                                     "evidence_shared_offtask_only": xt_built[
+                                         "evidence_shared_offtask_only"
+                                     ],
+                                 }
+                                 xt_probe_stats[name].update(
+                                     xt_position_terms(probe, teacher_kld),
+                                     response_mask=response_mask, task_ids=task_ids,
+                                 )
+                                 # The counterfactual's own state partition,
+                                 # built from the probe's OWN mu and evidence so
+                                 # its columns sum to the probe's (W - 1) D and
+                                 # not to the shipped arm's. The state labels and
+                                 # the teacher's probability are shared because
+                                 # alpha does not move them -- which is what makes
+                                 # the series an alpha ablation rather than three
+                                 # unrelated weightings.
+                                 xt_probe_state_stats[name].update(
+                                     xt_state_shift_terms(probe, teacher_kld),
+                                     response_mask=response_mask, task_ids=task_ids,
+                                 )
+                             for name, pre in xt_built["channel_pre_weight"].items():
+                                 self._xt_channel_mean[name].update(
+                                     pre_weight=pre, teacher_kl=teacher_kld,
+                                     response_mask=response_mask, task_ids=task_ids,
+                                     row_weights=task_loss_weight,
+                                     role_keep=xt_role_keep,
+                                 )
+                                 snap = xt_channel_snapshots.get(name, None)
+                                 mu_c = _xt_normalizer_mu(pre, snap, task_ids)
+                                 chan = {
+                                     "weight": _xt_role_masked(pre / mu_c, xt_role_keep),
+                                     "pre_weight": pre, "mu": mu_c,
+                                     "role_keep": xt_role_keep,
+                                     "evidence": xt_built["channel_evidence"][name],
+                                     "state": xt_built["state"],
+                                     "teacher_prob": xt_built["mass"], "mass": xt_built["mass"],
+                                     "available": xt_built["available"],
+                                     "evidence_shared": xt_built["evidence_shared"],
+                                     "evidence_shared_offtask_only": xt_built[
+                                         "evidence_shared_offtask_only"
+                                     ],
+                                 }
+                                 xt_channel_stats[name].update(
+                                     xt_position_terms(chan, teacher_kld),
+                                     response_mask=response_mask, task_ids=task_ids,
+                                 )
+                                 xt_channel_state_stats[name].update(
+                                     xt_state_shift_terms(chan, teacher_kld),
+                                     response_mask=response_mask, task_ids=task_ids,
+                                 )
+                         # sign_support_ids / sign_on_task_logprobs directly, NOT
+                         # sign_cand_inputs: that dict is the SIGN arm's stash and is
+                         # None whenever sign_weight.enable is off. This arm is a
+                         # different mechanism and runs with it off, so reading it here
+                         # crashed the cross-teacher arm at step 2 -- step 1 survives
+                         # only because no RMS exists yet, xt_built is None, and this
+                         # block never opens. The two names it needs are the ones
+                         # xt_enabled already asserts are present, a hundred lines up.
+                         if xt_built is not None and xt_collect:
+                             # Built once here whether or not the dense push
+                             # table is on: the event rows carry the same two
+                             # columns and must not compute them a second way.
+                             _push_for_events = (
+                                 opd_logit_push(
+                                     student_logprob=student_topk_logprobs,
+                                     teacher_logprob=sign_on_task_logprobs,
+                                     teacher_kl=teacher_kld,
+                                     coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                 )
+                                 if (xt_push_token_stats is not None or xt_pair_event_stats is not None)
+                                 else None
+                             )
+                             self._xt_token_tables(
+                                 built=xt_built, teacher_kl=teacher_kld, data=data,
+                                 support_ids=sign_support_ids,
+                                 student_topk_logprob=student_topk_logprobs,
+                                 on_task_logprob=sign_on_task_logprobs,
+                                 response_mask=response_mask, task_ids=task_ids,
+                                 report_epsilon=xt_report_eps,
+                                 tables=(
+                                     xt_token_stats, xt_pair_token_stats,
+                                     xt_event_stats, xt_pair_event_stats,
+                                 ),
+                                 roles=sign_role_tags,
+                                 planes=(base_logprob, off_logprobs),
+                                 raw_shifts=xt_shifts,
+                                 alpha_table=xt_alpha_snapshot,
+                                 row_reward=(None if _scores is None else _scores.sum(dim=-1)),
+                                 row_advantage=_row_adv,
+                                 push=_push_for_events,
+                             )
+                             if xt_role_token_stats is not None and xt_roles_mb is not None:
+                                 xt_role_token_stats.update(
+                                     support_ids=sign_support_ids,
+                                     roles=xt_roles_mb,
+                                     effect=per_candidate_shift(xt_built, teacher_kld),
+                                     response_mask=response_mask,
+                                 )
+                             if xt_push_token_stats is not None:
+                                 # The OTHER token table. The one above names the
+                                 # candidates whose evidence justified the weight;
+                                 # this one names the tokens whose logit the
+                                 # weight then moved, which is every token in the
+                                 # support. Conflating them is how "Search
+                                 # reinforced retrieve" gets written about a
+                                 # position where what it reinforced is the
+                                 # suppression of something else.
+                                 _y1 = data["responses"].unsqueeze(-1)
+                                 _push = _push_for_events
+                                 xt_push_token_stats.update(
+                                     support_ids=sign_support_ids,
+                                     g0=_push["g0"],
+                                     weight=xt_built["weight"],
+                                     coef_applied_weight=xt_built["weight"],
+                                     response_mask=response_mask, task_ids=task_ids,
+                                     sampled_onehot=(
+                                         sign_support_ids == _y1
+                                     ).to(teacher_kld.dtype),
+                                     p_student=_push["p_student"],
+                                     # The tail bucket has no token to be filed
+                                     # under, so it never reaches a row above --
+                                     # and without it the token ranking is quoted
+                                     # with an unstated denominator.
+                                     g0_tail=_push["g0_tail"],
+                                     # The exact partition of W - 1, so the
+                                     # ranking splits into one list per channel
+                                     # instead of one list for the mechanism.
+                                     push_shared=xt_built["push_shared"],
+                                     push_source=xt_built["push_by_source"].sum(dim=-1),
+                                     push_normalizer=xt_built["push_normalizer"],
+                                 )
+                             if xt_grad_stats is not None and xt_pg_grad_coef is not None:
+                                 # Analytic, so the diagnostic cannot perturb the
+                                 # update it describes. The policy side is the
+                                 # real clipped objective's per-token derivative,
+                                 # not A: with 360 rows at a mini-batch of 60,
+                                 # five of the six mini-batches in an epoch run at
+                                 # a ratio the optimizer has already moved, and a
+                                 # bound clip branch has no gradient at all.
+                                 y1 = data["responses"].unsqueeze(-1)
+                                 xt_grad_cols = logit_gradient_terms(
+                                     student_logprob=student_topk_logprobs,
+                                     teacher_logprob=sign_on_task_logprobs,
+                                     weight=xt_built["weight"],
+                                     teacher_kl=teacher_kld,
+                                     pg_grad_coef=xt_pg_grad_coef,
+                                     sampled_onehot=(
+                                         sign_support_ids == y1
+                                     ).to(teacher_kld.dtype),
+                                     coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                     pg_coef=float(pg_loss_coef),
+                                     # Both terms carry it in the loss, so a pooled
+                                     # norm ratio that omits it is the ratio of a
+                                     # different objective's gradients.
+                                     row_weight=task_loss_weight,
+                                     # The exact partition of W - 1, so each
+                                     # channel's own addition to the logit push
+                                     # is scored against the policy gradient
+                                     # separately. The pooled cosine cannot: it
+                                     # is taken on W, which carries the base OPD
+                                     # direction and both channels at once.
+                                     push_shared=xt_built["push_shared"],
+                                     push_source=xt_built["push_by_source"].sum(dim=-1),
+                                     # The third one. It is the only channel that
+                                     # can be negative, so without it the two
+                                     # above do not add up to the arm's departure
+                                     # from unweighted OPD.
+                                     push_normalizer=xt_built["push_normalizer"],
+                                 )
+                                 xt_grad_stats.update(
+                                     xt_grad_cols, response_mask=response_mask, task_ids=task_ids,
+                                 )
+                                 if xt_roles_mb is not None:
+                                     xt_role_grad_stats.update(
+                                         xt_grad_cols, response_mask=response_mask,
+                                         scope_ids=xt_roles_mb,
+                                     )
+                         # ---- the arm-independent attribution ------------- #
+                         # HERE, and not one line later. Everything below this
+                         # block multiplies teacher_kld by a weight; these columns
+                         # are the unweighted term's, so they have to be taken
+                         # while teacher_kld still is one. Outside every xt_built
+                         # guard as well: a control run reaches this line with
+                         # xt_built None on every step of the run, and that is the
+                         # run these columns exist for.
+                         if opd_attr_on and epoch == 0 and (
+                             opd_grad_stats is not None or opd_push_tokens is not None
+                         ):
+                             # The row's emitted token, and g0 -- built once here
+                             # and handed to both readers below. A second copy of
+                             # opd_logit_push is how "the arm amplified this
+                             # token" and "the arm's gradient norm" come to
+                             # describe different quantities under one name.
+                             _oy1 = data["responses"].unsqueeze(-1)
+                             _opd_sampled = (sign_support_ids == _oy1).to(teacher_kld.dtype)
+                             opd_push = (
+                                 opd_logit_push(
+                                     student_logprob=student_topk_logprobs,
+                                     teacher_logprob=sign_on_task_logprobs,
+                                     teacher_kl=teacher_kld,
+                                     coef=_opd_effective_coef,
+                                 )
+                                 if opd_push_tokens is not None
+                                 else None
+                             )
+                             if opd_push_tokens is not None:
+                                 # Ones, in the shape the class expects, passed to
+                                 # both weight arguments because they ARE the same
+                                 # weight -- the assertion in update() is checking
+                                 # that a caller has not handed it two.
+                                 _ones = torch.ones_like(teacher_kld)
+                                 opd_push_tokens.update(
+                                     support_ids=sign_support_ids,
+                                     g0=opd_push["g0"],
+                                     weight=_ones, coef_applied_weight=_ones,
+                                     response_mask=response_mask, task_ids=task_ids,
+                                     sampled_onehot=_opd_sampled,
+                                     p_student=opd_push["p_student"],
+                                     g0_tail=opd_push["g0_tail"],
+                                     gap=opd_push["gap"],
+                                 )
+                             if opd_grad_stats is not None and xt_pg_grad_coef is not None:
+                                 opd_cols = opd_attribution_terms(
+                                     student_logprob=student_topk_logprobs,
+                                     teacher_logprob=sign_on_task_logprobs,
+                                     teacher_kl=teacher_kld,
+                                     pg_grad_coef=xt_pg_grad_coef,
+                                     sampled_onehot=_opd_sampled,
+                                     coef=_opd_effective_coef,
+                                     pg_coef=float(pg_loss_coef),
+                                     row_weight=task_loss_weight,
+                                     push=opd_push,
+                                 )
+                                 opd_grad_stats.update(
+                                     opd_cols, response_mask=response_mask, task_ids=task_ids,
+                                 )
+                                 if opd_role_grad_stats is not None:
+                                     _opd_roles = token_roles(data["responses"], sign_role_tags)
+                                     opd_role_grad_stats.update(
+                                         opd_cols, response_mask=response_mask,
+                                         scope_ids=_opd_roles,
+                                     )
+                         if (xtt_grad_stats is not None and xtt_built is not None
+                                 and xt_pg_grad_coef is not None):
+                             # The curriculum's gradient geometry. teacher_kld is
+                             # the KL to the LIVE target here (the target arm
+                             # rewrote teacher_topk_lp before it was built); the
+                             # control's KL is recomputed against the untouched
+                             # on-task teacher so both directions sit on the same
+                             # student, positions and row weights.
+                             _xtt_on_kl = topk_kl_per_token(
+                                 student_topk_logprob=student_topk_logprobs,
+                                 teacher_topk_logprob=sign_on_task_logprobs,
+                             )
+                             _xtt_cols = xtt_gradient_terms(
+                                 student_logprob=student_topk_logprobs,
+                                 target_logprob=xtt_built["target_logprob"],
+                                 on_logprob=sign_on_task_logprobs,
+                                 live_kl=teacher_kld,
+                                 on_kl=_xtt_on_kl,
+                                 pg_grad_coef=xt_pg_grad_coef,
+                                 sampled_onehot=(
+                                     sign_support_ids == data["responses"].unsqueeze(-1)
+                                 ).to(teacher_kld.dtype),
+                                 coef=float(self.config.get("teacher_kl_loss_coef", 1.0)),
+                                 pg_coef=float(pg_loss_coef),
+                                 row_weight=task_loss_weight,
+                             )
+                             xtt_grad_stats.update(
+                                 _xtt_cols, response_mask=response_mask, task_ids=task_ids,
+                             )
+                             if xtt_role_grad_stats is not None:
+                                 xtt_role_grad_stats.update(
+                                     _xtt_cols, response_mask=response_mask,
+                                     scope_ids=token_roles(data["responses"], sign_role_tags),
+                                 )
+                         if xt_built is not None:
+                             # The one line the whole module exists to reach.
+                             teacher_kld = teacher_kld * xt_built["weight"].to(teacher_kld.dtype)
+                         if sign_position_weight is not None:
+                             # position mode: a positive per-token scalar, computed
+                             # from frozen models, so it scales the gradient at this
+                             # position without moving what the loss is minimised by.
+                             # target mode needs nothing here -- it rewrote the
+                             # teacher's own values above and reaches the loss
+                             # through the line that built teacher_kld.
+                             teacher_kld = teacher_kld * sign_position_weight.to(teacher_kld.dtype)
+                         if sign_target_inputs is not None:
+                             sign_stats.update_target(
+                                 on_task_logprob=sign_target_inputs[0],
+                                 candidate_weight=sign_target_inputs[1],
+                                 response_mask=response_mask,
+                                 task_ids=task_ids,
+                                 teacher_kl=teacher_kld,
+                             )
+                             if rewrite_stats is not None and sign_base_logprob is not None:
+                                 # The same rewrite, measured at the STUDENT's own
+                                 # distribution instead of the teacher's. target_kl
+                                 # says how far the target moved; these say whether
+                                 # that displacement reached the student, and what
+                                 # it cost the loss at the states actually visited.
+                                 #
+                                 # teacher_kld is passed as it stands, so under
+                                 # measure_only it is the KL to the UNREWRITTEN
+                                 # teacher and cf_clamp_resid picks up the whole
+                                 # rewrite instead of the clamp -- which is the
+                                 # correct reading for an arm whose loss the rewrite
+                                 # never entered.
+                                 rewrite_stats.update(
+                                     rewrite_decomposition_terms(
+                                         student_logprob=student_topk_logprobs,
+                                         on_task_logprob=sign_target_inputs[0],
+                                         base_logprob=sign_base_logprob,
+                                         candidate_weight=sign_target_inputs[1],
+                                         teacher_kl=teacher_kld,
+                                         state=sign_target_inputs[2],
+                                     ),
+                                     response_mask=response_mask,
+                                     task_ids=task_ids,
+                                 )
+                         teacher_kl_loss = agg_loss(loss_mat=teacher_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                         # Both built above, before the attribution columns, so
+                         # the loss and the diagnostics cannot disagree about what
+                         # coefficient this row carried.
+                         teacher_kl_coef = _teacher_kl_coef_scalar
+                         if opd_diag_stats is not None or pushback is not None:
+                             # The logit-space terms, computed ONCE here and reused
+                             # after the backward. They are needed before the loss
+                             # now: the gate decides which tokens this step's OPD
+                             # term is attenuated on. The (bs, T, k) intermediates
+                             # die inside opd_pg_alignment_terms; what survives is
+                             # a handful of (bs, T) tensors, all detached.
+                             _pb_terms = (
+                                 opd_pg_alignment_terms(
+                                     student_topk_logprob=student_topk_logprobs,
+                                     teacher_topk_logprob=teacher_topk_lp,
+                                     teacher_kl=teacher_kld,
+                                     topk_ids=(
+                                         student_topk_ids if student_indexed_topk
+                                         else data.get("teacher_topk_ids", None)
+                                     ),
+                                     response_ids=responses,
+                                     log_prob=log_prob,
+                                     # dL_pg/dlog p, clip branches included.
+                                     pg_grad_coef=xt_pg_grad_coef,
+                                     # beta ONLY -- not beta * b, and never the
+                                     # gate. The control inputs are measured at
+                                     # the base coefficient.
+                                     opd_coef=_teacher_kl_coef_scalar,
+                                 )
+                                 if teacher_topk_kl and log_prob is not None
+                                 else None
+                             )
+                             if pushback is not None and _pb_terms is not None and task_ids is not None:
+                                 # a[task] where the teacher pushes back against a
+                                 # live reward descent, 1 everywhere else. Detached;
+                                 # it is a measurement of this forward, not a
+                                 # differentiable part of the loss.
+                                 _pb_w = conflict_gate(_pb_terms, task_ids, _pb_a, len(task_id_names))
+                             _opd_diag_pending = {
+                                 "teacher_kl": teacher_kld,
+                                 "row_basis": task_loss_weight,
+                                 "row_coef": _kl_row_coef,
+                                 "terms": _pb_terms,
+                                 "gate_w": _pb_w,
+                             }
+                         # What the loss takes: the KL, gated per token when the
+                         # controller is on. teacher_kld itself stays ungated so
+                         # the unweighted metric above and the readout's base
+                         # inputs keep their meaning. The gate NEVER touches the
+                         # aggregation denominator -- a mean of w is not
+                         # renormalised back to 1.
+                         if (cross_gate is not None and teacher_topk_kl and log_prob is not None
+                                 and task_ids is not None):
+                             # MOPD v1: the soft cross-task gate, from OTHER tasks'
+                             # role-wise references fixed for this step. Everything
+                             # it returns is detached -- a measurement of this
+                             # forward the loss multiplies by, not a term in it.
+                             # The (bs, T, k) intermediates die inside the call.
+                             _cg_roles = token_roles(responses, sign_role_tags)
+                             _cg_topk_ids = (
+                                 student_topk_ids if student_indexed_topk
+                                 else data.get("teacher_topk_ids", None)
+                             )
+                             _cg = cross_gate_forward(
+                                 student_topk_logprob=student_topk_logprobs,
+                                 teacher_topk_logprob=teacher_topk_lp,
+                                 teacher_kl=teacher_kld,
+                                 topk_ids=_cg_topk_ids,
+                                 response_ids=responses,
+                                 # dL_pg/dlog p, clip branches included -- the
+                                 # reference is built from this, never from A.
+                                 pg_grad_coef=xt_pg_grad_coef,
+                                 # beta in, lambda out.
+                                 opd_coef=_teacher_kl_coef_scalar,
+                                 task_ids=task_ids,
+                                 roles=_cg_roles,
+                                 refs=_cg_refs,
+                                 delta=cross_gate.cfg.delta,
+                                 gate_version=cross_gate.cfg.gate_version,
+                                 q_scale=cross_gate.cfg.q_scale,
+                             )
+                             _pb_w = _cg["w"].to(teacher_kld.dtype)
+                             _cg_pending = {
+                                 "fwd": _cg, "roles": _cg_roles, "topk_ids": _cg_topk_ids,
+                                 "teacher_kl": teacher_kld, "row_basis": task_loss_weight,
+                             }
+                         if logit_prec is not None and pg_loss_coef != 0:
+                             self._collect_logit_precision(
+                                 acc=_lp_step, cfg=_lp_cfg, data=data,
+                                 log_prob=log_prob, old_log_prob=old_log_prob,
+                                 advantages=advantages, response_mask=response_mask,
+                                 task_ids=task_ids, task_loss_weight=task_loss_weight,
+                                 student_topk_logprobs=student_topk_logprobs,
+                                 student_topk_ids=student_topk_ids,
+                                 teacher_topk_lp=teacher_topk_lp,
+                                 clip_ratio=clip_ratio, clip_ratio_low=clip_ratio_low,
+                                 clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
+                             )
+                         _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
+                         # The OPD term is assembled into _opd_term and added
+                         # ONCE below, so the per-id reweighting has a single
+                         # place to intercept it. Three branches reach it and all
+                         # three have to be interceptable: an arm that reweights
+                         # two of them and silently not the third is the failure
+                         # this shape exists to prevent.
+                         _opd_term = None
+                         if task_loss_weight is None:
+                             if _kl_row_coef is None and _pb_w is None:
+                                 _opd_term = teacher_kl_loss * teacher_kl_coef
+                             else:
+                                 # Scaled BEFORE the token mean, so each token is
+                                 # weighted by its own task's coefficient and by the
+                                 # gate. The mask denominator is untouched, and
+                                 # teacher_kl_loss itself stays unscaled for the
+                                 # metric below.
+                                 _scaled = agg_loss(
+                                     loss_mat=(_kld_for_loss if _kl_row_coef is None
+                                               else _kld_for_loss * _kl_row_coef.reshape(-1, 1)),
+                                     loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                                 )
+                                 _opd_term = _scaled * teacher_kl_coef
+                         else:
+                             # Per-task normalised variant: the driver put a weight on
+                             # every row such that summing weight * row-KL over the whole
+                             # step gives each task an equal share of the loss (see
+                             # attach_task_loss_weights). The two divisions this sum must
+                             # survive are undone here rather than by special-casing the
+                             # shared scaling below: FSDP averages gradients across the DP
+                             # ranks, and the mini-batch loss is divided by
+                             # gradient_accumulation, but the weights already carry the
+                             # full normalisation.
+                             row_kl = (_kld_for_loss * response_mask).sum(-1)
+                             _row_w = (task_loss_weight if _kl_row_coef is None
+                                       else task_loss_weight * _kl_row_coef)
+                             weighted_teacher_kl = (row_kl * _row_w).sum()
+                             weighted_teacher_kl = weighted_teacher_kl * (
+                                 self.task_dp_world_size * self.gradient_accumulation
+                             )
+                             _opd_term = weighted_teacher_kl * teacher_kl_coef
+                             _defer("actor/teacher_kl_loss_weighted", weighted_teacher_kl)
+                         if _lp_ratio is not None and teacher_topk_kl:
+                             # Per-id precision weighting. The surrogate has the
+                             # SAME gradient as _opd_term wherever the weight is
+                             # one, so an unmeasured task or id leaves the run
+                             # exactly where it was.
+                             _w = _lp_ratio[task_ids.to(_lp_ratio.device).clamp(min=0)]
+                             _w = _w.unsqueeze(1).expand(-1, response_length, -1).gather(
+                                 2, student_topk_ids.to(torch.int64)
+                             )
+                             _opd_term = reweighted_opd_surrogate(
+                                 _opd_term, student_topk_logprobs, _w
+                             )
+                             _defer("actor/logit_prec/applied_w_mean", _w.detach().mean())
+                         policy_loss = policy_loss + _opd_term
 
-                        # Deferred, and appended rather than assigned: assignment kept
-                        # only the LAST micro-batch, which after _balance_batch's
-                        # reorder is often entirely adjust_batch padding.
-                        #
-                        # Kept unweighted so it stays comparable with runs that do not
-                        # normalise per task.
-                        _defer("actor/teacher_kl_loss", teacher_kl_loss)
-                        metrics["actor/teacher_kl_coef"] = teacher_kl_coef
+                         # Deferred, and appended rather than assigned: assignment kept
+                         # only the LAST micro-batch, which after _balance_batch's
+                         # reorder is often entirely adjust_batch padding.
+                         #
+                         # Kept unweighted so it stays comparable with runs that do not
+                         # normalise per task.
+                         _defer("actor/teacher_kl_loss", teacher_kl_loss)
+                         metrics["actor/teacher_kl_coef"] = teacher_kl_coef
 
-                    if self.config.use_dynamic_bsz:
-                        if minibatch_valid_tokens is not None:
-                            # Exact global token-mean: policy_loss is a token-mean
-                            # (denominator = this micro-batch's valid tokens), so
-                            # policy_loss * micro_valid_tokens = token-sum, and dividing
-                            # by the mini-batch's total valid tokens makes the per-token
-                            # weight independent of how tokens were grouped into
-                            # micro-batches (unlike the sample-count factor below).
-                            micro_valid_tokens = response_mask.sum()
-                            loss = policy_loss * (micro_valid_tokens / minibatch_valid_tokens)
-                        else:
-                            # relative to the dynamic bsz (sample-count reweighting)
-                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
-                    with _actor_phase("actor.bwd"):
-                        loss.backward()
+                     if self.config.use_dynamic_bsz:
+                         if minibatch_valid_tokens is not None:
+                             # Exact global token-mean: policy_loss is a token-mean
+                             # (denominator = this micro-batch's valid tokens), so
+                             # policy_loss * micro_valid_tokens = token-sum, and dividing
+                             # by the mini-batch's total valid tokens makes the per-token
+                             # weight independent of how tokens were grouped into
+                             # micro-batches (unlike the sample-count factor below).
+                             micro_valid_tokens = response_mask.sum()
+                             loss = policy_loss * (micro_valid_tokens / minibatch_valid_tokens)
+                         else:
+                             # relative to the dynamic bsz (sample-count reweighting)
+                             loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                     else:
+                         loss = policy_loss / self.gradient_accumulation
+                     with _actor_phase("actor.bwd"):
+                         loss.backward()
 
-                    if opd_diag_stats is not None and _opd_diag_pending is not None and task_ids is not None:
-                        # After the backward. The terms were built before the loss
-                        # (the gate needed them); this only folds them into the
-                        # table. Diagnostics only: no host sync, nothing touches
-                        # the loss.
-                        with _actor_phase("actor.opd_diag"), torch.no_grad():
-                            _pend = _opd_diag_pending
-                            opd_diag_stats.update(
-                                task_ids=task_ids,
-                                response_mask=response_mask,
-                                teacher_kl=_pend["teacher_kl"],
-                                advantages=data.get("advantages", None),
-                                terms=_pend["terms"],
-                                row_basis=_pend["row_basis"],
-                                row_coef=_pend["row_coef"],
-                                gate_w=_pend["gate_w"],
-                                group_idx=data.get("pushback_group_idx", None),
-                            )
+                     if opd_diag_stats is not None and _opd_diag_pending is not None and task_ids is not None:
+                         # After the backward. The terms were built before the loss
+                         # (the gate needed them); this only folds them into the
+                         # table. Diagnostics only: no host sync, nothing touches
+                         # the loss.
+                         with _actor_phase("actor.opd_diag"), torch.no_grad():
+                             _pend = _opd_diag_pending
+                             opd_diag_stats.update(
+                                 task_ids=task_ids,
+                                 response_mask=response_mask,
+                                 teacher_kl=_pend["teacher_kl"],
+                                 advantages=data.get("advantages", None),
+                                 terms=_pend["terms"],
+                                 row_basis=_pend["row_basis"],
+                                 row_coef=_pend["row_coef"],
+                                 gate_w=_pend["gate_w"],
+                                 group_idx=data.get("pushback_group_idx", None),
+                             )
 
-                    if cross_stats is not None and _cg_pending is not None and task_ids is not None:
-                        # After the backward, like the readout: the gate needed
-                        # the forward before the loss; this only folds it into
-                        # the tables. No host sync, nothing touches the loss.
-                        with _actor_phase("actor.cross_gate"), torch.no_grad():
-                            _p = _cg_pending
-                            cross_stats.update(
-                                fwd=_p["fwd"], task_ids=task_ids, roles=_p["roles"],
-                                response_mask=response_mask, teacher_kl=_p["teacher_kl"],
-                                topk_ids=_p["topk_ids"],
-                                side=data.get("cross_side", None),
-                                prompt_idx=data.get("cross_prompt_idx", None),
-                                row_basis=_p["row_basis"],
-                            )
+                     if cross_stats is not None and _cg_pending is not None and task_ids is not None:
+                         # After the backward, like the readout: the gate needed
+                         # the forward before the loss; this only folds it into
+                         # the tables. No host sync, nothing touches the loss.
+                         with _actor_phase("actor.cross_gate"), torch.no_grad():
+                             _p = _cg_pending
+                             cross_stats.update(
+                                 fwd=_p["fwd"], task_ids=task_ids, roles=_p["roles"],
+                                 response_mask=response_mask, teacher_kl=_p["teacher_kl"],
+                                 topk_ids=_p["topk_ids"],
+                                 side=data.get("cross_side", None),
+                                 prompt_idx=data.get("cross_prompt_idx", None),
+                                 row_basis=_p["row_basis"],
+                             )
 
-                    if task_ids is not None:
-                        # Same losses, re-aggregated over the rows of one task at a
-                        # time. Diagnostics only: nothing here touches the graph the
-                        # optimizer step above was built from, and the results are
-                        # deferred GPU tensors -- no host sync happens here. Timed
-                        # separately anyway: this phase is where the backward's
-                        # queued reduce-scatter tail drains.
-                        with _actor_phase("actor.task_metrics"), torch.no_grad():
-                            for task, rows in iter_task_row_masks(
-                                task_ids, task_id_names, include_absent=sync_free_task_metrics
-                            ):
-                                # A ROW MASK FOLDED INTO THE TOKEN MASK, not a
-                                # boolean index. ``x[rows]`` has a data-dependent
-                                # shape, so torch reads the count back to the host
-                                # to allocate the result -- a sync per task per
-                                # micro-batch, on top of the ones this loop is
-                                # being cleared of, and the reason the existing
-                                # "sync-free" path was not. Under token-mean the
-                                # two are the same number: the excluded rows
-                                # contribute zero to the numerator and zero to the
-                                # denominator. Under seq-mean-* they are not (an
-                                # excluded row would still count in the sequence
-                                # average), so that mode keeps the index.
-                                if loss_agg_mode == "token-mean":
-                                    task_rows = None
-                                    task_response_mask = response_mask * rows.reshape(-1, 1).to(response_mask.dtype)
-                                else:
-                                    task_rows = rows
-                                    task_response_mask = response_mask[rows]
+                     if task_ids is not None:
+                         # Same losses, re-aggregated over the rows of one task at a
+                         # time. Diagnostics only: nothing here touches the graph the
+                         # optimizer step above was built from, and the results are
+                         # deferred GPU tensors -- no host sync happens here. Timed
+                         # separately anyway: this phase is where the backward's
+                         # queued reduce-scatter tail drains.
+                         with _actor_phase("actor.task_metrics"), torch.no_grad():
+                             for task, rows in iter_task_row_masks(
+                                 task_ids, task_id_names, include_absent=sync_free_task_metrics
+                             ):
+                                 # A ROW MASK FOLDED INTO THE TOKEN MASK, not a
+                                 # boolean index. ``x[rows]`` has a data-dependent
+                                 # shape, so torch reads the count back to the host
+                                 # to allocate the result -- a sync per task per
+                                 # micro-batch, on top of the ones this loop is
+                                 # being cleared of, and the reason the existing
+                                 # "sync-free" path was not. Under token-mean the
+                                 # two are the same number: the excluded rows
+                                 # contribute zero to the numerator and zero to the
+                                 # denominator. Under seq-mean-* they are not (an
+                                 # excluded row would still count in the sequence
+                                 # average), so that mode keeps the index.
+                                 if loss_agg_mode == "token-mean":
+                                     task_rows = None
+                                     task_response_mask = response_mask * rows.reshape(-1, 1).to(response_mask.dtype)
+                                 else:
+                                     task_rows = rows
+                                     task_response_mask = response_mask[rows]
 
-                                def _sel(t, _rows=task_rows):
-                                    return t if _rows is None else t[_rows]
+                                 def _sel(t, _rows=task_rows):
+                                     return t if _rows is None else t[_rows]
 
-                                task_present = task_response_mask.sum() > 0
-                                task_metrics = {}
+                                 task_present = task_response_mask.sum() > 0
+                                 task_metrics = {}
 
-                                if pg_loss_coef != 0:
-                                    task_pg_loss, task_pg_clipfrac, task_ppo_kl, task_pg_clipfrac_lower = policy_loss_fn(
-                                        old_log_prob=_sel(old_log_prob),
-                                        log_prob=_sel(log_prob),
-                                        advantages=_sel(advantages),
-                                        response_mask=task_response_mask,
-                                        cliprange=clip_ratio,
-                                        cliprange_low=clip_ratio_low,
-                                        cliprange_high=clip_ratio_high,
-                                        clip_ratio_c=clip_ratio_c,
-                                        loss_agg_mode=loss_agg_mode,
-                                    )
-                                    # Deferred, not read. Four scalars a task a
-                                    # micro-batch is 12 stream syncs per
-                                    # micro-batch on a three-task mixture -- and
-                                    # each one drains the queue the backward just
-                                    # filled, which is what the update phase's
-                                    # periodic dips to 45% util are made of.
-                                    for _name, _value in (
-                                        ("pg_loss", task_pg_loss),
-                                        ("pg_clipfrac", task_pg_clipfrac),
-                                        ("ppo_kl", task_ppo_kl),
-                                        ("pg_clipfrac_lower", task_pg_clipfrac_lower),
-                                    ):
-                                        _defer_present(f"actor/{_name}/{task}", _value, task_present)
-                                else:
-                                    # Reading four device-side constants back per task
-                                    # per micro-batch costs a stream sync each; the
-                                    # values are known.
-                                    task_metrics.update(_ZERO_PG_METRICS_BY_TASK(task))
+                                 if pg_loss_coef != 0:
+                                     task_pg_loss, task_pg_clipfrac, task_ppo_kl, task_pg_clipfrac_lower = policy_loss_fn(
+                                         old_log_prob=_sel(old_log_prob),
+                                         log_prob=_sel(log_prob),
+                                         advantages=_sel(advantages),
+                                         response_mask=task_response_mask,
+                                         cliprange=clip_ratio,
+                                         cliprange_low=clip_ratio_low,
+                                         cliprange_high=clip_ratio_high,
+                                         clip_ratio_c=clip_ratio_c,
+                                         loss_agg_mode=loss_agg_mode,
+                                     )
+                                     # Deferred, not read. Four scalars a task a
+                                     # micro-batch is 12 stream syncs per
+                                     # micro-batch on a three-task mixture -- and
+                                     # each one drains the queue the backward just
+                                     # filled, which is what the update phase's
+                                     # periodic dips to 45% util are made of.
+                                     for _name, _value in (
+                                         ("pg_loss", task_pg_loss),
+                                         ("pg_clipfrac", task_pg_clipfrac),
+                                         ("ppo_kl", task_ppo_kl),
+                                         ("pg_clipfrac_lower", task_pg_clipfrac_lower),
+                                     ):
+                                         _defer_present(f"actor/{_name}/{task}", _value, task_present)
+                                 else:
+                                     # Reading four device-side constants back per task
+                                     # per micro-batch costs a stream sync each; the
+                                     # values are known.
+                                     task_metrics.update(_ZERO_PG_METRICS_BY_TASK(task))
 
-                                if entropy_coeff != 0:
-                                    task_metrics[f"actor/entropy_loss/{task}"] = (
-                                        agg_loss(loss_mat=_sel(entropy), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
-                                    )
+                                 if entropy_coeff != 0:
+                                     task_metrics[f"actor/entropy_loss/{task}"] = (
+                                         agg_loss(loss_mat=_sel(entropy), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                     )
 
-                                if self.config.use_kl_loss:
-                                    task_metrics[f"actor/kl_loss/{task}"] = (
-                                        agg_loss(loss_mat=_sel(kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
-                                    )
-                                    if kl_loss_coef is not None:
-                                        # Still a row selection: this is a mean over
-                                        # ROWS, which a token mask cannot express.
-                                        task_metrics[f"actor/kl_coef/{task}"] = kl_loss_coef[rows].float().mean().detach().item()
+                                 if self.config.use_kl_loss:
+                                     task_metrics[f"actor/kl_loss/{task}"] = (
+                                         agg_loss(loss_mat=_sel(kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode).detach().item()
+                                     )
+                                     if kl_loss_coef is not None:
+                                         # Still a row selection: this is a mean over
+                                         # ROWS, which a token mask cannot express.
+                                         task_metrics[f"actor/kl_coef/{task}"] = kl_loss_coef[rows].float().mean().detach().item()
 
-                                if self.config.get("use_sdl_loss", False):
-                                    from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
+                                 if self.config.get("use_sdl_loss", False):
+                                     from verl.trainer.ppo.skillsd_utils import compute_sdl_loss
 
-                                    task_metrics[f"actor/sdl_loss/{task}"] = compute_sdl_loss(
-                                        student_log_probs=_sel(log_prob),
-                                        teacher_log_probs=_sel(teacher_log_probs),
-                                        old_log_probs=_sel(old_log_prob),
-                                        response_mask=task_response_mask,
-                                        loss_agg_mode=loss_agg_mode,
-                                    ).detach().item()
+                                     task_metrics[f"actor/sdl_loss/{task}"] = compute_sdl_loss(
+                                         student_log_probs=_sel(log_prob),
+                                         teacher_log_probs=_sel(teacher_log_probs),
+                                         old_log_probs=_sel(old_log_prob),
+                                         response_mask=task_response_mask,
+                                         loss_agg_mode=loss_agg_mode,
+                                     ).detach().item()
 
-                                if self.config.get("use_sdar_loss", False):
-                                    from verl.trainer.ppo.sdar_utils import compute_sdar_loss
+                                 if self.config.get("use_sdar_loss", False):
+                                     from verl.trainer.ppo.sdar_utils import compute_sdar_loss
 
-                                    _, task_sdar_metrics = compute_sdar_loss(
-                                        student_log_probs=_sel(log_prob),
-                                        teacher_log_probs=_sel(teacher_log_probs),
-                                        response_mask=task_response_mask,
-                                        gate_beta=self.config.get("sdar_gate_beta", 5.0),
-                                        loss_agg_mode=loss_agg_mode,
-                                    )
-                                    task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
+                                     _, task_sdar_metrics = compute_sdar_loss(
+                                         student_log_probs=_sel(log_prob),
+                                         teacher_log_probs=_sel(teacher_log_probs),
+                                         response_mask=task_response_mask,
+                                         gate_beta=self.config.get("sdar_gate_beta", 5.0),
+                                         loss_agg_mode=loss_agg_mode,
+                                     )
+                                     task_metrics.update({f"{name}/{task}": value for name, value in task_sdar_metrics.items()})
 
-                                if use_teacher_kl_loss:
-                                    if sync_free_task_metrics:
-                                        # rows may select nothing here; _defer_task
-                                        # carries the presence so an absent task
-                                        # contributes 0 rather than NaN.
-                                        _defer_task(
-                                            f"actor/teacher_kl_loss/{task}",
-                                            _sel(teacher_kld),
-                                            task_response_mask,
-                                        )
-                                    else:
-                                        _defer(
-                                            f"actor/teacher_kl_loss/{task}",
-                                            agg_loss(loss_mat=_sel(teacher_kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
-                                        )
+                                 if use_teacher_kl_loss:
+                                     if sync_free_task_metrics:
+                                         # rows may select nothing here; _defer_task
+                                         # carries the presence so an absent task
+                                         # contributes 0 rather than NaN.
+                                         _defer_task(
+                                             f"actor/teacher_kl_loss/{task}",
+                                             _sel(teacher_kld),
+                                             task_response_mask,
+                                         )
+                                     else:
+                                         _defer(
+                                             f"actor/teacher_kl_loss/{task}",
+                                             agg_loss(loss_mat=_sel(teacher_kld), loss_mask=task_response_mask, loss_agg_mode=loss_agg_mode),
+                                         )
 
-                                append_to_dict(metrics, task_metrics)
+                                 append_to_dict(metrics, task_metrics)
 
-                    if pg_loss_coef != 0:
-                        # Deferred for the same reason as the per-task four above,
-                        # and bit-identically: the same tensors, read once at the
-                        # end of the call instead of once per micro-batch. The
-                        # flush takes the mean over micro-batches, which is what
-                        # append_to_dict + reduce_metrics did.
-                        _defer("actor/pg_loss", pg_loss)
-                        _defer("actor/pg_clipfrac", pg_clipfrac)
-                        _defer("actor/ppo_kl", ppo_kl)
-                        _defer("actor/pg_clipfrac_lower", pg_clipfrac_lower)
-                    else:
-                        append_to_dict(metrics, dict(_ZERO_PG_METRICS))
+                     if pg_loss_coef != 0:
+                         # Deferred for the same reason as the per-task four above,
+                         # and bit-identically: the same tensors, read once at the
+                         # end of the call instead of once per micro-batch. The
+                         # flush takes the mean over micro-batches, which is what
+                         # append_to_dict + reduce_metrics did.
+                         _defer("actor/pg_loss", pg_loss)
+                         _defer("actor/pg_clipfrac", pg_clipfrac)
+                         _defer("actor/ppo_kl", ppo_kl)
+                         _defer("actor/pg_clipfrac_lower", pg_clipfrac_lower)
+                     else:
+                         append_to_dict(metrics, dict(_ZERO_PG_METRICS))
 
-                if student_indexed_topk or sign_enabled:
-                    # Every row the exchange was asked about must have been
-                    # answered by exactly one rank. Also when only the sign
-                    # weights used it: a teacher-indexed arm reads base and the
-                    # off-task teachers out of the same cache. Checked here rather than in the
-                    # exchange itself: reading the tally synchronises, and this is
-                    # the last point before the weights move, so a row that went
-                    # unresolved still cannot reach them.
-                    from verl.workers.teacher_cache import assert_rows_were_owned_once
+                 if student_indexed_topk or sign_enabled:
+                     # Every row the exchange was asked about must have been
+                     # answered by exactly one rank. Also when only the sign
+                     # weights used it: a teacher-indexed arm reads base and the
+                     # off-task teachers out of the same cache. Checked here rather than in the
+                     # exchange itself: reading the tally synchronises, and this is
+                     # the last point before the weights move, so a row that went
+                     # unresolved still cannot reach them.
+                     from verl.workers.teacher_cache import assert_rows_were_owned_once
 
-                    assert_rows_were_owned_once()
+                     assert_rows_were_owned_once()
 
-                with _actor_phase("actor.optim"):
-                    # Named separately because it runs in the window between two
-                    # micro-batches, which the stall watch would otherwise report
-                    # as idle -- a reduce-scatter plus an Adam update over 570M
-                    # parameters is real kernels, and calling that idle puts a
-                    # noise floor under the stalls being looked for.
-                    with actor_capture.span("optim"):
-                        grad_norm = self._optimizer_step()
-                data = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, data)
-        self.actor_optimizer.zero_grad()
-        if logit_prec is not None:
+                 with _actor_phase("actor.optim"):
+                     # Named separately because it runs in the window between two
+                     # micro-batches, which the stall watch would otherwise report
+                     # as idle -- a reduce-scatter plus an Adam update over 570M
+                     # parameters is real kernels, and calling that idle puts a
+                     # noise floor under the stalls being looked for.
+                     with actor_capture.span("optim"):
+                         grad_norm = self._optimizer_step()
+                 data = {"actor/grad_norm": grad_norm.detach().item()}
+                 append_to_dict(metrics, data)
+        finally:
+            # Always, even on the way out of an exception: the forward checks
+            # this flag and would otherwise keep stashing a vocabulary-sized
+            # tensor for the rest of the worker's life.
             self._lp_want_logits = False
             self._lp_capture = None
+        self.actor_optimizer.zero_grad()
+        if logit_prec is not None:
             # One reduce for the whole step: every field is a plain sum over
             # rows, so the ranks combine by addition and nothing here needs to
             # know how the rows were dealt.

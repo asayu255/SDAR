@@ -352,6 +352,7 @@
 "algorithm.opd.logit_precision.max_beta_ratio": 1000.0
 "algorithm.opd.logit_precision.allow_negative_lambda": false
 "algorithm.opd.logit_precision.min_tokens": 64
+"algorithm.opd.logit_precision.min_eff_steps": 3.0
 "algorithm.opd.logit_precision.chunk_tokens": 32
 "actor_rollout_ref.actor.logit_precision.enable": true
 "actor_rollout_ref.actor.logit_precision.observe_only": true
@@ -363,6 +364,7 @@
 "actor_rollout_ref.actor.logit_precision.max_beta_ratio": 1000.0
 "actor_rollout_ref.actor.logit_precision.allow_negative_lambda": false
 "actor_rollout_ref.actor.logit_precision.min_tokens": 64
+"actor_rollout_ref.actor.logit_precision.min_eff_steps": 3.0
 "actor_rollout_ref.actor.logit_precision.chunk_tokens": 32
 
 # --- every other mechanism on the teacher term, declared off -----------------

@@ -244,11 +244,41 @@ def _synthetic(lam, noise_rl, noise_teacher, vocab=4000, n_rows=64, seed=0):
     return acc.moments(LogitPrecisionConfig())
 
 
+def _stream(lam, noise_rl, noise_teacher, *, steps=40, decay=0.8, vocab=4000,
+            n_rows=64, seed=0, live_frac=1.0):
+    """A smoothed stream of noisy steps -- what the trainer actually fits on.
+
+    ``live_frac`` is the share of rows carrying a nonzero advantage. At small
+    values the permutation null collapses (sum_r A_r^2 goes to zero with the
+    push), which is the case the across-step variance exists to survive.
+    """
+    g = torch.Generator().manual_seed(seed)
+    theta = torch.randn(vocab, generator=g, dtype=torch.float64)
+    cfg = LogitPrecisionConfig()
+    ema = StepMoments(1, vocab, dtype=torch.float64)
+    n_live = max(2, int(n_rows * live_frac))
+    for _ in range(steps):
+        acc = StepAccumulator(1, vocab, dtype=torch.float64)
+        acc.a[0] = theta + noise_rl * torch.randn(vocab, generator=g, dtype=torch.float64)
+        acc.d[0] = lam * theta + noise_teacher * torch.randn(vocab, generator=g, dtype=torch.float64)
+        acc.act[0] = torch.rand(vocab, generator=g, dtype=torch.float64) + 0.1
+        acc.n_rows[0] = n_rows
+        # Only the live rows carry advantage, so the null shrinks with them.
+        acc.sa2[0] = float(n_live)
+        acc.sm[0] = torch.zeros(vocab, dtype=torch.float64)
+        acc.sm2[0] = torch.full((vocab,), noise_rl ** 2 * (n_rows - 1) / n_rows,
+                                dtype=torch.float64)
+        acc.n_tokens[0] = 10_000
+        ema.ema_(acc.moments(cfg), decay)
+    return ema
+
+
 @pytest.mark.parametrize("lam", [0.25, 1.0, 3.0])
 def test_the_fit_recovers_a_known_teacher_scale(lam):
-    acc = _synthetic(lam, noise_rl=0.5, noise_teacher=0.3)
+    acc = _stream(lam, noise_rl=0.5, noise_teacher=0.3, seed=100 + int(lam * 4))
     fit = fit_weights(acc, ["t"], LogitPrecisionConfig())["t"]
-    assert fit.valid and fit.reason == "ok"
+    assert fit.valid and fit.reason in ("ok", "residual_floored"), fit.reason
+    assert fit.sigma2_is_across_step
     assert fit.lam == pytest.approx(lam, rel=0.08), fit.lam
     assert fit.varsigma2 == pytest.approx(0.09, rel=0.25), fit.varsigma2
     assert fit.tau2 == pytest.approx(1.0, rel=0.10), fit.tau2
@@ -678,12 +708,13 @@ def test_the_first_step_fit_is_not_scaled_down_by_the_smoother():
     out positive. The live pilot duly reported tau2 = 0,
     no_rl_signal_frac = 1.0 and "rl_push_is_all_noise" for all three tasks.
     """
+    cfg = LogitPrecisionConfig(min_eff_steps=1e9)   # pin the permutation path
     one = _synthetic(1.5, noise_rl=0.5, noise_teacher=0.3, seed=60)
-    direct = fit_weights(one, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    direct = fit_weights(one, ["t"], cfg, base_beta=1.0)["t"]
 
     ema = StepMoments(1, one.vocab, dtype=torch.float64)
     ema.ema_(one, 0.8)                       # exactly one step of smoothing
-    smoothed = fit_weights(ema, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    smoothed = fit_weights(ema, ["t"], cfg, base_beta=1.0)["t"]
 
     assert smoothed.valid and smoothed.reason == direct.reason
     assert smoothed.tau2 == pytest.approx(direct.tau2, rel=1e-9)
@@ -695,13 +726,20 @@ def test_the_first_step_fit_is_not_scaled_down_by_the_smoother():
 
 @pytest.mark.parametrize("steps", [1, 2, 5, 20])
 def test_a_constant_stream_of_steps_gives_the_same_fit_at_every_step(steps):
-    """Smoothing a repeated step must be a no-op, at step 1 and at step 20."""
+    """Smoothing a repeated step must be a no-op, at step 1 and at step 20.
+
+    Pinned to the permutation path (min_eff_steps above any reachable count),
+    because that is the path whose degree mismatch made the warm-up scale the
+    fit. The across-step variance of a repeated step is zero by construction,
+    which is a different question.
+    """
+    cfg = LogitPrecisionConfig(min_eff_steps=1e9)
     one = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=1500, seed=61)
-    direct = fit_weights(one, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    direct = fit_weights(one, ["t"], cfg, base_beta=1.0)["t"]
     ema = StepMoments(1, one.vocab, dtype=torch.float64)
     for _ in range(steps):
         ema.ema_(one, 0.8)
-    got = fit_weights(ema, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    got = fit_weights(ema, ["t"], cfg, base_beta=1.0)["t"]
     assert got.tau2 == pytest.approx(direct.tau2, rel=1e-9), steps
     assert got.lam == pytest.approx(direct.lam, rel=1e-9), steps
 
@@ -721,3 +759,74 @@ def test_the_permutation_variance_survives_the_trip_through_moments():
     acc.n_rows[0] = n_rows
     want = (acc.sm2[0] - acc.sm[0] ** 2 / n_rows) * (float(acc.sa2[0]) / (n_rows - 1))
     assert torch.allclose(acc.moments(LogitPrecisionConfig()).sig2[0], want, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 11. the review's finding 2: sigma^2 must not collapse with the advantages
+# ---------------------------------------------------------------------------
+
+
+def test_the_permutation_null_collapses_with_the_advantages_and_the_new_one_does_not():
+    """The defect, and the fix, side by side.
+
+    sigma^2_perm[v] = spread[v] * sum_r A_r^2 / (N - 1): only spread depends on
+    the id, and the scalar factor goes to zero with the advantages. So on a task
+    where most rows carry no advantage -- webshop's 62 percent -- the measured
+    coefficient shrinks uniformly, and the BLUE hands a push that is exactly
+    zero an infinite precision. The across-step variance sees the advantage
+    draw's own variability and does not.
+    """
+    perm = LogitPrecisionConfig(min_eff_steps=1e9)
+    across = LogitPrecisionConfig()
+    rows = []
+    for live in (1.0, 0.5, 0.1, 0.03):
+        mom = _stream(2.0, noise_rl=0.5, noise_teacher=0.3, seed=200, live_frac=live)
+        f_perm = fit_weights(mom, ["t"], perm, base_beta=1.0)["t"]
+        f_acr = fit_weights(mom, ["t"], across, base_beta=1.0)["t"]
+        b_perm = float(f_perm.implied_beta[f_perm.keep].median()) if f_perm.implied_beta is not None else float("nan")
+        b_acr = float(f_acr.implied_beta[f_acr.keep].median()) if f_acr.implied_beta is not None else float("nan")
+        rows.append((live, b_perm, b_acr))
+
+    full_perm, full_acr = rows[0][1], rows[0][2]
+    # The permutation path tracks sum_r A_r^2 downward; the across-step one holds.
+    assert rows[-1][1] < 0.2 * full_perm, rows
+    assert rows[-1][2] > 0.5 * full_acr, rows
+
+
+def test_the_measured_coefficient_is_no_longer_a_pure_function_of_the_spread():
+    """Under the permutation null, implied_beta was EXACTLY proportional to it."""
+    mom = _stream(2.0, noise_rl=0.5, noise_teacher=0.3, seed=201)
+    perm = fit_weights(mom, ["t"], LogitPrecisionConfig(min_eff_steps=1e9), base_beta=1.0)["t"]
+    r = perm.implied_beta[perm.keep] / mom.corrected().sig2[0][perm.keep]
+    assert float(r.std() / r.mean().abs()) < 1e-12, "the old path should be exactly proportional"
+
+    across = fit_weights(mom, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    r2 = across.implied_beta[across.keep] / mom.corrected().sig2[0][across.keep]
+    assert float(r2.std() / r2.mean().abs()) > 1e-3, "the new path must not be"
+
+
+def test_a_warming_up_fit_is_reported_but_never_applied():
+    from verl.trainer.ppo.opd_logit_precision import beta_ratio_matrix
+
+    one = _synthetic(1.5, noise_rl=0.5, noise_teacher=0.3, vocab=300, seed=202)
+    fit = fit_weights(one, ["t"], LogitPrecisionConfig())["t"]
+    assert fit.reason == "warming_up" and fit.valid
+    assert fit.implied_beta is not None, "the pilot still needs to see it"
+    assert not fit.sigma2_is_across_step
+    assert fit.metrics()["logit_prec/t/reason"] == 6.0
+    # but the apply path leaves the run at its own coefficient
+    ratio = beta_ratio_matrix({"t": fit}, ["t"], 300, 0.01)
+    assert torch.allclose(ratio, torch.ones_like(ratio))
+
+
+def test_the_effective_step_count_reaches_the_ema_limit():
+    """n_eff = w^2 / w2 must be 1 after one step and (1+d)/(1-d) in the limit."""
+    one = _synthetic(1.0, 0.5, 0.3, vocab=64, seed=203)
+    for decay, limit in ((0.8, 9.0), (0.9, 19.0)):
+        ema = StepMoments(1, 64, dtype=torch.float64)
+        ema.ema_(one, decay)
+        assert ema.n_eff_steps() == pytest.approx(1.0, rel=1e-9), decay
+        for _ in range(400):
+            ema.ema_(one, decay)
+        assert ema.n_eff_steps() == pytest.approx(limit, rel=1e-6), decay
+        assert ema.corrected().n_eff_steps() == pytest.approx(limit, rel=1e-6), decay

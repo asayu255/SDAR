@@ -147,6 +147,12 @@ class LogitPrecisionConfig:
     allow_negative_lambda: bool = False
     # Minimum tokens a task must contribute before its fit is used at all.
     min_tokens: int = 64
+    # Effective number of smoothed steps required before sigma^2 is taken as the
+    # ACROSS-STEP variance of the RL push. Below it the permutation null is used
+    # instead and the fit is flagged `warming_up`, which the apply path refuses.
+    # See the note on sigma^2 in fit_weights for why the two differ and why the
+    # across-step one is the quantity the model actually assumes.
+    min_eff_steps: float = 3.0
     # Floor on the teacher's residual variance, as a fraction of the variance of
     # its own push. NUMERICAL SAFETY ONLY, which is why it is small: the
     # errors-in-variables correction divides by an ESTIMATED signal variance, so
@@ -176,6 +182,12 @@ class LogitPrecisionConfig:
             raise ValueError(f"min_residual_frac must be in (0, 1], got {self.min_residual_frac}")
         if not (self.max_beta_ratio > 0.0) or not math.isfinite(self.max_beta_ratio):
             raise ValueError(f"max_beta_ratio must be finite and > 0, got {self.max_beta_ratio}")
+        if not (self.min_tokens >= 1):
+            raise ValueError(f"min_tokens must be >= 1, got {self.min_tokens}")
+        if not (self.min_activity >= 0.0) or not math.isfinite(self.min_activity):
+            raise ValueError(f"min_activity must be finite and >= 0, got {self.min_activity}")
+        if not (self.min_eff_steps >= 1.0) or not math.isfinite(self.min_eff_steps):
+            raise ValueError(f"min_eff_steps must be finite and >= 1, got {self.min_eff_steps}")
         if not (self.sigma2_floor_frac >= 0.0) or not math.isfinite(self.sigma2_floor_frac):
             raise ValueError(f"sigma2_floor_frac must be finite and >= 0, got {self.sigma2_floor_frac}")
 
@@ -368,6 +380,7 @@ class StepAccumulator:
         out.n_tokens.copy_(self.n_tokens)
         out.n_rows.copy_(self.n_rows)
         out.w.fill_(1.0)
+        out.w2.fill_(1.0)
         return out
 
     @torch.no_grad()
@@ -432,6 +445,16 @@ class StepAccumulator:
         tok_keep = row_keep[token_row.to(dev)].to(work)
         if token_valid is not None:
             tok_keep = tok_keep * token_valid.to(dev, work)
+        # A row that contributes no weighted token contributes nothing to a, d,
+        # sm or sm2 -- adjust_batch padding has task_loss_weight 0 -- so letting
+        # it into n_rows and sa2 would put the numerator and the denominator of
+        # sigma^2 on different populations, and would break the sum_r A_r = 0
+        # the permutation null rests on. Measured at 1 row in ~7000, so this is
+        # exactness rather than a correction.
+        row_mass = torch.zeros(n_rows_mb, device=dev, dtype=work)
+        row_mass.index_add_(0, token_row.to(dev, torch.int64), tok_keep)
+        row_keep = row_keep & (row_mass > 0)
+        tok_keep = tok_keep * row_keep[token_row.to(dev)].to(work)
         trow = token_row.to(dev, torch.int64)
         ttask = token_task.to(dev, torch.int64).clamp(min=0)
         sid = sampled_ids.to(dev, torch.int64)
@@ -588,6 +611,12 @@ class StepMoments:
 
     _PER_ID = ("a", "d", "a2", "ad", "d2", "sig2", "act")
     _PER_TASK = ("n_tokens", "n_rows")
+    # w is the sum of the EMA weights and w2 the sum of their squares, so
+    # w^2 / w2 is the effective number of steps the average rests on -- 1 after
+    # one step, rising to (1 + decay) / (1 - decay) in the limit. The fit needs
+    # it because the ACROSS-STEP variance of the push cannot be estimated from
+    # fewer than two effective steps, and is worthless from three.
+    _WEIGHTS = ("w", "w2")
 
     def __init__(self, n_tasks: int, vocab: int, *, device=None, dtype=torch.float32):
         self.n_tasks, self.vocab = int(n_tasks), int(vocab)
@@ -595,10 +624,16 @@ class StepMoments:
             setattr(self, name, torch.zeros(n_tasks, vocab, device=device, dtype=dtype))
         for name in self._PER_TASK:
             setattr(self, name, torch.zeros(n_tasks, device=device, dtype=dtype))
-        self.w = torch.zeros((), device=device, dtype=dtype)
+        for name in self._WEIGHTS:
+            setattr(self, name, torch.zeros((), device=device, dtype=dtype))
 
     def _fields(self):
-        return self._PER_ID + self._PER_TASK + ("w",)
+        return self._PER_ID + self._PER_TASK + self._WEIGHTS
+
+    def n_eff_steps(self) -> float:
+        """``w^2 / w2``: how many independent steps this average is worth."""
+        w, w2 = float(self.w), float(self.w2)
+        return (w * w / w2) if w2 > 0 else 0.0
 
     def to(self, device):
         for name in self._fields():
@@ -606,11 +641,17 @@ class StepMoments:
         return self
 
     def ema_(self, other: "StepMoments", decay: float):
-        """``self <- decay * self + (1 - decay) * other``, ``w`` included."""
+        """``self <- decay * self + (1 - decay) * other``.
+
+        ``w2`` is the only field that does not follow that rule: the sum of
+        SQUARED weights composes as ``decay^2 * w2 + (1 - decay)^2``, which is
+        what makes ``w^2 / w2`` the effective step count.
+        """
         d = float(decay)
-        for name in self._fields():
+        for name in self._PER_ID + self._PER_TASK + ("w",):
             cur = getattr(self, name)
             cur.mul_(d).add_(getattr(other, name).to(cur.device, cur.dtype), alpha=1.0 - d)
+        self.w2.mul_(d * d).add_(other.w2.to(self.w2.device, self.w2.dtype), alpha=(1.0 - d) ** 2)
         return self
 
     def corrected(self) -> "StepMoments":
@@ -618,9 +659,12 @@ class StepMoments:
         out = StepMoments(self.n_tasks, self.vocab, device=self.w.device, dtype=self.w.dtype)
         wv = float(self.w)
         scale = 1.0 / wv if wv > 0 else 0.0
-        for name in self._fields():
+        for name in self._PER_ID + self._PER_TASK:
             getattr(out, name).copy_(getattr(self, name) * scale)
+        # Normalised so the effective step count survives: w = 1 and
+        # w2 = w2 / w^2, hence n_eff = w^2 / w2 is unchanged.
         out.w.fill_(1.0 if wv > 0 else 0.0)
+        out.w2.copy_(self.w2 * (scale * scale))
         return out
 
     def state_dict(self) -> dict:
@@ -648,6 +692,7 @@ class StepMoments:
 
 _REASON_CODE = {
     "ok": 0,
+    "warming_up": 6,
     "residual_floored": 1,
     "teacher_uninformative": 2,
     "too_few_tokens": 3,
@@ -670,6 +715,9 @@ class TaskFit:
     varsigma2: float = 0.0     # teacher error variance
     r2: float = 0.0            # fraction of the teacher's push the reward explains
     lam_se: float = float("nan")   # jackknife-over-ids standard error of lam_raw
+    n_eff_steps: float = 0.0       # how many independent steps the average rests on
+    sigma2_is_across_step: bool = False   # False = the permutation null (warm-up only)
+    sigma2_perm_median: float = 0.0
     n_eff: float = 0.0             # Kish effective number of ids deciding lam
     n_ids: int = 0
     n_tokens: float = 0.0
@@ -699,6 +747,9 @@ class TaskFit:
                 else float("nan")
             ),
             f"{prefix}/{self.task}/n_eff_ids": self.n_eff,
+            f"{prefix}/{self.task}/n_eff_steps": self.n_eff_steps,
+            f"{prefix}/{self.task}/sigma2_across_step": float(self.sigma2_is_across_step),
+            f"{prefix}/{self.task}/sigma2_perm_median": self.sigma2_perm_median,
             f"{prefix}/{self.task}/n_ids": float(self.n_ids),
             f"{prefix}/{self.task}/beta_at_cap_frac": self.at_cap_frac,
             f"{prefix}/{self.task}/no_rl_signal_frac": self.no_rl_signal_frac,
@@ -783,6 +834,42 @@ def fit_weights(
             out[name] = TaskFit(name, False, "too_few_tokens", n_tokens=n_tok)
             continue
 
+        # WHICH sigma^2, AND WHY THE OBVIOUS CHOICE IS WRONG.
+        #
+        # The model in section 2 says a[v] = theta[v] + eps with variance
+        # sigma^2[v], so sigma^2 is the ESTIMATOR'S sampling variance. The
+        # permutation null is not that: it conditions on the advantages the step
+        # actually drew and asks how much of the push is attributable to an
+        # id-reward association. The two come apart exactly where this mechanism
+        # is supposed to earn its keep.
+        #
+        # Concretely, sigma^2_perm[v] = spread[v] * sum_r A_r^2 / (N - 1), and
+        # only spread[v] depends on the id -- so the id profile of the measured
+        # coefficient is the ROW-TO-ROW VARIABILITY OF THE ID'S OCCURRENCE and
+        # nothing else. Worse, as the advantages vanish sum_r A_r^2 goes to zero
+        # together with a[v] itself, so the BLUE hands a push that is exactly
+        # zero an infinite precision and gives the teacher none. The model reads
+        # "not measured" as "measured to be zero". On webshop, where 62 percent
+        # of tokens carry no advantage, that is the common case and it is
+        # backwards.
+        #
+        # The across-step variance has none of that: it is the variance of the
+        # push over the steps the EMA covers, so it includes the advantage
+        # draw's own variability and cannot collapse when one step happens to
+        # be flat. E[a2] = theta^2 + sigma^2 and E[abar^2] = theta^2 +
+        # sigma^2/n, so (a2 - abar^2) n/(n-1) estimates sigma^2 and leaves
+        # tau^2 = mean(a2) - mean(sigma^2) unchanged in form.
+        #
+        # It needs steps, though. Below min_eff_steps the permutation null is
+        # all there is; the fit is then flagged `warming_up` and the apply path
+        # declines to use it.
+        n_eff_steps = mom.n_eff_steps()
+        sig2_perm = sigma2
+        warming = n_eff_steps < cfg.min_eff_steps
+        if not warming:
+            k_n = n_eff_steps / (n_eff_steps - 1.0)
+            sigma2 = ((a2 - a * a) * k_n).clamp(min=0.0)
+
         keep = (act > cfg.min_activity) & torch.isfinite(a2) & torch.isfinite(d2) & torch.isfinite(sigma2)
         n_ids = int(keep.sum())
         if n_ids < 2 * cfg.n_strata:
@@ -852,9 +939,12 @@ def fit_weights(
         # HOW MANY IDS ACTUALLY DECIDE lambda. The OPD push is extremely
         # concentrated -- a handful of format tokens carry most of it -- so a
         # regression nominally over thousands of ids can still be settled by
-        # ten of them. Kish's effective sample size says how many, and the
-        # jackknife says what that costs. Reporting lambda without them would
-        # repeat the error the sign gates were faulted for: acting on a
+        # ten of them. n_eff = (sum |w|)^2 / sum w^2 over the per-id products
+        # says how many, and the jackknife says what that costs. It is Kish's
+        # ratio with absolute values in the numerator, because the products are
+        # SIGNED and Kish's (sum w)^2 would let a positive and a negative id
+        # cancel into an effective size of zero. Reporting lambda without either
+        # would repeat the error the sign gates were faulted for: acting on a
         # statistic whose noise was never measured.
         prod = adk
         n_eff = float((prod.abs().sum() ** 2) / (prod * prod).sum().clamp(min=1e-300))
@@ -864,9 +954,13 @@ def fit_weights(
         lam_j = torch.where(den_j.abs() > 0, (s_ad - prod) / den_j,
                             torch.full_like(den_j, float("nan")))
         ok_j = torch.isfinite(lam_j)
-        if int(ok_j.sum()) > 2:
+        n_ok = int(ok_j.sum())
+        if n_ok > 2:
             lj = lam_j[ok_j]
-            lam_se = float(((nk - 1.0) / nk * ((lj - lj.mean()) ** 2).sum()).clamp(min=0.0).sqrt())
+            # (n-1)/n over the leave-one-out values that EXIST: using the full
+            # id count here would scale the standard error by the share that
+            # was dropped for a vanishing denominator.
+            lam_se = float((((n_ok - 1.0) / n_ok) * ((lj - lj.mean()) ** 2).sum()).clamp(min=0.0).sqrt())
         else:
             lam_se = float("nan")
 
@@ -880,15 +974,18 @@ def fit_weights(
             out[name] = TaskFit(name, True, "teacher_uninformative", tau2=tau2, lam=0.0,
                                 lam_raw=lam_raw, varsigma2=max(varsigma2, 0.0), r2=r2,
                                 lam_se=lam_se, n_eff=n_eff, no_rl_signal_frac=no_rl_frac,
+                                n_eff_steps=n_eff_steps, sigma2_is_across_step=not warming,
+                                sigma2_perm_median=float(sig2_perm[keep].median()),
                                 n_ids=n_ids, n_tokens=n_tok, sigma2=sigma2,
                                 implied_beta=torch.zeros_like(a2), keep=keep,
                                 shrink=torch.ones_like(a2))
             continue
 
-        reason = "ok"
+        reason = "warming_up" if warming else "ok"
         floor = cfg.min_residual_frac * mean_d2
         if varsigma2 < floor:
-            varsigma2, reason = floor, "residual_floored"
+            varsigma2 = floor
+            reason = "warming_up" if warming else "residual_floored"
 
         prec_d = lam * lam / varsigma2                 # the teacher's precision
         implied_beta = lam * sigma2 / varsigma2        # omega_D / omega_R, per id
@@ -904,10 +1001,13 @@ def fit_weights(
         # one source with no information how much signal is present, while the
         # other source is saying it is not zero.
         #
-        # Under Adam a per-coordinate rescaling that is constant over time is
-        # close to a no-op anyway (m and sqrt(v) scale together), so applying it
-        # would buy little beyond its effect through the global clip, at the
-        # price of that failure mode.
+        # An earlier version of this note also argued that applying it would be
+        # nearly free because Adam normalises each coordinate over time. That
+        # argument is withdrawn: Adam normalises per PARAMETER, and a logit
+        # coordinate flows into a 2048-wide output row -- tied to the input
+        # embedding on this model -- and into the trunk, where every id is mixed
+        # before any normalisation. The reason it is not applied is the failure
+        # mode above and nothing else.
         shrink = torch.ones_like(a2)
         for st, t2s in tau2_by_stratum.items():
             sel = strat == st
@@ -920,6 +1020,8 @@ def fit_weights(
         shrink = torch.where(keep, shrink, torch.ones_like(a2))
         out[name] = TaskFit(name, True, reason, tau2=tau2, lam=lam, lam_raw=lam_raw,
                             varsigma2=varsigma2, r2=r2, lam_se=lam_se, n_eff=n_eff,
+                            n_eff_steps=n_eff_steps, sigma2_is_across_step=not warming,
+                            sigma2_perm_median=float(sig2_perm[keep].median()),
                             n_ids=n_ids, n_tokens=n_tok, no_rl_signal_frac=no_rl_frac,
                             sigma2=sigma2, implied_beta=implied_beta, shrink=shrink,
                             keep=keep, at_cap_frac=float((at_cap & keep).sum()) / max(n_ids, 1))
@@ -1015,6 +1117,11 @@ def beta_ratio_matrix(fits, task_names, vocab, base_beta, *, device=None) -> tor
     for i, name in enumerate(names):
         fit = fits.get(str(name)) if fits else None
         if fit is None or not fit.valid or fit.implied_beta is None:
+            continue
+        if not fit.sigma2_is_across_step:
+            # A warm-up fit rests on the permutation null, which is the wrong
+            # variance and collapses where the reward is flat. Leave the run at
+            # its own coefficient until enough steps have accumulated.
             continue
         out[i] = (fit.implied_beta / base).to(device=out.device, dtype=out.dtype)
     return out

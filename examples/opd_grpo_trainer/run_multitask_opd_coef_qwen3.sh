@@ -199,6 +199,7 @@ _LPREC_COMMON=(
     "+algorithm.opd.logit_precision.max_beta_ratio=1000.0"
     "+algorithm.opd.logit_precision.allow_negative_lambda=False"
     "+algorithm.opd.logit_precision.min_tokens=64"
+    "+algorithm.opd.logit_precision.min_eff_steps=3.0"
     "+algorithm.opd.logit_precision.chunk_tokens=32"
 )
 
@@ -453,7 +454,7 @@ case "$ARM" in
         )
         ;;
     *)
-        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | cross2k100, got: $ARM" >&2
+        echo "ARM must be control | uniform | redistribute | pushback | cross | cross2 | cross2k100 | lprec | lprecw, got: $ARM" >&2
         exit 1
         ;;
 esac
