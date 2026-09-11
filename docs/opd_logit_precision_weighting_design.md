@@ -212,16 +212,36 @@ step 間 EMA（decay 0.8）も併用。窓は §6 の時間相関から決める
 そこから 4 本の重みを作り、$\pi$ を位置のチャンクに切って重み付き列和を取る。
 最大の中間テンソルは (chunk, V) = 既定 19 MB。**トークン × 語彙は一度も持たない。**
 
-### 5.2 適用（未実装）とそのコスト
+### 5.2 適用（実装済み）とそのコスト
 
-適用はスカラー損失を組まず、cotangent を直接組み立てて backward 1 回に渡す。
-ただし**この cotangent は密テンソルになる**。
+**改訂 2 が予告した密 cotangent 3.1 GB は不要だった。** 回避できる構造がある。
+
+OPD 損失がロジットに届く経路は student の top-k 対数確率 $s$（(T, k)）だけである。
+そのような損失なら必ず
+
+$$\frac{\partial L}{\partial z_u}=\mathbb 1[u\in A]\frac{\partial L}{\partial s_u}-\pi[u]\sum_j\frac{\partial L}{\partial s_j}$$
+
+すなわち **支持上の疎な項 + rank-1 の背景**である。したがって **$k$ 個の係数の側を重み付けして
+log-softmax の backward をそのまま走らせれば**、
+
+$$\mathbb 1[u\in A]\,w_u\frac{\partial L}{\partial s_u}-\pi[u]\sum_j w_j\frac{\partial L}{\partial s_j}$$
+
+が得られる。支持上では $w$ が厳密に効き、背景には支持の加重平均が効き、
+**同じ log-softmax の引き戻しなので語彙総和ゼロが自動的に保たれる**
+（総和ゼロでない cotangent はロジットの全体水準を押す。方策は無視するがパラメータは動く）。
+背景を id 別ではなく平均で重み付けするのは、背景が正規化子の反作用であって
+教師の id 別の選好を含まないことの素直な帰結である。
+
+実装は `reweighted_opd_surrogate`。$\partial L/\partial s$ は KL ヘッドだけを通る
+backward 1 回（trunk に入らない）で取れ、あとは代理スカラーを損失に足すだけ。
+**$w\equiv1$ で元の勾配を厳密に再現する**ことをテストで固定している（$10^{-12}$）。
 
 | 項目 | 量 |
 |---|---|
-| 計測の追加 forward / backward | なし |
+| 追加 forward / backward | なし（KL ヘッドのみの VJP 1 回、trunk には入らない） |
 | 計測の一時領域 | (chunk, V) = 19 MB、集約 3.6 MB、per-row プロファイル (bs, V) = 6 MB |
-| **適用時の密 cotangent** | **10 行 × 512 × 151,936 × 4 B ≈ 3.1 GB**（現行 PG 経路は flash-attn の `inplace_backward=True` でこれを作らない） |
+| 適用時の密テンソル | **不要** |
+| 重み行列 | (n_tasks, V) = 1.8 MB、gather は (bs, resp, k) |
 | 順列統計 | 行単位なのでタスクあたり 2 本の V ベクトル。群単位なら 45 群 × 8 × V ≈ 219 MB が必要だった |
 
 **タイミング。** $a_i[v]$ はその step の全 micro-batch の forward が終わるまで確定しないが、
@@ -258,10 +278,15 @@ advantage で重み付けした押しが無い。§7 手順 1 がそれを足す
 
 | 手順 | 内容 | GPU | 時間 |
 |---|---|---|---|
-| 1 | 計測コード。**実装済み**（`opd_logit_precision.py`、41 テスト） | 不要 | — |
-| 2 | 観測 run。checkpoint 1 つで 10 step。学習は変えない | 要 | 1.5 h |
+| 1 | 計測・適用の両方と 2 アーム（`ARM=lprec` / `lprecw`）。**実装済み**、183 テスト | 不要 | — |
+| 2 | `ARM=lprec` の観測 run。学習は変えないので control 兼用 | 要 | 1.5 h |
 | 2' | early（step 25）と late（step 150）の 2 点 | 要 | +1.5 h |
-| 3 | 判定 | — | — |
+| 3 | 判定（下記） | — | — |
+| 4 | 通れば `ARM=lprecw` | 要 | 18 h |
+
+`lprec` と `lprecw` のコマンドラインは `observe_only` の 1 フラグだけが違う。
+アームの中身とロックは `run_multitask_opd_coef_qwen3.sh` と
+`expected_multitask_opd_coef_lprec{,w}_config.yaml`（各 118 キー固定）。
 
 **判定基準（事前に固定）**
 

@@ -129,7 +129,9 @@ from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, co
 from verl.trainer.ppo.opd_logit_precision import (
     LogitPrecisionConfig,
     StepAccumulator,
+    beta_ratio_matrix,
     fit_weights,
+    reweighted_opd_surrogate,
     topk_kl_logit_grad,
 )
 from verl.trainer.ppo.opd_cross_gate import (
@@ -2783,6 +2785,10 @@ class DataParallelPPOActor(BasePPOActor):
         # references and lambda for THIS step are read ONCE here and fixed for
         # every micro-batch; the step's own statistics update them at the end.
         logit_prec = self.logit_precision_controller(task_id_names) if use_teacher_kl_loss else None
+        # Defined unconditionally: the micro-batch body reads it on every path,
+        # and leaving it bound only inside the enabled branch is a NameError on
+        # every run that does not use this mechanism.
+        _lp_ratio = None
         if logit_prec is not None:
             _lp_cfg, _lp_step, _lp_ema = logit_prec
             if not self.response_only_logits:
@@ -2796,12 +2802,13 @@ class DataParallelPPOActor(BasePPOActor):
                     "logit_precision measures the teacher's push on the STUDENT's top-k "
                     "support; it needs kl_loss_type=topk_kl and student_indexed_topk=true."
                 )
-            if not bool(_lp_cfg.observe_only):
-                raise NotImplementedError(
-                    "logit_precision.observe_only=false is not implemented yet: the "
-                    "measurement lands first and the weights are applied only after the "
-                    "pilot has said what they are (design doc section 7)."
-                )
+            # The weights applied this step were fitted from the EMA as it
+            # stood at the END of the previous one. They cannot come from this
+            # step: a_i[v] is a sum over the whole batch and is not final until
+            # every micro-batch's forward has run, while the backward runs per
+            # micro-batch. One step of staleness, the same structure the cross
+            # gate has.
+            _lp_ratio = getattr(self, "_lp_ratio", None) if not _lp_cfg.observe_only else None
             _lp_step.zero_()
             self._lp_want_logits = True
         cross_gate = self.cross_gate_controller(task_id_names) if use_teacher_kl_loss else None
@@ -4976,9 +4983,16 @@ class DataParallelPPOActor(BasePPOActor):
                                 clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
                             )
                         _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
+                        # The OPD term is assembled into _opd_term and added
+                        # ONCE below, so the per-id reweighting has a single
+                        # place to intercept it. Three branches reach it and all
+                        # three have to be interceptable: an arm that reweights
+                        # two of them and silently not the third is the failure
+                        # this shape exists to prevent.
+                        _opd_term = None
                         if task_loss_weight is None:
                             if _kl_row_coef is None and _pb_w is None:
-                                policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef
+                                _opd_term = teacher_kl_loss * teacher_kl_coef
                             else:
                                 # Scaled BEFORE the token mean, so each token is
                                 # weighted by its own task's coefficient and by the
@@ -4990,7 +5004,7 @@ class DataParallelPPOActor(BasePPOActor):
                                               else _kld_for_loss * _kl_row_coef.reshape(-1, 1)),
                                     loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
                                 )
-                                policy_loss = policy_loss + _scaled * teacher_kl_coef
+                                _opd_term = _scaled * teacher_kl_coef
                         else:
                             # Per-task normalised variant: the driver put a weight on
                             # every row such that summing weight * row-KL over the whole
@@ -5008,8 +5022,23 @@ class DataParallelPPOActor(BasePPOActor):
                             weighted_teacher_kl = weighted_teacher_kl * (
                                 self.task_dp_world_size * self.gradient_accumulation
                             )
-                            policy_loss = policy_loss + weighted_teacher_kl * teacher_kl_coef
+                            _opd_term = weighted_teacher_kl * teacher_kl_coef
                             _defer("actor/teacher_kl_loss_weighted", weighted_teacher_kl)
+                        if _lp_ratio is not None and teacher_topk_kl:
+                            # Per-id precision weighting. The surrogate has the
+                            # SAME gradient as _opd_term wherever the weight is
+                            # one, so an unmeasured task or id leaves the run
+                            # exactly where it was.
+                            _w = _lp_ratio[task_ids.to(_lp_ratio.device).clamp(min=0)]
+                            _w = _w.unsqueeze(1).expand(-1, response_length, -1).gather(
+                                2, student_topk_ids.to(torch.int64)
+                            )
+                            _opd_term = reweighted_opd_surrogate(
+                                _opd_term, student_topk_logprobs, _w
+                            )
+                            _defer("actor/logit_prec/applied_w_mean", _w.detach().mean())
+                        policy_loss = policy_loss + _opd_term
+
                         # Deferred, and appended rather than assigned: assignment kept
                         # only the LAST micro-batch, which after _balance_batch's
                         # reorder is often entirely adjust_batch padding.
@@ -5237,9 +5266,14 @@ class DataParallelPPOActor(BasePPOActor):
             # know how the rows were dealt.
             _lp_step.all_reduce_()
             _lp_ema.ema_(_lp_step, _lp_cfg.ema_decay)
-            for _fit in fit_weights(_lp_ema, task_id_names, _lp_cfg,
-                                    base_beta=float(self.config.get("teacher_kl_loss_coef", 0.0))).values():
+            _lp_base = float(self.config.get("teacher_kl_loss_coef", 0.0))
+            _lp_fits = fit_weights(_lp_ema, task_id_names, _lp_cfg, base_beta=_lp_base)
+            for _fit in _lp_fits.values():
                 metrics.update(_fit.metrics())
+            if not _lp_cfg.observe_only:
+                self._lp_ratio = beta_ratio_matrix(
+                    _lp_fits, task_id_names, _lp_ema.vocab, _lp_base, device=_lp_ema.a.device
+                )
         if sign_stats is not None:
             metrics.update(sign_stats.metrics())
             metrics["sign_weight/mode_is_target"] = float(sign_mode == "target")

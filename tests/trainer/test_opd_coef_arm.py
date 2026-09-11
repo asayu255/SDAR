@@ -27,7 +27,8 @@ import pytest
 from verl.trainer.main_opd import KL_COEF_BY_TASK_BOX, validate_kl_coef_by_task
 from verl.utils.expected_config import load_expectations
 
-ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2", "cross2k100")
+ARMS = ("control", "uniform", "redistribute", "pushback", "cross", "cross2", "cross2k100",
+        "lprec", "lprecw")
 EXPECT = "examples/opd_grpo_trainer/expected_multitask_opd_coef_{arm}_config.yaml"
 SCRIPT = "examples/opd_grpo_trainer/run_multitask_opd_coef_qwen3.sh"
 
@@ -43,6 +44,11 @@ B = {
     # the strength arm on the revised objective: cross2 with q_scale=100, so
     # the static coefficient is null for the same reason cross2's is
     "cross2k100": None,
+    # Per-id precision weighting: the coefficient it changes is per ID and lives
+    # in the mechanism, not in a per-task constant, so the static one is null
+    # for the same reason the gate arms' are.
+    "lprec": None,
+    "lprecw": None,
 }
 CALIBRATION_D = {"alfworld": 0.4563, "search": 0.8859, "webshop": 0.4084}
 
@@ -70,7 +76,10 @@ def _is_pushback_key(key):
 # allowed to differ from control so the coefficient arms are not reported as
 # having drifted.
 SPEC_ROOT = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
-CROSS_FAMILY = ("control", "cross", "cross2", "cross2k100")
+# The spec-decode-on family. The logit_precision arms join it because they
+# are built from the control lock and are compared against the control run,
+# so they have to sample the way it did.
+CROSS_FAMILY = ("control", "cross", "cross2", "cross2k100", "lprec", "lprecw")
 
 
 def _is_spec_key(key):

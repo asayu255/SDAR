@@ -814,3 +814,97 @@ def fit_weights(
                             sigma2=sigma2, implied_beta=implied_beta, shrink=shrink,
                             keep=keep, at_cap_frac=float((at_cap & keep).sum()) / max(n_ids, 1))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Applying the weights
+# ---------------------------------------------------------------------------
+
+
+def reweighted_opd_surrogate(opd_scalar, student_topk_logprob, weight_topk):
+    """A scalar whose backward is the OPD gradient reweighted per vocabulary id.
+
+    WHY NOT JUST BUILD THE COTANGENT. Multiplying the (tokens x vocab) logit
+    gradient by a per-id weight needs that tensor materialised -- at this
+    micro-batch shape and vocabulary, 3.1 GB in float32, against roughly 4 GB of
+    headroom. This gets the same result without it.
+
+    THE STRUCTURE THAT MAKES IT POSSIBLE. The OPD loss reaches the logits only
+    through the student's top-k log-probs ``s``, a (tokens, k) gather of the
+    log-softmax. For any such loss,
+
+        dL/dz_u = 1[u in A] (dL/ds_u)  -  pi[u] sum_j (dL/ds_j)
+
+    -- sparse on the support, plus one rank-one background. So reweighting the k
+    COEFFICIENTS and letting the log-softmax backward run as usual gives
+
+        1[u in A] w_u (dL/ds_u)  -  pi[u] sum_j w_j (dL/ds_j)
+
+    which applies ``w`` exactly on the support, applies the support's weighted
+    average to the background, and -- because it is still the pullback of a
+    (tokens, k) cotangent through the same log-softmax -- automatically sums to
+    zero over the vocabulary. A cotangent that did not would push the overall
+    logit level, which the policy ignores and the parameters do not.
+
+    Weighting the background by an average rather than per id is the honest
+    reading of what the background is: the normaliser's recoil, carrying no
+    per-id preference of the teacher's to weight.
+
+    ``dL/ds`` costs one backward over the KL head alone -- exp, two sums, the
+    aggregation -- and does not enter the trunk. The returned scalar is then
+    added to the policy loss in place of the OPD term, and the step's single
+    backward carries it.
+
+    Args:
+        opd_scalar: exactly the scalar the OPD term would have contributed,
+            coefficient and aggregation included.
+        student_topk_logprob: the (bs, resp, k) tensor it flows through.
+        weight_topk: (bs, resp, k) per-id weight, gathered at the support ids
+            and already divided by the base coefficient the scalar carries.
+
+    Returns:
+        A scalar with the reweighted gradient, and ``weight_topk == 1``
+        reproduces ``opd_scalar``'s own gradient exactly.
+    """
+    (gcoef,) = torch.autograd.grad(
+        opd_scalar, student_topk_logprob, retain_graph=True, create_graph=False
+    )
+    return (student_topk_logprob * (weight_topk.to(gcoef.dtype) * gcoef).detach()).sum()
+
+
+def beta_ratio_at(fit: "TaskFit", topk_ids: torch.Tensor, base_beta: float) -> torch.Tensor:
+    """``implied_beta / base_beta`` gathered at the support ids, or ones.
+
+    The surrogate multiplies a scalar that ALREADY carries ``base_beta``, so the
+    weight it needs is the ratio rather than the coefficient. An invalid fit
+    gives ones, which is the run's present behaviour -- never zero, because a
+    measurement that failed must not silently switch the teacher off.
+    """
+    if fit is None or not fit.valid or fit.implied_beta is None:
+        return torch.ones_like(topk_ids, dtype=torch.float32)
+    base = abs(float(base_beta))
+    if base <= 0.0:
+        return torch.ones_like(topk_ids, dtype=torch.float32)
+    ratio = (fit.implied_beta / base).to(torch.float32)
+    return ratio.to(topk_ids.device).gather(0, topk_ids.reshape(-1).to(torch.int64)).view_as(topk_ids)
+
+
+def beta_ratio_matrix(fits, task_names, vocab, base_beta, *, device=None) -> torch.Tensor:
+    """``implied_beta / base_beta`` as (n_tasks, vocab), ones where unmeasured.
+
+    Ones rather than zeros in every fallback -- a task whose fit was refused,
+    an id below the activity floor, a base coefficient of zero -- so a failed
+    measurement leaves the run at the coefficient it already uses instead of
+    silently switching the teacher off.
+    """
+    names = list(task_names)
+    out = torch.ones(len(names), int(vocab), device=device, dtype=torch.float32)
+    base = abs(float(base_beta))
+    if base <= 0.0:
+        return out
+    for i, name in enumerate(names):
+        fit = fits.get(str(name)) if fits else None
+        if fit is None or not fit.valid or fit.implied_beta is None:
+            continue
+        out[i] = (fit.implied_beta / base).to(device=out.device, dtype=out.dtype)
+    return out

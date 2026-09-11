@@ -508,8 +508,12 @@ def test_the_actor_refuses_the_settings_the_measurement_cannot_be_taken_under():
     src = inspect.getsource(dp_actor)
     assert "logit_precision reads the packed response logits" in src
     assert "logit_precision measures the teacher's push on the STUDENT's top-k" in src
-    # The apply path does not exist yet and must say so rather than no-op.
-    assert "observe_only=false is not implemented yet" in src
+    # The OPD term is assembled once so the reweighting cannot miss a branch.
+    # init, three assembly branches, one reweighting swap.
+    assert src.count("_opd_term = ") == 5
+    assert src.count("policy_loss = policy_loss + _opd_term") == 1
+    # The applied weights are last step's, and the code has to say why.
+    assert "One step of staleness" in src
 
 
 def test_an_unknown_knob_is_refused_rather_than_dropped():
@@ -582,3 +586,70 @@ def test_lambda_carries_its_own_uncertainty_and_effective_sample_size():
     assert math.isfinite(spread.lam_se) and spread.lam_se > 0.0
     assert "logit_prec/t/n_eff_ids" in conc.metrics()
     assert "logit_prec/t/lam_t" in conc.metrics()
+
+
+# ---------------------------------------------------------------------------
+# 9. the apply path
+# ---------------------------------------------------------------------------
+
+
+def _kl_scalar(logits, topk_ids, t_lp, coef):
+    s = torch.log_softmax(logits, dim=-1).gather(-1, topk_ids)
+    return s, coef * topk_kl_per_token(s, t_lp).sum()
+
+
+def test_a_unit_weight_reproduces_the_original_gradient_exactly():
+    """The apply path has to be a no-op at omega = 1, or the arm is confounded."""
+    from verl.trainer.ppo.opd_logit_precision import reweighted_opd_surrogate
+
+    logits, topk_ids, t_lp = _mk(seed=50)
+    z = logits.clone().requires_grad_(True)
+    s, scalar = _kl_scalar(z, topk_ids, t_lp, 0.01)
+    (want,) = torch.autograd.grad(scalar, z, retain_graph=True)
+
+    sur = reweighted_opd_surrogate(scalar, s, torch.ones_like(s))
+    (got,) = torch.autograd.grad(sur, z)
+    assert torch.allclose(got, want, atol=1e-12), (got - want).abs().max()
+
+
+def test_the_weight_lands_exactly_on_the_support_and_averages_the_background():
+    from verl.trainer.ppo.opd_logit_precision import reweighted_opd_surrogate
+
+    logits, topk_ids, t_lp = _mk(seed=51)
+    z = logits.clone().requires_grad_(True)
+    s, scalar = _kl_scalar(z, topk_ids, t_lp, 0.01)
+    (gs,) = torch.autograd.grad(scalar, s, retain_graph=True)
+    w = 0.3 + 2.0 * torch.rand(s.shape, generator=torch.Generator().manual_seed(3), dtype=s.dtype)
+
+    sur = reweighted_opd_surrogate(scalar, s, w)
+    (got,) = torch.autograd.grad(sur, z)
+
+    pi = torch.softmax(logits, dim=-1)
+    want = -pi * (w * gs).sum(-1, keepdim=True)
+    want = want.scatter_add(-1, topk_ids, w * gs)
+    assert torch.allclose(got, want, atol=1e-12), (got - want).abs().max()
+
+
+def test_the_reweighted_cotangent_still_sums_to_zero():
+    """Softmax ignores a uniform logit shift; the parameters do not."""
+    from verl.trainer.ppo.opd_logit_precision import reweighted_opd_surrogate
+
+    logits, topk_ids, t_lp = _mk(seed=52)
+    z = logits.clone().requires_grad_(True)
+    s, scalar = _kl_scalar(z, topk_ids, t_lp, 0.01)
+    w = torch.rand(s.shape, generator=torch.Generator().manual_seed(4), dtype=s.dtype) * 5.0
+    (got,) = torch.autograd.grad(reweighted_opd_surrogate(scalar, s, w), z)
+    assert got.sum(-1).abs().max() < 1e-12
+
+
+def test_the_gathered_ratio_is_relative_to_the_run_coefficient():
+    from verl.trainer.ppo.opd_logit_precision import beta_ratio_at
+
+    acc = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=200, seed=53)
+    fit = fit_weights(acc, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    ids = torch.tensor([[[0, 5, 9]]])
+    got = beta_ratio_at(fit, ids, 1.0)
+    assert torch.allclose(got.reshape(-1).double(), fit.implied_beta[[0, 5, 9]], rtol=1e-6)
+    # A refused fit must leave the run at its own coefficient, never at zero.
+    bad = TaskFit("t", False, "too_few_tokens")
+    assert torch.allclose(beta_ratio_at(bad, ids, 0.01), torch.ones_like(ids, dtype=torch.float32))

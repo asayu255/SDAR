@@ -184,6 +184,24 @@ _SPEC_ON=(
 # entries from engine_kwargs, so null reaches the engine as "no spec decode".
 _SPEC_OFF=( "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config=null" )
 
+# Shared by the two logit_precision arms below, so their command lines differ
+# in exactly one flag. observe_only is NOT here: it is the difference.
+_LPREC_COMMON=(
+    "+algorithm.opd.kl_loss_coef_by_task=null"
+    "+algorithm.opd.pushback_control=null"
+    "+algorithm.opd.cross_gate=null"
+    "+algorithm.opd.logit_precision.enable=True"
+    "+algorithm.opd.logit_precision.ema_decay=0.8"
+    "+algorithm.opd.logit_precision.n_strata=10"
+    "+algorithm.opd.logit_precision.min_activity=1e-6"
+    "+algorithm.opd.logit_precision.sigma2_floor_frac=1e-3"
+    "+algorithm.opd.logit_precision.min_residual_frac=1e-3"
+    "+algorithm.opd.logit_precision.max_beta_ratio=1000.0"
+    "+algorithm.opd.logit_precision.allow_negative_lambda=False"
+    "+algorithm.opd.logit_precision.min_tokens=64"
+    "+algorithm.opd.logit_precision.chunk_tokens=32"
+)
+
 case "$ARM" in
     control)
         SPEC_ARGS=( "${_SPEC_ON[@]}" )
@@ -313,6 +331,66 @@ case "$ARM" in
             "+algorithm.opd.cross_gate.split_seed=1"
             "+algorithm.opd.cross_gate.roles=[format,env_action]"
         )
+        ;;
+    lprec)
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        # PER-ID PRECISION WEIGHTING of the RL and OPD signals.
+        # See verl/trainer/ppo/opd_logit_precision.py and
+        # docs/opd_logit_precision_weighting_design.md.
+        #
+        # WHAT IT REPLACES. Today the loss is pg + beta * teacher_kl with
+        # beta = 0.01 for every task and every vocabulary id. In the model's
+        # terms that single constant is a claim about lambda sigma^2 /
+        # varsigma^2, and it has never been measured. This measures it per task
+        # and per id and, in the `lprecw` arm, uses it.
+        #
+        # TWO ARMS, AND `lprec` IS THE ONE TO RUN FIRST.
+        #
+        #   lprec   observe_only. The statistics and the fitted weights are
+        #           computed and logged; the LOSS IS UNTOUCHED. It is therefore
+        #           also a clean OPD+GRPO control -- its checkpoints and val
+        #           numbers are comparable with the control arm's, and the
+        #           counterfactual beta trajectory comes free with them.
+        #   lprecw  the same, applying the weights.
+        #
+        # WHY THE PILOT IS NOT OPTIONAL. The design's go/no-go is stated in
+        # terms of numbers nobody has: whether lambda sigma^2 / varsigma^2
+        # differs from 0.01 by an order of magnitude, how many ids actually
+        # decide lambda (n_eff -- the OPD push is concentrated enough that a
+        # regression over thousands of ids can be settled by ten), and how
+        # large the region is where the reward says nothing at all. On webshop
+        # 62.3 percent of tokens carry zero advantage, and there the teacher is
+        # the only gradient there is; `no_rl_signal_frac` measures exactly that.
+        # Running lprecw first would be running an arm whose strength nobody
+        # has measured, which is what the cross-gate strength arm turned out
+        # to be.
+        #
+        # WHAT TO READ, in order:
+        #   logit_prec/<task>/beta_median          against 0.01
+        #   logit_prec/<task>/lam_t, n_eff_ids     is lambda a statistic or a ratio of ten tokens
+        #   logit_prec/<task>/no_rl_signal_frac    how much of the vocabulary the reward abstains on
+        #   logit_prec/<task>/lam_raw              negative means the teacher opposes its own reward
+        #   logit_prec/<task>/beta_at_cap_frac     a cap that starts binding is the mechanism, not the fit
+        #
+        # WHAT THIS ARM DOES NOT DO. It does not address cross-task
+        # interference. Under the equal-weight objective this repo already
+        # declares (normalize_loss_by_task=true) the sum over tasks IS the
+        # correct gradient, so the estimator has no cross-task term and the
+        # mechanism decomposes into three single-task copies. The seesaw the
+        # earlier arms chased is out of scope by construction, not by oversight.
+        OPD_COEF_ARGS=( "${_LPREC_COMMON[@]}" "+algorithm.opd.logit_precision.observe_only=True" )
+        ;;
+    lprecw)
+        # The applying half of the pair above. Same config in every other
+        # respect, so a diff of the two command lines is one flag -- which
+        # is what makes the pair an A/B and not two experiments.
+        #
+        # Do not run this before `lprec`. Its strength is whatever the fit
+        # turns out to be, and that has never been measured; launching it
+        # first repeats the cross-gate strength arm, which ran 150 steps at
+        # a mean attenuation of 0.019 percent before anyone checked.
+        SPEC_ARGS=( "${_SPEC_ON[@]}" )
+        OPD_COEF_ARGS=( "${_LPREC_COMMON[@]}" "+algorithm.opd.logit_precision.observe_only=False" )
         ;;
     cross2k100)
         SPEC_ARGS=( "${_SPEC_ON[@]}" )
