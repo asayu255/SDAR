@@ -201,6 +201,11 @@ _LPREC_COMMON=(
     "+algorithm.opd.logit_precision.min_tokens=64"
     "+algorithm.opd.logit_precision.min_eff_steps=3.0"
     "+algorithm.opd.logit_precision.chunk_tokens=32"
+    # The lm-head comparison: is G_i[v,:] = sum_t h_t[v] x_t anything more
+    # than H_i[v] times a common hidden direction? 512 ids against the
+    # measured concentration (64 carry 40-99% of ||H^OPD||^2), costing
+    # ~0.3% of the lm_head matmul and 25 MB. See lm_head_metrics.
+    "+algorithm.opd.logit_precision.lm_head_topm=512"
 )
 
 case "$ARM" in

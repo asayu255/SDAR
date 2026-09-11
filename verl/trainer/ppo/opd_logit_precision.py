@@ -96,7 +96,10 @@ from typing import Optional
 import torch
 
 __all__ = [
+    "LmHeadState",
     "LogitPrecisionConfig",
+    "lm_head_metrics",
+    "select_lm_ids",
     "topk_kl_logit_grad",
     "StepAccumulator",
     "fit_weights",
@@ -170,6 +173,38 @@ class LogitPrecisionConfig:
     # visible rather than silently becoming the mechanism -- which is what
     # lambda_max turned out to be in the cross-gate strength arm.
     max_beta_ratio: float = 1000.0
+    # HOW MANY VOCABULARY IDS THE LM-HEAD MEASUREMENT KEEPS. 0 turns it off.
+    #
+    # The question it answers: is the lm-head weight gradient
+    # G_i[v, :] = sum_t h_{i,t}[v] x_{i,t} anything more than H_i[v] times a
+    # common hidden direction? Decomposing x_t = xbar + xtilde_t gives
+    #
+    #     G_i[v, :] = H_i[v] xbar_i  +  sum_t h_{i,t}[v] xtilde_{i,t}
+    #
+    # so the logit-space vector IS the xbar component of the weight-space one.
+    # If the rank-1 part explains G, then for every pair
+    #
+    #     cos(G_i, G_j) = cos(xbar_i, xbar_j) cos(H_i, H_j)
+    #
+    # -- weight space can only RESCALE logit space's answer, and can change
+    # which pairs read as conflicting in exactly one way: by the sign of
+    # cos(xbar_i, xbar_j). That factor is logged, because whether it is
+    # positive is an empirical question about this model's hidden states and
+    # not something to assume from anisotropy.
+    #
+    # WHY A SUBSET AND NOT THE VOCABULARY. Two independent reasons, both hard.
+    # Memory: a full (V, hidden) buffer is 1.2 GB per task in float32 against
+    # 5.5 GB of headroom at this batch shape. Compute: the dense half of h_t is
+    # a scalar times pi_t, so the full-vocabulary accumulation is a
+    # (V, T) x (T, hidden) product -- the same order as the lm_head matmul
+    # itself, i.e. a second forward's worth of work. On the kept subset it is
+    # m/V of that: 0.3 percent at the default.
+    #
+    # 512 is chosen against the measured concentration, not for comfort: on the
+    # k100 dumps 64 ids carry between 40 and 99 percent of ||H^OPD||^2. The
+    # ratio is reported ON THIS SUBSET and is a statement about the subspace the
+    # mechanism would operate in, which is the one that matters.
+    lm_head_topm: int = 0
 
     def validate(self) -> None:
         if not (0.0 <= self.ema_decay < 1.0):
@@ -190,6 +225,8 @@ class LogitPrecisionConfig:
             raise ValueError(f"min_eff_steps must be finite and >= 1, got {self.min_eff_steps}")
         if not (self.sigma2_floor_frac >= 0.0) or not math.isfinite(self.sigma2_floor_frac):
             raise ValueError(f"sigma2_floor_frac must be finite and >= 0, got {self.sigma2_floor_frac}")
+        if self.lm_head_topm < 0:
+            raise ValueError(f"lm_head_topm must be >= 0 (0 = off), got {self.lm_head_topm}")
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +438,11 @@ class StepAccumulator:
         support_term: Optional[torch.Tensor] = None,  # (T, k), RAW from topk_kl_logit_grad
         token_valid: Optional[torch.Tensor] = None,   # (T,) 1 where the token counts
         chunk_tokens: int = 32,
+        hidden: Optional[torch.Tensor] = None,        # (T, hidden) lm_head's input
+        lm_state: Optional["LmHeadState"] = None,
+        lm_ids: Optional[torch.Tensor] = None,        # (m,) the kept vocabulary ids
+        lm_slot_of_id: Optional[torch.Tensor] = None, # (V,) inverse of lm_ids, -1 off it
+        base_beta: float = 0.0,
     ):
         """Fold one micro-batch in, taking the logits in the packed layout.
 
@@ -425,6 +467,12 @@ class StepAccumulator:
         already carries on the dense half of the same gradient. Making the
         caller apply it to one half and not the other is how the two halves of
         one gradient end up on different scales.
+
+        ``hidden`` and ``lm_state`` are the lm-head measurement, and ride on THIS
+        loop rather than opening a second one: the dense half of both pushes is a
+        scalar times ``pi``, so it needs the same softmax this method already
+        computes. A separate pass would double the widest reduction in the step
+        for a diagnostic.
         """
         if logits.dim() != 2:
             raise ValueError(f"add_packed wants (T, V) logits, got {tuple(logits.shape)}")
@@ -472,6 +520,16 @@ class StepAccumulator:
         dense_opd = torch.zeros_like(dense_rl)
         dense_act = torch.zeros_like(dense_rl)
         prof_dense = torch.zeros(n_rows_mb, vocab, device=dev, dtype=work)
+        lm_on = (lm_state is not None and lm_ids is not None and lm_slot_of_id is not None
+                 and hidden is not None and int(lm_ids.numel()) > 0)
+        if lm_on:
+            hidden = hidden.to(dev)
+            if hidden.shape[0] != n_tok:
+                raise ValueError(
+                    f"hidden has {hidden.shape[0]} rows, logits have {n_tok}; the lm-head "
+                    "measurement reads the SAME packed positions the logits were taken at"
+                )
+            lm_ids = lm_ids.to(dev, torch.int64)
         step = max(1, int(chunk_tokens))
         for c0 in range(0, n_tok, step):
             c1 = min(n_tok, c0 + step)
@@ -481,6 +539,13 @@ class StepAccumulator:
             dense_opd.index_add_(0, tt, w_opd[c0:c1, None] * pi)
             dense_act.index_add_(0, tt, w_act[c0:c1, None] * pi)
             prof_dense.index_add_(0, tr, w_prof[c0:c1, None] * pi)
+            if lm_on:
+                # a's dense half is -w_rl * pi and d's is +w_opd * pi, which is
+                # what makes G_rl and G_opd the two halves of the same H.
+                lm_state.absorb_dense(
+                    pi_sel=pi[:, lm_ids], x=hidden[c0:c1], task=tt,
+                    c_rl=-w_rl[c0:c1], c_opd=w_opd[c0:c1], keep=tok_keep[c0:c1],
+                )
             del pi
 
         # Sparse parts, as flat scatters so one call covers every (group, id).
@@ -500,6 +565,18 @@ class StepAccumulator:
                 topk_ids.to(dev, torch.int64),
                 support_term.to(dev, work) * w_act.unsqueeze(-1),
             )
+
+        if lm_on:
+            # The sparse halves. a carries w_rl at the sampled id; d carries
+            # w_act * support_term at the teacher's k ids.
+            lm_state.absorb_sparse(slot_of_id=lm_slot_of_id, x=hidden, task=ttask,
+                                   ids=sid.unsqueeze(-1), vals=w_rl.unsqueeze(-1), into="G_rl")
+            if topk_ids is not None and support_term is not None:
+                lm_state.absorb_sparse(
+                    slot_of_id=lm_slot_of_id, x=hidden, task=ttask,
+                    ids=topk_ids.to(dev, torch.int64),
+                    vals=support_term.to(dev, work) * w_act.unsqueeze(-1), into="G_opd",
+                )
 
         self.a += (sampled_rl - dense_rl).to(acc_dtype)
         self.d += (opd_support + dense_opd).to(acc_dtype)
@@ -536,6 +613,11 @@ class StepAccumulator:
         student_topk_logprob: Optional[torch.Tensor] = None,
         teacher_topk_logprob: Optional[torch.Tensor] = None,
         chunk_tokens: int = 32,
+        hidden: Optional[torch.Tensor] = None,        # (bs, resp, hidden)
+        lm_state: Optional["LmHeadState"] = None,
+        lm_ids: Optional[torch.Tensor] = None,
+        lm_slot_of_id: Optional[torch.Tensor] = None,
+        base_beta: float = 0.0,
     ):
         """The padded-layout entry point: flattens and calls :meth:`add_packed`.
 
@@ -573,6 +655,9 @@ class StepAccumulator:
             topk_ids=None if topk_ids is None else topk_ids.reshape(bs * resp, -1),
             support_term=support_flat,
             chunk_tokens=chunk_tokens,
+            hidden=None if hidden is None else hidden.reshape(bs * resp, -1),
+            lm_state=lm_state, lm_ids=lm_ids, lm_slot_of_id=lm_slot_of_id,
+            base_beta=base_beta,
         )
 
 
@@ -683,6 +768,254 @@ class StepMoments:
             if name in sd:
                 cur.copy_(sd[name].to(cur.device, cur.dtype))
         return self
+
+
+# ---------------------------------------------------------------------------
+# The lm-head weight gradient, on a fixed subset of ids
+# ---------------------------------------------------------------------------
+
+
+def select_lm_ids(a: torch.Tensor, d: torch.Tensor, base_beta: float, m: int) -> torch.Tensor:
+    """The ``m`` ids carrying the most ``sum_i H_i[v]^2``, as one shared set.
+
+    ONE SET FOR EVERY TASK, not one per task. ``cos(G_i, G_j)`` and
+    ``cos(H_i, H_j)`` are only defined on a common coordinate set, and the
+    comparison between them is the whole point of the measurement. Ranking by
+    the pooled energy rather than by any single task's keeps the set from being
+    one task's subspace.
+
+    Chosen from the SMOOTHED state at the end of the previous step, so the ids
+    are fixed before the step that fills ``G`` begins -- the accumulation needs
+    them up front, and letting the step choose its own ids would make the id set
+    a function of the data it then summarises. One step of staleness, the same
+    structure the applied weights already have.
+
+    Returns an empty tensor when there is no signal to rank yet (step 1), which
+    the caller turns into a skipped measurement rather than an arbitrary set.
+    """
+    H = a + float(base_beta) * d                      # (n_tasks, vocab)
+    energy = (H * H).sum(dim=0)                       # (vocab,)
+    k = int(min(max(m, 0), energy.numel()))
+    if k <= 0 or not bool(torch.isfinite(energy).any()) or float(energy.max()) <= 0.0:
+        return torch.zeros(0, dtype=torch.int64, device=a.device)
+    return torch.topk(energy, k).indices.to(torch.int64).sort().values
+
+
+class LmHeadState:
+    """``G_i[s, :] = sum_t h_{i,t}[ids[s]] x_{i,t}``, the two halves kept apart.
+
+    ``x_t`` is the input to ``lm_head`` at position ``t`` -- the hidden state the
+    output row is contracted with -- so this is the lm-head weight gradient
+    restricted to ``ids``, with the tied input-embedding channel EXCLUDED. The
+    parameter gradient a checkpoint carries is the sum of the output-side term
+    and an input-embedding term that has nothing to do with the push, and that
+    sum is not the object the comparison is about.
+
+    ``G_rl`` and ``G_opd`` are separate because ``H = a + beta * d`` is linear in
+    them, so the combined one is free while the halves stay available -- and the
+    halves are what the reproducibility question is actually about.
+
+    NOT SMOOTHED BY THE CALLER, and that is deliberate. The kept id set is
+    re-chosen every step from the current ``H``, so an EMA of ``G`` would add
+    coordinates that mean different things in different steps. The ratio is a
+    ratio of first moments of MATCHING degree within one step, so a single step
+    already estimates it; averaging belongs to whoever reads the series.
+    ``ema_`` and ``corrected`` are kept because they are correct for a caller
+    that freezes the id set, and the tests cover them.
+    """
+
+    _PER_TASK_MAT = ("G_rl", "G_opd")
+    _PER_TASK_VEC = ("xsum",)
+    _PER_TASK = ("n_tok",)
+    _WEIGHTS = ("w", "w2")
+
+    def __init__(self, n_tasks: int, n_ids: int, hidden: int, *, device=None, dtype=torch.float32):
+        self.n_tasks, self.n_ids, self.hidden = int(n_tasks), int(n_ids), int(hidden)
+        for name in self._PER_TASK_MAT:
+            setattr(self, name, torch.zeros(n_tasks, n_ids, hidden, device=device, dtype=dtype))
+        for name in self._PER_TASK_VEC:
+            setattr(self, name, torch.zeros(n_tasks, hidden, device=device, dtype=dtype))
+        for name in self._PER_TASK:
+            setattr(self, name, torch.zeros(n_tasks, device=device, dtype=dtype))
+        for name in self._WEIGHTS:
+            setattr(self, name, torch.zeros((), device=device, dtype=dtype))
+
+    def _fields(self):
+        return self._PER_TASK_MAT + self._PER_TASK_VEC + self._PER_TASK + self._WEIGHTS
+
+    def to(self, device):
+        for n in self._fields():
+            setattr(self, n, getattr(self, n).to(device))
+        return self
+
+    def zero_(self):
+        for n in self._fields():
+            getattr(self, n).zero_()
+        return self
+
+    def all_reduce_(self):
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return self
+        for n in self._PER_TASK_MAT + self._PER_TASK_VEC + self._PER_TASK:
+            torch.distributed.all_reduce(getattr(self, n), op=torch.distributed.ReduceOp.SUM)
+        return self
+
+    def ema_(self, other: "LmHeadState", decay: float):
+        dcy = float(decay)
+        for n in self._PER_TASK_MAT + self._PER_TASK_VEC + self._PER_TASK + ("w",):
+            cur = getattr(self, n)
+            cur.mul_(dcy).add_(getattr(other, n).to(cur.device, cur.dtype), alpha=1.0 - dcy)
+        self.w2.mul_(dcy * dcy).add_(other.w2.to(self.w2.device, self.w2.dtype), alpha=(1.0 - dcy) ** 2)
+        return self
+
+    def corrected(self) -> "LmHeadState":
+        out = LmHeadState(self.n_tasks, self.n_ids, self.hidden, device=self.w.device, dtype=self.w.dtype)
+        wv = float(self.w)
+        scale = 1.0 / wv if wv > 0 else 0.0
+        for n in self._PER_TASK_MAT + self._PER_TASK_VEC + self._PER_TASK:
+            getattr(out, n).copy_(getattr(self, n) * scale)
+        out.w.fill_(1.0 if wv > 0 else 0.0)
+        out.w2.copy_(self.w2 * (scale * scale))
+        return out
+
+    def state_dict(self) -> dict:
+        out = {"n_tasks": self.n_tasks, "n_ids": self.n_ids, "hidden": self.hidden}
+        out.update({n: getattr(self, n).detach().cpu() for n in self._fields()})
+        return out
+
+    def load_state_dict(self, sd: dict):
+        for key in ("n_tasks", "n_ids", "hidden"):
+            if int(sd.get(key, -1)) != int(getattr(self, key)):
+                raise ValueError(f"lm-head state {key}={sd.get(key)} != this run's {getattr(self, key)}")
+        for n in self._fields():
+            if n in sd:
+                cur = getattr(self, n)
+                cur.copy_(sd[n].to(cur.device, cur.dtype))
+        return self
+
+    # -- accumulation ----------------------------------------------------
+
+    @torch.no_grad()
+    def absorb_dense(self, *, pi_sel, x, task, c_rl, c_opd, keep):
+        """The rank-one-in-pi half of both pushes, for one chunk of positions.
+
+        ``pi_sel`` (n, m) is pi restricted to the kept ids, ``x`` (n, hidden) the
+        hidden states, ``c_rl`` / ``c_opd`` (n,) the scalars that multiply pi in
+        each push. Grouped by task because the tokens of a chunk need not share
+        one, and the destination is per task.
+        """
+        if self.n_ids == 0:
+            return self
+        w = self.G_rl.dtype
+        x = x.to(self.G_rl.device, w)
+        pi_sel = pi_sel.to(x.device, w)
+        for i in range(self.n_tasks):
+            sel = task == i
+            if not bool(sel.any()):
+                continue
+            xi = x[sel]
+            self.G_rl[i].addmm_((pi_sel[sel] * c_rl[sel, None].to(x.device, w)).t(), xi)
+            self.G_opd[i].addmm_((pi_sel[sel] * c_opd[sel, None].to(x.device, w)).t(), xi)
+        kf = keep.to(x.device, w)
+        self.xsum.index_add_(0, task, x * kf[:, None])
+        self.n_tok.index_add_(0, task, kf)
+        return self
+
+    @torch.no_grad()
+    def absorb_sparse(self, *, slot_of_id, x, task, ids, vals, into: str):
+        """The sparse half: ``vals`` at vocabulary ``ids``, dropped outside the set.
+
+        ``ids`` / ``vals`` are (n, k) -- k = 1 for the sampled token, k = topk for
+        the teacher's support. ``slot_of_id`` is the (vocab,) inverse of the id
+        set, -1 off it.
+        """
+        if self.n_ids == 0:
+            return self
+        G = getattr(self, into)
+        dev, w = G.device, G.dtype
+        ids = ids.to(dev, torch.int64)
+        slot = slot_of_id.to(dev)[ids]                                  # (n, k)
+        ok = slot >= 0
+        if not bool(ok.any()):
+            return self
+        k = ids.shape[-1]
+        flat = (task.to(dev, torch.int64)[:, None].expand(-1, k) * self.n_ids + slot)[ok]
+        src = vals.to(dev, w)[ok][:, None] * x.to(dev, w)[:, None, :].expand(-1, k, -1)[ok]
+        G.view(-1, self.hidden).index_add_(0, flat, src)
+        return self
+
+
+def lm_head_metrics(state: "LmHeadState", ids, a, d, base_beta: float, task_names,
+                    prefix: str = "lm_head") -> dict:
+    """How much of the lm-head gradient is the logit-space vector in disguise.
+
+    For each task, the best rank-one approximation of ``G`` along ``H`` is
+    ``u H^T`` with ``u = G^T H / ||H||^2``, and the fraction of ``||G||_F^2`` it
+    explains is
+
+        rank1_share = ||G^T H||^2 / ( ||H||^2 ||G||_F^2 )
+
+    reported alongside the weaker ``xbar`` version, which fixes ``u`` at the mean
+    hidden state instead of fitting it and is therefore a LOWER bound on the
+    same quantity. The decision rule is stated on the fitted one.
+
+    The pair block is the measurement the rank-one question exists to settle:
+    under an exact rank-one ``G``,
+
+        cos(G_i, G_j) = cos(xbar_i, xbar_j) * cos(H_i, H_j)
+
+    so ``cos_G_over_pred`` is 1 when weight space can only rescale logit space's
+    answer, and departs from 1 exactly to the extent that it can change it.
+    Note what the identity does NOT say: the signs agree only where
+    ``cos_xbar`` is positive, so a rank-one ``G`` can still flip which pairs
+    read as conflicting when two tasks' mean hidden directions are opposed.
+    ``cos_G``, ``cos_H`` and ``cos_xbar`` are all logged raw so that can be
+    read off rather than assumed.
+    """
+    names = [str(n) for n in task_names]
+    out: dict = {}
+    n_ids = 0 if ids is None else int(ids.numel())
+    out[f"{prefix}/n_ids"] = float(n_ids)
+    if n_ids == 0 or state is None or float(state.n_tok.sum()) <= 0.0:
+        return out
+    idx = ids.to(a.device, torch.int64)
+    H = (a[:, idx] + float(base_beta) * d[:, idx]).double()             # (n, m)
+    G = (state.G_rl + float(base_beta) * state.G_opd).to(a.device).double()
+    halves = {"": (H, G), "_rl": (a[:, idx].double(), state.G_rl.to(a.device).double()),
+              "_opd": (d[:, idx].double(), state.G_opd.to(a.device).double())}
+    nt = state.n_tok.to(a.device).double().clamp(min=1.0)
+    xbar = state.xsum.to(a.device).double() / nt[:, None]               # (n, hidden)
+    for ti, name in enumerate(names[: state.n_tasks]):
+        for tag, (Hh, Gg) in halves.items():
+            h, g = Hh[ti], Gg[ti]
+            h2 = float(h @ h)
+            gf = float((g * g).sum())
+            if h2 <= 0.0 or gf <= 0.0:
+                out[f"{prefix}/rank1_share{tag}/{name}"] = float("nan")
+                continue
+            u = g.t() @ h                                               # (hidden,)
+            out[f"{prefix}/rank1_share{tag}/{name}"] = float((u @ u) / (h2 * gf))
+        h, g = H[ti], G[ti]
+        h2, gf = float(h @ h), float((g * g).sum())
+        xb2 = float(xbar[ti] @ xbar[ti])
+        out[f"{prefix}/rank1_share_xbar/{name}"] = float(xb2 * h2 / gf) if gf > 0 else float("nan")
+        out[f"{prefix}/H_norm/{name}"] = math.sqrt(max(h2, 0.0))
+        out[f"{prefix}/G_fro/{name}"] = math.sqrt(max(gf, 0.0))
+        out[f"{prefix}/xbar_norm/{name}"] = math.sqrt(max(xb2, 0.0))
+    def _cos(u, v):
+        nu, nv = float(u.norm()), float(v.norm())
+        return float(u.flatten() @ v.flatten() / (nu * nv)) if nu > 0 and nv > 0 else float("nan")
+    for i in range(min(len(names), state.n_tasks)):
+        for j in range(i + 1, min(len(names), state.n_tasks)):
+            tag = f"{names[i]}__{names[j]}"
+            cg, ch, cx = _cos(G[i], G[j]), _cos(H[i], H[j]), _cos(xbar[i], xbar[j])
+            out[f"{prefix}/cos_G/{tag}"] = cg
+            out[f"{prefix}/cos_H/{tag}"] = ch
+            out[f"{prefix}/cos_xbar/{tag}"] = cx
+            pred = cx * ch
+            out[f"{prefix}/cos_G_over_pred/{tag}"] = (cg / pred) if pred not in (0.0,) and math.isfinite(pred) else float("nan")
+            out[f"{prefix}/sign_agree_G_H/{tag}"] = float((cg > 0) == (ch > 0))
+    return out
 
 
 # ---------------------------------------------------------------------------

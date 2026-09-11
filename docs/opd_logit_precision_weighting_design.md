@@ -309,6 +309,57 @@ backward は micro-batch ごとに走る。**同一 step の重みは 1 パス�
 
 ---
 
+### 5.3 ロジット空間と lm ヘッド重み空間は別物か（実装済み、`lm_head_topm`）
+
+**この案がロジット空間を選ぶ理由はコストであって、正しい座標だからではない。** パラメータ空間で
+$\langle g_i,g_j\rangle$ を得るにはタスクごとに勾配を分離する必要があり、backward 1 回では
+$\sum_i g_i$ しか取れない（`grad_probe` が 41 GB の dump を吐くオフラインスクリプトなのはこのため）。
+ロジット空間は両信号が損失の加算前から分離しているので backward 1 回で済む。払う代償は文脈で、
+
+$$\underbrace{\frac{\partial L_i}{\partial W_v}=\sum_t h_{i,t}[v]\,x_{i,t}}_{\text{重み空間}}
+\qquad
+\underbrace{H_i[v]=\sum_t h_{i,t}[v]}_{\text{ロジット空間}}$$
+
+は $x_t\to1$ の置換で結ばれている。$x_t=\bar x+\tilde x_t$ と分けると
+
+$$G_i[v,:]=H_i[v]\,\bar x_i+\sum_t h_{i,t}[v]\,\tilde x_{i,t}$$
+
+で、**ロジット空間は重み空間の $\bar x$ 方向 rank-1 成分そのもの**である。したがって
+「重み空間に移ると何か増えるか」は一つの数で決まる:
+
+$$\text{rank1\_share}=\frac{\lVert G^\top H\rVert^2}{\lVert H\rVert^2\,\lVert G\rVert_F^2}
+\qquad(\min_u\lVert G-uH^\top\rVert_F^2\text{ の解を入れたもの})$$
+
+これが 1 に近ければ、どのペアについても
+$\cos(G_i,G_j)=\cos(\bar x_i,\bar x_j)\cos(H_i,H_j)$ となり、**重み空間は大きさを変えられるだけ**である。
+ただし**符号は変えられる**: $\cos(\bar x_i,\bar x_j)<0$ のとき反転する。これは異方性から仮定してよい性質ではないので
+`cos_xbar` を実測する（テストで両方の regime を固定してある）。
+
+**実装。** `lm_head` に forward pre-hook を掛けて入力 $x_t$（= 出力行が縮約される隠れ状態）を取り、
+`G_rl` と `G_opd` を**保持している id 部分集合の上だけ**で累積する。$H=a+\beta d$ は両者に線形なので
+合成は無料で、半分ずつも残る。**checkpoint のパラメータ勾配は使えない**: このモデルは
+tied embedding なので $\partial L/\partial W_v$ は出力側と入力埋め込み側の和であり、後者は押しと無関係である。
+
+**なぜ部分集合か。** 理由は二つあり、どちらも譲れない。メモリ: 全語彙 $(V,\text{hidden})$ は
+float32 でタスクあたり 1.2 GB、この batch 形状での余裕は 5.5 GB。計算: $h_t$ の密な半分は
+スカラー×$\pi_t$ なので、全語彙の累積は $(V,T)\times(T,\text{hidden})$ ——
+**lm\_head の行列積と同じ桁**、つまり forward 一本分の仕事になる。部分集合ならその $m/V$ で、
+既定の 512 では 0.3%。512 は測定された集中度に対して選んである（k100 の dump で 64 id が
+$\lVert H^{\rm OPD}\rVert^2$ の 40〜99% を占める）。
+
+**判定。** `lm_head/rank1_share/{task}` が 0.9 を超えるなら、重み空間に移る路線は閉じる
+（機構が発火する相手は両空間で同じで、強度が違うだけになる)。下回るなら、
+`cos_G` と `cos_H` の符号一致率が次に読む数字になる。
+
+**指標**: `lm_head/rank1_share{,_rl,_opd}/{task}`、`rank1_share_xbar`（$u$ を $\bar x$ に固定した下界）、
+`H_norm` / `G_fro` / `xbar_norm`、ペア別の `cos_G` / `cos_H` / `cos_xbar` / `cos_G_over_pred` /
+`sign_agree_G_H`、`n_ids`、`hook_installed`。
+
+**平滑化しない。** id 集合は毎 step 選び直すので、$G$ を EMA すると step ごとに意味の違う座標を
+混ぜることになる。比は 1 step 内で次数の揃った一次モーメントの比なので、1 step で量として成立する。
+
+---
+
 ## 6. 既存 dump からわかること（GPU 不要、訂正済み）
 
 k100 run は 5 step ごとに `base_logit_push`（= $\sum_t g^{\rm opd}_t[v]$、タスク別）を吐く。

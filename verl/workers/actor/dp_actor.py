@@ -127,12 +127,15 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
 from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
 from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, conflict_gate
 from verl.trainer.ppo.opd_logit_precision import (
+    LmHeadState,
     LogitPrecisionConfig,
     StepAccumulator,
     StepMoments,
     beta_ratio_matrix,
     fit_weights,
+    lm_head_metrics,
     reweighted_opd_surrogate,
+    select_lm_ids,
     topk_kl_logit_grad,
 )
 from verl.trainer.ppo.opd_cross_gate import (
@@ -1419,6 +1422,7 @@ class DataParallelPPOActor(BasePPOActor):
                         self._lp_capture = (
                             logits_resp,
                             response_scatter_indices(sel_indices, sel_slot, seqlen, response_length),
+                            self._lp_take_hidden(),
                         )
 
                     log_probs = None
@@ -1717,6 +1721,7 @@ class DataParallelPPOActor(BasePPOActor):
         self, *, acc, cfg, data, log_prob, old_log_prob, advantages, response_mask,
         task_ids, task_loss_weight, student_topk_logprobs, student_topk_ids,
         teacher_topk_lp, clip_ratio, clip_ratio_low, clip_ratio_high, clip_ratio_c,
+        lm_ids=None, lm_slot=None, base_beta=0.0,
     ):
         """Fold this micro-batch's six pushes into the step's accumulator.
 
@@ -1737,7 +1742,7 @@ class DataParallelPPOActor(BasePPOActor):
         self._lp_capture = None
         if cap is None:
             return
-        logits_resp, resp_indices = cap
+        logits_resp, resp_indices, hidden_resp = cap
         if logits_resp is None or resp_indices is None:
             return
         resp_len = int(response_mask.shape[1])
@@ -1767,6 +1772,23 @@ class DataParallelPPOActor(BasePPOActor):
         denom = mask.sum(-1).clamp(min=1.0)
         row_adv = (advantages.detach().to(c_t.dtype) * mask).sum(-1) / denom
 
+        # The lm-head buffer is built on the FIRST micro-batch that carries a
+        # hidden state, because that tensor is where the width comes from --
+        # asking the wrapped module for its hidden_size is one more thing FSDP
+        # can hide. Zeroed on the step's first collect rather than at the step's
+        # start, since at the start it may not exist yet.
+        lm_state = None
+        if lm_ids is not None and int(lm_ids.numel()) > 0 and hidden_resp is not None:
+            want = (int(acc.n_tasks), int(lm_ids.numel()), int(hidden_resp.shape[-1]))
+            lm_state = getattr(self, "_lp_lm_state", None)
+            if lm_state is None or (lm_state.n_tasks, lm_state.n_ids, lm_state.hidden) != want:
+                lm_state = LmHeadState(*want, device=acc.a.device)
+                self._lp_lm_state = lm_state
+                self._lp_lm_fresh = False
+            elif getattr(self, "_lp_lm_fresh", False):
+                lm_state.zero_()
+                self._lp_lm_fresh = False
+
         support, kappa = topk_kl_logit_grad(
             student_topk_logprobs.detach().float(), teacher_topk_lp.detach().float()
         )
@@ -1788,7 +1810,53 @@ class DataParallelPPOActor(BasePPOActor):
             topk_ids=student_topk_ids.reshape(n_rows * resp_len, -1)[idx],
             support_term=support.reshape(n_rows * resp_len, -1)[idx],
             chunk_tokens=cfg.chunk_tokens,
+            hidden=hidden_resp,
+            lm_state=lm_state,
+            lm_ids=lm_ids,
+            lm_slot_of_id=lm_slot,
+            base_beta=base_beta,
         )
+
+    def _lp_install_lm_head_hook(self) -> bool:
+        """Capture ``lm_head``'s INPUT, which is the only place ``x_t`` exists.
+
+        The forward returns logits and nothing else, and asking for
+        ``output_hidden_states`` would hand back all 29 layers to get the one
+        that matters. A pre-hook on the module reads the tensor the projection
+        is about to consume, which under ``logits_to_keep`` is already restricted
+        to the response rows -- the same rows, in the same order, as
+        ``logits_resp``. Holding a reference costs no extra peak: autograd is
+        keeping that tensor for the backward either way.
+
+        Matched by leaf name rather than by attribute path because FSDP wraps the
+        root module, so ``self.actor_module.lm_head`` is not reliable while
+        ``named_modules`` still walks the real tree.
+        """
+        if getattr(self, "_lp_hook", None) is not None:
+            return True
+        target = None
+        for name, mod in self.actor_module.named_modules():
+            if name.rsplit(".", 1)[-1] == "lm_head":
+                target = mod
+                break
+        if target is None:
+            return False
+
+        def _pre(_module, args):
+            if getattr(self, "_lp_want_logits", False) and args:
+                self._lp_hidden = args[0]
+
+        self._lp_hook = target.register_forward_pre_hook(_pre)
+        return True
+
+    def _lp_take_hidden(self):
+        """The stashed hidden state, squeezed to (n_resp, hidden) and consumed."""
+        h = getattr(self, "_lp_hidden", None)
+        self._lp_hidden = None
+        if h is None:
+            return None
+        h = h.detach()
+        return h.squeeze(0) if h.dim() == 3 and h.shape[0] == 1 else h.reshape(-1, h.shape[-1])
 
     def logit_precision_controller(self, task_id_names):
         """State for the per-id precision weighting, built once and kept.
@@ -2835,6 +2903,30 @@ class DataParallelPPOActor(BasePPOActor):
             # gate has.
             _lp_ratio = getattr(self, "_lp_ratio", None) if not _lp_cfg.observe_only else None
             _lp_step.zero_()
+            # THE LM-HEAD MEASUREMENT'S ID SET, fixed before the step that fills
+            # it. Chosen from the smoothed state as it stood at the end of the
+            # previous step, for the same reason the applied weights are:
+            # H_i[v] is a sum over the whole batch and is not final until every
+            # micro-batch has run, while the accumulation needs the ids up front.
+            # Empty on the first step, which skips the measurement rather than
+            # ranking a vector of zeros.
+            _lp_lm_ids = _lp_lm_slot = None
+            _lp_base_beta = float(self.config.get("teacher_kl_loss_coef", 0.0))
+            # Reported, not assumed: if the module tree has no lm_head to hook,
+            # the measurement is skipped and a silent zero would look identical
+            # to a measured one.
+            _lp_hook_ok = int(_lp_cfg.lm_head_topm) > 0 and self._lp_install_lm_head_hook()
+            if _lp_hook_ok:
+                _c = _lp_ema.corrected()
+                _lp_lm_ids = select_lm_ids(_c.a, _c.d, _lp_base_beta, int(_lp_cfg.lm_head_topm))
+                if int(_lp_lm_ids.numel()) > 0:
+                    _lp_lm_slot = torch.full((_lp_ema.vocab,), -1, dtype=torch.int64,
+                                             device=_lp_lm_ids.device)
+                    _lp_lm_slot[_lp_lm_ids] = torch.arange(
+                        _lp_lm_ids.numel(), dtype=torch.int64, device=_lp_lm_ids.device)
+                    self._lp_lm_fresh = True
+                else:
+                    _lp_lm_ids = None
             # Cleared in the finally below, not just on the happy path: an
             # exception out of update_policy would otherwise leave the forward
             # stashing a vocabulary-sized tensor on every later call.
@@ -5010,6 +5102,8 @@ class DataParallelPPOActor(BasePPOActor):
                                  teacher_topk_lp=teacher_topk_lp,
                                  clip_ratio=clip_ratio, clip_ratio_low=clip_ratio_low,
                                  clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
+                                 lm_ids=_lp_lm_ids, lm_slot=_lp_lm_slot,
+                                 base_beta=_lp_base_beta,
                              )
                          _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
                          # The OPD term is assembled into _opd_term and added
@@ -5292,6 +5386,7 @@ class DataParallelPPOActor(BasePPOActor):
             # tensor for the rest of the worker's life.
             self._lp_want_logits = False
             self._lp_capture = None
+            self._lp_hidden = None
         self.actor_optimizer.zero_grad()
         if logit_prec is not None:
             # One reduce for the whole step: every field is a plain sum over
@@ -5303,6 +5398,21 @@ class DataParallelPPOActor(BasePPOActor):
             _lp_fits = fit_weights(_lp_ema, task_id_names, _lp_cfg, base_beta=_lp_base)
             for _fit in _lp_fits.values():
                 metrics.update(_fit.metrics())
+            # THE LM-HEAD COMPARISON. G is read from THIS step's sums against
+            # THIS step's H, not from the smoothed state: the id set is
+            # re-chosen every step, so smoothing G would average coordinates
+            # that mean different things in different steps. Both sides are
+            # first moments of matching degree within the step, which is what
+            # makes a single step's ratio the quantity rather than an estimate
+            # of it.
+            if int(_lp_cfg.lm_head_topm) > 0:
+                metrics["lm_head/hook_installed"] = float(_lp_hook_ok)
+            _lp_lm = getattr(self, "_lp_lm_state", None)
+            if _lp_lm is not None and _lp_lm_ids is not None and not getattr(self, "_lp_lm_fresh", False):
+                _lp_lm.all_reduce_()
+                metrics.update(lm_head_metrics(
+                    _lp_lm, _lp_lm_ids, _lp_step.a, _lp_step.d, _lp_base, task_id_names,
+                ))
             if not _lp_cfg.observe_only:
                 self._lp_ratio = beta_ratio_matrix(
                     _lp_fits, task_id_names, _lp_ema.vocab, _lp_base, device=_lp_ema.a2.device

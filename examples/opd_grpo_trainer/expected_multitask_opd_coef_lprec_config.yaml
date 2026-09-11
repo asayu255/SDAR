@@ -354,6 +354,7 @@
 "algorithm.opd.logit_precision.min_tokens": 64
 "algorithm.opd.logit_precision.min_eff_steps": 3.0
 "algorithm.opd.logit_precision.chunk_tokens": 32
+"algorithm.opd.logit_precision.lm_head_topm": 512
 "actor_rollout_ref.actor.logit_precision.enable": true
 "actor_rollout_ref.actor.logit_precision.observe_only": true
 "actor_rollout_ref.actor.logit_precision.ema_decay": 0.8
@@ -366,6 +367,7 @@
 "actor_rollout_ref.actor.logit_precision.min_tokens": 64
 "actor_rollout_ref.actor.logit_precision.min_eff_steps": 3.0
 "actor_rollout_ref.actor.logit_precision.chunk_tokens": 32
+"actor_rollout_ref.actor.logit_precision.lm_head_topm": 512
 
 # --- every other mechanism on the teacher term, declared off -----------------
 "algorithm.opd.cross_gate": null

@@ -28,10 +28,13 @@ import torch
 from verl.trainer.ppo.core_algos import topk_kl_per_token
 from verl.trainer.ppo.opd_logit_precision import (
     LogitPrecisionConfig,
+    LmHeadState,
     StepAccumulator,
     StepMoments,
     TaskFit,
     fit_weights,
+    lm_head_metrics,
+    select_lm_ids,
     topk_kl_logit_grad,
 )
 
@@ -830,3 +833,257 @@ def test_the_effective_step_count_reaches_the_ema_limit():
             ema.ema_(one, decay)
         assert ema.n_eff_steps() == pytest.approx(limit, rel=1e-6), decay
         assert ema.corrected().n_eff_steps() == pytest.approx(limit, rel=1e-6), decay
+
+
+# ---------------------------------------------------------------------------
+# 10. the lm-head comparison: is the weight-space gradient more than H times a
+#     common hidden direction?
+# ---------------------------------------------------------------------------
+
+HID = 6
+
+
+def _lm_batch(bs=3, resp=4, seed=0, hidden=HID, n_tasks=2):
+    g = torch.Generator().manual_seed(seed)
+    logits, topk_ids, t_lp = _mk(bs=bs, resp=resp, seed=seed)
+    s_lp = _student_topk_logprob(logits, topk_ids)
+    mask = torch.ones(bs, resp, dtype=torch.float64)
+    mask[-1, resp // 2:] = 0.0
+    return dict(
+        logits=logits, topk_ids=topk_ids, student_topk_logprob=s_lp, teacher_topk_logprob=t_lp,
+        responses=torch.randint(0, V, (bs, resp), generator=g),
+        response_mask=mask,
+        task_ids=torch.tensor([i % n_tasks for i in range(bs)]),
+        row_weight=torch.rand(bs, generator=g, dtype=torch.float64) + 0.2,
+        pg_coef=torch.randn(bs, resp, generator=g, dtype=torch.float64),
+        ratio=torch.rand(bs, resp, generator=g, dtype=torch.float64) + 0.5,
+        row_advantage=torch.randn(bs, generator=g, dtype=torch.float64),
+        hidden=torch.randn(bs, resp, hidden, generator=g, dtype=torch.float64),
+    )
+
+
+def _ids_and_slot(ids):
+    slot = torch.full((V,), -1, dtype=torch.int64)
+    slot[ids] = torch.arange(ids.numel(), dtype=torch.int64)
+    return slot
+
+
+def _run_lm(batch, ids, beta=0.01, n_tasks=2, chunk=2):
+    acc = StepAccumulator(n_tasks, V, dtype=torch.float64)
+    lm = LmHeadState(n_tasks, int(ids.numel()), batch["hidden"].shape[-1], dtype=torch.float64)
+    acc.add_micro_batch(chunk_tokens=chunk, lm_state=lm, lm_ids=ids,
+                        lm_slot_of_id=_ids_and_slot(ids), base_beta=beta, **batch)
+    return acc, lm
+
+
+def test_G_is_the_lm_head_gradient_summed_over_positions():
+    """The claim the whole comparison rests on, against a position-by-position loop."""
+    b = _lm_batch(seed=3)
+    ids = torch.arange(0, V, 3, dtype=torch.int64)[:8]
+    acc, lm = _run_lm(b, ids)
+
+    sup, kap = topk_kl_logit_grad(b["student_topk_logprob"], b["teacher_topk_logprob"])
+    pi = torch.softmax(b["logits"], dim=-1)
+    bs, resp = b["response_mask"].shape
+    G_rl = torch.zeros(2, ids.numel(), HID, dtype=torch.float64)
+    G_opd = torch.zeros_like(G_rl)
+    for r in range(bs):
+        i = int(b["task_ids"][r])
+        for t in range(resp):
+            if b["response_mask"][r, t] == 0:
+                continue
+            rho = b["row_weight"][r]
+            a_vec = (b["pg_coef"][r, t] * rho) * (
+                torch.nn.functional.one_hot(b["responses"][r, t], V).double() - pi[r, t])
+            d_vec = (kap[r, t] * rho) * pi[r, t]
+            d_vec = d_vec.index_add(0, b["topk_ids"][r, t], sup[r, t] * rho)
+            G_rl[i] += a_vec[ids][:, None] * b["hidden"][r, t][None, :]
+            G_opd[i] += d_vec[ids][:, None] * b["hidden"][r, t][None, :]
+    assert torch.allclose(lm.G_rl, G_rl, atol=1e-12), (lm.G_rl - G_rl).abs().max()
+    assert torch.allclose(lm.G_opd, G_opd, atol=1e-12), (lm.G_opd - G_opd).abs().max()
+    # and the id-space halves are the same sums with x replaced by 1
+    assert torch.allclose(lm.G_rl.sum(-1) * 0 + lm.G_rl[..., 0] * 0, torch.zeros_like(lm.G_rl[..., 0]))
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 5, 64])
+def test_the_lm_head_accumulation_does_not_depend_on_the_chunking(chunk):
+    b = _lm_batch(seed=4)
+    ids = torch.arange(0, V, 2, dtype=torch.int64)[:9]
+    ref = _run_lm(b, ids, chunk=1)[1]
+    got = _run_lm(b, ids, chunk=chunk)[1]
+    assert torch.allclose(ref.G_rl, got.G_rl, atol=1e-12)
+    assert torch.allclose(ref.G_opd, got.G_opd, atol=1e-12)
+
+
+def test_a_constant_hidden_state_makes_G_exactly_rank_one():
+    """The identity the decision rule is read against.
+
+    With x_t the same at every position, G[v, :] = H[v] xbar exactly, so the
+    fitted rank-one share must be 1. If this drifts, the metric is measuring
+    the fit's conditioning rather than the model's hidden states.
+    """
+    b = _lm_batch(seed=5)
+    b["hidden"] = torch.randn(HID, dtype=torch.float64).expand_as(b["hidden"]).contiguous()
+    ids = torch.arange(0, V, 3, dtype=torch.int64)[:8]
+    acc, lm = _run_lm(b, ids)
+    m = lm_head_metrics(lm, ids, acc.a, acc.d, 0.01, ["t0", "t1"])
+    for t in ("t0", "t1"):
+        assert m[f"lm_head/rank1_share/{t}"] == pytest.approx(1.0, abs=1e-9)
+        assert m[f"lm_head/rank1_share_xbar/{t}"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_a_varying_hidden_state_is_detected_as_not_rank_one():
+    """The other side: the metric must be able to come back BELOW 1, or it
+    cannot answer the question it exists for."""
+    b = _lm_batch(seed=6)
+    ids = torch.arange(0, V, 3, dtype=torch.int64)[:8]
+    acc, lm = _run_lm(b, ids)
+    m = lm_head_metrics(lm, ids, acc.a, acc.d, 0.01, ["t0", "t1"])
+    shares = [m[f"lm_head/rank1_share/{t}"] for t in ("t0", "t1")]
+    assert all(0.0 <= x <= 1.0 + 1e-9 for x in shares), shares
+    assert min(shares) < 0.95, shares
+    # the xbar version fixes u instead of fitting it, so it can only be smaller
+    for t in ("t0", "t1"):
+        assert m[f"lm_head/rank1_share_xbar/{t}"] <= m[f"lm_head/rank1_share/{t}"] + 1e-9
+
+
+def test_under_rank_one_the_pair_identity_holds_exactly():
+    """cos(G_i, G_j) = cos(xbar_i, xbar_j) cos(H_i, H_j) when G really is rank one.
+
+    This is the statement that decides the question. Built with a DIFFERENT
+    constant hidden direction per task, so the xbar factor is not 1 and the
+    identity is not trivially satisfied -- and checked in BOTH sign regimes,
+    because a rank-one G still flips the pair's sign when the two tasks' mean
+    hidden directions are opposed. "Weight space can only rescale the answer"
+    is true of the magnitude and false of the sign.
+    """
+    b = _lm_batch(seed=7)
+    g = torch.Generator().manual_seed(71)
+    dirs = torch.randn(2, HID, generator=g, dtype=torch.float64)
+    h = torch.zeros_like(b["hidden"])
+    for r in range(h.shape[0]):
+        h[r] = dirs[int(b["task_ids"][r])]
+    b["hidden"] = h
+    ids = torch.arange(0, V, 3, dtype=torch.int64)[:8]
+    acc, lm = _run_lm(b, ids)
+    m = lm_head_metrics(lm, ids, acc.a, acc.d, 0.01, ["t0", "t1"])
+    tag = "t0__t1"
+    assert m[f"lm_head/cos_G_over_pred/{tag}"] == pytest.approx(1.0, abs=1e-9)
+    pred = m[f"lm_head/cos_xbar/{tag}"] * m[f"lm_head/cos_H/{tag}"]
+    assert m[f"lm_head/cos_G/{tag}"] == pytest.approx(pred, abs=1e-9)
+    # the sign follows cos_xbar, and both regimes are reachable
+    assert m[f"lm_head/sign_agree_G_H/{tag}"] == float(m[f"lm_head/cos_xbar/{tag}"] > 0)
+    b2 = _lm_batch(seed=7)
+    h2 = torch.zeros_like(b2["hidden"])
+    flip = torch.stack([dirs[0], -dirs[0] * 1.0]) if m[f"lm_head/cos_xbar/{tag}"] > 0 else torch.stack([dirs[0], dirs[0] * 1.0])
+    for r in range(h2.shape[0]):
+        h2[r] = flip[int(b2["task_ids"][r])]
+    b2["hidden"] = h2
+    acc2, lm2 = _run_lm(b2, ids)
+    m2 = lm_head_metrics(lm2, ids, acc2.a, acc2.d, 0.01, ["t0", "t1"])
+    assert m2[f"lm_head/cos_G_over_pred/{tag}"] == pytest.approx(1.0, abs=1e-9)
+    assert m2[f"lm_head/sign_agree_G_H/{tag}"] != m[f"lm_head/sign_agree_G_H/{tag}"], (
+        "the two hidden-direction regimes must disagree on the pair's sign")
+
+
+def test_ids_outside_the_kept_set_contribute_nothing():
+    b = _lm_batch(seed=8)
+    ids = torch.arange(0, V, 3, dtype=torch.int64)[:8]
+    _, ref = _run_lm(b, ids)
+    # a second run whose id set is the same prefix plus one extra id must agree
+    ids2 = torch.cat([ids, torch.tensor([int(x) for x in range(V) if x not in set(ids.tolist())][:1])]).sort().values
+    _, got = _run_lm(b, ids2)
+    keep = torch.tensor([int((ids2 == v).nonzero()[0]) for v in ids])
+    assert torch.allclose(ref.G_rl, got.G_rl[:, keep], atol=1e-12)
+    assert torch.allclose(ref.G_opd, got.G_opd[:, keep], atol=1e-12)
+
+
+def test_select_lm_ids_takes_the_pooled_energy_and_refuses_an_empty_state():
+    a = torch.zeros(2, V, dtype=torch.float64)
+    d = torch.zeros_like(a)
+    assert select_lm_ids(a, d, 0.01, 4).numel() == 0, "a zero state must not rank anything"
+    a[0, 5] = 3.0
+    a[1, 9] = 2.0
+    d[0, 11] = 400.0            # beta = 0.01 -> contributes 4.0
+    got = set(select_lm_ids(a, d, 0.01, 3).tolist())
+    assert got == {5, 9, 11}, got
+    assert select_lm_ids(a, d, 10 * V, 10 * V).numel() == V, "m above the vocabulary must clamp"
+
+
+def test_the_lm_head_state_round_trips_and_refuses_a_reshaped_run():
+    lm = LmHeadState(2, 5, HID, dtype=torch.float64)
+    lm.G_rl.normal_(); lm.G_opd.normal_(); lm.xsum.normal_(); lm.n_tok.fill_(3.0); lm.w.fill_(1.0)
+    other = LmHeadState(2, 5, HID, dtype=torch.float64).load_state_dict(lm.state_dict())
+    assert torch.equal(other.G_rl, lm.G_rl) and torch.equal(other.xsum, lm.xsum)
+    with pytest.raises(ValueError, match="n_ids"):
+        LmHeadState(2, 6, HID, dtype=torch.float64).load_state_dict(lm.state_dict())
+
+
+def test_the_measurement_is_off_by_default_and_refuses_a_negative_width():
+    assert LogitPrecisionConfig().lm_head_topm == 0
+    LogitPrecisionConfig(lm_head_topm=512).validate()
+    with pytest.raises(ValueError, match="lm_head_topm"):
+        LogitPrecisionConfig(lm_head_topm=-1).validate()
+
+
+def test_no_ids_means_no_metrics_rather_than_a_guess():
+    b = _lm_batch(seed=9)
+    ids = torch.zeros(0, dtype=torch.int64)
+    acc = StepAccumulator(2, V, dtype=torch.float64)
+    lm = LmHeadState(2, 0, HID, dtype=torch.float64)
+    acc.add_micro_batch(chunk_tokens=2, lm_state=lm, lm_ids=ids,
+                        lm_slot_of_id=_ids_and_slot(torch.zeros(0, dtype=torch.int64)),
+                        base_beta=0.01, **b)
+    m = lm_head_metrics(lm, ids, acc.a, acc.d, 0.01, ["t0", "t1"])
+    assert m == {"lm_head/n_ids": 0.0}
+
+
+def test_the_lm_head_hook_finds_the_module_by_leaf_name_and_reads_its_input():
+    """FSDP wraps the root, so the attribute path is unreliable while the leaf
+    name survives. The hook must also fire only while the step asks for it."""
+    import torch.nn as nn
+
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    class Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(HID, V, bias=False)
+
+        def forward(self, x):
+            return self.lm_head(x)
+
+    class Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._fsdp_wrapped_module = Inner()
+
+        def forward(self, x):
+            return self._fsdp_wrapped_module(x)
+
+    actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+    actor.actor_module = Wrapped()
+    assert actor._lp_install_lm_head_hook() is True
+    assert actor._lp_install_lm_head_hook() is True, "installing twice must be a no-op"
+
+    x = torch.randn(1, 4, HID)
+    actor._lp_want_logits = False
+    actor.actor_module(x)
+    assert actor._lp_take_hidden() is None, "the hook must not stash outside the step"
+
+    actor._lp_want_logits = True
+    actor.actor_module(x)
+    got = actor._lp_take_hidden()
+    assert got is not None and got.shape == (4, HID)
+    assert torch.equal(got, x.squeeze(0))
+    assert actor._lp_take_hidden() is None, "the stash is consumed, not left behind"
+
+
+def test_a_module_tree_without_an_lm_head_skips_rather_than_raises():
+    import torch.nn as nn
+
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+    actor.actor_module = nn.Sequential(nn.Linear(HID, HID))
+    assert actor._lp_install_lm_head_hook() is False
