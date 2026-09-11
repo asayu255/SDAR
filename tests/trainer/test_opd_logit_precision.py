@@ -29,6 +29,7 @@ from verl.trainer.ppo.core_algos import topk_kl_per_token
 from verl.trainer.ppo.opd_logit_precision import (
     LogitPrecisionConfig,
     StepAccumulator,
+    StepMoments,
     TaskFit,
     fit_weights,
     topk_kl_logit_grad,
@@ -223,7 +224,11 @@ def test_the_closed_form_permutation_variance_matches_monte_carlo():
 
 
 def _synthetic(lam, noise_rl, noise_teacher, vocab=4000, n_rows=64, seed=0):
-    """An accumulator whose contents follow the model the fit assumes."""
+    """Moments that follow the model the fit assumes.
+
+    Built through StepAccumulator.moments() rather than by hand, so the tests
+    exercise the same permutation-variance arithmetic the trainer runs.
+    """
     g = torch.Generator().manual_seed(seed)
     theta = torch.randn(vocab, generator=g, dtype=torch.float64)
     acc = StepAccumulator(1, vocab, dtype=torch.float64)
@@ -236,7 +241,7 @@ def _synthetic(lam, noise_rl, noise_teacher, vocab=4000, n_rows=64, seed=0):
     acc.sm[0] = torch.zeros(vocab, dtype=torch.float64)
     acc.sm2[0] = torch.full((vocab,), noise_rl ** 2 * (n_rows - 1) / n_rows, dtype=torch.float64)
     acc.n_tokens[0] = 10_000
-    return acc
+    return acc.moments(LogitPrecisionConfig())
 
 
 @pytest.mark.parametrize("lam", [0.25, 1.0, 3.0])
@@ -294,8 +299,9 @@ def test_a_noisier_reward_at_an_id_gives_the_teacher_more_weight():
     g = torch.Generator().manual_seed(81)
     extra = 3.5                                     # sd of the added reward noise
     acc.a[0][:100] += extra * torch.randn(100, generator=g, dtype=torch.float64)
-    n_rows = float(acc.n_rows[0])
-    acc.sm2[0][:100] += extra ** 2 * (n_rows - 1) / n_rows
+    acc.a2[0][:100] = acc.a[0][:100] ** 2
+    acc.ad[0][:100] = acc.a[0][:100] * acc.d[0][:100]
+    acc.sig2[0][:100] += extra ** 2
     # base_beta matches the synthetic scale (theta ~ N(0,1)), so the relative
     # cap sits far above both groups and the comparison is of the fit, not of
     # the clamp.
@@ -306,7 +312,7 @@ def test_a_noisier_reward_at_an_id_gives_the_teacher_more_weight():
 
 
 def test_a_task_with_too_little_data_is_refused_rather_than_guessed():
-    acc = StepAccumulator(1, 500, dtype=torch.float64)
+    acc = StepAccumulator(1, 500, dtype=torch.float64).moments(LogitPrecisionConfig())
     acc.n_tokens[0] = 3
     fit = fit_weights(acc, ["t"], LogitPrecisionConfig())["t"]
     assert not fit.valid and fit.reason == "too_few_tokens"
@@ -329,18 +335,18 @@ def test_dropped_ids_fall_back_to_the_base_coefficient():
 def test_the_ema_is_a_convex_combination_field_by_field():
     a = _synthetic(1.0, 0.5, 0.3, vocab=64, seed=20)
     b = _synthetic(2.0, 0.5, 0.3, vocab=64, seed=21)
-    want = 0.8 * a.a[0] + 0.2 * b.a[0]
+    want = 0.8 * a.a2[0] + 0.2 * b.a2[0]
     a.ema_(b, 0.8)
-    assert torch.allclose(a.a[0], want)
+    assert torch.allclose(a.a2[0], want)
 
 
 def test_the_state_round_trips_and_refuses_a_reshaped_run():
     a = _synthetic(1.0, 0.5, 0.3, vocab=64, seed=22)
-    b = StepAccumulator(1, 64, dtype=torch.float64)
+    b = StepMoments(1, 64, dtype=torch.float64)
     b.load_state_dict(a.state_dict())
-    assert torch.allclose(a.d[0], b.d[0])
+    assert torch.allclose(a.d2[0], b.d2[0])
     with pytest.raises(ValueError, match="vocab"):
-        StepAccumulator(1, 65, dtype=torch.float64).load_state_dict(a.state_dict())
+        StepMoments(1, 65, dtype=torch.float64).load_state_dict(a.state_dict())
 
 
 @pytest.mark.parametrize("bad", [{"ema_decay": 1.0}, {"n_strata": 0}, {"chunk_tokens": 0},
@@ -376,7 +382,7 @@ def test_the_beta_cap_binds_visibly_rather_than_silently():
 
 
 def test_the_reason_is_reported_as_a_code_for_the_logger():
-    acc = StepAccumulator(1, 500, dtype=torch.float64)
+    acc = StepAccumulator(1, 500, dtype=torch.float64).moments(LogitPrecisionConfig())
     acc.n_tokens[0] = 3
     m = fit_weights(acc, ["t"], LogitPrecisionConfig())["t"].metrics()
     assert m["logit_prec/t/reason"] == 3.0      # too_few_tokens
@@ -545,13 +551,14 @@ def test_where_the_reward_says_nothing_the_teacher_still_gets_weight():
     n_dead = 400
     big = 6.0
     acc.a[0][:n_dead] = big * torch.randn(n_dead, generator=g, dtype=torch.float64)
-    n_rows = float(acc.n_rows[0])
     # The null is deliberately conservative (it permutes across the task's rows
     # rather than within a prompt group, destroying group identity as well), so
     # it comes out at or above the observed spread. 1.3x puts the stratum
     # unambiguously on the collapsed side instead of within sampling noise of
     # the boundary, which is what made the first version of this test flaky.
-    acc.sm2[0][:n_dead] = 1.3 * big ** 2 * (n_rows - 1) / n_rows
+    acc.a2[0][:n_dead] = acc.a[0][:n_dead] ** 2
+    acc.ad[0][:n_dead] = acc.a[0][:n_dead] * acc.d[0][:n_dead]
+    acc.sig2[0][:n_dead] = 1.3 * big ** 2
     # Put them in their own activity stratum so the collapse is not diluted.
     acc.act[0][:n_dead] = 10.0
     fit = fit_weights(acc, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
@@ -578,8 +585,8 @@ def test_lambda_carries_its_own_uncertainty_and_effective_sample_size():
     spread = fit_weights(acc, ["t"], LogitPrecisionConfig())["t"]
     # Now concentrate almost all of the product into a handful of ids.
     acc2 = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=2000, seed=43)
-    acc2.a[0][:5] *= 300.0
-    acc2.d[0][:5] *= 300.0
+    for f in ("a", "a2", "ad", "d", "d2"):
+        getattr(acc2, f)[0][:5] *= 300.0
     conc = fit_weights(acc2, ["t"], LogitPrecisionConfig())["t"]
     assert spread.n_eff > 100.0, spread.n_eff
     assert conc.n_eff < 20.0, conc.n_eff
@@ -653,3 +660,64 @@ def test_the_gathered_ratio_is_relative_to_the_run_coefficient():
     # A refused fit must leave the run at its own coefficient, never at zero.
     bad = TaskFit("t", False, "too_few_tokens")
     assert torch.allclose(beta_ratio_at(bad, ids, 0.01), torch.ones_like(ids, dtype=torch.float32))
+
+
+# ---------------------------------------------------------------------------
+# 10. the smoother must not invent a dead reward during warm-up
+#     (the pilot's first step reported exactly that, from the first version)
+# ---------------------------------------------------------------------------
+
+
+def test_the_first_step_fit_is_not_scaled_down_by_the_smoother():
+    """A bias-corrected EMA of one step must equal that step.
+
+    The first implementation smoothed the RAW row sums. An EMA starting at zero
+    scales them all by 1 - decay^t, and tau^2 = mean(a^2) - mean(sigma^2) is
+    quadratic in that factor through the first term and linear through the
+    second, so at step 1 (factor 0.2) it needed a reliability above 0.8 to come
+    out positive. The live pilot duly reported tau2 = 0,
+    no_rl_signal_frac = 1.0 and "rl_push_is_all_noise" for all three tasks.
+    """
+    one = _synthetic(1.5, noise_rl=0.5, noise_teacher=0.3, seed=60)
+    direct = fit_weights(one, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+
+    ema = StepMoments(1, one.vocab, dtype=torch.float64)
+    ema.ema_(one, 0.8)                       # exactly one step of smoothing
+    smoothed = fit_weights(ema, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+
+    assert smoothed.valid and smoothed.reason == direct.reason
+    assert smoothed.tau2 == pytest.approx(direct.tau2, rel=1e-9)
+    assert smoothed.lam == pytest.approx(direct.lam, rel=1e-9)
+    assert smoothed.no_rl_signal_frac == pytest.approx(direct.no_rl_signal_frac)
+    assert torch.allclose(smoothed.implied_beta[smoothed.keep],
+                          direct.implied_beta[direct.keep], rtol=1e-9)
+
+
+@pytest.mark.parametrize("steps", [1, 2, 5, 20])
+def test_a_constant_stream_of_steps_gives_the_same_fit_at_every_step(steps):
+    """Smoothing a repeated step must be a no-op, at step 1 and at step 20."""
+    one = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=1500, seed=61)
+    direct = fit_weights(one, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    ema = StepMoments(1, one.vocab, dtype=torch.float64)
+    for _ in range(steps):
+        ema.ema_(one, 0.8)
+    got = fit_weights(ema, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    assert got.tau2 == pytest.approx(direct.tau2, rel=1e-9), steps
+    assert got.lam == pytest.approx(direct.lam, rel=1e-9), steps
+
+
+def test_the_permutation_variance_survives_the_trip_through_moments():
+    """moments() must form sigma^2 from ONE step's sums, not from smoothed ones."""
+    n_rows, vocab = 12, 9
+    g = torch.Generator().manual_seed(62)
+    m = torch.randn(n_rows, vocab, generator=g, dtype=torch.float64)
+    adv = torch.randn(n_rows, generator=g, dtype=torch.float64)
+    adv = adv - adv.mean()
+
+    acc = StepAccumulator(1, vocab, dtype=torch.float64)
+    acc.sm[0] = m.sum(0)
+    acc.sm2[0] = (m * m).sum(0)
+    acc.sa2[0] = (adv * adv).sum()
+    acc.n_rows[0] = n_rows
+    want = (acc.sm2[0] - acc.sm[0] ** 2 / n_rows) * (float(acc.sa2[0]) / (n_rows - 1))
+    assert torch.allclose(acc.moments(LogitPrecisionConfig()).sig2[0], want, atol=1e-12)

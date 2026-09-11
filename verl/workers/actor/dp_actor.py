@@ -129,6 +129,7 @@ from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, co
 from verl.trainer.ppo.opd_logit_precision import (
     LogitPrecisionConfig,
     StepAccumulator,
+    StepMoments,
     beta_ratio_matrix,
     fit_weights,
     reweighted_opd_surrogate,
@@ -1826,9 +1827,14 @@ class DataParallelPPOActor(BasePPOActor):
             cfg = LogitPrecisionConfig(**{k: v for k, v in dict(cfg_map).items() if k in known})
             cfg.validate()
             dev = get_torch_device().current_device()
+            # One raw accumulator for the step being collected, and one
+            # StepMoments carrying the smoothed second moments. The EMA is on
+            # the MOMENTS and not on the raw sums: the prior variance mixes
+            # degrees in them, so smoothing the sums makes it negative during
+            # warm-up and reports a dead reward. See StepMoments.
             got = (cfg, names,
                    StepAccumulator(len(names), int(vocab), device=dev),
-                   StepAccumulator(len(names), int(vocab), device=dev))
+                   StepMoments(len(names), int(vocab), device=dev))
             self._logit_prec = got
         cfg, built_for, step_acc, ema_acc = got
         if names and names != built_for:
@@ -5265,14 +5271,14 @@ class DataParallelPPOActor(BasePPOActor):
             # rows, so the ranks combine by addition and nothing here needs to
             # know how the rows were dealt.
             _lp_step.all_reduce_()
-            _lp_ema.ema_(_lp_step, _lp_cfg.ema_decay)
+            _lp_ema.ema_(_lp_step.moments(_lp_cfg), _lp_cfg.ema_decay)
             _lp_base = float(self.config.get("teacher_kl_loss_coef", 0.0))
             _lp_fits = fit_weights(_lp_ema, task_id_names, _lp_cfg, base_beta=_lp_base)
             for _fit in _lp_fits.values():
                 metrics.update(_fit.metrics())
             if not _lp_cfg.observe_only:
                 self._lp_ratio = beta_ratio_matrix(
-                    _lp_fits, task_id_names, _lp_ema.vocab, _lp_base, device=_lp_ema.a.device
+                    _lp_fits, task_id_names, _lp_ema.vocab, _lp_base, device=_lp_ema.a2.device
                 )
         if sign_stats is not None:
             metrics.update(sign_stats.metrics())

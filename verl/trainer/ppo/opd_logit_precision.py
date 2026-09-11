@@ -346,6 +346,31 @@ class StepAccumulator:
     # -- the two methods that read a micro-batch --------------------------
 
     @torch.no_grad()
+    def moments(self, cfg: "LogitPrecisionConfig") -> "StepMoments":
+        """This step's per-id second moments and noise floor, ready to smooth.
+
+        The permutation variance is formed HERE, from this step's own row sums,
+        because it is not linear in them: ``sum_r m_r^2 - (sum_r m_r)^2 / N``
+        mixes degrees, and smoothing the three sums separately and combining
+        them afterwards is a different quantity. See :class:`StepMoments`.
+        """
+        out = StepMoments(self.n_tasks, self.vocab, device=self.a.device, dtype=self.a.dtype)
+        n = self.n_rows.clamp(min=1.0).unsqueeze(-1)
+        spread = (self.sm2 - self.sm * self.sm / n).clamp(min=0.0)
+        denom = (self.n_rows - 1.0).clamp(min=1.0).unsqueeze(-1)
+        out.sig2.copy_(spread * (self.sa2.unsqueeze(-1) / denom))
+        out.a.copy_(self.a)
+        out.d.copy_(self.d)
+        out.a2.copy_(self.a * self.a)
+        out.ad.copy_(self.a * self.d)
+        out.d2.copy_(self.d * self.d)
+        out.act.copy_(self.act)
+        out.n_tokens.copy_(self.n_tokens)
+        out.n_rows.copy_(self.n_rows)
+        out.w.fill_(1.0)
+        return out
+
+    @torch.no_grad()
     def add_packed(
         self,
         *,
@@ -528,6 +553,94 @@ class StepAccumulator:
         )
 
 
+
+class StepMoments:
+    """The quantities the fit consumes, averaged over steps the RIGHT way.
+
+    WHY THIS CLASS EXISTS, WHICH IS A BUG THE PILOT FOUND IN ITS FIRST STEP.
+    The first version smoothed the RAW accumulators -- sums over rows -- and
+    then formed the fit from them. That is wrong, and not subtly: an EMA that
+    starts at zero scales every accumulator by c = 1 - decay^t, and the prior
+    variance
+
+        tau^2 = mean_v(a[v]^2) - mean_v(sigma^2[v])
+
+    is QUADRATIC in c through the first term and LINEAR through the second, so
+    what the fit actually saw at step t was
+
+        tau^2 = c * ( c * mean(a^2) - mean(sigma^2) )
+
+    which is negative unless the reliability already exceeds 1 - c. At step 1,
+    c = 0.2, so it needed 0.8. The run duly reported tau^2 = 0,
+    no_rl_signal_frac = 1.0 and "rl_push_is_all_noise" for all three tasks --
+    an artefact of the smoother, reported as a measurement.
+
+    The fix is to smooth quantities of MATCHING DEGREE: the per-id second
+    moments themselves (a^2, a*d, d^2), the per-id noise floor, and the
+    activity. Each is averaged as itself, so the fit is a ratio of averages
+    rather than an average of ratios of mismatched powers.
+
+    The average is also BIAS CORRECTED. ``w`` accumulates the same way the
+    fields do, and dividing by it makes the estimate the weighted mean of the
+    per-step values at EVERY step rather than only asymptotically -- so step 1
+    gives exactly the single-step fit instead of one fifth of it.
+    """
+
+    _PER_ID = ("a", "d", "a2", "ad", "d2", "sig2", "act")
+    _PER_TASK = ("n_tokens", "n_rows")
+
+    def __init__(self, n_tasks: int, vocab: int, *, device=None, dtype=torch.float32):
+        self.n_tasks, self.vocab = int(n_tasks), int(vocab)
+        for name in self._PER_ID:
+            setattr(self, name, torch.zeros(n_tasks, vocab, device=device, dtype=dtype))
+        for name in self._PER_TASK:
+            setattr(self, name, torch.zeros(n_tasks, device=device, dtype=dtype))
+        self.w = torch.zeros((), device=device, dtype=dtype)
+
+    def _fields(self):
+        return self._PER_ID + self._PER_TASK + ("w",)
+
+    def to(self, device):
+        for name in self._fields():
+            setattr(self, name, getattr(self, name).to(device))
+        return self
+
+    def ema_(self, other: "StepMoments", decay: float):
+        """``self <- decay * self + (1 - decay) * other``, ``w`` included."""
+        d = float(decay)
+        for name in self._fields():
+            cur = getattr(self, name)
+            cur.mul_(d).add_(getattr(other, name).to(cur.device, cur.dtype), alpha=1.0 - d)
+        return self
+
+    def corrected(self) -> "StepMoments":
+        """The bias-corrected average: every field divided by the weight sum."""
+        out = StepMoments(self.n_tasks, self.vocab, device=self.w.device, dtype=self.w.dtype)
+        wv = float(self.w)
+        scale = 1.0 / wv if wv > 0 else 0.0
+        for name in self._fields():
+            getattr(out, name).copy_(getattr(self, name) * scale)
+        out.w.fill_(1.0 if wv > 0 else 0.0)
+        return out
+
+    def state_dict(self) -> dict:
+        out = {"n_tasks": self.n_tasks, "vocab": self.vocab}
+        out.update({n: getattr(self, n).detach().cpu() for n in self._fields()})
+        return out
+
+    def load_state_dict(self, sd: dict):
+        if int(sd.get("n_tasks", -1)) != self.n_tasks or int(sd.get("vocab", -1)) != self.vocab:
+            raise ValueError(
+                f"logit-precision moments are for n_tasks={sd.get('n_tasks')} "
+                f"vocab={sd.get('vocab')}, this run has n_tasks={self.n_tasks} vocab={self.vocab}"
+            )
+        for name in self._fields():
+            cur = getattr(self, name)
+            if name in sd:
+                cur.copy_(sd[name].to(cur.device, cur.dtype))
+        return self
+
+
 # ---------------------------------------------------------------------------
 # The fit
 # ---------------------------------------------------------------------------
@@ -627,7 +740,7 @@ def _strata(activity: torch.Tensor, keep: torch.Tensor, n_strata: int) -> torch.
 
 
 def fit_weights(
-    acc: StepAccumulator,
+    mom: "StepMoments",
     task_names,
     cfg: LogitPrecisionConfig,
     *,
@@ -657,30 +770,27 @@ def fit_weights(
     """
     cfg.validate()
     out = {}
-    n = min(len(task_names), acc.n_tasks)
+    mom = mom.corrected()
+    n = min(len(task_names), mom.n_tasks)
     for i in range(n):
         name = str(task_names[i])
-        a, d = acc.a[i], acc.d[i]
-        act, sm, sm2 = acc.act[i], acc.sm[i], acc.sm2[i]
-        n_rows, sa2 = float(acc.n_rows[i]), float(acc.sa2[i])
-        n_tok = float(acc.n_tokens[i])
+        a, d = mom.a[i], mom.d[i]
+        a2, ad, d2 = mom.a2[i], mom.ad[i], mom.d2[i]
+        act, sigma2 = mom.act[i], mom.sig2[i]
+        n_tok = float(mom.n_tokens[i])
 
-        if n_tok < cfg.min_tokens or n_rows < 2:
+        if n_tok < cfg.min_tokens or float(mom.n_rows[i]) < 2:
             out[name] = TaskFit(name, False, "too_few_tokens", n_tokens=n_tok)
             continue
 
-        # Permutation variance of the RL push, in closed form.
-        spread = (sm2 - sm * sm / max(n_rows, 1.0)).clamp(min=0.0)
-        sigma2 = spread * (sa2 / max(n_rows - 1.0, 1.0))
-
-        keep = (act > cfg.min_activity) & torch.isfinite(a) & torch.isfinite(d) & torch.isfinite(sigma2)
+        keep = (act > cfg.min_activity) & torch.isfinite(a2) & torch.isfinite(d2) & torch.isfinite(sigma2)
         n_ids = int(keep.sum())
         if n_ids < 2 * cfg.n_strata:
             out[name] = TaskFit(name, False, "too_few_ids", n_tokens=n_tok, n_ids=n_ids)
             continue
 
-        # Floor sigma^2 so an id seen in one rollout does not claim infinite
-        # precision. The floor is relative to this task's own scale.
+        # Floor sigma^2 so an id seen in a single rollout does not claim
+        # infinite precision. The floor is relative to this task's own scale.
         pos = sigma2[keep]
         floor = cfg.sigma2_floor_frac * float(pos[pos > 0].mean()) if bool((pos > 0).any()) else 0.0
         sigma2 = sigma2.clamp(min=max(floor, torch.finfo(sigma2.dtype).tiny))
@@ -708,7 +818,7 @@ def fit_weights(
             sel = strat == st
             if not bool(sel.any()):
                 continue
-            t2s = float((a[sel] * a[sel]).mean()) - float(sigma2[sel].mean())
+            t2s = float(a2[sel].mean()) - float(sigma2[sel].mean())
             tau2_by_stratum[st] = t2s
             if t2s > 0.0:
                 signal |= sel
@@ -719,13 +829,13 @@ def fit_weights(
                                 n_tokens=n_tok, n_ids=n_ids, no_rl_signal_frac=no_rl_frac)
             continue
 
-        ak, dk, s2k = a[signal], d[signal], sigma2[signal]
+        a2k, adk, d2k, s2k = a2[signal], ad[signal], d2[signal], sigma2[signal]
         # Both pushes sum to exactly zero over the vocabulary, so the second
         # moments are already central and nothing is subtracted here.
-        mean_a2 = float((ak * ak).mean())
+        mean_a2 = float(a2k.mean())
         mean_s2 = float(s2k.mean())
-        mean_d2 = float((dk * dk).mean())
-        mean_ad = float((ak * dk).mean())
+        mean_d2 = float(d2k.mean())
+        mean_ad = float(adk.mean())
 
         tau2 = max(0.0, mean_a2 - mean_s2)
         if tau2 <= 0.0:
@@ -746,11 +856,11 @@ def fit_weights(
         # jackknife says what that costs. Reporting lambda without them would
         # repeat the error the sign gates were faulted for: acting on a
         # statistic whose noise was never measured.
-        prod = ak * dk
+        prod = adk
         n_eff = float((prod.abs().sum() ** 2) / (prod * prod).sum().clamp(min=1e-300))
         nk = float(n_sig)
-        s_ad, s_a2, s_s2 = float(prod.sum()), float((ak * ak).sum()), float(s2k.sum())
-        den_j = (s_a2 - ak * ak) - (s_s2 - s2k)
+        s_ad, s_a2, s_s2 = float(prod.sum()), float(a2k.sum()), float(s2k.sum())
+        den_j = (s_a2 - a2k) - (s_s2 - s2k)
         lam_j = torch.where(den_j.abs() > 0, (s_ad - prod) / den_j,
                             torch.full_like(den_j, float("nan")))
         ok_j = torch.isfinite(lam_j)
@@ -771,8 +881,8 @@ def fit_weights(
                                 lam_raw=lam_raw, varsigma2=max(varsigma2, 0.0), r2=r2,
                                 lam_se=lam_se, n_eff=n_eff, no_rl_signal_frac=no_rl_frac,
                                 n_ids=n_ids, n_tokens=n_tok, sigma2=sigma2,
-                                implied_beta=torch.zeros_like(a), keep=keep,
-                                shrink=torch.ones_like(a))
+                                implied_beta=torch.zeros_like(a2), keep=keep,
+                                shrink=torch.ones_like(a2))
             continue
 
         reason = "ok"
@@ -798,7 +908,7 @@ def fit_weights(
         # close to a no-op anyway (m and sqrt(v) scale together), so applying it
         # would buy little beyond its effect through the global clip, at the
         # price of that failure mode.
-        shrink = torch.ones_like(a)
+        shrink = torch.ones_like(a2)
         for st, t2s in tau2_by_stratum.items():
             sel = strat == st
             shrink[sel] = 0.0 if t2s <= 0.0 else (t2s / (t2s + s2_blue[sel]))
@@ -806,8 +916,8 @@ def fit_weights(
         cap = cfg.max_beta_ratio * abs(base_beta)
         at_cap = implied_beta.abs() > cap
         implied_beta = implied_beta.clamp(min=-cap, max=cap)
-        implied_beta = torch.where(keep, implied_beta, torch.full_like(a, base_beta))
-        shrink = torch.where(keep, shrink, torch.ones_like(a))
+        implied_beta = torch.where(keep, implied_beta, torch.full_like(a2, base_beta))
+        shrink = torch.where(keep, shrink, torch.ones_like(a2))
         out[name] = TaskFit(name, True, reason, tau2=tau2, lam=lam, lam_raw=lam_raw,
                             varsigma2=varsigma2, r2=r2, lam_se=lam_se, n_eff=n_eff,
                             n_ids=n_ids, n_tokens=n_tok, no_rl_signal_frac=no_rl_frac,
