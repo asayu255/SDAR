@@ -126,6 +126,12 @@ from verl.trainer.ppo.cross_teacher_kl_weight import (
 )
 from verl.trainer.ppo.opd_task_diag import OpdTaskDiagStats, opd_pg_alignment_terms
 from verl.trainer.ppo.opd_pushback import PushbackConfig, PushbackController, conflict_gate
+from verl.trainer.ppo.opd_logit_precision import (
+    LogitPrecisionConfig,
+    StepAccumulator,
+    fit_weights,
+    topk_kl_logit_grad,
+)
 from verl.trainer.ppo.opd_cross_gate import (
     CrossGateConfig,
     CrossGateController,
@@ -1400,6 +1406,17 @@ class DataParallelPPOActor(BasePPOActor):
                     # before or after it is the same arithmetic.
                     logits_resp = output.logits.squeeze(0)
                     logits_resp.div_(temperature)
+                    if getattr(self, "_lp_want_logits", False):
+                        # Stashed rather than returned: the return is a 3-tuple
+                        # read at half a dozen call sites, and the consumer is a
+                        # diagnostic that must not change any of them. The
+                        # reference costs no extra peak -- autograd is holding
+                        # this tensor for the backward either way -- and the
+                        # caller drops it as soon as the micro-batch is folded in.
+                        self._lp_capture = (
+                            logits_resp,
+                            response_scatter_indices(sel_indices, sel_slot, seqlen, response_length),
+                        )
 
                     log_probs = None
                     if need_log_prob:
@@ -1691,6 +1708,133 @@ class DataParallelPPOActor(BasePPOActor):
         # handle. State is keyed by name, so an absent task keeps its retention
         # and a new one enters at 1.
         return ctl
+
+    @torch.no_grad()
+    def _collect_logit_precision(
+        self, *, acc, cfg, data, log_prob, old_log_prob, advantages, response_mask,
+        task_ids, task_loss_weight, student_topk_logprobs, student_topk_ids,
+        teacher_topk_lp, clip_ratio, clip_ratio_low, clip_ratio_high, clip_ratio_c,
+    ):
+        """Fold this micro-batch's six pushes into the step's accumulator.
+
+        Reads the packed response logits the forward stashed, converts the
+        per-position quantities the loss already computed into the four weights
+        the accumulator needs, and drops the stash.
+
+        NOTHING HERE TOUCHES THE LOSS. No forward, no backward, no autograd: the
+        student's and the teacher's pushes on the logits are both closed forms of
+        tensors that already exist at this point in the step.
+
+        The packed index is the same one ``pad_input`` would scatter with, namely
+        ``row * response_length + slot``, so a (rows, response) tensor is read at
+        the packed positions with one gather on its flattened view and the row
+        number is the quotient.
+        """
+        cap = getattr(self, "_lp_capture", None)
+        self._lp_capture = None
+        if cap is None:
+            return
+        logits_resp, resp_indices = cap
+        if logits_resp is None or resp_indices is None:
+            return
+        resp_len = int(response_mask.shape[1])
+        idx = resp_indices.to(logits_resp.device, torch.int64).reshape(-1)
+        token_row = torch.div(idx, resp_len, rounding_mode="floor")
+
+        def tok(x):
+            return x.reshape(-1)[idx]
+
+        # c_t: the coefficient the POLICY LOSS puts on d(log pi)/d(logit), sign
+        # flipped because the accumulator wants the descent direction and the
+        # helper differentiates the loss. Its clip branches matter: inside a
+        # bound clip the objective is pushing this position at zero, and -A
+        # would report it at full magnitude.
+        c_t = -policy_loss_gradient_coef(
+            old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages,
+            cliprange=clip_ratio, cliprange_low=clip_ratio_low,
+            cliprange_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
+        ).detach()
+        ratio = torch.exp((log_prob - old_log_prob).detach())
+        mask = response_mask.to(c_t.dtype)
+        n_rows = int(response_mask.shape[0])
+        rho = (task_loss_weight.to(c_t.dtype).reshape(-1) if task_loss_weight is not None
+               else torch.ones(n_rows, device=c_t.device, dtype=c_t.dtype))
+        # GRPO gives every position in a row the same advantage; the masked mean
+        # recovers it without assuming the row has a position at index zero.
+        denom = mask.sum(-1).clamp(min=1.0)
+        row_adv = (advantages.detach().to(c_t.dtype) * mask).sum(-1) / denom
+
+        support, kappa = topk_kl_logit_grad(
+            student_topk_logprobs.detach().float(), teacher_topk_lp.detach().float()
+        )
+        rho_tok = rho.unsqueeze(-1).expand(n_rows, resp_len)
+        rows = (task_ids.to(torch.int64) if task_ids is not None
+                else torch.zeros(n_rows, dtype=torch.int64, device=c_t.device))
+        acc.add_packed(
+            logits=logits_resp.detach(),
+            token_row=token_row,
+            token_task=rows.to(c_t.device).clamp(min=0).unsqueeze(-1).expand(n_rows, resp_len).reshape(-1)[idx],
+            sampled_ids=tok(data["responses"]),
+            w_rl=tok(c_t * rho_tok),
+            w_opd=tok(kappa.to(c_t.dtype) * rho_tok),
+            w_act=tok(rho_tok),
+            w_prof=tok(ratio * rho_tok),
+            token_valid=tok(mask),
+            row_task=rows,
+            row_adv=row_adv,
+            topk_ids=student_topk_ids.reshape(n_rows * resp_len, -1)[idx],
+            support_term=support.reshape(n_rows * resp_len, -1)[idx],
+            chunk_tokens=cfg.chunk_tokens,
+        )
+
+    def logit_precision_controller(self, task_id_names):
+        """State for the per-id precision weighting, built once and kept.
+
+        Two accumulators: one for the step being collected and one EMA that
+        outlives it. The vocabulary size comes from the module because the
+        statistics are vectors over it, and the task list from the first batch --
+        the same lifecycle the cross gate and the pushback controller use.
+
+        Returns ``(cfg, step_acc, ema_acc)``, or ``None`` when it is off.
+        """
+        cfg_map = self.config.get("logit_precision", None)
+        if not cfg_map or not bool(dict(cfg_map).get("enable", False)):
+            return None
+        got = getattr(self, "_logit_prec", None)
+        names = list(task_id_names or [])
+        if got is None:
+            if not names:
+                raise AssertionError(
+                    "logit_precision is enabled but the batch carries no task_id_names; "
+                    "the fit is per task and cannot be built."
+                )
+            vocab = model_vocab_size(self.actor_module)
+            if vocab is None:
+                raise AssertionError(
+                    "logit_precision needs the model's vocab_size -- its statistics are "
+                    "vectors over the vocabulary -- and the module does not report one."
+                )
+            known = set(LogitPrecisionConfig.__dataclass_fields__)
+            unknown = sorted(set(dict(cfg_map)) - known)
+            if unknown:
+                raise ValueError(
+                    f"logit_precision has no field(s) {unknown}; a misspelled knob that is "
+                    "silently dropped is a run that did not do what its config says."
+                )
+            cfg = LogitPrecisionConfig(**{k: v for k, v in dict(cfg_map).items() if k in known})
+            cfg.validate()
+            dev = get_torch_device().current_device()
+            got = (cfg, names,
+                   StepAccumulator(len(names), int(vocab), device=dev),
+                   StepAccumulator(len(names), int(vocab), device=dev))
+            self._logit_prec = got
+        cfg, built_for, step_acc, ema_acc = got
+        if names and names != built_for:
+            raise AssertionError(
+                f"logit_precision was built for tasks {built_for} and this batch carries "
+                f"{names}; the accumulators are indexed by task position."
+            )
+        return cfg, step_acc, ema_acc
 
     def cross_gate_controller(self, task_id_names):
         """The cross-task gate's controller (MOPD v1), built once and kept across steps.
@@ -2638,6 +2782,28 @@ class DataParallelPPOActor(BasePPOActor):
         # injection refuses both; this is the belt to that suspender). Its
         # references and lambda for THIS step are read ONCE here and fixed for
         # every micro-batch; the step's own statistics update them at the end.
+        logit_prec = self.logit_precision_controller(task_id_names) if use_teacher_kl_loss else None
+        if logit_prec is not None:
+            _lp_cfg, _lp_step, _lp_ema = logit_prec
+            if not self.response_only_logits:
+                raise AssertionError(
+                    "logit_precision reads the packed response logits, which only the "
+                    "response_only_logits path produces; set "
+                    "actor_rollout_ref.actor.response_only_logits=true."
+                )
+            if not (teacher_topk_kl and student_indexed_topk):
+                raise AssertionError(
+                    "logit_precision measures the teacher's push on the STUDENT's top-k "
+                    "support; it needs kl_loss_type=topk_kl and student_indexed_topk=true."
+                )
+            if not bool(_lp_cfg.observe_only):
+                raise NotImplementedError(
+                    "logit_precision.observe_only=false is not implemented yet: the "
+                    "measurement lands first and the weights are applied only after the "
+                    "pilot has said what they are (design doc section 7)."
+                )
+            _lp_step.zero_()
+            self._lp_want_logits = True
         cross_gate = self.cross_gate_controller(task_id_names) if use_teacher_kl_loss else None
         if cross_gate is not None and pushback is not None:
             raise AssertionError(
@@ -4797,6 +4963,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 "fwd": _cg, "roles": _cg_roles, "topk_ids": _cg_topk_ids,
                                 "teacher_kl": teacher_kld, "row_basis": task_loss_weight,
                             }
+                        if logit_prec is not None and pg_loss_coef != 0:
+                            self._collect_logit_precision(
+                                acc=_lp_step, cfg=_lp_cfg, data=data,
+                                log_prob=log_prob, old_log_prob=old_log_prob,
+                                advantages=advantages, response_mask=response_mask,
+                                task_ids=task_ids, task_loss_weight=task_loss_weight,
+                                student_topk_logprobs=student_topk_logprobs,
+                                student_topk_ids=student_topk_ids,
+                                teacher_topk_lp=teacher_topk_lp,
+                                clip_ratio=clip_ratio, clip_ratio_low=clip_ratio_low,
+                                clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
+                            )
                         _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
                         if task_loss_weight is None:
                             if _kl_row_coef is None and _pb_w is None:
@@ -5051,6 +5229,17 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        if logit_prec is not None:
+            self._lp_want_logits = False
+            self._lp_capture = None
+            # One reduce for the whole step: every field is a plain sum over
+            # rows, so the ranks combine by addition and nothing here needs to
+            # know how the rows were dealt.
+            _lp_step.all_reduce_()
+            _lp_ema.ema_(_lp_step, _lp_cfg.ema_decay)
+            for _fit in fit_weights(_lp_ema, task_id_names, _lp_cfg,
+                                    base_beta=float(self.config.get("teacher_kl_loss_coef", 0.0))).values():
+                metrics.update(_fit.metrics())
         if sign_stats is not None:
             metrics.update(sign_stats.metrics())
             metrics["sign_weight/mode_is_target"] = float(sign_mode == "target")
