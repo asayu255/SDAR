@@ -522,3 +522,63 @@ def test_observe_only_is_the_default():
     """The pilot must be what you get by turning it on, not an extra flag."""
     assert LogitPrecisionConfig().observe_only is True
     assert LogitPrecisionConfig().enable is False
+
+
+# ---------------------------------------------------------------------------
+# 8. the failure mode a review found: do not switch the teacher off where the
+#    reward is silent, which is where the teacher is the only source
+# ---------------------------------------------------------------------------
+
+
+def test_where_the_reward_says_nothing_the_teacher_still_gets_weight():
+    """62 percent of webshop's tokens have zero advantage; the OPD term is the
+    only gradient there. A prior estimated from the RL push alone collapses at
+    exactly those coordinates, so it must not multiply the teacher's weight."""
+    acc = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, seed=40)
+    # A block of ids whose RL push is pure noise: the observed push IS the
+    # noise, and the null says so.
+    g = torch.Generator().manual_seed(41)
+    n_dead = 400
+    big = 6.0
+    acc.a[0][:n_dead] = big * torch.randn(n_dead, generator=g, dtype=torch.float64)
+    n_rows = float(acc.n_rows[0])
+    # The null is deliberately conservative (it permutes across the task's rows
+    # rather than within a prompt group, destroying group identity as well), so
+    # it comes out at or above the observed spread. 1.3x puts the stratum
+    # unambiguously on the collapsed side instead of within sampling noise of
+    # the boundary, which is what made the first version of this test flaky.
+    acc.sm2[0][:n_dead] = 1.3 * big ** 2 * (n_rows - 1) / n_rows
+    # Put them in their own activity stratum so the collapse is not diluted.
+    acc.act[0][:n_dead] = 10.0
+    fit = fit_weights(acc, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+
+    assert fit.valid
+    assert fit.no_rl_signal_frac > 0.0, "the collapse has to be visible in the metrics"
+    dead = fit.implied_beta[:n_dead]
+    assert float(dead.abs().min()) > 0.0, "the teacher was switched off where it is the only source"
+    live = fit.implied_beta[n_dead:][fit.keep[n_dead:]]
+    assert float(dead.median()) > float(live.median()), (dead.median(), live.median())
+
+
+def test_the_shrinkage_is_reported_but_never_multiplies_the_applied_weight():
+    acc = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, seed=42)
+    fit = fit_weights(acc, ["t"], LogitPrecisionConfig(), base_beta=1.0)["t"]
+    want = fit.lam * fit.sigma2 / fit.varsigma2
+    assert torch.allclose(fit.implied_beta[fit.keep], want[fit.keep], rtol=1e-9)
+    assert fit.shrink is not None and float(fit.shrink[fit.keep].mean()) < 1.0
+
+
+def test_lambda_carries_its_own_uncertainty_and_effective_sample_size():
+    """A regression settled by ten format tokens must say so."""
+    acc = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=2000, seed=43)
+    spread = fit_weights(acc, ["t"], LogitPrecisionConfig())["t"]
+    # Now concentrate almost all of the product into a handful of ids.
+    acc2 = _synthetic(1.0, noise_rl=0.5, noise_teacher=0.3, vocab=2000, seed=43)
+    acc2.a[0][:5] *= 300.0
+    acc2.d[0][:5] *= 300.0
+    conc = fit_weights(acc2, ["t"], LogitPrecisionConfig())["t"]
+    assert spread.n_eff > 100.0, spread.n_eff
+    assert conc.n_eff < 20.0, conc.n_eff
+    assert math.isfinite(spread.lam_se) and spread.lam_se > 0.0
+    assert "logit_prec/t/n_eff_ids" in conc.metrics()
+    assert "logit_prec/t/lam_t" in conc.metrics()

@@ -36,11 +36,29 @@ the precision-weighted average -- Gauss-Markov, no Gaussian assumption needed:
     w_i = (1/sigma^2) / (1/sigma^2 + lambda^2/varsigma^2)
     u_i = (lambda/varsigma^2) / (1/sigma^2 + lambda^2/varsigma^2)
 
-Adam normalises each coordinate's magnitude, so what is left to optimise is the
-direction and the signal-to-noise ratio -- which is exactly what minimum variance
-under unbiasedness gives. A second layer shrinks the combined estimate toward
-zero by its own reliability (James-Stein), which suppresses coordinates that are
-noise.
+WHAT THAT DOES AND DOES NOT ESTABLISH. Gauss-Markov makes this the
+minimum-variance unbiased estimate OF THE PER-ID BIAS GRADIENT. It does not
+follow that it is the best cotangent to push through the network, and the
+tempting argument that "Adam normalises each coordinate so only direction and
+SNR are left" does not close the gap: Adam normalises per PARAMETER, while
+g_z[v] flows into the output row w_v (2048 numbers, and tied to the input
+embedding on this model) and into the trunk, where every id's contribution is
+mixed before any normalisation happens. The id is where the signals MEET, which
+is what makes the combination well posed; it is not a basis in which the
+optimiser is diagonal.
+
+WHAT lambda MEASURES, WHICH IS NOT TRUST. The model says the teacher's push is a
+scaled noisy copy of the reward's, so anything the teacher pushes that is
+ORTHOGONAL to the current reward gradient -- which is where a teacher's value
+is supposed to live -- lands in varsigma^2 and attenuates it. lambda/varsigma^2
+is therefore a measure of REDUNDANCY WITH THE REWARD, not of how good the
+teacher is. A teacher that knows something the reward has not found yet scores
+low. That is a real limitation of this estimator and not a wording problem;
+see the design doc's limitations.
+
+A second layer shrinks the combined estimate toward zero by its own reliability
+(James-Stein). It is computed and reported but NOT applied -- see fit_weights
+for the failure mode that decides that.
 
 There is NO cross-task gate. Teacher j is evidence about task j's objective and
 about nothing else, so the tasks meet only in the final sum -- which is what
@@ -536,9 +554,15 @@ class TaskFit:
     lam_raw: float = 0.0       # before the clamp -- a negative here is the finding
     varsigma2: float = 0.0     # teacher error variance
     r2: float = 0.0            # fraction of the teacher's push the reward explains
+    lam_se: float = float("nan")   # jackknife-over-ids standard error of lam_raw
+    n_eff: float = 0.0             # Kish effective number of ids deciding lam
     n_ids: int = 0
     n_tokens: float = 0.0
     at_cap_frac: float = 0.0
+    # Share of kept ids in a stratum where the RL push is indistinguishable
+    # from its own permutation null. There the teacher is the only source, and
+    # a mechanism that shrinks by an RL-estimated prior would zero them out.
+    no_rl_signal_frac: float = 0.0
     # Per id, or None when the fit is not valid
     sigma2: Optional[torch.Tensor] = None
     implied_beta: Optional[torch.Tensor] = None   # omega_D / omega_R -- the per-id beta
@@ -553,8 +577,16 @@ class TaskFit:
             f"{prefix}/{self.task}/varsigma2": self.varsigma2,
             f"{prefix}/{self.task}/tau2": self.tau2,
             f"{prefix}/{self.task}/teacher_r2": self.r2,
+            f"{prefix}/{self.task}/lam_se": self.lam_se,
+            f"{prefix}/{self.task}/lam_t": (
+                self.lam_raw / self.lam_se
+                if self.lam_se and math.isfinite(self.lam_se) and self.lam_se > 0
+                else float("nan")
+            ),
+            f"{prefix}/{self.task}/n_eff_ids": self.n_eff,
             f"{prefix}/{self.task}/n_ids": float(self.n_ids),
             f"{prefix}/{self.task}/beta_at_cap_frac": self.at_cap_frac,
+            f"{prefix}/{self.task}/no_rl_signal_frac": self.no_rl_signal_frac,
             f"{prefix}/{self.task}/reason": float(_REASON_CODE.get(self.reason, -1)),
         }
         if self.implied_beta is not None and self.keep is not None and bool(self.keep.any()):
@@ -651,7 +683,41 @@ def fit_weights(
         floor = cfg.sigma2_floor_frac * float(pos[pos > 0].mean()) if bool((pos > 0).any()) else 0.0
         sigma2 = sigma2.clamp(min=max(floor, torch.finfo(sigma2.dtype).tiny))
 
-        ak, dk, s2k = a[keep], d[keep], sigma2[keep]
+        # WHICH IDS CAN IDENTIFY lambda, AND WHICH ONLY CONSUME IT.
+        #
+        # lambda is identified by regressing the teacher's push on the reward's,
+        # so it can only be learned where the reward HAS a push above its own
+        # permutation null. Pooling every id into one regression lets a large
+        # noise-dominated region drive the estimated prior to zero and refuse
+        # the whole task -- and that region is not hypothetical: this run
+        # records 62 percent zero-advantage tokens on webshop, the task whose
+        # teacher matters most.
+        #
+        # So the fit is identified on the strata that carry signal, and the
+        # resulting lambda and varsigma are then applied to EVERY kept id. At
+        # a silent coordinate that gives a large implied_beta, because sigma^2
+        # is large there -- the teacher is the only source and is weighted
+        # accordingly. That is the answer the model gives; suppressing those
+        # coordinates instead would be the mechanism deciding, not the data.
+        strat = _strata(act, keep, cfg.n_strata)
+        signal = torch.zeros_like(keep)
+        tau2_by_stratum = {}
+        for st in range(cfg.n_strata):
+            sel = strat == st
+            if not bool(sel.any()):
+                continue
+            t2s = float((a[sel] * a[sel]).mean()) - float(sigma2[sel].mean())
+            tau2_by_stratum[st] = t2s
+            if t2s > 0.0:
+                signal |= sel
+        no_rl_frac = float((keep & ~signal).sum()) / max(n_ids, 1)
+        n_sig = int(signal.sum())
+        if n_sig < 2 * cfg.n_strata:
+            out[name] = TaskFit(name, False, "rl_push_is_all_noise", tau2=0.0,
+                                n_tokens=n_tok, n_ids=n_ids, no_rl_signal_frac=no_rl_frac)
+            continue
+
+        ak, dk, s2k = a[signal], d[signal], sigma2[signal]
         # Both pushes sum to exactly zero over the vocabulary, so the second
         # moments are already central and nothing is subtracted here.
         mean_a2 = float((ak * ak).mean())
@@ -662,7 +728,7 @@ def fit_weights(
         tau2 = max(0.0, mean_a2 - mean_s2)
         if tau2 <= 0.0:
             out[name] = TaskFit(name, False, "rl_push_is_all_noise", tau2=0.0,
-                                n_tokens=n_tok, n_ids=n_ids)
+                                n_tokens=n_tok, n_ids=n_ids, no_rl_signal_frac=no_rl_frac)
             continue
 
         # Errors-in-variables: a carries measurement error, so the denominator
@@ -670,6 +736,27 @@ def fit_weights(
         lam_raw = mean_ad / tau2
         varsigma2 = mean_d2 - lam_raw * lam_raw * tau2
         r2 = 0.0 if mean_d2 <= 0 else max(0.0, 1.0 - varsigma2 / mean_d2)
+
+        # HOW MANY IDS ACTUALLY DECIDE lambda. The OPD push is extremely
+        # concentrated -- a handful of format tokens carry most of it -- so a
+        # regression nominally over thousands of ids can still be settled by
+        # ten of them. Kish's effective sample size says how many, and the
+        # jackknife says what that costs. Reporting lambda without them would
+        # repeat the error the sign gates were faulted for: acting on a
+        # statistic whose noise was never measured.
+        prod = ak * dk
+        n_eff = float((prod.abs().sum() ** 2) / (prod * prod).sum().clamp(min=1e-300))
+        nk = float(n_sig)
+        s_ad, s_a2, s_s2 = float(prod.sum()), float((ak * ak).sum()), float(s2k.sum())
+        den_j = (s_a2 - ak * ak) - (s_s2 - s2k)
+        lam_j = torch.where(den_j.abs() > 0, (s_ad - prod) / den_j,
+                            torch.full_like(den_j, float("nan")))
+        ok_j = torch.isfinite(lam_j)
+        if int(ok_j.sum()) > 2:
+            lj = lam_j[ok_j]
+            lam_se = float(((nk - 1.0) / nk * ((lj - lj.mean()) ** 2).sum()).clamp(min=0.0).sqrt())
+        else:
+            lam_se = float("nan")
 
         lam = lam_raw if cfg.allow_negative_lambda else max(0.0, lam_raw)
         if not math.isfinite(lam) or not math.isfinite(varsigma2) or lam == 0.0:
@@ -680,6 +767,7 @@ def fit_weights(
             # failure, so the fit stays valid and the metric shows lam_raw.
             out[name] = TaskFit(name, True, "teacher_uninformative", tau2=tau2, lam=0.0,
                                 lam_raw=lam_raw, varsigma2=max(varsigma2, 0.0), r2=r2,
+                                lam_se=lam_se, n_eff=n_eff, no_rl_signal_frac=no_rl_frac,
                                 n_ids=n_ids, n_tokens=n_tok, sigma2=sigma2,
                                 implied_beta=torch.zeros_like(a), keep=keep,
                                 shrink=torch.ones_like(a))
@@ -694,14 +782,23 @@ def fit_weights(
         implied_beta = lam * sigma2 / varsigma2        # omega_D / omega_R, per id
         s2_blue = 1.0 / (1.0 / sigma2 + prec_d)        # BLUE variance
 
-        # Per-stratum prior, then the James-Stein factor.
-        strat = _strata(act, keep, cfg.n_strata)
+        # The James-Stein factor, DIAGNOSTIC ONLY.
+        #
+        # It is deliberately not folded into implied_beta. The prior variance
+        # behind it is estimated from the RL push alone, so at a coordinate
+        # where the reward is silent it collapses to zero -- and multiplying by
+        # it would switch the teacher off exactly where the teacher is the only
+        # gradient there is. The prior is circular in that region: it asks the
+        # one source with no information how much signal is present, while the
+        # other source is saying it is not zero.
+        #
+        # Under Adam a per-coordinate rescaling that is constant over time is
+        # close to a no-op anyway (m and sqrt(v) scale together), so applying it
+        # would buy little beyond its effect through the global clip, at the
+        # price of that failure mode.
         shrink = torch.ones_like(a)
-        for s in range(cfg.n_strata):
-            sel = strat == s
-            if not bool(sel.any()):
-                continue
-            t2s = max(0.0, float((a[sel] * a[sel]).mean()) - float(sigma2[sel].mean()))
+        for st, t2s in tau2_by_stratum.items():
+            sel = strat == st
             shrink[sel] = 0.0 if t2s <= 0.0 else (t2s / (t2s + s2_blue[sel]))
 
         cap = cfg.max_beta_ratio * abs(base_beta)
@@ -710,7 +807,8 @@ def fit_weights(
         implied_beta = torch.where(keep, implied_beta, torch.full_like(a, base_beta))
         shrink = torch.where(keep, shrink, torch.ones_like(a))
         out[name] = TaskFit(name, True, reason, tau2=tau2, lam=lam, lam_raw=lam_raw,
-                            varsigma2=varsigma2, r2=r2, n_ids=n_ids, n_tokens=n_tok,
+                            varsigma2=varsigma2, r2=r2, lam_se=lam_se, n_eff=n_eff,
+                            n_ids=n_ids, n_tokens=n_tok, no_rl_signal_frac=no_rl_frac,
                             sigma2=sigma2, implied_beta=implied_beta, shrink=shrink,
                             keep=keep, at_cap_frac=float((at_cap & keep).sum()) / max(n_ids, 1))
     return out
