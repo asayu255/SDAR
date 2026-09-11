@@ -275,10 +275,12 @@ class StepAccumulator:
     therefore more shrinkage, which is the safe direction.
 
     The profile ``m_r`` uses the PPO ratio without the clip branches, while
-    ``a_i`` uses the exact coefficient. Measured clip rate on this workload is
-    0.085 percent (``n_clip / clipfrac_den`` in the term probe), so the two agree
-    to that order; the point estimate stays exact and only the noise floor
-    carries the approximation.
+    ``a_i`` uses the exact coefficient. The measured clip rate over this run's
+    first 150 steps is 1.28 percent pooled (alfworld 1.37, webshop 1.11, search
+    0.49), so the two agree to about that order. The point estimate stays exact
+    -- it uses the real coefficient -- and only the noise floor carries the
+    approximation. (An earlier version of this note quoted 0.085 percent, which
+    is the term probe's alfworld stage-0 figure and not what the run does.)
     """
 
     def __init__(self, n_tasks: int, vocab: int, *, device=None, dtype=torch.float32):
