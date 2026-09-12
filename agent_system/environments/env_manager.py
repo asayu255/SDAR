@@ -66,6 +66,34 @@ _REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
                         "SliceObject", "ToggleObject")
 
 
+# The row inside each group that carries the corrupted plan. ALFWorld seeds
+# worker i with ``seed + i // group_n``, so the group_n consecutive workers of a
+# group all hold the SAME game; taking the last one leaves the other seven as an
+# untouched plain rollout of that game and needs no second generation pass.
+# Returns a boolean mask over rows, or None when the switch is off.
+def _oci_candidate_mask(n_rows: int, group_n: int):
+    import os
+
+    if not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
+        return None
+    if group_n is None or group_n < 2:
+        return None
+    return [((i % group_n) == (group_n - 1)) for i in range(n_rows)]
+
+
+def _oci_candidate_row(i: int, group_n) -> bool:
+    """Is env slot ``i`` the one that gets the corrupted plan?"""
+    import os
+
+    if not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
+        return False
+    try:
+        g = int(group_n)
+    except (TypeError, ValueError):
+        return False
+    return g >= 2 and (i % g) == (g - 1)
+
+
 def _wrong_plan_prefix(task: str, gamefile) -> str:
     """The instance's plan minus its requirement, or '' when the switch is off."""
     import os
@@ -301,7 +329,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
+                if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)):
+                    obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
             else:
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
@@ -312,7 +341,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
+                if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)):
+                    obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs

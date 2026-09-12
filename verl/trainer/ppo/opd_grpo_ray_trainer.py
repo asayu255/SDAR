@@ -112,6 +112,60 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             else:
                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+            # ---- OCI-sat: swap one row of a saturated group for a failure ----
+            # Before compute_advantage, because the point is to move the group
+            # baseline. A saturated group's zero advantage is GRPO behaving
+            # correctly -- the baseline equals the return -- so this manufactures
+            # a signal rather than recovering one, and the arm exists to find out
+            # whether the manufactured signal is worth anything. The verdict uses
+            # only the rows NOT reserved for injection, and is never carried to
+            # the next step: re-drawing the same dataset row changes its label 83%
+            # of the time because the row is a placeholder and the environment
+            # picks the game.
+            oci_cfg = self.config.algorithm.get("oci_sat", None)
+            oci_injected = None
+            if oci_cfg is not None and bool(oci_cfg.get("enable", False)):
+                from verl.trainer.ppo.oci_saturated import (
+                    classify_groups, injection_metrics, select_saturated_injections)
+
+                cand = batch.batch.get("oci_candidate", None)
+                if cand is None:
+                    # The rollout marks nothing, so derive it from the group
+                    # layout: ALFWorld seeds group_n consecutive workers with the
+                    # same game and env_manager puts the corrupted plan on the
+                    # last slot of each group, so that is the candidate.
+                    import torch as _t
+
+                    gn = int(self.config.env.rollout.n)
+                    uids = batch.non_tensor_batch.get("uid", None)
+                    if gn >= 2 and uids is not None:
+                        seen, pos = {}, []
+                        for u in uids:
+                            k = str(u)
+                            pos.append(seen.get(k, 0))
+                            seen[k] = seen.get(k, 0) + 1
+                        cand = _t.tensor(
+                            [1 if (p % gn) == (gn - 1) else 0 for p in pos],
+                            device=batch.batch["response_mask"].device)
+                if cand is None:
+                    metrics["oci/error_no_candidate_column"] = 1
+                else:
+                    cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
+                    grp = classify_groups(batch, judged_rows=~cand_np)
+                    oci_injected = select_saturated_injections(
+                        batch, grp, candidate_rows=cand_np)
+                    # a candidate that was not selected must not train at all:
+                    # it is an extra rollout of a group that did not want one
+                    drop = cand_np & ~oci_injected
+                    if drop.any():
+                        import torch as _t
+
+                        keep_mask = _t.as_tensor(~drop, device=batch.batch["response_mask"].device)
+                        batch.batch["response_mask"] = (
+                            batch.batch["response_mask"] * keep_mask.unsqueeze(-1).to(
+                                batch.batch["response_mask"].dtype))
+                    metrics.update(injection_metrics(grp, oci_injected, task="alfworld"))
+
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(
                 batch,
@@ -129,6 +183,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 gigpo_enable_similarity=self.config.algorithm.gigpo.enable_similarity,
                 gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
             )
+
+            # Arm B takes the injected row's gradient away AFTER the baseline
+            # has already moved, so the seven successes keep their +1/sqrt(7) and
+            # only the -sqrt(7) goes. A beating B is the only thing that shows
+            # suppressing the failure is worth more than that re-reinforcement.
+            if oci_injected is not None and not bool(oci_cfg.get("gradient_on_injected", True)):
+                from verl.trainer.ppo.oci_saturated import zero_injected_advantage
+
+                metrics["oci/rows_zeroed"] = zero_injected_advantage(batch, oci_injected)
 
             batch = self._attach_advantage_reliability_columns(batch)
 
