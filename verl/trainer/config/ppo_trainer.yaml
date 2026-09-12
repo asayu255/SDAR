@@ -379,6 +379,22 @@ algorithm:
     # and its block used a PDDL notation this one no longer emits, so it cannot
     # be reproduced from here -- see commit 888ff23.
     plan_corruption: misdirect
+    # Extra `go to` steps inserted into a CORRUPTED path (0 = off, and always
+    # off for `intact`). The generations say what a wrong path actually costs:
+    # the student follows it -- shown a path that puts the mug in the microwave
+    # it emits `take mug from microwave 1`, and after the environment answers
+    # "Nothing happens." it emits the same action again -- but an inadmissible
+    # action is not punished, because the projection's validity check looks for
+    # <action> and <think> tags and nothing else. So a wrong line costs one turn
+    # and no penalty, and with a 50-turn cap against a measured 22.9 turns per
+    # candidate trajectory (19.9 on the true path) three wasted turns are
+    # absorbed and 82% still succeed.
+    #
+    # The damage a wrong path can do is therefore bounded by the TURN BUDGET,
+    # not by how wrong it is. `go to {recep}` is admissible everywhere, so each
+    # inserted step is executed and spends a turn -- the one currency that
+    # decides the episode. Drawn from the receptacles the plan already names.
+    detour_steps: 0
     # Only where the plan exists. env_manager prepends it at the alfworld
     # prompt sites and nowhere else; a candidate marked on another task would
     # be a plain rollout excluded from its group's verdict and then dropped.

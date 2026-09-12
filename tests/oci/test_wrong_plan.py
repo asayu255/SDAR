@@ -171,6 +171,59 @@ print(("  OK  " if good else "  FAIL") +
       f" {invented} words name something the true plan does not")
 
 
+# --- PATH LENGTHENING ---------------------------------------------------------
+# The turn budget is what a wrong path can actually spend: an inadmissible line
+# costs one turn and no penalty (the projection checks only for <action> and
+# <think> tags), and 50 turns absorb three wasted ones. `go to {recep}` is
+# admissible everywhere, so each inserted step is executed.
+em._WRONG_PLAN_CACHE.clear()
+lens, dups, tails, invented_d = [], 0, 0, 0
+for g in samp[:120]:
+    d = traj(g)
+    base = em._build_wrong_plan(g, "misdirect", 0)
+    long = em._build_wrong_plan(g, "misdirect", 12)
+    if not base or not long:
+        continue
+    lb, ll = path_lines(base), path_lines(long)
+    lens.append(len(ll) - len(lb))
+    dups += sum(1 for a, b in zip(ll, ll[1:]) if a == b)
+    # nothing after the last step that changes the world
+    last_real = max((i for i, l in enumerate(ll)
+                     if l.startswith(("put ", "use ")) or " with " in l), default=len(ll) - 1)
+    tails += (last_real != len(ll) - 1)
+    if d is not None:
+        true_recs = {a for h in d["plan"]["high_pddl"]
+                     for a in h["discrete_action"].get("args", []) if a}
+        invented_d += sum(1 for l in ll if l.startswith("go to ")
+                          and l[len("go to "):] not in true_recs)
+
+good = lens and min(lens) > 0 and dups == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" detour_steps=12 adds {min(lens)}-{max(lens)} lines, {dups} immediate repeats")
+
+good = tails == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {tails} paths end with padding after the last world-changing step")
+
+good = invented_d == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {invented_d} inserted steps name a receptacle the true plan does not")
+
+em._WRONG_PLAN_CACHE.clear()
+good = (em._build_wrong_plan(samp[0], "intact", 12)
+        == em._build_wrong_plan(samp[0], "intact", 0))
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      " detour_steps is ignored for intact -- the true path is never padded")
+
+good = em._oci_detour(cfg()) == 0 and em._oci_detour(None) == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") + " detour defaults to 0 (off)")
+
+
 def test_wrong_plan():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

@@ -51,6 +51,8 @@ GPUS="${GPUS:-2}"
 # log rho 0.0), and only the true path can tell whether that is the block or
 # the corruption.
 CORRUPTION="${CORRUPTION:-intact}"
+# Extra `go to` steps inserted into a corrupted path; 0 = off, ignored by intact.
+DETOUR="${DETOUR:-0}"
 TAG="${TAG:-oci1}"
 MODEL="${MODEL:-student}"
 case "$MODEL" in
@@ -117,6 +119,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   trainer.n_gpus_per_node="$GPUS" \
   algorithm.oci_sat.enable=True \
   algorithm.oci_sat.plan_corruption="$CORRUPTION" \
+  algorithm.oci_sat.detour_steps="$DETOUR" \
   algorithm.oci_sat.gradient_on_injected=True \
   'algorithm.oci_sat.tasks=[alfworld]' \
   +trainer.grad_probe.enable=True \

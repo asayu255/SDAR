@@ -246,6 +246,12 @@
 # games, so the block gave away the navigation the student cannot know and
 # withheld the part it was already told; the candidate solved 14 of 15.
 "algorithm.oci_sat.plan_corruption": misdirect
+# Extra `go to` steps in the corrupted path. Pinned because it is the only knob
+# that reaches what actually decides an ALFWorld episode: the turn budget. A
+# wrong line costs one turn and no penalty (the projection validates the tags,
+# not the admissibility), and 50 turns absorb the three that receptacle
+# permutation alone wastes -- 82% of candidates still succeeded.
+"algorithm.oci_sat.detour_steps": 12
 # Only where the plan exists. Widening this without widening the prompt sites in
 # env_manager would mark plain rollouts on the other two tasks, exclude them from
 # their groups' verdicts and then drop them -- one eighth of those tasks'
