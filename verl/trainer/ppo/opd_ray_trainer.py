@@ -205,6 +205,57 @@ def check_sign_weight_prerequisites(*, mode, teacher_topk_kl, base_policy_path, 
     )
 
 
+
+def _oci_sample_dump(tokenizer, batch, cand_mask, *, n_groups=3, max_chars=2600):
+    """Decoded prompt tail and response for a few candidate rows and their
+    plain siblings, paired by prompt group and turn.
+
+    Paired on purpose: "the candidate wrote X" says little, "the candidate wrote
+    X where its sibling on the same game and the same turn wrote Y" says whether
+    the block changed the decision.
+    """
+    import numpy as np
+
+    uids = batch.non_tensor_batch.get("uid", None)
+    tuids = batch.non_tensor_batch.get("traj_uid", None)
+    turns = batch.non_tensor_batch.get("turn_step", None)
+    if uids is None or tuids is None:
+        return {"error": "batch lacks uid/traj_uid"}
+    resp = batch.batch["responses"]
+    ids, am = batch.batch["input_ids"], batch.batch["attention_mask"]
+    rlen = resp.shape[1]
+    plen = ids.shape[1] - rlen
+
+    def text(i):
+        pm = am[i, :plen].bool()
+        rm = am[i, plen:].bool()
+        return (tokenizer.decode(ids[i, :plen][pm], skip_special_tokens=False),
+                tokenizer.decode(ids[i, plen:][rm], skip_special_tokens=False))
+
+    cand_rows = np.flatnonzero(np.asarray(cand_mask, dtype=bool))
+    out, seen = [], set()
+    for i in cand_rows:
+        g = str(uids[i])
+        t = int(turns[i]) if turns is not None else -1
+        if (g, t) in seen or len(seen) >= n_groups:
+            continue
+        # a plain sibling: same group, same turn, not a candidate
+        sib = next((j for j in range(len(batch))
+                    if str(uids[j]) == g and not cand_mask[j]
+                    and (turns is None or int(turns[j]) == t)), None)
+        seen.add((g, t))
+        cp, cr = text(int(i))
+        entry = {"uid": g, "turn": t,
+                 "candidate_prompt_tail": cp[-max_chars:],
+                 "candidate_response": cr[:max_chars]}
+        if sib is not None:
+            sp, sr = text(int(sib))
+            entry["sibling_prompt_tail"] = sp[-max_chars:]
+            entry["sibling_response"] = sr[:max_chars]
+        out.append(entry)
+    return out
+
+
 class OPDRayTrainer(RayPPOTrainer):
     """Multitask on-policy distillation trainer with per-task teacher routing."""
 
@@ -1368,6 +1419,19 @@ class OPDRayTrainer(RayPPOTrainer):
                 )
             except Exception as exc:  # the report is the primary result; keep it
                 rec["reachability"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        # WHAT THE STUDENT ACTUALLY WROTE. Every number above is an aggregate,
+        # and four probes were read without once looking at a generation. The
+        # candidate's own text beside a PLAIN sibling from the SAME group -- same
+        # game, same turn, one shown the block and one not -- is the only thing
+        # that says whether the block is being followed, argued with, or ignored.
+        # A few rows, decoded on the driver, no extra pass.
+        try:
+            rec["samples"] = _oci_sample_dump(
+                self.tokenizer, batch, cand_np,
+                n_groups=int(probe_cfg.get("dump_groups", 3)))
+        except Exception as exc:
+            rec["samples"] = {"error": f"{type(exc).__name__}: {exc}"}
 
         import json
 
