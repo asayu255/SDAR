@@ -124,11 +124,27 @@ ok &= good
 print(("  OK  " if good else "  FAIL") +
       f" {same_frame}/{n} share every non-path line, {path_differs}/{n} differ in the path")
 
-good = tool_same == n
+# The tool line's VERB and OBJECT are the task's, but its receptacle follows the
+# walk like every other location reference. That is the trade this design takes:
+# a coherent walk that ends somewhere other than a sinkbasin yields `clean apple
+# with diningtable`, self-consistent as a plan and refused by the parser. The
+# alternative -- a grammatical `clean apple with sinkbasin` while standing at the
+# diningtable -- contradicts the walk the student is being told to follow, and
+# 57% of corrupted paths carried exactly that before this change.
+verb_obj_same = 0
+for g in samp[:150]:
+    em._WRONG_PLAN_CACHE.clear()
+    a2 = path_lines(em._wrong_plan_prefix("alfworld", g, cfg(mode="intact")))
+    em._WRONG_PLAN_CACHE.clear()
+    b2 = path_lines(em._wrong_plan_prefix("alfworld", g, cfg(mode="misdirect")))
+    ta = [l.rsplit(" with ", 1)[0] for l in a2 if " with " in l]
+    tb = [l.rsplit(" with ", 1)[0] for l in b2 if " with " in l]
+    verb_obj_same += (ta == tb)
+good = verb_obj_same == n
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" {tool_same}/{n} keep the tool line identical -- a swapped tool is "
-      f"inexecutable and would announce the block is unreliable")
+      f" {verb_obj_same}/{n} keep the tool line's verb and object; only its "
+      f"receptacle follows the walk")
 
 # --- THE CORRUPTION REACHES THE put DESTINATION ------------------------------
 has_put, put_moved = 0, 0
@@ -169,6 +185,92 @@ good = invented == 0
 ok &= good
 print(("  OK  " if good else "  FAIL") +
       f" {invented} words name something the true plan does not")
+
+
+# --- THE PATH MUST BE EXECUTABLE STEP BY STEP --------------------------------
+# Every action carries a precondition -- `take X from Y` and `clean X with Y`
+# need you to be AT Y, and `put`/`clean` need you to be holding X. Permuting the
+# GotoLocation targets used to break those: `go to diningtable` followed by
+# `clean apple with sinkbasin`, which cannot be taken from the diningtable. 57%
+# of corrupted paths carried such a step and 17% of the TRUE ones did too, so
+# the reference the whole design is measured against was itself partly
+# unexecutable. A path that contradicts itself is not a misdirection, it is
+# noise, and the generations show the student ignoring it.
+def coherence(lines):
+    at, holding, bad = None, None, []
+    for i, l in enumerate(lines, 1):
+        if l.startswith("go to "):
+            at = l[6:]
+        elif l.startswith("take "):
+            m = re.match(r"take (\S+) from (\S+)", l)
+            if m and m.group(2) != at:
+                bad.append((i, l, f"not at {m.group(2)}"))
+            holding = m.group(1) if m else holding
+        elif l.startswith("put "):
+            m = re.match(r"put (\S+) in/on (\S+)", l)
+            if m and m.group(2) != at:
+                bad.append((i, l, f"not at {m.group(2)}"))
+            elif not holding:
+                bad.append((i, l, "not holding anything"))
+            holding = None
+        elif " with " in l:
+            m = re.match(r"(\w+) (\S+) with (\S+)", l)
+            if m and m.group(3) != at:
+                bad.append((i, l, f"not at {m.group(3)}"))
+            elif not holding:
+                bad.append((i, l, "not holding anything"))
+        elif l.startswith("use ") and l[4:] != at:
+            bad.append((i, l, f"not at {l[4:]}"))
+    return bad
+
+
+for mode in ("intact", "misdirect"):
+    em._WRONG_PLAN_CACHE.clear()
+    tot = brk = 0
+    first = None
+    for g in samp[:150]:
+        b = em._wrong_plan_prefix("alfworld", g, cfg(mode=mode))
+        if not b:
+            continue
+        bad = coherence(path_lines(b))
+        tot += 1
+        brk += bool(bad)
+        if bad and first is None:
+            first = bad[0]
+    good = tot > 50 and brk == 0
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" {mode}: {tot - brk}/{tot} paths are executable step by step"
+          + (f"  e.g. {first}" if first else ""))
+
+# and the walk is what every location reference follows
+em._WRONG_PLAN_CACHE.clear()
+b = em._wrong_plan_prefix("alfworld", samp[0], cfg(mode="misdirect"))
+L = path_lines(b)
+at = None
+mismatch = 0
+for l in L:
+    if l.startswith("go to "):
+        at = l[6:]
+    elif " with " in l:
+        mismatch += (l.rsplit(" ", 1)[-1] != at)
+    elif " in/on " in l:
+        mismatch += (l.rsplit(" ", 1)[-1] != at)
+good = mismatch == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" tool and put lines name the place the walk put you at ({mismatch} mismatches)")
+
+# --- THE FRAMING IS IDENTICAL AND INSISTENT ----------------------------------
+em._WRONG_PLAN_CACHE.clear()
+a = em._wrong_plan_prefix("alfworld", samp[0], cfg(mode="intact"))
+em._WRONG_PLAN_CACHE.clear()
+c = em._wrong_plan_prefix("alfworld", samp[0], cfg(mode="misdirect"))
+for phrase in ("VERIFIED CORRECT SOLUTION PATH", "YOU MUST FOLLOW IT EXACTLY",
+               "DO NOT SEARCH ON YOUR OWN", "DO NOT DEVIATE"):
+    good = phrase in a and phrase in c
+    ok &= good
+    print(("  OK  " if good else "  FAIL") + f" both modes assert {phrase!r}")
 
 
 # --- PATH LENGTHENING ---------------------------------------------------------

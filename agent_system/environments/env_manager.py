@@ -215,8 +215,10 @@ PLAN_CORRUPTIONS = ("misdirect", "intact")
 _PLAN_HEADER = "[Privileged Solution Path]"
 _PLAN_FOOTER = "[/Privileged Solution Path]"
 _PLAN_LEAD = (
-    "THIS IS THE CORRECT SOLUTION PATH FOR THIS TASK.\n"
-    "FOLLOW IT. At every step, take the action given by the next line of this path.\n"
+    "THIS IS THE VERIFIED CORRECT SOLUTION PATH FOR THIS TASK. IT IS COMPLETE AND OPTIMAL.\n"
+    "YOU MUST FOLLOW IT EXACTLY. At every step, take the action given by the next line\n"
+    "of this path. DO NOT SEARCH ON YOUR OWN. DO NOT DEVIATE FROM IT. Any action that is\n"
+    "not the next line of this path is wrong.\n"
     "\n"
     "The full path that solves this task:"
 )
@@ -233,19 +235,30 @@ _PLAN_TOOL = {"HeatObject": "microwave", "CoolObject": "fridge",
 def _plan_lines(steps) -> List[str]:
     """PDDL high-level steps -> lines in the environment's action vocabulary.
 
-    WHY NOT THE PDDL SYMBOLS. The first design printed the plan as
-    ``GotoLocation(dresser)`` / ``PickupObject(alarmclock)``. Those symbols
-    appear nowhere in the environment: the admissible actions are strings like
-    ``go to dresser 1`` and ``take alarmclock 1 from dresser 1``. The block was
-    therefore asking a policy never trained on the notation to ground it, in 85
-    tokens. Measured on the control checkpoint, the median log rho between the
-    plan-conditioned and plain student was 0.0 -- the block changed the token
-    distribution by less than 4e-4 nats on half the tokens, i.e. it was not
-    being read. These lines use the environment's own verbs and nouns, so only
-    the instance number is missing.
+    WHY NOT THE PDDL SYMBOLS. The first design printed ``GotoLocation(dresser)``
+    / ``PickupObject(alarmclock)``. Those symbols appear nowhere in the
+    environment, whose admissible actions are strings like ``go to dresser 1``.
+    The block was asking a policy never trained on the notation to ground it.
+
+    EVERY LOCATION REFERENCE FOLLOWS THE WALK. An action's receptacle is taken
+    from the last ``go to``, not from the PDDL argument. Without this the
+    permutation broke the path's own preconditions: ``go to diningtable`` was
+    followed by ``clean apple with sinkbasin``, which cannot be taken from the
+    diningtable. 57% of corrupted paths carried such a step, and 100% once the
+    detour was inserted between a ``go to`` and the action that needed it. A
+    path that contradicts itself is not a misdirection, it is noise, and the
+    generations show the student ignoring it outright.
+
+    The consequence for the tool steps is deliberate and worth stating: the
+    environment's grammar fixes each one (``clean {obj} with {cleaner}`` takes a
+    sinkbasin), so a coherent walk that ends somewhere else yields ``clean apple
+    with diningtable`` -- self-consistent as a plan, refused by the parser. The
+    alternative is a line that is grammatical and contradicts the walk. This
+    picks coherence, because the walk is what the student is being asked to
+    follow.
 
     ``NoOp`` and anything unmapped is dropped: the environment has no command
-    for it, and it was one of the four lines the old block showed.
+    for it.
     """
     out, here = [], None
     for act, args in steps:
@@ -254,20 +267,18 @@ def _plan_lines(steps) -> List[str]:
             here = a0
             out.append(f"go to {a0}")
         elif act == "PickupObject" and a0:
-            # The receptacle comes from the preceding GotoLocation: PDDL does
-            # not carry it, and `take X from Y` needs it.
             out.append(f"take {a0} from {here}" if here else f"take {a0}")
         elif act == "PutObject" and a0:
-            r = args[1] if len(args) > 1 else here
-            out.append(f"put {a0} in/on {r}" if r else f"put {a0}")
+            # The walk, not the PDDL destination.
+            out.append(f"put {a0} in/on {here}" if here else f"put {a0}")
         elif act == "ToggleObject" and a0:
-            out.append(f"use {a0}")
+            out.append(f"use {here or a0}")
         elif act in _PLAN_TOOL and a0:
-            out.append(f"{act[:-6].lower()} {a0} with {_PLAN_TOOL[act]}")
+            out.append(f"{act[:-6].lower()} {a0} with {here or _PLAN_TOOL[act]}")
         elif act == "OpenObject" and a0:
-            out.append(f"open {a0}")
+            out.append(f"open {here or a0}")
         elif act == "CloseObject" and a0:
-            out.append(f"close {a0}")
+            out.append(f"close {here or a0}")
     return out
 
 
