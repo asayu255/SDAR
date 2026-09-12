@@ -36,6 +36,16 @@ TEMP="${TEMP:-1.0}"
 GROUP_N="${GROUP_N:-8}"
 PER_TASK="${PER_TASK:-15}"
 N_BATCHES="${N_BATCHES:-3}"
+# Which tasks the ROLLOUT covers. Separate from algorithm.oci_sat.tasks, which
+# is where the injection fires: alfworld-only is right once the per-task
+# degenerate rates have been taken (they have), because the remaining question
+# -- does the corrupted plan induce failure -- is an alfworld question. The
+# alfworld games are the same either way: ALFWorld seeds worker i with
+# seed + i//group_n, so slots 0..119 hold games 0..14 whatever else is in the
+# batch, and classify_groups now computes its reference level per task.
+TASKS="${TASKS:-alfworld,search,webshop}"
+N_TASKS=$(awk -F, "{print NF}" <<< "$TASKS")
+GPUS="${GPUS:-2}"
 TAG="${TAG:-oci1}"
 MODEL="${MODEL:-student}"
 case "$MODEL" in
@@ -58,7 +68,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${CONDA_SH:-$HOME/miniforge3/etc/profile.d/conda.sh}"
 conda activate "${CONDA_ENV:-sdar-multitask}"
 
-export EXPECTED_CONFIG_WAIVE="algorithm.opd.kl_loss_coef actor_rollout_ref.actor.teacher_kl_loss_coef actor_rollout_ref.model.path algorithm.opd.kl_loss_type actor_rollout_ref.actor.teacher_kl_loss_type actor_rollout_ref.actor.student_indexed_topk actor_rollout_ref.rollout.temperature env.rollout.n data.train_batch_size data.task_balance.per_task_batch_size"
+export EXPECTED_CONFIG_WAIVE="algorithm.opd.kl_loss_coef actor_rollout_ref.actor.teacher_kl_loss_coef actor_rollout_ref.model.path algorithm.opd.kl_loss_type actor_rollout_ref.actor.teacher_kl_loss_type actor_rollout_ref.actor.student_indexed_topk actor_rollout_ref.rollout.temperature env.rollout.n data.train_batch_size data.task_balance.per_task_batch_size data.task_balance.tasks trainer.n_gpus_per_node env.multitask.val_per_task_batch_size"
 
 export ALFWORLD_DATA=${ALFWORLD_DATA:-$HOME/data/alfworld}
 export ENV_RESET_PREFETCH=1
@@ -88,7 +98,9 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   actor_rollout_ref.rollout.temperature="$TEMP" \
   env.rollout.n="$GROUP_N" \
   ++data.task_balance.per_task_batch_size="$PER_TASK" \
-  data.train_batch_size=$(( PER_TASK * 3 )) \
+  data.train_batch_size=$(( PER_TASK * N_TASKS )) \
+  "data.task_balance.tasks=[${TASKS}]" \
+  trainer.n_gpus_per_node="$GPUS" \
   algorithm.oci_sat.enable=True \
   algorithm.oci_sat.plan_corruption=misdirect \
   algorithm.oci_sat.gradient_on_injected=True \
@@ -100,4 +112,5 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   +trainer.grad_probe.interim_every=1 \
   +trainer.grad_probe.gamma=0.1 \
   +trainer.grad_probe.out_path="$OUT" \
+  "$@" \
   >"$LOG" 2>&1
