@@ -23,6 +23,109 @@ import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
+
+
+# ---------------------------------------------------------------------------
+# PRIVILEGED_WRONG_PLAN: the instance's expert plan with its REQUIREMENT removed.
+# ---------------------------------------------------------------------------
+#
+# WHAT IT IS FOR. A saturated group -- eight of eight rollouts at max return --
+# has zero advantage, and that is GRPO behaving correctly: the baseline equals
+# the return, so the correct update is zero. Injecting a failure changes the
+# baseline and manufactures an advantage of +1/sqrt(7) on each of the seven
+# successes and -sqrt(7) on the injected row, independent of the reward scale.
+# Whether that helps is the open question; this switch produces the failure to
+# inject.
+#
+# WHY A CORRUPTED PLAN AND NOT THE BASE POLICY. The shaping coefficient on an
+# injected row is A*gamma*rho/(rho+gamma)^2 with rho = pi(a|x)/pi(a|x,z), and it
+# goes to ZERO as rho does. A failure the unconditioned student would never
+# produce carries no gradient. base's failures come from different weights, so
+# their rho is small by construction. A failure produced by the SAME weights
+# under a different prompt at least has a chance of staying near rho ~ 1.
+#
+# WHY DROPPING THE REQUIREMENT AND NOT SOMETHING ELSE. Every remaining step must
+# stay groundable in THIS game, otherwise the policy ignores the plan, and then
+# there is neither a failure nor a measurable rho. Dropping one step leaves every
+# other step naming an object and a place the game actually has; the episode runs
+# to the end and scores zero because the requirement was never met.
+#
+#   clean / heat / cool / slice   drop that transformation
+#   look_at_obj_in_light          drop ToggleObject
+#   pick_and_place*               drop the final PutObject
+#
+# Measured over 600 sampled games this covers 100% of them, and the block is 80
+# tokens at p50 (217 max) against an alfworld p99 turn prompt of 947 and a 4096
+# ceiling, so max_model_len does not move.
+#
+# THE SWITCH DOES NOT VALIDATE ITSELF. That the corrupted plan actually makes the
+# student fail, and that rho stays measurable, are both open and must be measured
+# before this is used to train anything.
+_WRONG_PLAN_CACHE = {}
+_REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
+                        "SliceObject", "ToggleObject")
+
+
+def _wrong_plan_prefix(task: str, gamefile) -> str:
+    """The instance's plan minus its requirement, or '' when the switch is off."""
+    import os
+
+    if task != "alfworld" or not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
+        return ""
+    if not gamefile:
+        return ""
+    key = str(gamefile)
+    if key not in _WRONG_PLAN_CACHE:
+        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(key)
+    return _WRONG_PLAN_CACHE[key]
+
+
+def _build_wrong_plan(gamefile: str) -> str:
+    import json as _json
+    import os
+
+    d, cand = gamefile, None
+    for _ in range(4):
+        probe = os.path.join(d, "traj_data.json") if os.path.isdir(d) else None
+        if probe and os.path.exists(probe):
+            cand = probe
+            break
+        d = os.path.dirname(d)
+    if not cand:
+        return ""
+    try:
+        with open(cand) as fh:
+            raw = _json.load(fh).get("plan", {}).get("high_pddl", [])
+    except Exception:
+        return ""
+
+    steps = []
+    for st in raw:
+        da = st.get("discrete_action", {}) or {}
+        act = da.get("action")
+        if act:
+            steps.append((act, [a for a in (da.get("args") or []) if a]))
+    if len(steps) < 3:
+        return ""
+
+    drop = next((i for i, (a, _) in enumerate(steps) if a in _REQUIREMENT_ACTIONS), None)
+    if drop is None:
+        puts = [i for i, (a, _) in enumerate(steps) if a == "PutObject"]
+        if not puts:
+            return ""
+        drop = puts[-1]
+    kept = [s for i, s in enumerate(steps) if i != drop]
+    if not kept:
+        return ""
+
+    body = "\n".join(
+        f"{i+1}. {a}({', '.join(g)})" if g else f"{i+1}. {a}()"
+        for i, (a, g) in enumerate(kept)
+    )
+    return ("### SOLUTION PLAN (training only) ###\n"
+            "A correct high-level plan for this task is:\n" + body +
+            "\nGround each step into one admissible action at a time.\n\n")
+
 from omegaconf import OmegaConf
 
 def parse_gamefile(infos):
@@ -198,6 +301,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
+                obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
             else:
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
@@ -208,6 +312,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
+                obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
