@@ -41,6 +41,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 from verl.trainer.ppo.ray_trainer import (
     GRPO_STAT_EXCLUDE_KEY,
+    OCI_FLOOR_KEY,
     _timer,
     apply_invalid_action_penalty,
     apply_kl_penalty,
@@ -258,6 +259,49 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                     exclude_rows=drop))
 
+            # ---- OCI-sat arm B': a virtual sample at the failure return ------
+            # The same place in the pipeline as the injection above and for the
+            # same reason -- the point is to move the group baseline before the
+            # advantage is computed -- but nothing is injected. Arm B removed the
+            # injected row's gradient, leaving the group's mean and std as the
+            # only channel by which it reached the weights, and a sample that
+            # only has to move a mean and a std does not have to be generated.
+            # See oci_floor for what that removes: the corrupted plan, the
+            # candidate column, the span bookkeeping, and the bar the plan could
+            # not clear (cand_fail_rate 0.222 against 0.5 over five designs). It
+            # also takes no rollout slot, so all eight rollouts are real, judged
+            # and trained, and the 7-vs-8 confound against control is gone.
+            oci_floor_cfg = self.config.algorithm.get("oci_floor", None)
+            oci_floored = None
+            if oci_floor_cfg is not None and bool(oci_floor_cfg.get("enable", False)):
+                import torch as _t
+
+                from verl.trainer.ppo.oci_floor import (
+                    floor_metrics, select_floor_groups)
+                from verl.trainer.ppo.oci_saturated import classify_groups
+
+                assert not (oci_cfg is not None and bool(oci_cfg.get("enable", False))), (
+                    "algorithm.oci_floor.enable and algorithm.oci_sat.enable are "
+                    "both on. They are two implementations of the same arm -- a "
+                    "real injected failure and a virtual one -- and running both "
+                    "gives a saturated group two failures, one of which also eats "
+                    "a rollout slot. Pick one."
+                )
+                _floor_tasks = list(oci_floor_cfg.get("tasks", ["alfworld"])
+                                    or ["alfworld"])
+                # EVERY TRAJECTORY IS JUDGED. The injection arm had to withhold
+                # the candidate from its own group's verdict; here there is no
+                # candidate, so the class is read off all eight.
+                _grp = classify_groups(batch)
+                oci_floored = select_floor_groups(
+                    batch, _grp, tasks=_floor_tasks,
+                    padding_mask=batch.batch.get(PADDING_ROW_KEY, None))
+                batch.batch[OCI_FLOOR_KEY] = _t.as_tensor(
+                    oci_floored, device=batch.batch["response_mask"].device)
+                metrics.update(floor_metrics(
+                    batch, _grp, oci_floored,
+                    task="+".join(sorted(set(_floor_tasks)))))
+
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(
                 batch,
@@ -279,7 +323,21 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # under the turn-weighted statistic.
                 compute_mean_std_cross_steps=self.config.algorithm.get(
                     "compute_mean_std_cross_steps", True),
+                # The return the virtual sample carries. 0.0 is ALFWorld's
+                # failure return; it is read from the config rather than defaulted
+                # because the reward scales are not comparable across tasks.
+                oci_floor_value=float((oci_floor_cfg or {}).get("value", 0.0)
+                                      if oci_floor_cfg is not None else 0.0),
             )
+
+            # WHAT THE FLOOR ACTUALLY BOUGHT, read off the advantage column after
+            # the fact. The arm's whole claim is that these rows go from exactly
+            # zero to a fixed positive number, and nothing else in the run checks
+            # that the term reached the statistic.
+            if oci_floored is not None and oci_floored.any():
+                from verl.trainer.ppo.oci_floor import realized_advantage
+
+                metrics.update(realized_advantage(batch, oci_floored))
 
             # Arm B takes the injected row's gradient away AFTER the baseline
             # has already moved, so the seven successes keep their +1/sqrt(7) and

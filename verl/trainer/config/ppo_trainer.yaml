@@ -351,6 +351,56 @@ algorithm:
   # observation text is assembled. `enable` alone does nothing without it, and
   # the trainer refuses a batch that carries no marks rather than training an
   # arm that silently became the control.
+  # OCI-sat ARM B': the virtual floor sample. A saturated group's mean and std
+  # gain one sample at `value`, and no rollout is generated for it.
+  #
+  # WHY THERE IS NO GENERATOR. Arm B (oci_sat.gradient_on_injected: False) took
+  # the injected row's own gradient away, which left the group's mean and std as
+  # the only channel by which the injection could reach the weights -- and a
+  # sample that only has to move a mean and a std does not have to exist. Adding
+  # it as a term reproduces B's update and drops everything built to make a real
+  # rollout fail: the corrupted plan block, the candidate column, the prompt-span
+  # bookkeeping, the reachability measurement. It also drops the bar none of
+  # those could clear. Five block designs were measured on 45 candidate
+  # trajectories each against a pre-registered cand_fail_rate > 0.5:
+  #   intact (true path)                    4.4%
+  #   misdirect, PDDL notation             15.6%
+  #   misdirect, +detour 12 / 35      6.7% / 20.0%
+  #   misdirect, environment words, coherent path, forceful framing   22.2%
+  #   delay (true path behind a 50-turn tour)   8.9%, and 44 of 45 candidates
+  #     did not take even the tour's first step
+  # The virtual sample fails by definition.
+  #
+  # AND IT TAKES NO ROLLOUT SLOT, so the confound the injection could not avoid
+  # is gone: all eight rollouts are real, judged and trained, and the
+  # distillation term sees the same eight rows as control. The arm's only
+  # difference from control is a term in the statistic of groups control would
+  # have given an advantage of exactly zero.
+  #
+  # Mutually exclusive with oci_sat.enable; the trainer asserts it.
+  oci_floor:
+    enable: False
+    # Only where the failure return is 0 and an episode either solves the task or
+    # does not. alfworld pays 10 or nothing; webshop pays a partial score, so
+    # "the floor" is not 0 there and flooring it would claim a failure that the
+    # reward function does not define.
+    tasks: ["alfworld"]
+    # The return the virtual sample carries: ALFWorld's failure return.
+    value: 0.0
+    # HOW MUCH THE SAMPLE WEIGHS, as a rule rather than a number, because the
+    # number depends on the group. `trajectory` = one trajectory's worth, which
+    # under compute_mean_std_cross_steps (the statistic every run in this repo
+    # uses) is the group's mean turns per trajectory, since there the statistic is
+    # over TURN ROWS and a weight of 1 would make the floor worth one turn instead
+    # of one rollout. Computed in compute_grpo_outcome_advantage from the sample
+    # counts the statistic itself used, so it cannot disagree with them.
+    #
+    # The advantage this produces is +0.351 for eight successes of 8 turns each
+    # and +0.353 at 20 turns -- NEARLY LENGTH-INDEPENDENT, which the real
+    # injection was not (+0.375 at 8 turns, +0.940 at 50, because the injected
+    # failure's own length set its weight). tests/oci/test_floor.py holds these
+    # numbers against core_algos.
+    weight: trajectory
   oci_sat:
     # The switch. Read by the alfworld env manager off its own copy of this
     # config (_copy_config_for_task copies the whole tree), so it is pinned by

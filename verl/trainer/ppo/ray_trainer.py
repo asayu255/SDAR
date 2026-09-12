@@ -80,6 +80,10 @@ from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 # Rows excluded from a GRPO group's mean/std. See compute_grpo_outcome_advantage.
 GRPO_STAT_EXCLUDE_KEY = "grpo_stat_exclude"
+# Rows whose GROUP gains a virtual sample at the failure return -- OCI-sat arm B'.
+# A column for the same reason the two masks above are: _balance_batch reorders
+# rows before the advantage is computed and a uid travels with its row.
+OCI_FLOOR_KEY = "oci_floor"
 
 WorkerType = Type[Worker]
 
@@ -417,6 +421,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             # reorders rows and moves a column with them, so whatever set this
             # does not need to know the final row order.
             exclude_mask=data.batch.get(GRPO_STAT_EXCLUDE_KEY, None),
+            # Arm B': the groups that gain a virtual sample at the failure
+            # return, and what that return is.
+            floor_mask=data.batch.get(OCI_FLOOR_KEY, None),
+            floor_value=float(kwargs.get("oci_floor_value", 0.0)),
             # PINNED, NOT DEFAULTED. True means the group's mean and std are
             # taken over TURN ROWS, so a trajectory's weight in its own baseline
             # is its length: the same group gives A_success/A_failure of

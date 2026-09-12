@@ -120,6 +120,8 @@ def compute_grpo_outcome_advantage(
     compute_mean_std_cross_steps: bool = True,
     padding_mask: torch.Tensor = None,
     exclude_mask: torch.Tensor = None,
+    floor_mask: torch.Tensor = None,
+    floor_value: float = 0.0,
 ):
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -162,6 +164,35 @@ def compute_grpo_outcome_advantage(
             and comes back as -1e6. A caller that wants them inert should still
             zero their ``response_mask``; this only makes the advantage column
             safe to read. ``None`` reproduces the previous behaviour exactly.
+        floor_mask: `(torch.Tensor)` or None
+            shape is (bs,). True for rows whose GROUP gains ONE VIRTUAL SAMPLE at
+            ``floor_value`` -- a sample counted in the group's mean and std that
+            has no row, no tokens and no advantage of its own. Arm B' of OCI-sat:
+            a group whose eight rollouts all scored alike has an advantage of
+            exactly zero and is discarded by GRPO, and the virtual sample is what
+            a failure would have contributed to the statistic had one occurred.
+
+            ITS WEIGHT IS ONE TRAJECTORY'S, COMPUTED HERE RATHER THAN PASSED IN.
+            Under ``compute_mean_std_cross_steps=True`` the statistic is over TURN
+            ROWS, so a trajectory's weight in its own baseline is its length and a
+            weight of 1 would make the virtual sample worth one turn instead of
+            one rollout. It is therefore ``len(samples) / len(distinct
+            trajectories)`` -- the group's mean turns per trajectory -- which is
+            the same 8:1 the real injection produced, and is still correct when
+            the statistic is over trajectories instead (both counts are then the
+            number of trajectories, so the weight is 1). Computing it from the
+            counts the statistic itself used is the only way it cannot disagree
+            with them.
+
+            The resulting advantage is NEARLY INDEPENDENT OF EPISODE LENGTH,
+            which the real injection was not: eight successes plus the floor give
+            +0.351 at 8 turns each and +0.353 at 20, where a real injected
+            failure gave +0.375 at 8 turns and +0.940 at 50 because its own length
+            set its weight. ``None`` reproduces the previous behaviour exactly.
+        floor_value: float
+            The return the virtual sample carries. 0.0 is ALFWorld's failure
+            return; the reward scales are not comparable across tasks, so this is
+            meaningful only for the tasks the caller floors.
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -175,6 +206,14 @@ def compute_grpo_outcome_advantage(
     id2mean = {}
     id2std = {}
     seen_pairs = set()
+    # The floor's weight is read off the samples that actually entered the
+    # statistic, so these are counted only when a floor is in play.
+    floor_uids = set()
+    id2trajs = defaultdict(set)
+    if floor_mask is not None:
+        for i in range(scores.shape[0]):
+            if bool(floor_mask[i]):
+                floor_uids.add(index[i])
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
@@ -189,10 +228,23 @@ def compute_grpo_outcome_advantage(
             if (index[i], traj_index[i]) in seen_pairs:
                 continue
             id2score[index[i]].append(scores[i])
+            if floor_uids and index[i] in floor_uids:
+                id2trajs[index[i]].add(traj_index[i])
             if not compute_mean_std_cross_steps:
                 seen_pairs.add((index[i], traj_index[i]))
         for idx in id2score:
-            if len(id2score[idx]) == 1:
+            if idx in floor_uids:
+                vals = torch.tensor(id2score[idx], dtype=torch.float32)
+                w = vals.numel() / max(len(id2trajs[idx]), 1)
+                n_eff = vals.numel() + w
+                mean = (vals.sum() + w * floor_value) / n_eff
+                ssd = ((vals - mean) ** 2).sum() + w * (floor_value - mean) ** 2
+                id2mean[idx] = mean
+                # ddof=1, matching torch.std on the path below: the floor is a
+                # sample of the group, not a known population parameter.
+                id2std[idx] = (torch.sqrt(ssd / (n_eff - 1.0)) if n_eff > 1.0
+                               else torch.tensor(1.0))
+            elif len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
