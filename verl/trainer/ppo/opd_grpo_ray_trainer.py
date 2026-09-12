@@ -299,8 +299,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 batch.batch[OCI_FLOOR_KEY] = _t.as_tensor(
                     oci_floored, device=batch.batch["response_mask"].device)
                 metrics.update(floor_metrics(
-                    batch, _grp, oci_floored,
-                    task="+".join(sorted(set(_floor_tasks)))))
+                    batch, _grp, oci_floored, tasks=_floor_tasks))
 
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(

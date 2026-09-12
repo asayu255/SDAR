@@ -133,6 +133,48 @@ print(("  OK  " if good else "  FAIL") +
       " floor_mask=None is bit-identical to the control path")
 
 
+# --- the metric must count the floored task, not the whole batch -------------
+# The first version pooled every group classify_groups returned and filed the
+# total under the floored task's name: a three-task batch of 15 groups each
+# reported "oci_floor/groups_live/alfworld: 14" -- the live groups of all 45 --
+# next to a correct groups/live/alfworld: 3 from compute_group_metrics. The
+# selection was right and only the label was wrong, which is the worse failure:
+# a number read for 300 steps that is off by the other two tasks.
+from types import SimpleNamespace  # noqa: E402
+
+from verl.trainer.ppo.oci_floor import floor_metrics  # noqa: E402
+
+
+class _Batch:
+    def __init__(self, tasks):
+        self.non_tensor_batch = {"uid": np.array([f"g{i}" for i in range(len(tasks))]),
+                                 "task_name": np.array(tasks)}
+        self.batch = {}
+
+    def __len__(self):
+        return len(self.non_tensor_batch["uid"])
+
+
+tasks = ["alfworld"] * 3 + ["search"] * 3 + ["webshop"] * 3
+b = _Batch(tasks)
+grp = {f"g{i}": {"rows": [i], "status": st} for i, st in enumerate(
+    ["live", "stuck", "saturated",          # alfworld
+     "live", "live", "live",                # search
+     "live", "live", "stuck"])}             # webshop
+m = floor_metrics(b, grp, np.array([0, 0, 1, 0, 0, 0, 0, 0, 0], dtype=bool),
+                  tasks=["alfworld"])
+good = (m["oci_floor/groups_live/alfworld"] == 1
+        and m["oci_floor/groups_stuck/alfworld"] == 1
+        and m["oci_floor/groups_saturated/alfworld"] == 1
+        and "oci_floor/groups_live/search" not in m
+        and m["oci_floor/groups_floored"] == 1
+        and m["oci_floor/rows_floored"] == 1)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" the class counts are the floored task's only: live "
+      f"{m['oci_floor/groups_live/alfworld']}/1 of 3 alfworld groups, not 5 of 9")
+
+
 def test_floor():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

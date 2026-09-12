@@ -83,27 +83,46 @@ def select_floor_groups(batch, groups: Dict[str, Dict], *,
 
 
 def floor_metrics(batch, groups: Dict[str, Dict], floored: np.ndarray, *,
-                  task: str = "alfworld") -> Dict[str, float]:
-    """Group counts by class and how much of the batch the floor touched.
+                  tasks: Optional[Iterable[str]] = None) -> Dict[str, float]:
+    """Group counts by class, per task, and how much of the batch the floor took.
 
-    Reported per task for the same reason the class reference level is computed
-    per task: alfworld pays about 10 for a solved episode and search pays 1, so a
-    pooled number is set by alfworld and says nothing about the others.
+    COUNTED PER TASK, NOT POOLED AND THEN LABELLED. The first version walked
+    every group ``classify_groups`` returned and filed the totals under the
+    floored task's name, so a three-task batch of 15 groups each reported
+    "oci_floor/groups_live/alfworld: 14" -- the live groups of all 45 -- beside a
+    correct ``groups/live/alfworld: 3`` from compute_group_metrics. The selection
+    was right and only the label was wrong, which is the worse failure: a number
+    that is read for 300 steps and is off by the other two tasks.
+
+    The reason to keep it per task at all is the one the reference level already
+    has: alfworld pays about 10 for a solved episode and search pays 1, so a
+    pooled count is set by alfworld and says nothing about the others.
     """
-    n_by = {"live": 0, "stuck": 0, "saturated": 0}
+    want = set(tasks or ["alfworld"])
+    task_names = get_task_names(batch)
+    by_task: Dict[str, Dict[str, int]] = {t: {"live": 0, "stuck": 0, "saturated": 0}
+                                          for t in want}
     for g in groups.values():
-        s = g.get("status")
-        if s in n_by:
-            n_by[s] += 1
-    total = max(sum(n_by.values()), 1)
-    return {
-        f"oci_floor/groups_live/{task}": n_by["live"],
-        f"oci_floor/groups_stuck/{task}": n_by["stuck"],
-        f"oci_floor/groups_saturated/{task}": n_by["saturated"],
-        f"oci_floor/live_frac/{task}": n_by["live"] / total,
+        rows = g.get("rows") or []
+        if not rows:
+            continue
+        t = str(task_names[rows[0]]) if task_names is not None else "alfworld"
+        if t not in by_task:
+            continue
+        st = g.get("status")
+        if st in by_task[t]:
+            by_task[t][st] += 1
+    out: Dict[str, float] = {
         "oci_floor/groups_floored": _floored_groups(batch, floored),
         "oci_floor/rows_floored": int(np.asarray(floored, dtype=bool).sum()),
     }
+    for t, n_by in by_task.items():
+        total = max(sum(n_by.values()), 1)
+        out[f"oci_floor/groups_live/{t}"] = n_by["live"]
+        out[f"oci_floor/groups_stuck/{t}"] = n_by["stuck"]
+        out[f"oci_floor/groups_saturated/{t}"] = n_by["saturated"]
+        out[f"oci_floor/live_frac/{t}"] = n_by["live"] / total
+    return out
 
 
 def _floored_groups(batch, floored: np.ndarray) -> int:
