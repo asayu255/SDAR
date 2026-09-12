@@ -615,3 +615,216 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
+
+def compute_group_metrics(batch: DataProto, *, n_shuffles: int = 50, seed: int = 0,
+                          with_records: bool = False) -> Dict[str, Any]:
+    """Per task: can another rollout on this task buy a policy gradient, and if
+    not, is the task stuck or solved.
+
+    THE TWO DECISIONS THIS SERVES.
+
+    1. *Does a rollout here return a policy gradient at all.* A GRPO advantage is
+       the return minus its prompt group's mean, so a group whose rollouts all
+       earned the same return contributes exactly zero. ``live_frac`` is the
+       share of groups that contribute anything.
+
+       DO NOT QUOTE A GROUP COUNT FROM BEFORE 2026-09-12. The earlier figures
+       (22/60 alfworld, 21/60 webshop, 13/60 search) came from a sibling report
+       that counted ROWS rather than trajectories, so a multi-turn trajectory
+       whose reward sat on one turn read as a live group. The measurement that
+       survives is by token mass on the control checkpoint at step 300: the
+       share of response tokens carrying a nonzero advantage was 0.755 on
+       alfworld, 0.376 on webshop, 0.235 on search. This function collapses
+       rows into trajectories (see ``traj_return`` below) and is not affected.
+
+    2. *If not, why not.* A group where every rollout failed and a group where
+       every rollout succeeded are both degenerate and want opposite responses:
+       the first needs a signal that does not come from the reward, the second
+       needs its budget spent elsewhere. ``degen_stuck_low`` and
+       ``degen_saturated_high`` split them against a reference level, so nothing
+       here needs to know a task's reward scale. That reference is chosen by the
+       same preference order as ``oci_saturated.classify_groups`` and for the
+       same reason -- see ``_reference_level``.
+
+    WHY THE PERMUTATION AND NOT A BERNOULLI FORMULA. ``prompt_determinism`` asks
+    whether the degeneracy is a property of the PROMPT or just of the sampling.
+    The null is "the outcome does not depend on which prompt it came from", and
+    the exact way to state that is to reshuffle the trajectory returns across the
+    task's groups and recount. A closed form would need the reward to be 0/1,
+    which is true of search and false of alfworld and webshop. A ratio near 1 is
+    sampling noise; well above 1 means the policy either solves a prompt or does
+    not, and buying more rollouts of those same prompts cannot create an
+    advantage -- the knob that moves is temperature, group size, or which
+    prompts are drawn, not the share of the budget.
+
+    Costs one pass over the returns. No forward, no backward, no extra rollout.
+
+    ``with_records`` additionally returns, per task, each prompt group's key and
+    the trajectory returns inside it, so two runs over the SAME prompts can be
+    joined and cross-tabulated by the student's live / stuck / saturated label.
+
+    THE JOIN KEY IS ``gamefile``, NOT ``index``. An earlier version emitted
+    ``index`` and called it "the only key that survives a restart". It is not a
+    key at all on alfworld: that parquet holds fifteen rows with EMPTY prompts
+    and the environment picks the game by worker position, so every run assigns
+    the same fifteen index values to a different fifteen games. Every join made
+    on it was invalid. ``extra.gamefile`` is the game's own path and does
+    identify it; ``index`` is still emitted, marked, for tasks that have real
+    prompt rows.
+    """
+    import numpy as np
+
+    rewards = batch.batch.get("token_level_rewards", None)
+    if rewards is None:
+        return {}
+    uids = batch.non_tensor_batch.get("uid", None)
+    tuids = batch.non_tensor_batch.get("traj_uid", None)
+    if uids is None or tuids is None:
+        return {}
+    by_task = task_row_indices(batch)
+    if not by_task:
+        return {}
+
+    row_return = rewards.sum(-1).detach().float().cpu().numpy()
+    rng = np.random.default_rng(seed)
+    out: Dict[str, Any] = {}
+
+    for task, rows in by_task.items():
+        # rows -> trajectories -> prompt groups
+        idxs = batch.non_tensor_batch.get("index", None)
+        gfs = batch.non_tensor_batch.get("gamefile", None)
+        traj: Dict[Any, List[float]] = defaultdict(list)
+        traj_group: Dict[Any, Any] = {}
+        traj_index: Dict[Any, Any] = {}
+        traj_gf: Dict[Any, Any] = {}
+        for i in rows:
+            key = str(tuids[i])
+            traj[key].append(float(row_return[i]))
+            traj_group[key] = str(uids[i])
+            if idxs is not None:
+                traj_index[key] = str(idxs[i])
+            if gfs is not None and gfs[i] is not None:
+                traj_gf[key] = str(gfs[i])
+        # A trajectory's rows carry its return; take the max so a reward placed
+        # on one turn rather than broadcast still reads as that trajectory's.
+        # THIS is the line that keeps the row-counting bug out of this function.
+        traj_return = {k: max(v) for k, v in traj.items()}
+
+        groups: Dict[Any, List[float]] = defaultdict(list)
+        for k, r in traj_return.items():
+            groups[traj_group[k]].append(r)
+        if not groups:
+            continue
+
+        sizes = [len(v) for v in groups.values()]
+        live, degen = [], []
+        for v in groups.values():
+            (live if max(v) != min(v) else degen).append(v)
+
+        n_groups = len(groups)
+        ref = _reference_level([x for g in live for x in g], [g[0] for g in degen])
+        stuck = sum(1 for v in degen if v[0] < ref)
+        rec = {
+            "groups/total": n_groups,
+            "groups/live": len(live),
+            "groups/degenerate": len(degen),
+            "groups/live_frac": len(live) / n_groups,
+            "groups/degen_stuck_low": stuck,
+            "groups/degen_saturated_high": len(degen) - stuck,
+            "groups/reference_level": ref,
+            "groups/degen_return_mean": (
+                float(np.mean([v[0] for v in degen])) if degen else float("nan")
+            ),
+        }
+
+        # Permutation null: outcomes reassigned across this task's groups,
+        # group sizes preserved.
+        vals = np.array(list(traj_return.values()), dtype=float)
+        if len(vals) >= 2 and n_groups >= 2:
+            hits = []
+            for _ in range(max(int(n_shuffles), 1)):
+                perm = rng.permutation(vals)
+                pos, d = 0, 0
+                for sz in sizes:
+                    chunk = perm[pos:pos + sz]
+                    pos += sz
+                    if chunk.size and chunk.max() == chunk.min():
+                        d += 1
+                hits.append(d / n_groups)
+            null = float(np.mean(hits))
+            obs = len(degen) / n_groups
+            rec["groups/degen_frac_obs"] = obs
+            rec["groups/degen_frac_null"] = null
+            if null > 0:
+                rec["groups/prompt_determinism"] = obs / null
+            elif obs > 0:
+                # Shuffling never produced a tied group and the real batch has
+                # them: as determined as the statistic can report.
+                rec["groups/prompt_determinism"] = float("inf")
+            else:
+                # No degenerate groups under either arrangement -- typically a
+                # task whose returns are near-continuous, where the question
+                # does not arise. nan, not inf and not 0: both of those read as
+                # an answer.
+                rec["groups/prompt_determinism"] = float("nan")
+        if with_records:
+            index_of, gf_of = {}, {}
+            for k, g in traj_group.items():
+                if k in traj_index:
+                    index_of.setdefault(g, traj_index[k])
+                if k in traj_gf:
+                    gf_of.setdefault(g, traj_gf[k])
+            recs = []
+            for g, v in groups.items():
+                lo = min(v)
+                recs.append({
+                    "uid": g,
+                    # The join key. None on a task that carries no gamefile,
+                    # in which case there is no valid cross-run join for it.
+                    "gamefile": gf_of.get(g),
+                    "index_unreliable": index_of.get(g),
+                    "rets": sorted(v),
+                    "live": max(v) != lo,
+                    "status": ("live" if max(v) != lo
+                               else ("stuck" if lo < ref else "saturated")),
+                })
+            rec = dict(rec)
+            rec["groups/records"] = recs
+        out.update(with_task_suffix(rec, task))
+    return out
+
+
+def _reference_level(live_returns: List[float], degen_returns: List[float]) -> float:
+    """The level that separates a stuck degenerate group from a saturated one.
+
+    WHY NOT JUST THE MEAN OVER EVERYTHING. The obvious fallback -- when no group
+    is live, average all the returns -- is wrong in the one regime this split
+    exists for. A batch where EVERY group failed has every return equal, so the
+    mean equals them, and ``return < mean`` is false: all-zero groups get
+    labelled saturated and the mechanism fires the wrong arm on every one of
+    them. This is a bug that was found and fixed in
+    ``oci_saturated.classify_groups``; the same order is used here so the
+    training-loop metric and the injection selector never disagree about which
+    class a group is in.
+
+    The order:
+
+    1. The mean of the live returns -- the band where learning is happening.
+    2. No live group but the degenerate ones differ from each other: their
+       midpoint, which at least separates the two ends that exist.
+    3. Nothing differs anywhere. If that single value is above zero the batch is
+       saturated, so a floor of 0 makes every group read saturated; if it is
+       zero the batch is stuck, and ``+inf`` makes every group read stuck.
+       Neither case has any internal contrast to appeal to, and both are
+       reported exactly for what they are.
+    """
+    import numpy as np
+
+    if live_returns:
+        return float(np.mean(live_returns))
+    if degen_returns and min(degen_returns) != max(degen_returns):
+        return (min(degen_returns) + max(degen_returns)) / 2.0
+    if degen_returns and max(degen_returns) > 0.0:
+        return 0.0
+    return float("inf")

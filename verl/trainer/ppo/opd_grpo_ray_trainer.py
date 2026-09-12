@@ -134,22 +134,48 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     # layout: ALFWorld seeds group_n consecutive workers with the
                     # same game and env_manager puts the corrupted plan on the
                     # last slot of each group, so that is the candidate.
+                    #
+                    # PER TRAJECTORY, NOT PER ROW. uid is shared by the whole
+                    # prompt group and a multi-turn trajectory contributes one
+                    # row per turn, so counting rows inside a uid and taking
+                    # every gn-th one marks rows from the middle of arbitrary
+                    # trajectories -- it only coincides with the intended slot
+                    # when every trajectory is exactly one turn long. Order each
+                    # group's TRAJECTORIES by first appearance and mark every row
+                    # of the last one.
                     import torch as _t
 
                     gn = int(self.config.env.rollout.n)
                     uids = batch.non_tensor_batch.get("uid", None)
-                    if gn >= 2 and uids is not None:
-                        seen, pos = {}, []
-                        for u in uids:
-                            k = str(u)
-                            pos.append(seen.get(k, 0))
-                            seen[k] = seen.get(k, 0) + 1
+                    tuids = batch.non_tensor_batch.get("traj_uid", None)
+                    if gn >= 2 and uids is not None and tuids is not None:
+                        order, seen = {}, {}
+                        for u, t in zip(uids, tuids):
+                            key = (str(u), str(t))
+                            if key not in order:
+                                order[key] = seen.get(str(u), 0)
+                                seen[str(u)] = order[key] + 1
+                        # A group that did not come back with gn trajectories has
+                        # no "last slot" to trust: the env_manager marks slot
+                        # gn-1 of the worker block, and if that trajectory is
+                        # missing from the batch then nothing here is the
+                        # candidate. Marking whatever came last instead would
+                        # inject a plain rollout and read as an unreachable one.
+                        full = {u: n for u, n in seen.items() if n == gn}
+                        if len(full) < len(seen):
+                            metrics["oci/groups_short_of_n"] = len(seen) - len(full)
                         cand = _t.tensor(
-                            [1 if (p % gn) == (gn - 1) else 0 for p in pos],
+                            [1 if (str(u) in full and order[(str(u), str(t))] == gn - 1)
+                             else 0 for u, t in zip(uids, tuids)],
                             device=batch.batch["response_mask"].device)
                 if cand is None:
                     metrics["oci/error_no_candidate_column"] = 1
                 else:
+                    # Written back so every later reader -- the reachability
+                    # probe, the arm-B zeroing, an offline pass over a dump --
+                    # sees the mask this step actually acted on rather than
+                    # re-deriving it from a layout that may have changed.
+                    batch.batch["oci_candidate"] = cand.reshape(-1)
                     cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
                     grp = classify_groups(batch, judged_rows=~cand_np)
                     oci_injected = select_saturated_injections(

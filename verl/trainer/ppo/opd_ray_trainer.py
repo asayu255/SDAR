@@ -1259,6 +1259,128 @@ class OPDRayTrainer(RayPPOTrainer):
     # ------------------------------------------------------------------ #
     progress_desc = "OPD Training"
 
+    def _accumulate_oci_probe(self, batch, state: dict, probe_cfg) -> dict:
+        """One rollout batch: the class split, the injection count, and rho.
+
+        THE THREE THINGS THAT HAVE TO BE TRUE BEFORE OCI-sat TRAINS ANYTHING,
+        and none of them is assumed anywhere else:
+
+        1. *Where the degenerate token mass actually is.* The group count and the
+           token count disagree by roughly 4x, because a saturated group finishes
+           early and a stuck one runs to the turn cap. Only the token split bounds
+           what the saturated arm can buy, and only ``compute_group_metrics``
+           labels the classes; the training loop logs group counts and stops
+           there.
+        2. *That the corrupted plan actually makes the student fail.* The switch
+           does not validate itself. ``oci/cand_fail_rate`` is that check: a plan
+           missing its requirement step that the student solves anyway leaves the
+           group saturated and injects nothing.
+        3. *That the failure is REACHABLE.* A row injected into a saturated group
+           carries advantage -sqrt(7), but what reaches the weights under shaping
+           is ``A * gamma * rho / (rho + gamma)^2``, which is zero at rho = 0. A
+           failure the student would only produce with the plan in front of it
+           carries no gradient however large its advantage. See
+           oci_reachability.reachability_report.
+
+        No optimizer step, no generation, one extra forward pass of weights the
+        actor already holds over tokens that already exist.
+        """
+        import numpy as np
+
+        from verl.trainer.ppo.metric_utils import compute_group_metrics
+        from verl.trainer.ppo.oci_reachability import (
+            plan_length_column, reachability_report, wrong_plan_strip_fn)
+        from verl.trainer.ppo.oci_saturated import (
+            classify_groups, injection_metrics, select_saturated_injections,
+            token_mass_by_class)
+
+        n = state["batches"] + 1
+        task_id_names = list(batch.meta_info.get("task_id_names", []) or [])
+        multi_turn = bool(self.config.actor_rollout_ref.rollout.multi_turn.enable)
+
+        rec = {"batch": n}
+        rec["groups"] = compute_group_metrics(batch, with_records=True)
+
+        cand = batch.batch.get("oci_candidate", None)
+        if cand is None:
+            # _reward_and_advantage only derives and writes the column when
+            # algorithm.oci_sat.enable is set. Say so rather than reporting a
+            # reachability of nothing.
+            rec["error"] = ("no oci_candidate column: run with "
+                            "algorithm.oci_sat.enable=True and PRIVILEGED_WRONG_PLAN=1")
+            state.setdefault("oci", []).append(rec)
+            state["batches"] = n
+            return state
+
+        cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
+        grp = classify_groups(batch, judged_rows=~cand_np)
+        injected = select_saturated_injections(batch, grp, candidate_rows=cand_np)
+        rec["injection"] = injection_metrics(grp, injected, task="alfworld")
+        rec["token_mass"] = token_mass_by_class(batch, grp, multi_turn=multi_turn)
+
+        # Did the corrupted plan do its job? Per trajectory, not per row.
+        rets = batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy()
+        tuids = batch.non_tensor_batch.get("traj_uid", None)
+        if tuids is not None:
+            best = {}
+            for i in np.flatnonzero(cand_np):
+                k = str(tuids[i])
+                best[k] = max(best.get(k, float("-inf")), float(rets[i]))
+            if best:
+                vals = np.array(list(best.values()), dtype=float)
+                rec["cand_trajectories"] = int(vals.size)
+                rec["cand_fail_rate"] = float((vals <= 0.0).mean())
+                rec["cand_return_mean"] = float(vals.mean())
+
+        # rho, on the candidate rows only: the plan block is the only thing that
+        # differs between numerator and denominator, and rows without one would
+        # dilute the distribution with a ratio that is 1 by construction.
+        try:
+            from agent_system.environments.env_manager import _wrong_plan_prefix
+
+            gfs = batch.non_tensor_batch.get("gamefile", None)
+            if gfs is None:
+                rec["reachability"] = {"error": "batch carries no gamefile column"}
+            else:
+                # Rebuilt through the SAME cached builder the rollout used, keyed
+                # by the same gamefile, rather than by arithmetic on worker slots
+                # -- the slot layout is an assumption, the gamefile is the row's
+                # own data.
+                prefixes = [
+                    _wrong_plan_prefix("alfworld", gfs[i]) if cand_np[i] else ""
+                    for i in range(len(batch))
+                ]
+                plen = plan_length_column(prefixes, self.tokenizer)
+                rec["plan_tokens"] = {
+                    "rows_with_plan": int((plen > 0).sum()),
+                    "p50": float(np.percentile(plen[plen > 0].numpy(), 50)) if int((plen > 0).sum()) else 0.0,
+                    "max": int(plen.max()),
+                }
+                if int((plen > 0).sum()) == 0:
+                    rec["reachability"] = {
+                        "error": "no row carries a plan block; is PRIVILEGED_WRONG_PLAN set "
+                                 "in the process that built the observations?"
+                    }
+                else:
+                    batch.batch["oci_plan_len"] = plen.to(batch.batch["response_mask"].device)
+                    strip = wrong_plan_strip_fn(self.tokenizer, self.tokenizer.pad_token_id)
+                    sub = batch[np.flatnonzero(cand_np).tolist()]
+                    rec["reachability"] = reachability_report(
+                        self.actor_rollout_wg, sub, task_id_names, strip_fn=strip,
+                        gamma=float(probe_cfg.get("gamma", 0.1)),
+                    )
+        except Exception as exc:  # the report is the primary result; keep it
+            rec["reachability"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        import json
+
+        print(f"[grad_probe] oci batch {n}: "
+              f"{json.dumps({k: v for k, v in rec.items() if k != 'groups'}, default=float)}",
+              flush=True)
+        state.setdefault("oci", []).append(rec)
+        state["batches"] = n
+        return state
+
     def _reward_and_advantage(self, batch: DataProto, metrics: dict, timing_raw: dict):
         """Turn the env reward into whatever this arm feeds the loss.
 
@@ -1569,6 +1691,83 @@ class OPDRayTrainer(RayPPOTrainer):
                             metrics["teacher_cache/witness_max_err"] = max(
                                 r["witness_max_err"] for r in per_rank
                             )
+
+                    # ---- MEASUREMENT MODES (replace the update, never ride beside it) ----
+                    # A probe needs the parameters held still while it reads them,
+                    # so a step in the same iteration would invalidate its own
+                    # measurement. Ported from the probe lineage (grad_probe
+                    # 2026-09-07); see grad_probe_driver.py.
+                    #
+                    # ONLY THE ZERO-BACKWARD MODES CAME ACROSS. `halves` and
+                    # `terms` take per-(task, half) gradients through
+                    # dp_actor/fsdp_workers hooks that this lineage rewrote
+                    # underneath them (2900 changed lines in dp_actor alone), so
+                    # they are refused here rather than silently no-opping.
+                    probe_cfg = self.config.trainer.get("grad_probe", None)
+                    if probe_cfg is not None and bool(probe_cfg.get("enable", False)):
+                        from verl.trainer.ppo.grad_probe_driver import (
+                            accumulate_tau_probe,
+                            new_probe_state,
+                            write_payload,
+                        )
+
+                        probe_mode = str(probe_cfg.get("mode", "tau") or "tau")
+                        assert probe_mode in ("tau", "oci"), (
+                            f"grad_probe.mode={probe_mode!r}: this branch carries only the "
+                            "zero-backward probe modes ('tau', 'oci'). 'halves' and 'terms' "
+                            "need the worker-side gradient hooks, which were not ported -- "
+                            "run them from the probe worktree instead."
+                        )
+                        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        if getattr(self, "_grad_probe_state", None) is None:
+                            self._grad_probe_state = new_probe_state()
+
+                        if probe_mode == "tau":
+                            accumulate_tau_probe(
+                                self, batch, self._grad_probe_state,
+                                seed=int(probe_cfg.get("seed", 0)),
+                            )
+                        else:
+                            self._accumulate_oci_probe(batch, self._grad_probe_state, probe_cfg)
+
+                        done = self._grad_probe_state["batches"]
+                        n_batches = int(probe_cfg.get("n_batches", 1) or 1)
+                        every = int(probe_cfg.get("interim_every", 1) or 0)
+                        out_path = str(probe_cfg.get("out_path", "grad_probe.json"))
+                        final = done >= n_batches
+                        # A report at batch k is a valid result at that k, so the
+                        # interim write is the same payload, not a partial one.
+                        if final or (every > 0 and done % every == 0):
+                            payload = {
+                                "mode": probe_mode,
+                                "checkpoint": str(
+                                    self.config.trainer.get("resume_from_path", None)
+                                    or self.config.actor_rollout_ref.model.path
+                                ),
+                                "n_batches": done,
+                                "final": bool(final),
+                                "rollout_n": int(self.config.env.rollout.get("n", 1)),
+                                "temperature": float(
+                                    self.config.actor_rollout_ref.rollout.temperature
+                                ),
+                            }
+                            for k in ("advantages", "tau", "groups", "prompt_len",
+                                      "oci", "reachability"):
+                                if self._grad_probe_state.get(k, None):
+                                    payload[k] = self._grad_probe_state[k]
+                            write_payload(payload, out_path)
+                        if final:
+                            pprint(f"[grad_probe] mode={probe_mode}: report written after "
+                                   f"{done} batch(es); no optimizer step taken.")
+                            return
+                        # Not done yet: skip the update and draw the next batch.
+                        # The counters still advance so the log reads normally and
+                        # `is_last_step` cannot stall; nothing below them runs,
+                        # which is the point -- no update, no validation, no save.
+                        progress_bar.update(1)
+                        self.global_steps += 1
+                        continue
 
                     with _timer("update_actor", timing_raw):
                         # update_policy scales the student logits by this temperature to
