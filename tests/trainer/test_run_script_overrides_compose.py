@@ -62,6 +62,57 @@ COMPOSED_SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_oci_sat_b_qwen3.sh",
 ]
 
+# Scripts that must COMPOSE but whose intent lock does not apply: a measurement
+# pass deliberately moves pinned knobs (the checkpoint, the temperature, the
+# group size) and waives them through EXPECTED_CONFIG_WAIVE at launch, so
+# checking them against the arm's lock here would assert the opposite of what
+# the script is for. Composing is still worth checking -- that is the failure
+# that stops a run at second zero.
+COMPOSE_ONLY_SCRIPTS = [
+    "examples/opd_grpo_trainer/run_multitask_oci_probe_qwen3.sh",
+]
+
+
+def _expand(cmd, script_text):
+    """Expand $VAR and $(( arithmetic )) the way the shell would.
+
+    The scripts are parameterised by their own ``VAR="${VAR:-default}"`` lines,
+    which is how a probe is re-run at another group size, and one of them sizes
+    the batch as ``$(( PER_TASK * 3 ))``. os.path.expandvars leaves both alone,
+    and a leftover ``$((`` reaches Hydra as ``mismatched input '('`` -- so the
+    script that most needs checking was the one this parser could not read.
+
+    Only integer arithmetic over the script's own defaults, and only names the
+    script actually assigns: nothing here evaluates arbitrary text.
+    """
+    defaults = dict(re.findall(r'^(\w+)="\$\{\1:-([^}"]*)\}"', script_text, re.M))
+    env = {**defaults, **os.environ}
+
+    def _arith(match):
+        expr = match.group(1)
+        for name in sorted(re.findall(r"[A-Za-z_]\w*", expr), key=len, reverse=True):
+            expr = expr.replace(name, str(env.get(name, "0")))
+        if not re.fullmatch(r"[\d\s+\-*/()]+", expr):
+            return match.group(0)
+        return str(int(eval(expr, {"__builtins__": {}}, {})))  # noqa: S307 -- digits and operators only
+
+    cmd = re.sub(r"\$\(\(([^)]*)\)\)", _arith, cmd)
+    # Inline ${VAR:-default}: the launch lines use it for the retriever URL.
+    cmd = re.sub(r"\$\{(\w+):-([^}]*)\}",
+                 lambda m: os.environ.get(m.group(1)) or m.group(2), cmd)
+    for name, value in defaults.items():
+        if name not in os.environ:
+            cmd = cmd.replace(f"${name}", value).replace(f"${{{name}}}", value)
+    cmd = os.path.expandvars(cmd)
+    # A shell redirection is not an override. Cut the line there.
+    cmd = re.split(r"\s(?:\d?>|2>&1)", cmd)[0]
+    # Anything still unexpanded is a path assembled by the script (a checkpoint
+    # directory, an output file). A placeholder keeps the KEY in the override
+    # list -- which is what is being checked -- without this parser pretending
+    # to know a machine-specific value.
+    cmd = re.sub(r"\$\{?(\w+)\}?", r"UNSET_\1", cmd)
+    return cmd
+
 
 def _overrides(path):
     """The Hydra arguments of the script's trainer invocation.
@@ -87,15 +138,22 @@ def _overrides(path):
         # which is what bash produces and therefore what Hydra sees. Following
         # the chain is the only way this test covers a wrapper at all; without it
         # a wrapper returns None and is silently skipped.
-        chain = re.search(r'exec bash "?\$?\{?_?HERE\}?/?"?([\w./-]*)', text)
-        target = re.search(r'exec bash "\$_HERE/([\w.-]+)"', text)
-        if target is None:
+        # Two spellings in the tree: `exec bash "$_HERE/<name>"` (a sibling,
+        # resolved relative to this script) and `exec bash <repo/relative/path>`
+        # (resolved from the repo root, which is where the scripts are run from).
+        chain = re.search(
+            r'exec bash (?:"\$_HERE/(?P<sibling>[\w.-]+)"|(?P<rel>[\w][\w./-]*\.sh))',
+            text)
+        if chain is None:
             return None
-        inner = _overrides(os.path.join(os.path.dirname(path), target.group(1)))
+        if chain.group("sibling"):
+            target = os.path.join(os.path.dirname(path), chain.group("sibling"))
+        else:
+            target = chain.group("rel")
+        inner = _overrides(target)
         if inner is None:
             return None
-        marker = re.search(r'exec bash "\$_HERE/[\w.-]+"', text)
-        tail = text[marker.end():]
+        tail = text[chain.end():]
         lines = []
         for raw in tail.splitlines():
             lines.append(raw)
@@ -104,7 +162,7 @@ def _overrides(path):
         cmd = " ".join(line.rstrip().rstrip("\\").strip() for line in lines)
         cmd = cmd.replace('"$@"', "")
         cmd = re.sub(r"\$\{(\w+):\+[^}]*\}", "", cmd)
-        cmd = os.path.expandvars(cmd)
+        cmd = _expand(cmd, text)
         return inner + [a for a in shlex.split(cmd) if a]
     tail = text[marker.start():]
     lines = []
@@ -149,7 +207,7 @@ def _overrides(path):
     return [_unquote(os.path.expandvars(tok)) for tok in shlex.split(cmd) if "=" in tok]
 
 
-@pytest.mark.parametrize("script", COMPOSED_SCRIPTS)
+@pytest.mark.parametrize("script", COMPOSED_SCRIPTS + COMPOSE_ONLY_SCRIPTS)
 def test_the_script_composes(script):
     if not os.path.exists(os.path.join(REPO, script)):
         pytest.skip(f"{script} not present on this branch")
