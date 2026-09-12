@@ -172,52 +172,80 @@ print(("  OK  " if good else "  FAIL") +
 
 
 # --- PATH LENGTHENING ---------------------------------------------------------
-# The turn budget is what a wrong path can actually spend: an inadmissible line
-# costs one turn and no penalty (the projection checks only for <action> and
-# <think> tags), and 50 turns absorb three wasted ones. `go to {recep}` is
-# admissible everywhere, so each inserted step is executed.
-em._WRONG_PLAN_CACHE.clear()
-lens, dups, tails, invented_d = [], 0, 0, 0
+# The return is BINARY (0 or 10, no partial credit) and an inadmissible action
+# is not punished -- the projection validates the tags, not the admissibility --
+# so the only way a wrong path turns a success into a failure is by spending the
+# 50-turn budget. `go to {recep}` is admissible everywhere, so each inserted step
+# is executed and costs a turn.
+#
+# AND THE DESTINATIONS MUST BE IRRELEVANT. A first version drew them from the
+# receptacles THE PLAN NAMES, which are the object's location, the tool and the
+# destination: walking round those three is the search the task requires, so the
+# padding would have helped rather than hurt.
+SCENE = ["go to cabinet %d" % i for i in range(1, 11)] + [
+    "go to countertop 1", "go to diningtable 1", "go to drawer 1", "go to drawer 2",
+    "go to fridge 1", "go to garbagecan 1", "go to microwave 1", "go to sinkbasin 1",
+    "go to stoveburner 1", "go to stoveburner 2", "go to stoveburner 3",
+    "go to stoveburner 4", "go to toaster 1", "take mug 1 from cabinet 1", "look"]
+
+em._SCENE_RECEPS.clear()
+recs = em._scene_receptacles("TESTGAME", SCENE)
+good = len(recs) == 23 and "cabinet 3" in recs and "look" not in recs
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {len(recs)} scene receptacles parsed from the admissible actions, numbered")
+
+added, dups, tails, off_plan, n = [], 0, 0, 0, 0
 for g in samp[:120]:
     d = traj(g)
+    if d is None:
+        continue
     base = em._build_wrong_plan(g, "misdirect", 0)
-    long = em._build_wrong_plan(g, "misdirect", 12)
+    long = em._build_wrong_plan(g, "misdirect", 50, recs)
     if not base or not long:
         continue
+    n += 1
     lb, ll = path_lines(base), path_lines(long)
-    lens.append(len(ll) - len(lb))
+    added.append(len(ll) - len(lb))
     dups += sum(1 for a, b in zip(ll, ll[1:]) if a == b)
-    # nothing after the last step that changes the world
     last_real = max((i for i, l in enumerate(ll)
                      if l.startswith(("put ", "use ")) or " with " in l), default=len(ll) - 1)
     tails += (last_real != len(ll) - 1)
-    if d is not None:
-        true_recs = {a for h in d["plan"]["high_pddl"]
-                     for a in h["discrete_action"].get("args", []) if a}
-        invented_d += sum(1 for l in ll if l.startswith("go to ")
-                          and l[len("go to "):] not in true_recs)
+    plan_recs = {a for h in d["plan"]["high_pddl"]
+                 for a in h["discrete_action"].get("args", []) if a}
+    inserted = [l[len("go to "):] for l in ll
+                if l.startswith("go to ") and l[len("go to "):] not in plan_recs]
+    off_plan += all(x.rsplit(" ", 1)[0] not in plan_recs for x in inserted) if inserted else 0
 
-good = lens and min(lens) > 0 and dups == 0
+good = n > 50 and min(added) > 20 and dups == 0
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" detour_steps=12 adds {min(lens)}-{max(lens)} lines, {dups} immediate repeats")
+      f" detour=50 adds {min(added)}-{max(added)} lines over {n} games, "
+      f"{dups} immediate repeats")
+
+good = off_plan == n
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {off_plan}/{n} games send every inserted step to a receptacle the plan "
+      f"does NOT name")
 
 good = tails == 0
 ok &= good
 print(("  OK  " if good else "  FAIL") +
       f" {tails} paths end with padding after the last world-changing step")
 
-good = invented_d == 0
+# without a scene list there is nowhere irrelevant to go, so the path is left alone
+good = em._build_wrong_plan(samp[0], "misdirect", 50) == em._build_wrong_plan(samp[0], "misdirect", 0)
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" {invented_d} inserted steps name a receptacle the true plan does not")
+      " with no admissible actions to read, the detour is skipped rather than "
+      "drawn from the plan's own receptacles")
 
 em._WRONG_PLAN_CACHE.clear()
-good = (em._build_wrong_plan(samp[0], "intact", 12)
+good = (em._build_wrong_plan(samp[0], "intact", 50, recs)
         == em._build_wrong_plan(samp[0], "intact", 0))
 ok &= good
-print(("  OK  " if good else "  FAIL") +
-      " detour_steps is ignored for intact -- the true path is never padded")
+print(("  OK  " if good else "  FAIL") + " the true path is never padded")
 
 good = em._oci_detour(cfg()) == 0 and em._oci_detour(None) == 0
 ok &= good

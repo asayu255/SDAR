@@ -62,6 +62,28 @@ from agent_system.memory import SimpleMemory, SearchMemory
 # student fail, and that rho stays measurable, are both open and must be measured
 # before this is used to train anything.
 _WRONG_PLAN_CACHE = {}
+# Every `go to X` the scene offers, captured the first time a game is seen.
+# The detour needs somewhere IRRELEVANT to send the student, and the plan only
+# names the places that matter -- where the object is, the tool, the
+# destination. Sending it round those three is a guided tour of the solution.
+_SCENE_RECEPS = {}
+
+
+def _scene_receptacles(gamefile, admissible):
+    """The scene's `go to` targets, cached per game. Numbered, so no grounding
+    step is needed, and admissible by construction."""
+    import re
+
+    key = str(gamefile)
+    if key not in _SCENE_RECEPS and admissible:
+        found = []
+        for a in admissible:
+            m = re.fullmatch(r"go to ([a-z]+ \d+)", str(a).strip())
+            if m and m.group(1) not in found:
+                found.append(m.group(1))
+        if found:
+            _SCENE_RECEPS[key] = found
+    return _SCENE_RECEPS.get(key, [])
 _REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
                         "SliceObject", "ToggleObject")
 
@@ -165,15 +187,24 @@ def _oci_plan_mode(config) -> str:
     return mode
 
 
-def _wrong_plan_prefix(task: str, gamefile, config=None) -> str:
-    """The instance's plan, corrupted per ``plan_corruption``, or '' when off."""
+def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str:
+    """The instance's plan, corrupted per ``plan_corruption``, or '' when off.
+
+    ``admissible`` is this slot's admissible-action list. It is read once per
+    game to learn which receptacles the SCENE offers, which is where the detour
+    sends the student -- the plan only names the places that matter. Cached, so
+    the block is the same text on every turn of an episode rather than drifting
+    with whatever happens to be reachable now.
+    """
     if not _oci_switch_on(config):
         return ""
     if task != "alfworld" or not gamefile:
         return ""
-    key = (str(gamefile), _oci_plan_mode(config), _oci_detour(config))
+    n_detour = _oci_detour(config)
+    scene = _scene_receptacles(gamefile, admissible) if n_detour else []
+    key = (str(gamefile), _oci_plan_mode(config), n_detour)
     if key not in _WRONG_PLAN_CACHE:
-        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(str(gamefile), key[1], key[2])
+        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(str(gamefile), key[1], key[2], scene)
     return _WRONG_PLAN_CACHE[key]
 
 
@@ -284,65 +315,63 @@ def _misdirect(steps):
     return out
 
 
-def _add_detour(steps, n_detour: int):
-    """Insert ``n_detour`` extra ``go to`` steps, drawn from the plan's own
-    receptacles, spread through the path.
+def _add_detour(steps, n_detour: int, scene_recs=None):
+    """Insert ``n_detour`` extra ``go to`` steps that go nowhere useful.
 
-    WHY LENGTH AND NOT A STRONGER CORRUPTION. The generations say what the
-    corrupted path actually costs. The student FOLLOWS it -- shown a path that
-    puts the mug in the microwave it emits ``take mug from microwave 1``, and
-    when the environment answers ``Nothing happens.`` it emits the same action
-    again on the next turn. But an inadmissible action is not punished: the
+    WHY LENGTH. The generations say what a wrong path actually costs. The
+    student FOLLOWS it -- shown a path that puts the mug in the microwave it
+    emits ``take mug from microwave 1``, and after ``Nothing happens.`` it emits
+    the same action again -- but an inadmissible action is not punished: the
     projection's validity check looks for ``<action>`` and ``<think>`` tags and
-    nothing else, so a non-existent action costs one turn and no penalty. With a
-    50-turn cap and a measured 22.9 turns per candidate trajectory (19.9 on the
-    true path), three wasted turns are absorbed and 82% still succeed.
+    nothing else. A wrong line costs one turn and no penalty, and the return is
+    BINARY (0 or 10, no partial credit), so the only way a wrong path can turn a
+    success into a failure is to spend the 50-turn budget. Measured: 19.9 turns
+    per candidate on the true path, 22.9 on the permuted one, 82% still solving.
 
-    So the damage a wrong path can do is bounded by the TURN BUDGET, not by how
-    wrong it is. ``go to {recep}`` is admissible everywhere, so every inserted
-    step is executed and consumes a turn -- the one corruption whose cost is
-    paid in the currency that actually decides the episode.
+    WHY IRRELEVANT RECEPTACLES. A first version drew the detour from the
+    receptacles THE PLAN NAMES -- which are exactly the places that matter: the
+    object's location, the tool, the destination. Walking round those three is
+    not waste, it is the search the task requires, so the padding would have
+    helped. The scene offers about 23 `go to` targets and the plan names three;
+    the other twenty hold nothing relevant, so a step there is spent and returns
+    nothing. They come from the admissible actions, so they are real, numbered
+    and executable, and a tour of twenty distinct places reads as a systematic
+    search rather than a three-way loop.
 
-    Drawn from the receptacles the plan already names, so nothing is invented,
-    and never the same place twice in a row, which would read as a typo rather
-    than a plan.
+    Sized to exhaust the budget rather than to approach it: with a follow rate f
+    the waste is f*n_detour, and 22.9 + f*n_detour > 50 needs n_detour > 27/f.
+    f is not known, so under-shooting buys nothing -- the cost of a long list is
+    tokens, and the budget has thousands spare.
     """
     if n_detour <= 0:
         return steps
-    recs = []
+    plan_recs = set()
     for act, args in steps:
-        if act == "GotoLocation" and args and args[0] not in recs:
-            recs.append(args[0])
-        if act == "PutObject" and len(args) > 1 and args[1] not in recs:
-            recs.append(args[1])
-    if len(recs) < 2:
+        if act == "GotoLocation" and args:
+            plan_recs.add(args[0])
+        if act == "PutObject" and len(args) > 1:
+            plan_recs.add(args[1])
+    # A scene name is "cabinet 3"; a plan name is "cabinet". Match on the noun.
+    pool = [r for r in (scene_recs or []) if r.rsplit(" ", 1)[0] not in plan_recs]
+    if not pool:
         return steps
 
-    # NOTHING AFTER THE LAST REAL STEP. Padding placed past the final PutObject
-    # is visibly filler -- the task is already done by then, so the student has
-    # no reason to keep walking and the block loses whatever authority it had.
-    last_real = max(i for i, (a, _) in enumerate(steps)
-                    if a in ("PutObject", "ToggleObject") or a in _PLAN_TOOL) \
-        if any(a in ("PutObject", "ToggleObject") or a in _PLAN_TOOL for a, _ in steps) \
-        else len(steps) - 1
-
+    last_real = max((i for i, (a, _) in enumerate(steps)
+                     if a in ("PutObject", "ToggleObject") or a in _PLAN_TOOL),
+                    default=len(steps) - 1)
     out, k, placed = [], 0, 0
     per_pass = max(1, n_detour // max(last_real + 1, 1))
     for idx, (act, args) in enumerate(steps):
         if idx <= last_real:
-            # The next real step's destination, so a detour never lands where the
-            # path is about to send the student anyway: `go to X` twice in a row
-            # reads as a typo, not a plan.
-            nxt = args[0] if (act == "GotoLocation" and args) else None
             for _ in range(per_pass):
                 if placed >= n_detour:
                     break
                 prev = out[-1][1][0] if (out and out[-1][0] == "GotoLocation" and out[-1][1]) else None
                 cand = None
-                for _try in range(len(recs)):
-                    c = recs[k % len(recs)]
+                for _try in range(len(pool)):
+                    c = pool[k % len(pool)]
                     k += 1
-                    if c != prev and c != nxt:
+                    if c != prev:
                         cand = c
                         break
                 if cand is None:
@@ -353,7 +382,8 @@ def _add_detour(steps, n_detour: int):
     return out
 
 
-def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0) -> str:
+def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
+                      scene_recs=None) -> str:
     """The instance's expert path, as a block shown to the student.
 
     ``intact`` prints the true path; ``misdirect`` permutes its receptacles.
@@ -395,7 +425,7 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0)
         steps = _misdirect(steps)
         if steps is None:
             return ""
-        steps = _add_detour(steps, n_detour)
+        steps = _add_detour(steps, n_detour, scene_recs)
     lines = _plan_lines(steps)
     if not lines:
         return ""
@@ -593,7 +623,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld',
                                               (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
-                                              self.config)
+                                              self.config, admissible_actions[i])
                             if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
                 self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
@@ -609,7 +639,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld',
                                               (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
-                                              self.config)
+                                              self.config, admissible_actions[i])
                             if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
                 self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs

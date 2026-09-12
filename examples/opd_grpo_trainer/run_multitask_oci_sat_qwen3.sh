@@ -54,7 +54,7 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
     algorithm.oci_sat.enable=True \
     algorithm.oci_sat.plan_corruption=misdirect \
-    algorithm.oci_sat.detour_steps=12 \
+    algorithm.oci_sat.detour_steps=50 \
     'algorithm.oci_sat.tasks=[alfworld]' \
     algorithm.oci_sat.gradient_on_injected=True \
     algorithm.compute_mean_std_cross_steps=True \
