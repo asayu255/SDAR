@@ -60,6 +60,7 @@ COMPOSED_SCRIPTS = [
     # arm could start.
     "examples/opd_grpo_trainer/run_multitask_oci_sat_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_oci_sat_b_qwen3.sh",
+    "examples/opd_grpo_trainer/run_multitask_oci_sat_shaped_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

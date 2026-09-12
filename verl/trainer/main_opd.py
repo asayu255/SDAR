@@ -295,6 +295,14 @@ def inject_distillation_config(config) -> None:
         notice_cfg = opd_cfg.get("privileged_notice", None)
         if notice_cfg is not None:
             config.actor_rollout_ref.actor.privileged_notice = notice_cfg
+        # OCI-sat, for the same reason: the driver classifies groups and selects
+        # injections, and the ACTOR needs to know whether arm A's shaping is on
+        # and with what gamma. Authored under algorithm (not algorithm.opd -- it
+        # is a policy-gradient knob, not a distillation one) and copied whole, so
+        # the lock pins one place and both readers see the same block.
+        oci_cfg = config.algorithm.get("oci_sat", None)
+        if oci_cfg is not None:
+            config.actor_rollout_ref.actor.oci_sat = oci_cfg
         # The stand-alone transfer ladder: the off-task planes with NO weighting,
         # so an arm that touches neither the KL nor the target can still report
         # transfer/off_travel. It needs the same four-model cache the weighted

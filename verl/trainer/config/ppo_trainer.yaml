@@ -363,6 +363,20 @@ algorithm:
     # worth anything, and it needs no claim about the injected row's
     # reachability.
     gradient_on_injected: True
+    # HOW arm A trains on it. Off, the injected row contributes an ordinary
+    # clipped ratio whose numerator and denominator both carry the corrupted
+    # plan -- a policy gradient on a conditional distribution that never occurs
+    # at test time. On, the numerator becomes the plain student evaluated on the
+    # same response tokens and the ratio is shaped rather than clipped
+    # (LUFFY's f(rho) = rho/(rho+gamma)), so the coefficient vanishes for a
+    # sequence the plain student would not produce. Costs one extra forward, on
+    # the injected rows only. Meaningless when gradient_on_injected is False --
+    # arm B does not train on that row at all.
+    shaping:
+      enable: False
+      # Where the coefficient's band sits: it peaks at rho = gamma with a
+      # ceiling of 1/4. LUFFY's value.
+      gamma: 0.1
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

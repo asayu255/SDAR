@@ -238,6 +238,12 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     metrics["oci/trajectories_dropped"] = len({
                         str(t) for t, d in zip(
                             batch.non_tensor_batch.get("traj_uid", []), drop) if d})
+                # Shipped to the actor so arm A's shaping knows which rows to
+                # take on the plan-stripped prompt. A column rather than a
+                # recomputation: the selection depends on the group verdict,
+                # which only the driver has.
+                batch.batch["oci_injected"] = _t.as_tensor(
+                    oci_injected, device=batch.batch["response_mask"].device).long()
                 metrics.update(injection_metrics(
                     grp, oci_injected,
                     # Not a literal: widening oci_sat.tasks would leave the

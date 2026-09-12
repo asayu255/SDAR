@@ -489,6 +489,77 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+
+def _oci_injected_rows(micro_batch):
+    """Boolean row mask for the shaped rows in this micro-batch, or None."""
+    from verl.trainer.ppo.oci_shaping import injected_rows
+
+    return injected_rows(micro_batch)
+
+
+def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
+                     advantages, old_log_prob, temperature, gamma):
+    """Replace the injected rows' per-token loss with the shaped one.
+
+    ONE EXTRA FORWARD, ON THOSE ROWS ONLY. The numerator of the shaped ratio is
+    the plain student -- the same weights on the PLAN-STRIPPED prompt with the
+    same response tokens -- so it has to be computed, and it has to carry
+    gradient. Forwarding the whole micro-batch would double the pass for rows
+    whose strip is a no-op; the injected rows are at most one per group of eight
+    on one task of three, so the sub-batch is small and usually a single row.
+
+    THE ROWS ARE REPLACED, NOT SCALED. What sits in ``pg_losses`` for them is the
+    clipped ratio taken on the plan-conditioned prompt, which is exactly the
+    quantity arm A's shaping exists to stop optimising.
+
+    A row whose plan span cannot be removed exactly -- no span recorded, or the
+    prompt was left-truncated so the offset no longer locates the block -- keeps
+    its unshaped term and is counted. Stripping it approximately would make the
+    ratio a comparison between two prompts that differ in more than the
+    conditioning, which is the one thing rho must not be.
+    """
+    import torch
+
+    from verl.trainer.ppo.oci_reachability import strip_span
+    from verl.trainer.ppo.oci_shaping import shaped_pg_losses, shaping_diagnostics
+
+    n_len = micro_batch["oci_plan_len"].reshape(-1).clone()
+    trunc = micro_batch.get("oci_plan_truncated", None)
+    if trunc is not None:
+        n_len = n_len * (1 - trunc.reshape(-1).clamp(0, 1)).to(n_len.dtype)
+    usable = inj & (n_len > 0)
+    diag = {"oci/shaping/rows_injected": float(int(inj.sum())),
+            "oci/shaping/rows_unstrippable": float(int((inj & ~usable).sum()))}
+    if not bool(usable.any()):
+        return pg_losses, diag
+
+    rows = torch.nonzero(usable, as_tuple=False).reshape(-1)
+    resp = micro_batch["responses"]
+    pad = int(micro_batch["input_ids"][0, 0].item())  # left-padded: column 0 is pad
+    s_ids, s_mask, s_pos = strip_span(
+        micro_batch["input_ids"][rows], micro_batch["attention_mask"][rows],
+        micro_batch["oci_plan_off"].reshape(-1)[rows], n_len[rows], pad,
+        response_length=resp.shape[1],
+        position_ids=micro_batch["position_ids"][rows],
+    )
+    sub = {k: (v[rows] if torch.is_tensor(v) and v.shape[0] == inj.shape[0] else v)
+           for k, v in micro_batch.items()}
+    sub["input_ids"] = s_ids
+    sub["attention_mask"] = s_mask
+    if s_pos is not None:
+        sub["position_ids"] = s_pos
+    # WITH gradient: this is the term being optimised, not a diagnostic.
+    _, _, lp_plain = actor._forward_micro_batch(
+        micro_batch=sub, temperature=temperature, calculate_entropy=False)
+
+    shaped = shaped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows], gamma=gamma)
+    out = pg_losses.clone()
+    out[rows] = shaped.to(out.dtype)
+    diag.update(shaping_diagnostics(lp_plain.detach(), old_log_prob[rows],
+                                    response_mask[rows], gamma=gamma))
+    diag = {k: float(v) for k, v in diag.items()}
+    return out, diag
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -2497,6 +2568,37 @@ class DataParallelPPOActor(BasePPOActor):
             and "notice_len" in data.batch.keys()
             and (self._notice_probe_counter % max(1, int(notice_cfg.effect_probe_every))) == 0
         )
+        # OCI-sat ARM A's SHAPING. The injected rollout was generated with a
+        # corrupted plan in its prompt; the policy being trained has no plan in
+        # its prompt. Without this the arm optimises an ordinary clipped ratio
+        # whose numerator and denominator BOTH carry the plan, i.e. it trains a
+        # conditional distribution that is never queried at test time. With it
+        # the numerator becomes the plain student, evaluated on the same response
+        # tokens, and the ratio is shaped rather than clipped -- see
+        # verl/trainer/ppo/oci_shaping.py for the form and why the coefficient
+        # vanishes at rho -> 0.
+        #
+        # Needs three columns: which rows are injected, and where each one's plan
+        # block sits so it can be removed. All three come off the rollout.
+        _oci_cfg = self.config.get("oci_sat", None) or {}
+        _oci_shape_cfg = _oci_cfg.get("shaping", None) or {}
+        oci_shaping_on = (
+            bool(_oci_shape_cfg.get("enable", False))
+            and "oci_injected" in data.batch.keys()
+            and "oci_plan_off" in data.batch.keys()
+            and "oci_plan_len" in data.batch.keys()
+        )
+        if bool(_oci_shape_cfg.get("enable", False)) and not oci_shaping_on:
+            # A launch error, not a quiet fallback to the unshaped ratio: that
+            # fallback IS arm A without the shaping, which is the arm this
+            # option exists to replace.
+            raise AssertionError(
+                "actor.oci_sat.shaping.enable=True but the batch lacks "
+                f"{sorted({'oci_injected', 'oci_plan_off', 'oci_plan_len'} - set(data.batch.keys()))}. "
+                "Those columns come from the rollout loop (PRIVILEGED_WRONG_PLAN) "
+                "and from the trainer's injection selection."
+            )
+        oci_gamma = float(_oci_shape_cfg.get("gamma", 0.1))
         # The one knob, and it is a unit conversion rather than a strength dial:
         # exp(c) needs c in nats and c is in RMS units. The measured conversion is
         # 2.148 and that is what the run scripts pin; the 1.0 default here is the
@@ -2630,6 +2732,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys += ["sign_cache_ids", "sign_off_tasks"]
         if notice_probe_on:
             select_keys.append("notice_len")
+        if oci_shaping_on:
+            select_keys += ["oci_injected", "oci_plan_off", "oci_plan_len"]
+            if "oci_plan_truncated" in data.batch.keys():
+                select_keys.append("oci_plan_truncated")
         if xtt_enabled:
             # The same two columns the arms above select, for the same reader:
             # the base and off-task cache rows, and which planes are whose.
@@ -4142,6 +4248,23 @@ class DataParallelPPOActor(BasePPOActor):
                                  cliprange_high=clip_ratio_high,
                                  clip_ratio_c=clip_ratio_c,
                              )
+                             # OCI-sat ARM A: the injected rows' term is REPLACED,
+                             # not added to. Their clipped ratio above is the one
+                             # taken on the plan-conditioned prompt, which is the
+                             # thing the shaping exists to stop using.
+                             if oci_shaping_on:
+                                 _inj = _oci_injected_rows(data)
+                                 if _inj is not None:
+                                     pg_losses, _oci_diag = _oci_shaped_rows(
+                                         self, data, pg_losses, _inj,
+                                         response_mask=response_mask,
+                                         advantages=advantages,
+                                         old_log_prob=old_log_prob,
+                                         temperature=temperature,
+                                         gamma=oci_gamma,
+                                     )
+                                     for _k, _v in _oci_diag.items():
+                                         _defer(_k, _v)
                              pg_term = _task_agg(pg_losses)
                              # Reported unweighted so it stays comparable with runs
                              # that do not normalise per task; the weighted number is
