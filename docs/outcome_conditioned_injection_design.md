@@ -331,14 +331,33 @@ v2 の「95% が反証条件」という記述は削除した。7+1 の 1 本で
 であり、1 seed で有意にはならない。本実験が答えられるのは「機構が動き、
 方向が正か」であって、効果量ではない。
 
-### 6.5 適用範囲
+### 6.5 適用範囲 — 3 つの別物を混同しないこと
 
-**alfworld のみ。** `algorithm.oci_sat.tasks = ["alfworld"]` で固定し、trainer が
-他タスクに候補が付いていたら assert で落とす。誤った計画は alfworld の
-`traj_data.json` から作るので、他タスクに対応物が無い。
+この節の初版は見出しに「alfworld のみ」と書いていた。それは**注入の範囲**の話で
+あって run の話ではないが、run が alfworld 単独だと読める書き方だった。別物が 3 つ
+ある。
 
-webshop / search を同時に走らせることは問題ない（それらの群は判定も注入もされ
-ない）。3 タスク混合のまま alfworld にだけ作用する。
+| | 範囲 | 固定場所 |
+|---|---|---|
+| ロールアウトのタスク構成 | **3 タスク** alfworld + search + webshop、各 15 プロンプト | control スクリプト、`train_batch_size=45` として lock |
+| 注入が作用する範囲 | **alfworld のみ** | `algorithm.oci_sat.tasks=["alfworld"]`、lock |
+| H1 が読む指標 | **alfworld の成功率** | §6.1 |
+
+**run が 3 タスクであることは選択ではない。** H1 は 300 step 時点の alfworld 成功率
+を control と比べる。その control は 3 タスク混合の run であり、その alfworld 成功率
+は webshop と search の勾配が同じ重みを共有した状態の数字である。アームを alfworld
+単独にすると比較相手が存在せず、alfworld 単独の control を 300 step 新たに回す必要
+が出る。0.01 の教師 KL 係数のせいで klw_control 以外にベースラインが無い、という
+のが元々の制約なので、run のタスク構成は control から継承する以外に選択肢がない。
+
+**注入が alfworld のみであることは実装の制約。** 誤った計画は alfworld の
+`traj_data.json` から作るので他タスクに対応物が無い。`algorithm.oci_sat.tasks` で
+固定し、trainer は他タスクに候補が付いていたら assert で落とす。webshop / search の
+群は判定も注入も drop もされないので、3 タスク混合のまま alfworld にだけ作用する。
+
+**プローブも同じ 3 タスク構成で走らせる。** 理由は 2 つ。アームと同じ経路を通すこと
+（プローブ専用のコードパスを作らない）、および §7.1 で引用停止したタスク別の退化率
+が 1 回のロールアウトで 3 タスク分そろうこと。
 
 ---
 
