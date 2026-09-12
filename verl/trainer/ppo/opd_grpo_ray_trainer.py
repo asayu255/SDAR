@@ -147,8 +147,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 assert cand is not None, (
                     "algorithm.oci_sat.enable=True but the batch carries no "
                     "oci_candidate column. The column is emitted by the rollout "
-                    "loop and requires PRIVILEGED_WRONG_PLAN=1 in the environment "
-                    "that builds the observations."
+                    "loop, which emits it when algorithm.oci_sat.enable reaches the "
+                    "environment manager that builds the observations."
                 )
                 cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
                 # PER GROUP, NOT "AT LEAST ONE". The previous version asserted
@@ -178,10 +178,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                         f"{len(_bad)} of {len(_per_group)} groups on "
                         f"{sorted(_tasks_cfg)} do not carry exactly one candidate "
                         f"trajectory (counts: {sorted(set(_bad.values()))}). "
-                        "Zero everywhere means PRIVILEGED_WRONG_PLAN did not reach "
-                        "the process that builds the observations -- export it "
-                        "INSIDE the launched script, not only in the launching "
-                        "shell. Zero on SOME groups means the mark and the row it "
+                        "Zero everywhere means algorithm.oci_sat.enable did not reach "
+                        "the alfworld environment manager, or the run is not a "
+                        "training rollout. Zero on SOME groups means the mark and the row it "
                         "was read for are indexed differently; the prefix must "
                         "travel on the observation dict, which the multitask "
                         "merge reorders, not in a side channel keyed by env slot."

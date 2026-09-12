@@ -65,11 +65,6 @@ export ENV_RESET_PREFETCH=1
 export ROLLOUT_KEEP_VLLM_AWAKE=1
 export ROLLOUT_PREFETCH_TEACHER=0
 export TASK_BALANCE_INTERLEAVE=1
-# THE SWITCH. Prepends alfworld's own expert high-level plan MINUS its
-# requirement step to the last slot of each alfworld group. ~78 tokens at p50
-# against an alfworld p99 turn prompt of 947 and a 4096 ceiling, so
-# max_model_len is untouched and this arm stays comparable to every other one.
-export PRIVILEGED_WRONG_PLAN=1
 export PRIVILEGED_SKILLS=""
 export PRIVILEGED_PLAN=""
 export RUN_TAG=ociprobe
@@ -95,6 +90,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   ++data.task_balance.per_task_batch_size="$PER_TASK" \
   data.train_batch_size=$(( PER_TASK * 3 )) \
   algorithm.oci_sat.enable=True \
+  algorithm.oci_sat.plan_corruption=misdirect \
   algorithm.oci_sat.gradient_on_injected=True \
   'algorithm.oci_sat.tasks=[alfworld]' \
   +trainer.grad_probe.enable=True \

@@ -1071,6 +1071,9 @@ class TrajectoryCollector:
         # see the OCI_PREFIX_KEY note in env_manager for what reading a
         # locally-keyed side channel by the global index did (1 group of 15
         # marked, and the "at least one candidate" assert passed anyway).
+        # No flag to read here: the env manager only puts a non-empty prefix on the
+        # observation when its own config has the switch on, so an absent or
+        # empty entry already means "no plan was shown to this row".
         _oci_pres = obs.get(OCI_PREFIX_KEY, None)
         _oci_pre = (_oci_pres[item] or "") if _oci_pres is not None and _oci_pres[item] else ""
         if _oci_pre and obs_content.startswith(_oci_pre):

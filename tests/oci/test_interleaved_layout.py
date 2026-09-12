@@ -136,7 +136,6 @@ import types
 from agent_system.environments.env_manager import (
     AlfWorldEnvironmentManager, MultiTaskEnvironmentManager, OCI_PREFIX_KEY)
 
-os.environ["PRIVILEGED_WRONG_PLAN"] = "1"
 N_ALF = PER_TASK * GN
 
 
@@ -152,7 +151,9 @@ def fake_alf_manager():
     m = AlfWorldEnvironmentManager.__new__(AlfWorldEnvironmentManager)
     m._oci_prefixes = []
     m.envs = FakeAlfEnvs()
-    m.config = types.SimpleNamespace(env=types.SimpleNamespace(history_length=0))
+    m.config = types.SimpleNamespace(
+        env=types.SimpleNamespace(history_length=0),
+        algorithm={"oci_sat": {"enable": True, "plan_corruption": "misdirect"}})
     m.tasks = ["put a clean mug in the countertop"] * N_ALF
     # One distinct game per GROUP, the way ALFWorld seeds seed + i // group_n.
     m.gamefile = [f"/games/g{i // GN}/traj_data.json" for i in range(N_ALF)]
@@ -165,7 +166,7 @@ def fake_alf_manager():
 import agent_system.environments.env_manager as em
 
 _real_builder = em._wrong_plan_prefix
-em._wrong_plan_prefix = lambda task, gamefile: (
+em._wrong_plan_prefix = lambda task, gamefile, config=None: (
     f"PLAN[{gamefile}]\n" if gamefile else "")
 try:
     mgr = fake_alf_manager()
@@ -244,7 +245,6 @@ try:
           "manager's prefixes intact")
 finally:
     em._wrong_plan_prefix = _real_builder
-    os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
 
 
 def test_interleaved_layout():

@@ -7,7 +7,9 @@ TWO BUGS THIS FILE PINS.
    manager -- built with group_n=1, is_train=False -- also matched and one
    alfworld instance in eight was validated with a corrupted plan. The arm's
    own success-rate measurement was contaminated by the arm. It now asks the
-   envs it holds.
+   envs it holds for the group size, and its own config for the switch -- the
+   switch was the environment variable PRIVILEGED_WRONG_PLAN, which a setsid'd
+   process over ssh does not inherit and which no intent lock could pin.
 
 2. ``compute_group_metrics`` fell back to the mean over all returns when no
    group was live. An all-failed batch has every return equal to that mean, so
@@ -34,23 +36,29 @@ def envs(group_n=GN, is_train=True):
     return types.SimpleNamespace(group_n=group_n, is_train=is_train)
 
 
-# --- the switch is off unless the environment variable says otherwise --------
-os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
-good = not any(_oci_candidate_row(i, envs()) for i in range(GN))
+def cfg(enable=True):
+    return types.SimpleNamespace(
+        algorithm={"oci_sat": {"enable": enable, "plan_corruption": "misdirect"}})
+
+
+# --- the switch is off unless the CONFIG says otherwise ---------------------
+good = not any(_oci_candidate_row(i, envs(), cfg(enable=False)) for i in range(GN))
 ok &= good
 print(("  OK  " if good else "  FAIL") + " switch off: no slot is a candidate")
 
-os.environ["PRIVILEGED_WRONG_PLAN"] = "1"
+good = not any(_oci_candidate_row(i, envs(), None) for i in range(GN))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " no config at all: no slot is a candidate")
 
 # --- on a training manager, exactly the last slot of each group -------------
-marks = [_oci_candidate_row(i, envs()) for i in range(3 * GN)]
+marks = [_oci_candidate_row(i, envs(), cfg()) for i in range(3 * GN)]
 good = [i for i, m in enumerate(marks) if m] == [GN - 1, 2 * GN - 1, 3 * GN - 1]
 ok &= good
 print(("  OK  " if good else "  FAIL") +
       f" training manager: slots {[i for i, m in enumerate(marks) if m]} of 24")
 
 # --- the validation manager must be untouched -------------------------------
-val = [_oci_candidate_row(i, envs(group_n=1, is_train=False)) for i in range(3 * GN)]
+val = [_oci_candidate_row(i, envs(group_n=1, is_train=False), cfg()) for i in range(3 * GN)]
 good = not any(val)
 ok &= good
 print(("  OK  " if good else "  FAIL") +
@@ -58,13 +66,13 @@ print(("  OK  " if good else "  FAIL") +
 
 # Both guards are load-bearing and are checked separately, because group_n=1
 # alone would already have hidden the missing is_train check.
-good = not any(_oci_candidate_row(i, envs(group_n=GN, is_train=False))
+good = not any(_oci_candidate_row(i, envs(group_n=GN, is_train=False), cfg())
                for i in range(3 * GN))
 ok &= good
 print(("  OK  " if good else "  FAIL") +
       " is_train=False with a train-sized group_n: still nothing marked")
 
-good = not any(_oci_candidate_row(i, envs(group_n=1, is_train=True))
+good = not any(_oci_candidate_row(i, envs(group_n=1, is_train=True), cfg())
                for i in range(3 * GN))
 ok &= good
 print(("  OK  " if good else "  FAIL") + " group_n=1: a group of one has no odd slot")
@@ -77,10 +85,9 @@ print(("  OK  " if good else "  FAIL") +
       f" the old config-reading rule marked {sum(old)} validation slots, "
       f"which is the contamination")
 
-good = not any(_oci_candidate_row(i, None) for i in range(GN))
+good = not any(_oci_candidate_row(i, None, cfg()) for i in range(GN))
 ok &= good
 print(("  OK  " if good else "  FAIL") + " no envs at all: nothing marked")
-os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
 
 # --- the reference level, in the four regimes that decide the class split ----
 cases = [

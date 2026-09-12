@@ -1305,7 +1305,7 @@ class OPDRayTrainer(RayPPOTrainer):
             # the no-fallback note in opd_grpo_ray_trainer. Say so rather than
             # reporting a reachability of nothing.
             rec["error"] = ("no oci_candidate column: the rollout must be built "
-                            "with PRIVILEGED_WRONG_PLAN=1")
+                            "with algorithm.oci_sat.enable=True")
             state.setdefault("oci", []).append(rec)
             state["batches"] = n
             return state
@@ -1353,8 +1353,8 @@ class OPDRayTrainer(RayPPOTrainer):
         if not len(rows):
             rec["reachability"] = {
                 "error": "no candidate row carries a strippable plan span; is "
-                         "PRIVILEGED_WRONG_PLAN set in the process that built "
-                         "the observations, and did the prompt avoid truncation?"
+                         "algorithm.oci_sat.enable reaching the alfworld manager, "
+                         "and did the prompt avoid truncation?"
             }
         else:
             try:

@@ -34,13 +34,11 @@
 # expected_multitask_oci_sat_shaped_config.yaml and exactly five of them differ from the
 # control's file (the run's name and the four below).
 #
-# THE SWITCH IS AN ENVIRONMENT VARIABLE AND IS EXPORTED HERE, INSIDE THE SCRIPT.
-# PRIVILEGED_WRONG_PLAN is read in the process that assembles the observation
-# text, which no config key reaches, so the lock cannot pin it. Exporting it in
-# the launching shell is not enough and has already failed once in this project
-# (PLAN=1 lost across setsid over ssh; the arm ran as a plain student for thirty
-# minutes and reported as the arm). Hence both belts: the export is here, and the
-# trainer asserts that at least one row came back marked.
+# THE SWITCH IS A CONFIG KEY (algorithm.oci_sat.enable), not an environment
+# variable. It was PRIVILEGED_WRONG_PLAN, which a setsid'd process over ssh
+# does not inherit -- an arm once ran as a plain student for thirty minutes and
+# reported as the arm -- and which no intent lock could pin. The env manager
+# reads it off its own copy of the config, so the lock fixes the arm's identity.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -52,7 +50,6 @@ set -euo pipefail
 export RUN_TAG=${RUN_TAG:-}
 export RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
 
-export PRIVILEGED_WRONG_PLAN=1
 # Mutually exclusive with the other privileged inputs: two blocks at the head of
 # the same observation are two interventions, and the strip that measures rho
 # removes only one span.
@@ -62,6 +59,7 @@ export PRIVILEGED_PLAN=""
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
     algorithm.oci_sat.enable=True \
+    algorithm.oci_sat.plan_corruption=misdirect \
     'algorithm.oci_sat.tasks=[alfworld]' \
     algorithm.oci_sat.gradient_on_injected=True \
     algorithm.oci_sat.shaping.enable=True \

@@ -93,7 +93,7 @@ _REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
 OCI_PREFIX_KEY = "oci_prefix"
 
 
-def _oci_candidate_row(i: int, envs) -> bool:
+def _oci_candidate_row(i: int, envs, config=None) -> bool:
     """Is env slot ``i`` the one that gets the corrupted plan?
 
     ALFWorld seeds worker i with ``seed + i // group_n``, so the group_n
@@ -101,19 +101,23 @@ def _oci_candidate_row(i: int, envs) -> bool:
     leaves the other group_n-1 as untouched plain rollouts of that game and needs
     no second generation pass.
 
-    ASKS THE ENVS, NOT THE CONFIG. An earlier version read
-    ``config.env.rollout.n``, which is the TRAINING group size and is the same
-    object in the validation manager -- built with ``group_n=1, is_train=False``
-    by ``_build_val_envs``. So validation put a corrupted plan on one alfworld
-    instance in eight and its success rate fell for a reason that had nothing to
-    do with the arm being tested, i.e. the measurement the switch exists to make
-    was contaminated by the switch. Both guards below are load-bearing: group_n
-    alone would already disable it on the validation manager, and is_train says
-    so explicitly rather than by arithmetic accident.
-    """
-    import os
+    THE SWITCH IS A CONFIG KEY, NOT AN ENVIRONMENT VARIABLE. It used to be
+    PRIVILEGED_WRONG_PLAN, copying how PRIVILEGED_SKILLS and PRIVILEGED_PLAN are
+    done here, and that has a failure mode this project has already paid for: a
+    variable exported in the launching shell does not reach a setsid'd process
+    over ssh, so an arm ran as a plain student for thirty minutes and reported as
+    the arm. It also cannot be pinned by the intent lock, so the arm's identity
+    was not fixed anywhere. _copy_config_for_task copies the WHOLE config onto
+    each task's manager, so the manager can read algorithm.oci_sat directly and
+    the lock pins both the switch and the corruption mode.
 
-    if not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
+    ASKS THE ENVS, NOT THE CONFIG, FOR THE GROUP SIZE. config.env.rollout.n is
+    the TRAINING group size on a shared config object, so the validation manager
+    -- built with group_n=1, is_train=False -- matched it too and one alfworld
+    instance in eight was VALIDATED with a corrupted plan, i.e. the arm's own
+    success-rate measurement was contaminated by the arm.
+    """
+    if not _oci_switch_on(config):
         return False
     if envs is None or not getattr(envs, "is_train", False):
         return False
@@ -124,23 +128,96 @@ def _oci_candidate_row(i: int, envs) -> bool:
     return g >= 2 and (i % g) == (g - 1)
 
 
-def _wrong_plan_prefix(task: str, gamefile) -> str:
-    """The instance's plan minus its requirement, or '' when the switch is off."""
-    import os
+def _oci_cfg(config):
+    """``algorithm.oci_sat`` off the manager's own config, or None."""
+    if config is None:
+        return None
+    try:
+        return config.algorithm.get("oci_sat", None)
+    except Exception:
+        return None
 
-    if task != "alfworld" or not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
+
+def _oci_switch_on(config) -> bool:
+    cfg = _oci_cfg(config)
+    return bool(cfg is not None and cfg.get("enable", False))
+
+
+def _oci_plan_mode(config) -> str:
+    cfg = _oci_cfg(config)
+    mode = str((cfg or {}).get("plan_corruption", "misdirect") or "misdirect")
+    if mode not in PLAN_CORRUPTIONS:
+        raise ValueError(
+            f"algorithm.oci_sat.plan_corruption={mode!r}; expected one of "
+            f"{PLAN_CORRUPTIONS}. 'misdirect' permutes the navigation targets; "
+            "'drop' removes the requirement step and is kept only to reproduce "
+            "the measurement that refuted it (cand_fail_rate 1/15)."
+        )
+    return mode
+
+
+def _wrong_plan_prefix(task: str, gamefile, config=None) -> str:
+    """The instance's plan, corrupted per ``plan_corruption``, or '' when off."""
+    if not _oci_switch_on(config):
         return ""
-    if not gamefile:
+    if task != "alfworld" or not gamefile:
         return ""
-    key = str(gamefile)
+    key = (str(gamefile), _oci_plan_mode(config))
     if key not in _WRONG_PLAN_CACHE:
-        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(key)
+        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(str(gamefile), key[1])
     return _WRONG_PLAN_CACHE[key]
 
 
-def _build_wrong_plan(gamefile: str) -> str:
+PLAN_CORRUPTIONS = ("misdirect", "drop")
+
+
+def _build_wrong_plan(gamefile: str, mode: str = "misdirect") -> str:
+    """The instance's expert plan, corrupted so the student FAILS it.
+
+    WHY "drop" DOES NOT WORK, measured rather than argued. The first version
+    removed the plan's requirement step -- the CleanObject / HeatObject /
+    CoolObject / SliceObject / ToggleObject, else the final PutObject. On the
+    control checkpoint at step 300 the candidate shown that plan solved the task
+    14 times in 15 and scored ABOVE its group's mean while doing it.
+
+    The reason is visible once the text is read: the step being removed is the
+    one the TASK DESCRIPTION already states. Over 853 sampled games with a
+    requirement step, the dropped action is named in the task text 92% of the
+    time -- ToggleObject 99%, HeatObject 97%, CoolObject 91%, CleanObject 86%,
+    SliceObject 76% ("put a clean mug under the coffee maker", "heat an egg and
+    put it back in the fridge", "carry a laptop while turning on a light") -- and
+    in the 43% of games with no requirement step the dropped step is the final
+    PutObject, whose object and receptacle ARE the task description. So the plan
+    handed over the part the student cannot know (where to search) and withheld
+    the one part it was already told. Net effect: a strong help.
+
+    WHAT "misdirect" CORRUPTS INSTEAD. The informative content of an expert plan
+    here is the NAVIGATION: which receptacle holds the object, and in what order
+    to visit things. That is exactly what the student cannot get from the task
+    text. This mode cyclically permutes the distinct GotoLocation targets, so
+    every navigation step points at a receptacle from the SAME plan that is not
+    the right one for that step. Nothing is removed and no name is invented: the
+    step count, the action vocabulary and the object names are untouched, which
+    keeps the block the same size and keeps the leak surface identical to the
+    refuted version.
+
+    99.7% of plans (798 of 800 sampled) carry at least two distinct GotoLocation
+    targets, so the permutation has somewhere to send them; a plan with one is
+    returned unchanged as '' rather than corrupted in some other way.
+
+    AND WHY THIS FAILURE MODE AND NOT A STRONGER ONE. Handing over another
+    game's plan entirely would fail more reliably and be useless: rho is the
+    probability the PLAIN student would produce the same tokens, and a sequence
+    driven by an unrelated scene is one it would never produce, so the shaped
+    gradient vanishes (see the design document section 4). Searching the wrong
+    receptacle is the student's own unassisted failure mode, which is the one
+    corruption that can raise the failure rate and keep rho measurable.
+    """
     import json as _json
     import os
+
+    if mode not in PLAN_CORRUPTIONS:
+        raise ValueError(f"plan_corruption={mode!r}; expected one of {PLAN_CORRUPTIONS}")
 
     d, cand = gamefile, None
     for _ in range(4):
@@ -166,13 +243,28 @@ def _build_wrong_plan(gamefile: str) -> str:
     if len(steps) < 3:
         return ""
 
-    drop = next((i for i, (a, _) in enumerate(steps) if a in _REQUIREMENT_ACTIONS), None)
-    if drop is None:
-        puts = [i for i, (a, _) in enumerate(steps) if a == "PutObject"]
-        if not puts:
+    if mode == "drop":
+        drop = next((i for i, (a, _) in enumerate(steps) if a in _REQUIREMENT_ACTIONS), None)
+        if drop is None:
+            puts = [i for i, (a, _) in enumerate(steps) if a == "PutObject"]
+            if not puts:
+                return ""
+            drop = puts[-1]
+        kept = [s for i, s in enumerate(steps) if i != drop]
+    else:
+        # Cyclically permute the distinct navigation targets, in first-appearance
+        # order, so no GotoLocation keeps its own destination.
+        order = []
+        for a, g in steps:
+            if a == "GotoLocation" and g and g[0] not in order:
+                order.append(g[0])
+        if len(order) < 2:
             return ""
-        drop = puts[-1]
-    kept = [s for i, s in enumerate(steps) if i != drop]
+        swap = {src: order[(i + 1) % len(order)] for i, src in enumerate(order)}
+        kept = [
+            (a, ([swap[g[0]]] + g[1:]) if (a == "GotoLocation" and g) else g)
+            for a, g in steps
+        ]
     if not kept:
         return ""
 
@@ -183,6 +275,7 @@ def _build_wrong_plan(gamefile: str) -> str:
     return ("### SOLUTION PLAN (training only) ###\n"
             "A correct high-level plan for this task is:\n" + body +
             "\nGround each step into one admissible action at a time.\n\n")
+
 
 from omegaconf import OmegaConf
 
@@ -371,8 +464,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
-                            if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
+                _oci_pre = (_wrong_plan_prefix('alfworld',
+                                              (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
+                                              self.config)
+                            if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
                 self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
             else:
@@ -385,8 +480,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
-                            if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
+                _oci_pre = (_wrong_plan_prefix('alfworld',
+                                              (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
+                                              self.config)
+                            if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
                 self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
 

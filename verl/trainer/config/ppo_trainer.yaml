@@ -352,7 +352,25 @@ algorithm:
   # the trainer refuses a batch that carries no marks rather than training an
   # arm that silently became the control.
   oci_sat:
+    # The switch. Read by the alfworld env manager off its own copy of this
+    # config (_copy_config_for_task copies the whole tree), so it is pinned by
+    # the intent lock. It used to be the environment variable
+    # PRIVILEGED_WRONG_PLAN, which a setsid'd process over ssh does not inherit
+    # -- an arm once ran as a plain student for thirty minutes and reported as
+    # the arm -- and which no lock could pin.
     enable: False
+    # HOW the plan is corrupted so the student fails it.
+    #   misdirect: cyclically permute the distinct GotoLocation targets, so every
+    #     navigation step points at a receptacle from the same plan that is wrong
+    #     for that step. Nothing removed, no name invented.
+    #   drop: remove the requirement step (Clean/Heat/Cool/Slice/ToggleObject,
+    #     else the final PutObject). KEPT ONLY TO REPRODUCE A REFUTED
+    #     MEASUREMENT: the dropped step is the one the task description already
+    #     states (92% of 853 sampled games), so the plan gave away the part the
+    #     student cannot know and withheld the part it was already told. The
+    #     candidate solved the task 14 times in 15 and scored above its group's
+    #     mean.
+    plan_corruption: misdirect
     # Only where the plan exists. env_manager prepends it at the alfworld
     # prompt sites and nowhere else; a candidate marked on another task would
     # be a plain rollout excluded from its group's verdict and then dropped.

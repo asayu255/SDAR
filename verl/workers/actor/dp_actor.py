@@ -2597,7 +2597,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise AssertionError(
                 "actor.oci_sat.shaping.enable=True but the batch lacks "
                 f"{sorted({'oci_injected', 'oci_plan_off', 'oci_plan_len'} - set(data.batch.keys()))}. "
-                "Those columns come from the rollout loop (PRIVILEGED_WRONG_PLAN) "
+                "Those columns come from the rollout loop (algorithm.oci_sat.enable) "
                 "and from the trainer's injection selection."
             )
         oci_gamma = float(_oci_shape_cfg.get("gamma", 0.1))

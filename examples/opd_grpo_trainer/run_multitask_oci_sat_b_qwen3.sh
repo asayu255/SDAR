@@ -28,13 +28,13 @@ set -euo pipefail
 export RUN_TAG=${RUN_TAG:-}
 export RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
 
-export PRIVILEGED_WRONG_PLAN=1
 export PRIVILEGED_SKILLS=""
 export PRIVILEGED_PLAN=""
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
     algorithm.oci_sat.enable=True \
+    algorithm.oci_sat.plan_corruption=misdirect \
     'algorithm.oci_sat.tasks=[alfworld]' \
     algorithm.oci_sat.gradient_on_injected=False \
     algorithm.compute_mean_std_cross_steps=True \
