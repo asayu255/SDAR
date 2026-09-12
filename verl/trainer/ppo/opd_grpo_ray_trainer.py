@@ -151,6 +151,23 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     "that builds the observations."
                 )
                 cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
+                # THE SILENT FAILURE THIS CATCHES. The column exists on every
+                # row whether the switch fired or not, so a present-but-all-zero
+                # column means the rollout ran with the switch off while the
+                # trainer thought it was running an injection arm -- the arm
+                # becomes the control and reports as the arm. The way that
+                # happens is an environment variable not reaching the process
+                # that builds the observations, which has already happened once
+                # in this project (PLAN=1 lost across setsid over ssh, so the
+                # arm ran as a plain student for thirty minutes). It is a launch
+                # error and it fails here.
+                assert cand_np.any(), (
+                    "algorithm.oci_sat.enable=True but not one row is marked as a "
+                    "candidate. The rollout was built without PRIVILEGED_WRONG_PLAN "
+                    "reaching the environment process, so this arm is the control. "
+                    "Check that the variable is exported INSIDE the launched script "
+                    "rather than only in the launching shell."
+                )
                 # The switch itself is gated on the training envs, so a candidate
                 # can only be an on-task row; this only says so out loud, and
                 # catches a widened switch that forgot to widen the metric names.

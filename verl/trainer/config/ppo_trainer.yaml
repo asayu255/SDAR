@@ -333,6 +333,36 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: True
+  # Whether a GRPO group's mean and std are taken over TURN ROWS (True) or over
+  # trajectories (False). True is the historical behaviour of every run in this
+  # repo and stays the default; it makes a trajectory's weight in its own
+  # baseline equal to its length, so the same 7-success/1-failure group gives
+  # A_success/A_failure of +0.375/-2.625 when the odd trajectory runs 8 turns
+  # and +0.940/-1.053 when it runs 50. Listed here rather than left to a
+  # function default because any mechanism that injects a row into a group
+  # changes that group's baseline through the row's length as well as its
+  # return, so which statistic is in use is part of what identifies an arm.
+  compute_mean_std_cross_steps: True
+  # OCI-sat: inject one deliberately-failing rollout into an already-solved
+  # group so its seven successes stop cancelling. The rollout is the SAME
+  # student shown its own expert plan with the requirement step removed; the
+  # mark is placed by the rollout loop and requires PRIVILEGED_WRONG_PLAN=1 in
+  # the environment that builds the observations, because that is where the
+  # observation text is assembled. `enable` alone does nothing without it, and
+  # the trainer refuses a batch that carries no marks rather than training an
+  # arm that silently became the control.
+  oci_sat:
+    enable: False
+    # Only where the plan exists. env_manager prepends it at the alfworld
+    # prompt sites and nowhere else; a candidate marked on another task would
+    # be a plain rollout excluded from its group's verdict and then dropped.
+    tasks: ["alfworld"]
+    # Arm A (True) trains on the injected row; arm B (False) keeps it in the
+    # group's mean, so the baseline still moves, but takes its gradient away
+    # after the fact. B is the arm that tests whether the contrast alone is
+    # worth anything, and it needs no claim about the injected row's
+    # reachability.
+    gradient_on_injected: True
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
