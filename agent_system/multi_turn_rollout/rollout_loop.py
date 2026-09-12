@@ -35,12 +35,7 @@ from verl.trainer.ppo.privileged_notice import (
     notice_text as _notice_text,
     parse_notice_config as _parse_notice_config,
 )
-from agent_system.environments.env_manager import oci_prefix_for
-
-# Read once. env_manager decides per slot whether a plan was actually shown (it
-# also gates on the envs being a TRAINING manager); this only says whether to
-# bother asking, so that a run with the switch off pays nothing per row.
-_OCI_WRONG_PLAN_ON = bool(os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip())
+from agent_system.environments.env_manager import OCI_PREFIX_KEY
 from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -1049,7 +1044,14 @@ class TrajectoryCollector:
         # in TOKENS -- character arithmetic can split a token that spans the
         # boundary.
         oci_candidate, oci_plan_off, oci_plan_len, oci_plan_truncated = 0, 0, 0, 0
-        _oci_pre = oci_prefix_for(item) if _OCI_WRONG_PLAN_ON else ""
+        # Read off the OBSERVATION, in the same indexing as every other obs key,
+        # because the multitask merge has already put them all in global row
+        # order. `item` is a global row index and the env slot is a local one;
+        # see the OCI_PREFIX_KEY note in env_manager for what reading a
+        # locally-keyed side channel by the global index did (1 group of 15
+        # marked, and the "at least one candidate" assert passed anyway).
+        _oci_pres = obs.get(OCI_PREFIX_KEY, None)
+        _oci_pre = (_oci_pres[item] or "") if _oci_pres is not None and _oci_pres[item] else ""
         if _oci_pre and obs_content.startswith(_oci_pre):
             oci_candidate = 1
             _msgs_wo = [dict(_m) for _m in messages]

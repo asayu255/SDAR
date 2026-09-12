@@ -20,6 +20,14 @@
 # wrapper rather than a copy.
 set -euo pipefail
 
+# The same expression the control exports, set HERE too: this script builds
+# the experiment_name override before exec'ing the control, so the shell
+# expands $RUN_TAG_SUFFIX at that point and it has to already be set. The
+# control re-exports the identical value, so this is idempotent, and the
+# lock file expects exactly this suffix.
+export RUN_TAG=${RUN_TAG:-}
+export RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
+
 export PRIVILEGED_WRONG_PLAN=1
 export PRIVILEGED_SKILLS=""
 export PRIVILEGED_PLAN=""
@@ -30,6 +38,6 @@ exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
     'algorithm.oci_sat.tasks=[alfworld]' \
     algorithm.oci_sat.gradient_on_injected=False \
     algorithm.compute_mean_std_cross_steps=True \
-    trainer.experiment_name="opd_grpo_multitask_oci_sat_b_qwen3_1.7b${RUN_TAG:+_$RUN_TAG}" \
-    +trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_oci_sat_b_config.yaml \
+    trainer.experiment_name="opd_grpo_multitask_oci_sat_b_qwen3_1.7b$RUN_TAG_SUFFIX" \
+    ++trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_oci_sat_b_config.yaml \
     "$@"

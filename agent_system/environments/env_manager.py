@@ -66,21 +66,31 @@ _REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
                         "SliceObject", "ToggleObject")
 
 
-# What was actually prepended, per env slot, for the turn just built. The row
-# builder reads it to record where the block sits in the tokenised prompt, and
-# the reachability probe removes exactly that span. Re-deriving the text there
-# would be a second source of truth that can drift from this one.
-_OCI_LAST_PREFIX = {}
-
-
-def oci_last_prefixes(n_rows: int):
-    """Per-slot plan block for the turn just built; '' where none was shown."""
-    return [_OCI_LAST_PREFIX.get(i, "") for i in range(n_rows)]
-
-
-def oci_prefix_for(i: int) -> str:
-    """The plan block shown to env slot ``i`` on the turn just built, or ''."""
-    return _OCI_LAST_PREFIX.get(i, "")
+# THE PREFIX TRAVELS ON THE OBSERVATION, NOT IN A MODULE-LEVEL DICT.
+#
+# The row builder needs to know what was prepended, to record where the block
+# sits in the tokenised prompt. The first version kept a dict keyed by env slot
+# and the loop read it by the row's GLOBAL batch index. Those are different
+# numbers. Under TASK_BALANCE_INTERLEAVE (the default) the generation batch is
+# laid out alf0, search0, webshop0, alf1, ... at the PROMPT level and each prompt
+# is then repeated group_n times contiguously, so alfworld local slot i is global
+# row 24*(i//8) + i%8 on a three-task batch of 8. Looking up the global index in
+# a locally-keyed dict matched for exactly ONE group of fifteen: four more landed
+# on another group's candidate (a different game, so the startswith check
+# rejected it) and ten were past the end of the dict. Fourteen candidate
+# trajectories went unmarked -- judged as part of their group and trained as
+# plain rows with the corrupted plan still in the prompt -- and because one group
+# WAS marked, the "at least one candidate" assert passed.
+#
+# The dict was also shared with the validation manager, which writes '' into it
+# for every slot it builds, so a validation step could blank the marks for the
+# next batch's turn 0.
+#
+# A key on the observation dict has neither problem: MultiTaskEnvironmentManager
+# ._merge_observations reorders EVERY key from each manager's local order into
+# global order using _task_indices, and the validation manager has its own
+# observations.
+OCI_PREFIX_KEY = "oci_prefix"
 
 
 def _oci_candidate_row(i: int, envs) -> bool:
@@ -285,6 +295,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        # Refilled by every build_text_obs call; see OCI_PREFIX_KEY.
+        self._oci_prefixes = []
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -297,7 +309,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.extract_task(text_obs)
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
-        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
+                OCI_PREFIX_KEY: list(self._oci_prefixes)}, infos
     
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
@@ -313,7 +326,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
+                             OCI_PREFIX_KEY: list(self._oci_prefixes)}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -332,7 +346,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
+
+        Also fills ``self._oci_prefixes``: one entry per slot IN THIS MANAGER'S
+        OWN ORDER, holding the corrupted-plan block prepended to that slot's
+        observation or '' when none was. The caller puts it on the observation
+        dict under OCI_PREFIX_KEY so the multitask merge reorders it with
+        everything else -- see the note on OCI_PREFIX_KEY for what happened when
+        it travelled by env-slot index instead.
         """
+        self._oci_prefixes = []
         postprocess_text_obs = []
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
@@ -351,7 +373,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
                             if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
-                _OCI_LAST_PREFIX[i] = _oci_pre
+                self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
             else:
                 obs = ALFWORLD_TEMPLATE.format(
@@ -365,7 +387,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
                             if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
-                _OCI_LAST_PREFIX[i] = _oci_pre
+                self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
 
             postprocess_text_obs.append(obs)

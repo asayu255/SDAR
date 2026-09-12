@@ -151,34 +151,60 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     "that builds the observations."
                 )
                 cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
-                # THE SILENT FAILURE THIS CATCHES. The column exists on every
-                # row whether the switch fired or not, so a present-but-all-zero
-                # column means the rollout ran with the switch off while the
-                # trainer thought it was running an injection arm -- the arm
-                # becomes the control and reports as the arm. The way that
-                # happens is an environment variable not reaching the process
-                # that builds the observations, which has already happened once
-                # in this project (PLAN=1 lost across setsid over ssh, so the
-                # arm ran as a plain student for thirty minutes). It is a launch
-                # error and it fails here.
-                assert cand_np.any(), (
-                    "algorithm.oci_sat.enable=True but not one row is marked as a "
-                    "candidate. The rollout was built without PRIVILEGED_WRONG_PLAN "
-                    "reaching the environment process, so this arm is the control. "
-                    "Check that the variable is exported INSIDE the launched script "
-                    "rather than only in the launching shell."
-                )
-                # The switch itself is gated on the training envs, so a candidate
-                # can only be an on-task row; this only says so out loud, and
-                # catches a widened switch that forgot to widen the metric names.
-                _tn = get_task_names(batch)
-                _oci_tasks = set(oci_cfg.get("tasks", ["alfworld"]) or ["alfworld"])
-                if _tn is not None and cand_np.any():
-                    _off = sorted({str(t) for t, c in zip(_tn, cand_np)
-                                   if c and str(t) not in _oci_tasks})
+                # PER GROUP, NOT "AT LEAST ONE". The previous version asserted
+                # only that SOME row was marked, and that is not a check: when
+                # the prefix travelled by env-slot index and was read by the
+                # global row index, exactly one alfworld group of fifteen matched
+                # and the assert passed. The other fourteen candidate
+                # trajectories went unmarked, were judged as part of their own
+                # group, and were trained as plain rows with the corrupted plan
+                # still in the prompt. Every group on an oci_sat task gets
+                # exactly one candidate trajectory or the batch is not what the
+                # arm says it is.
+                _tn_all = get_task_names(batch)
+                _tasks_cfg = set(oci_cfg.get("tasks", ["alfworld"]) or ["alfworld"])
+                _tuids = batch.non_tensor_batch.get("traj_uid", None)
+                _uids = batch.non_tensor_batch.get("uid", None)
+                if _tn_all is not None and _uids is not None and _tuids is not None:
+                    _per_group = {}
+                    for _i in range(len(batch)):
+                        if str(_tn_all[_i]) not in _tasks_cfg:
+                            continue
+                        _per_group.setdefault(str(_uids[_i]), set())
+                        if cand_np[_i]:
+                            _per_group[str(_uids[_i])].add(str(_tuids[_i]))
+                    _bad = {g: len(v) for g, v in _per_group.items() if len(v) != 1}
+                    assert _per_group and not _bad, (
+                        f"{len(_bad)} of {len(_per_group)} groups on "
+                        f"{sorted(_tasks_cfg)} do not carry exactly one candidate "
+                        f"trajectory (counts: {sorted(set(_bad.values()))}). "
+                        "Zero everywhere means PRIVILEGED_WRONG_PLAN did not reach "
+                        "the process that builds the observations -- export it "
+                        "INSIDE the launched script, not only in the launching "
+                        "shell. Zero on SOME groups means the mark and the row it "
+                        "was read for are indexed differently; the prefix must "
+                        "travel on the observation dict, which the multitask "
+                        "merge reorders, not in a side channel keyed by env slot."
+                    )
+                else:
+                    metrics["oci/error_cannot_verify_marks"] = 1
+                    assert cand_np.any(), (
+                        "algorithm.oci_sat.enable=True but not one row is marked "
+                        "as a candidate, and the batch lacks the columns needed to "
+                        "check this per group."
+                    )
+                # And nothing marked OFF the configured tasks. Separate from the
+                # per-group check above, which only walks the on-task rows and so
+                # cannot see a candidate that appeared on webshop or search. The
+                # switch is gated on the alfworld manager, so this should be
+                # unreachable; it is here because the two ends of that gate are in
+                # different files.
+                if _tn_all is not None and cand_np.any():
+                    _off = sorted({str(t) for t, c in zip(_tn_all, cand_np)
+                                   if c and str(t) not in _tasks_cfg})
                     assert not _off, (
                         f"oci_candidate marked rows on {_off}, which is not in "
-                        f"algorithm.oci_sat.tasks={sorted(_oci_tasks)}"
+                        f"algorithm.oci_sat.tasks={sorted(_tasks_cfg)}"
                     )
 
                 grp = classify_groups(batch, judged_rows=~cand_np)
@@ -212,7 +238,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     metrics["oci/trajectories_dropped"] = len({
                         str(t) for t, d in zip(
                             batch.non_tensor_batch.get("traj_uid", []), drop) if d})
-                metrics.update(injection_metrics(grp, oci_injected, task="alfworld"))
+                metrics.update(injection_metrics(
+                    grp, oci_injected,
+                    # Not a literal: widening oci_sat.tasks would leave the
+                    # metric filed under a task the arm no longer only touches.
+                    task="+".join(sorted(_tasks_cfg))))
                 # tokens, not groups: a saturated group finishes early and a
                 # stuck one runs to the turn cap, so the group count and the
                 # token count disagree by about 4x and only the token count
@@ -251,9 +281,25 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             # only the -sqrt(7) goes. A beating B is the only thing that shows
             # suppressing the failure is worth more than that re-reinforcement.
             if oci_injected is not None and not bool(oci_cfg.get("gradient_on_injected", True)):
+                import torch as _t
+
                 from verl.trainer.ppo.oci_saturated import zero_injected_advantage
 
                 metrics["oci/rows_zeroed"] = zero_injected_advantage(batch, oci_injected)
+                # AND THE DISTILLATION TERM. Zeroing the advantage removes the
+                # policy gradient and nothing else: dp_actor aggregates the
+                # teacher-KL over response_mask, so without this the injected row
+                # still trains OPD -- on a plan-conditioned prompt, with the
+                # teacher also reading the plan. B is supposed to be the arm that
+                # makes NO claim about the injected row, so it must not learn from
+                # it at all. Safe here and only here: the baseline has already
+                # moved inside compute_advantage, so the seven successes keep the
+                # advantage the injection bought them.
+                if oci_injected.any():
+                    _keep = _t.as_tensor(~oci_injected, device=batch.batch["response_mask"].device)
+                    batch.batch["response_mask"] = (
+                        batch.batch["response_mask"] * _keep.unsqueeze(-1).to(
+                            batch.batch["response_mask"].dtype))
 
             batch = self._attach_advantage_reliability_columns(batch)
 

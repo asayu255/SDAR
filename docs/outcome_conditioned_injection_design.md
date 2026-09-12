@@ -109,9 +109,23 @@ alfworld のターンプロンプト p99 が 947 で上限 4096 なので `max_m
 この経路は `attach_task_loss_weights` と teacher cache id が既に使っている型で、
 `_balance_batch` は列を行と一緒に動かす。
 
-列が無い batch は**拒否する**（assert）。全行ゼロの列も拒否する: 後者は
-「switch が観測を組む側のプロセスに届かなかった」状態で、アームが control に
-なったままアームとして報告される。本プロジェクトで一度起きている。
+**前置きテキストは観測 dict に載せる**（`OCI_PREFIX_KEY`）。rollout loop は
+行がどのブロックを持つか知る必要があるが、env slot 番号で引いてはいけない。
+`TASK_BALANCE_INTERLEAVE`（全アーム既定）ではプロンプト順が alf0, search0,
+webshop0, alf1, … で、各プロンプトが group_n 回連続 repeat されるので、3 タスク
+群 8 では **alfworld ローカル slot i は全体行 24·(i//8) + i%8**。ローカル鍵の
+dict を全体行番号で引くと 15 群中 1 群しか一致せず、4 群は別の群の候補（別ゲーム
+なので `startswith` が弾く）、10 群は範囲外。**残る 14 本の候補軌跡が無印のまま
+群の判定に入り、計画付きプロンプトのまま素の行として学習される。** しかも 1 群は
+印が付くので「候補が 1 行以上ある」検査は通る。
+
+`_merge_observations` は各 manager のローカル順を `_task_indices` で全体順に
+並べ替えるので、観測 dict の 1 キーにすればこの不整合は生じない。検証 manager が
+同じ dict を `""` で上書きする問題も同時に消える（manager ごとの観測になる）。
+
+検査は **「oci_sat タスクの全群が候補軌跡をちょうど 1 本持つ」**。列が無い、
+全行ゼロ、対象外タスクに印、のいずれも assert で落ちる。「1 行以上」では上の
+1/15 が通ってしまう。
 
 **検証には触れない。** switch は自分が保持する envs に group_n と is_train を
 訊く。検証 manager は `group_n=1, is_train=False` で作られるので発火しない。
@@ -142,15 +156,25 @@ v2 は「OPD は元の 8 本に固定」と書いた。そうではない。`dp_
 `response_mask` で集約するので、drop した行は OPD からも消える。**アームは 7 本で
 OPD を訓練し、control は 8 本で訓練する。** これは §6.4 に交絡として記載する。
 
+飽和群の注入行は drop されない（選ばれる）ので、A アームではその行が OPD を
+計画付きプロンプト上で訓練する。B アームは §3 の通りこれも消す。
+
 ---
 
 ## 3. アーム
 
-| | 注入 | 注入行の勾配 | 群の平均を動かすか |
-|---|---|---|---|
-| control | なし | — | — |
-| OCI-sat B | あり | **なし**（advantage 計算の後で消す） | 動かす |
-| OCI-sat A | あり | あり | 動かす |
+| | 注入 | 注入行の政策勾配 | 注入行の OPD | 群の平均を動かすか |
+|---|---|---|---|---|
+| control | なし | — | — | — |
+| OCI-sat B | あり | **なし** | **なし** | 動かす |
+| OCI-sat A | あり | あり | あり（計画付き文脈） | 動かす |
+
+B は advantage をゼロにするだけでは足りない。`dp_actor` は teacher-KL を
+`response_mask` で集約するので、それだけでは注入行が**蒸留項を訓練し続ける** —
+計画付きプロンプトの上で、教師も計画を読んだ状態で。B は注入行について何も
+主張しない腕なので、advantage 計算の**後**に `response_mask` もゼロにする。
+その時点で基準線は既に動いているので、7 本の成功は注入が買った advantage を
+保つ。
 
 3 アーム。それぞれ `expected_multitask_oci_sat{,_b}_config.yaml` で固定し、
 control の lock ファイルと**5 行しか違わない**（run 名と OCI 4 鍵）。
@@ -322,7 +346,7 @@ webshop / search を同時に走らせることは問題ない（それらの群
 
 走らせる前に**無料で**取れるものを先に取る。`grad_probe.mode=oci`、
 optimizer step なし、生成なし、既にあるトークンに対する forward 1 回。
-起動は `/opt1/ohara/run_oci_probe.sh`。アームと同じ switch・同じ列・同じ分類を
+起動は `examples/opd_grpo_trainer/run_multitask_oci_probe_qwen3.sh`。アームと同じ switch・同じ列・同じ分類を
 通り、optimizer step だけが report に置き換わる。
 
 | 量 | 何を決めるか |
@@ -382,3 +406,12 @@ control と比較する。
 2. **§6.4 の交絡**をこのまま受けるか、群を 9 本にするか。
 3. **新規性**（§5）。本書は主張しない。主張が必要なら結果を見てから別に立てる。
 4. §7 のプローブを取るまで GPU で訓練は走らせない。
+
+## 10. control と共有するコードパスの変更（記録）
+
+`compute_group_metrics(batch)` は control を含む全アームの毎 step に入る
+（`_data_metrics`）。metric 専用で CPU のみ、リターン列を 1 回走るだけなので
+実害はないが、control と共有するコードパスを変えた事実は記録する。
+`exclude_mask` と `compute_mean_std_cross_steps` も `core_algos` /
+`compute_advantage` の共有パスに足したが、既定値は従来の挙動と bit 単位で同一
+（`None` / `True`）。

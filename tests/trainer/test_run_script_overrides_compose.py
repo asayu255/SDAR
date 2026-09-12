@@ -51,6 +51,15 @@ COMPOSED_SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_target_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_content_qwen3.sh",
     "examples/sdar_trainer/run_multitask_qwen3.sh",
+    # WRAPPERS. These exec another script in this list and append their own
+    # overrides; _overrides follows the chain. They were invisible to this test
+    # while it only looked for a `python3 -m verl.trainer.main_*` line, and the
+    # first thing it would have caught is what it now does catch: both of them
+    # appended `+trainer.expected_config=` on top of the control's own, which
+    # Hydra refuses ("an item is already at trainer.expected_config"), so neither
+    # arm could start.
+    "examples/opd_grpo_trainer/run_multitask_oci_sat_qwen3.sh",
+    "examples/opd_grpo_trainer/run_multitask_oci_sat_b_qwen3.sh",
 ]
 
 
@@ -73,7 +82,30 @@ def _overrides(path):
     text = open(os.path.join(REPO, path)).read()
     marker = re.search(r"python3 -m verl\.trainer\.main_\w+", text)
     if marker is None:
-        return None
+        # A WRAPPER: `exec bash "<other script>" <overrides...>`. The composed
+        # argument list is the target's followed by this one's, in that order,
+        # which is what bash produces and therefore what Hydra sees. Following
+        # the chain is the only way this test covers a wrapper at all; without it
+        # a wrapper returns None and is silently skipped.
+        chain = re.search(r'exec bash "?\$?\{?_?HERE\}?/?"?([\w./-]*)', text)
+        target = re.search(r'exec bash "\$_HERE/([\w.-]+)"', text)
+        if target is None:
+            return None
+        inner = _overrides(os.path.join(os.path.dirname(path), target.group(1)))
+        if inner is None:
+            return None
+        marker = re.search(r'exec bash "\$_HERE/[\w.-]+"', text)
+        tail = text[marker.end():]
+        lines = []
+        for raw in tail.splitlines():
+            lines.append(raw)
+            if not raw.rstrip().endswith("\\"):
+                break
+        cmd = " ".join(line.rstrip().rstrip("\\").strip() for line in lines)
+        cmd = cmd.replace('"$@"', "")
+        cmd = re.sub(r"\$\{(\w+):\+[^}]*\}", "", cmd)
+        cmd = os.path.expandvars(cmd)
+        return inner + [a for a in shlex.split(cmd) if a]
     tail = text[marker.start():]
     lines = []
     for raw in tail.splitlines():
