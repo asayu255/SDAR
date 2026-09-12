@@ -33,6 +33,8 @@ from typing import Dict, Optional
 
 import numpy as np
 
+from verl.trainer.ppo.metric_utils import get_task_names
+
 __all__ = ["classify_groups", "select_saturated_injections", "zero_injected_advantage"]
 
 INJECTED_KEY = "oci_injected"
@@ -83,28 +85,49 @@ def classify_groups(batch, *, judged_rows: Optional[np.ndarray] = None) -> Dict[
     #   3. the batch's own minimum, when every group scored alike -- then the
     #      question is only whether that common score is the floor, and a batch
     #      of all-zero groups must read as stuck rather than saturated.
-    vals_by_group = {u: list(g["traj"].values()) for u, g in by_group.items() if g["traj"]}
-    live_vals = [v for vs in vals_by_group.values() if len(set(vs)) > 1 for v in vs]
-    deg = [vs[0] for vs in vals_by_group.values() if len(set(vs)) == 1]
-    if live_vals:
-        ref = float(np.mean(live_vals))
-    elif deg and min(deg) != max(deg):
-        ref = (float(min(deg)) + float(max(deg))) / 2.0
-    else:
-        # everything alike: saturated iff that score is above the floor. The
-        # floor is 0.0 -- no environment here pays for doing nothing -- so an
-        # all-zero batch is stuck and an all-solved batch is saturated.
-        ref = 0.0 if (deg and max(deg) > 0.0) else float("inf")
+    # PER TASK, BECAUSE THE REWARD SCALES ARE NOT COMPARABLE. An earlier version
+    # pooled every group in the batch into one reference level. On this mixture
+    # alfworld pays about 10 for a solved episode and search pays 1, so the
+    # pooled live mean is set by alfworld -- measured at 5.83 on the control
+    # checkpoint -- and every search group, whose best possible return is 1,
+    # read as "stuck" against it. The first probe reported 19 stuck groups where
+    # the per-task split gives 10. Worse than the metric: the same verdict is
+    # what select_saturated_injections reads, so a group's class was being
+    # decided against another task's scale.
+    task_names = get_task_names(batch)
+    group_task = {}
+    for uid, g in by_group.items():
+        group_task[uid] = str(task_names[g["rows"][0]]) if task_names is not None else ""
+
+    ref_by_task: Dict[str, float] = {}
+    for task in set(group_task.values()):
+        vals_by_group = {
+            u: list(g["traj"].values())
+            for u, g in by_group.items()
+            if g["traj"] and group_task[u] == task
+        }
+        live_vals = [v for vs in vals_by_group.values() if len(set(vs)) > 1 for v in vs]
+        deg = [vs[0] for vs in vals_by_group.values() if len(set(vs)) == 1]
+        if live_vals:
+            ref_by_task[task] = float(np.mean(live_vals))
+        elif deg and min(deg) != max(deg):
+            ref_by_task[task] = (float(min(deg)) + float(max(deg))) / 2.0
+        else:
+            # everything alike: saturated iff that score is above the floor. The
+            # floor is 0.0 -- no environment here pays for doing nothing -- so an
+            # all-zero batch is stuck and an all-solved batch is saturated.
+            ref_by_task[task] = 0.0 if (deg and max(deg) > 0.0) else float("inf")
 
     out = {}
     for uid, g in by_group.items():
+        ref = ref_by_task[group_task[uid]]
         vals = list(g["traj"].values())
         if not vals:
             continue
         lo, hi = min(vals), max(vals)
         status = "live" if hi != lo else ("stuck" if lo < ref else "saturated")
         out[uid] = {"rows": g["rows"], "status": status, "ret": lo,
-                    "n_judged": len(vals)}
+                    "n_judged": len(vals), "task": group_task[uid], "ref": ref}
     return out
 
 
@@ -173,19 +196,32 @@ def zero_injected_advantage(batch, injected: np.ndarray) -> int:
 
 
 def injection_metrics(groups: Dict[str, Dict], injected: np.ndarray, task: str = "") -> Dict:
-    """What the arm actually did this step, for the log."""
-    n = {"live": 0, "stuck": 0, "saturated": 0}
+    """What the arm actually did this step, for the log.
+
+    SPLIT BY THE GROUP'S OWN TASK, not labelled with one. The first version
+    counted every group in the batch and filed the total under ``task``, so a
+    three-task batch reported "11 live alfworld groups" when alfworld has only
+    fifteen groups in total and six of them were live. ``task`` is now only a
+    fallback for groups whose task is unknown.
+    """
+    per_task: Dict[str, Dict[str, int]] = {}
     for g in groups.values():
+        t = g.get("task") or task
+        n = per_task.setdefault(t, {"live": 0, "stuck": 0, "saturated": 0})
         n[g["status"]] += 1
-    tot = max(sum(n.values()), 1)
-    suffix = f"/{task}" if task else ""
-    return {
-        f"oci/groups_live{suffix}": n["live"],
-        f"oci/groups_stuck{suffix}": n["stuck"],
-        f"oci/groups_saturated{suffix}": n["saturated"],
-        f"oci/live_frac{suffix}": n["live"] / tot,
-        f"oci/injected_rows{suffix}": int(np.asarray(injected, dtype=bool).sum()),
-    }
+    inj = np.asarray(injected, dtype=bool)
+    out = {}
+    for t, n in per_task.items():
+        suffix = f"/{t}" if t else ""
+        tot = max(sum(n.values()), 1)
+        out[f"oci/groups_live{suffix}"] = n["live"]
+        out[f"oci/groups_stuck{suffix}"] = n["stuck"]
+        out[f"oci/groups_saturated{suffix}"] = n["saturated"]
+        out[f"oci/live_frac{suffix}"] = n["live"] / tot
+    # Injected rows are counted once: the switch fires on one task and the mask
+    # is over rows, so a per-task split of it would be the same number twice.
+    out["oci/injected_rows"] = int(inj.sum())
+    return out
 
 
 def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = True,

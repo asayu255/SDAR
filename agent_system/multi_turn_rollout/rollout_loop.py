@@ -36,6 +36,11 @@ from verl.trainer.ppo.privileged_notice import (
     parse_notice_config as _parse_notice_config,
 )
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
+
+# Width of the oci_plan_repl column. The replacement is the no-plan render's
+# boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
+# row needing more is recorded as not strippable rather than truncated.
+OCI_REPL_WIDTH = 16
 from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -1043,7 +1048,23 @@ class TrajectoryCollector:
         # offset and a length are needed, and they are read off the two renders
         # in TOKENS -- character arithmetic can split a token that spans the
         # boundary.
+        # THE EDIT IS A REPLACEMENT, NOT A DELETION. The first version recorded an
+        # offset and a length and required the two renders to differ in exactly
+        # one contiguous DELETED span. On the real template they do not, by one
+        # token: without the plan the chat header's newline merges with the
+        # observation's leading newline into a single "\n\n" token, and with the
+        # plan it cannot, because "###" follows it. So head + tail came out one
+        # short of the no-plan length on every row and every candidate was filed
+        # unstrippable -- the first probe measured rho on zero of 299 candidate
+        # rows. Removing the span does not produce the no-plan prompt either;
+        # the boundary token differs.
+        #
+        # Recorded instead: the with-plan region to take out (off, len) AND the
+        # no-plan tokens to put in its place (repl, repl_len). Verified exact on
+        # 120 real games, where repl is a single "\n\n".
         oci_candidate, oci_plan_off, oci_plan_len, oci_plan_truncated = 0, 0, 0, 0
+        oci_plan_repl = [0] * OCI_REPL_WIDTH
+        oci_plan_repl_len = 0
         # Read off the OBSERVATION, in the same indexing as every other obs key,
         # because the multitask merge has already put them all in global row
         # order. `item` is a global row index and the env slot is a local one;
@@ -1065,20 +1086,27 @@ class TrajectoryCollector:
             _ids_o = tokenizer.encode(tokenizer.apply_chat_template(
                 _msgs_wo, add_generation_prompt=True, tokenize=False,
                 **apply_chat_template_kwargs), add_special_tokens=False)
+            _lo = min(len(_ids_w), len(_ids_o))
             _head = 0
-            while _head < len(_ids_o) and _ids_w[_head] == _ids_o[_head]:
+            while _head < _lo and _ids_w[_head] == _ids_o[_head]:
                 _head += 1
             _tail = 0
-            while (_tail < len(_ids_o) - _head
+            while (_tail < _lo - _head
                    and _ids_w[len(_ids_w) - 1 - _tail] == _ids_o[len(_ids_o) - 1 - _tail]):
                 _tail += 1
-            # The two renders must differ in exactly one contiguous span, or the
-            # strip is not the inverse of the prepend and rho would be computed
-            # against the wrong prompt. A row that fails this keeps
-            # oci_candidate=1 (it IS the injected row) and length 0, which every
-            # reader treats as "no strippable span" rather than "no plan".
-            if len(_ids_w) > len(_ids_o) and _head + _tail == len(_ids_o):
-                oci_plan_off, oci_plan_len = _head, len(_ids_w) - len(_ids_o)
+            _take = len(_ids_w) - _head - _tail        # with-plan region
+            _repl = _ids_o[_head:len(_ids_o) - _tail]  # no-plan region
+            # Checked by RECONSTRUCTION rather than by an arithmetic identity:
+            # splicing _repl in where _take came out must reproduce the no-plan
+            # render token for token. A row that fails it, or whose replacement
+            # does not fit the fixed-width column, keeps oci_candidate=1 (it IS
+            # the injected row) and length 0, which every reader treats as "not
+            # strippable" rather than "no plan".
+            if (_take > 0 and len(_repl) <= OCI_REPL_WIDTH
+                    and _ids_w[:_head] + _repl + _ids_w[len(_ids_w) - _tail:] == _ids_o):
+                oci_plan_off, oci_plan_len = _head, _take
+                oci_plan_repl_len = len(_repl)
+                oci_plan_repl = list(_repl) + [0] * (OCI_REPL_WIDTH - len(_repl))
 
         chat = np.array(messages)
         
@@ -1172,6 +1200,8 @@ class TrajectoryCollector:
             'oci_candidate': torch.tensor(oci_candidate, dtype=torch.long),
             'oci_plan_off': torch.tensor(oci_plan_off, dtype=torch.long),
             'oci_plan_len': torch.tensor(oci_plan_len, dtype=torch.long),
+            'oci_plan_repl': torch.tensor(oci_plan_repl, dtype=torch.long),
+            'oci_plan_repl_len': torch.tensor(oci_plan_repl_len, dtype=torch.long),
             # truncation=left cuts the head, which is where the offset is
             # measured from, so a truncated row's span no longer locates the
             # block and must not be stripped.
@@ -1235,6 +1265,8 @@ class TrajectoryCollector:
             'oci_candidate': torch.tensor(0, dtype=torch.long),
             'oci_plan_off': torch.tensor(0, dtype=torch.long),
             'oci_plan_len': torch.tensor(0, dtype=torch.long),
+            'oci_plan_repl': torch.zeros(OCI_REPL_WIDTH, dtype=torch.long),
+            'oci_plan_repl_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_truncated': torch.tensor(0, dtype=torch.long),
         }
         if 'task_name' in gen_batch.non_tensor_batch:

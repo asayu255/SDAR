@@ -164,6 +164,8 @@ def micro(inj, plan_len, trunc=None):
         "oci_injected": torch.tensor(inj, dtype=torch.long),
         "oci_plan_off": torch.zeros(BS, dtype=torch.long),
         "oci_plan_len": torch.tensor(plan_len, dtype=torch.long),
+        "oci_plan_repl": torch.zeros(BS, 16, dtype=torch.long),
+        "oci_plan_repl_len": torch.zeros(BS, dtype=torch.long),
         **({"oci_plan_truncated": torch.tensor(trunc, dtype=torch.long)} if trunc else {}),
     }
 

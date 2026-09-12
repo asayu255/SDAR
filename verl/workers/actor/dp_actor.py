@@ -520,7 +520,7 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
     """
     import torch
 
-    from verl.trainer.ppo.oci_reachability import strip_span
+    from verl.trainer.ppo.oci_reachability import splice_span
     from verl.trainer.ppo.oci_shaping import shaped_pg_losses, shaping_diagnostics
 
     n_len = micro_batch["oci_plan_len"].reshape(-1).clone()
@@ -536,9 +536,11 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
     rows = torch.nonzero(usable, as_tuple=False).reshape(-1)
     resp = micro_batch["responses"]
     pad = int(micro_batch["input_ids"][0, 0].item())  # left-padded: column 0 is pad
-    s_ids, s_mask, s_pos = strip_span(
+    s_ids, s_mask, s_pos = splice_span(
         micro_batch["input_ids"][rows], micro_batch["attention_mask"][rows],
-        micro_batch["oci_plan_off"].reshape(-1)[rows], n_len[rows], pad,
+        micro_batch["oci_plan_off"].reshape(-1)[rows], n_len[rows],
+        micro_batch["oci_plan_repl"][rows],
+        micro_batch["oci_plan_repl_len"].reshape(-1)[rows], pad,
         response_length=resp.shape[1],
         position_ids=micro_batch["position_ids"][rows],
     )
@@ -2733,7 +2735,8 @@ class DataParallelPPOActor(BasePPOActor):
         if notice_probe_on:
             select_keys.append("notice_len")
         if oci_shaping_on:
-            select_keys += ["oci_injected", "oci_plan_off", "oci_plan_len"]
+            select_keys += ["oci_injected", "oci_plan_off", "oci_plan_len",
+                            "oci_plan_repl", "oci_plan_repl_len"]
             if "oci_plan_truncated" in data.batch.keys():
                 select_keys.append("oci_plan_truncated")
         if xtt_enabled:

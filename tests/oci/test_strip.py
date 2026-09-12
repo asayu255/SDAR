@@ -15,7 +15,7 @@ import os, sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from verl.trainer.ppo.oci_reachability import strip_span, wrong_plan_strip_fn, strippable_rows
+from verl.trainer.ppo.oci_reachability import splice_span, wrong_plan_strip_fn, strippable_rows
 
 CKPT = "/opt1/ohara/offline_ladder/probe_hf/klwctl_step300"
 PAD = 0
@@ -60,8 +60,9 @@ responses = ids[:, PL:].clone()
 # remove 2 prompt tokens from offset 1 on row 0, 2 from offset 2 on row 1, none row 2
 off = torch.tensor([1, 2, 0])
 ln = torch.tensor([2, 2, 0])
-out_ids, out_mask, out_pos = strip_span(ids, mask, off, ln, PAD,
-                                        response_length=RL, position_ids=posi)
+out_ids, out_mask, out_pos = splice_span(ids, mask, off, ln, torch.zeros(len(rows_spec), 4, dtype=torch.long),
+                                          torch.zeros(len(rows_spec), dtype=torch.long), PAD,
+                                          response_length=RL, position_ids=posi)
 
 # THE INVARIANT THE WHOLE MEASUREMENT RESTS ON.
 good = torch.equal(out_ids[:, PL:], responses) and torch.equal(out_ids[:, -RL:], responses)
@@ -111,9 +112,11 @@ print(("  OK  " if good else "  FAIL") +
       f"of {responses[0].tolist()}")
 
 # an offset that does not fit leaves the row alone rather than corrupting it
-bad_ids, bad_mask, _ = strip_span(ids, mask, torch.tensor([4, 0, 0]),
-                                  torch.tensor([9, 0, 0]), PAD,
-                                  response_length=RL, position_ids=posi)
+bad_ids, bad_mask, _ = splice_span(ids, mask, torch.tensor([4, 0, 0]),
+                                   torch.tensor([9, 0, 0]),
+                                   torch.zeros(3, 4, dtype=torch.long),
+                                   torch.zeros(3, dtype=torch.long), PAD,
+                                   response_length=RL, position_ids=posi)
 good = torch.equal(bad_ids[0], ids[0]) and torch.equal(bad_mask[0], mask[0])
 ok &= good
 print(("  OK  " if good else "  FAIL") + " an out-of-range span is a no-op, not a corruption")
@@ -130,9 +133,18 @@ else:
             "1. GotoLocation(cabinet)\n2. PickupObject(mug)\n"
             "3. PutObject(mug, countertop)\n"
             "Ground each step into one admissible action at a time.\n\n")
-    OBS = ("You are in the middle of a room. Looking quickly around you, you see "
-           "a cabinet 1, a countertop 1, and a fridge 1.\nYour task is to: put a "
-           "clean mug in the countertop.\nAdmissible actions: 'go to cabinet 1'\n")
+    # THE REAL TEMPLATE, not a hand-written stand-in. The first version of this
+    # test wrote its own observation text and it began with a letter; the real
+    # one begins with a NEWLINE, which merges with the chat header's newline into
+    # a single "\n\n" token when no plan is in front of it. That merge is the
+    # whole reason the edit is a replacement rather than a deletion, so a test
+    # whose observation lacks the leading newline passes while production files
+    # every candidate row unstrippable.
+    from agent_system.environments.env_manager import ALFWORLD_TEMPLATE_NO_HIS
+    OBS = ALFWORLD_TEMPLATE_NO_HIS.format(
+        current_observation="You are in the middle of a room. You see a cabinet 1.",
+        admissible_actions="'go to cabinet 1'")
+    assert OBS.startswith("\n"), "the template's leading newline is what this checks"
 
     def render(content):
         return tok.apply_chat_template([{"role": "user", "content": content}],
@@ -142,21 +154,34 @@ else:
     ids_o = tok.encode(render(OBS), add_special_tokens=False)
 
     # exactly the computation the rollout loop does
+    lo = min(len(ids_w), len(ids_o))
     head = 0
-    while head < len(ids_o) and ids_w[head] == ids_o[head]:
+    while head < lo and ids_w[head] == ids_o[head]:
         head += 1
     tail = 0
-    while (tail < len(ids_o) - head
+    while (tail < lo - head
            and ids_w[len(ids_w) - 1 - tail] == ids_o[len(ids_o) - 1 - tail]):
         tail += 1
-    clean = len(ids_w) > len(ids_o) and head + tail == len(ids_o)
-    plan_off, plan_len = (head, len(ids_w) - len(ids_o)) if clean else (0, 0)
+    plan_take = len(ids_w) - head - tail
+    plan_repl = ids_o[head:len(ids_o) - tail]
+    plan_off = head
+    clean = (plan_take > 0 and len(plan_repl) <= 16
+             and ids_w[:head] + plan_repl + ids_w[len(ids_w) - tail:] == ids_o)
+    plan_len = plan_take
 
     good = clean
     ok &= good
     print(("  OK  " if good else "  FAIL") +
-          f" the two renders differ in ONE contiguous span (off {plan_off}, "
-          f"len {plan_len} tokens)")
+          f" the edit reconstructs exactly: take {plan_take} tokens at {plan_off}, "
+          f"put back {len(plan_repl)} ({[tok.decode([t]) for t in plan_repl]})")
+
+    # AND IT IS NOT A PURE DELETION, which is what the first version required.
+    deletion_only = len(ids_w) > len(ids_o) and head + tail == len(ids_o)
+    good = not deletion_only and len(plan_repl) > 0
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" a deletion-only rule would reject this row (head+tail={head+tail}, "
+          f"no-plan length {len(ids_o)}) -- the boundary token differs")
 
     # THE POINT: the span does not start at 0, so a front-strip is wrong.
     good = plan_off > 0
@@ -175,9 +200,11 @@ else:
     r_mask[0, P2 - len(ids_w):P2] = 1
     r_ids[0, P2:P2 + 2] = torch.tensor([9001, 9002])
     r_mask[0, P2:P2 + 2] = 1
-    s_ids, s_mask, _ = strip_span(r_ids, r_mask, torch.tensor([plan_off]),
-                                  torch.tensor([plan_len]), PAD,
-                                  response_length=R2)
+    s_ids, s_mask, _ = splice_span(r_ids, r_mask, torch.tensor([plan_off]),
+                                   torch.tensor([plan_take]),
+                                   torch.tensor([plan_repl + [0] * (16 - len(plan_repl))]),
+                                   torch.tensor([len(plan_repl)]), PAD,
+                                   response_length=R2)
     stripped = s_ids[0, :P2][s_mask[0, :P2].bool()].tolist()
     good = stripped == ids_o and torch.equal(s_ids[0, P2:], r_ids[0, P2:])
     ok &= good

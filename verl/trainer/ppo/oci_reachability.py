@@ -154,39 +154,42 @@ def reachability_report(
 # --------------------------------------------------------------------------- #
 
 
-def strip_span(input_ids, attention_mask, off, length, pad_token_id,
-               response_length: int, position_ids=None):
-    """Remove live tokens ``[off[i], off[i]+length[i])`` from each row's PROMPT.
+def splice_span(input_ids, attention_mask, off, take, repl, repl_len, pad_token_id,
+                response_length: int, position_ids=None):
+    """Replace live prompt tokens ``[off, off+take)`` with ``repl[:repl_len]``.
 
-    NOT A FRONT-STRIP, WHICH IS WHY THIS EXISTS SEPARATELY FROM
-    ``privileged_notice.strip_prefix``. The student-mode notice is a system
-    message at position 0, so its tokens really are a prefix of the render and a
-    length alone locates them. The corrupted plan goes at the head of the USER
-    turn's content, behind the chat header, so stripping ``length`` leading
-    tokens removes the header and leaves the plan -- the resulting prompt is not
-    one the policy could ever see, and the rho computed against it is a ratio
-    between two fictions. The offset is measured in the rollout loop, where the
-    two renders can be compared token by token, and rides on the row.
+    A REPLACEMENT, NOT A DELETION, and not a front-strip either. Two things went
+    wrong before:
 
-    AND IT TOUCHES THE PROMPT REGION ONLY. The rollout writes
+    1. The student-mode notice is a system message at position 0, so its tokens
+       are a prefix of the render and a length alone locates them. The corrupted
+       plan sits at the head of the USER turn's content, behind the chat header,
+       so stripping ``take`` LEADING tokens removes the header and leaves the
+       plan.
+    2. Removing the plan's span does not give the no-plan render either. Without
+       the plan the chat header's newline merges with the observation's leading
+       newline into one "\n\n" token; with the plan it cannot, because "###"
+       follows. So the two renders differ by a replacement of one token, not by a
+       pure deletion, and a deletion-only rule filed every candidate row as
+       unstrippable -- the first probe measured rho on 0 of 299 rows.
+
+    The rollout loop records both halves of the edit and verifies by
+    reconstruction, so what arrives here is known to reproduce the no-plan
+    prompt exactly.
+
+    THE RESPONSE REGION IS COPIED THROUGH BYTE FOR BYTE. The rollout writes
     ``input_ids = cat([prompt, response])`` with the PROMPT LEFT-PADDED and the
-    RESPONSE RIGHT-PADDED (vllm_rollout.py states the layout:
-    ``attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]``), so the live
-    tokens are not one block at the right-hand end. An earlier version here
-    gathered every live token and right-aligned the result, which slid the
-    response rightwards by however much trailing padding it had: on a row with a
-    4-token prompt and a 3-token response in an 8+8 buffer, ``input_ids[:,
-    -8:]`` came back as ``[0,0,0,103,104,201,202,203]`` against a ``responses``
-    of ``[201,202,203,0,0,0,0,0]``. The forward reads logits at
-    ``[-response_length-1:-1]``, so every log-prob would have been taken at the
-    wrong position -- and the shape check passes, so rho would have come back a
-    plausible-looking number for the wrong tokens.
+    RESPONSE RIGHT-PADDED (vllm_rollout.py: ``attention_mask:
+    [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]``), so the live tokens are not one
+    block at the right-hand end. Gathering every live token and right-aligning
+    the result slid the response rightwards by however much trailing padding it
+    had, and the forward reads logits at ``[-response_length-1:-1]`` -- every
+    log-prob would have come from the wrong position, with the shape check
+    passing. Only the prompt's own left-padded window is rebuilt.
 
-    The response region is therefore copied through byte for byte, and only the
-    prompt's own left-padded window is rebuilt. ``position_ids``, when given,
-    keeps the rollout's convention: the prompt's live span numbered from 0 and
-    the response continuing after it, so removing n prompt tokens shifts the
-    response's positions down by exactly n.
+    ``position_ids``, when given, keeps the rollout's convention: the prompt's
+    live span numbered from 0 and the response continuing after it, so a net
+    change of ``take - repl_len`` prompt tokens shifts the response by that much.
     """
     import torch
 
@@ -197,29 +200,36 @@ def strip_span(input_ids, attention_mask, off, length, pad_token_id,
 
     out_ids = input_ids.clone()
     out_mask = attention_mask.clone()
-    removed = torch.zeros(bs, dtype=torch.long)
+    net = torch.zeros(bs, dtype=torch.long)
     for i in range(bs):
         p_mask = attention_mask[i, :plen].bool()
         toks = input_ids[i, :plen][p_mask]
-        o, n = int(off[i]), int(length[i])
-        if n > 0 and 0 <= o <= toks.numel() - n:
-            keep = torch.cat([toks[:o], toks[o + n:]])
-            removed[i] = n
+        o, k, m = int(off[i]), int(take[i]), int(repl_len[i])
+        if k > 0 and 0 <= o <= toks.numel() - k:
+            keep = torch.cat([toks[:o], repl[i, :m].to(toks.dtype), toks[o + k:]])
+            net[i] = k - m
         else:
             keep = toks
         out_ids[i, :plen] = int(pad_token_id)
         out_mask[i, :plen] = 0
-        k = keep.numel()
-        out_ids[i, plen - k:plen] = keep
-        out_mask[i, plen - k:plen] = 1
+        n_keep = keep.numel()
+        if n_keep > plen:
+            # The replacement cannot make the prompt longer than its own window.
+            # Nothing here can be spliced without dropping real tokens, so the
+            # row passes through untouched and the caller's strippable check is
+            # what keeps it out of the report.
+            out_ids[i, :plen] = input_ids[i, :plen]
+            out_mask[i, :plen] = attention_mask[i, :plen]
+            net[i] = 0
+            continue
+        out_ids[i, plen - n_keep:plen] = keep
+        out_mask[i, plen - n_keep:plen] = 1
 
     if position_ids is None:
         return out_ids, out_mask, None
     out_pos = position_ids.clone()
-    # the prompt's live span renumbered from 0, pad positions left at 0
     out_pos[:, :plen] = (out_mask[:, :plen].cumsum(-1) - 1).clamp(min=0).to(out_pos.dtype)
-    # the response continues from a prompt that is now `removed` tokens shorter
-    out_pos[:, plen:] = (position_ids[:, plen:] - removed.unsqueeze(-1)).clamp(min=0)
+    out_pos[:, plen:] = (position_ids[:, plen:] - net.unsqueeze(-1)).clamp(min=0)
     return out_ids, out_mask, out_pos
 
 
@@ -255,11 +265,13 @@ def wrong_plan_strip_fn(tokenizer, pad_token_id: int):
         # tensor, so the prompt region is everything before it and must stay
         # exactly that wide.
         resp = batch.batch.get("responses", None)
-        if resp is None:
+        repl = batch.batch.get("oci_plan_repl", None)
+        rlen = batch.batch.get("oci_plan_repl_len", None)
+        if resp is None or repl is None or rlen is None:
             return batch
-        ids, mask, pos = strip_span(
+        ids, mask, pos = splice_span(
             batch.batch["input_ids"], batch.batch["attention_mask"],
-            n_off.reshape(-1), length, pad_token_id,
+            n_off.reshape(-1), length, repl, rlen.reshape(-1), pad_token_id,
             response_length=resp.shape[1],
             position_ids=batch.batch.get("position_ids", None),
         )
