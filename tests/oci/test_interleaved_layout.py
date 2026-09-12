@@ -166,7 +166,7 @@ def fake_alf_manager():
 import agent_system.environments.env_manager as em
 
 _real_builder = em._wrong_plan_prefix
-em._wrong_plan_prefix = lambda task, gamefile, config=None: (
+em._wrong_plan_prefix = lambda task, gamefile, config=None, admissible=None: (
     f"PLAN[{gamefile}]\n" if gamefile else "")
 try:
     mgr = fake_alf_manager()
