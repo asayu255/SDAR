@@ -35,6 +35,8 @@ from verl import DataProto
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_data_metrics_by_task,
+    compute_group_metrics,
+    get_task_names,
 )
 from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 from verl.trainer.ppo.ray_trainer import (
@@ -148,9 +150,31 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                     gn = int(self.config.env.rollout.n)
                     uids = batch.non_tensor_batch.get("uid", None)
                     tuids = batch.non_tensor_batch.get("traj_uid", None)
+                    # ONLY THE TASK THE SWITCH FIRES ON. env_manager prepends the
+                    # corrupted plan at the alfworld prompt sites and nowhere
+                    # else, so a candidate marked on webshop or search is a plain
+                    # rollout that saw no privileged input. It would be excluded
+                    # from its group's verdict and then dropped from training by
+                    # the `drop` mask below -- one eighth of those two tasks'
+                    # rollouts thrown away to measure nothing. The task list is a
+                    # config key rather than a literal so a later arm can widen
+                    # it without this rule going stale.
+                    _oci_tasks = set(oci_cfg.get("tasks", ["alfworld"]) or ["alfworld"])
+                    _tn = get_task_names(batch)
+                    if _tn is None:
+                        # Single-task run: nothing to restrict to, and the task
+                        # is whatever the run is. Marking everything is correct
+                        # there and wrong on a multitask batch, so say which
+                        # happened rather than letting the count speak for it.
+                        metrics["oci/no_task_names"] = 1
+                        _on_task = [True] * len(batch)
+                    else:
+                        _on_task = [str(t) in _oci_tasks for t in _tn]
                     if gn >= 2 and uids is not None and tuids is not None:
                         order, seen = {}, {}
-                        for u, t in zip(uids, tuids):
+                        for u, t, on in zip(uids, tuids, _on_task):
+                            if not on:
+                                continue
                             key = (str(u), str(t))
                             if key not in order:
                                 order[key] = seen.get(str(u), 0)
@@ -165,8 +189,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                         if len(full) < len(seen):
                             metrics["oci/groups_short_of_n"] = len(seen) - len(full)
                         cand = _t.tensor(
-                            [1 if (str(u) in full and order[(str(u), str(t))] == gn - 1)
-                             else 0 for u, t in zip(uids, tuids)],
+                            [1 if (on and str(u) in full
+                                   and order.get((str(u), str(t))) == gn - 1)
+                             else 0 for u, t, on in zip(uids, tuids, _on_task)],
                             device=batch.batch["response_mask"].device)
                 if cand is None:
                     metrics["oci/error_no_candidate_column"] = 1
@@ -316,4 +341,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         """
         metrics = compute_data_metrics(batch=batch, use_critic=self.use_critic)
         metrics.update(compute_data_metrics_by_task(batch=batch, use_critic=self.use_critic))
+        # The allocation signals, from columns the batch already carries: whether
+        # a rollout on this task buys a policy gradient at all, and if not
+        # whether the task is stuck or solved. Costs one pass over the returns.
+        metrics.update(compute_group_metrics(batch))
         return metrics
