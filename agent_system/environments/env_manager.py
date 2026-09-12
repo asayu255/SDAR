@@ -174,15 +174,29 @@ def _oci_detour(config) -> int:
         return 0
 
 
+def _oci_delay_turns(config) -> int:
+    """Turns the `delay` tour must consume before the true path begins.
+
+    Counted in TURNS, not lines: the episode cap is 50 turns, so a tour of 50
+    executable lines means perfect compliance never reaches the tail.
+    """
+    cfg = _oci_cfg(config)
+    try:
+        return max(1, int((cfg or {}).get("delay_turns", 50) or 50))
+    except (TypeError, ValueError):
+        return 50
+
+
 def _oci_plan_mode(config) -> str:
     cfg = _oci_cfg(config)
     mode = str((cfg or {}).get("plan_corruption", "misdirect") or "misdirect")
     if mode not in PLAN_CORRUPTIONS:
         raise ValueError(
             f"algorithm.oci_sat.plan_corruption={mode!r}; expected one of "
-            f"{PLAN_CORRUPTIONS}. 'misdirect' permutes the navigation targets; "
-            "'drop' removes the requirement step and is kept only to reproduce "
-            "the measurement that refuted it (cand_fail_rate 1/15)."
+            f"{PLAN_CORRUPTIONS}. 'misdirect' permutes the navigation targets, "
+            "'delay' prefixes the true path with a tour that spends the turn "
+            "budget, 'intact' prints the true path. 'drop' removed the "
+            "requirement step and is gone: it was refuted (cand_fail_rate 1/15)."
         )
     return mode
 
@@ -200,15 +214,24 @@ def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str
         return ""
     if task != "alfworld" or not gamefile:
         return ""
+    mode = _oci_plan_mode(config)
     n_detour = _oci_detour(config)
-    scene = _scene_receptacles(gamefile, admissible) if n_detour else []
-    key = (str(gamefile), _oci_plan_mode(config), n_detour)
+    turns = _oci_delay_turns(config)
+    scene = (_scene_receptacles(gamefile, admissible)
+             if (n_detour or mode == "delay") else [])
+    key = (str(gamefile), mode, n_detour, turns)
     if key not in _WRONG_PLAN_CACHE:
-        _WRONG_PLAN_CACHE[key] = _build_wrong_plan(str(gamefile), key[1], key[2], scene)
+        block = _build_wrong_plan(str(gamefile), mode, n_detour, scene, turns)
+        # DO NOT CACHE A BLOCK BUILT WITHOUT THE SCENE. The pool comes from the
+        # admissible actions, so an early call that has none would otherwise
+        # pin an empty tour for the rest of training.
+        if block or not (n_detour or mode == "delay") or scene:
+            _WRONG_PLAN_CACHE[key] = block
+        return block
     return _WRONG_PLAN_CACHE[key]
 
 
-PLAN_CORRUPTIONS = ("misdirect", "intact")
+PLAN_CORRUPTIONS = ("misdirect", "intact", "delay")
 
 # The block, in the environment's own words. Both modes emit the SAME text apart
 # from the numbered lines -- no word anywhere says whether the path is right.
@@ -326,6 +349,149 @@ def _misdirect(steps):
     return out
 
 
+# ALFWorld's openable receptacles. Taken from the walkthroughs themselves: over
+# 1200 sampled games the only nouns that ever follow `open` are these five, and
+# the grammar gates examineReceptacle on an `openable(r:receptacle)` predicate,
+# so openability is a property of the TYPE, not of the instance.
+_OPENABLE_RECEPS = ("cabinet", "drawer", "fridge", "microwave", "safe")
+
+_TW_PDDL_CACHE = {}
+
+
+def _tw_pddl(gamefile: str):
+    """``(walkthrough, banned_nouns)`` for this instance, cached per game.
+
+    WHY THE WALKTHROUGH. ``game.tw-pddl`` carries the ground-truth action
+    sequence IN THE ENVIRONMENT'S OWN NUMBERED VOCABULARY -- ``['go to desk 1',
+    'take pencil 2 from desk 1', 'go to shelf 2', 'use desklamp 1']`` -- present
+    in 300 of 300 sampled games, median length 6. traj_data.json's high_pddl,
+    which the other two modes read, is the same plan with the instance numbers
+    stripped, so a path built from it has to be grounded by the student. Printed
+    from the walkthrough the path is executable as written, which is what the
+    delay tail needs: the tour in front of it must be the only reason the task
+    is not solved.
+
+    WHY BANNED NOUNS. The tour must not show the student the object it needs.
+    ``go to R`` already reveals R's contents -- GotoLocation.feedback is "You
+    arrive at {r.name}. #examineReceptacle.feedback#" -- and 73% of games hold
+    more than one instance of the target type, so keeping the tour off the
+    walkthrough's own receptacles is not enough. The ``:init`` facts give
+    ``(inReceptacle <ObjId> <RecepId>)`` and the text name of anything in
+    ALFWorld is the lowercased type prefix of its id (``Pencil_bar__plus_01...``
+    -> ``pencil``, ``GarbageCan_bar_...`` -> ``garbagecan``), so the receptacles
+    holding a needed object type can be read off without mapping PDDL ids to
+    instance numbers: ban the NOUN and every instance of it goes.
+    """
+    import json as _json
+    import os
+    import re
+
+    key = str(gamefile)
+    if key in _TW_PDDL_CACHE:
+        return _TW_PDDL_CACHE[key]
+
+    d, cand = key, None
+    for _ in range(4):
+        probe = os.path.join(d, "game.tw-pddl") if os.path.isdir(d) else None
+        if probe and os.path.exists(probe):
+            cand = probe
+            break
+        d = os.path.dirname(d)
+    if not cand:
+        _TW_PDDL_CACHE[key] = ([], set())
+        return _TW_PDDL_CACHE[key]
+    try:
+        with open(cand) as fh:
+            raw = _json.load(fh)
+        walk = [str(a) for a in (raw.get("walkthrough") or [])]
+        problem = str(raw.get("pddl_problem") or "")
+    except Exception:
+        _TW_PDDL_CACHE[key] = ([], set())
+        return _TW_PDDL_CACHE[key]
+
+    def noun(ident):
+        return ident.split("_bar_")[0].lower()
+
+    init = problem[problem.index("(:init"):] if "(:init" in problem else ""
+    # The object nouns the path touches, and so must stay out of sight.
+    needed = set()
+    for line in walk:
+        tok = line.split()
+        if len(tok) > 1 and tok[0] in ("take", "move", "put", "clean", "heat",
+                                       "cool", "slice", "use", "open", "close"):
+            needed.add(tok[1])
+    banned = {noun(r) for o, r in
+              re.findall(r"\(inReceptacle\s+(\S+)\s+(\S+?)\)", init)
+              if noun(o) in needed}
+    # Plus every receptacle the path itself names: the object's location, the
+    # tool, the destination. A tour of those three is the search the task needs.
+    words = {w for line in walk for w in line.split()}
+    banned |= {n for n in (noun(r) for r in
+                           re.findall(r"\(receptacleAtLocation\s+(\S+)\s+", init))
+               if n in words}
+    _TW_PDDL_CACHE[key] = (walk, banned)
+    return _TW_PDDL_CACHE[key]
+
+
+def _delay_lines(walk, banned, scene_recs, min_turns: int):
+    """A tour that cannot be refuted, then the true path behind it.
+
+    WHAT THE MISDIRECT MEASUREMENTS SAID. The student does read the block --
+    shown the true path it solves 21.1 points more often than its plain
+    siblings, and at turn 0 it restates the corrupted path in its reasoning and
+    executes line 1 verbatim. What it will not do is keep following a path the
+    environment has contradicted: one ``Nothing happens.``, or one sight of the
+    object somewhere the path did not mention, and it reverts to searching and
+    solves the task. Every misdirect line is a refutable claim about where
+    something is, so the corruption buys a few turns and then evaporates:
+    cand_fail_rate 22.2% against a 50% bar, and the candidate still beat its
+    plain siblings by 5.3 points.
+
+    WHAT THIS DOES INSTEAD. Failure in ALFWorld has exactly one currency. The
+    return is binary, an inadmissible action costs a turn and no penalty, and
+    nothing in the action set is irreversible -- so the only way a block can
+    turn a success into a failure is to spend the 50-turn budget. The tour
+    spends it with lines that assert nothing: every line is executable, and
+    every observation it draws ("You arrive at cabinet 3. The cabinet 3 is
+    closed.") is consistent with a path that never claimed anything was there.
+    There is nothing for the student to catch.
+
+    The tail is the true path, unaltered, so this mode is exactly the already
+    measured ``intact`` arm plus a prefix -- and the prefix is sized in TURNS,
+    not lines, so perfect compliance exhausts the budget before the tail is
+    reached and failure is certain by construction. Partial compliance to step k
+    leaves 50-k turns, against the ~20 an unaided episode takes.
+
+    Motif per receptacle: ``go to`` then ``open``/``close`` where the type is
+    openable, else ``examine`` -- both supported by the grammar
+    (CloseObject.feedback, examineReceptacle.feedback) and both leaving the
+    scene as they found it, so a second pass draws the same observation as the
+    first. One pass over the un-banned receptacles covers the budget in 41% of
+    games (median 15 instances, 2 passes); the rest sweep back and forth.
+    """
+    pool = [r for r in scene_recs if r.rsplit(" ", 1)[0] not in banned]
+    if len(pool) < 3:
+        # 3% of games: a scene too small to avoid everything the object type
+        # touches. Fall back to keeping the tour off the path's own receptacles.
+        named = {w for line in walk for w in line.split()}
+        pool = [r for r in scene_recs if r.rsplit(" ", 1)[0] not in named]
+    if not pool:
+        return None
+    tour, rounds = [], 0
+    while len(tour) < min_turns and rounds <= 64:
+        order = pool if rounds % 2 == 0 else list(reversed(pool))
+        for r in order:
+            if len(tour) >= min_turns:
+                break
+            tour.append(f"go to {r}")
+            if r.rsplit(" ", 1)[0] in _OPENABLE_RECEPS:
+                tour.extend([f"open {r}", f"close {r}"])
+            else:
+                tour.append(f"examine {r}")
+        rounds += 1
+    return tour[:min_turns] + list(walk)
+
+
 def _add_detour(steps, n_detour: int, scene_recs=None):
     """Insert ``n_detour`` extra ``go to`` steps that go nowhere useful.
 
@@ -394,7 +560,7 @@ def _add_detour(steps, n_detour: int, scene_recs=None):
 
 
 def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
-                      scene_recs=None) -> str:
+                      scene_recs=None, delay_turns: int = 50) -> str:
     """The instance's expert path, as a block shown to the student.
 
     ``intact`` prints the true path; ``misdirect`` permutes its receptacles.
@@ -407,6 +573,16 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
 
     if mode not in PLAN_CORRUPTIONS:
         raise ValueError(f"plan_corruption={mode!r}; expected one of {PLAN_CORRUPTIONS}")
+
+    if mode == "delay":
+        walk, banned = _tw_pddl(gamefile)
+        if not walk or not scene_recs:
+            return ""
+        lines = _delay_lines(walk, banned, list(scene_recs), delay_turns)
+        if not lines:
+            return ""
+        body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(lines))
+        return f"{_PLAN_HEADER}\n{_PLAN_LEAD}\n{body}\n{_PLAN_FOOTER}\n\n"
 
     d, cand = gamefile, None
     for _ in range(4):

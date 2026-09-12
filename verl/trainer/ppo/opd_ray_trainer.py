@@ -206,6 +206,88 @@ def check_sign_weight_prerequisites(*, mode, teacher_topk_kl, base_policy_path, 
 
 
 
+def _oci_adherence(tokenizer, batch, cand_mask):
+    """How far down the block the candidate actually walks.
+
+    THE QUANTITY THE AGGREGATES COULD NOT SEE. cand_fail_rate says whether the
+    episode failed; rho says whether the tokens are reachable. Neither says how
+    many steps of the path were taken, which is the only thing that decides
+    whether a turn-budget corruption can work at all: comply for k steps and
+    50-k turns remain, against the ~20 an unaided episode takes. misdirect
+    established that the block IS read and that a refuted line ends the
+    compliance -- this counts the steps.
+
+    Read off the prompt, not from any bookkeeping: the block is in the
+    candidate's own prompt, so the numbered lines are decoded once per prompt
+    group and compared against the <action> the projection would have taken
+    (same extraction: the text between the tags, stripped and lowercased).
+    ``leading_k`` is consecutive compliance from the trajectory's first turn --
+    the only form that spends the budget -- and ``matched`` counts agreement
+    anywhere, which is higher whenever the student rejoins the path later.
+    """
+    import re
+    import numpy as np
+
+    from agent_system.environments.env_manager import _PLAN_FOOTER, _PLAN_HEADER
+
+    uids = batch.non_tensor_batch.get("uid", None)
+    tuids = batch.non_tensor_batch.get("traj_uid", None)
+    turns = batch.non_tensor_batch.get("turn_step", None)
+    if uids is None or tuids is None or turns is None:
+        return {"error": "batch lacks uid/traj_uid/turn_step"}
+    cand_mask = np.asarray(cand_mask, dtype=bool)
+    resp, ids, am = batch.batch["responses"], batch.batch["input_ids"], batch.batch["attention_mask"]
+    rlen = resp.shape[1]
+    plen = ids.shape[1] - rlen
+
+    plans, per_traj = {}, {}
+    for i in np.flatnonzero(cand_mask):
+        i = int(i)
+        g = str(uids[i])
+        if g not in plans:
+            pm = am[i, :plen].bool()
+            prompt = tokenizer.decode(ids[i, :plen][pm], skip_special_tokens=False)
+            a, b = prompt.find(_PLAN_HEADER), prompt.find(_PLAN_FOOTER)
+            plans[g] = (re.findall(r"^\s*\d+\.\s*(.+?)\s*$",
+                                   prompt[a:b], flags=re.M)
+                        if 0 <= a < b else [])
+        plan = plans[g]
+        if not plan:
+            continue
+        rm = am[i, plen:].bool()
+        text = tokenizer.decode(ids[i, plen:][rm], skip_special_tokens=False).lower()
+        s0, s1 = text.find("<action>"), text.find("</action>")
+        act = text[s0 + 8:s1].strip() if 0 <= s0 < s1 else None
+        per_traj.setdefault(str(tuids[i]), []).append((int(turns[i]), act, plan))
+
+    ks, rates, lens = [], [], []
+    for rows in per_traj.values():
+        rows.sort()
+        base, plan = rows[0][0], rows[0][2]
+        hit = [(act is not None and t - base < len(plan)
+                and act == plan[t - base].lower()) for t, act, plan in rows]
+        k = 0
+        for h in hit:
+            if not h:
+                break
+            k += 1
+        ks.append(k)
+        rates.append(float(np.mean(hit)) if hit else 0.0)
+        lens.append(len(plan))
+    if not ks:
+        return {"error": "no candidate row carries a readable plan block"}
+    ks_a = np.asarray(ks, dtype=float)
+    return {"trajectories": int(ks_a.size),
+            "plan_lines_p50": float(np.percentile(lens, 50)),
+            "leading_k_mean": float(ks_a.mean()),
+            "leading_k_p50": float(np.percentile(ks_a, 50)),
+            "leading_k_max": int(ks_a.max()),
+            "leading_k_ge_40": float((ks_a >= 40).mean()),
+            "leading_k_hist": {str(int(v)): int(c) for v, c in
+                               zip(*np.unique(ks_a, return_counts=True))},
+            "match_rate_mean": float(np.mean(rates))}
+
+
 def _oci_sample_dump(tokenizer, batch, cand_mask, *, n_groups=3, max_chars=2600):
     """Decoded prompt tail and response for a few candidate rows and their
     plain siblings, paired by prompt group and turn.
@@ -1426,6 +1508,14 @@ class OPDRayTrainer(RayPPOTrainer):
         # game, same turn, one shown the block and one not -- is the only thing
         # that says whether the block is being followed, argued with, or ignored.
         # A few rows, decoded on the driver, no extra pass.
+        # HOW FAR DOWN THE BLOCK IT WALKED. Everything above is an outcome; this
+        # is the behaviour that produces it, and the delay mode lives or dies on
+        # it -- see _oci_adherence.
+        try:
+            rec["adherence"] = _oci_adherence(self.tokenizer, batch, cand_np)
+        except Exception as exc:
+            rec["adherence"] = {"error": f"{type(exc).__name__}: {exc}"}
+
         try:
             rec["samples"] = _oci_sample_dump(
                 self.tokenizer, batch, cand_np,

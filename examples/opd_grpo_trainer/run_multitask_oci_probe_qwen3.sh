@@ -46,13 +46,18 @@ N_BATCHES="${N_BATCHES:-3}"
 TASKS="${TASKS:-alfworld,search,webshop}"
 N_TASKS=$(awk -F, "{print NF}" <<< "$TASKS")
 GPUS="${GPUS:-2}"
-# intact = the true path, misdirect = receptacles permuted. Run intact FIRST:
-# two measurements say the student does not read the block at all (median
-# log rho 0.0), and only the true path can tell whether that is the block or
-# the corruption.
+# intact = the true path, misdirect = receptacles permuted, delay = the true
+# path behind a tour that spends the turn budget. Measured so far, on 15
+# alfworld groups x 3 batches at step 300:
+#   intact     cand_fail 4.4%   cand 95.6% vs plain 74.4%  (+21.1)  19.9 turns
+#   misdirect  cand_fail 22.2%  cand 77.8% vs plain 72.5%  ( +5.3)  24.0 turns
+# The block is read; a refutable corruption is abandoned once refuted.
 CORRUPTION="${CORRUPTION:-intact}"
 # Extra `go to` steps inserted into a corrupted path; 0 = off, ignored by intact.
 DETOUR="${DETOUR:-0}"
+# `delay` only: turns the tour must cover before the true path starts. 50 = the
+# episode cap, so full compliance cannot reach the tail.
+DELAY_TURNS="${DELAY_TURNS:-50}"
 TAG="${TAG:-oci1}"
 MODEL="${MODEL:-student}"
 case "$MODEL" in
@@ -120,6 +125,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   algorithm.oci_sat.enable=True \
   algorithm.oci_sat.plan_corruption="$CORRUPTION" \
   algorithm.oci_sat.detour_steps="$DETOUR" \
+  algorithm.oci_sat.delay_turns="$DELAY_TURNS" \
   algorithm.oci_sat.gradient_on_injected=True \
   'algorithm.oci_sat.tasks=[alfworld]' \
   +trainer.grad_probe.enable=True \

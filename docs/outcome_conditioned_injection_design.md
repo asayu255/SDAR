@@ -362,7 +362,7 @@ control より高い。H2 は H1 の機構的説明であり、H1 の代わり�
 - B も A も H1 で control を上回らない → §0 の主張は棄却。設計は終わり。
 - `cand_fail_rate` が低い → 誤った計画が道具として機能していない。機構ではなく
   特権入力の設計の問題。
-- `oci/groups_saturated/alfworld` がほぼゼロ → 作用対象が無い。§7.2 の測定を
+- `oci/groups_saturated/alfworld` がほぼゼロ → 作用対象が無い。§7.1 の測定を
   先にすべきだった、ということになる。
 
 v2 の「95% が反証条件」という記述は削除した。7+1 の 1 本では検出できない。
@@ -459,12 +459,21 @@ rollout の規約を保ち、プロンプトを n トークン削ったら応答
 **alfworld の退化側はほぼ全部飽和**で、機構には作用対象がある。トークン質量
 （alfworld 単独プローブ）は dead が 40.7〜70.8% とバッチ間で大きく振れる。
 
-特権ブロックの効果（2 設計とも棄却、§4）:
+特権ブロックの効果（打ち切り線 `cand_fail_rate` > 0.5。45 候補軌跡 = 15 群 × 3
+バッチ）:
 
-| 設計 | `cand_fail_rate` | 候補の成功率 | 素の 7 本 | ρ |
-|---|---|---|---|---|
-| `drop`（要件除去、PDDL） | 1/15 = 6.7% | 93.3% | 74.2% | 未測定（span バグ） |
-| `misdirect`（移動置換、PDDL） | 15.6% | 84.4% | 73.9% | **log ρ p50 = 0.0** |
+| 設計 | `cand_fail_rate` | 候補の成功率 | 素の 7 本 | 差 | ターン数 |
+|---|---|---|---|---|---|
+| `drop`（要件除去、PDDL） | 6.7% | 93.3% | 74.2% | +19.1 | — |
+| `misdirect`（移動置換、PDDL） | 15.6% | 84.4% | 73.9% | +10.5 | — |
+| `intact`（真の経路、環境語） | 4.4% | 95.6% | 74.4% | **+21.1** | 19.9 |
+| `misdirect` v1（環境語、経路 57% が自己矛盾） | 17.8% | 82.2% | 73.9% | +8.3 | 22.9 |
+| `misdirect` v2（矛盾 0%、文言強化） | 22.2% | 77.8% | 72.5% | +5.3 | 24.0 |
+
+読み方は 2 つある。**`intact` が +21.1 なので、ブロックは読まれている**（v1 の
+「読まれていない」は ρ だけを見た誤読）。そして**腐敗を強めるほど失敗率は上がり
+助けは縮む**が、v2 でも候補はまだ素の 7 本を上回っており、打ち切り線 0.5 に対して
+0.22 で止まっている。プロンプト側の語調と整合性はここで上限に達した。
 
 **注意: alfworld は毎バッチ同じ 15 ゲームを引く。** ALFWorld は worker i を
 `seed + i // group_n` で seed し、seed は run 固定なので、3 バッチでクラス分割が
@@ -490,7 +499,82 @@ turn 5  obs: "Nothing happens."
 集計単位の問題で、`<think>` の定型が大半を占め、変わっているのは受け皿名の数
 トークンだけである。
 
-### 7.3 `index` はゲームを同定しない
+### 7.3 離脱の引き金 — 失敗が誘発できない理由（v2 の生成）
+
+v2 の候補は**冒頭でブロックを完全に復唱して 1 行目を実行する**。
+
+```
+見せた経路（腐敗）: 1. go to microwave / 2. take mug from microwave /
+  3. go to coffeemachine / 4. heat mug with coffeemachine /
+  5. go to sinkbasin / 6. put mug in/on sinkbasin
+
+turn 0  think「take the mug from the microwave, heat it using the coffeemachine,
+        and then place it on the sinkbasin」   action: go to microwave 1
+turn 3  obs: sinkbasin 1 に mug 2 が見える     action: take mug 2 from sinkbasin 1
+turn 5                                          action: move mug 2 to coffeemachine 1
+```
+
+turn 0 の時点では従っている。turn 3 で**観測が経路を反証した瞬間に乗り換え**、
+自分の方策で正解する。引き金は 2 つある。
+
+1. **反証可能な行を出した瞬間**（`take mug from microwave 1` → mug が無い、
+   または `Nothing happens.`）。`misdirect` の行はほぼ全部が「そこに何がある」と
+   いう反証可能な主張である。
+2. **目標物を見た瞬間**（turn 3）。`go to R` の観測は R の中身を列挙する
+   （`GotoLocation.feedback` = `You arrive at {r.name}. #examineReceptacle.feedback#`）。
+
+そして**失敗の通貨はターン予算だけ**である。リターンは二値、不正行動は無罰
+（projection は `<action>`/`<think>` タグしか見ない）、行動集合に不可逆なものは
+無い。よって誘発ブロックの要件は「**反証されない行だけで、目標物を一度も見せず
+に、50 ターンを使い切らせる**」。`misdirect` は 3 つとも満たしていない。
+
+`detour_steps` はこの予算消費のために作ったが、実手順の間に均等に挟むので
+10 歩目に反証が来て離脱し、残り 40 ターンで解かれる。設計として使えない。
+
+### 7.4 `delay` — 反証されない巡回を先に置く（実装済み、測定中）
+
+`intact` と 1 バイトも変えず、番号行の前に**計画が名指さない受け皿の巡回**を
+足す。`game.tw-pddl` の `walkthrough` が**番号付きの実行可能な正解列**
+（`['go to desk 1', 'take pencil 2 from desk 1', ...]`、300/300 ゲームに存在、
+中央長 6）なので、末尾は真の経路をそのまま印字できる。
+
+```
+1. go to cabinet 1      ← 開く型は go to / open / close で 3 ターン
+2. open cabinet 1
+3. close cabinet 1
+...
+49. go to toaster 1     ← 開かない型は go to / examine で 2 ターン
+50. examine toaster 1
+51. go to fridge 1      ← ここから真の経路（walkthrough そのまま）
+52. open fridge 1
+53. take tomato 1 from fridge 1
+```
+
+成立条件を 3 つとも満たす。
+
+- **反証不能**: 全行が実行可能で、引く観測（`You arrive at cabinet 3. The
+  cabinet 3 is closed.`）は計画のどの主張とも矛盾しない。計画は「そこに物が
+  ある」と言っていない。`open` は必ず `close` で閉じるので 2 周目も同じ観測。
+- **目標物を見せない**: `:init` の `(inReceptacle o r)` から、経路が触る物型の
+  **全**インスタンスを含む受け皿の**名詞**を除外する（ALFWorld の表示名は id の
+  型接頭辞の小文字なので、PDDL id → 番号付き名の対応は不要）。200 ゲームで漏れ 0。
+- **予算を行数でなくターン数で保証**: 既定 `delay_turns: 50` = ターン上限。
+  完全追従なら末尾に到達せず**失敗が構成的に確定**する。1 周で足りるのは 41%
+  （中央 15 インスタンス、中央 2 周）で、残りは往復して埋める。
+
+**`delay` = 測定済みの `intact` + 前置きだけ**という単一変数比較になる。判定は
+`cand_fail_rate > 0.5`（据え置き）と、新しく測る `oci/adherence`:
+
+- `leading_k` — 軌跡の最初のターンから連続で計画の次行と一致した歩数。予算を
+  食うのはこの形だけ。部分追従が k 歩なら残り 50−k ターンで、無補助の 1 話が
+  約 20 ターンなので **k ≥ 40 が失敗の必要条件**（`leading_k_ge_40` を出す）。
+- `match_rate` — どこでも一致した割合。後から経路に復帰すると高くなる。
+
+**これがプロンプト側の最後の手**である。反証されない列を 40 歩追従させられない
+なら、どんな語調でも失敗は誘発できない。その場合は B を仮想床サンプル、A を
+自分の過去の実失敗の再生に切り替える（§9）。
+
+### 7.5 `index` はゲームを同定しない
 
 alfworld の parquet は**空プロンプトの 15 行**を持ち、環境がゲームを worker 位置で
 選ぶ。よって run ごとに同じ 15 個の index が別の 15 ゲームに割り当たる。

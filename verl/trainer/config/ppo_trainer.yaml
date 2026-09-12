@@ -367,13 +367,27 @@ algorithm:
     #     correct: the grammar fixes each one, so any swap is inexecutable and
     #     an inexecutable line announces the block is unreliable instead of
     #     misleading.
+    #   delay: the true path, unaltered, behind a tour of the receptacles the
+    #     path does NOT name -- `go to cabinet 3` / `open cabinet 3` /
+    #     `close cabinet 3` and so on -- sized in TURNS to cover the whole
+    #     episode cap. This is the mode that follows from what misdirect
+    #     measured: the student does read the block (intact solves 21.1 points
+    #     above its plain siblings, and at turn 0 it restates the corrupted path
+    #     and executes line 1 verbatim) but abandons it the moment the
+    #     environment contradicts it, and every misdirect line is a refutable
+    #     claim about where something is. A tour claims nothing: each line is
+    #     executable and each observation it draws is consistent with it, so
+    #     there is nothing to catch. Failure then follows by construction rather
+    #     than by persuasion -- full compliance spends the budget before the
+    #     tail is reached. See delay_turns.
     #   intact: the true path. This is the arm that asks whether the student
-    #     reads such a block AT ALL, which the first two measurements say it
-    #     does not -- median log rho 0.0 between the plan-conditioned and plain
-    #     student. Run it before any corrupted arm.
+    #     reads such a block AT ALL. It does: cand_fail_rate 4.4% and +21.1
+    #     points over the plain seven. (The first two measurements read rho
+    #     alone, saw median log rho 0.0 and concluded the opposite; rho is
+    #     aggregated over all tokens and the <think> boilerplate dominates it.)
     #
-    # The two emit byte-identical text apart from the numbered lines, so no word
-    # labels the path right or wrong. The earlier "drop" mode (remove the
+    # All three emit byte-identical text apart from the numbered lines, so no
+    # word labels the path right or wrong. The earlier "drop" mode (remove the
     # requirement step) is gone: it was refuted (cand_fail_rate 1/15, because
     # the removed step is the one the task text already states in 92% of games)
     # and its block used a PDDL notation this one no longer emits, so it cannot
@@ -394,7 +408,18 @@ algorithm:
     # not by how wrong it is. `go to {recep}` is admissible everywhere, so each
     # inserted step is executed and spends a turn -- the one currency that
     # decides the episode. Drawn from the receptacles the plan already names.
+    #
+    # Superseded by `delay`, which spends the same currency without asking the
+    # student to keep following a path the environment has already refuted.
     detour_steps: 0
+    # `delay` only: how many TURNS the tour must consume before the true path
+    # begins. Turns, not lines, because the episode cap is what decides the
+    # episode: at 50 a perfectly compliant candidate never reaches the tail and
+    # fails by construction, and lines past the cap cost tokens and nothing
+    # else. Compliance to step k instead leaves 50-k turns against the ~20 an
+    # unaided episode takes, so the mode is also the measurement of how far a
+    # non-refutable path is followed.
+    delay_turns: 50
     # Only where the plan exists. env_manager prepends it at the alfworld
     # prompt sites and nowhere else; a candidate marked on another task would
     # be a plain rollout excluded from its group's verdict and then dropped.

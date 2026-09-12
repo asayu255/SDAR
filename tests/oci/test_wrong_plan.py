@@ -354,6 +354,128 @@ ok &= good
 print(("  OK  " if good else "  FAIL") + " detour defaults to 0 (off)")
 
 
+# --- delay: the tour in front of the true path -------------------------------
+#
+# THE MODE EXISTS BECAUSE THE OTHER TWO MEASURED THEIR OWN LIMIT. misdirect got
+# cand_fail_rate to 22.2% against a 50% bar and the candidate still beat its
+# plain siblings by 5.3 points, because every line it writes is a refutable
+# claim about where something is and the student drops the path the moment the
+# environment contradicts one. So the checks here are about the two properties
+# that make a tour different: that NOTHING IN IT CAN BE REFUTED, and that it
+# covers the TURN BUDGET -- the only currency ALFWorld failure has.
+print("\n[delay]")
+em._WRONG_PLAN_CACHE.clear()
+em._TW_PDDL_CACHE.clear()
+TOUR_VERBS = ("go to ", "open ", "close ", "examine ")
+random.seed(11)
+samp = random.sample(GAMES, 200)
+
+n = 0
+short_tour = leaks = ungrammatical = dup = unbalanced = tail_bad = 0
+chars = []
+for g in samp:
+    d = json.load(open(g))
+    walk = [a for a in (d.get("walkthrough") or [])]
+    init = d["pddl_problem"][d["pddl_problem"].index("(:init"):]
+    recs = sorted({m.split("_bar_")[0].lower() for m in
+                   re.findall(r"\(receptacleAtLocation\s+(\S+)\s+", init)})
+    # a plausible stand-in for the runtime admissible list: every receptacle
+    # noun the scene has, numbered
+    scene = [f"{r} {i}" for r in recs for i in (1, 2)]
+    block = em._build_wrong_plan(g, "delay", 0, scene, 50)
+    if not block or not walk:
+        continue
+    n += 1
+    chars.append(len(block))
+    lines = path_lines(block)
+    tour, tail = lines[:50], lines[50:]
+    if len(tour) != 50:
+        short_tour += 1
+    if tail != walk:
+        tail_bad += 1
+    if not all(l.startswith(TOUR_VERBS) for l in tour):
+        ungrammatical += 1
+    if any(a == b for a, b in zip(tour, tour[1:])):
+        dup += 1
+    # open must be answered by close, so a second pass sees what the first did
+    opens = [l[len("open "):] for l in tour if l.startswith("open ")]
+    closes = [l[len("close "):] for l in tour if l.startswith("close ")]
+    if opens[:len(closes)] != closes:
+        unbalanced += 1
+
+    # nothing the path needs may be visible from the tour
+    needed = {a.split()[1] for a in walk
+              if len(a.split()) > 1 and a.split()[0] in
+              ("take", "move", "put", "clean", "heat", "cool", "slice", "use",
+               "open", "close")}
+    banned = {r.split("_bar_")[0].lower() for o, r in
+              re.findall(r"\(inReceptacle\s+(\S+)\s+(\S+?)\)", init)
+              if o.split("_bar_")[0].lower() in needed}
+    banned |= {r for r in recs if r in {w for a in walk for w in a.split()}}
+    visited = {l.split(" ", 2)[2].rsplit(" ", 1)[0] for l in tour
+               if l.startswith("go to ")}
+    if visited & banned:
+        leaks += 1
+
+    # The tail needs no coherence check of its own, and MUST NOT be given the
+    # one the permuted path gets. The walkthrough is TextWorld's own solution to
+    # a game marked solvable, so it is executable by construction -- and 13 of
+    # these 200 break the "every reference is the place the walk last arrived
+    # at" rule anyway: `go to coffeemachine 1` / `take mug 1 from countertop 2`,
+    # `go to drawer 7` / `move bowl 1 to dresser 1`. `go to` moves the agent to
+    # a LOCATION and several receptacles share one, so that rule is stricter
+    # than the environment. It is the right rule for a path whose walk has been
+    # permuted, where nothing guarantees the destination is still co-located;
+    # here the only thing to check is that the walkthrough is reproduced.
+
+good = n > 150 and short_tour == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {n} games build a block, {n - short_tour} of them with a full 50-turn "
+      f"tour before the true path (median {sorted(chars)[len(chars)//2]} chars)")
+
+good = leaks == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {n - leaks}/{n} tours never visit a receptacle holding anything the "
+      f"path needs ({leaks} would show the student its object)")
+
+good = ungrammatical == 0 and dup == 0 and unbalanced == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" every tour line is go to / open / close / examine, {dup} immediate "
+      f"repeats, {unbalanced} unbalanced open/close")
+
+good = tail_bad == 0
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" the tail is the walkthrough verbatim, so it is executable by "
+      f"construction ({tail_bad}/{n} differ)")
+
+# the framing is the same text; only the numbered lines differ
+em._WRONG_PLAN_CACHE.clear()
+a = em._build_wrong_plan(samp[0], "delay", 0, ["shelf 1", "shelf 2", "bed 1"], 50)
+b = em._build_wrong_plan(samp[0], "intact", 0)
+strip = lambda blk: [l for l in blk.splitlines() if not re.match(r"^\d+\. ", l)]
+good = bool(a) and bool(b) and strip(a) == strip(b)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      " delay and intact are byte-identical apart from the numbered lines")
+
+good = em._build_wrong_plan(samp[0], "delay", 0, [], 50) == ""
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      " with no admissible actions to read there is no pool, so no block is "
+      "emitted rather than one with an empty tour")
+
+good = (em._oci_delay_turns(None) == 50
+        and em._oci_delay_turns(cfg(mode="delay")) == 50
+        and em._oci_delay_turns(SimpleNamespace(algorithm={"oci_sat": {
+            "enable": True, "delay_turns": 12}})) == 12)
+ok &= good
+print(("  OK  " if good else "  FAIL") + " delay_turns defaults to the 50-turn cap")
+
+
 def test_wrong_plan():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok
