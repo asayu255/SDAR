@@ -89,5 +89,36 @@ good = m["oci/groups_saturated/alfworld"] == 1 and abs(m["oci/live_frac/alfworld
 ok &= good
 print(("  OK  " if good else "  FAIL") + f" metrics: {m}")
 
+# --- token mass by class: the number that sizes the mechanism ---------------
+from verl.trainer.ppo.oci_saturated import token_mass_by_class
+
+# a saturated group that finished in 1 turn against a stuck one that ran 5
+spec4 = {"sat": [10.0] * 8, "stuck": [0.0] * 8}
+turns = {"sat": 1, "stuck": 5}
+rew4, uids4, tuids4 = [], [], []
+for uid, rets in spec4.items():
+    for k, r in enumerate(rets):
+        for _ in range(turns[uid]):
+            row = [0.0] * TOK
+            row[-1] = float(r)
+            rew4.append(row); uids4.append(uid); tuids4.append(f"{uid}:{k}")
+n4 = len(rew4)
+b4 = types.SimpleNamespace(
+    batch={"token_level_rewards": torch.tensor(rew4),
+           "responses": torch.zeros(n4, TOK, dtype=torch.long),
+           "loss_mask": torch.ones(n4, TOK, dtype=torch.long),
+           "attention_mask": torch.ones(n4, TOK, dtype=torch.long)},
+    non_tensor_batch={"uid": np.array(uids4), "traj_uid": np.array(tuids4)},
+    meta_info={})
+tm = token_mass_by_class(b4, classify_groups(b4))
+good = (abs(tm["oci/tokmass/saturated/group_share"] - 0.5) < 1e-9
+        and abs(tm["oci/tokmass/saturated/token_share"] - 1 / 6) < 1e-9
+        and abs(tm["oci/tokmass/dead_token_share"] - 1.0) < 1e-9)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" token mass splits where the group count does not: saturated is "
+      f"{tm['oci/tokmass/saturated/group_share']:.0%} of groups but "
+      f"{tm['oci/tokmass/saturated/token_share']:.0%} of tokens")
+
 print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
 sys.exit(0 if ok else 1)

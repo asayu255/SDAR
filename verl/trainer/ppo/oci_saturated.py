@@ -75,10 +75,26 @@ def classify_groups(batch, *, judged_rows: Optional[np.ndarray] = None) -> Dict[
             k = str(tuids[i])
             g["traj"][k] = max(g["traj"].get(k, float("-inf")), float(ret[i]))
 
-    # the reference level that splits degenerate groups into stuck and saturated
-    live_vals = [v for g in by_group.values()
-                 if len(set(g["traj"].values())) > 1 for v in g["traj"].values()]
-    ref = float(np.mean(live_vals)) if live_vals else 0.0
+    # THE SPLIT IS RELATIVE TO WHAT THE BATCH ACHIEVED, and the batch may not
+    # contain a live group to read that from. Preference order:
+    #   1. the mean over live groups -- the band where learning is happening;
+    #   2. the midpoint of the degenerate returns, when there are no live groups
+    #      but the degenerate ones disagree with each other;
+    #   3. the batch's own minimum, when every group scored alike -- then the
+    #      question is only whether that common score is the floor, and a batch
+    #      of all-zero groups must read as stuck rather than saturated.
+    vals_by_group = {u: list(g["traj"].values()) for u, g in by_group.items() if g["traj"]}
+    live_vals = [v for vs in vals_by_group.values() if len(set(vs)) > 1 for v in vs]
+    deg = [vs[0] for vs in vals_by_group.values() if len(set(vs)) == 1]
+    if live_vals:
+        ref = float(np.mean(live_vals))
+    elif deg and min(deg) != max(deg):
+        ref = (float(min(deg)) + float(max(deg))) / 2.0
+    else:
+        # everything alike: saturated iff that score is above the floor. The
+        # floor is 0.0 -- no environment here pays for doing nothing -- so an
+        # all-zero batch is stuck and an all-solved batch is saturated.
+        ref = 0.0 if (deg and max(deg) > 0.0) else float("inf")
 
     out = {}
     for uid, g in by_group.items():
@@ -146,3 +162,48 @@ def injection_metrics(groups: Dict[str, Dict], injected: np.ndarray, task: str =
         f"oci/live_frac{suffix}": n["live"] / tot,
         f"oci/injected_rows{suffix}": int(np.asarray(injected, dtype=bool).sum()),
     }
+
+
+def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = True) -> Dict:
+    """Tokens, not groups, split by group class.
+
+    THE NUMBER THAT SIZES THE MECHANISM. The gradient counts tokens; a count of
+    groups does not. On the control checkpoint 30% of alfworld's groups are live
+    while 75.5% of its TOKENS already carry advantage, because a saturated group
+    finishes early and a stuck one runs to the 50-turn cap. So "70% of groups are
+    dead" and "24.5% of the gradient is missing" are both true, and only the
+    second one bounds what any injection can buy.
+
+    Reported per class: groups, tokens, and tokens per group.
+    """
+    import numpy as np
+
+    resp = batch.batch.get("responses", None)
+    am = batch.batch.get("attention_mask", None)
+    if resp is None or am is None:
+        return {}
+    n = resp.shape[1]
+    key = "loss_mask" if (multi_turn and "loss_mask" in batch.batch.keys()) else "attention_mask"
+    mask = batch.batch[key][:, -n:].bool()
+    per_row = mask.sum(-1).detach().cpu().numpy()
+
+    agg = {c: [0, 0] for c in ("live", "stuck", "saturated")}
+    for g in groups.values():
+        a = agg[g["status"]]
+        a[0] += 1
+        a[1] += int(sum(per_row[i] for i in g["rows"]))
+    tot_g = max(sum(v[0] for v in agg.values()), 1)
+    tot_t = max(sum(v[1] for v in agg.values()), 1)
+    out = {}
+    for c, (ng, nt) in agg.items():
+        out[f"oci/tokmass/{c}/groups"] = ng
+        out[f"oci/tokmass/{c}/tokens"] = nt
+        out[f"oci/tokmass/{c}/group_share"] = ng / tot_g
+        out[f"oci/tokmass/{c}/token_share"] = nt / tot_t
+        out[f"oci/tokmass/{c}/tokens_per_group"] = (nt / ng) if ng else 0.0
+    # what the mechanism can buy at most: the share of tokens that carry nothing
+    out["oci/tokmass/dead_token_share"] = (
+        agg["stuck"][1] + agg["saturated"][1]) / tot_t
+    out["oci/tokmass/saturated_share_of_dead"] = (
+        agg["saturated"][1] / max(agg["stuck"][1] + agg["saturated"][1], 1))
+    return out

@@ -125,3 +125,57 @@ def reachability_report(
         if rec:
             res[name] = rec
     return res
+
+
+# --------------------------------------------------------------------------- #
+# the strip function for the wrong-plan arm
+# --------------------------------------------------------------------------- #
+
+
+def wrong_plan_strip_fn(tokenizer, pad_token_id: int):
+    """Build a ``strip_fn`` that removes the corrupted-plan block from each row.
+
+    The block is a prompt-side prefix inserted by ``env_manager._wrong_plan_prefix``
+    at the head of the turn's observation, so removing its tokens from the front
+    of the live span gives exactly the prompt the policy would have seen without
+    it, on the SAME response tokens. That is what makes rho well defined:
+    numerator and denominator differ in the conditioning and in nothing else.
+
+    The per-row prefix length rides in ``oci_plan_len``; rows without one keep a
+    length of zero and pass through unchanged, so a batch where only the
+    candidate slot carries a plan needs no special case.
+    """
+    from verl.trainer.ppo.privileged_notice import strip_prefix
+
+    def _strip(batch):
+        import torch
+        from verl.protocol import DataProto
+
+        n_len = batch.batch.get("oci_plan_len", None)
+        if n_len is None:
+            return batch
+        ids, mask, pos = strip_prefix(
+            batch.batch["input_ids"], batch.batch["attention_mask"],
+            n_len.reshape(-1), pad_token_id,
+        )
+        tensors = {k: v for k, v in batch.batch.items()}
+        tensors.update({"input_ids": ids, "attention_mask": mask, "position_ids": pos})
+        out = DataProto.from_dict(tensors=tensors,
+                                  non_tensors=dict(batch.non_tensor_batch))
+        out.meta_info = dict(batch.meta_info)
+        return out
+
+    return _strip
+
+
+def plan_length_column(prefixes, tokenizer):
+    """``oci_plan_len``: how many tokens each row's plan block occupies.
+
+    ``prefixes`` is one string per row, empty where no plan was shown.
+    """
+    import torch
+
+    lens = []
+    for p in prefixes:
+        lens.append(len(tokenizer(p, add_special_tokens=False).input_ids) if p else 0)
+    return torch.tensor(lens, dtype=torch.long)

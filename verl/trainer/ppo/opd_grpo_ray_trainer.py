@@ -165,6 +165,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                             batch.batch["response_mask"] * keep_mask.unsqueeze(-1).to(
                                 batch.batch["response_mask"].dtype))
                     metrics.update(injection_metrics(grp, oci_injected, task="alfworld"))
+                    # tokens, not groups: a saturated group finishes early and a
+                    # stuck one runs to the turn cap, so the group count and the
+                    # token count disagree by about 4x and only the token count
+                    # bounds what injection can buy.
+                    from verl.trainer.ppo.oci_saturated import token_mass_by_class
+
+                    metrics.update(token_mass_by_class(
+                        batch, grp,
+                        multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable))
 
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(

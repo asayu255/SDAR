@@ -81,6 +81,17 @@ def _oci_candidate_mask(n_rows: int, group_n: int):
     return [((i % group_n) == (group_n - 1)) for i in range(n_rows)]
 
 
+# What was actually prepended, per env slot, for the turn just built. The
+# reachability probe needs the exact block to remove it again, and re-deriving it
+# there would be a second source of truth that can drift from this one.
+_OCI_LAST_PREFIX = {}
+
+
+def oci_last_prefixes(n_rows: int):
+    """Per-row plan block for the turn just built; '' where none was shown."""
+    return [_OCI_LAST_PREFIX.get(i, "") for i in range(n_rows)]
+
+
 def _oci_candidate_row(i: int, group_n) -> bool:
     """Is env slot ``i`` the one that gets the corrupted plan?"""
     import os
@@ -329,8 +340,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)):
-                    obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
+                _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
+                            if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)) else "")
+                _OCI_LAST_PREFIX[i] = _oci_pre
+                obs = _oci_pre + obs
             else:
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
@@ -341,8 +354,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)):
-                    obs = _wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None)) + obs
+                _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
+                            if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)) else "")
+                _OCI_LAST_PREFIX[i] = _oci_pre
+                obs = _oci_pre + obs
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
