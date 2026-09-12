@@ -74,5 +74,12 @@ good = "error" in bad
 ok &= good
 print(("  OK  " if good else "  FAIL") + f" a broken re-score is reported: {str(bad)[:56]}")
 
-print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
-sys.exit(0 if ok else 1)
+
+def test_reachability():
+    """Collected by pytest; the checks above ran at import and set `ok`."""
+    assert ok
+
+
+if __name__ == "__main__":
+    print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+    sys.exit(0 if ok else 1)

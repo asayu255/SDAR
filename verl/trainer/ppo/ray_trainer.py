@@ -78,6 +78,9 @@ from agent_system.multi_turn_rollout.rollout_loop import reset_batch_wall, rollo
 from verl.utils.val_pipeline import Slot, run_pipelined
 from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
+# Rows excluded from a GRPO group's mean/std. See compute_grpo_outcome_advantage.
+GRPO_STAT_EXCLUDE_KEY = "grpo_stat_exclude"
+
 WorkerType = Type[Worker]
 
 
@@ -409,6 +412,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             # Absent when the batch was already divisible, which is the same thing
             # as "no copies were added".
             padding_mask=data.batch.get(PADDING_ROW_KEY, None),
+            # Rows a mechanism decided the group did not want. A column rather
+            # than a kwarg for the same reason padding_mask is: _balance_batch
+            # reorders rows and moves a column with them, so whatever set this
+            # does not need to know the final row order.
+            exclude_mask=data.batch.get(GRPO_STAT_EXCLUDE_KEY, None),
+            # PINNED, NOT DEFAULTED. True means the group's mean and std are
+            # taken over TURN ROWS, so a trajectory's weight in its own baseline
+            # is its length: the same group gives A_success/A_failure of
+            # +0.375/-2.625 when the odd trajectory runs 8 turns and
+            # +0.940/-1.053 when it runs 50. That is the historical behaviour of
+            # every run in this repo and it stays the default, but a mechanism
+            # that injects a row changes its group's baseline through the row's
+            # LENGTH as well as its return, so which statistic is in use belongs
+            # in the config that identifies an arm rather than in a default.
+            compute_mean_std_cross_steps=bool(
+                kwargs.get("compute_mean_std_cross_steps", True)),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

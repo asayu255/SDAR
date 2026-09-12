@@ -35,6 +35,12 @@ from verl.trainer.ppo.privileged_notice import (
     notice_text as _notice_text,
     parse_notice_config as _parse_notice_config,
 )
+from agent_system.environments.env_manager import oci_prefix_for
+
+# Read once. env_manager decides per slot whether a plan was actually shown (it
+# also gates on the envs being a TRAINING manager); this only says whether to
+# bother asking, so that a run with the switch off pays nothing per row.
+_OCI_WRONG_PLAN_ON = bool(os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip())
 from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -1021,6 +1027,57 @@ class TrajectoryCollector:
                 _without = tokenizer.apply_chat_template(
                     messages[1:], add_generation_prompt=True, tokenize=False, **apply_chat_template_kwargs)
                 notice_len = len(tokenizer.encode(_with[: len(_with) - len(_without)], add_special_tokens=False))
+        # OCI-sat: WHERE THE CORRUPTED PLAN BLOCK SITS IN THIS ROW'S PROMPT.
+        #
+        # COMPUTED HERE BECAUSE ONLY HERE IS THE ROW ORDER MEANINGFUL. The block
+        # is prepended by env_manager to the observation of one env slot per
+        # group, so "which row is the injected one" is a fact about the env slot
+        # `item`. The driver cannot recover it: rows are regrouped by task,
+        # padded, and then reordered by _balance_batch before the advantage is
+        # computed, so any rule the trainer applies to the row order is applied
+        # to a permuted one. Deriving it there marked whole trajectories that
+        # were never shown a plan. Carried as a column instead, the way
+        # attach_task_loss_weights and the teacher cache id are -- _balance_batch
+        # moves a column with its row, so the mark stays attached.
+        #
+        # NOT A FRONT-STRIP. The notice is a system message at position 0, so its
+        # own tokens are a PREFIX of the render and notice_len alone locates it.
+        # The plan goes at the head of the USER turn's content, behind the chat
+        # header, so a row that recorded only a length and stripped that many
+        # leading tokens would remove the header and leave the plan. Both an
+        # offset and a length are needed, and they are read off the two renders
+        # in TOKENS -- character arithmetic can split a token that spans the
+        # boundary.
+        oci_candidate, oci_plan_off, oci_plan_len, oci_plan_truncated = 0, 0, 0, 0
+        _oci_pre = oci_prefix_for(item) if _OCI_WRONG_PLAN_ON else ""
+        if _oci_pre and obs_content.startswith(_oci_pre):
+            oci_candidate = 1
+            _msgs_wo = [dict(_m) for _m in messages]
+            for _m in _msgs_wo:
+                if _m.get("role") == "user":
+                    _m["content"] = _m["content"][len(_oci_pre):]
+                    break
+            _ids_w = tokenizer.encode(tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
+                **apply_chat_template_kwargs), add_special_tokens=False)
+            _ids_o = tokenizer.encode(tokenizer.apply_chat_template(
+                _msgs_wo, add_generation_prompt=True, tokenize=False,
+                **apply_chat_template_kwargs), add_special_tokens=False)
+            _head = 0
+            while _head < len(_ids_o) and _ids_w[_head] == _ids_o[_head]:
+                _head += 1
+            _tail = 0
+            while (_tail < len(_ids_o) - _head
+                   and _ids_w[len(_ids_w) - 1 - _tail] == _ids_o[len(_ids_o) - 1 - _tail]):
+                _tail += 1
+            # The two renders must differ in exactly one contiguous span, or the
+            # strip is not the inverse of the prepend and rho would be computed
+            # against the wrong prompt. A row that fails this keeps
+            # oci_candidate=1 (it IS the injected row) and length 0, which every
+            # reader treats as "no strippable span" rather than "no plan".
+            if len(_ids_w) > len(_ids_o) and _head + _tail == len(_ids_o):
+                oci_plan_off, oci_plan_len = _head, len(_ids_w) - len(_ids_o)
+
         chat = np.array(messages)
         
         # Apply chat template
@@ -1108,6 +1165,17 @@ class TrajectoryCollector:
             'notice_truncated': torch.tensor(
                 int(notice_len > 0 and int(attention_mask[0].sum()) >= int(self.config.data.max_prompt_length)),
                 dtype=torch.long),
+            # OCI-sat, on EVERY row (all zero when the switch is off) so collate
+            # stacks them into batch columns.
+            'oci_candidate': torch.tensor(oci_candidate, dtype=torch.long),
+            'oci_plan_off': torch.tensor(oci_plan_off, dtype=torch.long),
+            'oci_plan_len': torch.tensor(oci_plan_len, dtype=torch.long),
+            # truncation=left cuts the head, which is where the offset is
+            # measured from, so a truncated row's span no longer locates the
+            # block and must not be stripped.
+            'oci_plan_truncated': torch.tensor(
+                int(oci_plan_len > 0 and int(attention_mask[0].sum()) >= int(self.config.data.max_prompt_length)),
+                dtype=torch.long),
         })
 
         if 'task_name' in gen_batch.non_tensor_batch:
@@ -1162,6 +1230,10 @@ class TrajectoryCollector:
             # only so collate_fn sees one schema for the whole batch.
             'notice_len': torch.tensor(0, dtype=torch.long),
             'notice_truncated': torch.tensor(0, dtype=torch.long),
+            'oci_candidate': torch.tensor(0, dtype=torch.long),
+            'oci_plan_off': torch.tensor(0, dtype=torch.long),
+            'oci_plan_len': torch.tensor(0, dtype=torch.long),
+            'oci_plan_truncated': torch.tensor(0, dtype=torch.long),
         }
         if 'task_name' in gen_batch.non_tensor_batch:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]

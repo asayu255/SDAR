@@ -65,5 +65,12 @@ g_ok = (em._wrong_plan_prefix("search", GAMES[0]) == ""
 ok &= g_ok
 print(("  OK  " if g_ok else "  FAIL") + " other tasks, missing and bogus paths yield nothing")
 
-print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
-sys.exit(0 if ok else 1)
+
+def test_wrong_plan():
+    """Collected by pytest; the checks above ran at import and set `ok`."""
+    assert ok
+
+
+if __name__ == "__main__":
+    print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+    sys.exit(0 if ok else 1)

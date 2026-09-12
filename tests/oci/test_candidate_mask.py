@@ -1,82 +1,88 @@
-"""CPU test: the candidate mask is per trajectory, and the class split has a
-reference level that survives a batch with no live group.
+"""CPU test: who gets the corrupted plan, and what the class split falls back to.
 
-Both were wrong before. The mask counted ROWS inside a uid, so on multi-turn it
-marked rows out of the middle of arbitrary trajectories; the reference level
-averaged every return when nothing was live, which labels an all-failed batch
-saturated and fires the wrong arm on all of it.
+TWO BUGS THIS FILE PINS.
+
+1. The switch read ``config.env.rollout.n`` to find the slot. That is the
+   TRAINING group size and the config object is shared, so the validation
+   manager -- built with group_n=1, is_train=False -- also matched and one
+   alfworld instance in eight was validated with a corrupted plan. The arm's
+   own success-rate measurement was contaminated by the arm. It now asks the
+   envs it holds.
+
+2. ``compute_group_metrics`` fell back to the mean over all returns when no
+   group was live. An all-failed batch has every return equal to that mean, so
+   ``return < mean`` is false and every stuck group read as saturated -- the
+   wrong arm on all of it, in exactly the regime the split exists for.
+
+The candidate mask itself is no longer derived from the row order anywhere, so
+there is nothing here to test about it: the rollout loop marks the env slot and
+the mark travels as a column (see test_strip for the span, and the no-fallback
+assertion in opd_grpo_ray_trainer).
 """
 import os, sys, types
-import numpy as np, torch
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from verl.trainer.ppo.metric_utils import _reference_level
+from agent_system.environments.env_manager import _oci_candidate_row
 
 GN = 8
-
-
-def derive(turns_per_traj, n_groups=2, gn=GN, drop_last_traj=False):
-    """The mask exactly as opd_grpo_ray_trainer derives it, on a batch whose
-    trajectories are ``turns_per_traj`` rows long."""
-    uids, tuids = [], []
-    for g in range(n_groups):
-        n_traj = gn - 1 if (drop_last_traj and g == 0) else gn
-        for t in range(n_traj):
-            for _ in range(turns_per_traj):
-                uids.append(f"g{g}")
-                tuids.append(f"g{g}:t{t}")
-    order, seen = {}, {}
-    for u, t in zip(uids, tuids):
-        key = (str(u), str(t))
-        if key not in order:
-            order[key] = seen.get(str(u), 0)
-            seen[str(u)] = order[key] + 1
-    full = {u: n for u, n in seen.items() if n == gn}
-    mask = [bool(str(u) in full and order[(str(u), str(t))] == gn - 1)
-            for u, t in zip(uids, tuids)]
-    return np.array(mask), np.array(tuids), seen, full
-
-
 ok = True
 
-# 1. Single-turn: the old row-counting rule and the new one agree, so the fix
-#    cannot have broken the case that used to work.
-mask, tuids, _, _ = derive(1)
-old = np.array([(i % GN) == (GN - 1) for i in range(len(mask))])
-good = bool((mask == old).all()) and int(mask.sum()) == 2
+
+def envs(group_n=GN, is_train=True):
+    return types.SimpleNamespace(group_n=group_n, is_train=is_train)
+
+
+# --- the switch is off unless the environment variable says otherwise --------
+os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
+good = not any(_oci_candidate_row(i, envs()) for i in range(GN))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " switch off: no slot is a candidate")
+
+os.environ["PRIVILEGED_WRONG_PLAN"] = "1"
+
+# --- on a training manager, exactly the last slot of each group -------------
+marks = [_oci_candidate_row(i, envs()) for i in range(3 * GN)]
+good = [i for i, m in enumerate(marks) if m] == [GN - 1, 2 * GN - 1, 3 * GN - 1]
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" single-turn: new rule matches the old one, {int(mask.sum())} rows marked")
+      f" training manager: slots {[i for i, m in enumerate(marks) if m]} of 24")
 
-# 2. Multi-turn: exactly one trajectory per group, all of its rows.
-TURNS = 3
-mask, tuids, _, _ = derive(TURNS)
-marked = sorted(set(tuids[mask]))
-good = (marked == [f"g0:t{GN-1}", f"g1:t{GN-1}"]
-        and int(mask.sum()) == 2 * TURNS)
+# --- the validation manager must be untouched -------------------------------
+val = [_oci_candidate_row(i, envs(group_n=1, is_train=False)) for i in range(3 * GN)]
+good = not any(val)
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" multi-turn: whole trajectories marked, {marked}, {int(mask.sum())} rows")
+      " validation manager (group_n=1, is_train=False): nothing marked")
 
-# 3. What the old rule did on the same batch: not the last trajectory at all.
-old = np.array([(i % GN) == (GN - 1) for i in range(len(mask))])
-old_marked = sorted(set(tuids[old]))
-good = old_marked != marked and len(old_marked) > 2
+# Both guards are load-bearing and are checked separately, because group_n=1
+# alone would already have hidden the missing is_train check.
+good = not any(_oci_candidate_row(i, envs(group_n=GN, is_train=False))
+               for i in range(3 * GN))
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" the old rule marked {len(old_marked)} different trajectories "
-      f"({old_marked[:3]}...), which is the bug")
+      " is_train=False with a train-sized group_n: still nothing marked")
 
-# 4. A short group has no trustworthy last slot, so nothing in it is a candidate.
-mask, tuids, seen, full = derive(TURNS, drop_last_traj=True)
-good = (not any(t.startswith("g0:") for t in set(tuids[mask]))
-        and sorted(set(tuids[mask])) == [f"g1:t{GN-1}"]
-        and len(seen) - len(full) == 1)
+good = not any(_oci_candidate_row(i, envs(group_n=1, is_train=True))
+               for i in range(3 * GN))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " group_n=1: a group of one has no odd slot")
+
+# --- and what the old rule did on the same validation manager ---------------
+old = [(i % 8) == 7 for i in range(3 * GN)]   # read config.env.rollout.n = 8
+good = sum(old) == 3 and not any(val)
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" a group short of n is skipped entirely: marked {sorted(set(tuids[mask]))}")
+      f" the old config-reading rule marked {sum(old)} validation slots, "
+      f"which is the contamination")
 
-# 5. The reference level, in the four regimes that decide the class split.
+good = not any(_oci_candidate_row(i, None) for i in range(GN))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " no envs at all: nothing marked")
+os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
+
+# --- the reference level, in the four regimes that decide the class split ----
 cases = [
     ("some live", [0.0, 1.0], [0.0], 0.5, "live mean"),
     ("all failed", [], [0.0, 0.0, 0.0], float("inf"), "everything reads stuck"),
@@ -90,17 +96,23 @@ for name, live, degen, want, why in cases:
     print(("  OK  " if good else "  FAIL") +
           f" reference level, {name}: {got} ({why})")
 
-# 6. The regression itself: the old fallback called an all-failed batch saturated.
+# the regression itself
 all_fail = [0.0, 0.0, 0.0]
-old_ref = float(np.mean(all_fail))          # what the previous code used
+old_ref = float(np.mean(all_fail))
 old_stuck = sum(1 for v in all_fail if v < old_ref)
-new_ref = _reference_level([], all_fail)
-new_stuck = sum(1 for v in all_fail if v < new_ref)
+new_stuck = sum(1 for v in all_fail if v < _reference_level([], all_fail))
 good = old_stuck == 0 and new_stuck == len(all_fail)
 ok &= good
 print(("  OK  " if good else "  FAIL") +
       f" all-failed batch: old rule called {len(all_fail)-old_stuck}/{len(all_fail)} "
       f"saturated, new rule calls {new_stuck}/{len(all_fail)} stuck")
 
-print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
-sys.exit(0 if ok else 1)
+
+def test_candidate_mask():
+    """Collected by pytest; the checks above ran at import and set `ok`."""
+    assert ok
+
+
+if __name__ == "__main__":
+    print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+    sys.exit(0 if ok else 1)

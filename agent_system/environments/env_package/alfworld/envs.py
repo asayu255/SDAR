@@ -154,6 +154,10 @@ class AlfworldEnvs(gym.Env):
         self.multi_modal = (env_type == 'AlfredThorEnv')
         self.num_processes = env_num * group_n
         self.group_n = group_n
+        # Kept, not just consumed above: a manager holding these envs has no other
+        # way to tell a training rollout from a validation one, and any switch that
+        # must not touch validation needs to ask (see _oci_candidate_row).
+        self.is_train = bool(is_train)
 
         # Create Ray remote actors instead of processes
         env_worker = ray.remote(**resources_per_worker)(AlfworldWorker)

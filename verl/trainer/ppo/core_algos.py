@@ -119,6 +119,7 @@ def compute_grpo_outcome_advantage(
     norm_adv_by_std_in_grpo: str = True,
     compute_mean_std_cross_steps: bool = True,
     padding_mask: torch.Tensor = None,
+    exclude_mask: torch.Tensor = None,
 ):
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -144,6 +145,23 @@ def compute_grpo_outcome_advantage(
             statistic here and still receive an advantage below, computed from the
             statistic their originals produced. ``None`` reproduces the previous
             behaviour exactly.
+        exclude_mask: `(torch.Tensor)` or None
+            shape is (bs,). True for rows that must not enter the group's mean or
+            std. Unlike ``padding_mask`` these are not copies of anything: they
+            are real rollouts a mechanism decided the group did not want, and
+            zeroing their ``response_mask`` is NOT enough to keep them out --
+            nothing in this function reads ``response_mask`` before the
+            statistic is formed, so a masked-out row still moves the yardstick
+            that every remaining row is measured against. Under
+            ``compute_mean_std_cross_steps=True`` it moves it once per TURN, so a
+            long unwanted trajectory dominates. Such rows still receive an
+            advantage of ZERO -- unlike a padding copy they have no original
+            whose statistic belongs to them, and asking for one is actively
+            dangerous: excluding the only row that differed leaves the group with
+            std 0, and the excluded row's own score then divides by ``epsilon``
+            and comes back as -1e6. A caller that wants them inert should still
+            zero their ``response_mask``; this only makes the advantage column
+            safe to read. ``None`` reproduces the previous behaviour exactly.
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -166,6 +184,8 @@ def compute_grpo_outcome_advantage(
             # statistic.
             if padding_mask is not None and bool(padding_mask[i]):
                 continue
+            if exclude_mask is not None and bool(exclude_mask[i]):
+                continue
             if (index[i], traj_index[i]) in seen_pairs:
                 continue
             id2score[index[i]].append(scores[i])
@@ -181,7 +201,10 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
+            if exclude_mask is not None and bool(exclude_mask[i]):
+                # No baseline was formed for this row, so it gets no advantage.
+                scores[i] = 0.0
+            elif norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]

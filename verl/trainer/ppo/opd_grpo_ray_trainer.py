@@ -40,6 +40,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
 from verl.trainer.ppo.ray_trainer import (
+    GRPO_STAT_EXCLUDE_KEY,
     _timer,
     apply_invalid_action_penalty,
     apply_kl_penalty,
@@ -127,104 +128,83 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             oci_cfg = self.config.algorithm.get("oci_sat", None)
             oci_injected = None
             if oci_cfg is not None and bool(oci_cfg.get("enable", False)):
+                import torch as _t
+
                 from verl.trainer.ppo.oci_saturated import (
-                    classify_groups, injection_metrics, select_saturated_injections)
+                    classify_groups, injection_metrics, select_saturated_injections,
+                    token_mass_by_class)
 
+                # NO FALLBACK. The mark is made where the row order means
+                # something -- the env slot, in the rollout loop -- and travels as
+                # a column. Deriving it here from the group layout is not a
+                # degraded version of that, it is wrong: rows are regrouped by
+                # task, padded and reordered by _balance_batch before this runs,
+                # so any rule applied to this row order is applied to a permuted
+                # one and marks trajectories that were never shown a plan. A
+                # missing column means the rollout was not built with the switch
+                # on, which is a launch error, not something to paper over.
                 cand = batch.batch.get("oci_candidate", None)
-                if cand is None:
-                    # The rollout marks nothing, so derive it from the group
-                    # layout: ALFWorld seeds group_n consecutive workers with the
-                    # same game and env_manager puts the corrupted plan on the
-                    # last slot of each group, so that is the candidate.
-                    #
-                    # PER TRAJECTORY, NOT PER ROW. uid is shared by the whole
-                    # prompt group and a multi-turn trajectory contributes one
-                    # row per turn, so counting rows inside a uid and taking
-                    # every gn-th one marks rows from the middle of arbitrary
-                    # trajectories -- it only coincides with the intended slot
-                    # when every trajectory is exactly one turn long. Order each
-                    # group's TRAJECTORIES by first appearance and mark every row
-                    # of the last one.
-                    import torch as _t
+                assert cand is not None, (
+                    "algorithm.oci_sat.enable=True but the batch carries no "
+                    "oci_candidate column. The column is emitted by the rollout "
+                    "loop and requires PRIVILEGED_WRONG_PLAN=1 in the environment "
+                    "that builds the observations."
+                )
+                cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
+                # The switch itself is gated on the training envs, so a candidate
+                # can only be an on-task row; this only says so out loud, and
+                # catches a widened switch that forgot to widen the metric names.
+                _tn = get_task_names(batch)
+                _oci_tasks = set(oci_cfg.get("tasks", ["alfworld"]) or ["alfworld"])
+                if _tn is not None and cand_np.any():
+                    _off = sorted({str(t) for t, c in zip(_tn, cand_np)
+                                   if c and str(t) not in _oci_tasks})
+                    assert not _off, (
+                        f"oci_candidate marked rows on {_off}, which is not in "
+                        f"algorithm.oci_sat.tasks={sorted(_oci_tasks)}"
+                    )
 
-                    gn = int(self.config.env.rollout.n)
-                    uids = batch.non_tensor_batch.get("uid", None)
-                    tuids = batch.non_tensor_batch.get("traj_uid", None)
-                    # ONLY THE TASK THE SWITCH FIRES ON. env_manager prepends the
-                    # corrupted plan at the alfworld prompt sites and nowhere
-                    # else, so a candidate marked on webshop or search is a plain
-                    # rollout that saw no privileged input. It would be excluded
-                    # from its group's verdict and then dropped from training by
-                    # the `drop` mask below -- one eighth of those two tasks'
-                    # rollouts thrown away to measure nothing. The task list is a
-                    # config key rather than a literal so a later arm can widen
-                    # it without this rule going stale.
-                    _oci_tasks = set(oci_cfg.get("tasks", ["alfworld"]) or ["alfworld"])
-                    _tn = get_task_names(batch)
-                    if _tn is None:
-                        # Single-task run: nothing to restrict to, and the task
-                        # is whatever the run is. Marking everything is correct
-                        # there and wrong on a multitask batch, so say which
-                        # happened rather than letting the count speak for it.
-                        metrics["oci/no_task_names"] = 1
-                        _on_task = [True] * len(batch)
-                    else:
-                        _on_task = [str(t) in _oci_tasks for t in _tn]
-                    if gn >= 2 and uids is not None and tuids is not None:
-                        order, seen = {}, {}
-                        for u, t, on in zip(uids, tuids, _on_task):
-                            if not on:
-                                continue
-                            key = (str(u), str(t))
-                            if key not in order:
-                                order[key] = seen.get(str(u), 0)
-                                seen[str(u)] = order[key] + 1
-                        # A group that did not come back with gn trajectories has
-                        # no "last slot" to trust: the env_manager marks slot
-                        # gn-1 of the worker block, and if that trajectory is
-                        # missing from the batch then nothing here is the
-                        # candidate. Marking whatever came last instead would
-                        # inject a plain rollout and read as an unreachable one.
-                        full = {u: n for u, n in seen.items() if n == gn}
-                        if len(full) < len(seen):
-                            metrics["oci/groups_short_of_n"] = len(seen) - len(full)
-                        cand = _t.tensor(
-                            [1 if (on and str(u) in full
-                                   and order.get((str(u), str(t))) == gn - 1)
-                             else 0 for u, t, on in zip(uids, tuids, _on_task)],
-                            device=batch.batch["response_mask"].device)
-                if cand is None:
-                    metrics["oci/error_no_candidate_column"] = 1
-                else:
-                    # Written back so every later reader -- the reachability
-                    # probe, the arm-B zeroing, an offline pass over a dump --
-                    # sees the mask this step actually acted on rather than
-                    # re-deriving it from a layout that may have changed.
-                    batch.batch["oci_candidate"] = cand.reshape(-1)
-                    cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
-                    grp = classify_groups(batch, judged_rows=~cand_np)
-                    oci_injected = select_saturated_injections(
-                        batch, grp, candidate_rows=cand_np)
-                    # a candidate that was not selected must not train at all:
-                    # it is an extra rollout of a group that did not want one
-                    drop = cand_np & ~oci_injected
-                    if drop.any():
-                        import torch as _t
+                grp = classify_groups(batch, judged_rows=~cand_np)
+                oci_injected = select_saturated_injections(
+                    batch, grp, candidate_rows=cand_np)
 
-                        keep_mask = _t.as_tensor(~drop, device=batch.batch["response_mask"].device)
-                        batch.batch["response_mask"] = (
-                            batch.batch["response_mask"] * keep_mask.unsqueeze(-1).to(
-                                batch.batch["response_mask"].dtype))
-                    metrics.update(injection_metrics(grp, oci_injected, task="alfworld"))
-                    # tokens, not groups: a saturated group finishes early and a
-                    # stuck one runs to the turn cap, so the group count and the
-                    # token count disagree by about 4x and only the token count
-                    # bounds what injection can buy.
-                    from verl.trainer.ppo.oci_saturated import token_mass_by_class
-
-                    metrics.update(token_mass_by_class(
-                        batch, grp,
-                        multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable))
+                # A candidate the group did not want must be inert, and that
+                # takes BOTH of the following. Zeroing response_mask alone leaves
+                # its return in the group's mean and std (nothing in
+                # compute_grpo_outcome_advantage reads response_mask before the
+                # statistic is formed), and under the turn-weighted statistic a
+                # long wrong-plan failure moves that baseline once per turn -- so
+                # live and stuck groups, which the design says it does not touch,
+                # were having their yardstick moved by a rollout that was
+                # supposed to have been discarded.
+                drop = cand_np & ~oci_injected
+                batch.batch[GRPO_STAT_EXCLUDE_KEY] = _t.as_tensor(
+                    drop, device=batch.batch["response_mask"].device)
+                if drop.any():
+                    keep = _t.as_tensor(~drop, device=batch.batch["response_mask"].device)
+                    batch.batch["response_mask"] = (
+                        batch.batch["response_mask"] * keep.unsqueeze(-1).to(
+                            batch.batch["response_mask"].dtype))
+                    # The same rows must not train the distillation term either:
+                    # dp_actor aggregates the teacher-KL over response_mask, so
+                    # the line above already removes them from OPD. Recorded
+                    # because the design document claims OPD is untouched, and it
+                    # is not -- an arm trains OPD on 7 rollouts where control
+                    # trains it on 8.
+                    metrics["oci/rows_dropped"] = int(drop.sum())
+                    metrics["oci/trajectories_dropped"] = len({
+                        str(t) for t, d in zip(
+                            batch.non_tensor_batch.get("traj_uid", []), drop) if d})
+                metrics.update(injection_metrics(grp, oci_injected, task="alfworld"))
+                # tokens, not groups: a saturated group finishes early and a
+                # stuck one runs to the turn cap, so the group count and the
+                # token count disagree by about 4x and only the token count
+                # bounds what injection can buy. Dropped rows are reported
+                # separately rather than folded into a class.
+                metrics.update(token_mass_by_class(
+                    batch, grp,
+                    multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                    exclude_rows=drop))
 
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(
@@ -242,6 +222,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 gigpo_mode=self.config.algorithm.gigpo.mode,
                 gigpo_enable_similarity=self.config.algorithm.gigpo.enable_similarity,
                 gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                # See ray_trainer: pinned rather than defaulted, because an
+                # injected row changes its group's baseline through its length
+                # under the turn-weighted statistic.
+                compute_mean_std_cross_steps=self.config.algorithm.get(
+                    "compute_mean_std_cross_steps", True),
             )
 
             # Arm B takes the injected row's gradient away AFTER the baseline

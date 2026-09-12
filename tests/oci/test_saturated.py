@@ -120,5 +120,12 @@ print(("  OK  " if good else "  FAIL") +
       f"{tm['oci/tokmass/saturated/group_share']:.0%} of groups but "
       f"{tm['oci/tokmass/saturated/token_share']:.0%} of tokens")
 
-print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
-sys.exit(0 if ok else 1)
+
+def test_saturated():
+    """Collected by pytest; the checks above ran at import and set `ok`."""
+    assert ok
+
+
+if __name__ == "__main__":
+    print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+    sys.exit(0 if ok else 1)

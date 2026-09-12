@@ -66,40 +66,49 @@ _REQUIREMENT_ACTIONS = ("CleanObject", "HeatObject", "CoolObject",
                         "SliceObject", "ToggleObject")
 
 
-# The row inside each group that carries the corrupted plan. ALFWorld seeds
-# worker i with ``seed + i // group_n``, so the group_n consecutive workers of a
-# group all hold the SAME game; taking the last one leaves the other seven as an
-# untouched plain rollout of that game and needs no second generation pass.
-# Returns a boolean mask over rows, or None when the switch is off.
-def _oci_candidate_mask(n_rows: int, group_n: int):
-    import os
-
-    if not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
-        return None
-    if group_n is None or group_n < 2:
-        return None
-    return [((i % group_n) == (group_n - 1)) for i in range(n_rows)]
-
-
-# What was actually prepended, per env slot, for the turn just built. The
-# reachability probe needs the exact block to remove it again, and re-deriving it
-# there would be a second source of truth that can drift from this one.
+# What was actually prepended, per env slot, for the turn just built. The row
+# builder reads it to record where the block sits in the tokenised prompt, and
+# the reachability probe removes exactly that span. Re-deriving the text there
+# would be a second source of truth that can drift from this one.
 _OCI_LAST_PREFIX = {}
 
 
 def oci_last_prefixes(n_rows: int):
-    """Per-row plan block for the turn just built; '' where none was shown."""
+    """Per-slot plan block for the turn just built; '' where none was shown."""
     return [_OCI_LAST_PREFIX.get(i, "") for i in range(n_rows)]
 
 
-def _oci_candidate_row(i: int, group_n) -> bool:
-    """Is env slot ``i`` the one that gets the corrupted plan?"""
+def oci_prefix_for(i: int) -> str:
+    """The plan block shown to env slot ``i`` on the turn just built, or ''."""
+    return _OCI_LAST_PREFIX.get(i, "")
+
+
+def _oci_candidate_row(i: int, envs) -> bool:
+    """Is env slot ``i`` the one that gets the corrupted plan?
+
+    ALFWorld seeds worker i with ``seed + i // group_n``, so the group_n
+    consecutive workers of a group all hold the SAME game; taking the last one
+    leaves the other group_n-1 as untouched plain rollouts of that game and needs
+    no second generation pass.
+
+    ASKS THE ENVS, NOT THE CONFIG. An earlier version read
+    ``config.env.rollout.n``, which is the TRAINING group size and is the same
+    object in the validation manager -- built with ``group_n=1, is_train=False``
+    by ``_build_val_envs``. So validation put a corrupted plan on one alfworld
+    instance in eight and its success rate fell for a reason that had nothing to
+    do with the arm being tested, i.e. the measurement the switch exists to make
+    was contaminated by the switch. Both guards below are load-bearing: group_n
+    alone would already disable it on the validation manager, and is_train says
+    so explicitly rather than by arithmetic accident.
+    """
     import os
 
     if not os.environ.get("PRIVILEGED_WRONG_PLAN", "").strip():
         return False
+    if envs is None or not getattr(envs, "is_train", False):
+        return False
     try:
-        g = int(group_n)
+        g = int(getattr(envs, "group_n", 0))
     except (TypeError, ValueError):
         return False
     return g >= 2 and (i % g) == (g - 1)
@@ -341,7 +350,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
-                            if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)) else "")
+                            if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
                 _OCI_LAST_PREFIX[i] = _oci_pre
                 obs = _oci_pre + obs
             else:
@@ -355,7 +364,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
                 _oci_pre = (_wrong_plan_prefix('alfworld', (self.gamefile[i] if getattr(self, 'gamefile', None) else None))
-                            if _oci_candidate_row(i, getattr(self.config.env.rollout, 'n', None)) else "")
+                            if _oci_candidate_row(i, getattr(self, 'envs', None)) else "")
                 _OCI_LAST_PREFIX[i] = _oci_pre
                 obs = _oci_pre + obs
 

@@ -116,16 +116,40 @@ def select_saturated_injections(batch, groups: Dict[str, Dict], *,
     candidate actually failed -- an injected row that also succeeds leaves the
     group uniform and changes nothing, which is the reason mixing a strong
     off-policy trace into an already-solved group is a no-op.
+
+    PER TRAJECTORY, LIKE THE CLASSIFICATION. An earlier version compared each
+    ROW's return to the group's level. ``classify_groups`` decides a trajectory's
+    return by the max over its rows, so the two disagreed exactly where a
+    trajectory's reward is not on every row: a candidate that succeeded could
+    still have individual rows reading below the level, and those rows alone were
+    kept as "injections" while the rest of the same trajectory was dropped --
+    half a trajectory in the group's statistic and half out of it. A trajectory
+    is kept or dropped whole.
     """
     ret = _row_returns(batch)
     cand = np.asarray(candidate_rows, dtype=bool)
     keep = np.zeros(len(ret), dtype=bool)
+    tuids = batch.non_tensor_batch.get("traj_uid", None)
     for g in groups.values():
         if g["status"] != "saturated":
             continue
-        for i in g["rows"]:
-            if cand[i] and ret[i] < g["ret"] - 1e-9:
-                keep[i] = True
+        rows = [i for i in g["rows"] if cand[i]]
+        if not rows:
+            continue
+        if tuids is None:
+            # No trajectory ids: every row is its own trajectory, which is the
+            # single-turn case and where the row rule was already correct.
+            for i in rows:
+                if ret[i] < g["ret"] - 1e-9:
+                    keep[i] = True
+            continue
+        by_traj: Dict[str, list] = {}
+        for i in rows:
+            by_traj.setdefault(str(tuids[i]), []).append(i)
+        for idxs in by_traj.values():
+            if max(ret[i] for i in idxs) < g["ret"] - 1e-9:
+                for i in idxs:
+                    keep[i] = True
     return keep
 
 
@@ -164,15 +188,26 @@ def injection_metrics(groups: Dict[str, Dict], injected: np.ndarray, task: str =
     }
 
 
-def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = True) -> Dict:
+def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = True,
+                        exclude_rows=None) -> Dict:
     """Tokens, not groups, split by group class.
 
     THE NUMBER THAT SIZES THE MECHANISM. The gradient counts tokens; a count of
-    groups does not. On the control checkpoint 30% of alfworld's groups are live
-    while 75.5% of its TOKENS already carry advantage, because a saturated group
-    finishes early and a stuck one runs to the 50-turn cap. So "70% of groups are
-    dead" and "24.5% of the gradient is missing" are both true, and only the
-    second one bounds what any injection can buy.
+    groups does not. A saturated group finishes early and a stuck one runs to the
+    turn cap, so the two counts disagree by roughly 4x and only the token count
+    bounds what any injection can buy.
+
+    NO NUMBERS QUOTED HERE. An earlier version of this docstring gave 30% of
+    groups live against 75.5% of tokens on the control checkpoint. Those came
+    from a payload with no ``group_unit`` label, written by the sibling report
+    that counted spread over rows rather than trajectories, so the live side is
+    over-stated by an unknown amount. The quantity is re-derived by running this
+    function; it is not restated from memory.
+
+    ``exclude_rows`` drops rows from the token count without moving them between
+    classes -- injected candidates the group did not want are neither live nor
+    stuck nor saturated tokens, and folding them into their group's class
+    inflates exactly the class the mechanism is trying to size.
 
     Reported per class: groups, tokens, and tokens per group.
     """
@@ -186,12 +221,16 @@ def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = Tr
     key = "loss_mask" if (multi_turn and "loss_mask" in batch.batch.keys()) else "attention_mask"
     mask = batch.batch[key][:, -n:].bool()
     per_row = mask.sum(-1).detach().cpu().numpy()
+    skip = (np.asarray(exclude_rows, dtype=bool) if exclude_rows is not None
+            else np.zeros(len(per_row), dtype=bool))
 
     agg = {c: [0, 0] for c in ("live", "stuck", "saturated")}
+    dropped = 0
     for g in groups.values():
         a = agg[g["status"]]
         a[0] += 1
-        a[1] += int(sum(per_row[i] for i in g["rows"]))
+        a[1] += int(sum(per_row[i] for i in g["rows"] if not skip[i]))
+        dropped += int(sum(per_row[i] for i in g["rows"] if skip[i]))
     tot_g = max(sum(v[0] for v in agg.values()), 1)
     tot_t = max(sum(v[1] for v in agg.values()), 1)
     out = {}
@@ -206,4 +245,5 @@ def token_mass_by_class(batch, groups: Dict[str, Dict], *, multi_turn: bool = Tr
         agg["stuck"][1] + agg["saturated"][1]) / tot_t
     out["oci/tokmass/saturated_share_of_dead"] = (
         agg["saturated"][1] / max(agg["stuck"][1] + agg["saturated"][1], 1))
+    out["oci/tokmass/excluded_tokens"] = dropped
     return out

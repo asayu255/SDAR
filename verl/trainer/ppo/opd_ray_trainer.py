@@ -1269,18 +1269,16 @@ class OPDRayTrainer(RayPPOTrainer):
            token count disagree by roughly 4x, because a saturated group finishes
            early and a stuck one runs to the turn cap. Only the token split bounds
            what the saturated arm can buy, and only ``compute_group_metrics``
-           labels the classes; the training loop logs group counts and stops
-           there.
+           labels the classes.
         2. *That the corrupted plan actually makes the student fail.* The switch
-           does not validate itself. ``oci/cand_fail_rate`` is that check: a plan
+           does not validate itself. ``cand_fail_rate`` is that check: a plan
            missing its requirement step that the student solves anyway leaves the
            group saturated and injects nothing.
         3. *That the failure is REACHABLE.* A row injected into a saturated group
-           carries advantage -sqrt(7), but what reaches the weights under shaping
-           is ``A * gamma * rho / (rho + gamma)^2``, which is zero at rho = 0. A
-           failure the student would only produce with the plan in front of it
-           carries no gradient however large its advantage. See
-           oci_reachability.reachability_report.
+           carries a large negative advantage, but what reaches the weights under
+           shaping is ``A * gamma * rho / (rho + gamma)^2``, which is zero at
+           rho = 0. A failure the student would only produce with the plan in
+           front of it carries no gradient however large its advantage.
 
         No optimizer step, no generation, one extra forward pass of weights the
         actor already holds over tokens that already exist.
@@ -1289,7 +1287,7 @@ class OPDRayTrainer(RayPPOTrainer):
 
         from verl.trainer.ppo.metric_utils import compute_group_metrics
         from verl.trainer.ppo.oci_reachability import (
-            plan_length_column, reachability_report, wrong_plan_strip_fn)
+            reachability_report, strippable_rows, wrong_plan_strip_fn)
         from verl.trainer.ppo.oci_saturated import (
             classify_groups, injection_metrics, select_saturated_injections,
             token_mass_by_class)
@@ -1303,11 +1301,11 @@ class OPDRayTrainer(RayPPOTrainer):
 
         cand = batch.batch.get("oci_candidate", None)
         if cand is None:
-            # _reward_and_advantage only derives and writes the column when
-            # algorithm.oci_sat.enable is set. Say so rather than reporting a
-            # reachability of nothing.
-            rec["error"] = ("no oci_candidate column: run with "
-                            "algorithm.oci_sat.enable=True and PRIVILEGED_WRONG_PLAN=1")
+            # The column is emitted by the rollout loop, not derived here -- see
+            # the no-fallback note in opd_grpo_ray_trainer. Say so rather than
+            # reporting a reachability of nothing.
+            rec["error"] = ("no oci_candidate column: the rollout must be built "
+                            "with PRIVILEGED_WRONG_PLAN=1")
             state.setdefault("oci", []).append(rec)
             state["batches"] = n
             return state
@@ -1315,8 +1313,10 @@ class OPDRayTrainer(RayPPOTrainer):
         cand_np = cand.reshape(-1).detach().cpu().numpy().astype(bool)
         grp = classify_groups(batch, judged_rows=~cand_np)
         injected = select_saturated_injections(batch, grp, candidate_rows=cand_np)
+        drop = cand_np & ~injected
         rec["injection"] = injection_metrics(grp, injected, task="alfworld")
-        rec["token_mass"] = token_mass_by_class(batch, grp, multi_turn=multi_turn)
+        rec["token_mass"] = token_mass_by_class(
+            batch, grp, multi_turn=multi_turn, exclude_rows=drop)
 
         # Did the corrupted plan do its job? Per trajectory, not per row.
         rets = batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy()
@@ -1332,45 +1332,40 @@ class OPDRayTrainer(RayPPOTrainer):
                 rec["cand_fail_rate"] = float((vals <= 0.0).mean())
                 rec["cand_return_mean"] = float(vals.mean())
 
-        # rho, on the candidate rows only: the plan block is the only thing that
-        # differs between numerator and denominator, and rows without one would
-        # dilute the distribution with a ratio that is 1 by construction.
-        try:
-            from agent_system.environments.env_manager import _wrong_plan_prefix
-
-            gfs = batch.non_tensor_batch.get("gamefile", None)
-            if gfs is None:
-                rec["reachability"] = {"error": "batch carries no gamefile column"}
-            else:
-                # Rebuilt through the SAME cached builder the rollout used, keyed
-                # by the same gamefile, rather than by arithmetic on worker slots
-                # -- the slot layout is an assumption, the gamefile is the row's
-                # own data.
-                prefixes = [
-                    _wrong_plan_prefix("alfworld", gfs[i]) if cand_np[i] else ""
-                    for i in range(len(batch))
-                ]
-                plen = plan_length_column(prefixes, self.tokenizer)
-                rec["plan_tokens"] = {
-                    "rows_with_plan": int((plen > 0).sum()),
-                    "p50": float(np.percentile(plen[plen > 0].numpy(), 50)) if int((plen > 0).sum()) else 0.0,
-                    "max": int(plen.max()),
-                }
-                if int((plen > 0).sum()) == 0:
-                    rec["reachability"] = {
-                        "error": "no row carries a plan block; is PRIVILEGED_WRONG_PLAN set "
-                                 "in the process that built the observations?"
-                    }
-                else:
-                    batch.batch["oci_plan_len"] = plen.to(batch.batch["response_mask"].device)
-                    strip = wrong_plan_strip_fn(self.tokenizer, self.tokenizer.pad_token_id)
-                    sub = batch[np.flatnonzero(cand_np).tolist()]
-                    rec["reachability"] = reachability_report(
-                        self.actor_rollout_wg, sub, task_id_names, strip_fn=strip,
-                        gamma=float(probe_cfg.get("gamma", 0.1)),
-                    )
-        except Exception as exc:  # the report is the primary result; keep it
-            rec["reachability"] = {"error": f"{type(exc).__name__}: {exc}"}
+        # rho, on the candidate rows whose plan span can be removed EXACTLY. A
+        # row that cannot be stripped is reported, not approximated: the whole
+        # quantity is a ratio between two conditionings of the same weights, and
+        # an approximate denominator makes it a ratio between two fictions.
+        strip_ok = strippable_rows(batch)
+        rows = np.flatnonzero(cand_np & strip_ok)
+        rec["plan_span"] = {
+            "candidate_rows": int(cand_np.sum()),
+            "strippable_rows": int(len(rows)),
+            "unstrippable_rows": int((cand_np & ~strip_ok).sum()),
+        }
+        _len = batch.batch.get("oci_plan_len", None)
+        if _len is not None and len(rows):
+            pl = _len.reshape(-1).detach().cpu().numpy()[rows]
+            rec["plan_span"].update({
+                "tokens_p50": float(np.percentile(pl, 50)),
+                "tokens_max": int(pl.max()),
+            })
+        if not len(rows):
+            rec["reachability"] = {
+                "error": "no candidate row carries a strippable plan span; is "
+                         "PRIVILEGED_WRONG_PLAN set in the process that built "
+                         "the observations, and did the prompt avoid truncation?"
+            }
+        else:
+            try:
+                strip = wrong_plan_strip_fn(self.tokenizer, self.tokenizer.pad_token_id)
+                sub = batch[rows.tolist()]
+                rec["reachability"] = reachability_report(
+                    self.actor_rollout_wg, sub, task_id_names, strip_fn=strip,
+                    gamma=float(probe_cfg.get("gamma", 0.1)),
+                )
+            except Exception as exc:  # the report is the primary result; keep it
+                rec["reachability"] = {"error": f"{type(exc).__name__}: {exc}"}
 
         import json
 
