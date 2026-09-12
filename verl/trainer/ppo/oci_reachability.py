@@ -69,15 +69,37 @@ def reachability_report(
     sign of the advantage, which is the split that matters: a positive injected
     row is being imitated, a negative one suppressed, and they are not
     interchangeable.
+
+    PADDED TO THE WORKER GROUP. ``compute_log_prob`` is registered
+    ``DP_COMPUTE_PROTO``, whose dispatch chunks the DataProto across the data
+    parallel world and whose ``DataProto.chunk`` asserts the size divides
+    exactly. The caller hands this function the CANDIDATE ROWS ONLY -- one
+    trajectory per group, each as many rows as it ran turns -- so the count is
+    arbitrary and on a 2-GPU host fails that assert about half the time. The
+    failure lands in the except below and comes back as a recorded error, i.e.
+    the one number the whole design turns on would have been missing from
+    roughly every other probe batch with nothing but a string to say why.
     """
     import numpy as np
     import torch
+
+    from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
     lp_cond = batch.batch.get("rollout_log_probs", batch.batch.get("old_log_probs", None))
     if lp_cond is None:
         return {"error": "batch carries no rollout_log_probs/old_log_probs"}
     try:
-        out = policy_wg.compute_log_prob(strip_fn(batch))
+        stripped = strip_fn(batch)
+        world = int(getattr(policy_wg, "world_size", 1) or 1)
+        # Only when it is actually needed: a world of one needs no padding, and
+        # pad_dataproto_to_divisor requires a real DataProto, which a
+        # single-process caller (or a CPU test) may not have built.
+        pad_size = 0
+        if world > 1 and (len(stripped) % world):
+            stripped, pad_size = pad_dataproto_to_divisor(stripped, world)
+        out = policy_wg.compute_log_prob(stripped)
+        if pad_size:
+            out = unpad_dataproto(out, pad_size=pad_size)
         lp_plain = out.batch["old_log_probs"]
     except Exception as exc:
         return {"error": f"re-scoring failed: {exc!r}"}
@@ -132,8 +154,9 @@ def reachability_report(
 # --------------------------------------------------------------------------- #
 
 
-def strip_span(input_ids, attention_mask, off, length, pad_token_id: int):
-    """Remove live tokens ``[off[i], off[i]+length[i])`` from each row.
+def strip_span(input_ids, attention_mask, off, length, pad_token_id,
+               response_length: int, position_ids=None):
+    """Remove live tokens ``[off[i], off[i]+length[i])`` from each row's PROMPT.
 
     NOT A FRONT-STRIP, WHICH IS WHY THIS EXISTS SEPARATELY FROM
     ``privileged_notice.strip_prefix``. The student-mode notice is a system
@@ -144,24 +167,60 @@ def strip_span(input_ids, attention_mask, off, length, pad_token_id: int):
     one the policy could ever see, and the rho computed against it is a ratio
     between two fictions. The offset is measured in the rollout loop, where the
     two renders can be compared token by token, and rides on the row.
+
+    AND IT TOUCHES THE PROMPT REGION ONLY. The rollout writes
+    ``input_ids = cat([prompt, response])`` with the PROMPT LEFT-PADDED and the
+    RESPONSE RIGHT-PADDED (vllm_rollout.py states the layout:
+    ``attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]``), so the live
+    tokens are not one block at the right-hand end. An earlier version here
+    gathered every live token and right-aligned the result, which slid the
+    response rightwards by however much trailing padding it had: on a row with a
+    4-token prompt and a 3-token response in an 8+8 buffer, ``input_ids[:,
+    -8:]`` came back as ``[0,0,0,103,104,201,202,203]`` against a ``responses``
+    of ``[201,202,203,0,0,0,0,0]``. The forward reads logits at
+    ``[-response_length-1:-1]``, so every log-prob would have been taken at the
+    wrong position -- and the shape check passes, so rho would have come back a
+    plausible-looking number for the wrong tokens.
+
+    The response region is therefore copied through byte for byte, and only the
+    prompt's own left-padded window is rebuilt. ``position_ids``, when given,
+    keeps the rollout's convention: the prompt's live span numbered from 0 and
+    the response continuing after it, so removing n prompt tokens shifts the
+    response's positions down by exactly n.
     """
     import torch
 
     bs, width = input_ids.shape
-    out_ids = torch.full_like(input_ids, int(pad_token_id))
-    out_mask = torch.zeros_like(attention_mask)
+    plen = width - int(response_length)
+    assert plen > 0, (
+        f"response_length={response_length} leaves no prompt in a width of {width}")
+
+    out_ids = input_ids.clone()
+    out_mask = attention_mask.clone()
+    removed = torch.zeros(bs, dtype=torch.long)
     for i in range(bs):
-        live = attention_mask[i].bool()
-        toks = input_ids[i][live]
+        p_mask = attention_mask[i, :plen].bool()
+        toks = input_ids[i, :plen][p_mask]
         o, n = int(off[i]), int(length[i])
         if n > 0 and 0 <= o <= toks.numel() - n:
             keep = torch.cat([toks[:o], toks[o + n:]])
+            removed[i] = n
         else:
             keep = toks
-        out_ids[i, width - keep.numel():] = keep
-        out_mask[i, width - keep.numel():] = 1
-    pos = (out_mask.cumsum(-1) - 1).clamp(min=0).to(torch.long)
-    return out_ids, out_mask, pos
+        out_ids[i, :plen] = int(pad_token_id)
+        out_mask[i, :plen] = 0
+        k = keep.numel()
+        out_ids[i, plen - k:plen] = keep
+        out_mask[i, plen - k:plen] = 1
+
+    if position_ids is None:
+        return out_ids, out_mask, None
+    out_pos = position_ids.clone()
+    # the prompt's live span renumbered from 0, pad positions left at 0
+    out_pos[:, :plen] = (out_mask[:, :plen].cumsum(-1) - 1).clamp(min=0).to(out_pos.dtype)
+    # the response continues from a prompt that is now `removed` tokens shorter
+    out_pos[:, plen:] = (position_ids[:, plen:] - removed.unsqueeze(-1)).clamp(min=0)
+    return out_ids, out_mask, out_pos
 
 
 def wrong_plan_strip_fn(tokenizer, pad_token_id: int):
@@ -191,12 +250,23 @@ def wrong_plan_strip_fn(tokenizer, pad_token_id: int):
         length = n_len.reshape(-1).clone()
         if trunc is not None:
             length = length * (1 - trunc.reshape(-1).clamp(0, 1)).to(length.dtype)
+        # Where the prompt ends. `responses` is the authority: the forward reads
+        # logits at [-response_length-1:-1] and gathers against that same
+        # tensor, so the prompt region is everything before it and must stay
+        # exactly that wide.
+        resp = batch.batch.get("responses", None)
+        if resp is None:
+            return batch
         ids, mask, pos = strip_span(
             batch.batch["input_ids"], batch.batch["attention_mask"],
             n_off.reshape(-1), length, pad_token_id,
+            response_length=resp.shape[1],
+            position_ids=batch.batch.get("position_ids", None),
         )
         tensors = {k: v for k, v in batch.batch.items()}
-        tensors.update({"input_ids": ids, "attention_mask": mask, "position_ids": pos})
+        tensors.update({"input_ids": ids, "attention_mask": mask})
+        if pos is not None:
+            tensors["position_ids"] = pos
         out = DataProto.from_dict(tensors=tensors,
                                   non_tensors=dict(batch.non_tensor_batch))
         out.meta_info = dict(batch.meta_info)

@@ -21,38 +21,100 @@ CKPT = "/opt1/ohara/offline_ladder/probe_hf/klwctl_step300"
 PAD = 0
 ok = True
 
-# --- the arithmetic, on synthetic rows of different real lengths -------------
-rows = [[11, 12, 13, 14, 15], [21, 22, 23, 24, 25, 26], [31, 32, 33]]
-W = max(len(r) for r in rows) + 2
-ids = torch.full((len(rows), W), PAD, dtype=torch.long)
-mask = torch.zeros((len(rows), W), dtype=torch.long)
-for i, r in enumerate(rows):
-    ids[i, W - len(r):] = torch.tensor(r)
-    mask[i, W - len(r):] = 1
+# --- the arithmetic, on the REAL post-generation layout ---------------------
+# vllm_rollout writes input_ids = cat([prompt, response]) with the PROMPT
+# LEFT-PADDED and the RESPONSE RIGHT-PADDED, and states it:
+#   attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+# so the live tokens are NOT one block at the right-hand end. A version of
+# strip_span that gathered every live token and right-aligned the result slid
+# the response rightwards by however much trailing padding it had, and the
+# forward reads logits at [-response_length-1:-1] -- so every log-prob came from
+# the wrong position while the shape check passed and rho looked plausible.
+PL, RL = 8, 8
 
-# remove [1,3) from row 0, [2,4) from row 1, nothing from row 2
+
+def row(prompt_toks, response_toks):
+    ids = torch.zeros(PL + RL, dtype=torch.long)
+    am = torch.zeros(PL + RL, dtype=torch.long)
+    pos = torch.zeros(PL + RL, dtype=torch.long)
+    lp = len(prompt_toks)
+    ids[PL - lp:PL] = torch.tensor(prompt_toks)
+    am[PL - lp:PL] = 1
+    pos[PL - lp:PL] = torch.arange(lp)
+    ids[PL:PL + len(response_toks)] = torch.tensor(response_toks)
+    am[PL:PL + len(response_toks)] = 1
+    pos[PL:] = torch.arange(lp, lp + RL)
+    return ids, am, pos
+
+
+rows_spec = [
+    ([101, 102, 103, 104], [201, 202, 203]),      # short response -> trailing pad
+    ([111, 112, 113, 114, 115], [211, 212]),
+    ([121, 122, 123], [221, 222, 223, 224, 225, 226, 227, 228]),  # full response
+]
+ids = torch.stack([row(p, r)[0] for p, r in rows_spec])
+mask = torch.stack([row(p, r)[1] for p, r in rows_spec])
+posi = torch.stack([row(p, r)[2] for p, r in rows_spec])
+responses = ids[:, PL:].clone()
+
+# remove 2 prompt tokens from offset 1 on row 0, 2 from offset 2 on row 1, none row 2
 off = torch.tensor([1, 2, 0])
 ln = torch.tensor([2, 2, 0])
-out_ids, out_mask, out_pos = strip_span(ids, mask, off, ln, PAD)
-got = [out_ids[i][out_mask[i].bool()].tolist() for i in range(len(rows))]
-want = [[11, 14, 15], [21, 22, 25, 26], [31, 32, 33]]
-good = got == want
-ok &= good
-print(("  OK  " if good else "  FAIL") + f" span removal: {got}")
+out_ids, out_mask, out_pos = strip_span(ids, mask, off, ln, PAD,
+                                        response_length=RL, position_ids=posi)
 
-good = all(int(out_mask[i].sum()) == len(want[i]) for i in range(len(rows)))
+# THE INVARIANT THE WHOLE MEASUREMENT RESTS ON.
+good = torch.equal(out_ids[:, PL:], responses) and torch.equal(out_ids[:, -RL:], responses)
 ok &= good
-print(("  OK  " if good else "  FAIL") + " width kept, live span shortened by the span")
+print(("  OK  " if good else "  FAIL") +
+      " the response region is byte-identical, so input_ids[:, -response_length:] "
+      "still equals responses")
 
-good = all(out_pos[i][out_mask[i].bool()].tolist() == list(range(len(want[i])))
-           for i in range(len(rows)))
+good = torch.equal(out_mask[:, PL:], mask[:, PL:])
 ok &= good
-print(("  OK  " if good else "  FAIL") + " position ids restart at 0 on the live span")
+print(("  OK  " if good else "  FAIL") + " the response's attention mask is untouched")
+
+live = [out_ids[i, :PL][out_mask[i, :PL].bool()].tolist() for i in range(len(rows_spec))]
+want = [[101, 104], [111, 112, 115], [121, 122, 123]]
+good = live == want
+ok &= good
+print(("  OK  " if good else "  FAIL") + f" prompt spans after removal: {live}")
+
+good = all(int(out_mask[i, :PL].sum()) == len(want[i]) for i in range(len(rows_spec)))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " the prompt stays left-padded inside its own region")
+
+# position ids: prompt renumbered from 0, response shifted down by exactly what
+# was removed from the prompt in front of it
+good = all(
+    out_pos[i, :PL][out_mask[i, :PL].bool()].tolist() == list(range(len(want[i])))
+    for i in range(len(rows_spec)))
+ok &= good
+print(("  OK  " if good else "  FAIL") + " prompt position ids restart at 0 on the live span")
+
+good = all(torch.equal(out_pos[i, PL:], (posi[i, PL:] - int(ln[i])).clamp(min=0))
+           for i in range(len(rows_spec)))
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" response position ids drop by exactly the tokens removed {ln.tolist()}")
+
+# and what the old right-aligning version produced on row 0, so the test is
+# known to be able to fail
+live0 = ids[0][mask[0].bool()]
+old_keep = torch.cat([live0[:1], live0[3:]])
+old_out = torch.full((PL + RL,), PAD, dtype=torch.long)
+old_out[PL + RL - old_keep.numel():] = old_keep
+good = not torch.equal(old_out[-RL:], responses[0])
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" the old right-align gives {old_out[-RL:].tolist()} against a responses "
+      f"of {responses[0].tolist()}")
 
 # an offset that does not fit leaves the row alone rather than corrupting it
 bad_ids, bad_mask, _ = strip_span(ids, mask, torch.tensor([4, 0, 0]),
-                                  torch.tensor([9, 0, 0]), PAD)
-good = bad_ids[0][bad_mask[0].bool()].tolist() == rows[0]
+                                  torch.tensor([9, 0, 0]), PAD,
+                                  response_length=RL, position_ids=posi)
+good = torch.equal(bad_ids[0], ids[0]) and torch.equal(bad_mask[0], mask[0])
 ok &= good
 print(("  OK  " if good else "  FAIL") + " an out-of-range span is a no-op, not a corruption")
 
@@ -104,18 +166,24 @@ else:
           f"first, which is why a length alone cannot locate it")
 
     # removing the span reproduces the no-plan render exactly
-    W2 = len(ids_w) + 3
-    r_ids = torch.full((1, W2), PAD, dtype=torch.long)
-    r_mask = torch.zeros((1, W2), dtype=torch.long)
-    r_ids[0, W2 - len(ids_w):] = torch.tensor(ids_w)
-    r_mask[0, W2 - len(ids_w):] = 1
+    # A real row: the prompt left-padded in its own region, a response after it.
+    P2 = len(ids_w) + 3
+    R2 = 4
+    r_ids = torch.full((1, P2 + R2), PAD, dtype=torch.long)
+    r_mask = torch.zeros((1, P2 + R2), dtype=torch.long)
+    r_ids[0, P2 - len(ids_w):P2] = torch.tensor(ids_w)
+    r_mask[0, P2 - len(ids_w):P2] = 1
+    r_ids[0, P2:P2 + 2] = torch.tensor([9001, 9002])
+    r_mask[0, P2:P2 + 2] = 1
     s_ids, s_mask, _ = strip_span(r_ids, r_mask, torch.tensor([plan_off]),
-                                  torch.tensor([plan_len]), PAD)
-    stripped = s_ids[0][s_mask[0].bool()].tolist()
-    good = stripped == ids_o
+                                  torch.tensor([plan_len]), PAD,
+                                  response_length=R2)
+    stripped = s_ids[0, :P2][s_mask[0, :P2].bool()].tolist()
+    good = stripped == ids_o and torch.equal(s_ids[0, P2:], r_ids[0, P2:])
     ok &= good
     print(("  OK  " if good else "  FAIL") +
-          " stripping the span reproduces the no-plan render token for token")
+          " stripping the span reproduces the no-plan render token for token, "
+      "and leaves the response region alone")
 
     # what a front-strip would have produced instead
     front = ids_w[plan_len:]

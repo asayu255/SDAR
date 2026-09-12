@@ -1358,7 +1358,9 @@ class OPDRayTrainer(RayPPOTrainer):
             }
         else:
             try:
-                strip = wrong_plan_strip_fn(self.tokenizer, self.tokenizer.pad_token_id)
+                _pad = (self.tokenizer.pad_token_id
+                        if self.tokenizer.pad_token_id is not None else 0)
+                strip = wrong_plan_strip_fn(self.tokenizer, _pad)
                 sub = batch[rows.tolist()]
                 rec["reachability"] = reachability_report(
                     self.actor_rollout_wg, sub, task_id_names, strip_fn=strip,

@@ -125,6 +125,128 @@ print(("  OK  " if good else "  FAIL") +
       "which is why the bug was invisible without the interleave")
 
 
+# --- THE REAL MERGE AND THE REAL build_text_obs ----------------------------
+# Everything above is the layout arithmetic. This part calls the code: the
+# alfworld manager's own build_text_obs fills its prefix list, and
+# MultiTaskEnvironmentManager._merge_observations scatters it. A simulation
+# cannot see a length mismatch between the two, and a length mismatch is
+# exactly how zip() loses rows silently.
+import types
+
+from agent_system.environments.env_manager import (
+    AlfWorldEnvironmentManager, MultiTaskEnvironmentManager, OCI_PREFIX_KEY)
+
+os.environ["PRIVILEGED_WRONG_PLAN"] = "1"
+N_ALF = PER_TASK * GN
+
+
+class FakeAlfEnvs:
+    def __init__(self):
+        self.group_n = GN
+        self.is_train = True
+        self.num_processes = N_ALF
+        self.get_admissible_commands = [["go to cabinet 1", "help"]] * N_ALF
+
+
+def fake_alf_manager():
+    m = AlfWorldEnvironmentManager.__new__(AlfWorldEnvironmentManager)
+    m._oci_prefixes = []
+    m.envs = FakeAlfEnvs()
+    m.config = types.SimpleNamespace(env=types.SimpleNamespace(history_length=0))
+    m.tasks = ["put a clean mug in the countertop"] * N_ALF
+    # One distinct game per GROUP, the way ALFWorld seeds seed + i // group_n.
+    m.gamefile = [f"/games/g{i // GN}/traj_data.json" for i in range(N_ALF)]
+    return m
+
+
+# The plan builder reads real game files, which are not present here, so stub
+# the one function and check the PLUMBING: which slot gets a block, and whether
+# the block that reaches a row is the block that row's observation carries.
+import agent_system.environments.env_manager as em
+
+_real_builder = em._wrong_plan_prefix
+em._wrong_plan_prefix = lambda task, gamefile: (
+    f"PLAN[{gamefile}]\n" if gamefile else "")
+try:
+    mgr = fake_alf_manager()
+    text_obs = [f"obs {i}" for i in range(N_ALF)]
+    full = mgr.build_text_obs(text_obs, mgr.envs.get_admissible_commands, init=True)
+
+    good = len(mgr._oci_prefixes) == N_ALF == len(full)
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" build_text_obs filled {len(mgr._oci_prefixes)} prefixes for "
+          f"{len(full)} observations ({N_ALF} slots)")
+
+    # Every prefix is really at the head of its own observation, which is what
+    # the rollout loop's startswith check requires.
+    good = all((not pre) or obs.startswith(pre)
+               for pre, obs in zip(mgr._oci_prefixes, full))
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          " every non-empty prefix is the head of its own observation")
+
+    marked_local = [i for i, pre in enumerate(mgr._oci_prefixes) if pre]
+    good = marked_local == [GN * p + GN - 1 for p in range(PER_TASK)]
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" marked local slots are the last of each group: {marked_local[:4]}...")
+
+    # Now the real merge, with alfworld interleaved among three tasks.
+    multi = MultiTaskEnvironmentManager.__new__(MultiTaskEnvironmentManager)
+    multi._task_indices = task_indices
+    merged = multi._merge_observations(
+        {"alfworld": {"text": full, OCI_PREFIX_KEY: list(mgr._oci_prefixes)},
+         "search": {"text": ["s"] * N_ALF},
+         "webshop": {"text": ["w"] * N_ALF}},
+        batch_size=len(rows))
+
+    # What the rollout loop does, on the merged obs, at each global row.
+    got_marks = {}
+    for gidx in range(len(rows)):
+        pres = merged.get(OCI_PREFIX_KEY, None)
+        pre = (pres[gidx] or "") if pres is not None and pres[gidx] else ""
+        content = merged["text"][gidx] or ""
+        if pre and content.startswith(pre):
+            got_marks[gidx] = pre
+
+    good = len(got_marks) == PER_TASK
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" through the real merge, {len(got_marks)}/{PER_TASK} rows mark")
+
+    # and each marks the game of ITS OWN group, not another's
+    wrong = [g for g, pre in got_marks.items()
+             if pre != mgr._oci_prefixes[task_indices["alfworld"].index(g)]]
+    good = not wrong
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" {len(wrong)} rows carry another group's plan")
+
+    good = sorted(got_marks) == [task_indices["alfworld"][GN * p + GN - 1]
+                                 for p in range(PER_TASK)]
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" the marked global rows are {sorted(got_marks)[:4]}... "
+          f"(24p+7, as the layout predicts)")
+
+    # A validation-shaped manager marks nothing, and it has its OWN list, so it
+    # cannot blank the training manager's -- which the module-level dict did.
+    vmgr = fake_alf_manager()
+    vmgr.envs.group_n, vmgr.envs.is_train = 1, False
+    vmgr.build_text_obs([f"v {i}" for i in range(N_ALF)],
+                        vmgr.envs.get_admissible_commands, init=True)
+    good = (not any(vmgr._oci_prefixes)
+            and [i for i, p in enumerate(mgr._oci_prefixes) if p] == marked_local)
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          " a validation manager marks nothing and leaves the training "
+          "manager's prefixes intact")
+finally:
+    em._wrong_plan_prefix = _real_builder
+    os.environ.pop("PRIVILEGED_WRONG_PLAN", None)
+
+
 def test_interleaved_layout():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok
