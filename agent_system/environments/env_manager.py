@@ -168,50 +168,120 @@ def _wrong_plan_prefix(task: str, gamefile, config=None) -> str:
     return _WRONG_PLAN_CACHE[key]
 
 
-PLAN_CORRUPTIONS = ("misdirect", "drop")
+PLAN_CORRUPTIONS = ("misdirect", "intact")
+
+# The block, in the environment's own words. Both modes emit the SAME text apart
+# from the numbered lines -- no word anywhere says whether the path is right.
+_PLAN_HEADER = "[Privileged Solution Path]"
+_PLAN_FOOTER = "[/Privileged Solution Path]"
+_PLAN_LEAD = (
+    "THIS IS THE CORRECT SOLUTION PATH FOR THIS TASK.\n"
+    "FOLLOW IT. At every step, take the action given by the next line of this path.\n"
+    "\n"
+    "The full path that solves this task:"
+)
+
+# ALFWorld's own command grammar, from the installed package:
+#   go to {recep} | take {obj} from {recep} | put {obj} in/on {recep}
+#   open {recep}  | close {recep}           | use {obj}
+#   heat {obj} with {microwave} | cool {obj} with {fridge}
+#   clean {obj} with {cleaner}  | slice {obj} with {knife}
+_PLAN_TOOL = {"HeatObject": "microwave", "CoolObject": "fridge",
+              "CleanObject": "sinkbasin", "SliceObject": "knife"}
+
+
+def _plan_lines(steps) -> List[str]:
+    """PDDL high-level steps -> lines in the environment's action vocabulary.
+
+    WHY NOT THE PDDL SYMBOLS. The first design printed the plan as
+    ``GotoLocation(dresser)`` / ``PickupObject(alarmclock)``. Those symbols
+    appear nowhere in the environment: the admissible actions are strings like
+    ``go to dresser 1`` and ``take alarmclock 1 from dresser 1``. The block was
+    therefore asking a policy never trained on the notation to ground it, in 85
+    tokens. Measured on the control checkpoint, the median log rho between the
+    plan-conditioned and plain student was 0.0 -- the block changed the token
+    distribution by less than 4e-4 nats on half the tokens, i.e. it was not
+    being read. These lines use the environment's own verbs and nouns, so only
+    the instance number is missing.
+
+    ``NoOp`` and anything unmapped is dropped: the environment has no command
+    for it, and it was one of the four lines the old block showed.
+    """
+    out, here = [], None
+    for act, args in steps:
+        a0 = args[0] if args else None
+        if act == "GotoLocation" and a0:
+            here = a0
+            out.append(f"go to {a0}")
+        elif act == "PickupObject" and a0:
+            # The receptacle comes from the preceding GotoLocation: PDDL does
+            # not carry it, and `take X from Y` needs it.
+            out.append(f"take {a0} from {here}" if here else f"take {a0}")
+        elif act == "PutObject" and a0:
+            r = args[1] if len(args) > 1 else here
+            out.append(f"put {a0} in/on {r}" if r else f"put {a0}")
+        elif act == "ToggleObject" and a0:
+            out.append(f"use {a0}")
+        elif act in _PLAN_TOOL and a0:
+            out.append(f"{act[:-6].lower()} {a0} with {_PLAN_TOOL[act]}")
+        elif act == "OpenObject" and a0:
+            out.append(f"open {a0}")
+        elif act == "CloseObject" and a0:
+            out.append(f"close {a0}")
+    return out
+
+
+def _misdirect(steps):
+    """Send every receptacle-valued slot to a different one from the same plan.
+
+    THE NAVIGATION IS THE INFORMATIVE HALF. An expert plan's value here is
+    knowing which receptacle holds the object and in what order to visit things;
+    that is exactly what the task description cannot tell the student. The
+    design this replaces removed the plan's REQUIREMENT step instead, and the
+    requirement is the one step the task text already states -- 92% of 853
+    sampled games name it ("put a CLEAN mug", "HEAT an egg", "TURNING ON a
+    light"). Measured: the candidate solved the task 14 times in 15.
+
+    EVERY RECEPTACLE SLOT, not just GotoLocation. Leaving `put X in/on R`
+    correct keeps the one line that states the goal, and the task text names
+    that destination too.
+
+    THE TOOLS ARE LEFT ALONE. The grammar fixes each one -- `clean {obj} with
+    {cleaner}` takes a sinkbasin and nothing else -- so every possible swap
+    yields a line the environment cannot execute, and an impossible line does
+    not mislead, it announces that the block is unreliable. The tool also leaks
+    nothing the task text does not ("the WASHED apple" -> sinkbasin).
+
+    Returns ``None`` when the plan names fewer than two receptacles, which is
+    0.3% of games: there is nowhere to send anything.
+    """
+    recs = []
+    for act, args in steps:
+        if act == "GotoLocation" and args and args[0] not in recs:
+            recs.append(args[0])
+        if act == "PutObject" and len(args) > 1 and args[1] not in recs:
+            recs.append(args[1])
+    if len(recs) < 2:
+        return None
+    swap = {r: recs[(i + 1) % len(recs)] for i, r in enumerate(recs)}
+    out = []
+    for act, args in steps:
+        if act == "GotoLocation" and args:
+            out.append((act, [swap[args[0]]] + list(args[1:])))
+        elif act == "PutObject" and len(args) > 1:
+            out.append((act, [args[0], swap[args[1]]] + list(args[2:])))
+        else:
+            out.append((act, list(args)))
+    return out
 
 
 def _build_wrong_plan(gamefile: str, mode: str = "misdirect") -> str:
-    """The instance's expert plan, corrupted so the student FAILS it.
+    """The instance's expert path, as a block shown to the student.
 
-    WHY "drop" DOES NOT WORK, measured rather than argued. The first version
-    removed the plan's requirement step -- the CleanObject / HeatObject /
-    CoolObject / SliceObject / ToggleObject, else the final PutObject. On the
-    control checkpoint at step 300 the candidate shown that plan solved the task
-    14 times in 15 and scored ABOVE its group's mean while doing it.
-
-    The reason is visible once the text is read: the step being removed is the
-    one the TASK DESCRIPTION already states. Over 853 sampled games with a
-    requirement step, the dropped action is named in the task text 92% of the
-    time -- ToggleObject 99%, HeatObject 97%, CoolObject 91%, CleanObject 86%,
-    SliceObject 76% ("put a clean mug under the coffee maker", "heat an egg and
-    put it back in the fridge", "carry a laptop while turning on a light") -- and
-    in the 43% of games with no requirement step the dropped step is the final
-    PutObject, whose object and receptacle ARE the task description. So the plan
-    handed over the part the student cannot know (where to search) and withheld
-    the one part it was already told. Net effect: a strong help.
-
-    WHAT "misdirect" CORRUPTS INSTEAD. The informative content of an expert plan
-    here is the NAVIGATION: which receptacle holds the object, and in what order
-    to visit things. That is exactly what the student cannot get from the task
-    text. This mode cyclically permutes the distinct GotoLocation targets, so
-    every navigation step points at a receptacle from the SAME plan that is not
-    the right one for that step. Nothing is removed and no name is invented: the
-    step count, the action vocabulary and the object names are untouched, which
-    keeps the block the same size and keeps the leak surface identical to the
-    refuted version.
-
-    99.7% of plans (798 of 800 sampled) carry at least two distinct GotoLocation
-    targets, so the permutation has somewhere to send them; a plan with one is
-    returned unchanged as '' rather than corrupted in some other way.
-
-    AND WHY THIS FAILURE MODE AND NOT A STRONGER ONE. Handing over another
-    game's plan entirely would fail more reliably and be useless: rho is the
-    probability the PLAIN student would produce the same tokens, and a sequence
-    driven by an unrelated scene is one it would never produce, so the shaped
-    gradient vanishes (see the design document section 4). Searching the wrong
-    receptacle is the student's own unassisted failure mode, which is the one
-    corruption that can raise the failure rate and keep rho measurable.
+    ``intact`` prints the true path; ``misdirect`` permutes its receptacles.
+    The two produce byte-identical text apart from the numbered lines, which is
+    the point: no word labels the path as right or wrong, so the two arms differ
+    in the path and in nothing else.
     """
     import json as _json
     import os
@@ -243,38 +313,16 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect") -> str:
     if len(steps) < 3:
         return ""
 
-    if mode == "drop":
-        drop = next((i for i, (a, _) in enumerate(steps) if a in _REQUIREMENT_ACTIONS), None)
-        if drop is None:
-            puts = [i for i, (a, _) in enumerate(steps) if a == "PutObject"]
-            if not puts:
-                return ""
-            drop = puts[-1]
-        kept = [s for i, s in enumerate(steps) if i != drop]
-    else:
-        # Cyclically permute the distinct navigation targets, in first-appearance
-        # order, so no GotoLocation keeps its own destination.
-        order = []
-        for a, g in steps:
-            if a == "GotoLocation" and g and g[0] not in order:
-                order.append(g[0])
-        if len(order) < 2:
+    if mode == "misdirect":
+        steps = _misdirect(steps)
+        if steps is None:
             return ""
-        swap = {src: order[(i + 1) % len(order)] for i, src in enumerate(order)}
-        kept = [
-            (a, ([swap[g[0]]] + g[1:]) if (a == "GotoLocation" and g) else g)
-            for a, g in steps
-        ]
-    if not kept:
+    lines = _plan_lines(steps)
+    if not lines:
         return ""
 
-    body = "\n".join(
-        f"{i+1}. {a}({', '.join(g)})" if g else f"{i+1}. {a}()"
-        for i, (a, g) in enumerate(kept)
-    )
-    return ("### SOLUTION PLAN (training only) ###\n"
-            "A correct high-level plan for this task is:\n" + body +
-            "\nGround each step into one admissible action at a time.\n\n")
+    body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(lines))
+    return f"{_PLAN_HEADER}\n{_PLAN_LEAD}\n{body}\n{_PLAN_FOOTER}\n\n"
 
 
 from omegaconf import OmegaConf

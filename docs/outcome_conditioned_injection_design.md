@@ -83,33 +83,50 @@ GRPO の advantage は軌跡のリターンからその prompt 群の平均を�
 
 `env.rollout.n = 8`。ALFWorld は worker i を `seed + i // group_n` で seed する
 ので、群の 8 worker は同じゲームを持つ。その**最後のスロット**の観測の先頭に、
-そのゲーム自身の専門家計画から要件手順を 1 つ除いたものを前置きする
-(`env_manager._build_wrong_plan`)。他の 7 本は同じゲームの素の rollout であり、
-第二の生成パスは要らない。
+そのゲーム自身の専門家経路から作ったブロックを前置きする。他の 7 本は同じゲーム
+の素の rollout であり、第二の生成パスは要らない。
+
+**ブロックは環境の行動語で書く。** ALFWorld の文法は
+`go to {recep}` / `take {obj} from {recep}` / `put {obj} in/on {recep}` /
+`use {obj}` / `heat {obj} with {microwave}` / `cool {obj} with {fridge}` /
+`clean {obj} with {cleaner}` / `slice {obj} with {knife}` / `open` / `close`。
+`traj_data` の `high_pddl` はここに全部写せる（`PickupObject` の受け皿は直前の
+`GotoLocation` から復元。`NoOp` は環境に対応コマンドが無いので落とす）。
 
 ```
-### SOLUTION PLAN (training only) ###
-A correct high-level plan for this task is:
-1. GotoLocation(cabinet)
-...
-Ground each step into one admissible action at a time.
+[Privileged Solution Path]
+THIS IS THE CORRECT SOLUTION PATH FOR THIS TASK.
+FOLLOW IT. At every step, take the action given by the next line of this path.
+
+The full path that solves this task:
+1. go to microwave
+2. take apple from microwave
+3. go to sinkbasin
+4. clean apple with sinkbasin
+5. go to diningtable
+6. put apple in/on diningtable
+[/Privileged Solution Path]
 ```
 
-除く手順は、変換動作 (`CleanObject` / `HeatObject` / `CoolObject` /
-`SliceObject`)、なければ `ToggleObject`、なければ最後の `PutObject`。
-実ゲーム 300/300 で「1 手だけ除去」「専門家計画が挙げていない物体名を出さない」を
-確認済み（`tests/oci/test_wrong_plan.py`）。p50 279 文字 / 約 55 トークン、
-alfworld のターンプロンプト p99 が 947 で上限 4096 なので `max_model_len` は不変。
+p50 97 / p99 145 / 最大 147 トークン。alfworld のターンプロンプト p99 が 947 で
+上限 4096 なので最悪 1092、`max_model_len` は不変。
 
-**どの行が注入行かは rollout loop が決め、列として運ぶ。** `oci_candidate` /
-`oci_plan_off` / `oci_plan_len` / `oci_plan_truncated` の 4 列。trainer 側で
-行順から導出することはしない。理由: 行は task で再編成され、padding され、
-`_balance_batch` で並べ替えられてから advantage 計算に入る。trainer が行順に
-適用する規則は**並べ替え後の順序**に適用され、計画を見ていない軌跡を掴む。
-この経路は `attach_task_loss_weights` と teacher cache id が既に使っている型で、
-`_balance_batch` は列を行と一緒に動かす。
+**2 モードは番号行以外バイト単位で同一。** `intact` は真の経路、`misdirect` は
+受け皿を巡回置換したもの。**どの語も正誤を区別しない** — ブロックは両方とも
+「これが正解経路だ、従え」と主張する。これは RLCSD の設計点（correct と
+incorrect のヒントを同一の枠で提示する）で、これにより 2 アームが経路以外で
+一切違わなくなる。形式は SMRC-SD の FullPath テンプレートに倣ったが、文言は独自。
 
-**前置きテキストは観測 dict に載せる**（`OCI_PREFIX_KEY`）。rollout loop は
+**腐敗は受け皿スロット全部に及ぶ。** `GotoLocation` の宛先と `PutObject` の宛先
+の両方。移動先だけを置換すると `put X in/on R` が正しいまま残り、課題文もその
+宛先を名指しているので、**目標を述べる 1 行が正解のまま残る**。
+
+**道具名は変えない。** 文法が `clean {obj} with {cleaner}` と cleaner を固定する
+ので、どの入れ替えも実行不能な行になる。実行不能な行は誤誘導せず、「このブロック
+は信用できない」と教えてしまう。道具は課題文からも導ける（"the WASHED apple" →
+sinkbasin）ので、残しても新しい漏れにならない。
+
+**前置きテキストは観測 dict に載せる****前置きテキストは観測 dict に載せる**（`OCI_PREFIX_KEY`）。rollout loop は
 行がどのブロックを持つか知る必要があるが、env slot 番号で引いてはいけない。
 `TASK_BALANCE_INTERLEAVE`（全アーム既定）ではプロンプト順が alf0, search0,
 webshop0, alf1, … で、各プロンプトが group_n 回連続 repeat されるので、3 タスク
@@ -185,13 +202,13 @@ unclipped。B が消すのは注入行自身の勾配、すなわち**到達可�
 部分**。B が効いて A が効かないなら、機構は contrast であって off-policy 項は
 雑音。どちらも効かないなら contrast に価値がなく、設計は終わり。
 
-### 3.1 A アームの勾配整形 — 未実装であることを明記する
+### 3.1 A アームの勾配整形 — 実装済み、既定 off
 
 v2 の §3.1 は A アームが LUFFY 型の整形 `f(ρ) = ρ/(ρ+γ)`（γ=0.1）を使うと
-書いた。**実装していない。** `dp_actor` に整形は無く、A は通常のクリップ付き
-重要度比で学習する。
+書いたが、当時は実装していなかった。**いまは `oci_shaping.py` にあり、
+`algorithm.oci_sat.shaping.enable` で切り替える（既定 off）。**
 
-したがって A アームが実際に学習するのは、**計画条件付きプロンプトの上での
+整形なしの A が学習するのは、**計画条件付きプロンプトの上での
 政策勾配**である。注入行の生成分布と学習分布が同じなので比は 1 に近く、クリップ
 されない。これは「計画を見た生徒の失敗を、計画を見た文脈で罰する」ことになり、
 テスト時に計画が無いことと整合しない。
@@ -238,24 +255,30 @@ B** であり、その run は何も言わない。
 
 ---
 
-## 4. なぜ base の失敗キャッシュを採らなかったか
+## 4. 採らなかった設計と、測定で潰れた設計
 
-v2 の §2 / §4 は、凍結 base に全プロンプトの失敗軌跡をオフライン生成させ
-（3.5 時間、gamefile 鍵）、飽和群にそれを注入する方式を記述していた。実装は
-採らなかった。
+**base の失敗キャッシュ（v2 の方式）。** 凍結 base に失敗軌跡を事前生成させて
+注入する案。採らなかった理由は ρ である。base の失敗は別の重みが生んだ系列で、
+学習する生徒がそれを出す確率は小さい。ρ→0 では整形を入れても係数はゼロに向かう
+ので、|A| を持っていても勾配は届かない。同じ重みの生徒に特権入力を見せる方なら
+分布のずれは条件付けの差だけになる。
 
-**理由は ρ である。** base の失敗は別の重み（凍結 base）が生んだもので、学習する
-生徒がその系列を出す確率は小さい。ρ → 0 では、整形を入れても係数はゼロに向かう
-（整形はまさにそこで係数を消す形をしている）ので、|A| = √7 を持っていても勾配は
-届かない。すなわち base の失敗は**A アームでは原理的に使えない**。
+**要件手順の除去（`drop`、測定で棄却）。** 計画から Clean/Heat/Cool/Slice/Toggle
+（なければ最後の PutObject）を 1 つ落とす案。control step300 で
+`cand_fail_rate` = 1/15、候補は群平均を上回った。理由はテキストを読めば分かる:
+**落としている手順は課題文が既に述べている手順**で、要件手順を持つ 853 ゲームの
+92% で課題文が名指ししている（ToggleObject 99% / HeatObject 97% / CoolObject 91%
+/ CleanObject 86% / SliceObject 76%)。要件手順の無い 43% では最後の PutObject を
+落とすが、その物体と宛先は課題文そのもの。つまり**学生が知り得ない部分（探索）を
+渡し、既に知っている 1 手だけを隠していた**。
 
-誤った計画を見せた**同じ重みの**生徒なら、分布のずれは条件付けの差だけになる。
-ρ が測定可能な範囲に入る見込みがあるのはこちらだけである。
-
-副作用として、事前生成もキャッシュも、第二の vLLM エンジンも要らなくなった。
-費用の主張（§8）はそれに合わせて書き直した。
-
----
+**PDDL 記法（測定で棄却）。** 移動先を置換する `misdirect` の初版は
+`GotoLocation(dresser)` と印字していた。`cand_fail_rate` は 6.7%→15.6% に上がった
+が、ρ の中位が **log ρ = 0.0**（p25 −4e-4、p75 +1.5e-6、`rho_median` 1.0）。
+**計画の有無がトークン分布をほぼ動かしていない = 読まれていない。** `GotoLocation`
+等の記号は環境の行動空間に一度も現れず、admissible actions は
+`go to cabinet 1` 形式である。85 トークンの見慣れない記法で記号接地を要求して
+いた。§2 の環境語版はこれへの対処。
 
 ## 5. 先行研究に対する位置 — v2 の差別化根拠は消えている
 
@@ -404,19 +427,33 @@ optimizer step なし、生成なし、既にあるトークンに対する forw
 そのまま通し、プロンプト自身の左詰め窓だけを再構成する。`position_ids` は
 rollout の規約を保ち、プロンプトを n トークン削ったら応答の位置は n だけ下がる。
 
-### 7.1 先行測定の訂正
+### 7.1 測定済みの値（2026-09-12、control step300、fuji）
 
-**v2 の §1 と §7.1 が引用した数値は全て使用停止。**
+**v2 が引用していた `terms_n8_fixed.json` の数値は全て使用停止**（`group_unit`
+ラベルの無い行単位集計で live 側が過大）。プローブ 2 回で取り直した値がこれ。
 
-`terms_n8_fixed.json` の `degenerate_groups`（63/66/78%）は `group_unit` ラベルの
-無い行単位集計で、live 側が過大。同じ payload 由来の「非ゼロ advantage トークン
-割合 alfworld 0.755 / webshop 0.376 / search 0.235」も同様に信用できない。
-したがって v2 の「alfworld は最も退化が少ないので最弱の標的」という標的選択の
-議論も保留する。
+群クラス（`compute_group_metrics`、タスク別基準、45 群/タスク、3 バッチ合算）:
 
-実際の退化率はこれより高く、予算再配分の取り分はさらに小さい。正しい数値は
-§7 のプローブで取り直す。それまで引用しない。`token_mass_by_class` の docstring
-からも数値を削除した。
+| タスク | live | 停滞 | 飽和 | 飽和が退化の何割 |
+|---|---|---|---|---|
+| alfworld | 18/45 | 3 | 24 | 89% |
+| webshop | 9/45 | 9 | 27 | 75% |
+| search | 7/45 | 22 | 16 | 42% |
+
+**alfworld の退化側はほぼ全部飽和**で、機構には作用対象がある。トークン質量
+（alfworld 単独プローブ）は dead が 40.7〜70.8% とバッチ間で大きく振れる。
+
+特権ブロックの効果（2 設計とも棄却、§4）:
+
+| 設計 | `cand_fail_rate` | 候補の成功率 | 素の 7 本 | ρ |
+|---|---|---|---|---|
+| `drop`（要件除去、PDDL） | 1/15 = 6.7% | 93.3% | 74.2% | 未測定（span バグ） |
+| `misdirect`（移動置換、PDDL） | 15.6% | 84.4% | 73.9% | **log ρ p50 = 0.0** |
+
+**注意: alfworld は毎バッチ同じ 15 ゲームを引く。** ALFWorld は worker i を
+`seed + i // group_n` で seed し、seed は run 固定なので、3 バッチでクラス分割が
+完全に同一になる。バッチを増やしても alfworld のサンプルは増えない。変動するのは
+webshop と search だけ。
 
 ### 7.2 `index` はゲームを同定しない
 
@@ -425,8 +462,6 @@ alfworld の parquet は**空プロンプトの 15 行**を持ち、環境がゲ
 `index` で作った結合は全て無効だった。結合鍵は `extra.gamefile`。
 `compute_group_metrics(with_records=True)` は `gamefile` を出し、旧フィールドは
 `index_unreliable` に改名した。
-
----
 
 ## 8. 費用
 
@@ -445,13 +480,29 @@ control と比較する。
 
 ## 9. 未解決（走らせる前に決めること）
 
-1. **A アームの整形**（§3.1）。実装済み・既定 off。ρ の
-   `frac_coef_above_0.025` が 10% を超えたら整形ありの A を走らせ、下回れば
-   B のみ。アームは 3 本になった（B / A整形なし / A整形あり）が、**同時に走らせる
-   のは 1 本**。
-2. **§6.4 の交絡**をこのまま受けるか、群を 9 本にするか。
-3. **新規性**（§5）。本書は主張しない。主張が必要なら結果を見てから別に立てる。
-4. §7 のプローブを取るまで GPU で訓練は走らせない。
+1. **次に走らせるのは `intact`。** 2 つの測定が「生徒は特権ブロックを読んで
+   いない」（log ρ p50 = 0.0）を示したので、腐敗の作り方を変える前に
+   **正解経路でも読まないのか**を確定させる。読まないなら腐敗版は何をしても
+   無意味で、設計は畳む。読むなら `misdirect` に意味が戻る。
+   判定: `intact` で ρ が 1 から離れる（`log_rho` の p25/p75 が 0 から有意に
+   外れる）か、候補の成功率が素の 7 本を明確に上回るか。
+2. **A アームの整形**（§3.1）。実装済み・既定 off。ρ の
+   `frac_coef_above_0.025` が 10% を超えたら整形ありの A を走らせる。ただし
+   **ρ≈1 でこの規則は退化して通る** — 素の生徒が出すはずの系列だから自明に
+   到達可能、という意味で、特権情報を何も使っていない。情報のある版は「ρ が 1
+   から離れていて、かつ帯域内」でなければならない。規則をそう書き直すこと。
+3. **§6.4 の交絡**をこのまま受けるか、群を 9 本にするか。LUFFY は同じ選択を
+   同じ理由でしている（§4 "we use 1 off-policy rollout and 7 on-policy rollouts
+   to ensure fairness"）ので、置き換え方式のままでよい。
+4. **新規性**（§5）。本書は主張しない。サーベイした OPSD/hindsight 系 8 本は
+   全て特権情報を**教師側**に渡しており（SDAR / SMRC-SD / Skill-SD / OPID /
+   Ahead / TRIAL / LEAP / PACT）、生徒のロールアウトに入れる例外 2 本のうち 1 本
+   は「答えを見せないこと」を要件にしている。**生徒に正解系列を見せる設計に
+   前例が無い**ことは、新規性であると同時に ρ≈1 の理由でもありうる。
+5. **advantage スケールの注記**。§1 の表は std 除算ありの値。LUFFY は Dr.GRPO に
+   従って std 除算を外しており、γ=0.1 という帯域はそのスケールで決まった値で
+   ある。ρ の帯域自体は advantage と独立なので γ は移植できるが、`A·coef` の
+   絶対値を LUFFY と比べるときはこの差を踏まえる。
 
 ## 10. control と共有するコードパスの変更（記録）
 

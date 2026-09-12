@@ -1,12 +1,21 @@
-"""CPU test for the corrupted-plan prefix: reads real ALFWorld games, no GPU.
+"""CPU test for the privileged path block: reads real ALFWorld games, no GPU.
 
-WHAT THE FIRST MEASUREMENT TAUGHT THIS FILE. The original mode removed the
-plan's requirement step and this file checked that exactly one step was gone and
-that no unnamed object appeared. Both held on 300 games -- and the mechanism
-still did nothing, because the step being removed is the one the TASK
-DESCRIPTION already states. The invariants were about the edit's shape and said
-nothing about whether the edit destroys information the student needs. The
-checks below are about the latter.
+TWO MEASUREMENTS SHAPED THIS FILE, and both refuted a design whose invariants
+this suite had already checked and passed.
+
+1. The first block removed the plan's REQUIREMENT step. The suite verified that
+   exactly one step was gone and that no unnamed object appeared. Both held on
+   300 games; the candidate still solved the task 14 times in 15, because the
+   removed step is the one the TASK DESCRIPTION already states (92% of 853
+   sampled games).
+2. The second permuted the navigation but printed PDDL symbols --
+   `GotoLocation(dresser)`. The median log rho between the plan-conditioned and
+   the plain student came back 0.0: the block was not being read at all.
+
+So the checks below are not about the edit's shape. They are about whether the
+block is written in the environment's own language, whether the two modes are
+indistinguishable apart from the path, and whether the corruption reaches every
+slot that carries information the task text does not.
 """
 import glob, json, os, random, re, sys
 from types import SimpleNamespace
@@ -19,13 +28,10 @@ GAMES = sorted(glob.glob(os.path.expanduser(
 if not GAMES:
     print("SKIP: no alfworld games on this host"); sys.exit(0)
 
-WORDS = {
-    "CleanObject":  ("clean", "wash", "rinse"),
-    "HeatObject":   ("heat", "hot", "warm", "microwav", "cook"),
-    "CoolObject":   ("cool", "cold", "chill", "fridge", "refrigerat"),
-    "SliceObject":  ("slice", "cut", "chop"),
-    "ToggleObject": ("turn on", "lamp", "light", "switch"),
-}
+# ALFWorld's own command grammar, from the installed package.
+VERBS = ("go to ", "take ", "put ", "open ", "close ", "use ",
+         "heat ", "cool ", "clean ", "slice ")
+TOOLS = ("microwave", "fridge", "sinkbasin", "knife")
 
 
 def cfg(enable=True, mode="misdirect"):
@@ -43,124 +49,126 @@ def traj(gamefile):
     return None
 
 
+def path_lines(block):
+    return [l.split(". ", 1)[1] for l in block.splitlines()
+            if re.match(r"^\d+\. ", l)]
+
+
 ok = True
 
-# --- the switch ------------------------------------------------------------
+# --- the switch --------------------------------------------------------------
 em._WRONG_PLAN_CACHE.clear()
-good = em._wrong_plan_prefix("alfworld", GAMES[0], cfg(enable=False)) == ""
+good = (em._wrong_plan_prefix("alfworld", GAMES[0], cfg(enable=False)) == ""
+        and em._wrong_plan_prefix("alfworld", GAMES[0], None) == ""
+        and em._wrong_plan_prefix("webshop", GAMES[0], cfg()) == "")
 ok &= good
-print(("  OK  " if good else "  FAIL") + " switch off (config) yields nothing")
-
-good = em._wrong_plan_prefix("alfworld", GAMES[0], None) == ""
-ok &= good
-print(("  OK  " if good else "  FAIL") + " no config at all yields nothing")
-
-good = em._wrong_plan_prefix("webshop", GAMES[0], cfg()) == ""
-ok &= good
-print(("  OK  " if good else "  FAIL") + " another task yields nothing")
+print(("  OK  " if good else "  FAIL") +
+      " switch off, no config, and another task all yield nothing")
 
 try:
-    em._oci_plan_mode(cfg(mode="shuffle"))
+    em._oci_plan_mode(cfg(mode="drop"))
     good = False
 except ValueError as e:
     good = "plan_corruption" in str(e)
 ok &= good
-print(("  OK  " if good else "  FAIL") + " an unknown corruption mode is refused by name")
+print(("  OK  " if good else "  FAIL") +
+      " the retired 'drop' mode is refused by name, not silently accepted")
 
-# --- misdirect: coverage and size ------------------------------------------
+# --- coverage and size -------------------------------------------------------
 em._WRONG_PLAN_CACHE.clear()
 random.seed(0)
 samp = random.sample(GAMES, min(250, len(GAMES)))
-lens, empty = [], 0
-for g in samp:
-    p = em._wrong_plan_prefix("alfworld", g, cfg())
-    (lens.append(len(p)) if p else None)
-    empty += (not p)
+empty = sum(1 for g in samp if not em._wrong_plan_prefix("alfworld", g, cfg()))
 good = empty <= len(samp) * 0.02
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" {len(samp)-empty}/{len(samp)} games corruptible ({empty} have <2 nav targets)")
-lens.sort()
-good = lens and lens[len(lens)//2] < 1200
+      f" {len(samp)-empty}/{len(samp)} games corruptible ({empty} name <2 receptacles)")
+
+# --- THE LANGUAGE: every line is an environment command, no PDDL -------------
+bad_verb, pddl, checked = 0, 0, 0
+for g in samp[:150]:
+    for mode in ("intact", "misdirect"):
+        em._WRONG_PLAN_CACHE.clear()
+        b = em._wrong_plan_prefix("alfworld", g, cfg(mode=mode))
+        if not b:
+            continue
+        checked += 1
+        for l in path_lines(b):
+            bad_verb += not l.startswith(VERBS)
+            pddl += bool(re.search(r"[A-Z]\w+\(", l))
+good = checked > 100 and bad_verb == 0 and pddl == 0
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" block size: p50 {lens[len(lens)//2]} chars, max {lens[-1]}")
+      f" {checked} blocks: {bad_verb} lines outside the environment's grammar, "
+      f"{pddl} lines still in PDDL notation")
 
-# --- THE POINT: every navigation step is sent somewhere it should not be ----
-moved, checked, invented = 0, 0, 0
+# --- THE TWO MODES DIFFER IN THE PATH AND IN NOTHING ELSE --------------------
+same_frame, path_differs, tool_same, n = 0, 0, 0, 0
+for g in samp[:150]:
+    em._WRONG_PLAN_CACHE.clear()
+    a = em._wrong_plan_prefix("alfworld", g, cfg(mode="intact"))
+    em._WRONG_PLAN_CACHE.clear()
+    b = em._wrong_plan_prefix("alfworld", g, cfg(mode="misdirect"))
+    if not a or not b:
+        continue
+    n += 1
+    fa = [l for l in a.splitlines() if not re.match(r"^\d+\. ", l)]
+    fb = [l for l in b.splitlines() if not re.match(r"^\d+\. ", l)]
+    same_frame += (fa == fb)
+    path_differs += (path_lines(a) != path_lines(b))
+    ta = [l for l in path_lines(a) if any(t in l for t in TOOLS) and " with " in l]
+    tb = [l for l in path_lines(b) if any(t in l for t in TOOLS) and " with " in l]
+    tool_same += (ta == tb)
+good = n > 100 and same_frame == n and path_differs == n
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {same_frame}/{n} share every non-path line, {path_differs}/{n} differ in the path")
+
+good = tool_same == n
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {tool_same}/{n} keep the tool line identical -- a swapped tool is "
+      f"inexecutable and would announce the block is unreliable")
+
+# --- THE CORRUPTION REACHES THE put DESTINATION ------------------------------
+has_put, put_moved = 0, 0
+for g in samp[:150]:
+    em._WRONG_PLAN_CACHE.clear()
+    a = [l for l in path_lines(em._wrong_plan_prefix("alfworld", g, cfg(mode="intact")))
+         if " in/on " in l]
+    em._WRONG_PLAN_CACHE.clear()
+    b = [l for l in path_lines(em._wrong_plan_prefix("alfworld", g, cfg(mode="misdirect")))
+         if " in/on " in l]
+    if not a:
+        continue
+    has_put += 1
+    put_moved += (a != b)
+good = has_put > 50 and put_moved == has_put
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" {put_moved}/{has_put} games move the `put X in/on R` destination -- "
+      f"leaving it correct keeps the line that states the goal")
+
+# --- and no receptacle is invented -------------------------------------------
+invented = 0
 for g in samp[:120]:
     d = traj(g)
     if d is None:
         continue
-    p = em._wrong_plan_prefix("alfworld", g, cfg())
-    if not p:
-        continue
-    true_nav = [h["discrete_action"]["args"][0]
-                for h in d["plan"]["high_pddl"]
-                if h["discrete_action"]["action"] == "GotoLocation" and h["discrete_action"]["args"]]
-    shown_nav = re.findall(r"\d+\. GotoLocation\(([^)]*)\)", p)
-    if len(shown_nav) != len(true_nav):
-        continue
-    checked += 1
-    moved += all(a != b for a, b in zip(shown_nav, true_nav))
-    invented += any(a not in set(true_nav) for a in shown_nav)
-good = checked > 50 and moved == checked and invented == 0
+    true_recs = {a for h in d["plan"]["high_pddl"]
+                 for a in h["discrete_action"].get("args", []) if a}
+    em._WRONG_PLAN_CACHE.clear()
+    for l in path_lines(em._wrong_plan_prefix("alfworld", g, cfg(mode="misdirect"))):
+        for w in l.split():
+            if w in TOOLS or w in ("go", "to", "take", "from", "put", "in/on",
+                                   "use", "open", "close", "with",
+                                   "heat", "cool", "clean", "slice"):
+                continue
+            invented += w not in true_recs
+good = invented == 0
 ok &= good
 print(("  OK  " if good else "  FAIL") +
-      f" {moved}/{checked} games have EVERY navigation step redirected, and "
-      f"{invented} invent a receptacle the true plan does not name")
-
-# --- and the steps themselves are all still there --------------------------
-same_shape = 0
-for g in samp[:120]:
-    d = traj(g)
-    if d is None:
-        continue
-    p = em._wrong_plan_prefix("alfworld", g, cfg())
-    if not p:
-        continue
-    true_acts = [h["discrete_action"]["action"] for h in d["plan"]["high_pddl"]]
-    shown_acts = re.findall(r"\d+\. (\w+)\(", p)
-    same_shape += (shown_acts == true_acts)
-good = same_shape == checked
-ok &= good
-print(("  OK  " if good else "  FAIL") +
-      f" {same_shape}/{checked} keep the step count and action sequence exactly "
-      f"(only the destinations move)")
-
-# --- the refuted mode, and WHY it is refuted, kept as a regression ----------
-em._WRONG_PLAN_CACHE.clear()
-named, total = 0, 0
-for g in samp[:200]:
-    d = traj(g)
-    if d is None:
-        continue
-    acts = [h["discrete_action"]["action"] for h in d["plan"]["high_pddl"]]
-    req = next((a for a in em._REQUIREMENT_ACTIONS if a in acts), None)
-    if req is None:
-        continue
-    desc = d["turk_annotations"]["anns"][0]["task_desc"].lower()
-    total += 1
-    named += any(w in desc for w in WORDS[req])
-good = total > 20 and named / total > 0.8
-ok &= good
-print(("  OK  " if good else "  FAIL") +
-      f" 'drop' removes a step the task text already states in {named}/{total} "
-      f"({named/max(total,1):.0%}) games -- which is why it did not induce failure")
-
-# and misdirect does not have that property: the destinations are not in the
-# task description in any useful way, because the task names the DESTINATION of
-# the put, not where the object starts
-em._WRONG_PLAN_CACHE.clear()
-p = em._wrong_plan_prefix("alfworld", samp[0], cfg(mode="drop"))
-q = em._wrong_plan_prefix("alfworld", samp[0], cfg(mode="misdirect"))
-good = bool(p and q and p != q)
-ok &= good
-print(("  OK  " if good else "  FAIL") + " the two modes produce different text")
-
-good = "### SOLUTION PLAN (training only) ###" in q and q.endswith("\n\n")
-ok &= good
-print(("  OK  " if good else "  FAIL") + " the header and trailing blank line are unchanged")
+      f" {invented} words name something the true plan does not")
 
 
 def test_wrong_plan():

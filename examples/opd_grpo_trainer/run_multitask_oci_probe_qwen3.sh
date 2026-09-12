@@ -68,7 +68,15 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${CONDA_SH:-$HOME/miniforge3/etc/profile.d/conda.sh}"
 conda activate "${CONDA_ENV:-sdar-multitask}"
 
-export EXPECTED_CONFIG_WAIVE="algorithm.opd.kl_loss_coef actor_rollout_ref.actor.teacher_kl_loss_coef actor_rollout_ref.model.path algorithm.opd.kl_loss_type actor_rollout_ref.actor.teacher_kl_loss_type actor_rollout_ref.actor.student_indexed_topk actor_rollout_ref.rollout.temperature env.rollout.n data.train_batch_size data.task_balance.per_task_batch_size data.task_balance.tasks trainer.n_gpus_per_node env.multitask.val_per_task_batch_size"
+export EXPECTED_CONFIG_WAIVE="algorithm.opd.kl_loss_coef actor_rollout_ref.actor.teacher_kl_loss_coef actor_rollout_ref.model.path algorithm.opd.kl_loss_type actor_rollout_ref.actor.teacher_kl_loss_type actor_rollout_ref.actor.student_indexed_topk actor_rollout_ref.rollout.temperature env.rollout.n data.train_batch_size data.task_balance.per_task_batch_size data.task_balance.tasks env.multitask.tasks"
+
+# UNBUFFERED, so a failure is visible. bash writes its `set -x` trace straight
+# out, but python's stderr to a FILE is block-buffered: three launches in a row
+# ended at byte 7381 -- the trace line for the python command -- with the
+# AssertionError that actually killed them still sitting in the buffer when the
+# next attempt's pkill -9 discarded it. The run looked like it had died silently
+# at startup when in fact it had said exactly why.
+export PYTHONUNBUFFERED=1
 
 export ALFWORLD_DATA=${ALFWORLD_DATA:-$HOME/data/alfworld}
 export ENV_RESET_PREFETCH=1
@@ -100,6 +108,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   ++data.task_balance.per_task_batch_size="$PER_TASK" \
   data.train_batch_size=$(( PER_TASK * N_TASKS )) \
   "data.task_balance.tasks=[${TASKS}]" \
+  "env.multitask.tasks=[${TASKS}]" \
   trainer.n_gpus_per_node="$GPUS" \
   algorithm.oci_sat.enable=True \
   algorithm.oci_sat.plan_corruption=misdirect \

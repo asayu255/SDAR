@@ -359,17 +359,25 @@ algorithm:
     # -- an arm once ran as a plain student for thirty minutes and reported as
     # the arm -- and which no lock could pin.
     enable: False
-    # HOW the plan is corrupted so the student fails it.
-    #   misdirect: cyclically permute the distinct GotoLocation targets, so every
-    #     navigation step points at a receptacle from the same plan that is wrong
-    #     for that step. Nothing removed, no name invented.
-    #   drop: remove the requirement step (Clean/Heat/Cool/Slice/ToggleObject,
-    #     else the final PutObject). KEPT ONLY TO REPRODUCE A REFUTED
-    #     MEASUREMENT: the dropped step is the one the task description already
-    #     states (92% of 853 sampled games), so the plan gave away the part the
-    #     student cannot know and withheld the part it was already told. The
-    #     candidate solved the task 14 times in 15 and scored above its group's
-    #     mean.
+    # HOW the path block is built.
+    #   misdirect: send every receptacle-valued slot (GotoLocation targets AND
+    #     PutObject destinations) to a different receptacle from the same plan,
+    #     so the navigation -- the half the task description cannot supply -- is
+    #     wrong while nothing is removed and no name is invented. Tools are left
+    #     correct: the grammar fixes each one, so any swap is inexecutable and
+    #     an inexecutable line announces the block is unreliable instead of
+    #     misleading.
+    #   intact: the true path. This is the arm that asks whether the student
+    #     reads such a block AT ALL, which the first two measurements say it
+    #     does not -- median log rho 0.0 between the plan-conditioned and plain
+    #     student. Run it before any corrupted arm.
+    #
+    # The two emit byte-identical text apart from the numbered lines, so no word
+    # labels the path right or wrong. The earlier "drop" mode (remove the
+    # requirement step) is gone: it was refuted (cand_fail_rate 1/15, because
+    # the removed step is the one the task text already states in 92% of games)
+    # and its block used a PDDL notation this one no longer emits, so it cannot
+    # be reproduced from here -- see commit 888ff23.
     plan_corruption: misdirect
     # Only where the plan exists. env_manager prepends it at the alfworld
     # prompt sites and nowhere else; a candidate marked on another task would

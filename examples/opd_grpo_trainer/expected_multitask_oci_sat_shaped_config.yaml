@@ -248,12 +248,12 @@
 # selection and exclusion; the corrupted plan is placed by the rollout loop under
 # PRIVILEGED_WRONG_PLAN, which no config key can pin (see the header).
 "algorithm.oci_sat.enable": true
-# HOW the plan is corrupted. Pinned because it IS the intervention: the first
-# measurement used "drop" (remove the requirement step) and refuted it --
-# cand_fail_rate 1/15, because the dropped step is the one the task description
-# already states in 92% of games, so the plan gave away the navigation the
-# student cannot know and withheld the part it was already told. "misdirect"
-# permutes the navigation targets instead, which is the informative half.
+# HOW the path block is built. Pinned because it IS the intervention:
+# "misdirect" permutes every receptacle slot in the plan, "intact" prints the
+# true path. The first design removed the plan's requirement step and was
+# refuted -- that step is the one the task description already states in 92% of
+# games, so the block gave away the navigation the student cannot know and
+# withheld the part it was already told; the candidate solved 14 of 15.
 "algorithm.oci_sat.plan_corruption": misdirect
 # Only where the plan exists. Widening this without widening the prompt sites in
 # env_manager would mark plain rollouts on the other two tasks, exclude them from
