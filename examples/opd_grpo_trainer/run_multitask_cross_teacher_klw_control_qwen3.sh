@@ -1007,15 +1007,24 @@ export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
 # the tail of every call on a mostly idle GPU. Pairs with VAL_PIPELINE_DEPTH:
 # with one slot there is no second caller to fill from.
 #
-# NOT accuracy-preserving, unlike the four above, and it is on anyway because
-# nothing in TRAINING can reach it: the pool serves only calls that pin n=1
-# (do_sample=False or validate=True), and a training rollout sets neither, so it
-# is refused and takes the blocking path. What it does change is VALIDATION --
-# which requests share a decode step moves floating-point reduction order, so
-# [val-hash] will not match a pumped run against an unpumped one. Compare
-# scores, not tokens. 0 restores the blocking path.
+# NOT accuracy-preserving, unlike the four above. What this comment used to say
+# next -- that nothing in TRAINING can reach it, because the pool serves only
+# calls pinning n=1 and a training rollout pins neither -- was written before
+# ROLLOUT_PUMP_TRAINING. It is now false in both halves. `_pump_pins_one_sample`
+# accepts a training call once the rank reports n=1, which is the case on these
+# arms (env.rollout.n is applied by repeating rows in the driver, not through
+# SamplingParams), and the k100 run logged
+#   [rollout-pump] ROLLOUT_PUMP_TRAINING='1' -> the TRAINING rollout goes
+#   through the pool too
+#   [rollout-pump] driving 2 ranks as a pool
+# So the TRAINING rollout does go through the pool, and since _pump_will_serve
+# is (this flag AND ROLLOUT_PUMP_TRAINING), setting this to 0 also turns the
+# pump off. Its cost in training is unmeasured; do not set it to 0 there
+# expecting determinism, which is unreachable anyway (FSDP/NCCL reduction order,
+# non-deterministic backward kernels, the remote retriever's timing) and is not
+# what a training run needs -- multiple seeds are.
 #
-# MEASURED 2026-09-14, AND IT IS NOT ONLY ABOUT TOKENS: with
+# WHERE IT DOES MATTER, MEASURED 2026-09-14, AND NOT ONLY IN TOKENS: with
 # ROLLOUT_KEEP_VLLM_AWAKE=1 (the default below) this makes validation
 # NONDETERMINISTIC -- re-scoring one checkpoint gave 0.744 to 0.811, and 10
 # repeats of the fast configuration had SD 1.60 pp. Either flag ALONE is
@@ -1025,7 +1034,12 @@ export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
 # ROLLOUT_ASYNC_GENERATE=0 for any val-only run whose number will be compared
 # with another: repeats then match byte for byte and it is not even slower
 # (5m00s against 5m18s -- 126 concurrent requests already saturate the engine).
-# docs/validation_determinism.md has the full ablation.
+#
+# A TRAINING run's OWN validation (trainer.test_freq) inherits this flag, so
+# those numbers carry the same 1.6 pp. The fix is not to slow training down: set
+# trainer.test_freq=0 and score the checkpoints afterwards with separate
+# val-only runs at ROLLOUT_ASYNC_GENERATE=0, which costs about five minutes each
+# and reproduces exactly. docs/validation_determinism.md has the full ablation.
 export ROLLOUT_ASYNC_GENERATE=${ROLLOUT_ASYNC_GENERATE:-1}
 # Match the mini-batch COLUMNS across ranks. _balance_batch equalises each rank's
 # total over the whole batch and reports that it worked to within a token; that

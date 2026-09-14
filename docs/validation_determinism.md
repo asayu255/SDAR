@@ -63,7 +63,19 @@ prefix caching を入れると 90 ゲーム中 **82 ゲームで生成テキス�
 
 ## 学習側はどうするか
 
-**やらないこと。** 学習の非決定性はロールアウト経路だけではない（FSDP/NCCL の縮約順序、backward の
+**学習中の検証（`trainer.test_freq`）はこのフラグを継承する。** 同じプロセス・同じ環境変数なので、
+学習 run が出す検証値には上記のブレがそのまま乗る。対処は学習を遅くすることではなく、
+**`trainer.test_freq=0` にして、後から val-only で `ROLLOUT_ASYNC_GENERATE=0` 採点する**こと
+（1 本 5 分、完全再現、学習速度への影響ゼロ）。
+
+なお `ROLLOUT_ASYNC_GENERATE=0` は学習側でも無影響ではない。`_pump_will_serve` は
+（このフラグ AND `ROLLOUT_PUMP_TRAINING`）なので、0 にすると **pump も止まる**。
+`_pump_pins_one_sample` はランクが n=1 を報告すれば学習呼び出しも受け付け、これらのアームでは
+`env.rollout.n` が駆動側の行複製で適用されるため n=1 である。k100 のログに
+`[rollout-pump] ROLLOUT_PUMP_TRAINING='1' -> the TRAINING rollout goes through the pool too` と
+残っている。学習での速度影響は未測定。
+
+**学習を決定化しようとはしないこと。** 学習の非決定性はロールアウト経路だけではない（FSDP/NCCL の縮約順序、backward の
 非決定的カーネル、search のリモートリトリーバ、Ray のスケジューリング。`torch.use_deterministic_algorithms`
 はこのツリーでは `verl/workers/megatron_workers.py` でコメントアウトされたまま）。残った非決定性は
 300 step で増幅するので、部分的な決定化は何も買わない。そして本質的に、学習で測りたい量は
