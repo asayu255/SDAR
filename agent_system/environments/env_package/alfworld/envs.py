@@ -61,6 +61,16 @@ class AlfworldWorker:
     def __init__(self, config, seed, base_env):
         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
         self.env.seed(seed)
+
+    def reseed(self, seed):
+        """Rebuild this worker's game cycle from ``seed``, back at its first game.
+
+        ``TextworldBatchGymEnv.seed`` shuffles a fresh copy of the game list and
+        hands reset() the elements in order, so re-seeding is a rewind.
+        """
+        self.env.seed(seed)
+        return True
+
     
     def step(self, action):
         """Execute a step in the environment"""
@@ -154,6 +164,7 @@ class AlfworldEnvs(gym.Env):
         self.multi_modal = (env_type == 'AlfredThorEnv')
         self.num_processes = env_num * group_n
         self.group_n = group_n
+        self._seed = seed
         # Kept, not just consumed above: a manager holding these envs has no other
         # way to tell a training rollout from a validation one, and any switch that
         # must not touch validation needs to ask (see _oci_candidate_row).
@@ -163,10 +174,39 @@ class AlfworldEnvs(gym.Env):
         env_worker = ray.remote(**resources_per_worker)(AlfworldWorker)
         self.workers = []
         for i in range(self.num_processes):
-            worker = env_worker.remote(config, seed + (i // self.group_n), base_env)
+            worker = env_worker.remote(config, self._worker_seed(i), base_env)
             self.workers.append(worker)
 
         self.prev_admissible_commands = [None for _ in range(self.num_processes)]
+
+    def _worker_seed(self, i: int) -> int:
+        """Seed of worker ``i``. The group_n workers of a group share a seed, so
+        they play the same game -- that is what makes a GRPO group a group."""
+        return self._seed + (i // self.group_n)
+
+    def rewind_games(self) -> str:
+        """Put every worker back at the first game of its cycle.
+
+        VALIDATION HAS TO SCORE THE SAME GAMES EVERY TIME AND DID NOT. The env
+        manager is built once per process and reset() takes the NEXT element of
+        each worker's shuffled list, so the second validation inside one process
+        scored a different 126-game set than the first: with test_freq=150 over
+        300 steps, @150 and @300 were not comparable, and the gap between them
+        mixed a policy change with a change of test set. Re-seeding rebuilds each
+        worker's iterator from the same seed, which is exactly the state a freshly
+        started val-only process is in -- which is why ten repeated val-only runs
+        of one checkpoint all scored the identical 126-game multiset.
+
+        Training envs must NOT be rewound: there, the cycle advancing once per
+        step is what gives a run 3553 games instead of 15.
+        """
+        if self.is_train:
+            raise RuntimeError(
+                "rewind_games() is for validation envs; training must keep advancing "
+                "its game cycle (see fast_forward/skip_games for the resume path)")
+        ray.get([w.reseed.remote(self._worker_seed(i)) for i, w in enumerate(self.workers)])
+        return (f"alfworld: {len(self.workers)} workers rewound to the first game of "
+                f"their cycle (seeds {self._worker_seed(0)}..{self._worker_seed(self.num_processes - 1)})")
 
     def step(self, actions):
         assert len(actions) == self.num_processes, \

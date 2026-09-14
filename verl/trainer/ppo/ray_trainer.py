@@ -1248,6 +1248,23 @@ class RayPPOTrainer:
         val_started = 0
         with rollout_session(self.actor_rollout_wg):
             slots = self._validation_slots()
+
+            # EVERY VALIDATION SCORES THE SAME PROBLEMS. The env managers are built
+            # once per process and each reset() takes the next game of the cycle, so
+            # the second validation inside one run scored a DIFFERENT 126-game set
+            # than the first -- with test_freq=150 over 300 steps, @150 and @300 were
+            # not comparable and the difference between them mixed a policy change
+            # with a change of test set. Rewinding here puts the cycle where a
+            # freshly started val_only process would have it, which is the state the
+            # repeated val-only runs of one checkpoint agreed on. The extra pipeline
+            # slots serve search only (PIPELINEABLE_VAL_TASKS), which draws its
+            # problems from the dataloader and has no cycle to rewind.
+            if self.val_envs is not None:
+                _rewind = getattr(self.val_envs, "rewind_games", None)
+                if _rewind is not None:
+                    _rewound = _rewind()
+                    if _rewound:
+                        print(f"[val-games] rewound to the start of the cycle: {_rewound}", flush=True)
             def _prepare_and_announce(test_data):
                 nonlocal val_started
                 val_started += 1

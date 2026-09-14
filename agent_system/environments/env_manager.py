@@ -1265,6 +1265,15 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
         self._last_obs_by_task = {}
         self._last_infos_by_task = {}
 
+    def rewind_games(self):
+        """Rewind every task that has a problem cycle. See EnvironmentManagerBase."""
+        out = {}
+        for task, manager in self.managers.items():
+            info = manager.rewind_games()
+            if info:
+                out[task] = info
+        return out
+
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
         if kwargs is None:
             raise ValueError("multitask environment requires env_kwargs with task_name for every sample.")
