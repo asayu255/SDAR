@@ -192,6 +192,25 @@ class AlfredTWEnv(object):
                 # Add to game file list
                 self.game_files.append(game_file_path)
 
+        # SORTED, BECAUSE os.walk ORDER IS A PROPERTY OF THE FILESYSTEM, NOT OF THE DATA.
+        # Every downstream draw is by POSITION in this list: TextworldBatchGymEnv.seed
+        # shuffles a copy with RandomState(seed) and plays element 0, and worker i is
+        # seeded env.seed + i // group_n (+1000 for validation). Unsorted, the same 140
+        # valid_seen and 3553 train games came out in three different orders on fuji
+        # (ext4), tamago (ext4) and yamabuki (NFS), so identical seeds drew different
+        # games on every host -- validation sets whose task-type mix did not even agree
+        # (fuji 11/34/23/31/6/21 vs yamabuki 12/28/25/26/13/22). The key is the path
+        # RELATIVE to data_path, so the host's mount point (/home/ohara vs
+        # /opt/home/ohara) never enters it and the order depends on the games alone.
+        #
+        # A given seed therefore draws different games than it did before this line
+        # existed -- as it already did from one host to the next. A run RESUMED across
+        # this change would switch game sequence mid-training: resume it from the code
+        # it started with. With num_train_games / num_eval_games > 0 the slice below
+        # takes the lexicographically first N, i.e. the leading task types; every
+        # config here uses -1.
+        self.game_files.sort(key=lambda p: os.path.relpath(p, data_path))
+
         print(f"Overall we have {len(self.game_files)} games in split={self.train_eval}")
         self.num_games = len(self.game_files)
 
