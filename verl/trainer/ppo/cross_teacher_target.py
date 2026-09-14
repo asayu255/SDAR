@@ -192,7 +192,7 @@ BRANCHES = ("agree", "conflict", "on_silent", "split")
 #               assert its direction and the layers are released over training
 #               (docs/cross_teacher_curriculum_design.md). Off-task injection is
 #               zero by construction and the final stage IS the control.
-MODES = ("tilt", "curriculum")
+MODES = ("tilt", "curriculum", "shrink")
 
 # The three layers of the on-task shift, coarsest first. Nested by construction:
 # |shared| <= |pair| <= |own|, all three carrying sign(h_on), and summing to
@@ -564,6 +564,59 @@ CURRICULUM_GRAD_ROLE_CUT_SUFFIXES = (
 )
 
 
+def shrink_exponent(*, shift_on: torch.Tensor, hat_off: torch.Tensor,
+                    sigma_on: torch.Tensor, lambda_prime: float) -> dict:
+    """``c`` for the UNIFORM-SHRINKAGE target -- the posterior mean of the
+    on-task shift under the hierarchical model, written as a tilt on ``p_on``.
+
+    Args:
+        shift_on: (bs, resp, k) ``log pi_on - log pi_0`` in nats, NOT standardised.
+        hat_off: (bs, resp, k, n_off) the off-task shifts in their own RMS units.
+        sigma_on: (bs, 1, 1) the row's own RMS divisor.
+        lambda_prime: the weight kept on the on-task teacher. ``1.0`` is the
+            control exactly; ``1/K`` is the equal-weight geometric mean of all K
+            teachers, i.e. routing removed from the TARGET. The hierarchical
+            model admits ``[1/K, 1]`` and nothing outside it -- no posterior
+            weights the on-task teacher BELOW an off-task one, since it is the
+            only one that observed this task's own component.
+
+    Returns:
+        ``{"c", "off_nats", "a", "beyond"}``. ``a = shift_on + c`` is the tilt on
+        BASE, so ``p_0 e^a`` is the target on the support. ``beyond`` marks the
+        candidates that leave the bracket ``[min(p_0, p_on), max(p_0, p_on)]``.
+
+    WHY THE SUBTRACTION IS OFF THE RAW SHIFT, for the same reason
+    :func:`nested_layers` gives: ``sigma * (h / sigma)`` is not ``h``, and at
+    ``lambda' = 1`` this arm has to reproduce the control BIT for bit. Written
+    as ``(1 - lambda')(sigma_d * mean_hat_off - h_d)`` the factor is exactly
+    ``0.0`` there, so ``c`` is exactly zero, ``live`` is False, and the loss gets
+    the on-task teacher's own bits. Written as ``sigma_d[lambda' hat_on + ...]``
+    it would not be.
+
+    THE OFF-TASK VOICES ARE CONVERTED INTO THE DESTINATION'S NATS
+    (``sigma_d * hat_m``) rather than mixed raw. The teachers were trained at
+    different KL coefficients -- search at 0.001, the others at 0.01 -- so a raw
+    mixture would mostly measure which teacher moved further from base. This is
+    equivalent to mixing the KLs against the gain-matched teachers
+    ``pi'_m ~ pi_0 (pi_m / pi_0)^(sigma_d / sigma_m)``, for which ``pi'_d`` is
+    ``pi_d`` itself.
+
+    BEYOND IS THE ARM'S DEFINING NUMBER. ``mode="curriculum"`` cannot leave the
+    base/on-task bracket by construction (its layers are bounded by the on-task
+    shift), which is why its clamp is None. Here the off-task mean can exceed
+    the on-task shift or oppose it, so the target leaves the bracket and the
+    clamp in :func:`normalized_weight` is load-bearing. How often that happens
+    is measured, not argued.
+    """
+    lam = float(lambda_prime)
+    assert 0.0 <= lam <= 1.0, f"lambda_prime={lam} is not a weight in [0, 1]"
+    off_nats = sigma_on * hat_off.mean(dim=-1)
+    c = (1.0 - lam) * (off_nats - shift_on)
+    a = shift_on + c
+    beyond = ((a * shift_on) < 0) | (a.abs() > shift_on.abs())
+    return {"c": c, "off_nats": off_nats, "a": a, "beyond": beyond}
+
+
 def curriculum_gradient_terms(*, student_logprob: torch.Tensor,
                               target_logprob: torch.Tensor, on_logprob: torch.Tensor,
                               live_kl: torch.Tensor, on_kl: torch.Tensor,
@@ -763,6 +816,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
                  diag_valid: torch.Tensor, task_ids: torch.Tensor,
                  off_plane_tasks: torch.Tensor, exponent_scale: float = 1.0,
                  mode: str = "tilt", rho: Optional[dict] = None,
+                 lambda_prime: Optional[float] = None,
                  shuffle_counterfactual: bool = False,
                  channel_counterfactuals: bool = False,
                  curriculum_counterfactuals: bool = False,
@@ -778,7 +832,12 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
             module was written for; ``"curriculum"`` is the corroboration-only
             staged target of ``docs/cross_teacher_curriculum_design.md``, which
             needs ``rho`` and ignores ``exponent_scale`` (its layers are already
-            in the on-task teacher's nats, so there is no unit to convert).
+            in the on-task teacher's nats, so there is no unit to convert);
+            ``"shrink"`` is the uniform-shrinkage geometric mixture of
+            ``docs/cross_teacher_shrink_design.md``, which needs
+            ``lambda_prime`` and also ignores ``exponent_scale``.
+        lambda_prime: the on-task weight, required in shrink mode. ``1.0``
+            makes the target the on-task teacher bit-for-bit.
         rho: ``{"pair", "own"}`` from :func:`curriculum_rho`, required in
             curriculum mode. ``(1, 1)`` makes the target the on-task teacher
             bit-for-bit.
@@ -842,6 +901,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
     cons = off_task_consensus(hat["off"])
     tilt = target_exponent(hat_on=hat["on"], consensus=cons, exponent_scale=exponent_scale)
 
+    shrink = None
     if mode == "curriculum":
         assert rho is not None, (
             "curriculum mode needs rho from curriculum_rho(step=...); the driver "
@@ -855,6 +915,19 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         # teacher on the other, by construction. See normalized_weight's `clamp`.
         built = normalized_weight(c=c, p_on=p_on, row_available=hat["row_available"],
                                   clamp=None)
+    elif mode == "shrink":
+        assert lambda_prime is not None, (
+            "cross_teacher_target.mode=shrink needs lambda_prime; there is no "
+            "default, because 1.0 is the control and any other value is a claim "
+            "about sigma_s^2 / (sigma_s^2 + sigma_eps^2) that the run is making"
+        )
+        layers = None
+        shrink = shrink_exponent(shift_on=shifts["on"], hat_off=hat["off"],
+                                 sigma_on=hat["sigma_on"], lambda_prime=lambda_prime)
+        c = shrink["c"]
+        # The clamp STAYS, unlike the curriculum path: `a` is not bounded by the
+        # on-task shift here, so nothing else caps one candidate's move.
+        built = normalized_weight(c=c, p_on=p_on, row_available=hat["row_available"])
     else:
         layers = None
         c = tilt["c"]
@@ -874,6 +947,12 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         "row_available": hat["row_available"],
         "mode": mode,
     }
+    if shrink is not None:
+        out.update({
+            "shift_on": shifts["on"], "off_nats": shrink["off_nats"],
+            "a": shrink["a"], "beyond": shrink["beyond"],
+            "lambda_prime": float(lambda_prime),
+        })
     if layers is not None:
         out.update({
             "layer_shared": layers["shared"], "layer_pair": layers["pair"],
@@ -886,11 +965,21 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
         assert response_mask is not None, "the shuffle rolls within the real response"
         from verl.trainer.ppo.cross_teacher_kl_weight import decorrelated_off_shifts
 
-        sh_c = target_exponent(
-            hat_on=hat["on"],
-            consensus=off_task_consensus(decorrelated_off_shifts(hat["off"], response_mask)),
-            exponent_scale=exponent_scale,
-        )["c"]
+        sh_off = decorrelated_off_shifts(hat["off"], response_mask)
+        if mode == "shrink":
+            # G1 reads the same way here as for the tilt path -- a ratio near 1
+            # says the mixture moves mass for reasons that survive destroying the
+            # position correspondence -- unlike the curriculum path, where it
+            # inverts and is replaced by the retained-mass ratio.
+            sh_c = shrink_exponent(shift_on=shifts["on"], hat_off=sh_off,
+                                   sigma_on=hat["sigma_on"],
+                                   lambda_prime=lambda_prime)["c"]
+        else:
+            sh_c = target_exponent(
+                hat_on=hat["on"],
+                consensus=off_task_consensus(sh_off),
+                exponent_scale=exponent_scale,
+            )["c"]
         out["shuffled_moved"] = normalized_weight(
             c=sh_c, p_on=p_on, row_available=hat["row_available"])["moved"]
     if channel_counterfactuals:
@@ -1036,6 +1125,34 @@ class TargetStepStats:
         "tail_cand", "tail_smass", "tail_three_cand", "tail_withheld_smass",
     )
 
+    # ...and the columns only the shrink path can fill. The channel split does
+    # not exist (one channel) but the shuffled counterfactual DOES keep G1's
+    # original meaning here, so it is not in this list -- it stays in _SUMS.
+    _SHRINK_ONLY = (
+        # sum p_on |h_d| and sum p_on |sigma_d mean hat_off|: how loud the
+        # off-task voice is against the on-task shift it is being mixed with,
+        # both in the destination teacher's nats. Their ratio is the dose in the
+        # only unit the target is written in.
+        "on_absmass", "off_absmass",
+        # does the off-task mean point the same way as the on-task teacher?
+        # Diagnostic only -- no sign enters the loss (theory 3.3: the posterior
+        # mean has no sign gate) -- but it separates "shrinking toward the
+        # consensus" from "being pulled across it".
+        "agree_cand", "agree_mass",
+        # THE ARM'S DEFINING NUMBER: candidates whose target leaves
+        # [min(p_0, p_on), max(p_0, p_on)], which mode="curriculum" cannot do at
+        # all. This is injection, counted.
+        "beyond_cand", "beyond_mass",
+        # sum p_on |c|, and its structural/content split. The audit measured the
+        # shared component as format; if the mixture lands on content instead,
+        # that is the webshop-damage path and it is visible here before the
+        # validation is.
+        "c_absmass", "c_structural", "c_content",
+        # KL(student || base) over all masked positions, as in curriculum mode:
+        # where the student sits between the two models the target interpolates.
+        "d_base_all",
+    )
+
     _SUMS = (
         "n_pos",              # response-masked positions
         "moved",              # sum of per-position TV(p_tilde, p_on), tail included
@@ -1101,7 +1218,12 @@ class TargetStepStats:
         self.mode = mode
         # Instance-level, so the rendered table has a column exactly when the
         # mode can fill it. _col() and metrics() both go through self._SUMS.
-        if mode == "curriculum":
+        if mode == "shrink":
+            self._SUMS = tuple(
+                k for k in self._SUMS
+                if k not in self._TILT_ONLY or k == "shuffled_moved"
+            ) + self._SHRINK_ONLY
+        elif mode == "curriculum":
             self._SUMS = tuple(
                 k for k in self._SUMS if k not in self._TILT_ONLY
             ) + self._CURRICULUM_ONLY + tuple(
@@ -1171,6 +1293,28 @@ class TargetStepStats:
             for key in ("shuffled_moved", "a_only_moved", "b_only_moved"):
                 if key in built:
                     cols[key] = built[key].to(torch.float64) * m_pos
+        elif self.mode == "shrink":
+            shift_on = built["shift_on"].to(torch.float64)
+            off_nats = built["off_nats"].to(torch.float64)
+            cols["on_absmass"] = shift_on.abs() * p * m_cand
+            cols["off_absmass"] = off_nats.abs() * p * m_cand
+            agree = ((shift_on * off_nats) > 0).to(torch.float64) * m_cand
+            cols["agree_cand"] = agree
+            cols["agree_mass"] = p * agree
+            beyond = built["beyond"].to(torch.float64) * m_cand
+            cols["beyond_cand"] = beyond
+            cols["beyond_mass"] = p * beyond
+            cols["c_absmass"] = c.abs() * p * m_cand
+            if "shuffled_moved" in built:
+                cols["shuffled_moved"] = built["shuffled_moved"].to(torch.float64) * m_pos
+            if roles is not None:
+                from verl.trainer.ppo.cross_teacher_kl_weight import role_keep_mask
+
+                for group in ("structural", "content"):
+                    keep = role_keep_mask(roles=roles, group=group).to(torch.float64)
+                    cols[f"c_{group}"] = c.abs() * p * m_cand * keep.unsqueeze(-1)
+            if d_base is not None:
+                cols["d_base_all"] = d_base.detach().to(torch.float64) * m_pos
         else:
             # The three layers, by teacher mass. p_on and not the student's mass:
             # the evidence is read on the measure of the distribution being
@@ -1376,6 +1520,34 @@ class TargetStepStats:
                 if ab > 0:
                     out[f"{head}/channel/a_share"] = g("a_absmass") / ab
                     out[f"{head}/channel/b_share"] = g("b_absmass") / ab
+            elif self.mode == "shrink":
+                # THE DOSE, in the destination's nats. lambda' sets it by
+                # construction -- |c| = (1 - lambda') |off_nats - h_d| -- so this
+                # is the run confirming the size the design predicted, not
+                # discovering it.
+                on_abs = g("on_absmass")
+                if on_abs > 0:
+                    out[f"{head}/shrink/off_to_on_absmass"] = g("off_absmass") / on_abs
+                    out[f"{head}/shrink/c_to_on_absmass"] = g("c_absmass") / on_abs
+                out[f"{head}/shrink/agree_cand_frac"] = g("agree_cand") / n_cand
+                out[f"{head}/shrink/agree_mass_frac"] = g("agree_mass") / mass
+                # INJECTION, counted. The curriculum arm's target is bounded by
+                # base and the on-task teacher by construction and this one is
+                # not; the fraction that actually leaves that bracket is the
+                # difference between the two arms, so it is a first-class number
+                # rather than an inference from c.
+                out[f"{head}/shrink/beyond_cand_frac"] = g("beyond_cand") / n_cand
+                out[f"{head}/shrink/beyond_mass_frac"] = g("beyond_mass") / mass
+                c_abs = g("c_absmass")
+                if c_abs > 0:
+                    # The two do not sum to 1: a role code this build does not
+                    # know lands in neither group.
+                    for group in ("structural", "content"):
+                        col = f"c_{group}"
+                        if col in self._SUMS:
+                            out[f"{head}/shrink/role/{group}_share"] = g(col) / c_abs
+                if "d_base_all" in self._SUMS and g("d_base_all") != 0:
+                    out[f"{head}/kl_to_base"] = g("d_base_all") / n_pos
             else:
                 # HOW MUCH OF THE ON-TASK SHIFT IS BACKED by at least three, at
                 # least two, at least one teacher: each layer's p_on-weighted
@@ -1454,12 +1626,14 @@ class TargetStepStats:
             inter = g("intervention")
             if inter > 0:
                 out[f"{head}/tag_share"] = g("tag_intervention") / inter    # G3
-            if self.mode == "tilt":
+            if self.mode in ("tilt", "shrink"):
                 if g("moved") > 0 and g("shuffled_moved") >= 0 and scope == 0:
                     out[f"{head}/shuffled_tv_ratio"] = g("shuffled_moved") / g("moved")  # G1
-                for key, col in (("a_only_tv", "a_only_moved"), ("b_only_tv", "b_only_moved")):
-                    if g(col) > 0:
-                        out[f"{head}/channel/{key}"] = g(col) / n_pos
+                if self.mode == "tilt":
+                    for key, col in (("a_only_tv", "a_only_moved"),
+                                     ("b_only_tv", "b_only_moved")):
+                        if g(col) > 0:
+                            out[f"{head}/channel/{key}"] = g(col) / n_pos
             if g("d_base") > 0:
                 out[f"{head}/acted_novelty"] = 1.0 - g("d_on") / g("d_base")  # G2
             # A rate, not an alarm: the clamp is the mechanism's only cap. READ
@@ -1468,7 +1642,7 @@ class TargetStepStats:
             # mass ratio that says whether the continuous signal has collapsed
             # back to a flat +-clamp -- which is what the section 2 construction
             # exists to avoid, and what retired the (2.148, 3.0) setting.
-            if self.mode == "tilt":
+            if self.mode in ("tilt", "shrink"):
                 out[f"{head}/clamped_per_step"] = g("clamped")
                 if g("acted_cand") > 0:
                     out[f"{head}/clamped_frac_of_acted"] = g("clamped") / g("acted_cand")

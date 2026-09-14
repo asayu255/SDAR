@@ -1986,6 +1986,29 @@ class DataParallelPPOActor(BasePPOActor):
         assert xtt_mode in XTT_MODES, (
             f"actor.cross_teacher_target.mode={xtt_mode!r} is not one of {XTT_MODES}"
         )
+        xtt_lambda = None
+        if xtt_cfg_on and xtt_mode == "shrink":
+            # Same refusal as the curriculum path's, for the same reason: the
+            # shrink target's tilt is already in the destination teacher's nats,
+            # so a unit conversion has nothing to convert and a config carrying
+            # the key was copied from the tilt arm's script.
+            assert "exponent_scale" not in (xtt_cfg or {}), (
+                "cross_teacher_target.mode=shrink has no exponent_scale: its tilt is "
+                "in the on-task teacher's own nats already. Remove the key rather than "
+                "setting it to 1.0, so the run's config says which mechanism it is"
+            )
+            _lam = (xtt_cfg or {}).get("lambda_prime", None)
+            assert _lam is not None, (
+                "cross_teacher_target.mode=shrink needs lambda_prime and has no "
+                "default: 1.0 is the control bit-for-bit and every other value is a "
+                "claim about sigma_s^2 / (sigma_s^2 + sigma_eps^2). A run must say it"
+            )
+            xtt_lambda = float(_lam)
+            assert 0.0 <= xtt_lambda <= 1.0, (
+                f"cross_teacher_target.lambda_prime={xtt_lambda} is not a weight in "
+                "[0, 1]. The hierarchical model admits [1/K, 1]; below 1/K the on-task "
+                "teacher is weighted under an off-task one, which no posterior does"
+            )
         xtt_rho = None
         if xtt_cfg_on and xtt_mode == "curriculum":
             # REFUSED rather than ignored. The curriculum's layers are already in
@@ -3229,6 +3252,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     exponent_scale=xtt_scale,
                                     mode=xtt_mode,
                                     rho=xtt_rho,
+                                    lambda_prime=xtt_lambda,
                                     # The counterfactuals ride the collecting
                                     # epoch only: a few more elementwise
                                     # exchanges, and nothing the loss reads.
@@ -3239,7 +3263,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     # subtraction), so what replaces it is the
                                     # shared layer's retained mass.
                                     shuffle_counterfactual=(
-                                        xtt_collect and xtt_mode == "tilt"),
+                                        xtt_collect and xtt_mode in ("tilt", "shrink")),
                                     channel_counterfactuals=(
                                         xtt_collect and xtt_mode == "tilt"),
                                     curriculum_counterfactuals=(

@@ -90,6 +90,13 @@ def _overrides(path):
     # OmegaConf as an INTERPOLATION, which fails to resolve and takes the whole
     # compose down -- a shell construct read as a config reference.
     cmd = re.sub(r"\$\{(\w+):\+[^}]*\}", "", cmd)
+    # ...and bash's ${VAR:-text} -- "VAR, or text when it is unset or empty".
+    # The scripts use it for values a launch legitimately overrides (the
+    # retriever URL is not local on every host; where a run stops is
+    # operational). Expanded the same way bash would, so a test that sets the
+    # variable and one that does not both read what the launch would.
+    cmd = re.sub(r"\$\{(\w+):-([^}]*)\}",
+                 lambda m: os.environ.get(m.group(1)) or m.group(2), cmd)
     # RUN_TAG_SUFFIX is the derived form of that same construct, and the scripts
     # now put it on the wandb names as well as the paths. Resolved from the
     # environment with an empty default -- the SAME rule load_expectations uses,
