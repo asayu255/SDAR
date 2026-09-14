@@ -575,9 +575,15 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
     sub["attention_mask"] = s_mask
     if s_pos is not None:
         sub["position_ids"] = s_pos
-    # WITH gradient: this is the term being optimised, not a diagnostic.
-    _, _, lp_plain = actor._forward_micro_batch(
+    # WITH gradient: this is the term being optimised, not a diagnostic. The
+    # forward returns (entropy, log_probs, topk_out); the log-prob is the SECOND
+    # slot. The first version took the third, which is None when no top-k is
+    # asked for, and the run died on `None - Tensor` at its first shaped row.
+    _, lp_plain, _ = actor._forward_micro_batch(
         micro_batch=sub, temperature=temperature, calculate_entropy=False)
+    assert lp_plain is not None and tuple(lp_plain.shape) == tuple(old_log_prob[rows].shape), (
+        f"the plain forward returned {None if lp_plain is None else tuple(lp_plain.shape)} "
+        f"for log-probs of shape {tuple(old_log_prob[rows].shape)}")
 
     shaped = shaped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows], gamma=gamma)
     out = pg_losses.clone()

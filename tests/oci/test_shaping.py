@@ -185,7 +185,13 @@ class StubActor:
         self.seen_ids = ids.clone()
         live = micro_batch["attention_mask"][:, :ids.shape[1] - RL].sum(-1, keepdim=True)
         lp = -self.scale * (live.to(torch.float32) / 10.0).expand(-1, RL)
-        return None, None, lp
+        # THE REAL ORDER: (entropy, log_probs, topk_out). This stub used to hand
+        # the log-prob back in the THIRD slot, which is what the production code
+        # read -- so the test passed against a wiring that returned None (the
+        # top-k, not requested) for every real row and died at the first shaped
+        # row of the first GPU run. tests/oci/test_slots.py pins the order by
+        # source; this stub follows it.
+        return None, lp, None
 
 
 adv = torch.full((BS, RL), -math.sqrt(7))

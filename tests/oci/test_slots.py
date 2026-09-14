@@ -15,7 +15,7 @@ is degenerate, in which case the eighth is replaced by the special rollout that
 disagrees -- and never by one that cannot be re-scored on the plain prompt, since
 that is what makes the shaped term meaningful.
 """
-import glob, json, os, re, sys, zlib
+import glob, json, math, os, re, sys, zlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -460,6 +460,67 @@ check(re.search(r"_kld_for_loss = teacher_kld if _pb_w is None else teacher_kld 
 check("oci_slots_on = bool(_oci_slots_cfg.get(\"enable\", False))" in src
       and "_oci_shape_wanted = bool(_oci_shape_cfg.get(\"enable\", False)) or oci_slots_on" in src,
       "the layout turns the shaping on by itself: there is no unshaped version of this arm")
+
+# --- 7b. the shaped rows, driven through the real _oci_shaped_rows -------------
+# The first two runs of this path on a GPU died inside it, each on something no
+# CPU test had exercised: a tensor built on the wrong device, diagnostics handed
+# to _defer as floats, and the plain log-prob taken from the wrong slot of the
+# forward's 3-tuple. This drives the real function with a stand-in actor whose
+# forward returns what the real one does -- (entropy, log_probs, topk_out) -- and
+# holds the row replacement, the sub-batch it forwards, and the diagnostics'
+# types against it. The return order itself is pinned by source, below.
+try:
+    from verl.workers.actor.dp_actor import _oci_opd_keep, _oci_shaped_rows
+    _HAVE_ACTOR = True
+except Exception as _exc:  # pragma: no cover - environment without the actor's deps
+    print(f"  SKIP  dp_actor not importable here ({type(_exc).__name__}); shaped-row drive skipped")
+    _HAVE_ACTOR = False
+if _HAVE_ACTOR:
+    PL, RL, BS = 8, 4, 3
+    ids = torch.arange(100, 100 + BS * (PL + RL)).reshape(BS, PL + RL)
+    mask = torch.ones(BS, PL + RL, dtype=torch.long)
+    pos = torch.arange(PL + RL).repeat(BS, 1)
+    mb = {"input_ids": ids, "attention_mask": mask, "position_ids": pos, "responses": ids[:, PL:].clone(),
+          "oci_plan_off": torch.tensor([0, 1, 0]), "oci_plan_len": torch.tensor([0, 2, 0]),
+          "oci_plan_repl": torch.zeros(BS, 4, dtype=torch.int32), "oci_plan_repl_len": torch.tensor([0, 0, 0]),
+          "oci_plan_truncated": torch.tensor([0, 0, 0]), "oci_injected": torch.tensor([0, 1, 1])}
+    seen = {}
+
+    class _Actor:
+        def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, **kw):
+            seen["sub"] = micro_batch
+            n = micro_batch["input_ids"].shape[0]
+            return None, torch.full((n, RL), -1.0, requires_grad=True), None
+
+    pg = torch.full((BS, RL), 7.0)
+    adv = torch.tensor([[1.0] * RL, [2.0] * RL, [3.0] * RL])
+    old = torch.full((BS, RL), -1.5)
+    out, diag = _oci_shaped_rows(_Actor(), mb, pg, torch.tensor([False, True, True]),
+                                 response_mask=torch.ones(BS, RL), advantages=adv, old_log_prob=old,
+                                 temperature=1.0, gamma=0.1)
+    rho = math.exp(-1.0 - (-1.5))
+    check(torch.allclose(out[1], torch.full((RL,), -2.0 * rho / (rho + 0.1)))
+          and torch.equal(out[0], pg[0]) and torch.equal(out[2], pg[2]),
+          "the strippable injected row's loss is -A*f(rho); the other rows keep their clipped term "
+          "(the unstrippable one too)")
+    check(seen["sub"]["input_ids"].shape[0] == 1 and torch.equal(seen["sub"]["responses"][0], mb["responses"][1])
+          and seen["sub"]["input_ids"][0, :PL][seen["sub"]["attention_mask"][0, :PL].bool()].tolist()
+          == [ids[1, 0].item()] + ids[1, 3:PL].tolist(),
+          "the forward receives only the strippable row, with its span taken out and its response intact")
+    check(float(diag["oci/shaping/rows_injected"]) == 2 and float(diag["oci/shaping/rows_unstrippable"]) == 1
+          and all(torch.is_tensor(v) and v.dim() == 0 and v.detach() is not None for v in diag.values())
+          and "oci/shaping/frac_in_band" in diag,
+          "the diagnostics are 0-d tensors (what _defer detaches) and count the unstrippable row")
+    keep = _oci_opd_keep(mb, torch.zeros(BS, RL))
+    check(keep.tolist() == [[1.0], [0.0], [0.0]], "the distillation keep factor is 0 exactly on the injected rows")
+    src = open(os.path.join(REPO, "verl/workers/actor/dp_actor.py")).read()
+    fm = src[src.index("def _forward_micro_batch("):]
+    fm = fm[:fm.index("\n    def ", 10)]
+    rets = [l.strip() for l in fm.splitlines() if l.strip().startswith("return ")]
+    check(rets and all(r == "return entropy, log_probs, topk_out" for r in rets)
+          and "_, lp_plain, _ = actor._forward_micro_batch(" in src,
+          f"the real forward returns (entropy, log_probs, topk_out) at every exit ({len(rets)} of them) "
+          "and the shaped path reads the second slot")
 
 # --- 8. the launch is refused when it cannot be the arm ----------------------
 def full_cfg(**over):
