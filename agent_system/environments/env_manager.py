@@ -197,7 +197,8 @@ def _oci_plan_mode(config) -> str:
             "'delay' prefixes the true path with a tour that spends the turn "
             "budget, 'intact' prints the true path from high_pddl (unnumbered), "
             "'walkthrough' prints TextWorld's own numbered solution, "
-            "'walkthrough_stepwise' adds a per-turn progress line to it. 'drop' "
+            "'walkthrough_stepwise' / 'delay_stepwise' add a per-turn progress "
+            "line to those blocks. 'drop' "
             "removed the requirement step and is gone: it was refuted "
             "(cand_fail_rate 1/15)."
         )
@@ -220,21 +221,21 @@ def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str
     mode = _oci_plan_mode(config)
     n_detour = _oci_detour(config)
     turns = _oci_delay_turns(config)
-    scene = (_scene_receptacles(gamefile, admissible)
-             if (n_detour or mode == "delay") else [])
+    needs_scene = n_detour or mode in ("delay", "delay_stepwise")
+    scene = _scene_receptacles(gamefile, admissible) if needs_scene else []
     key = (str(gamefile), mode, n_detour, turns)
     if key not in _WRONG_PLAN_CACHE:
         block = _build_wrong_plan(str(gamefile), mode, n_detour, scene, turns)
         # DO NOT CACHE A BLOCK BUILT WITHOUT THE SCENE. The pool comes from the
         # admissible actions, so an early call that has none would otherwise
         # pin an empty tour for the rest of training.
-        if block or not (n_detour or mode == "delay") or scene:
+        if block or not needs_scene or scene:
             _WRONG_PLAN_CACHE[key] = block
         return block
     return _WRONG_PLAN_CACHE[key]
 
 
-PLAN_CORRUPTIONS = ("misdirect", "intact", "delay", "walkthrough", "walkthrough_stepwise")
+PLAN_CORRUPTIONS = ("misdirect", "intact", "delay", "walkthrough", "walkthrough_stepwise", "delay_stepwise")
 
 # The block, in the environment's own words. Both modes emit the SAME text apart
 # from the numbered lines -- no word anywhere says whether the path is right.
@@ -457,8 +458,23 @@ def _tw_pddl(gamefile: str):
 _GUIDE_ANCHOR = "Now it's your turn to take an action."
 
 
+_STEPWISE_MODES = ("walkthrough_stepwise", "delay_stepwise")
+
+
 def _oci_stepwise(config) -> bool:
-    return _oci_switch_on(config) and _oci_plan_mode(config) == "walkthrough_stepwise"
+    return _oci_switch_on(config) and _oci_plan_mode(config) in _STEPWISE_MODES
+
+
+def _block_lines(block: str):
+    """The numbered lines of the block actually shown -- what the pointer walks.
+
+    Read off the rendered block rather than rebuilt from the walkthrough, so the
+    progress line can never disagree with the path on screen: for
+    walkthrough_stepwise these ARE the walkthrough, for delay_stepwise they are the
+    tour followed by the walkthrough.
+    """
+    import re
+    return re.findall(r"^\d+\. (.+)$", block or "", flags=re.M)
 
 
 def _guide_line(walk, ptr: int) -> str:
@@ -644,7 +660,7 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
         body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(walk))
         return f"{_PLAN_HEADER}\n{_PLAN_LEAD}\n{body}\n{_PLAN_FOOTER}\n\n"
 
-    if mode == "delay":
+    if mode in ("delay", "delay_stepwise"):
         walk, banned = _tw_pddl(gamefile)
         if not walk or not scene_recs:
             return ""
@@ -831,7 +847,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             ptrs = list(getattr(self, "_guide_ptr", None) or [0] * len(actions))
             for i, act in enumerate(actions):
                 if _oci_candidate_row(i, getattr(self, 'envs', None), self.config):
-                    ptrs[i] = _advance_guide(_tw_pddl(str(self.gamefile[i]))[0], ptrs[i], act)
+                    shown = self._oci_prefixes[i] if i < len(self._oci_prefixes) else ""
+                    ptrs[i] = _advance_guide(_block_lines(shown), ptrs[i], act)
             self._guide_ptr = ptrs
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
@@ -912,7 +929,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             if _oci_pre and _oci_stepwise(self.config):
                 _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
-                obs = _insert_guide(obs, _guide_line(_tw_pddl(str(self.gamefile[i]))[0], _ptrs[i]))
+                obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs

@@ -1583,7 +1583,7 @@ class OPDRayTrainer(RayPPOTrainer):
                 "tokens_max": int(pl.max()),
             })
         _mode = str((self.config.algorithm.get("oci_sat", {}) or {}).get("plan_corruption", ""))
-        if _mode == "walkthrough_stepwise":
+        if _mode.endswith("_stepwise"):
             rec["reachability"] = {
                 "skipped": "walkthrough_stepwise puts a progress line OUTSIDE the stripped "
                            "span, so the 'plain' prompt would still carry privileged text "

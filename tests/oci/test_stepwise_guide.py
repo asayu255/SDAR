@@ -102,6 +102,29 @@ else:
     check("progress]" not in o2["text"][1], "plain `walkthrough` mode adds no progress line")
 
 
+# --- delay_stepwise: the pointer walks the TOUR first --------------------------
+if gf is not None:
+    scene = ["go to cabinet 1", "go to cabinet 2", "go to drawer 1", "go to shelf 1", "go to shelf 2",
+             "go to countertop 1", "go to microwave 1", "go to fridge 1", "go to coffeemachine 1", "look"]
+
+    class TourEnvs(FakeEnvs):
+        get_admissible_commands = [list(scene), list(scene)]
+
+    cfg3 = SimpleNamespace(env=SimpleNamespace(history_length=2),
+                           algorithm={"oci_sat": {"enable": True, "plan_corruption": "delay_stepwise", "delay_turns": 50}})
+    em._WRONG_PLAN_CACHE.clear()
+    m3 = em.AlfWorldEnvironmentManager(TourEnvs(), lambda acts, adm: (list(acts), [1] * len(acts)), cfg3)
+    o3, _ = m3.reset(kwargs=None)
+    blk3 = em._build_wrong_plan(gf, "delay", 0, [x[len("go to "):] for x in scene if x.startswith("go to ")], 50)
+    lines3 = em._block_lines(blk3)
+    check(o3["text"][1].startswith(blk3) and len(lines3) > 50, f"the delay_stepwise block is the delay block ({len(lines3)} lines: tour then walkthrough)")
+    check(f"Your next action is step 1 of {len(lines3)}: {lines3[0]}" in o3["text"][1], "its first progress line names the first TOUR line, not the walkthrough")
+    x1, *_ = m3.step(["look", lines3[0]])
+    check(f"step 2 of {len(lines3)}: {lines3[1]}" in x1["text"][1], "taking the tour step advances along the tour")
+    check(lines3[50:] == real_walk, "after 50 tour lines the pointer would reach the true walkthrough")
+    check(em._block_lines(em._build_wrong_plan(gf, "walkthrough")) == real_walk, "for walkthrough_stepwise the shown lines ARE the walkthrough, so that mode is unchanged")
+
+
 def test_stepwise_guide():
     assert ok
 
