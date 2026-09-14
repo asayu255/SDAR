@@ -1014,6 +1014,18 @@ export VAL_PIPELINE_DEPTH=${VAL_PIPELINE_DEPTH:-3}
 # which requests share a decode step moves floating-point reduction order, so
 # [val-hash] will not match a pumped run against an unpumped one. Compare
 # scores, not tokens. 0 restores the blocking path.
+#
+# MEASURED 2026-09-14, AND IT IS NOT ONLY ABOUT TOKENS: with
+# ROLLOUT_KEEP_VLLM_AWAKE=1 (the default below) this makes validation
+# NONDETERMINISTIC -- re-scoring one checkpoint gave 0.744 to 0.811, and 10
+# repeats of the fast configuration had SD 1.60 pp. Either flag ALONE is
+# byte-identical to the all-off baseline; the pair is what breaks it, because
+# async opens the continuously-stepped engine and keep-awake lets it live across
+# turns, so arrival timing decides which requests share a decode step. Set
+# ROLLOUT_ASYNC_GENERATE=0 for any val-only run whose number will be compared
+# with another: repeats then match byte for byte and it is not even slower
+# (5m00s against 5m18s -- 126 concurrent requests already saturate the engine).
+# docs/validation_determinism.md has the full ablation.
 export ROLLOUT_ASYNC_GENERATE=${ROLLOUT_ASYNC_GENERATE:-1}
 # Match the mini-batch COLUMNS across ranks. _balance_batch equalises each rank's
 # total over the whole batch and reports that it worked to within a token; that
