@@ -196,7 +196,8 @@ def _oci_plan_mode(config) -> str:
             f"{PLAN_CORRUPTIONS}. 'misdirect' permutes the navigation targets, "
             "'delay' prefixes the true path with a tour that spends the turn "
             "budget, 'intact' prints the true path from high_pddl (unnumbered), "
-            "'walkthrough' prints TextWorld's own numbered solution. 'drop' "
+            "'walkthrough' prints TextWorld's own numbered solution, "
+            "'walkthrough_stepwise' adds a per-turn progress line to it. 'drop' "
             "removed the requirement step and is gone: it was refuted "
             "(cand_fail_rate 1/15)."
         )
@@ -233,7 +234,7 @@ def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str
     return _WRONG_PLAN_CACHE[key]
 
 
-PLAN_CORRUPTIONS = ("misdirect", "intact", "delay", "walkthrough")
+PLAN_CORRUPTIONS = ("misdirect", "intact", "delay", "walkthrough", "walkthrough_stepwise")
 
 # The block, in the environment's own words. Both modes emit the SAME text apart
 # from the numbered lines -- no word anywhere says whether the path is right.
@@ -435,6 +436,57 @@ def _tw_pddl(gamefile: str):
     return _TW_PDDL_CACHE[key]
 
 
+# --- walkthrough_stepwise: where the student is in the path, every turn ------
+#
+# WHY. Shown the whole walkthrough, the eighth rollout rescued 12 of 34 stuck groups
+# -- real (chance 2.4%) but far below the 100% a compliant student gets: replayed in
+# the live env the walkthrough wins 30 of 30 games. How far it followed says where it
+# breaks: of 60 candidate trajectories 17 followed exactly 4 lines and only 3 went
+# past 4, and 4 lines is the whole solution for pick_and_place and look_at but the
+# midpoint of heat/cool/clean/pick_two -- the share of 4-step tasks (33%) is about
+# the rescue rate (35%). The prompt carries two turns of history, and the block is
+# numbered but says nothing about which line is next, so by step four the student
+# cannot tell from its own prompt where it is.
+#
+# WHAT. (A) A pointer per slot that advances only when the action actually taken is
+# the next line, so a deviation leaves it on the step still owed; (B) the line
+# rendered right before "Now it's your turn to take an action.", where the action
+# is chosen, instead of only in the block at the top of a ~600-token prompt. The
+# block itself is byte-identical to `walkthrough`, so the two probes differ in this
+# line and nothing else.
+_GUIDE_ANCHOR = "Now it's your turn to take an action."
+
+
+def _oci_stepwise(config) -> bool:
+    return _oci_switch_on(config) and _oci_plan_mode(config) == "walkthrough_stepwise"
+
+
+def _guide_line(walk, ptr: int) -> str:
+    """The progress line for a slot whose pointer is at ``ptr``."""
+    n = len(walk)
+    if n == 0:
+        return ""
+    if ptr >= n:
+        return f"[Privileged Solution Path progress] All {n} steps of the path are done.\n\n"
+    done = "" if ptr == 0 else (f"Step 1 of {n} is done. " if ptr == 1 else f"Steps 1-{ptr} of {n} are done. ")
+    return (f"[Privileged Solution Path progress] {done}"
+            f"Your next action is step {ptr + 1} of {n}: {walk[ptr]}\n\n")
+
+
+def _advance_guide(walk, ptr: int, action) -> int:
+    """Advance past a step only when the action taken IS that step."""
+    if ptr < len(walk) and str(action).strip().lower() == str(walk[ptr]).strip().lower():
+        return ptr + 1
+    return ptr
+
+
+def _insert_guide(obs: str, line: str) -> str:
+    """Put ``line`` immediately before the turn prompt; untouched if that is ambiguous."""
+    if not line or obs.count(_GUIDE_ANCHOR) != 1:
+        return obs
+    return obs.replace(_GUIDE_ANCHOR, line + _GUIDE_ANCHOR, 1)
+
+
 def _delay_lines(walk, banned, scene_recs, min_turns: int):
     """A tour that cannot be refuted, then the true path behind it.
 
@@ -576,7 +628,7 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
     if mode not in PLAN_CORRUPTIONS:
         raise ValueError(f"plan_corruption={mode!r}; expected one of {PLAN_CORRUPTIONS}")
 
-    if mode == "walkthrough":
+    if mode in ("walkthrough", "walkthrough_stepwise"):
         # THE CORRECT DOCUMENT, AS STRONG AS IT GETS. game.tw-pddl's walkthrough is
         # TextWorld's own solution in the environment's numbered vocabulary
         # (`take mug 1 from countertop 2`), executable as printed -- unlike
@@ -757,6 +809,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def reset(self, kwargs):
         text_obs, image_obs, infos = self.envs.reset()
         self.gamefile = parse_gamefile(infos)
+        # walkthrough_stepwise: every slot starts at step 1 of its path.
+        self._guide_ptr = [0] * len(text_obs)
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
@@ -772,6 +826,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
+
+        if _oci_stepwise(self.config) and getattr(self, 'gamefile', None):
+            ptrs = list(getattr(self, "_guide_ptr", None) or [0] * len(actions))
+            for i, act in enumerate(actions):
+                if _oci_candidate_row(i, getattr(self, 'envs', None), self.config):
+                    ptrs[i] = _advance_guide(_tw_pddl(str(self.gamefile[i]))[0], ptrs[i], act)
+            self._guide_ptr = ptrs
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         if infos[0].get("extra.gamefile") is None:
@@ -848,6 +909,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                             if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
                 self._oci_prefixes.append(_oci_pre)
                 obs = _oci_pre + obs
+
+            if _oci_pre and _oci_stepwise(self.config):
+                _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
+                obs = _insert_guide(obs, _guide_line(_tw_pddl(str(self.gamefile[i]))[0], _ptrs[i]))
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs

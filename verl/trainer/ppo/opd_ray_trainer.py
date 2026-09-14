@@ -240,7 +240,7 @@ def _oci_adherence(tokenizer, batch, cand_mask):
     rlen = resp.shape[1]
     plen = ids.shape[1] - rlen
 
-    plans, per_traj = {}, {}
+    plans, per_traj, tasks, traj_uid = {}, {}, {}, {}
     for i in np.flatnonzero(cand_mask):
         i = int(i)
         g = str(uids[i])
@@ -251,6 +251,8 @@ def _oci_adherence(tokenizer, batch, cand_mask):
             plans[g] = (re.findall(r"^\s*\d+\.\s*(.+?)\s*$",
                                    prompt[a:b], flags=re.M)
                         if 0 <= a < b else [])
+            _t = re.search(r"Your task is to: (.+?)(?:\n|$)", prompt)
+            tasks[g] = _t.group(1).strip() if _t else ""
         plan = plans[g]
         if not plan:
             continue
@@ -259,9 +261,10 @@ def _oci_adherence(tokenizer, batch, cand_mask):
         s0, s1 = text.find("<action>"), text.find("</action>")
         act = text[s0 + 8:s1].strip() if 0 <= s0 < s1 else None
         per_traj.setdefault(str(tuids[i]), []).append((int(turns[i]), act, plan))
+        traj_uid[str(tuids[i])] = g
 
-    ks, rates, lens = [], [], []
-    for rows in per_traj.values():
+    ks, rates, lens, ptrs, records = [], [], [], [], []
+    for tr, rows in per_traj.items():
         rows.sort()
         base, plan = rows[0][0], rows[0][2]
         hit = [(act is not None and t - base < len(plan)
@@ -271,9 +274,18 @@ def _oci_adherence(tokenizer, batch, cand_mask):
             if not h:
                 break
             k += 1
+        # How far down the path it got in the end, allowing detours: the pointer
+        # advances only on the step still owed, as walkthrough_stepwise does.
+        ptr = 0
+        for _, act, _p in rows:
+            if act is not None and ptr < len(plan) and act == plan[ptr].lower():
+                ptr += 1
         ks.append(k)
+        ptrs.append(ptr)
         rates.append(float(np.mean(hit)) if hit else 0.0)
         lens.append(len(plan))
+        records.append({"traj": tr, "uid": traj_uid.get(tr), "task": tasks.get(traj_uid.get(tr), "")[:90],
+                        "plan_len": len(plan), "leading_k": k, "ptr_final": ptr})
     if not ks:
         return {"error": "no candidate row carries a readable plan block"}
     ks_a = np.asarray(ks, dtype=float)
@@ -285,7 +297,10 @@ def _oci_adherence(tokenizer, batch, cand_mask):
             "leading_k_ge_40": float((ks_a >= 40).mean()),
             "leading_k_hist": {str(int(v)): int(c) for v, c in
                                zip(*np.unique(ks_a, return_counts=True))},
-            "match_rate_mean": float(np.mean(rates))}
+            "match_rate_mean": float(np.mean(rates)),
+            "ptr_final_mean": float(np.mean(ptrs)),
+            "full_follow_rate": float(np.mean([p >= n for p, n in zip(ptrs, lens)])),
+            "records": records}
 
 
 def _oci_sample_dump(tokenizer, batch, cand_mask, *, n_groups=3, max_chars=2600):
@@ -1519,7 +1534,13 @@ class OPDRayTrainer(RayPPOTrainer):
                 "tokens_p50": float(np.percentile(pl, 50)),
                 "tokens_max": int(pl.max()),
             })
-        if not len(rows):
+        _mode = str((self.config.algorithm.get("oci_sat", {}) or {}).get("plan_corruption", ""))
+        if _mode == "walkthrough_stepwise":
+            rec["reachability"] = {
+                "skipped": "walkthrough_stepwise puts a progress line OUTSIDE the stripped "
+                           "span, so the 'plain' prompt would still carry privileged text "
+                           "and rho would compare privileged with privileged"}
+        elif not len(rows):
             rec["reachability"] = {
                 "error": "no candidate row carries a strippable plan span; is "
                          "algorithm.oci_sat.enable reaching the alfworld manager, "
@@ -1551,6 +1572,59 @@ class OPDRayTrainer(RayPPOTrainer):
             rec["adherence"] = _oci_adherence(self.tokenizer, batch, cand_np)
         except Exception as exc:
             rec["adherence"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        # RESCUE BY PLAN LENGTH. The whole-path probe's followers stopped at 4 lines,
+        # which is the entire solution for pick_and_place and look_at and half of the
+        # rest, so the rescue rate has to be read separately for short and long plans
+        # -- a pooled rate cannot say whether a progress pointer helps where the
+        # student was losing its place.
+        try:
+            _recs = (rec.get("adherence") or {}).get("records") or []
+            if _recs and tuids is not None:
+                _status = {str(u): g.get("status") for u, g in grp.items()}
+                _ret = {}
+                for i in np.flatnonzero(cand_np):
+                    k = str(tuids[i])
+                    _ret[k] = max(_ret.get(k, float("-inf")), float(rets[i]))
+
+                def _kind(task):
+                    t = task.lower()
+                    if " two " in f" {t} ":
+                        return "pick_two"
+                    if "clean" in t:
+                        return "clean"
+                    if "hot" in t or "heat" in t:
+                        return "heat"
+                    if "cool" in t:
+                        return "cool"
+                    if "look at" in t or "examine" in t:
+                        return "look_at"
+                    return "pick_and_place"
+
+                _agg = {}
+                for r in _recs:
+                    r["class"] = _status.get(str(r["uid"]))
+                    r["solved"] = bool(_ret.get(str(r["traj"]), float("-inf")) > 0.0)
+                    r["kind"] = _kind(r.get("task", ""))
+                    for key in (f'{r["class"]}/{"short_le4" if r["plan_len"] <= 4 else "long_ge5"}',
+                                f'{r["class"]}/{r["kind"]}'):
+                        a = _agg.setdefault(key, {"trajectories": 0, "solved": 0,
+                                                  "full_follow": 0, "ptr_final_sum": 0,
+                                                  "plan_len_sum": 0})
+                        a["trajectories"] += 1
+                        a["solved"] += int(r["solved"])
+                        a["full_follow"] += int(r["ptr_final"] >= r["plan_len"])
+                        a["ptr_final_sum"] += r["ptr_final"]
+                        a["plan_len_sum"] += r["plan_len"]
+                for a in _agg.values():
+                    n = max(a["trajectories"], 1)
+                    a["solve_rate"] = a["solved"] / n
+                    a["full_follow_rate"] = a["full_follow"] / n
+                    a["ptr_final_mean"] = a.pop("ptr_final_sum") / n
+                    a["plan_len_mean"] = a.pop("plan_len_sum") / n
+                rec["cand_by_class_and_length"] = _agg
+        except Exception as exc:
+            rec["cand_by_class_and_length"] = {"error": f"{type(exc).__name__}: {exc}"}
 
         try:
             rec["samples"] = _oci_sample_dump(
