@@ -303,6 +303,54 @@ def _oci_adherence(tokenizer, batch, cand_mask):
             "records": records}
 
 
+def _task_kind(task: str) -> str:
+    """ALFWorld task type from its task sentence."""
+    t = f" {task.lower()} "
+    if " two " in t:
+        return "pick_two"
+    if "clean" in t:
+        return "clean"
+    if " hot " in t or "heat" in t:
+        return "heat"
+    if "cool" in t:
+        return "cool"
+    if "look at" in t or "examine" in t:
+        return "look_at"
+    return "pick_and_place"
+
+
+def _aggregate_cand_records(records, status_by_uid, return_by_traj):
+    """Rescue by class x plan length and class x task kind.
+
+    ``records`` come from _oci_adherence (one per candidate trajectory); each gains
+    its group's class, whether it solved, and its task kind. The whole-path probe's
+    followers stopped at four lines -- the entire solution for pick_and_place and
+    look_at, half of the rest -- so the rescue rate has to be read separately for
+    short and long plans.
+    """
+    agg = {}
+    for r in records:
+        r["class"] = status_by_uid.get(str(r.get("uid")))
+        r["solved"] = bool(return_by_traj.get(str(r.get("traj")), float("-inf")) > 0.0)
+        r["kind"] = _task_kind(r.get("task", ""))
+        length = "short_le4" if r["plan_len"] <= 4 else "long_ge5"
+        for key in (f'{r["class"]}/{length}', f'{r["class"]}/{r["kind"]}'):
+            a = agg.setdefault(key, {"trajectories": 0, "solved": 0, "full_follow": 0,
+                                     "_ptr": 0, "_len": 0})
+            a["trajectories"] += 1
+            a["solved"] += int(r["solved"])
+            a["full_follow"] += int(r["ptr_final"] >= r["plan_len"])
+            a["_ptr"] += r["ptr_final"]
+            a["_len"] += r["plan_len"]
+    for a in agg.values():
+        count = max(a["trajectories"], 1)
+        a["solve_rate"] = a["solved"] / count
+        a["full_follow_rate"] = a["full_follow"] / count
+        a["ptr_final_mean"] = a.pop("_ptr") / count
+        a["plan_len_mean"] = a.pop("_len") / count
+    return agg
+
+
 def _oci_sample_dump(tokenizer, batch, cand_mask, *, n_groups=3, max_chars=2600):
     """Decoded prompt tail and response for a few candidate rows and their
     plain siblings, paired by prompt group and turn.
@@ -1573,56 +1621,21 @@ class OPDRayTrainer(RayPPOTrainer):
         except Exception as exc:
             rec["adherence"] = {"error": f"{type(exc).__name__}: {exc}"}
 
-        # RESCUE BY PLAN LENGTH. The whole-path probe's followers stopped at 4 lines,
-        # which is the entire solution for pick_and_place and look_at and half of the
-        # rest, so the rescue rate has to be read separately for short and long plans
-        # -- a pooled rate cannot say whether a progress pointer helps where the
-        # student was losing its place.
+        # RESCUE BY PLAN LENGTH -- see _aggregate_cand_records. It is a module-level
+        # function on purpose: the first version was written inline here, used `n`
+        # as a loop variable, and so overwrote this method's `n` -- the batch
+        # counter that `state["batches"] = n` stores below. The counter sat at the
+        # last bucket's trajectory count, never reached n_batches, and the probe
+        # ran on indefinitely (12 batches reported as "batch 1").
         try:
             _recs = (rec.get("adherence") or {}).get("records") or []
             if _recs and tuids is not None:
                 _status = {str(u): g.get("status") for u, g in grp.items()}
                 _ret = {}
                 for i in np.flatnonzero(cand_np):
-                    k = str(tuids[i])
-                    _ret[k] = max(_ret.get(k, float("-inf")), float(rets[i]))
-
-                def _kind(task):
-                    t = task.lower()
-                    if " two " in f" {t} ":
-                        return "pick_two"
-                    if "clean" in t:
-                        return "clean"
-                    if "hot" in t or "heat" in t:
-                        return "heat"
-                    if "cool" in t:
-                        return "cool"
-                    if "look at" in t or "examine" in t:
-                        return "look_at"
-                    return "pick_and_place"
-
-                _agg = {}
-                for r in _recs:
-                    r["class"] = _status.get(str(r["uid"]))
-                    r["solved"] = bool(_ret.get(str(r["traj"]), float("-inf")) > 0.0)
-                    r["kind"] = _kind(r.get("task", ""))
-                    for key in (f'{r["class"]}/{"short_le4" if r["plan_len"] <= 4 else "long_ge5"}',
-                                f'{r["class"]}/{r["kind"]}'):
-                        a = _agg.setdefault(key, {"trajectories": 0, "solved": 0,
-                                                  "full_follow": 0, "ptr_final_sum": 0,
-                                                  "plan_len_sum": 0})
-                        a["trajectories"] += 1
-                        a["solved"] += int(r["solved"])
-                        a["full_follow"] += int(r["ptr_final"] >= r["plan_len"])
-                        a["ptr_final_sum"] += r["ptr_final"]
-                        a["plan_len_sum"] += r["plan_len"]
-                for a in _agg.values():
-                    n = max(a["trajectories"], 1)
-                    a["solve_rate"] = a["solved"] / n
-                    a["full_follow_rate"] = a["full_follow"] / n
-                    a["ptr_final_mean"] = a.pop("ptr_final_sum") / n
-                    a["plan_len_mean"] = a.pop("plan_len_sum") / n
-                rec["cand_by_class_and_length"] = _agg
+                    _k = str(tuids[i])
+                    _ret[_k] = max(_ret.get(_k, float("-inf")), float(rets[i]))
+                rec["cand_by_class_and_length"] = _aggregate_cand_records(_recs, _status, _ret)
         except Exception as exc:
             rec["cand_by_class_and_length"] = {"error": f"{type(exc).__name__}: {exc}"}
 
