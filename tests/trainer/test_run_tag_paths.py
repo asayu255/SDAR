@@ -53,7 +53,10 @@ def _chain_text(script):
 def _assign(text, key):
     m = re.search(rf"{re.escape(key)}=([^ \\\n]*)", text)
     assert m, f"{key} not found"
-    return m.group(1)
+    # ${RUN_TAG_SUFFIX} and $RUN_TAG_SUFFIX are the same expansion to bash, and
+    # both spellings are in the tree. The checks below look for the plain one, so
+    # the braced one is normalised here rather than read as a missing tag.
+    return m.group(1).replace("${RUN_TAG_SUFFIX}", "$RUN_TAG_SUFFIX")
 
 
 def _expand(value, home, tag, arm=""):

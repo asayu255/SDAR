@@ -63,6 +63,13 @@ COMPOSED_SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_oci_sat_shaped_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_oci_floor_qwen3.sh",
     "examples/opd_grpo_trainer/run_multitask_oci_slots_qwen3.sh",
+    # A WRAPPER OF A WRAPPER: the alfworld-only arm execs the alfworld-only
+    # baseline, which execs the 3-task control. _overrides follows the chain to
+    # the end, so what is checked here is the composition all three produce --
+    # including that three `trainer.expected_config` overrides in one command line
+    # leave the LAST one standing, which is the arm's own lock.
+    "examples/opd_grpo_trainer/run_alfworld_only_cross_teacher_klw_control_qwen3.sh",
+    "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

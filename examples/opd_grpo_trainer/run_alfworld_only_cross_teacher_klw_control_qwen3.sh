@@ -22,6 +22,21 @@
 # test.parquet, which prepare_sdar_multitask regenerates deterministically).
 set -euo pipefail
 
+# THE ROLLOUT WINDOW, SIZED FOR AN ALL-ALFWORLD BATCH. With the control's own
+# defaults (pump 1, log-prob prefetch 1) this run died twice in four steps inside
+# that machinery -- an intermittent teacher-cache witness failure at step 1 and an
+# NCCL watchdog death inside _prefetch_pending_log_probs at step 4 -- and turning
+# the TEACHER prefetch off instead OOMs at step 2, because the post-rollout
+# teacher call then receives the whole ~6000-row batch and accumulates 12 GB of
+# hidden states plus a reorder copy. The 3-task mixture never tripped either in
+# 500+ steps; the all-long-sequence batch does. These are performance paths, not
+# objective ones (the same math runs after the rollout instead of inside it), so
+# they are set here for every arm that execs this script rather than left to the
+# launch line -- an arm and its baseline must not differ in them by accident.
+export ROLLOUT_PUMP_TRAINING=${ROLLOUT_PUMP_TRAINING:-0}
+export ROLLOUT_PREFETCH_LOGPROB=${ROLLOUT_PREFETCH_LOGPROB:-0}
+export ROLLOUT_PREFETCH_TEACHER=${ROLLOUT_PREFETCH_TEACHER:-1}
+
 RUN_TAG_SUFFIX="${RUN_TAG:+_$RUN_TAG}"
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
