@@ -45,6 +45,19 @@ class EnvironmentManagerBase:
         self.projection_f = projection_f
         self.config = config
 
+    def rewind_games(self):
+        """Put the envs back at the first problem of their cycle, if they have one.
+
+        Validation must score the same problems every time, and the env managers
+        live for the whole process: one reset() takes the NEXT game (alfworld) or
+        the next goal draw (webshop), so a second validation in one process scored
+        a different set than the first. Only the validation path calls this; the
+        env classes refuse it on training envs. Returns None for envs with nothing
+        to rewind (search takes its problems from the dataloader).
+        """
+        fn = getattr(self.envs, "rewind_games", None)
+        return fn() if fn is not None else None
+
     def reset(self, kwargs) -> Dict[str, Any]:
         """
         Reset all environments and return the initial observations.
