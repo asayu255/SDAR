@@ -270,3 +270,17 @@ def test_the_channel_keys_of_the_tilt_path_are_not_reused():
     assert "a_on_base" in got
     tilt = build_target(mode="tilt", **kw)
     assert torch.equal(got["a"], tilt["a"]) and torch.equal(got["b"], tilt["b"])
+
+
+def test_the_role_split_is_filled_and_not_a_structural_zero():
+    """A live run reported both shares as exactly 0.000, because the actor gated
+    the `roles` kwarg on curriculum mode. The columns are in _SUMS either way, so
+    the table rendered zeros -- which reads as "the injection lands on neither
+    kind of token" rather than as "nothing was measured". Every role code belongs
+    to exactly one of the two groups, so the shares must sum to one.
+    """
+    m = _stats_for(0.6)
+    lo = m["target/shrink/role/structural_share"]
+    hi = m["target/shrink/role/content_share"]
+    assert lo > 0.0 and hi > 0.0, (lo, hi)
+    assert lo + hi == pytest.approx(1.0, abs=1e-9)

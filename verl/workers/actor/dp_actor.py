@@ -3298,16 +3298,25 @@ class DataParallelPPOActor(BasePPOActor):
                                     # underflows float32, and log(exp(x)) would
                                     # lose exactly those.
                                     on_logprob=sign_on_task_logprobs,
-                                    # layer x role, curriculum mode only. The
-                                    # design predicts the shared layer is format
-                                    # and tag -- the audit measured the shared
-                                    # component as format -- and the pair
-                                    # layer's content share is the number that
-                                    # says whether stage 2 teaches anything but
-                                    # structure. Nothing has measured it before.
+                                    # role x mechanism, for the two modes that
+                                    # partition by role. Curriculum: the design
+                                    # predicts the shared layer is format and tag
+                                    # -- the audit measured the shared component
+                                    # as format -- and the pair layer's content
+                                    # share says whether stage 2 teaches anything
+                                    # but structure. Shrink: WHERE THE INJECTION
+                                    # LANDS, which is the audit's mechanism for
+                                    # the webshop damage (other tasks' specific
+                                    # components mixed into content positions).
+                                    # The shrink columns were added without this
+                                    # gate being widened, and both shares came
+                                    # out of a live run as exactly 0.000 -- a
+                                    # column that is structurally zero reads as a
+                                    # measurement, which is the failure the step
+                                    # table's own comments warn about.
                                     roles=(
                                         token_roles(data["responses"], sign_role_tags)
-                                        if (xtt_mode == "curriculum" and sign_role_tags)
+                                        if (xtt_mode in ("curriculum", "shrink") and sign_role_tags)
                                         else None
                                     ),
                                     # Which off-task teacher set the pair layer,

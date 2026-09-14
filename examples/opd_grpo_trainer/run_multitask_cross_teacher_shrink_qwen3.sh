@@ -87,14 +87,29 @@ set -x
 #                                  before the validation is.
 #   target/clamped_frac_of_acted, target/clamped_mass_frac
 #                                  the clamp is the only cap. READ THE MASS one.
-#   target/shuffled_tv_ratio       G1, in its original sense here (unlike the
-#                                  curriculum mode, where it inverts): near 1
-#                                  says the mixture moves mass for reasons that
-#                                  survive destroying the position correspondence.
-#   actor/entropy                  the target sits nearer base than the control's
-#                                  does, so entropy rises. The klw arm's gain was
+#   target/shuffled_tv_ratio       G1 INVERTS in this mode too (measured 1.620
+#                                  at step 3, against 1.45 predicted from the
+#                                  audit's spreads). Shuffling breaks the +0.72
+#                                  correlation between the on- and off-task
+#                                  shifts, and c is proportional to their
+#                                  DIFFERENCE, so |c| grows. Above 1 is the
+#                                  default; near 1 would mean the two shifts are
+#                                  uncorrelated.
+#   target/shrink/role/*_share     WHERE THE INJECTION LANDS. The audit's
+#                                  mechanism for the webshop damage is other
+#                                  tasks' specific components reaching CONTENT
+#                                  positions, and this is that, measured.
+#   target/entropy_delta           the TARGET's entropy against the on-task
+#                                  teacher's. A geometric mixture is a product of
+#                                  experts and therefore SHARPER, not flatter:
+#                                  -0.039 measured. (The first version of this
+#                                  header predicted the opposite, from a wrong
+#                                  reason -- the target is not nearer base.)
+#   actor/entropy                  the STUDENT's, which the target's entropy does
+#                                  not determine. The klw arm's gain was
 #                                  attributed to entropy (audit 15), so a gain
-#                                  here is NOT separable from exploration.
+#                                  here is NOT separable from exploration
+#                                  whichever way this moves.
 #
 # PRE-REGISTERED PREDICTION (docs/cross_teacher_shrink_design.md): no task
 # differs from the control by more than the validation floor at 150. The offline
@@ -106,6 +121,15 @@ set -x
 #
 # FALSIFICATION: any task above the control by more than 2x the validation
 # floor at BOTH 75 and 150, in the deterministic scoring configuration.
+#
+# OBSERVED ON THE FIRST LAUNCH (stopped at step 13 for the roles fix; see
+# docs/cross_teacher_shrink_design.md 6.4): tv 0.068, abs_dkl_mean 0.233 nats,
+# beyond_cand_frac 0.226 / beyond_mass_frac 0.309, c_to_on_absmass 0.277,
+# clamped_mass_frac 0.255. The injection is real and the dose is larger than the
+# predecessor target arm's 1.42% TV, so a null here will not be a null of size.
+#
+# TIMING, measured rather than estimated: 13 min of startup and ~12.3 min/step,
+# so 150 steps is about 31 hours on two GPUs.
 #
 # ---------------------------------------------------------------------------
 # ENVIRONMENT. SEARCH_URL must point at the retriever -- it is NOT local on

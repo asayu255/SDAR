@@ -168,3 +168,18 @@ def test_the_driver_needs_no_per_step_state_for_this_mode():
     assert "shrink" not in driver
     actor = open(os.path.join(REPO, "verl", "workers", "actor", "dp_actor.py")).read()
     assert "lambda_prime" in actor
+
+
+def test_the_actor_hands_this_mode_the_roles_it_splits_by():
+    """The regression the first launch found. `roles` was gated on curriculum
+    mode, so shrink got None and target/shrink/role/*_share came out of a live
+    run as exactly 0.000 -- a structurally zero column reads as a measurement.
+    Checked on the call site, because the unit test can only see what it passes.
+    """
+    src = open(os.path.join(REPO, "verl", "workers", "actor", "dp_actor.py")).read()
+    call = src[src.index("xtt_stats.update("):]
+    call = call[: call.index("xtt_token_stats is not None")]
+    block = call[call.index("roles=("):]
+    block = block[: block.index("),")]
+    assert "shrink" in block, block
+    assert "curriculum" in block, block

@@ -967,10 +967,18 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
 
         sh_off = decorrelated_off_shifts(hat["off"], response_mask)
         if mode == "shrink":
-            # G1 reads the same way here as for the tilt path -- a ratio near 1
-            # says the mixture moves mass for reasons that survive destroying the
-            # position correspondence -- unlike the curriculum path, where it
-            # inverts and is replaced by the retained-mass ratio.
+            # G1 INVERTS HERE TOO, which the first version of this comment got
+            # wrong. Decorrelating the off-task teachers from the position breaks
+            # their correlation with the on-task shift (the audit measures
+            # corr(delta_on, s_gen) = +0.72), and `c` is (1 - lambda') times
+            # their DIFFERENCE, so |c| is structurally LARGER on shuffled
+            # teachers. The audit's own spreads put the ratio near
+            # sqrt(138.3 + 25.4) / sqrt(138.3 + 25.4 - 2*0.72*11.76*5.04) = 1.45;
+            # a live run measured target/shuffled_tv_ratio = 1.62 at step 3.
+            # So a ratio near 1 is NOT the null here -- it would mean the two
+            # shifts were uncorrelated. Read it as a measure of how much of the
+            # mixture's restraint comes from the teachers agreeing at the SAME
+            # position, and read the null off the audit's correlation instead.
             sh_c = shrink_exponent(shift_on=shifts["on"], hat_off=sh_off,
                                    sigma_on=hat["sigma_on"],
                                    lambda_prime=lambda_prime)["c"]

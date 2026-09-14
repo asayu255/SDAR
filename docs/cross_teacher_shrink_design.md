@@ -173,7 +173,7 @@ sg1(n=662、clusters=86)も同形で、$\lambda'$ = 0.9/0.8/0.6/0.5/(1/3) の対
 | `target/shrink/beyond_cand_frac` | **> 0**。ゼロなら注入が起きておらず、curriculum アームを別名で走らせている |
 | `target/mass_error_max` | ~1e-6。$\sum\tilde p = 1$ は構成なので、これは assertion |
 | `target/clamped_mass_frac` | 読む(count 比は 1.9–3.1 倍過小評価する) |
-| `target/shuffled_tv_ratio` | G1。1 に近ければ、位置対応を壊しても同じだけ動いている |
+| `target/shuffled_tv_ratio` | **G1 は本モードでも反転する**(§6.4 の訂正)。1 を超えるのが既定で、1 に近い方が「2 つの shift が無相関」を意味する |
 | `target/shrink/role/content_share` | **確認項目**。内容 role に載ることが仮説の検定対象であり、警告ではない |
 
 ### 6.2 結果の予測と反証条件
@@ -182,8 +182,10 @@ sg1(n=662、clusters=86)も同形で、$\lambda'$ = 0.9/0.8/0.6/0.5/(1/3) の対
 * **反証条件: いずれかのタスクが @75 と @150 の両方で、検証床の 2 倍を超えて control を上回る。**
 * **null は「dose 不足」を排除しない**(§5)。$\lambda'=0.6$ の $\lvert c\rvert$ 中央値は発火トークンで約 1.8 nats で小さくはないが、
   端点で測っていない以上、bound にはならない。
-* **entropy の交絡は排除されない。** 目標が base 寄りになるので生徒の entropy は上がる。klw の利得は監査 §15 で
-  entropy 上昇(探索)に帰属されており、正の結果が出てもそれと区別できない。
+* **entropy の向きは初版の予測と逆だった**(§6.4)。幾何混合は product of experts で連言的なので、目標は on-task 教師より
+  **鋭く**なる(`target/entropy_delta` = −0.039 を実測)。「目標が base 寄りになるので entropy が上がる」という初版の理由づけは
+  誤りで、撤回する。生徒側の entropy がどちらへ動くかは目標の entropy から直接は出ないので、`actor/entropy` を実測して報告する。
+  klw の利得が監査 §15 で entropy 上昇(探索)に帰属されている以上、**どちらへ動いてもその交絡は残る**。
 
 ### 6.3 検出力と採点
 
@@ -228,3 +230,40 @@ bash examples/opd_grpo_trainer/run_multitask_cross_teacher_shrink_qwen3.sh
 * **新規性は低い。** 幾何混合は MOD(Shi+ 2024)そのもので、routing + token 別多教師蒸留は LS-MOPD(Xie+ 2026)が既にやっている。
   本アームの価値は機構の新しさではなく、**この教師集合に書式以外の共有知識があるかを、最も弱い仮定で測ること**にある。
 * **オフライン掃引は動学に触れていない**(§4 の弱さ)。
+
+---
+
+## 6.4 初回起動で観測された値と、それによる 2 つの訂正(2026-09-14/15)
+
+第 1 回の起動は tamago で step 13 まで走り、§7 の role 列が埋まらない実装不具合(下記)のために停止した。
+checkpoint は save_freq=25 に届いておらず、残っているのは dump 5 file と下の観測だけである。
+
+**機構は設計通りに発火した**(step 3、コンソールは小数第 3 位丸め):
+
+| 指標 | 実測 | 事前の記述との関係 |
+|---|---:|---|
+| `live_frac` | 1.000 | step 1 は cold start で 0(`row_available=False`)、step 2 から全位置 |
+| `tv` | 0.068 | 旧 teachertopk アームの実測 1.42%、再設計見積り 3.9% より**大きい** |
+| `abs_dkl_mean` | 0.233 nats | — |
+| **`shrink/beyond_cand_frac`** | **0.226** | §6.1 の「> 0」を満たす。質量では 0.309。**注入は実在する** |
+| `shrink/c_to_on_absmass` | 0.277 | $\lambda'=0.6$ が構成上決める dose |
+| `shrink/off_to_on_absmass` | 0.746 | off-task の声は on-task shift の 3/4 の大きさ |
+| `shrink/agree_cand_frac` | 0.702 | off-task 平均が on-task と同符号なのは 7 割 |
+| `clamped_mass_frac` | 0.255 | **acted 量の 1/4 が ±5 に潰れている**。count 比(0.108)ではなくこちらを読むこと |
+| `mass_error_max` | 0.000 | 構成通り |
+
+**訂正 1: G1 は本モードでも反転する。** `shuffled_tv_ratio = 1.620` を実測した。off-task を位置方向に decorrelate すると
+on-task shift との相関(監査実測 $\mathrm{corr}(\delta_{on}, s_{gen}) = +0.72$)が切れ、$c$ はその**差**に比例するので
+$|c|$ は構造的に大きくなる。監査の spread から $\sqrt{138.3+25.4}/\sqrt{138.3+25.4-2(0.72)(11.76)(5.04)} = 1.45$ と見積もられ、
+実測 1.62 と同じ向き・同程度である。初版が「shrink では G1 は元の意味を保つ」と書いたのは**誤りで、撤回する**。
+1 に近い方が「2 つの shift が無相関」を意味する。
+
+**訂正 2: 目標の entropy は下がる。** `entropy_delta = −0.039`。幾何混合は product of experts で連言的なので、
+目標は on-task 教師より鋭くなる。初版の「目標が base 寄りになるので entropy は上がる」は理由づけから誤りで、撤回する。
+
+**実装不具合(修正済み)。** `dp_actor.py` の `xtt_stats.update(roles=...)` が `xtt_mode == "curriculum"` に gate されていたため、
+shrink では `roles=None` が渡り、`target/shrink/role/{structural,content}_share` が両方**きっかり 0.000** になっていた。
+`_SUMS` に列があるのでゼロとして描画され、`TargetStepStats` 自身の注記が警告する「構造的にゼロの列が測定値として読める」状態だった。
+gate を `in ("curriculum", "shrink")` に広げ、`tests/trainer/test_cross_teacher_shrink_arm.py` に呼び出し側の gate を読む回帰テストを追加した。
+
+**所要時間の実測**: 起動 13 分 + 約 12.3 分/step。150 step は**約 31 時間**で、設計時の 27 時間見積りより長い。
