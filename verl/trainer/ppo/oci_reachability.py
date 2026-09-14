@@ -200,7 +200,11 @@ def splice_span(input_ids, attention_mask, off, take, repl, repl_len, pad_token_
 
     out_ids = input_ids.clone()
     out_mask = attention_mask.clone()
-    net = torch.zeros(bs, dtype=torch.long)
+    # ON THE INPUT'S DEVICE. The probe ran this on driver-side tensors and every
+    # test on CPU tensors; the first time the actor ran it on its own micro-batch
+    # the subtraction below met a cuda position_ids and a cpu net and died at
+    # step 1 of the first shaped run.
+    net = torch.zeros(bs, dtype=torch.long, device=input_ids.device)
     for i in range(bs):
         p_mask = attention_mask[i, :plen].bool()
         toks = input_ids[i, :plen][p_mask]

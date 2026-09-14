@@ -1675,6 +1675,13 @@ class OPDRayTrainer(RayPPOTrainer):
             group_n=int(self.config.env.rollout.n),
         )
         metrics.update(slot_metrics)
+        # On the console as well as in the step's metrics: the metrics are logged
+        # when the step completes, and the first thing a step can die of is a
+        # stage AFTER this one -- which then leaves no record of what the
+        # selection did with the rollout that was just paid for.
+        print("[oci_slots] " + " ".join(
+            f"{k.split('/', 1)[1]}={v:.3g}" if isinstance(v, float) else f"{k.split('/', 1)[1]}={v}"
+            for k, v in sorted(slot_metrics.items())), flush=True)
         return apply_selection(batch, keep, injected)
 
     def _reward_and_advantage(self, batch: DataProto, metrics: dict, timing_raw: dict):

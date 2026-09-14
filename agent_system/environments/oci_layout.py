@@ -214,17 +214,32 @@ _WEBSHOP_LANDING_OBSERVATION = "'Search'"
 _WEBSHOP_LANDING_ACTIONS = "'search[<your query>]',\n'click[search]',"
 
 
+def game_key(gamefile) -> str:
+    """The part of a gamefile path that is the same on every host.
+
+    The data sits under a different root per host (``/home/...`` on one,
+    ``/opt1/...`` on another), so a key that included the root would show the
+    same game a different foreign prompt on each. Which prompt it is does not
+    change the outcome -- any of them fails -- but a run that is meant to be
+    reproducible elsewhere should draw the same text, so the key is the path
+    from the split directory down: ``train/<task>/<trial>/game.tw-pddl``.
+    """
+    parts = [p for p in str(gamefile).replace("\\", "/").split("/") if p]
+    return "/".join(parts[-4:])
+
+
 def foreign_prompt(task: str, key) -> str:
     """The turn-0 prompt of another task, verbatim, for the slot that must fail.
 
-    ``key`` (the gamefile) picks which one, through a stable hash rather than
-    ``hash()``, whose salt differs per process -- a rollout worker and a test
-    would otherwise disagree about what a game was shown.
+    ``key`` (the gamefile) picks which one, through a stable hash of its
+    host-independent part (see ``game_key``) rather than ``hash()``, whose salt
+    differs per process -- a rollout worker and a test would otherwise disagree
+    about what a game was shown.
     """
     if task not in FOREIGN_TASKS:
         raise ValueError(f"foreign_task={task!r}; expected one of {FOREIGN_TASKS}")
     pool = WEBSHOP_TRAIN_INSTRUCTIONS
-    idx = zlib.crc32(str(key).encode("utf-8")) % len(pool)
+    idx = zlib.crc32(game_key(key).encode("utf-8")) % len(pool)
     return WEBSHOP_TEMPLATE_NO_HIS.format(
         task_description=pool[idx],
         current_observation=_WEBSHOP_LANDING_OBSERVATION,

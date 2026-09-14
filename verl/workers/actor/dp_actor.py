@@ -546,8 +546,17 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
     usable = inj & (n_len > 0)
     diag = {"oci/shaping/rows_injected": float(int(inj.sum())),
             "oci/shaping/rows_unstrippable": float(int((inj & ~usable).sum()))}
+
+    # AS 0-D TENSORS ON THE LOSS'S DEVICE: the caller hands every entry to
+    # _defer, which keeps metrics as device tensors until the end of the call
+    # and calls .detach() on what it is given -- a Python float has no such
+    # method, and this path had never run inside update_policy before.
+    def _on_device(d):
+        return {k: torch.as_tensor(float(v), dtype=torch.float32, device=pg_losses.device)
+                for k, v in d.items()}
+
     if not bool(usable.any()):
-        return pg_losses, diag
+        return pg_losses, _on_device(diag)
 
     rows = torch.nonzero(usable, as_tuple=False).reshape(-1)
     resp = micro_batch["responses"]
@@ -575,8 +584,7 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
     out[rows] = shaped.to(out.dtype)
     diag.update(shaping_diagnostics(lp_plain.detach(), old_log_prob[rows],
                                     response_mask[rows], gamma=gamma))
-    diag = {k: float(v) for k, v in diag.items()}
-    return out, diag
+    return out, _on_device(diag)
 
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):

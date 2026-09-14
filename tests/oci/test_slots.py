@@ -82,7 +82,11 @@ check(all(g % 10 == i % 10 for i, g in enumerate(_global)),
 
 # --- 2. the foreign prompt is another task's OWN prompt -----------------------
 key = "/data/alfworld/json_2.1.1/train/pick_and_place-Mug-None-Desk-301/trial_1/game.tw-pddl"
-instr = ol.WEBSHOP_TRAIN_INSTRUCTIONS[zlib.crc32(key.encode()) % len(ol.WEBSHOP_TRAIN_INSTRUCTIONS)]
+instr = ol.WEBSHOP_TRAIN_INSTRUCTIONS[zlib.crc32(ol.game_key(key).encode()) % len(ol.WEBSHOP_TRAIN_INSTRUCTIONS)]
+check(ol.game_key(key) == "train/pick_and_place-Mug-None-Desk-301/trial_1/game.tw-pddl"
+      and ol.foreign_prompt("webshop", key) == ol.foreign_prompt("webshop", "/opt1/other/root" + key),
+      "the prompt is chosen by the path below the split directory, so two hosts with the data "
+      "under different roots show a game the same one")
 wm = em.WebshopEnvironmentManager.__new__(em.WebshopEnvironmentManager)
 wm.config = SimpleNamespace(env=SimpleNamespace(history_length=2))
 wm.tasks = [instr]
