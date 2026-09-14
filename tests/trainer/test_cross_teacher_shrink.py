@@ -81,7 +81,7 @@ def test_lambda_one_third_is_the_equal_weight_mean_of_all_three_teachers():
     h_on = kw["on_logprob"] - kw["base_logprob"]
     h_off = kw["off_logprob"] - kw["base_logprob"].unsqueeze(-1)
     want = (h_on + h_off.sum(dim=-1)) / 3.0
-    assert torch.allclose(got["a"], want, atol=1e-6)
+    assert torch.allclose(got["a_on_base"], want, atol=1e-6)
 
 
 def test_lambda_prime_is_required_and_bounded():
@@ -259,3 +259,14 @@ def test_the_dose_the_table_reports_is_the_one_lambda_sets():
     a = _stats_for(0.6)["target/shrink/c_to_on_absmass"]
     b = _stats_for(0.8)["target/shrink/c_to_on_absmass"]
     assert a == pytest.approx(2.0 * b, rel=1e-6)
+
+
+def test_the_channel_keys_of_the_tilt_path_are_not_reused():
+    """`a` and `b` are the tilt path's two channels. This mode has one channel,
+    and a key that means two things in two modes is how a diagnostic starts
+    reporting something else without anyone noticing."""
+    kw = _chain()
+    got = build_target(mode="shrink", lambda_prime=0.6, **kw)
+    assert "a_on_base" in got
+    tilt = build_target(mode="tilt", **kw)
+    assert torch.equal(got["a"], tilt["a"]) and torch.equal(got["b"], tilt["b"])

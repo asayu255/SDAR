@@ -950,7 +950,7 @@ def build_target(*, on_logprob: torch.Tensor, off_logprob: torch.Tensor,
     if shrink is not None:
         out.update({
             "shift_on": shifts["on"], "off_nats": shrink["off_nats"],
-            "a": shrink["a"], "beyond": shrink["beyond"],
+            "a_on_base": shrink["a"], "beyond": shrink["beyond"],
             "lambda_prime": float(lambda_prime),
         })
     if layers is not None:
