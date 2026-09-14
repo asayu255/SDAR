@@ -158,6 +158,7 @@ class WebshopMultiProcessEnv(gym.Env):
         self.is_train = is_train
         if not is_train: assert group_n == 1
 
+        self._seed = seed
         self._rng = np.random.RandomState(seed)
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
@@ -256,6 +257,22 @@ class WebshopMultiProcessEnv(gym.Env):
             f'replayed {int(num_resets)} goal draws '
             f'(env_num={self.env_num}, goal pool={len(self.goal_idxs)})'
         )
+
+    def rewind_games(self) -> str:
+        """Restart the goal draw, so every validation scores the same goals.
+
+        The mirror of :py:meth:`fast_forward`: that one replays draws a resumed
+        run skipped, this one puts the draw back at the beginning. Needed for the
+        same reason as AlfworldEnvs.rewind_games -- the manager lives for the
+        whole process and one reset() consumes one ``_rng.choice``, so a second
+        validation scored different goals than the first.
+        """
+        if self.is_train:
+            raise RuntimeError(
+                "rewind_games() is for validation envs; training must keep advancing "
+                "its goal draw (see fast_forward for the resume path)")
+        self._rng = np.random.RandomState(self._seed)
+        return f"webshop: goal draw rewound (env_num={self.env_num}, pool={len(self.goal_idxs)})"
 
     # ------------------------------------------------------------------
     # Convenience helpers ----------------------------------------------
