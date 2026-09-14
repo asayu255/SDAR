@@ -46,15 +46,25 @@ ARMS = {
 
 
 def series(project, keys):
-    """{arm: {step: {key: value}}}, taking the longest run per arm."""
+    """{arm: ("id1+id2", {step: {key: value}})}, every TRAINING run of an arm merged.
+
+    MERGED, NOT THE LONGEST. A run resumed from a checkpoint is a new wandb run that
+    logs only the steps after the resume, so keeping the longest run per arm threw
+    away B' steps 226-300 in favour of the 224-step original. Runs are merged in
+    creation order, the later run winning any step both logged (a crashed attempt
+    that reached step 1 and its relaunch both log step 1). Val-only runs are skipped:
+    they log no training steps, and mixing them in would be mixing two procedures.
+    """
     import wandb
 
     api = wandb.Api()
     entity = os.environ.get("WANDB_ENTITY") or api.default_entity
-    out = {}
+    runs = {}
     for run in api.runs(f"{entity}/{project}"):
         cfg = run.config.get("trainer") or {}
-        arm = ARMS.get(cfg.get("experiment_name") if isinstance(cfg, dict) else None)
+        if not isinstance(cfg, dict) or cfg.get("val_only"):
+            continue
+        arm = ARMS.get(cfg.get("experiment_name"))
         if arm is None:
             continue
         pts = {}
@@ -64,8 +74,15 @@ def series(project, keys):
             if step is None:
                 continue
             pts[int(step)] = {k: row.get(k) for k in keys}
-        if pts and (arm not in out or len(pts) > len(out[arm][1])):
-            out[arm] = (run.id, pts)
+        if pts:
+            runs.setdefault(arm, []).append((run.created_at, run.id, pts))
+    out = {}
+    for arm, lst in runs.items():
+        merged, ids = {}, []
+        for _, rid, pts in sorted(lst):
+            merged.update(pts)
+            ids.append(rid)
+        out[arm] = ("+".join(ids), merged)
     return out
 
 
