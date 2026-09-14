@@ -835,6 +835,20 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
+        # EVERY VALIDATION SCORES THE SAME PROBLEMS. The env managers are built
+        # once per process and each reset() takes the next game of the cycle, so
+        # the second validation inside one run scored a DIFFERENT 126-game set
+        # than the first -- with test_freq=150 over 300 steps, @150 and @300 were
+        # not comparable and the difference between them mixed a policy change
+        # with a change of test set. Rewinding here puts the cycle where a
+        # freshly started val_only process would have it, which is the state the
+        # repeated val-only runs of one checkpoint agreed on.
+        if getattr(self, "val_envs", None) is not None:
+            _rewind = getattr(self.val_envs, "rewind_games", None)
+            if _rewind is not None:
+                _rewound = _rewind()
+                if _rewound:
+                    print(f"[val-games] rewound to the start of the cycle: {_rewound}", flush=True)
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
