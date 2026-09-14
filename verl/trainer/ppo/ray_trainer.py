@@ -962,6 +962,17 @@ class RayPPOTrainer:
         # multi_turn_loop still opens become no-ops.
         val_batch_index = 0
         with rollout_session(self.actor_rollout_wg):
+            # EVERY VALIDATION SCORES THE SAME PROBLEMS (2185b44). Each reset() takes the
+            # next game of the cycle, so a second validation in one process scored a
+            # DIFFERENT set than the first -- with test_freq=150 over 300 steps, @150 and
+            # @300 were not comparable. Rewinding puts the cycle where a freshly started
+            # val-only process would have it.
+            if getattr(self, "val_envs", None) is not None:
+                _rewind = getattr(self.val_envs, "rewind_games", None)
+                if _rewind is not None:
+                    _rewound = _rewind()
+                    if _rewound:
+                        print(f"[val-games] rewound to the start of the cycle: {_rewound}", flush=True)
             for test_data in self.val_dataloader:
                 test_batch = DataProto.from_single_dict(test_data)
 
