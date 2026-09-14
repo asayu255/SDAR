@@ -195,8 +195,10 @@ def _oci_plan_mode(config) -> str:
             f"algorithm.oci_sat.plan_corruption={mode!r}; expected one of "
             f"{PLAN_CORRUPTIONS}. 'misdirect' permutes the navigation targets, "
             "'delay' prefixes the true path with a tour that spends the turn "
-            "budget, 'intact' prints the true path. 'drop' removed the "
-            "requirement step and is gone: it was refuted (cand_fail_rate 1/15)."
+            "budget, 'intact' prints the true path from high_pddl (unnumbered), "
+            "'walkthrough' prints TextWorld's own numbered solution. 'drop' "
+            "removed the requirement step and is gone: it was refuted "
+            "(cand_fail_rate 1/15)."
         )
     return mode
 
@@ -231,7 +233,7 @@ def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str
     return _WRONG_PLAN_CACHE[key]
 
 
-PLAN_CORRUPTIONS = ("misdirect", "intact", "delay")
+PLAN_CORRUPTIONS = ("misdirect", "intact", "delay", "walkthrough")
 
 # The block, in the environment's own words. Both modes emit the SAME text apart
 # from the numbered lines -- no word anywhere says whether the path is right.
@@ -573,6 +575,22 @@ def _build_wrong_plan(gamefile: str, mode: str = "misdirect", n_detour: int = 0,
 
     if mode not in PLAN_CORRUPTIONS:
         raise ValueError(f"plan_corruption={mode!r}; expected one of {PLAN_CORRUPTIONS}")
+
+    if mode == "walkthrough":
+        # THE CORRECT DOCUMENT, AS STRONG AS IT GETS. game.tw-pddl's walkthrough is
+        # TextWorld's own solution in the environment's numbered vocabulary
+        # (`take mug 1 from countertop 2`), executable as printed -- unlike
+        # `intact`, which prints high_pddl's unnumbered plan and leaves the student
+        # to ground every noun. This is the mode for measuring whether showing the
+        # solution RESCUES a group whose seven plain rollouts all failed; the
+        # measurement is only worth anything if the document is the best one we
+        # have. Known gap: 3.5% of walkthroughs (clean/cool/heat types) stop
+        # before the final placement.
+        walk, _ = _tw_pddl(gamefile)
+        if not walk:
+            return ""
+        body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(walk))
+        return f"{_PLAN_HEADER}\n{_PLAN_LEAD}\n{body}\n{_PLAN_FOOTER}\n\n"
 
     if mode == "delay":
         walk, banned = _tw_pddl(gamefile)

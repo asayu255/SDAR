@@ -476,6 +476,30 @@ ok &= good
 print(("  OK  " if good else "  FAIL") + " delay_turns defaults to the 50-turn cap")
 
 
+# --- walkthrough: the correct document for a stuck group --------------------
+print("\n[walkthrough]")
+em._WRONG_PLAN_CACHE.clear()
+em._TW_PDDL_CACHE.clear()
+random.seed(13)
+n = same_frame = verbatim = 0
+for g in random.sample(GAMES, 120):
+    walk = json.load(open(g)).get("walkthrough") or []
+    blk = em._build_wrong_plan(g, "walkthrough")
+    ref = em._build_wrong_plan(g, "intact")
+    if not blk or not walk or not ref:
+        continue
+    n += 1
+    verbatim += path_lines(blk) == walk
+    strip = lambda b: [l for l in b.splitlines() if not re.match(r"^\d+\. ", l)]
+    same_frame += strip(blk) == strip(ref)
+good = n > 80 and verbatim == n
+ok &= good
+print(("  OK  " if good else "  FAIL") + f" {verbatim}/{n} blocks print the walkthrough verbatim, numbered")
+good = same_frame == n
+ok &= good
+print(("  OK  " if good else "  FAIL") + f" {same_frame}/{n} share every non-path byte with intact")
+
+
 def test_wrong_plan():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

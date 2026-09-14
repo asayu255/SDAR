@@ -1465,6 +1465,42 @@ class OPDRayTrainer(RayPPOTrainer):
                 rec["cand_fail_rate"] = float((vals <= 0.0).mean())
                 rec["cand_return_mean"] = float(vals.mean())
 
+            # DID THE EIGHTH ROLLOUT SOLVE THE GAMES THE SEVEN COULD NOT? Split by
+            # the class the seven plain rollouts put the group in. cand_fail_rate
+            # pools every group, and a pooled rate cannot say whether a document
+            # RESCUES a stuck group -- the one question the 7+1+1 design turns on,
+            # because an injected rollout on a stuck group helps only if it
+            # succeeds. Saturated and live groups are reported beside it so the
+            # rescue rate can be read against how often the document helps where
+            # the student already succeeds.
+            _by = {c: {"groups": 0, "cand_solved": 0, "plain_success": 0.0}
+                   for c in ("stuck", "live", "saturated")}
+            for _uid, _g in grp.items():
+                _st = _g.get("status")
+                if _st not in _by:
+                    continue
+                _rows = _g.get("rows") or []
+                _cand = [i for i in _rows if cand_np[i]]
+                _plain = [i for i in _rows if not cand_np[i]]
+                if not _cand:
+                    continue
+                _ctraj, _ptraj = {}, {}
+                for i in _cand:
+                    k = str(tuids[i])
+                    _ctraj[k] = max(_ctraj.get(k, float("-inf")), float(rets[i]))
+                for i in _plain:
+                    k = str(tuids[i])
+                    _ptraj[k] = max(_ptraj.get(k, float("-inf")), float(rets[i]))
+                _by[_st]["groups"] += 1
+                _by[_st]["cand_solved"] += int(max(_ctraj.values()) > 0.0)
+                if _ptraj:
+                    _by[_st]["plain_success"] += float(np.mean([v > 0.0 for v in _ptraj.values()]))
+            for _c, _v in _by.items():
+                n_g = max(_v["groups"], 1)
+                _v["cand_solve_rate"] = _v["cand_solved"] / n_g
+                _v["plain_success_rate"] = _v.pop("plain_success") / n_g
+            rec["cand_by_class"] = _by
+
         # rho, on the candidate rows whose plan span can be removed EXACTLY. A
         # row that cannot be stripped is reported, not approximated: the whole
         # quantity is a ratio between two conditionings of the same weights, and
