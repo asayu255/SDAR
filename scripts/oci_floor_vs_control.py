@@ -23,10 +23,13 @@ control ran on 2 GPUs and B' on 3; wandb says both ran on 3 (control on yamabuki
 B' on fuji), and the host is what matters. collect_game_files builds the game list
 from `list(os.walk(...))`, and os.walk order is a property of the filesystem: the
 140 valid_seen games and 3553 train games are the same set on both hosts (identical
-sorted-list md5) in a different order (different walk-order md5). The validation
-draw is therefore a different 126 of 140 -- confirmed by per-type success rates
-whose integer decompositions share no task-type mix -- and the training draw differs
-too. Nothing here can pair games across the runs: the per-instance dumps carry a
+sorted-list md5) in a different order (different walk-order md5). The seed fixes
+a POSITION, not a game: validation worker i shuffles its own copy of that list with
+RandomState(1001 + i) and plays element 0, so workers 0/1/2 take positions 1/24/108
+on every host and get whatever game the host's order put there (126 draws with
+replacement, 90 distinct games). Simulated on each host's real order this
+reproduces both observed per-type mixes exactly and neither fits the other; the
+training draw differs the same way. Nothing here can pair games across the runs: the per-instance dumps carry a
 fresh traj_uid per run and no game id.
 
 Usage: python scripts/oci_floor_vs_control.py [--bins 15] [--key ...]
