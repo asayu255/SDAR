@@ -1655,6 +1655,28 @@ class OPDRayTrainer(RayPPOTrainer):
         state["batches"] = n
         return state
 
+    def _select_oci_slots(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Keep the eight rollouts each group trains and drop the other two.
+
+        A no-op unless ``algorithm.oci_slots.enable``. The rule, and why the drop
+        belongs at this point in the loop, are in verl/trainer/ppo/oci_slots.py.
+        """
+        cfg = self.config.algorithm.get("oci_slots", None)
+        if cfg is None or not bool(cfg.get("enable", False)):
+            return batch
+
+        from verl.trainer.ppo.oci_slots import (apply_selection, check_config,
+                                                select_rollouts)
+
+        check_config(self.config)
+        keep, injected, slot_metrics = select_rollouts(
+            batch,
+            tasks=list(cfg.get("tasks", ["alfworld"]) or ["alfworld"]),
+            group_n=int(self.config.env.rollout.n),
+        )
+        metrics.update(slot_metrics)
+        return apply_selection(batch, keep, injected)
+
     def _reward_and_advantage(self, batch: DataProto, metrics: dict, timing_raw: dict):
         """Turn the env reward into whatever this arm feeds the loss.
 
@@ -1820,6 +1842,17 @@ class OPDRayTrainer(RayPPOTrainer):
 
                     del batch
                     batch = gen_batch_output
+
+                    # TEN GENERATED, EIGHT TRAINED (algorithm.oci_slots), and the
+                    # two that are not trained leave HERE -- before anything starts
+                    # counting rows. adjust_batch pads to a divisor,
+                    # attach_task_loss_weights divides each task's share by its
+                    # token count, _balance_batch splits by tokens and
+                    # update_policy cuts mini-batches by row count, so a batch
+                    # still carrying them would take about a quarter more
+                    # optimizer steps per training step than control, each with a
+                    # quarter of its rows inert. A no-op with the arm off.
+                    batch = self._select_oci_slots(batch, metrics)
 
                     # Rows at or past n_real are the duplicates adjust_batch appends
                     # to reach a DP/micro-divisible count; the per-task weights below

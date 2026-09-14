@@ -303,6 +303,14 @@ def inject_distillation_config(config) -> None:
         oci_cfg = config.algorithm.get("oci_sat", None)
         if oci_cfg is not None:
             config.actor_rollout_ref.actor.oci_sat = oci_cfg
+        # The ten-slot layout, for the same reason and by the same route: the
+        # driver decides which of a group's ten rollouts are trained and which one
+        # is special, and the ACTOR needs to know that the special one is trained
+        # by the shaped term alone (with what gamma, and whether it also
+        # distils). Copied whole so the lock pins one place.
+        oci_slots_cfg = config.algorithm.get("oci_slots", None)
+        if oci_slots_cfg is not None:
+            config.actor_rollout_ref.actor.oci_slots = oci_slots_cfg
         # The stand-alone transfer ladder: the off-task planes with NO weighting,
         # so an arm that touches neither the KL nor the target can still report
         # transfer/off_travel. It needs the same four-model cache the weighted

@@ -401,6 +401,56 @@ algorithm:
     # failure's own length set its weight). tests/oci/test_floor.py holds these
     # numbers against core_algos.
     weight: trajectory
+  oci_slots:
+    # TEN ROLLOUTS PER GROUP, EIGHT OF THEM TRAINED. The switch; read by the
+    # alfworld env manager off its own copy of this config (the same route, and
+    # for the same reasons, as oci_sat.enable below), and by the driver, which
+    # decides which eight of the ten a group trains.
+    #
+    # THE LAYOUT, at env.rollout.n = 10:
+    #   slots 0-6  plain      ordinary rollouts, always trained
+    #   slot  7    reserve    ordinary too; trained unless a special slot replaces it
+    #   slot  8    document   shown this game's own walkthrough
+    #   slot  9    foreign    shown ANOTHER TASK'S prompt instead of its own
+    # The class is read off the eight ordinary ones -- exactly the eight a control
+    # group trains -- and the special slots are spent only where control's group
+    # has an advantage of exactly zero:
+    #   live      -> the eight ordinary rollouts (identical to control)
+    #   stuck     -> seven plain + the document rollout, if it solved the game
+    #   saturated -> seven plain + the foreign rollout, if it failed
+    # Eight trajectories train either way, so the group size, the advantage's
+    # denominator and the rows in an optimizer step stay control's. See
+    # verl/trainer/ppo/oci_slots.py and agent_system/environments/oci_layout.py.
+    enable: False
+    # Only where a document exists and has been checked. alfworld's is the game's
+    # own walkthrough, which replays 30/30; webshop's and search's have to be
+    # built and replay-verified before they can be listed here.
+    tasks: ["alfworld"]
+    # What the document slot prints. Both print the walkthrough; the stepwise
+    # variant adds the line naming the step still owed, which is the difference
+    # between 35% of stuck groups rescued and 88-95% -- the block alone is read
+    # and then lost track of after about four steps, with two turns of history.
+    doc_mode: walkthrough_stepwise
+    # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
+    # five of those were measured on saturated groups and none reached 12%,
+    # because a student that already knows what to do ignores a path it does not
+    # need. Another task's prompt is not a claim about this game at all -- every
+    # action it produces is inadmissible here, so the episode spends its turn
+    # budget and ends at the failure return. webshop rather than search because
+    # its prompt asks for the same <think>/<action> shape, so the rows are
+    # format-valid and take no invalid-action penalty; a search prompt would emit
+    # <search> tags and land BELOW an ordinary failure.
+    foreign_task: webshop
+    # LUFFY's f(rho) = rho/(rho+gamma) for the special row's policy gradient,
+    # taken on the PLAIN prompt (verl/trainer/ppo/oci_shaping.py). Not a knob for
+    # whether to shape: both special rows are off-policy for the prompt that
+    # exists at test time, so there is no unshaped version of this arm.
+    gamma: 0.1
+    # Whether the special row also trains the distillation term. False: the
+    # teacher would be read on a prompt carrying a walkthrough, or on another
+    # task's prompt entirely, and distilling that is a claim the arm does not
+    # make. The policy gradient still trains those rows, shaped.
+    opd_on_special: False
   oci_sat:
     # The switch. Read by the alfworld env manager off its own copy of this
     # config (_copy_config_for_task copies the whole tree), so it is pinned by

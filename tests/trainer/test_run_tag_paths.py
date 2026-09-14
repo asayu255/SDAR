@@ -31,6 +31,25 @@ TAGGED = (
 TAGGED_IF_PRESENT = ("trainer.sign_token_dump_dir",)
 
 
+def _chain_text(script):
+    """The script's own text, followed by the text of the script it execs.
+
+    A WRAPPER (`exec bash "$_HERE/<arm>.sh" <overrides>`) sets only what differs
+    from the arm it wraps -- its own directories and its own name -- and inherits
+    the rest, project_name included. Read alone it looks like a script that forgot
+    to tag a path, which is what this test used to report for every wrapper. Read
+    with its target appended, the FIRST match for a key is the wrapper's value
+    where it sets one and the target's where it does not, which is what Hydra
+    sees: the later override on the composed command line wins.
+    """
+    text = script.read_text()
+    m = re.search(r'exec bash (?:"\$_HERE/(?P<sibling>[\w.-]+)"|(?P<rel>[\w][\w./-]*\.sh))', text)
+    if m is None:
+        return text
+    target = (script.parent / m.group("sibling")) if m.group("sibling") else (ROOT / m.group("rel"))
+    return text + "\n" + _chain_text(target)
+
+
 def _assign(text, key):
     m = re.search(rf"{re.escape(key)}=([^ \\\n]*)", text)
     assert m, f"{key} not found"
@@ -76,7 +95,7 @@ def _arms(text):
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
     """Byte-for-byte, or an existing run stops resuming the moment this lands."""
-    text = script.read_text()
+    text = _chain_text(script)
     for arm in _arms(text):
         for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
             raw = _assign(text, key)
@@ -88,7 +107,7 @@ def test_an_unset_tag_leaves_every_path_exactly_as_it_was(script):
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_a_set_tag_moves_every_tagged_value(script):
-    text = script.read_text()
+    text = _chain_text(script)
     for arm in _arms(text):
         for key in TAGGED + tuple(k for k in TAGGED_IF_PRESENT if f"{k}=" in text):
             raw = _assign(text, key)
@@ -102,7 +121,7 @@ def test_the_lock_expects_the_same_suffixed_name_the_script_passes(script):
     lock has to carry the suffix too, and against the SAME base."""
     import re as _re
 
-    text = script.read_text()
+    text = _chain_text(script)
     lock = _re.search(r"\+trainer\.expected_config=(\S+)", text)
     assert lock, "the arm does not pin an expectations file"
     lock_path = lock.group(1).strip('"')
@@ -125,7 +144,7 @@ def test_every_arm_still_has_its_own_untagged_directory():
     be a different bug, and this is where it would show up."""
     dirs = {}
     for script in SCRIPTS:
-        text = script.read_text()
+        text = _chain_text(script)
         raw = _assign(text, "trainer.default_local_dir")
         for arm in _arms(text):
             d = _expand(raw, "/h", "", arm)

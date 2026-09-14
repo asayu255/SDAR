@@ -35,7 +35,8 @@ import numpy as np
 
 from verl.trainer.ppo.metric_utils import get_task_names
 
-__all__ = ["classify_groups", "select_saturated_injections", "zero_injected_advantage"]
+__all__ = ["classify_groups", "classify_returns", "select_saturated_injections",
+           "zero_injected_advantage"]
 
 INJECTED_KEY = "oci_injected"
 
@@ -64,7 +65,23 @@ def classify_groups(batch, *, judged_rows: Optional[np.ndarray] = None) -> Dict[
     tuids = batch.non_tensor_batch.get("traj_uid", None)
     if uids is None or tuids is None:
         return {}
-    ret = _row_returns(batch)
+    return classify_returns(_row_returns(batch), uids, tuids, get_task_names(batch),
+                            judged_rows=judged_rows)
+
+
+def classify_returns(returns, uids, tuids, task_names=None, *,
+                     judged_rows: Optional[np.ndarray] = None) -> Dict[str, Dict]:
+    """The same verdict, from plain columns rather than from a scored batch.
+
+    ONE STEP EARLIER IN THE PIPELINE. The ten-slot layout (see
+    verl/trainer/ppo/oci_slots.py) picks each group's eighth rollout straight out
+    of the rollout loop, before the reward manager has written
+    ``token_level_rewards``; the only return available there is the environment's
+    own. That is the number the manager goes on to copy -- both entry points
+    build it with ``normalize_by_length=False`` -- so the verdict taken here and
+    the verdict the advantage is built from cannot disagree.
+    """
+    ret = np.asarray([float(r) for r in returns], dtype=float)
     n = len(ret)
     judged = np.ones(n, dtype=bool) if judged_rows is None else np.asarray(judged_rows, dtype=bool)
 
@@ -94,7 +111,6 @@ def classify_groups(batch, *, judged_rows: Optional[np.ndarray] = None) -> Dict[
     # the per-task split gives 10. Worse than the metric: the same verdict is
     # what select_saturated_injections reads, so a group's class was being
     # decided against another task's scale.
-    task_names = get_task_names(batch)
     group_task = {}
     for uid, g in by_group.items():
         group_task[uid] = str(task_names[g["rows"][0]]) if task_names is not None else ""

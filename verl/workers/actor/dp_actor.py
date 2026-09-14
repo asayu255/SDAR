@@ -497,6 +497,22 @@ def _oci_injected_rows(micro_batch):
     return injected_rows(micro_batch)
 
 
+def _oci_opd_keep(micro_batch, like):
+    """``(bs, 1)``: 0 on rows whose only training term is the shaped one, 1 elsewhere.
+
+    The ten-slot layout's special rows are a walkthrough-conditioned rollout and a
+    rollout shown another task's prompt. Distilling either means reading the
+    teacher on a prompt the student never meets and calling the result the
+    teacher's opinion of this task, which is a claim the arm does not make. The
+    factor multiplies the KL and not ``response_mask``, which the policy-gradient
+    term aggregates over too -- those rows DO train it, shaped.
+    """
+    col = micro_batch.get("oci_injected", None) if hasattr(micro_batch, "get") else None
+    if col is None:
+        return torch.ones((like.shape[0], 1), dtype=like.dtype, device=like.device)
+    return (1 - col.reshape(-1, 1).clamp(0, 1)).to(dtype=like.dtype, device=like.device)
+
+
 def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
                      advantages, old_log_prob, temperature, gamma):
     """Replace the injected rows' per-token loss with the shaped one.
@@ -2584,23 +2600,36 @@ class DataParallelPPOActor(BasePPOActor):
         # block sits so it can be removed. All three come off the rollout.
         _oci_cfg = self.config.get("oci_sat", None) or {}
         _oci_shape_cfg = _oci_cfg.get("shaping", None) or {}
+        # The ten-slot layout has no unshaped variant: BOTH of its special rows
+        # are off-policy for the prompt that exists at test time (one carries a
+        # walkthrough, the other another task's prompt entirely), so the shaping
+        # is not a knob there -- it is the only way those rows can be trained at
+        # all. It brings its own gamma and its own decision about the
+        # distillation term.
+        _oci_slots_cfg = self.config.get("oci_slots", None) or {}
+        oci_slots_on = bool(_oci_slots_cfg.get("enable", False))
+        _oci_shape_wanted = bool(_oci_shape_cfg.get("enable", False)) or oci_slots_on
         oci_shaping_on = (
-            bool(_oci_shape_cfg.get("enable", False))
+            _oci_shape_wanted
             and "oci_injected" in data.batch.keys()
             and "oci_plan_off" in data.batch.keys()
             and "oci_plan_len" in data.batch.keys()
         )
-        if bool(_oci_shape_cfg.get("enable", False)) and not oci_shaping_on:
+        if _oci_shape_wanted and not oci_shaping_on:
             # A launch error, not a quiet fallback to the unshaped ratio: that
             # fallback IS arm A without the shaping, which is the arm this
             # option exists to replace.
             raise AssertionError(
-                "actor.oci_sat.shaping.enable=True but the batch lacks "
-                f"{sorted({'oci_injected', 'oci_plan_off', 'oci_plan_len'} - set(data.batch.keys()))}. "
-                "Those columns come from the rollout loop (algorithm.oci_sat.enable) "
-                "and from the trainer's injection selection."
+                "actor.oci_sat.shaping.enable=True or actor.oci_slots.enable=True, but "
+                f"the batch lacks {sorted({'oci_injected', 'oci_plan_off', 'oci_plan_len'} - set(data.batch.keys()))}. "
+                "Those columns come from the rollout loop (algorithm.oci_sat.enable / "
+                "algorithm.oci_slots.enable) and from the trainer's selection."
             )
-        oci_gamma = float(_oci_shape_cfg.get("gamma", 0.1))
+        oci_gamma = float(_oci_slots_cfg.get("gamma", 0.1) if oci_slots_on
+                          else _oci_shape_cfg.get("gamma", 0.1))
+        # Whether the special rows also train the distillation term. Off in the
+        # arm, and off by default: see _oci_opd_keep.
+        oci_opd_skip = oci_slots_on and not bool(_oci_slots_cfg.get("opd_on_special", False))
         # The one knob, and it is a unit conversion rather than a strength dial:
         # exp(c) needs c in nats and c is in RMS units. The measured conversion is
         # 2.148 and that is what the run scripts pin; the 1.0 default here is the
@@ -2786,6 +2815,15 @@ class DataParallelPPOActor(BasePPOActor):
         # the loss 1/num_tasks instead of its share of the response tokens. Absent ->
         # plain token-mean, i.e. nothing below changes.
         task_weighted = TASK_LOSS_WEIGHT_KEY in data.batch.keys()
+        if oci_slots_on and not task_weighted:
+            # The shaped term is built on the per-task-weighted branch of the
+            # policy loss and only there, so without the weights the special rows
+            # would train an ordinary clipped ratio taken on the privileged
+            # prompt -- the one thing the arm exists to avoid.
+            raise AssertionError(
+                f"algorithm.oci_slots.enable=True but the batch carries no {TASK_LOSS_WEIGHT_KEY}; "
+                "set algorithm.opd.normalize_loss_by_task=True."
+            )
         if task_weighted:
             select_keys.append(TASK_LOSS_WEIGHT_KEY)
             check_task_weighting_supported(
@@ -5232,6 +5270,10 @@ class DataParallelPPOActor(BasePPOActor):
                                  base_beta=_lp_base_beta,
                              )
                          _kld_for_loss = teacher_kld if _pb_w is None else teacher_kld * _pb_w
+                         if oci_opd_skip:
+                             # The ten-slot layout's special rows: policy gradient
+                             # yes (shaped, above), distillation no.
+                             _kld_for_loss = _kld_for_loss * _oci_opd_keep(data, _kld_for_loss)
                          # The OPD term is assembled into _opd_term and added
                          # ONCE below, so the per-id reweighting has a single
                          # place to intercept it. Three branches reach it and all

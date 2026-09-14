@@ -36,11 +36,67 @@ from verl.trainer.ppo.privileged_notice import (
     parse_notice_config as _parse_notice_config,
 )
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
+from agent_system.environments.oci_layout import (
+    OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on)
 
 # Width of the oci_plan_repl column. The replacement is the no-plan render's
 # boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
 # row needing more is recorded as not strippable rather than truncated.
 OCI_REPL_WIDTH = 16
+
+
+def _oci_render_edit(tokenizer, messages, plain_content, width, template_kwargs,
+                     prompt_window=None):
+    """``(off, take, repl)``: the ONE replacement that turns this row's rendered
+    prompt into the render it would have had with ``plain_content`` as the user
+    turn's content. ``None`` when that edit is not exact or does not fit ``width``.
+
+    Both halves are read off the two renders IN TOKENS, because character
+    arithmetic can split a token that spans the boundary, and the result is
+    checked by RECONSTRUCTION rather than by an arithmetic identity: splicing
+    ``repl`` in where ``take`` came out must reproduce the plain render token for
+    token. It is a replacement and not a deletion because the two renders really
+    do differ that way -- without the block in front of it the chat header's
+    newline merges with the observation's leading newline into one "\\n\\n" token
+    -- and the first version of this, which required a pure deletion, filed every
+    candidate row unstrippable and measured rho on 0 of 299 rows.
+
+    ``prompt_window`` is the row's prompt region, and a plain render that does not
+    FIT it is reported as not strippable. The foreign slot makes this reachable:
+    its prompt is another task's, which is SHORTER than the alfworld prompt it
+    stands in for, so the splice grows the prompt instead of shrinking it. Past
+    the window ``splice_span`` leaves the row untouched by design -- and an
+    untouched row would be re-scored on the prompt it was generated with, giving
+    rho = 1 and handing the special row nearly its whole advantage on exactly the
+    conditional distribution the shaping exists to keep it off.
+    """
+    msgs_plain = [dict(_m) for _m in messages]
+    for _m in msgs_plain:
+        if _m.get("role") == "user":
+            _m["content"] = plain_content
+            break
+    ids_w = tokenizer.encode(tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False,
+        **template_kwargs), add_special_tokens=False)
+    ids_o = tokenizer.encode(tokenizer.apply_chat_template(
+        msgs_plain, add_generation_prompt=True, tokenize=False,
+        **template_kwargs), add_special_tokens=False)
+    lo = min(len(ids_w), len(ids_o))
+    head = 0
+    while head < lo and ids_w[head] == ids_o[head]:
+        head += 1
+    tail = 0
+    while (tail < lo - head
+           and ids_w[len(ids_w) - 1 - tail] == ids_o[len(ids_o) - 1 - tail]):
+        tail += 1
+    take = len(ids_w) - head - tail        # the region to take out
+    repl = ids_o[head:len(ids_o) - tail]   # what to put in its place
+    if prompt_window is not None and len(ids_o) > int(prompt_window):
+        return None
+    if (take > 0 and len(repl) <= width
+            and ids_w[:head] + repl + ids_w[len(ids_w) - tail:] == ids_o):
+        return head, take, repl
+    return None
 from typing import List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -840,6 +896,14 @@ def _prompt_ids_from_tensors(input_ids_row, attention_mask_row):
 
 
 class TrajectoryCollector:
+    # Set by __init__ off the config; declared here so an instance built without
+    # it -- tests construct one with __new__ to exercise a single method -- still
+    # carries the layout's defaults, which are the ones every run without the arm
+    # has.
+    _oci_repl_width = OCI_REPL_WIDTH
+    _oci_repl_dtype = torch.long
+    _oci_group_n = 0
+
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
         Initialize the TrajectoryProcessor class.
@@ -852,6 +916,23 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        # HOW WIDE THE REPLACEMENT COLUMN IS. The single-candidate arm's edit puts
+        # back one boundary token (see OCI_REPL_WIDTH). The ten-slot layout's
+        # document slot edits the prompt in two places at once and its foreign
+        # slot replaces the user turn outright, so what goes back is the plain
+        # render's own span -- bounded by the prompt length, since that is what it
+        # is part of. int32 because the column is then one per row of the batch
+        # and token ids fit it; a row whose replacement does not fit is recorded
+        # as not strippable, exactly as before.
+        self._oci_repl_width = (int(config.data.max_prompt_length)
+                                if _oci_slots_on(config) else OCI_REPL_WIDTH)
+        self._oci_repl_dtype = (torch.long if self._oci_repl_width <= OCI_REPL_WIDTH
+                                else torch.int32)
+        # Which slot of its group a row is. Recorded HERE, where the row order in
+        # the generation batch still means something -- the driver sees it after
+        # the batch has been regrouped by task, padded and reordered. 0 when the
+        # layout is off, where nothing reads it.
+        self._oci_group_n = int(config.env.rollout.n) if _oci_slots_on(config) else 0
         # The privileged multitask notice, STUDENT mode: a system message chosen by
         # the row's task, prepended to every turn's prompt at tokenisation time so
         # it is in the rollout and in the update alike (the two must agree, since
@@ -1063,7 +1144,8 @@ class TrajectoryCollector:
         # no-plan tokens to put in its place (repl, repl_len). Verified exact on
         # 120 real games, where repl is a single "\n\n".
         oci_candidate, oci_plan_off, oci_plan_len, oci_plan_truncated = 0, 0, 0, 0
-        oci_plan_repl = [0] * OCI_REPL_WIDTH
+        _oci_width = self._oci_repl_width
+        oci_plan_repl = [0] * _oci_width
         oci_plan_repl_len = 0
         # Read off the OBSERVATION, in the same indexing as every other obs key,
         # because the multitask merge has already put them all in global row
@@ -1076,40 +1158,34 @@ class TrajectoryCollector:
         # empty entry already means "no plan was shown to this row".
         _oci_pres = obs.get(OCI_PREFIX_KEY, None)
         _oci_pre = (_oci_pres[item] or "") if _oci_pres is not None and _oci_pres[item] else ""
-        if _oci_pre and obs_content.startswith(_oci_pre):
+        # THE TEN-SLOT LAYOUT HANDS OVER THE PLAIN RENDER, NOT A PREFIX. Its
+        # document slot edits the prompt in two places (the block at the head and
+        # the progress line before the turn prompt) and its foreign slot replaces
+        # the user turn outright, so "what was prepended" no longer locates the
+        # edit. Both arms end at the same thing -- ONE replacement, verified by
+        # reconstruction -- and only one of them can be on for a given run, which
+        # the env manager asserts.
+        _oci_plains = obs.get(OCI_PLAIN_KEY, None)
+        _oci_plain = (_oci_plains[item] or "") if _oci_plains is not None and _oci_plains[item] else ""
+        _oci_roles = obs.get(OCI_ROLE_KEY, None)
+        oci_role = int(_oci_roles[item] or 0) if _oci_roles is not None and _oci_roles[item] is not None else 0
+        _plain_content = None
+        if _oci_plain and _oci_plain != obs_content:
+            _plain_content = _oci_plain
+        elif _oci_pre and obs_content.startswith(_oci_pre):
+            _plain_content = obs_content[len(_oci_pre):]
+        if _plain_content is not None:
             oci_candidate = 1
-            _msgs_wo = [dict(_m) for _m in messages]
-            for _m in _msgs_wo:
-                if _m.get("role") == "user":
-                    _m["content"] = _m["content"][len(_oci_pre):]
-                    break
-            _ids_w = tokenizer.encode(tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False,
-                **apply_chat_template_kwargs), add_special_tokens=False)
-            _ids_o = tokenizer.encode(tokenizer.apply_chat_template(
-                _msgs_wo, add_generation_prompt=True, tokenize=False,
-                **apply_chat_template_kwargs), add_special_tokens=False)
-            _lo = min(len(_ids_w), len(_ids_o))
-            _head = 0
-            while _head < _lo and _ids_w[_head] == _ids_o[_head]:
-                _head += 1
-            _tail = 0
-            while (_tail < _lo - _head
-                   and _ids_w[len(_ids_w) - 1 - _tail] == _ids_o[len(_ids_o) - 1 - _tail]):
-                _tail += 1
-            _take = len(_ids_w) - _head - _tail        # with-plan region
-            _repl = _ids_o[_head:len(_ids_o) - _tail]  # no-plan region
-            # Checked by RECONSTRUCTION rather than by an arithmetic identity:
-            # splicing _repl in where _take came out must reproduce the no-plan
-            # render token for token. A row that fails it, or whose replacement
-            # does not fit the fixed-width column, keeps oci_candidate=1 (it IS
-            # the injected row) and length 0, which every reader treats as "not
-            # strippable" rather than "no plan".
-            if (_take > 0 and len(_repl) <= OCI_REPL_WIDTH
-                    and _ids_w[:_head] + _repl + _ids_w[len(_ids_w) - _tail:] == _ids_o):
-                oci_plan_off, oci_plan_len = _head, _take
+            # A row whose edit is not exact, or whose replacement does not fit the
+            # column, keeps oci_candidate=1 (it IS a privileged row) and length 0,
+            # which every reader treats as "not strippable" rather than "no plan".
+            _edit = _oci_render_edit(tokenizer, messages, _plain_content, _oci_width,
+                                     apply_chat_template_kwargs,
+                                     prompt_window=int(self.config.data.max_prompt_length))
+            if _edit is not None:
+                oci_plan_off, oci_plan_len, _repl = _edit
                 oci_plan_repl_len = len(_repl)
-                oci_plan_repl = list(_repl) + [0] * (OCI_REPL_WIDTH - len(_repl))
+                oci_plan_repl = list(_repl) + [0] * (_oci_width - len(_repl))
 
         chat = np.array(messages)
         
@@ -1203,7 +1279,7 @@ class TrajectoryCollector:
             'oci_candidate': torch.tensor(oci_candidate, dtype=torch.long),
             'oci_plan_off': torch.tensor(oci_plan_off, dtype=torch.long),
             'oci_plan_len': torch.tensor(oci_plan_len, dtype=torch.long),
-            'oci_plan_repl': torch.tensor(oci_plan_repl, dtype=torch.long),
+            'oci_plan_repl': torch.tensor(oci_plan_repl, dtype=self._oci_repl_dtype),
             'oci_plan_repl_len': torch.tensor(oci_plan_repl_len, dtype=torch.long),
             # truncation=left cuts the head, which is where the offset is
             # measured from, so a truncated row's span no longer locates the
@@ -1211,6 +1287,13 @@ class TrajectoryCollector:
             'oci_plan_truncated': torch.tensor(
                 int(oci_plan_len > 0 and int(attention_mask[0].sum()) >= int(self.config.data.max_prompt_length)),
                 dtype=torch.long),
+            # The ten-slot layout: what this row's slot is for (from the env
+            # manager, the only place that knows its own slots) and which slot of
+            # its group it is (from the row order, which means something here and
+            # nowhere downstream). Both 0 when the layout is off.
+            'oci_role': torch.tensor(oci_role, dtype=torch.long),
+            'oci_slot': torch.tensor(
+                (item % self._oci_group_n) if self._oci_group_n else 0, dtype=torch.long),
         })
 
         if 'task_name' in gen_batch.non_tensor_batch:
@@ -1268,9 +1351,12 @@ class TrajectoryCollector:
             'oci_candidate': torch.tensor(0, dtype=torch.long),
             'oci_plan_off': torch.tensor(0, dtype=torch.long),
             'oci_plan_len': torch.tensor(0, dtype=torch.long),
-            'oci_plan_repl': torch.zeros(OCI_REPL_WIDTH, dtype=torch.long),
+            'oci_plan_repl': torch.zeros(self._oci_repl_width, dtype=self._oci_repl_dtype),
             'oci_plan_repl_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_truncated': torch.tensor(0, dtype=torch.long),
+            'oci_role': torch.tensor(0, dtype=torch.long),
+            'oci_slot': torch.tensor(
+                (item % self._oci_group_n) if self._oci_group_n else 0, dtype=torch.long),
         }
         if 'task_name' in gen_batch.non_tensor_batch:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]

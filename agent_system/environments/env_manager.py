@@ -22,6 +22,11 @@ from functools import partial
 import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
+from agent_system.environments.oci_layout import (
+    OCI_PLAIN_KEY, OCI_ROLE_KEY, ROLE_DOC, ROLE_FOREIGN,
+    doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
+    foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
+    slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
 
 
@@ -165,6 +170,23 @@ def _oci_switch_on(config) -> bool:
     return bool(cfg is not None and cfg.get("enable", False))
 
 
+def _assert_one_privileged_arm(config) -> None:
+    """Two privileged inputs in one prompt is two interventions, and rho removes one.
+
+    ``oci_sat`` writes a plan into one slot per group; ``oci_slots`` writes a
+    walkthrough into the document slot and another task's prompt into the foreign
+    one. Both are stripped for the shaped term by a SINGLE verified replacement
+    per row, so a prompt carrying both cannot be re-scored on the prompt that
+    exists at test time -- and the two arms also disagree about which slot is
+    which.
+    """
+    if _oci_switch_on(config) and _slots_on(config):
+        raise ValueError(
+            "algorithm.oci_sat.enable and algorithm.oci_slots.enable are both on. "
+            "They are two different privileged inputs into the same alfworld "
+            "prompt and two different slot layouts; pick one arm.")
+
+
 def _oci_detour(config) -> int:
     """Extra ``go to`` steps inserted into a corrupted path. 0 = off."""
     cfg = _oci_cfg(config)
@@ -216,11 +238,21 @@ def _wrong_plan_prefix(task: str, gamefile, config=None, admissible=None) -> str
     """
     if not _oci_switch_on(config):
         return ""
+    return _plan_block(task, gamefile, _oci_plan_mode(config), admissible,
+                       _oci_detour(config), _oci_delay_turns(config))
+
+
+def _plan_block(task: str, gamefile, mode: str, admissible=None,
+                n_detour: int = 0, turns: int = 50) -> str:
+    """The block itself, for a caller that already knows which mode it wants.
+
+    Split out of ``_wrong_plan_prefix`` for the ten-slot layout, whose document
+    slot asks for one specific mode (the game's own walkthrough) while
+    ``algorithm.oci_sat`` is off -- so the switch that gates the other arm cannot
+    be the gate here.
+    """
     if task != "alfworld" or not gamefile:
         return ""
-    mode = _oci_plan_mode(config)
-    n_detour = _oci_detour(config)
-    turns = _oci_delay_turns(config)
     needs_scene = n_detour or mode in ("delay", "delay_stepwise")
     scene = _scene_receptacles(gamefile, admissible) if needs_scene else []
     key = (str(gamefile), mode, n_detour, turns)
@@ -820,9 +852,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         # Refilled by every build_text_obs call; see OCI_PREFIX_KEY.
         self._oci_prefixes = []
+        # The same, for the ten-slot layout (algorithm.oci_slots): what each slot
+        # is for, and the render it would have had with no privileged text in it.
+        # Both travel on the observation dict, for the reason OCI_PREFIX_KEY does.
+        self._oci_roles = []
+        self._oci_plains = []
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
+        _assert_one_privileged_arm(self.config)
         text_obs, image_obs, infos = self.envs.reset()
         self.gamefile = parse_gamefile(infos)
         # walkthrough_stepwise: every slot starts at step 1 of its path.
@@ -835,7 +873,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
-                OCI_PREFIX_KEY: list(self._oci_prefixes)}, infos
+                OCI_PREFIX_KEY: list(self._oci_prefixes),
+                OCI_ROLE_KEY: list(self._oci_roles),
+                OCI_PLAIN_KEY: list(self._oci_plains)}, infos
     
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
@@ -843,10 +883,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
 
-        if _oci_stepwise(self.config) and getattr(self, 'gamefile', None):
+        if (_oci_stepwise(self.config) or _slots_doc_stepwise(self.config)) and getattr(self, 'gamefile', None):
+            _envs = getattr(self, 'envs', None)
             ptrs = list(getattr(self, "_guide_ptr", None) or [0] * len(actions))
             for i, act in enumerate(actions):
-                if _oci_candidate_row(i, getattr(self, 'envs', None), self.config):
+                # The single-candidate arm marks one slot per group; the ten-slot
+                # layout marks the document slot. reset() asserts the two are not
+                # both on, so at most one of these can be true for a given run.
+                if (_oci_candidate_row(i, _envs, self.config)
+                        or _slots_role(i, _envs, self.config) == ROLE_DOC):
                     shown = self._oci_prefixes[i] if i < len(self._oci_prefixes) else ""
                     ptrs[i] = _advance_guide(_block_lines(shown), ptrs[i], act)
             self._guide_ptr = ptrs
@@ -860,7 +905,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             info['is_action_valid'] = to_numpy(valids[i])
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
-                             OCI_PREFIX_KEY: list(self._oci_prefixes)}
+                             OCI_PREFIX_KEY: list(self._oci_prefixes),
+                             OCI_ROLE_KEY: list(self._oci_roles),
+                             OCI_PLAIN_KEY: list(self._oci_plains)}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -886,8 +933,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         dict under OCI_PREFIX_KEY so the multitask merge reorders it with
         everything else -- see the note on OCI_PREFIX_KEY for what happened when
         it travelled by env-slot index instead.
+
+        With the ten-slot layout on (algorithm.oci_slots) it fills two more lists
+        the same way: ``self._oci_roles``, what each slot is for, and
+        ``self._oci_plains``, the render THIS turn would have had with no
+        privileged text in it -- kept because the shaped term re-scores the
+        special slots' response tokens on exactly that prompt, and rebuilding it
+        later from a stored history would not be the same string.
         """
         self._oci_prefixes = []
+        self._oci_roles = []
+        self._oci_plains = []
+        _envs = getattr(self, 'envs', None)
         postprocess_text_obs = []
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
@@ -904,12 +961,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                _oci_pre = (_wrong_plan_prefix('alfworld',
-                                              (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
-                                              self.config, admissible_actions[i])
-                            if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
-                self._oci_prefixes.append(_oci_pre)
-                obs = _oci_pre + obs
             else:
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
@@ -920,16 +971,46 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-                _oci_pre = (_wrong_plan_prefix('alfworld',
-                                              (self.gamefile[i] if getattr(self, 'gamefile', None) else None),
-                                              self.config, admissible_actions[i])
-                            if _oci_candidate_row(i, getattr(self, 'envs', None), self.config) else "")
-                self._oci_prefixes.append(_oci_pre)
-                obs = _oci_pre + obs
 
-            if _oci_pre and _oci_stepwise(self.config):
-                _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
-                obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
+            # What the plain student would have been asked at this turn. Kept as
+            # it is here, before anything privileged is added, because it is the
+            # prompt the special slots' tokens are re-scored on.
+            plain_obs = obs
+            _gamefile = self.gamefile[i] if getattr(self, 'gamefile', None) else None
+            _role = _slots_role(i, _envs, self.config)
+            self._oci_roles.append(_role)
+            if _role == ROLE_DOC:
+                # This game's own solution path, and (stepwise) the one line that
+                # says which step it still owes -- the difference between 35% and
+                # 88-95% of stuck groups solved.
+                _oci_pre = _plan_block('alfworld', _gamefile, _slots_doc_mode(self.config),
+                                       admissible_actions[i])
+                obs = _oci_pre + obs
+                if _oci_pre and _slots_doc_stepwise(self.config):
+                    _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
+                    obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
+            elif _role == ROLE_FOREIGN:
+                # ANOTHER TASK'S PROMPT, not a document about this game: the slot
+                # is told nothing about where it is, so every action it produces
+                # is inadmissible here and the episode spends its turn budget.
+                # Chosen from the gamefile, so a game is shown the same one every
+                # time it is drawn.
+                _oci_pre = ""
+                obs = _slots_foreign_prompt(_slots_foreign_task(self.config), _gamefile)
+            else:
+                _oci_pre = (_wrong_plan_prefix('alfworld', _gamefile, self.config,
+                                               admissible_actions[i])
+                            if _oci_candidate_row(i, _envs, self.config) else "")
+                obs = _oci_pre + obs
+                if _oci_pre and _oci_stepwise(self.config):
+                    _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
+                    obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
+            self._oci_prefixes.append(_oci_pre)
+            # Only where the render actually differs. '' means "nothing to strip",
+            # which is what every plain slot wants and what the single-candidate
+            # arm wants too -- that one is stripped by its prefix instead.
+            self._oci_plains.append(
+                plain_obs if (_role in (ROLE_DOC, ROLE_FOREIGN) and obs != plain_obs) else "")
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
@@ -948,6 +1029,35 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 if gamefile:
                     self._process_gamefile(gamefile, won_value, success)
                 return  # Exit after finding the first active mask
+
+    def success_evaluator(self, *args, **kwargs) -> Dict[str, np.ndarray]:
+        """Training success over the ORDINARY slots, with the special ones split out.
+
+        The ten-slot layout adds two rollouts per group that are not the student
+        being measured: one is shown the answer, the other is shown another task's
+        prompt. Folding them into ``success_rate`` would move the training curve by
+        construction -- up by the document slot's rescues, down by the foreign
+        slot's certain failures -- and that curve is what this arm is compared
+        against control on. They get their own keys instead, where they say what
+        each slot is doing: the document slot's rate is its rescue rate, and the
+        foreign slot's should stay at zero.
+        """
+        total_infos = kwargs['total_infos']
+        total_batch_list = kwargs['total_batch_list']
+        _envs = getattr(self, 'envs', None)
+        roles = [_slots_role(i, _envs, self.config) for i in range(len(total_batch_list))]
+        if not any(r in (ROLE_DOC, ROLE_FOREIGN) for r in roles):
+            return super().success_evaluator(*args, **kwargs)
+
+        plain = defaultdict(list)
+        special = {ROLE_DOC: defaultdict(list), ROLE_FOREIGN: defaultdict(list)}
+        for bs in range(len(total_batch_list)):
+            self._process_batch(bs, total_batch_list, total_infos,
+                                special.get(roles[bs], plain))
+        out = {key: np.array(value) for key, value in plain.items()}
+        out["oci_doc_success_rate"] = np.array(special[ROLE_DOC]["success_rate"])
+        out["oci_foreign_success_rate"] = np.array(special[ROLE_FOREIGN]["success_rate"])
+        return out
 
     def _process_gamefile(self, gamefile, won_value, success):
         tasks = [
