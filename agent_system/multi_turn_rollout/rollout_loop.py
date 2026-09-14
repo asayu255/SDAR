@@ -1777,6 +1777,16 @@ class TrajectoryCollector:
         rows: list[dict] = to_list_of_dict(batch, record_idx)
 
         for pos, i in enumerate(record_idx):
+            # WHICH INSTANCE THIS ROW BELONGS TO. The validation dump's pairing key
+            # was `val_index`, the row's position in the pass -- which identifies an
+            # instance only when one row IS one instance. On a multi-turn task a
+            # trajectory contributes one row per turn and the lengths differ between
+            # checkpoints, so row i is a different game at every checkpoint and no
+            # paired comparison is possible. ALFWorld's parquet is 15 placeholder
+            # rows and the environment picks the game, so the game's identity exists
+            # only in the info dict; carried here, where the row and its info are the
+            # same index by construction. Empty on tasks that have no such id.
+            rows[pos]['gamefile'] = str((infos[i] or {}).get('extra.gamefile') or '')
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:

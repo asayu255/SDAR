@@ -979,7 +979,7 @@ class RayPPOTrainer:
         return kwargs
 
     def _dump_val_instances(self, *, scores, task_names, data_sources, traj_uids,
-                            tool_callings, response_texts=None):
+                            tool_callings, response_texts=None, gamefiles=None):
         """One line per validation instance, so a later comparison can be PAIRED.
 
         The aggregate this function sits next to -- a mean per task -- is the only
@@ -1019,6 +1019,9 @@ class RayPPOTrainer:
                             "task": None if task_names[i] is None else str(task_names[i]),
                             "data_source": str(data_sources[i]),
                             "traj_uid": str(traj_uids[i]),
+                            # The INSTANCE key, and the reason val_index is not one:
+                            # see _record_turn. Empty when the task has no game id.
+                            "gamefile": "" if gamefiles is None else str(gamefiles[i]),
                             # The episode return. Success is deliberately NOT
                             # derived here: it is 1.0 == score on alfworld and
                             # search but a threshold on webshop's continuous score,
@@ -1226,6 +1229,7 @@ class RayPPOTrainer:
         task_name_lst = []
         tool_calling_list = []
         traj_uid_list = []
+        gamefile_list = []
         success_rate_dict = {}
 
         # Lists to collect samples for the table
@@ -1314,6 +1318,8 @@ class RayPPOTrainer:
                 task_name_lst.append(batch_task_names)
                 tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
                 traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                gamefile_list.append(test_output_gen_batch.non_tensor_batch.get(
+                    'gamefile', np.array([''] * reward_tensor.shape[0], dtype=object)))
                 if val_log_text:
                     response_text_lst.extend(
                         self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -1335,12 +1341,14 @@ class RayPPOTrainer:
         task_names = np.concatenate(task_name_lst, axis=0)
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
+        gamefiles = np.concatenate(gamefile_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
         self._dump_val_instances(
             scores=reward_tensor,
             task_names=task_names,
             data_sources=data_sources,
             traj_uids=traj_uids,
+            gamefiles=gamefiles,
             tool_callings=tool_callings,
             response_texts=response_text_lst if val_log_text else None,
         )
