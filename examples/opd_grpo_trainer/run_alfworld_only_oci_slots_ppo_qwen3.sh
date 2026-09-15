@@ -24,6 +24,17 @@
 # baseline -- a handicap in the arm's disfavour, left in place until the loss
 # question is settled).
 #
+# TWO OPERATIONAL CHANGES, neither of which touches the objective:
+#   ppo_micro_batch_size_per_gpu 5 -> 10. The update is 43% of a 475 s step at
+#     5 with an MFU of 0.15; the first run peaked at 75-80 GiB of a 95 GiB card
+#     and took one allocator retry in 150 steps. Same adjust_batch divisor
+#     (lcm(30,30,30) = lcm(30,30,15) = 30), and the loss sums per-row terms
+#     whose weights are computed over the whole step, so regrouping rows changes
+#     only the order of the arithmetic. If it OOMs anyway, resume_mode=auto
+#     restarts from the last checkpoint.
+#   save_freq 25 -> 10, so an OOM costs at most ten steps. 21 GB each, 30
+#     checkpoints over 300 steps, against 14 TB free on fuji.
+#
 # It execs the first run's launcher and overrides only the keys above plus the
 # names. Scoring afterwards, as for the first run:
 #
@@ -39,6 +50,8 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$_HERE/run_alfworld_only_oci_slots_qwen3.sh" \
     algorithm.oci_slots.special_loss=ppo \
     algorithm.oci_slots.foreign_task=alfworld \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
+    trainer.save_freq=10 \
     trainer.experiment_name="opd_grpo_alfworld_only_oci_slots_ppo_qwen3_1.7b$RUN_TAG_SUFFIX" \
     trainer.default_local_dir="$HOME/checkpoints/verl_agent_opd_grpo_oci_slots_ppo_alfworld_only$RUN_TAG_SUFFIX" \
     trainer.val_instance_log_dir="$HOME/val_instances/opd_grpo_alfworld_only_oci_slots_ppo_qwen3_1.7b$RUN_TAG_SUFFIX" \

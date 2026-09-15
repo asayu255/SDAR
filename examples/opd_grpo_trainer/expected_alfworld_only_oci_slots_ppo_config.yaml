@@ -116,12 +116,21 @@
 # or the two arms are not training on the same rows.
 "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
 # ---- what bounds the training forward ----------------------------------------
-# Halved from 10 after this arm's first launch: it holds four models per row in
-# the hidden-state cache (teacher_cache/gb 16.3 against pure OPD's 4.1) while
-# vLLM is awake and holding its KV cache. Unlike the rollout key above it does
-# NOT enter adjust_batch's divisor, so it moves no rows and drops no data --
-# only how much is resident at once.
-"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
+# BACK TO 10 FOR THIS RUN, for speed. It was halved to 5 on the 3-task arm that
+# holds four models per row in the hidden-state cache (teacher_cache/gb 16.3
+# against pure OPD's 4.1); this run is alfworld-only with one teacher, and the
+# first ten-slot run measured 3-7 GB of teacher cache, an update-peak allocation
+# of 75-80 GiB on a 95 GiB card, and ONE allocator retry (rank 0, step 44) in
+# 150 steps -- so the headroom the halving bought is not being used.
+#
+# IT MOVES NO ROWS, but not for the reason the 5-era comment gave: it DOES enter
+# adjust_batch's divisor, as size_divisor_actor = micro * world_size. At 3 GPUs
+# that is lcm(30, 30, 30) = 30 where 5 gave lcm(30, 30, 15) = 30 -- the same
+# divisor, so the same rows are duplicated to reach it. And the loss is a sum of
+# per-row terms with weights computed over the whole step
+# (agg_loss_by_task_weights), so regrouping rows into fewer micro-batches
+# changes the arithmetic's order and nothing else.
+"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 10
 
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
