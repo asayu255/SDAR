@@ -131,6 +131,14 @@ set -x
 # TIMING, measured rather than estimated: 13 min of startup and ~12.3 min/step,
 # so 150 steps is about 31 hours on two GPUs.
 #
+# ROLLOUT KNOBS, 2026-09-15: the first run switched to ROLLOUT_PUMP_TRAINING=0
+# ROLLOUT_PREFETCH_LOGPROB=0 ROLLOUT_PREFETCH_TEACHER=1 at step 41, after three
+# NCCL watchdog deaths in the rollout phase (steps 19, 34, 34 -- the same
+# signature that killed opd_coef_redistribute at 16 and the alfworld-only run at
+# 4, all on this 2-GPU host). The launcher exports them; the defaults below stay
+# so the script still documents what the other arms ran with. See
+# docs/cross_teacher_shrink_design.md 6.5.
+#
 # ---------------------------------------------------------------------------
 # ENVIRONMENT. SEARCH_URL must point at the retriever -- it is NOT local on
 # every host (wakaba, 100.86.45.30) and the wrong value HANGS rather than

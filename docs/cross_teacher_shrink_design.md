@@ -267,3 +267,25 @@ shrink では `roles=None` が渡り、`target/shrink/role/{structural,content}_
 gate を `in ("curriculum", "shrink")` に広げ、`tests/trainer/test_cross_teacher_shrink_arm.py` に呼び出し側の gate を読む回帰テストを追加した。
 
 **所要時間の実測**: 起動 13 分 + 約 12.3 分/step。150 step は**約 31 時間**で、設計時の 27 時間見積りより長い。
+
+## 6.5 3 回目の死と、rollout knob の切り替え(2026-09-15)
+
+supervisor 下で 2 回落ちた(attempt 1: step 34、attempt 2: step 34。どちらも checkpoint 30 から復旧)。
+flight recorder(§6.4 で有効化)が捕まえた内容:
+
+* 両 rank とも `nccl:_all_gather_base`(input 25,168,000)が **20 個 `scheduled` のまま開始されない**。rank 1 が rank 0 より 4 collective 先行。
+* 位置は step 34 の指標行の直後、step 35 の rollout フェーズ。最後のマイクロバッチ活動(19:04:42)から 35 分後に watchdog。
+* OOM ではない(初報の "oom 103 件" は `dim_room` の部分一致で誤り)。
+
+**同じ署名がこのホストで 4 回**: `opd_coef_redistribute` step 16(09-07)、本アーム step 19 / 34 / 34。全部 2 GPU、
+`ROLLOUT_PUMP_TRAINING=1 ROLLOUT_PREFETCH_LOGPROB=1 ROLLOUT_PREFETCH_TEACHER=1`。fuji(3 GPU)には一度も無い。
+alfworld-only の supervisor ログは同じ死を **`_prefetch_pending_log_probs` の中**と特定し、`PUMP=0 LOGPROB=0 TEACHER=1`
+で 300 step 完走している(TEACHER=0 は post-rollout の一括 teacher 呼び出しで OOM)。
+
+**判断**: step 41(checkpoint 40)で attempt 3 を止め、launcher に上の 3 つの export を入れて supervisor に再開させた。
+損失は 1 step + 起動 13 分。放置した場合の期待損失は残り 110 step で約 5 回 × 2 時間。pump が買っていた時間
+(logprob prefetch ≈ 44 s/step、pump 本体は未計測)は失う。**intent lock には触れていない**(性能経路であって科学的 knob ではない)。
+同じ数学が rollout の後に走るだけで、目標・損失・データ順は同一。
+
+**記録上の含意**: step 41 以降の学習曲線は knob が違う。速度の比較(s/step)は 41 を境に分けて読むこと。精度への影響は無いはずだが、
+「はず」であって測定ではない — 41 前後で `episode/*` の窓平均が跳ねないことを確認項目にする。
