@@ -70,6 +70,10 @@ COMPOSED_SCRIPTS = [
     # leave the LAST one standing, which is the arm's own lock.
     "examples/opd_grpo_trainer/run_alfworld_only_cross_teacher_klw_control_qwen3.sh",
     "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_qwen3.sh",
+    # A WRAPPER OF A WRAPPER OF A WRAPPER: the second ten-slot run execs the
+    # first's launcher with two overrides and its own lock, four
+    # `trainer.expected_config` overrides deep.
+    "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_ppo_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement
@@ -80,6 +84,7 @@ COMPOSED_SCRIPTS = [
 # that stops a run at second zero.
 COMPOSE_ONLY_SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_oci_probe_qwen3.sh",
+    "examples/opd_grpo_trainer/run_alfworld_oci_slots_probe_qwen3.sh",
 ]
 
 
