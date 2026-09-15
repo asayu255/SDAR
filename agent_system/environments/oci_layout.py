@@ -228,6 +228,107 @@ def game_key(gamefile) -> str:
     return "/".join(parts[-4:])
 
 
+# --------------------------------------------------------------------------- #
+# the document slot's block, for each task that has one
+# --------------------------------------------------------------------------- #
+
+# The block, in the environment's own words, and the SAME wrapper for every task
+# so the strip, the numbered-line reader and the progress line do not have to
+# care which task produced it. ALFWorld's path comes from TextWorld's own
+# walkthrough (env_manager._build_wrong_plan); the two below are built here.
+PLAN_HEADER = "[Privileged Solution Path]"
+PLAN_FOOTER = "[/Privileged Solution Path]"
+PLAN_LEAD = (
+    "THIS IS THE VERIFIED CORRECT SOLUTION PATH FOR THIS TASK. IT IS COMPLETE AND OPTIMAL.\n"
+    "YOU MUST FOLLOW IT EXACTLY. At every step, take the action given by the next line\n"
+    "of this path. DO NOT SEARCH ON YOUR OWN. DO NOT DEVIATE FROM IT. Any action that is\n"
+    "not the next line of this path is wrong.\n"
+    "\n"
+    "The full path that solves this task:"
+)
+
+
+def render_document(lines) -> str:
+    """The numbered block, or '' when there is no path to print.
+
+    Numbered because that is what ``_block_lines`` reads back and what the
+    per-turn progress line counts against; the wrapper is byte-identical across
+    tasks so one strip handles all three.
+    """
+    lines = [str(line).strip() for line in (lines or []) if str(line).strip()]
+    if not lines:
+        return ""
+    body = "\n".join(f"{i + 1}. {line}" for i, line in enumerate(lines))
+    return f"{PLAN_HEADER}\n{PLAN_LEAD}\n{body}\n{PLAN_FOOTER}\n\n"
+
+
+def webshop_document_lines(goal, query: str = "name") -> list:
+    """The actions that buy this goal's own product, in WebShop's action grammar.
+
+    WHAT MAKES IT CORRECT. The goal record names the product (``asin``) and the
+    options the reward checks, so buying THAT product with THOSE options is the
+    winning trajectory by construction. Replayed in a live env it reached reward
+    1.0 on 286 of 300 goals; the other 14 top out at 0.80-0.86 because the reward's
+    fuzzy option matching does not credit some of their own options, and no
+    trajectory through the target can fix that. A document slot on those goals
+    simply fails and its group keeps the reserve.
+
+    ``query`` picks the first line, and the default is the leakier one on
+    purpose. ``name`` searches the product's full title, which puts the target on
+    results page 1 for 300 of 300 goals and wins 58 of 60 replayed documents;
+    ``instruction`` searches the goal's own instruction text -- the string the
+    student's prompt already contains -- and wins 52 of 60, losing six goals
+    whose product never appears on page 1. The title is not a meaningful extra
+    leak: the next line is ``click[<asin>]``, which names the product outright,
+    and the block's whole purpose is to be the best document available, as
+    ALFWorld's is TextWorld's own walkthrough.
+    """
+    if not goal:
+        return []
+    asin = str(goal.get("asin") or "").strip().lower()
+    if not asin:
+        return []
+    if query == "name":
+        q = goal.get("name") or goal.get("instruction_text") or goal.get("query")
+    else:
+        q = goal.get("instruction_text") or goal.get("query") or goal.get("name")
+    if not q:
+        return []
+    options = goal.get("goal_options") or {}
+    values = options.values() if isinstance(options, dict) else options
+    lines = [f"search[{str(q).strip()}]", f"click[{asin}]"]
+    lines += [f"click[{str(v).strip().lower()}]" for v in values if str(v).strip()]
+    lines.append("click[buy now]")
+    return lines
+
+
+def search_document_lines(question, target) -> list:
+    """One grounded search, then the answer, in the Search task's action grammar.
+
+    THE SECOND LINE IS THE LEAK AND IT IS WHAT MAKES THE RESCUE CERTAIN: the
+    reward is exact match on ``<answer>``, so a document that only proposed a
+    query would rescue nothing on the questions this slot exists for. The first
+    line is what keeps the trajectory honest -- searching the question verbatim
+    returns passages containing the answer for 65 of 100 nq and 55 of 96
+    hotpotqa questions, so on those the answer is supported by the context the
+    student can see rather than produced from nowhere.
+
+    ``target`` may be a string, a list, or a numpy array of accepted answers;
+    the reward accepts any of them, so the first is printed.
+    """
+    if question is None or target is None:
+        return []
+    if isinstance(target, dict):
+        target = target.get("target")
+    if isinstance(target, (list, tuple)) or hasattr(target, "tolist"):
+        target = list(target)
+        target = target[0] if target else None
+    q, a = str(question or "").strip(), str(target or "").strip()
+    if not q or not a:
+        return []
+    return [f"<search> {q} </search>", f"<answer> {a} </answer>"]
+
+
 def foreign_prompt(task: str, key) -> str:
     """The turn-0 prompt of another task, verbatim, for the slot that must fail.
 

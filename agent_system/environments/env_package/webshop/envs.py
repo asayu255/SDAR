@@ -106,6 +106,20 @@ class WebshopWorker:
         info = dict(info or {})
         info['available_actions'] = self.env.get_available_actions()
         info['won'] = False
+        # THE GOAL RECORD, for the correct-document slot. The reward is defined
+        # by this record -- the product to buy and the options its matcher checks
+        # -- so the winning trajectory can be written from it. Only the worker
+        # can see it: the manager receives observations, and the observation
+        # deliberately shows the instruction text and not which product satisfies
+        # it. Six fields, so what crosses Ray is a few hundred bytes per episode.
+        try:
+            goal = self.env.server.user_sessions[self.env.session]['goal']
+            info['goal'] = {key: goal.get(key) for key in
+                            ('asin', 'name', 'query', 'instruction_text',
+                             'goal_options', 'price_upper')}
+            info['session'] = str(self.env.session)
+        except (AttributeError, KeyError, TypeError):
+            pass
         return obs, info
     
     def render(self, mode_for_render):
