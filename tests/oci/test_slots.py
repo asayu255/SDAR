@@ -553,6 +553,71 @@ for name, kw in (("oci_sat also on", {"algorithm": {"oci_sat": {"enable": True}}
         check(True, f"refused before the first rollout: {name}")
 
 
+# --- 9. the foreign slot, second design: this game with another game's goal ---
+# The WebShop prompt's rows sat at rho = e^-40 and trained nothing. This one
+# keeps the observation and swaps the goal sentence, so what is checked is the
+# swap itself: a different object, the same choice on every host, every mention
+# replaced, and the manager's plain render still the ordinary slot's.
+lk = "/data/alfworld/json_2.1.1/train/look_at_obj_in_light-AlarmClock-None-DeskLamp-301/trial_2/game.tw-pddl"
+check(ol.alfworld_goal_from_gamefile(lk) == ("look_at_obj_in_light", "AlarmClock", "DeskLamp"),
+      "the target object is read off the game directory's name")
+real = "examine the alarmclock with the desklamp."
+alt = ol.alfworld_foreign_task(lk, real)
+check(alt != real and "alarmclock" not in alt and alt in {s for s, _ in ol.ALFWORLD_TRAIN_TASKS},
+      f"the foreign goal is another train game's sentence naming a different object ({alt!r})")
+check(alt == ol.alfworld_foreign_task("/opt1/other/root" + lk, real),
+      "the same game gets the same wrong goal under a different data root")
+check(len({ol.alfworld_foreign_task(f"/d/train/pick_and_place-Mug-None-Desk-{i}/t/game.tw-pddl",
+                                    "put a mug in desk.") for i in range(60)}) > 5,
+      "different games spread over the pool")
+check(all("mug" not in ol.alfworld_foreign_task(f"/d/train/pick_and_place-Mug-None-Desk-{i}/t/game.tw-pddl",
+                                                 "put a mug in desk.") for i in range(60)),
+      "and no game is ever shown a goal about its own object")
+twice = f"Your task is to: {real}\nhistory: ... Your task is to: {real}\nnow"
+swapped = ol.alfworld_foreign_obs(twice, real, lk)
+check(real not in swapped and swapped.count(alt) == 2,
+      "every mention of the real goal is replaced, the history's included")
+try:
+    ol.alfworld_foreign_obs("no goal here", real, lk)
+    check(False, "an observation without the goal should be refused")
+except ValueError:
+    check(True, "an observation that does not carry the goal sentence is refused, not passed through")
+try:
+    ol.foreign_prompt("alfworld", lk)
+    check(False, "foreign_prompt('alfworld') should point at alfworld_foreign_obs")
+except ValueError:
+    check(True, "foreign_prompt refuses 'alfworld': that design needs the observation")
+
+if gf is not None:
+    class FakeEnvs9:
+        group_n, is_train = 4, True
+        get_admissible_commands = [["look", "inventory"]] * 4
+
+        def reset(self):
+            obs = ["You are in the middle of a room.\n\nYour task is to: heat some mug and put it somewhere."] * 4
+            return obs, None, [{"extra.gamefile": gf, "won": False}] * 4
+
+        def step(self, actions):
+            return ([f"You did: {a}." for a in actions], None, [0.0] * 4, [False] * 4,
+                    [{"extra.gamefile": gf, "won": False}] * 4)
+
+    em._WRONG_PLAN_CACHE.clear()
+    m9 = em.AlfWorldEnvironmentManager(FakeEnvs9(), lambda acts, adm: (list(acts), [1] * len(acts)),
+                                       cfg(foreign_task="alfworld"))
+    o9, _ = m9.reset(kwargs=None)
+    t9, p9 = o9["text"], o9[ol.OCI_PLAIN_KEY]
+    goal9 = "heat some mug and put it somewhere."
+    alt9 = ol.alfworld_foreign_task(gf, goal9)
+    check(t9[3] == t9[0].replace(goal9, alt9) and goal9 not in t9[3] and alt9 in t9[3],
+          "the foreign slot is shown the ordinary slot's render with only the goal swapped")
+    check(p9[3] == t9[0] and t9[3] != p9[3],
+          "its plain render is the ordinary slot's, so rho compares the two goals and nothing else")
+    o9b = m9.step(["look", "look", "look", "go to fridge 1"])[0]
+    check(goal9 not in o9b["text"][3] and alt9 in o9b["text"][3]
+          and o9b[ol.OCI_PLAIN_KEY][3].count(goal9) == o9b["text"][3].count(alt9),
+          "on later turns the swap covers the template's goal line and the history's copy alike")
+
+
 def test_slots():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

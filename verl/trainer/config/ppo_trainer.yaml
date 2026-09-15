@@ -440,6 +440,15 @@ algorithm:
     # its prompt asks for the same <think>/<action> shape, so the rows are
     # format-valid and take no invalid-action penalty; a search prompt would emit
     # <search> tags and land BELOW an ordinary failure.
+    #
+    # WHAT THE FIRST RUN SAID. A WebShop response re-scored under the alfworld
+    # observation sits at rho = e^-40, so those rows' own gradient was zero: they
+    # failed 352/352 and acted only through the group statistic, which a virtual
+    # floor gives for free. "alfworld" instead keeps this game's observation and
+    # swaps only the goal sentence for another train game's (different target
+    # object, chosen per game by crc32): the slot pursues the wrong goal in the
+    # right room with the right vocabulary, so its tokens are re-scorable under
+    # the real goal. Measured before use by run_alfworld_oci_slots_probe_qwen3.sh.
     foreign_task: webshop
     # LUFFY's f(rho) = rho/(rho+gamma) for the special row's policy gradient,
     # taken on the PLAIN prompt (verl/trainer/ppo/oci_shaping.py). Not a knob for

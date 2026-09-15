@@ -15,7 +15,9 @@ ordinary rollouts:
     slot  group_n-3        reserve    ordinary too; trained unless a special
                                       slot takes its place
     slot  group_n-2        document   shown this game's own solution path
-    slot  group_n-1        foreign    shown ANOTHER TASK'S prompt instead of its own
+    slot  group_n-1        foreign    shown a prompt it cannot win on: another
+                                      task's (foreign_task=webshop) or this game
+                                      with another game's goal (foreign_task=alfworld)
 
 THE VERDICT IS READ OFF THE ORDINARY ONES -- plain + reserve, which at
 ``group_n=10`` are exactly the eight rollouts a control group trains. So a group
@@ -53,6 +55,24 @@ FORMAT-valid and inadmissible, which is what an ordinary failure is here; a
 Search prompt would emit ``<search>`` tags instead and collect the invalid-action
 penalty, which would put those rows BELOW an ordinary failure and change the
 group's floor rather than sit on it.
+
+WHAT THE FIRST RUN SAID ABOUT THAT CHOICE (2026-09-15, alfworld-only, 150
+steps). The foreign row is re-scored on the observation it stood in for, and a
+WebShop response under an alfworld observation has rho = e^-40 (median of the
+per-token log-ratio -39.7 on the steps where only foreign rows were injected).
+The shaped coefficient is zero there, so the row's own tokens trained NOTHING;
+its whole effect was to sit in the group statistic as a zero-return sample --
+which a virtual floor (algorithm.oci_floor) gives without generating fifty
+turns or paying the extra forward. It failed 352/352 and taught nothing.
+
+THE SECOND CHOICE: THE SAME TASK, ANOTHER GAME'S GOAL. ``foreign_task=alfworld``
+keeps this game's observation and swaps only the goal sentence for another
+train game's, chosen with a different target object. The student then pursues
+the wrong goal in the right room, with the right vocabulary: what it writes is
+an ordinary alfworld response, so under the real goal most of its tokens have
+rho near 1 and a clipped policy-gradient term can suppress exactly the actions
+that are plausible under either goal. Whether it fails often enough, and what
+its rho is, are what run_alfworld_oci_slots_probe_qwen3.sh measures.
 """
 
 import zlib
@@ -79,9 +99,11 @@ OCI_PLAIN_KEY = "oci_plain"
 # of stuck groups rescued.
 DOC_MODES = ("walkthrough", "walkthrough_stepwise")
 
-# Whose prompt the foreign slot shows. One entry, because the choice is not free:
-# see the note on the invalid-action penalty above.
-FOREIGN_TASKS = ("webshop",)
+# What the foreign slot is shown. "webshop": another task's turn-0 prompt in
+# place of the observation (the first run). "alfworld": THIS game's observation
+# with ANOTHER game's goal sentence -- see the paragraph above on why the first
+# choice trained nothing.
+FOREIGN_TASKS = ("webshop", "alfworld")
 
 
 def slots_cfg(config):
@@ -339,6 +361,9 @@ def foreign_prompt(task: str, key) -> str:
     """
     if task not in FOREIGN_TASKS:
         raise ValueError(f"foreign_task={task!r}; expected one of {FOREIGN_TASKS}")
+    if task == "alfworld":
+        raise ValueError("foreign_task='alfworld' edits this game's own observation; "
+                         "call alfworld_foreign_obs(obs, real_task, gamefile) instead")
     pool = WEBSHOP_TRAIN_INSTRUCTIONS
     idx = zlib.crc32(game_key(key).encode("utf-8")) % len(pool)
     return WEBSHOP_TEMPLATE_NO_HIS.format(
@@ -346,3 +371,179 @@ def foreign_prompt(task: str, key) -> str:
         current_observation=_WEBSHOP_LANDING_OBSERVATION,
         available_actions=_WEBSHOP_LANDING_ACTIONS,
     )
+
+
+# --------------------------------------------------------------------------- #
+# the foreign slot, second design: this game, another game's goal
+# --------------------------------------------------------------------------- #
+
+# Goal sentences exactly as the environment prints them after "Your task is
+# to: ", read off 120 train games (110 distinct), with the target object each
+# names. The object is what the chooser avoids: a goal that shares the real
+# goal's object could be satisfied on the way ("put a clean mug in fridge"
+# solves "put a mug in fridge"), and then the slot would not fail.
+ALFWORLD_TRAIN_TASKS = (
+    ('clean some cup and put it in shelf.', 'Cup'),
+    ('clean some dishsponge and put it in cabinet.', 'DishSponge'),
+    ('clean some fork and put it in sidetable.', 'Fork'),
+    ('clean some kettle and put it in stoveburner.', 'Kettle'),
+    ('clean some knife and put it in countertop.', 'Knife'),
+    ('clean some lettuce and put it in fridge.', 'Lettuce'),
+    ('clean some mug and put it in coffeemachine.', 'Mug'),
+    ('clean some potato and put it in microwave.', 'Potato'),
+    ('cool some bowl and put it in microwave.', 'Bowl'),
+    ('cool some lettuce and put it in countertop.', 'Lettuce'),
+    ('cool some mug and put it in coffeemachine.', 'Mug'),
+    ('cool some pot and put it in cabinet.', 'Pot'),
+    ('cool some tomato and put it in garbagecan.', 'Tomato'),
+    ('cool some tomato and put it in microwave.', 'Tomato'),
+    ('cool some winebottle and put it in cabinet.', 'WineBottle'),
+    ('examine the alarmclock with the desklamp.', 'AlarmClock'),
+    ('examine the cellphone with the desklamp.', 'CellPhone'),
+    ('examine the pillow with the desklamp.', 'Pillow'),
+    ('examine the watch with the desklamp.', 'Watch'),
+    ('find two bowl and put them in coffeetable.', 'Bowl'),
+    ('find two cellphone and put them in bed.', 'CellPhone'),
+    ('find two cellphone and put them in dresser.', 'CellPhone'),
+    ('find two cup and put them in countertop.', 'Cup'),
+    ('find two lettuce and put them in fridge.', 'Lettuce'),
+    ('find two newspaper and put them in armchair.', 'Newspaper'),
+    ('find two remotecontrol and put them in ottoman.', 'RemoteControl'),
+    ('find two saltshaker and put them in countertop.', 'SaltShaker'),
+    ('find two saltshaker and put them in drawer.', 'SaltShaker'),
+    ('find two soapbar and put them in shelf.', 'SoapBar'),
+    ('find two soapbottle and put them in countertop.', 'SoapBottle'),
+    ('find two soapbottle and put them in toilet.', 'SoapBottle'),
+    ('find two spraybottle and put them in dresser.', 'SprayBottle'),
+    ('find two statue and put them in dresser.', 'Statue'),
+    ('find two tissuebox and put them in drawer.', 'TissueBox'),
+    ('heat some apple and put it in garbagecan.', 'Apple'),
+    ('heat some cup and put it in cabinet.', 'Cup'),
+    ('heat some cup and put it in countertop.', 'Cup'),
+    ('heat some egg and put it in fridge.', 'Egg'),
+    ('heat some egg and put it in garbagecan.', 'Egg'),
+    ('heat some mug and put it in cabinet.', 'Mug'),
+    ('heat some mug and put it in coffeemachine.', 'Mug'),
+    ('heat some plate and put it in shelf.', 'Plate'),
+    ('heat some tomato and put it in countertop.', 'Tomato'),
+    ('heat some tomato and put it in sidetable.', 'Tomato'),
+    ('look at book under the desklamp.', 'Book'),
+    ('look at laptop under the desklamp.', 'Laptop'),
+    ('look at pillow under the desklamp.', 'Pillow'),
+    ('put a alarmclock in sidetable.', 'AlarmClock'),
+    ('put a book in sofa.', 'Book'),
+    ('put a butterknife in drawer.', 'ButterKnife'),
+    ('put a cellphone in desk.', 'CellPhone'),
+    ('put a clean butterknife in countertop.', 'ButterKnife'),
+    ('put a clean cloth in cart.', 'Cloth'),
+    ('put a clean cloth in drawer.', 'Cloth'),
+    ('put a clean egg in diningtable.', 'Egg'),
+    ('put a clean fork in diningtable.', 'Fork'),
+    ('put a clean fork in drawer.', 'Fork'),
+    ('put a clean kettle in diningtable.', 'Kettle'),
+    ('put a clean knife in diningtable.', 'Knife'),
+    ('put a clean soapbar in garbagecan.', 'SoapBar'),
+    ('put a clean soapbar in toilet.', 'SoapBar'),
+    ('put a clean tomato in countertop.', 'Tomato'),
+    ('put a cool apple in microwave.', 'Apple'),
+    ('put a cool bowl in countertop.', 'Bowl'),
+    ('put a cool bowl in shelf.', 'Bowl'),
+    ('put a cool egg in microwave.', 'Egg'),
+    ('put a cool lettuce in countertop.', 'Lettuce'),
+    ('put a cool mug in cabinet.', 'Mug'),
+    ('put a cool mug in coffeemachine.', 'Mug'),
+    ('put a cool pan in countertop.', 'Pan'),
+    ('put a cool pan in diningtable.', 'Pan'),
+    ('put a cool pan in stoveburner.', 'Pan'),
+    ('put a cool pot in stoveburner.', 'Pot'),
+    ('put a cool potato in microwave.', 'Potato'),
+    ('put a cool tomato in microwave.', 'Tomato'),
+    ('put a creditcard in drawer.', 'CreditCard'),
+    ('put a creditcard in shelf.', 'CreditCard'),
+    ('put a dishsponge in cabinet.', 'DishSponge'),
+    ('put a glassbottle in countertop.', 'Glassbottle'),
+    ('put a hot apple in diningtable.', 'Apple'),
+    ('put a hot cup in fridge.', 'Cup'),
+    ('put a hot mug in cabinet.', 'Mug'),
+    ('put a hot mug in coffeemachine.', 'Mug'),
+    ('put a pen in sidetable.', 'Pen'),
+    ('put a pencil in dresser.', 'Pencil'),
+    ('put a remotecontrol in armchair.', 'RemoteControl'),
+    ('put a soapbottle in garbagecan.', 'SoapBottle'),
+    ('put a soapbottle in toilet.', 'SoapBottle'),
+    ('put a statue in coffeetable.', 'Statue'),
+    ('put a tissuebox in sidetable.', 'TissueBox'),
+    ('put a toiletpaper in toiletpaperhanger.', 'ToiletPaper'),
+    ('put a tomato in microwave.', 'Tomato'),
+    ('put some book on sofa.', 'Book'),
+    ('put some box on armchair.', 'Box'),
+    ('put some candle on cabinet.', 'Candle'),
+    ('put some cd on diningtable.', 'CD'),
+    ('put some pen on shelf.', 'Pen'),
+    ('put some pencil on shelf.', 'Pencil'),
+    ('put some remotecontrol on armchair.', 'RemoteControl'),
+    ('put some tissuebox on coffeetable.', 'TissueBox'),
+    ('put some toiletpaper on toiletpaperhanger.', 'ToiletPaper'),
+    ('put two creditcard in armchair.', 'CreditCard'),
+    ('put two peppershaker in drawer.', 'PepperShaker'),
+    ('put two peppershaker in shelf.', 'PepperShaker'),
+    ('put two remotecontrol in sofa.', 'RemoteControl'),
+    ('put two saltshaker in cabinet.', 'SaltShaker'),
+    ('put two spraybottle in cabinet.', 'SprayBottle'),
+    ('put two spraybottle in countertop.', 'SprayBottle'),
+    ('put two toiletpaper in countertop.', 'ToiletPaper'),
+    ('put two wateringcan in shelf.', 'WateringCan'),
+)
+
+
+def alfworld_goal_from_gamefile(gamefile):
+    """``(task_type, object, receptacle)`` read off the game directory's name.
+
+    ALFWorld names the directory ``<type>-<Object>-<movable>-<Receptacle>-<scene>``
+    (``pick_two_obj_and_place-PepperShaker-None-Drawer-301``), and that name is
+    the only place the target object is spelled the way the goal pool spells it.
+    Empty strings when the path is not shaped that way.
+    """
+    parts = [p for p in str(gamefile or "").replace("\\", "/").split("/") if p]
+    name = parts[-3] if len(parts) >= 3 else ""
+    fields = name.split("-")
+    if len(fields) < 5:
+        return ("", "", "")
+    return (fields[0], fields[1], fields[3])
+
+
+def alfworld_foreign_task(gamefile, real_task: str) -> str:
+    """Another train game's goal sentence for this game, with a different object.
+
+    Deterministic in the game (crc32 of its host-independent key, as the WebShop
+    chooser), so a game is shown the same wrong goal every time it is drawn and
+    on every host. Goals naming the real target object are excluded even when the
+    directory name could not be parsed, by the object's lowercase spelling in
+    the sentence.
+    """
+    _, obj, _ = alfworld_goal_from_gamefile(gamefile)
+    real = str(real_task or "").strip()
+    low = obj.lower()
+    pool = [s for s, o in ALFWORLD_TRAIN_TASKS
+            if s != real and (not low or (o.lower() != low and low not in s))]
+    if not pool:
+        raise ValueError(f"no foreign goal left for {gamefile!r} (object {obj!r})")
+    return pool[zlib.crc32(game_key(gamefile).encode("utf-8")) % len(pool)]
+
+
+def alfworld_foreign_obs(obs: str, real_task: str, gamefile) -> str:
+    """This turn's rendered observation with every mention of the real goal
+    sentence replaced by the foreign one.
+
+    Every mention, because the sentence appears both in the template's own
+    "Your task is to:" line and inside the turn-0 observation the history
+    quotes, and a slot that saw the real goal anywhere would be an ordinary
+    rollout. Raises when the sentence is not there at all: the plain render is
+    what the slot is re-scored on, and a render that did not change would give
+    rho = 1 on a row that is in fact plain.
+    """
+    real = str(real_task or "").strip()
+    if not real or real not in obs:
+        raise ValueError("the real goal sentence is not in this observation; the foreign "
+                         "slot cannot be built from it")
+    return obs.replace(real, alfworld_foreign_task(gamefile, real))

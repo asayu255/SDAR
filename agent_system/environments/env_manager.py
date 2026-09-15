@@ -29,6 +29,7 @@ from agent_system.environments.oci_layout import (
     webshop_document_lines as _webshop_document_lines,
     doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
     foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
+    alfworld_foreign_obs as _slots_foreign_alfworld_obs,
     slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
 
@@ -1017,13 +1018,23 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
                     obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
             elif _role == ROLE_FOREIGN:
-                # ANOTHER TASK'S PROMPT, not a document about this game: the slot
-                # is told nothing about where it is, so every action it produces
-                # is inadmissible here and the episode spends its turn budget.
-                # Chosen from the gamefile, so a game is shown the same one every
-                # time it is drawn.
                 _oci_pre = ""
-                obs = _slots_foreign_prompt(_slots_foreign_task(self.config), _gamefile)
+                _ftask = _slots_foreign_task(self.config)
+                if _ftask == "alfworld":
+                    # THIS GAME'S OBSERVATION, ANOTHER GAME'S GOAL. The slot acts
+                    # in the right room with the right vocabulary toward the
+                    # wrong target, so what it writes is an ordinary alfworld
+                    # response that the real goal's prompt can re-score
+                    # (rho near 1) -- unlike the WebShop prompt below, whose
+                    # rows sat at rho = e^-40 and trained nothing.
+                    obs = _slots_foreign_alfworld_obs(obs, self.tasks[i], _gamefile)
+                else:
+                    # ANOTHER TASK'S PROMPT, not a document about this game: the
+                    # slot is told nothing about where it is, so every action it
+                    # produces is inadmissible here and the episode spends its
+                    # turn budget. Chosen from the gamefile, so a game is shown
+                    # the same one every time it is drawn.
+                    obs = _slots_foreign_prompt(_ftask, _gamefile)
             else:
                 _oci_pre = (_wrong_plan_prefix('alfworld', _gamefile, self.config,
                                                admissible_actions[i])

@@ -1495,6 +1495,14 @@ class OPDRayTrainer(RayPPOTrainer):
         rec = {"batch": n}
         rec["groups"] = compute_group_metrics(batch, with_records=True)
 
+        # The ten-slot layout marks its rows by role, and its special rows carry
+        # oci_candidate=1 as well (the rollout sets it for every row it can
+        # re-score), so the role has to be read first or the single-candidate
+        # reader below would take document and foreign rows for one candidate.
+        _role_col = batch.batch.get("oci_role", None)
+        if _role_col is not None and bool((_role_col.reshape(-1) != 0).any()):
+            return self._accumulate_slots_probe(batch, state, probe_cfg, rec, n)
+
         cand = batch.batch.get("oci_candidate", None)
         if cand is None:
             # The column is emitted by the rollout loop, not derived here -- see
@@ -1655,6 +1663,82 @@ class OPDRayTrainer(RayPPOTrainer):
         state["batches"] = n
         return state
 
+    def _accumulate_slots_probe(self, batch, state: dict, probe_cfg, rec: dict, n: int) -> dict:
+        """The ten-slot layout's probe: what each special slot did, and its rho.
+
+        Runs on the batch AFTER ``_select_oci_slots`` dropped the two unused rows
+        per group, so the rows here are exactly the ones a training step would
+        put through the loss. Two things per role:
+
+        1. Whether the slot did its job, from the selection's own counts
+           (``document_used`` of ``groups_stuck``, ``foreign_used`` of
+           ``groups_saturated``) -- the generation-time numbers the drop hides.
+        2. Whether its tokens are REACHABLE from the plain prompt: rho per token,
+           re-scored with the privileged edit spliced out. Split by role, because
+           the training run pooled document and foreign rows into one statistic
+           and the pooled median (-30) turned out to be the foreign rows alone.
+        """
+        import numpy as np
+
+        from agent_system.environments.oci_layout import ROLE_DOC, ROLE_FOREIGN
+        from verl.trainer.ppo.oci_reachability import (
+            reachability_report, strippable_rows, wrong_plan_strip_fn)
+
+        task_id_names = list(batch.meta_info.get("task_id_names", []) or [])
+        role = batch.batch["oci_role"].reshape(-1).detach().cpu().numpy().astype(int)
+        inj_col = batch.batch.get("oci_injected", None)
+        inj = (inj_col.reshape(-1).detach().cpu().numpy().astype(bool)
+               if inj_col is not None else np.zeros(role.shape[0], dtype=bool))
+        rets = batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy()
+        tuids = batch.non_tensor_batch.get("traj_uid", None)
+        strip_ok = strippable_rows(batch)
+
+        rec["layout"] = "oci_slots"
+        rec["selection"] = dict(getattr(self, "_oci_slots_last_metrics", None) or {})
+        _pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        strip = wrong_plan_strip_fn(self.tokenizer, _pad)
+
+        rec["roles"] = {}
+        for r, name in ((ROLE_DOC, "document"), (ROLE_FOREIGN, "foreign")):
+            kept = np.flatnonzero((role == r) & inj)
+            entry = {"rows_kept": int(kept.size),
+                     "strippable_rows": int(strip_ok[kept].sum()) if kept.size else 0}
+            if tuids is not None and kept.size:
+                best = {}
+                for i in kept:
+                    k = str(tuids[i])
+                    best[k] = max(best.get(k, float("-inf")), float(rets[i]))
+                vals = np.array(list(best.values()), dtype=float)
+                entry["trajectories_kept"] = int(vals.size)
+                entry["kept_fail_rate"] = float((vals <= 0.0).mean())
+                entry["kept_return_mean"] = float(vals.mean())
+            rows = np.flatnonzero((role == r) & inj & strip_ok)
+            if rows.size:
+                try:
+                    entry["reachability"] = reachability_report(
+                        self.actor_rollout_wg, batch[rows.tolist()], task_id_names,
+                        strip_fn=strip, gamma=float(probe_cfg.get("gamma", 0.1)))
+                except Exception as exc:
+                    entry["reachability"] = {"error": f"{type(exc).__name__}: {exc}"}
+            else:
+                entry["reachability"] = {"skipped": "no strippable row of this role was kept"}
+            try:
+                entry["samples"] = _oci_sample_dump(
+                    self.tokenizer, batch, (role == r) & inj,
+                    n_groups=int(probe_cfg.get("dump_groups", 3)))
+            except Exception as exc:
+                entry["samples"] = {"error": f"{type(exc).__name__}: {exc}"}
+            rec["roles"][name] = entry
+
+        import json
+
+        print(f"[grad_probe] slots batch {n}: "
+              f"{json.dumps({k: v for k, v in rec.items() if k != 'groups'}, default=float)}",
+              flush=True)
+        state.setdefault("oci", []).append(rec)
+        state["batches"] = n
+        return state
+
     def _select_oci_slots(self, batch: DataProto, metrics: dict) -> DataProto:
         """Keep the eight rollouts each group trains and drop the other two.
 
@@ -1675,6 +1759,9 @@ class OPDRayTrainer(RayPPOTrainer):
             group_n=int(self.config.env.rollout.n),
         )
         metrics.update(slot_metrics)
+        # Kept for the probe, which sees the batch only after this drop and so
+        # cannot recount what was generated.
+        self._oci_slots_last_metrics = dict(slot_metrics)
         # On the console as well as in the step's metrics: the metrics are logged
         # when the step completes, and the first thing a step can die of is a
         # stage AFTER this one -- which then leaves no record of what the
