@@ -138,6 +138,23 @@ set -x
 # lock pins lambda_prime, so changing it means editing the lock in the same
 # commit -- which is why it is NOT an environment override here.
 
+# THE NCCL FLIGHT RECORDER, ON. This is the one difference between
+# ~/opd_coef_redistribute_300.log.attempt2, which died at step 16 with
+# "Watchdog caught collective operation timeout", and ...log.final, which
+# completed: the two runs are otherwise identical in every exported variable and
+# every override. The failure this arm hit at step 19 printed
+#
+#   Stack trace of the failed collective not found, potentially because
+#   FlightRecorder is disabled. You can enable it by setting
+#   TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+#
+# so a repeat now leaves a dump naming the collective that hung, instead of a
+# stack trace that says it cannot tell us.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-20000}
+export TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}
+mkdir -p "$HOME/nccl_trace"
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-$HOME/nccl_trace/opd_shrink_rank}
+
 export ALFWORLD_DATA=$HOME/data/alfworld
 # NO PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here, and it is not a
 # tuning choice. vLLM's sleep/wake allocates through CuMemAllocator, which
@@ -464,7 +481,7 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.val_instance_log_dir=$HOME/val_instances/opd_grpo_multitask_cross_teacher_shrink_qwen3_1.7b$RUN_TAG_SUFFIX \
     +trainer.val_instance_log_text=True \
     trainer.sign_token_dump_dir=$HOME/sign_tokens/opd_grpo_multitask_cross_teacher_shrink_qwen3_1.7b$RUN_TAG_SUFFIX \
-    trainer.save_freq=25 \
+    trainer.save_freq=${SAVE_FREQ:-10} \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.stop_after_steps=${STOP_AFTER_STEPS:-150} \

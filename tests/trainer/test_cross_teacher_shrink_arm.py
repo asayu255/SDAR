@@ -45,9 +45,17 @@ _MECHANISMS = ("algorithm.opd.cross_teacher_target.",
                "algorithm.opd.cross_teacher_kl_weight.",
                "actor_rollout_ref.actor.cross_teacher_target.",
                "actor_rollout_ref.actor.cross_teacher_kl_weight.")
-# Where a run STOPS is operational, not scientific: total_training_steps is what
-# defines the schedule and it is pinned. The lock deliberately does not pin this.
-_OPERATIONAL = ("trainer.stop_after_steps", "env.search.search_url")
+# Operational, not scientific, and so deliberately unpinned by the lock:
+#   stop_after_steps  WHERE a run stops. total_training_steps is what defines the
+#                     schedule and the data order, and that IS pinned.
+#   search_url        the retriever is not local on every host.
+#   save_freq         HOW OFTEN a restart can resume from. Raised in frequency
+#                     (25 -> 10) after two deaths on this host at steps 16 and
+#                     19: with checkpoints every 25 steps neither run had ever
+#                     written one, so a supervised restart began again from zero
+#                     every time. It changes nothing about what is trained.
+_OPERATIONAL = ("trainer.stop_after_steps", "env.search.search_url",
+                "trainer.save_freq")
 
 
 def _allowed(differing):
