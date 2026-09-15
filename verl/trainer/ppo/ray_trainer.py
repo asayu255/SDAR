@@ -1125,11 +1125,25 @@ class RayPPOTrainer:
 
         depth = int(os.environ.get("VAL_PIPELINE_DEPTH", "1"))
         slots = [Slot("primary", self.val_envs, self.traj_collector, tasks=None)]
+        tasks, configured = [], []
         if depth > 1:
             from agent_system.environments.env_manager import PIPELINEABLE_VAL_TASKS, build_val_env_manager
             from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
 
-            tasks = list(PIPELINEABLE_VAL_TASKS)
+            # ONLY THE TASKS THIS RUN ACTUALLY HAS. PIPELINEABLE_VAL_TASKS says
+            # which tasks a SECOND manager may serve without changing which
+            # episodes are scored; it does not promise the run contains them. An
+            # alfworld-only run asked for a search manager and
+            # build_val_env_manager refused -- at the first validation, after the
+            # rollout, which is the most expensive moment to discover it, and the
+            # depth default is 3 in every arm script.
+            try:
+                configured = [str(t) for t in (self.config.env.get("multitask", {}) or {}).get(
+                    "tasks", ["alfworld", "search", "webshop"])]
+            except Exception:
+                configured = []
+            tasks = [t for t in PIPELINEABLE_VAL_TASKS if t in configured]
+        if depth > 1 and tasks:
             for index in range(1, depth):
                 slots.append(
                     Slot(
@@ -1140,6 +1154,10 @@ class RayPPOTrainer:
                     )
                 )
             detail = f"the extra ones restricted to {tasks}. Batches retire in order; only the rollouts overlap."
+        elif depth > 1:
+            detail = (f"depth {depth} was asked for, but this run's tasks {configured} include none of "
+                      f"{list(PIPELINEABLE_VAL_TASKS)}, so there is nothing a second manager may serve: "
+                      "one slot, the sequential loop.")
         else:
             detail = "the sequential loop, run inline with no threads. Set VAL_PIPELINE_DEPTH=2 to overlap."
         # Printed at every depth, including 1. Silence would mean both "depth is

@@ -199,8 +199,15 @@ def test_slot_accepts():
 # --------------------------------------------------------------------------- #
 
 
-def _trainer(depth, tasks=("search",)):
-    """RayPPOTrainer's slot builder bound to the fields it touches."""
+def _trainer(depth, tasks=("alfworld", "search", "webshop")):
+    """RayPPOTrainer's slot builder bound to the fields it touches.
+
+    ``tasks`` is what the RUN has, which is not the same as what a second manager
+    MAY serve: an alfworld-only run has no search envs, and asking for one raises
+    inside build_val_env_manager.
+    """
+    from omegaconf import OmegaConf
+
     from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
     class _T:
@@ -209,11 +216,28 @@ def _trainer(depth, tasks=("search",)):
         def __init__(self):
             self.val_envs = "primary-envs"
             self.traj_collector = "primary-collector"
-            self.config = None
+            self.config = OmegaConf.create({"env": {"multitask": {"tasks": list(tasks)}}})
             self.tokenizer = None
             self.processor = None
 
     return _T()
+
+
+def test_a_single_task_run_does_not_ask_for_a_manager_it_has_no_envs_for(monkeypatch, capsys):
+    """THE FAILURE THIS PINS. Every arm script exports VAL_PIPELINE_DEPTH=3, and
+    the slot builder took PIPELINEABLE_VAL_TASKS literally -- so an alfworld-only
+    run tried to build a SEARCH validation manager and died in
+    build_val_env_manager ("tasks not configured for this run: ['search']"). It
+    died at the first validation, i.e. after a full rollout, and for a val-only
+    run that is the whole job.
+    """
+    monkeypatch.setenv("VAL_PIPELINE_DEPTH", "3")
+    slots = _trainer(3, tasks=("alfworld",))._validation_slots()
+
+    assert len(slots) == 1, "no second manager for a task the run does not have"
+    assert slots[0].accepts("alfworld") is True
+    out = capsys.readouterr().out
+    assert "include none of" in out and "['search']" in out
 
 
 def test_depth_one_is_the_primary_manager_and_nothing_else(monkeypatch):
