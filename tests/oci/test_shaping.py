@@ -263,6 +263,60 @@ print(("  OK  " if good else "  FAIL") +
       f"frac_in_band {diag.get('oci/shaping/frac_in_band')}")
 
 
+# --- loss_mode="ppo": the ordinary clip on the plain prompt ------------------
+# The stub's plain log-prob on a stripped row is -scale*live/10 with live = 2
+# prompt tokens left after the 2-token span comes out of 4, i.e. -0.2. Setting
+# old_log_prob to that makes rho exactly 1 at the first optimizer step, which is
+# where the two objectives are compared: there f(rho) is 0.083 and the clip is
+# 1, the twelvefold difference the first run trained under.
+from verl.trainer.ppo.oci_shaping import clipped_pg_losses
+
+old1 = torch.full((BS, RL), -0.2)
+mbp = micro([0, 1, 0, 1], [0, 2, 0, 2])
+res = {}
+for mode in ("shaped", "ppo"):
+    ac = StubActor()
+    o, dg = _oci_shaped_rows(ac, mbp, base.clone(), _oci_injected_rows(mbp), response_mask=rmask,
+                             advantages=adv, old_log_prob=old1, temperature=1.0, gamma=G,
+                             loss_mode=mode, cliprange=0.2, clip_ratio_c=3.0)
+    o[[1, 3]].sum().backward()
+    res[mode] = (float(ac.scale.grad), dg["oci/shaping/loss_mode_ppo"].item())
+ratio = res["ppo"][0] / res["shaped"][0]
+good = (abs(ratio - 1.0 / shaping_coefficient(1.0, G)) < 1e-4
+        and res["ppo"][1] == 1.0 and res["shaped"][1] == 0.0)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" at rho=1 the clip's gradient is {ratio:.2f}x the shaped one "
+      f"(1/{shaping_coefficient(1.0, G):.4f}), and the log says which was taken")
+
+# the clip's selection on the unreachable tail, per token, by autograd
+def clip_grad(log_rho, a):
+    old = torch.zeros(1, 1, dtype=torch.float64)
+    plain = torch.tensor([[float(log_rho)]], dtype=torch.float64, requires_grad=True)
+    loss = clipped_pg_losses(plain, old, torch.tensor([[float(a)]], dtype=torch.float64),
+                             torch.ones(1, 1, dtype=torch.float64), cliprange=0.2)
+    loss.sum().backward()
+    return float(plain.grad[0, 0])
+
+g_pos_far = clip_grad(math.log(0.009), +1.0)   # copied specifics, being imitated
+g_neg_far = clip_grad(math.log(0.009), -1.0)   # copied specifics, being suppressed
+g_pos_one = clip_grad(0.0, +1.0)
+good = (abs(g_pos_far + 0.009) < 1e-9 and g_neg_far == 0.0 and abs(g_pos_one + 1.0) < 1e-9)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" below 1-eps a positive advantage carries -A*rho ({g_pos_far:+.4f} at rho=0.009), a "
+      f"negative one nothing ({g_neg_far:+.1f}); at rho=1 the full -A ({g_pos_one:+.1f})")
+
+try:
+    _oci_shaped_rows(StubActor(), mbp, base.clone(), _oci_injected_rows(mbp), response_mask=rmask,
+                     advantages=adv, old_log_prob=old1, temperature=1.0, gamma=G, loss_mode="ppo")
+    check_bad = False
+except AssertionError:
+    check_bad = True
+ok &= check_bad
+print(("  OK  " if check_bad else "  FAIL") + " loss_mode='ppo' without a clip range is refused")
+
+
 def test_shaping():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

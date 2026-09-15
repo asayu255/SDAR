@@ -134,6 +134,10 @@ def check_config(config) -> None:
         "the shaped off-policy term is built on the per-task-weighted branch of the "
         "policy loss, and without it the special rows would train an ordinary "
         "clipped ratio taken on the privileged prompt.")
+    _loss = str(cfg.get("special_loss", "shaped") or "shaped")
+    assert _loss in ("shaped", "ppo"), (
+        f"algorithm.oci_slots.special_loss={_loss!r}; expected 'shaped' (LUFFY's f(rho)) "
+        "or 'ppo' (the ordinary clip on the plain prompt).")
     _filter = config.algorithm.get("filter_groups", None)
     assert not (_filter is not None and bool(_filter.get("enable", False))), (
         "algorithm.filter_groups.enable rejects and regenerates whole groups, which "

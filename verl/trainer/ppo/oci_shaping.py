@@ -115,6 +115,54 @@ def shaped_pg_losses(
     return -advantages * (rho / (rho + gamma))
 
 
+def clipped_pg_losses(
+    log_prob_plain: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    cliprange: float,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c: float = 3.0,
+):
+    """The ORDINARY clipped objective on the plain prompt, for the special rows.
+
+    Same numerator as :func:`shaped_pg_losses` -- the plain student on the
+    plan-stripped prompt -- and the same denominator, the rollout's log-prob
+    under the privileged prompt, so the ratio is rho. What differs is what is
+    done with it: PPO's clip instead of f(rho).
+
+    WHY THIS EXISTS. The first ten-slot run measured the document rows at rho
+    close to 1 on nine tokens in ten: the response the student writes with the
+    walkthrough in front of it is, almost everywhere, one it would write
+    without. There f(rho) is not a selector but a constant -- gamma*rho/(rho+gamma)^2
+    is 0.083 at rho=1 and 0.074 at rho=0.009, the copied specifics -- and a
+    constant on the document side alone breaks the zero sum GRPO's advantages
+    hold across a group: the seven failures' push-down stayed at full weight
+    while the document's push-up was cut to a twelfth, and the net update on a
+    rescued group was a push-down of everything the failures wrote.
+
+    The clip keeps the balance and still refuses the unreachable tokens:
+    below 1-eps a positive advantage's gradient is -A*rho (vanishing with rho),
+    and a negative advantage's is zero (the clamped branch binds), which is the
+    selection the shaping was meant to make and did not.
+    """
+    from verl.trainer.ppo.core_algos import compute_policy_loss_per_token
+
+    losses, _, _, _ = compute_policy_loss_per_token(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob_plain,
+        advantages=advantages,
+        response_mask=response_mask,
+        cliprange=cliprange,
+        cliprange_low=cliprange_low,
+        cliprange_high=cliprange_high,
+        clip_ratio_c=clip_ratio_c,
+    )
+    return losses
+
+
 def shaping_diagnostics(
     log_prob_plain: torch.Tensor,
     old_log_prob: torch.Tensor,

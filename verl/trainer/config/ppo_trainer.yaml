@@ -455,6 +455,15 @@ algorithm:
     # whether to shape: both special rows are off-policy for the prompt that
     # exists at test time, so there is no unshaped version of this arm.
     gamma: 0.1
+    # What the special rows' policy gradient is, on the plain prompt, with rho
+    # as the ratio: "shaped" = -A*f(rho) above; "ppo" = the actor's ordinary
+    # clipped objective. The first run measured the document rows at rho ~ 1,
+    # where f(rho) is a constant 0.083 on the document side only -- the seven
+    # failures' push-down kept full weight and the document's push-up was cut to
+    # a twelfth, so a rescued group trained a net push-down. The clip keeps
+    # GRPO's zero sum and still drops the unreachable tokens (a positive
+    # advantage below 1-eps carries -A*rho; a negative one carries nothing).
+    special_loss: shaped
     # Whether the special row also trains the distillation term. False: the
     # teacher would be read on a prompt carrying a walkthrough, or on another
     # task's prompt entirely, and distilling that is a claim the arm does not

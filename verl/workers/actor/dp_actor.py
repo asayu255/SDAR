@@ -514,8 +514,14 @@ def _oci_opd_keep(micro_batch, like):
 
 
 def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
-                     advantages, old_log_prob, temperature, gamma):
-    """Replace the injected rows' per-token loss with the shaped one.
+                     advantages, old_log_prob, temperature, gamma,
+                     loss_mode="shaped", cliprange=None, cliprange_low=None,
+                     cliprange_high=None, clip_ratio_c=3.0):
+    """Replace the injected rows' per-token loss with one taken on the PLAIN prompt.
+
+    ``loss_mode`` picks which: ``"shaped"`` is LUFFY's -A*f(rho); ``"ppo"`` is
+    the ordinary clipped objective with the same rho as its ratio -- see
+    ``clipped_pg_losses`` for why the ten-slot layout moved to it.
 
     ONE EXTRA FORWARD, ON THOSE ROWS ONLY. The numerator of the shaped ratio is
     the plain student -- the same weights on the PLAN-STRIPPED prompt with the
@@ -585,11 +591,23 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
         f"the plain forward returned {None if lp_plain is None else tuple(lp_plain.shape)} "
         f"for log-probs of shape {tuple(old_log_prob[rows].shape)}")
 
-    shaped = shaped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows], gamma=gamma)
+    if loss_mode == "ppo":
+        from verl.trainer.ppo.oci_shaping import clipped_pg_losses
+
+        assert cliprange is not None, "loss_mode='ppo' needs the actor's clip range"
+        shaped = clipped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows],
+                                   response_mask[rows], cliprange=cliprange,
+                                   cliprange_low=cliprange_low, cliprange_high=cliprange_high,
+                                   clip_ratio_c=clip_ratio_c)
+    else:
+        assert loss_mode == "shaped", f"oci loss_mode={loss_mode!r}; expected 'shaped' or 'ppo'"
+        shaped = shaped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows], gamma=gamma)
     out = pg_losses.clone()
     out[rows] = shaped.to(out.dtype)
     diag.update(shaping_diagnostics(lp_plain.detach(), old_log_prob[rows],
                                     response_mask[rows], gamma=gamma))
+    # Which objective the replaced rows actually took, in the log: 1 = the clip.
+    diag["oci/shaping/loss_mode_ppo"] = 1.0 if loss_mode == "ppo" else 0.0
     return out, _on_device(diag)
 
 class DataParallelPPOActor(BasePPOActor):
@@ -2641,6 +2659,13 @@ class DataParallelPPOActor(BasePPOActor):
             )
         oci_gamma = float(_oci_slots_cfg.get("gamma", 0.1) if oci_slots_on
                           else _oci_shape_cfg.get("gamma", 0.1))
+        # Which objective the special rows take on the plain prompt. The
+        # single-candidate arm has only the shaped one; the ten-slot layout may
+        # take the ordinary clip instead (see clipped_pg_losses for why).
+        oci_special_loss = (str(_oci_slots_cfg.get("special_loss", "shaped") or "shaped")
+                            if oci_slots_on else "shaped")
+        assert oci_special_loss in ("shaped", "ppo"), (
+            f"algorithm.oci_slots.special_loss={oci_special_loss!r}; expected 'shaped' or 'ppo'")
         # Whether the special rows also train the distillation term. Off in the
         # arm, and off by default: see _oci_opd_keep.
         oci_opd_skip = oci_slots_on and not bool(_oci_slots_cfg.get("opd_on_special", False))
@@ -4317,6 +4342,11 @@ class DataParallelPPOActor(BasePPOActor):
                                          old_log_prob=old_log_prob,
                                          temperature=temperature,
                                          gamma=oci_gamma,
+                                         loss_mode=oci_special_loss,
+                                         cliprange=clip_ratio,
+                                         cliprange_low=clip_ratio_low,
+                                         cliprange_high=clip_ratio_high,
+                                         clip_ratio_c=clip_ratio_c,
                                      )
                                      for _k, _v in _oci_diag.items():
                                          _defer(_k, _v)
