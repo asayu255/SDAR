@@ -1730,6 +1730,12 @@ class OPDRayTrainer(RayPPOTrainer):
                 entry["samples"] = {"error": f"{type(exc).__name__}: {exc}"}
             rec["roles"][name] = entry
 
+        if bool((self.config.algorithm.get("oci_rank", None) or {}).get("enable", False)):
+            try:
+                rec["rank"] = self._oci_rank_report(batch, probe_cfg)
+            except Exception as exc:
+                rec["rank"] = {"error": f"{type(exc).__name__}: {exc}"}
+
         import json
 
         print(f"[grad_probe] slots batch {n}: "
@@ -1738,6 +1744,96 @@ class OPDRayTrainer(RayPPOTrainer):
         state.setdefault("oci", []).append(rec)
         state["batches"] = n
         return state
+
+    def _oci_rank_report(self, batch: DataProto, probe_cfg=None) -> dict:
+        """Both rank scores for every trajectory, and whether they order a live group.
+
+        TWO FORWARDS, NO BACKWARD, NOTHING GENERATED:
+          privileged  the actor's own weights on the DOCUMENT-CONDITIONED prompt,
+                      spliced from the edit the rollout recorded and verified
+          teacher     the task's teacher on the prompt the student actually had
+
+        Both return a log-prob per response token at the tokens the student
+        sampled, which is all a ranking needs -- the top-k machinery the
+        distillation KL uses is not involved.
+
+        Diagnostic only: the caller writes the payload, nothing here touches the
+        advantages. What decides whether it ever should is ``auc_pooled`` on the
+        LIVE groups, where the outcome is known.
+        """
+        import numpy as np
+
+        from verl.trainer.ppo.oci_rank import (document_rows, rank_report,
+                                               trajectory_scores, with_document)
+
+        cfg = self.config.algorithm.get("oci_rank", None)
+        tasks = tuple((cfg or {}).get("tasks", ["alfworld"]) or ["alfworld"])
+        rows = document_rows(batch)
+        rec = {"rows_with_document": int(rows.sum()), "rows": int(len(batch)), "tasks": list(tasks)}
+        if not rows.any():
+            rec["error"] = ("no row carries a document edit; is algorithm.oci_rank.enable "
+                            "reaching the env manager, and does the task have a document?")
+            return rec
+
+        mask = batch.batch["response_mask"] if "response_mask" in batch.batch.keys() else None
+        if mask is None:
+            from verl.trainer.ppo.ray_trainer import compute_response_mask
+            mask = compute_response_mask(batch)
+        tuids = batch.non_tensor_batch["traj_uid"]
+        pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        scores = {}
+
+        # --- privileged: the same weights, the document in front -------------
+        try:
+            doc_batch, spliced = with_document(batch, pad)
+            rec["rows_spliced"] = int(spliced.sum())
+            sub = doc_batch[np.flatnonzero(spliced).tolist()]
+            out = self._padded_log_prob(self.actor_rollout_wg, sub)
+            scores["privileged"] = trajectory_scores(
+                out, mask[np.flatnonzero(spliced).tolist()], tuids[np.flatnonzero(spliced)])
+        except Exception as exc:
+            rec["privileged_error"] = f"{type(exc).__name__}: {exc}"
+
+        # --- teacher: the task's checkpoint, the plain prompt -----------------
+        try:
+            task_names = [self._normalize_task_name(t)
+                          for t in batch.non_tensor_batch["task_name"]]
+            per_task = {}
+            for task, wg in self.teacher_wg.items():
+                idx = [i for i, t in enumerate(task_names) if t == task]
+                if not idx:
+                    continue
+                out = self._padded_log_prob(wg, batch[idx], ref=True)
+                per_task.update(trajectory_scores(out, mask[idx], tuids[idx]))
+            scores["teacher"] = per_task
+        except Exception as exc:
+            rec["teacher_error"] = f"{type(exc).__name__}: {exc}"
+
+        if scores:
+            rec.update(rank_report(batch, scores, tasks=tasks))
+        return rec
+
+    def _padded_log_prob(self, wg, sub: DataProto, ref: bool = False):
+        """``compute_log_prob`` on a worker group, padded to its world size.
+
+        ``DataProto.chunk`` asserts the row count divides the data-parallel world
+        exactly, and these sub-batches are arbitrary -- one trajectory per group,
+        as many rows as it ran turns. The same padding dance the reachability
+        report does, for the same reason.
+        """
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+        world = int(getattr(wg, "world_size", 1) or 1)
+        pad_size = 0
+        if world > 1 and (len(sub) % world):
+            sub, pad_size = pad_dataproto_to_divisor(sub, world)
+        out = wg.compute_ref_log_prob(sub) if ref else wg.compute_log_prob(sub)
+        if pad_size:
+            out = unpad_dataproto(out, pad_size=pad_size)
+        for key in ("ref_log_prob", "old_log_probs", "log_probs"):
+            if key in out.batch.keys():
+                return out.batch[key]
+        raise KeyError(f"no log-prob column in {sorted(out.batch.keys())}")
 
     def _select_oci_slots(self, batch: DataProto, metrics: dict) -> DataProto:
         """Keep the eight rollouts each group trains and drop the other two.

@@ -401,6 +401,39 @@ algorithm:
     # failure's own length set its weight). tests/oci/test_floor.py holds these
     # numbers against core_algos.
     weight: trajectory
+  oci_rank:
+    # RANK A DEGENERATE GROUP BY HOW LIKELY ITS TRAJECTORIES ARE UNDER A SCORER
+    # THAT KNOWS THE ANSWER, instead of injecting extra rollouts into it.
+    #
+    # WHY. A group whose eight rollouts all agree has an advantage of exactly
+    # zero, and three arms that filled that silence by GENERATING a differing
+    # rollout all cost accuracy: the special row's tokens are off-policy for the
+    # prompt that exists at test time, and training them raised entropy whether
+    # they were pushed up or down. Here nothing is generated. The eight rollouts
+    # are the student's own, and the only new quantity is how likely each one is
+    # under a conditioning the student did not have.
+    #
+    # TWO SCORERS, BOTH LENGTH-NORMALISED MEAN LOG-PROB OF THE STUDENT'S OWN
+    # SAMPLED TOKENS:
+    #   privileged  the SAME weights with this instance's document (alfworld's
+    #               walkthrough, webshop's goal record, search's answer) in front
+    #               of the observation -- "which of the eight would the self that
+    #               knows the answer have written?"
+    #   teacher     the task's teacher checkpoint on the plain prompt, which the
+    #               distillation term already uses.
+    # The document is shown WHOLE, with no per-turn progress line: the scorer
+    # does not have to act, only to rank, and the progress pointer only advances
+    # on an exact action match, which a plain rollout does not give.
+    #
+    # NOT WIRED TO THE LOSS YET. With enable=True the columns are recorded and
+    # the probe reports, per group class, each trajectory's two scores beside its
+    # outcome -- so the question "does either score separate winners from losers
+    # in the LIVE groups, where the answer is known?" is answered before anything
+    # is trained on it.
+    enable: False
+    # Tasks whose rows carry the document-conditioned prompt. Every manager
+    # exposes document_block(); only alfworld's is replay-verified (3553/3553).
+    tasks: ["alfworld"]
   oci_slots:
     # TEN ROLLOUTS PER GROUP, EIGHT OF THEM TRAINED. The switch; read by the
     # alfworld env manager off its own copy of this config (the same route, and

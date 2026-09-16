@@ -92,6 +92,10 @@ ROLE_NAMES = {ROLE_NONE: "none", ROLE_PLAIN: "plain", ROLE_RESERVE: "reserve",
 # "at least one is marked" assert.
 OCI_ROLE_KEY = "oci_role"
 OCI_PLAIN_KEY = "oci_plain"
+# The render THIS turn would have had with the instance's document in front of
+# the observation, for the rank scorer (algorithm.oci_rank). It travels beside
+# the other two for the same reason: the multitask merge reorders every key.
+OCI_DOC_KEY = "oci_doc"
 
 # What the document slot may print. Both print the game's own walkthrough, which
 # replays 30/30 in this environment; the stepwise variant adds the one line that
@@ -143,6 +147,27 @@ def foreign_task(config) -> str:
         raise ValueError(
             f"algorithm.oci_slots.foreign_task={task!r}; expected one of {FOREIGN_TASKS}.")
     return task
+
+
+def rank_cfg(config):
+    """``algorithm.oci_rank`` off whatever config object the caller holds, or None."""
+    if config is None:
+        return None
+    try:
+        return config.algorithm.get("oci_rank", None)
+    except Exception:
+        return None
+
+
+def rank_on(config) -> bool:
+    cfg = rank_cfg(config)
+    return bool(cfg is not None and cfg.get("enable", False))
+
+
+def rank_tasks(config):
+    """Tasks whose rows carry the document-conditioned render."""
+    cfg = rank_cfg(config) or {}
+    return tuple(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
 
 
 def slot_tasks(config):

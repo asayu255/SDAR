@@ -37,7 +37,8 @@ from verl.trainer.ppo.privileged_notice import (
 )
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
 from agent_system.environments.oci_layout import (
-    OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on)
+    OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on,
+    rank_on as _oci_rank_on)
 
 # Width of the oci_plan_repl column. The replacement is the no-plan render's
 # boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
@@ -90,6 +91,20 @@ def _oci_render_edit(tokenizer, messages, plain_content, width, template_kwargs,
            and ids_w[len(ids_w) - 1 - tail] == ids_o[len(ids_o) - 1 - tail]):
         tail += 1
     take = len(ids_w) - head - tail        # the region to take out
+    if take == 0:
+        # A PURE INSERTION -- nothing was removed. That is what the document
+        # direction (algorithm.oci_rank) looks like whenever the tokenizer does
+        # not merge at the boundary: the ordinary render's tokens are all in the
+        # head and tail, and the document's are the difference. splice_span
+        # applies an edit only where it has a span to REPLACE, so borrow the one
+        # token in front of the insertion point (or behind it, at position 0)
+        # and put it back at the end of the replacement. Same edit, same
+        # reconstruction check, and a span the splice can find.
+        if head > 0:
+            head -= 1
+        elif tail > 0:
+            tail -= 1
+        take = len(ids_w) - head - tail
     repl = ids_o[head:len(ids_o) - tail]   # what to put in its place
     if prompt_window is not None and len(ids_o) > int(prompt_window):
         return None
@@ -925,7 +940,8 @@ class TrajectoryCollector:
         # and token ids fit it; a row whose replacement does not fit is recorded
         # as not strippable, exactly as before.
         self._oci_repl_width = (int(config.data.max_prompt_length)
-                                if _oci_slots_on(config) else OCI_REPL_WIDTH)
+                                if (_oci_slots_on(config) or _oci_rank_on(config))
+                                else OCI_REPL_WIDTH)
         self._oci_repl_dtype = (torch.long if self._oci_repl_width <= OCI_REPL_WIDTH
                                 else torch.int32)
         # Which slot of its group a row is. Recorded HERE, where the row order in
@@ -1187,6 +1203,25 @@ class TrajectoryCollector:
                 oci_plan_repl_len = len(_repl)
                 oci_plan_repl = list(_repl) + [0] * (_oci_width - len(_repl))
 
+        # THE OTHER DIRECTION, for algorithm.oci_rank: the edit that turns this
+        # row's prompt INTO the document-conditioned one. Recorded by the same
+        # function and verified the same way; a row whose document render does
+        # not fit the prompt window is left at length 0, which every reader
+        # treats as "no document for this row".
+        oci_doc_off = oci_doc_len = oci_doc_repl_len = 0
+        oci_doc_repl = [0] * self._oci_repl_width
+        _oci_doc_renders = obs.get(OCI_DOC_KEY, None)
+        _oci_doc = ((_oci_doc_renders[item] or "")
+                    if _oci_doc_renders is not None and _oci_doc_renders[item] else "")
+        if _oci_doc and _oci_doc != obs_content:
+            _edit_doc = _oci_render_edit(tokenizer, messages, _oci_doc, self._oci_repl_width,
+                                         apply_chat_template_kwargs,
+                                         prompt_window=int(self.config.data.max_prompt_length))
+            if _edit_doc is not None:
+                oci_doc_off, oci_doc_len, _doc_repl = _edit_doc
+                oci_doc_repl_len = len(_doc_repl)
+                oci_doc_repl = list(_doc_repl) + [0] * (self._oci_repl_width - len(_doc_repl))
+
         chat = np.array(messages)
         
         # Apply chat template
@@ -1280,6 +1315,10 @@ class TrajectoryCollector:
             'oci_plan_off': torch.tensor(oci_plan_off, dtype=torch.long),
             'oci_plan_len': torch.tensor(oci_plan_len, dtype=torch.long),
             'oci_plan_repl': torch.tensor(oci_plan_repl, dtype=self._oci_repl_dtype),
+            'oci_doc_off': torch.tensor(oci_doc_off, dtype=torch.long),
+            'oci_doc_len': torch.tensor(oci_doc_len, dtype=torch.long),
+            'oci_doc_repl': torch.tensor(oci_doc_repl, dtype=self._oci_repl_dtype),
+            'oci_doc_repl_len': torch.tensor(oci_doc_repl_len, dtype=torch.long),
             'oci_plan_repl_len': torch.tensor(oci_plan_repl_len, dtype=torch.long),
             # truncation=left cuts the head, which is where the offset is
             # measured from, so a truncated row's span no longer locates the
@@ -1352,6 +1391,10 @@ class TrajectoryCollector:
             'oci_plan_off': torch.tensor(0, dtype=torch.long),
             'oci_plan_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_repl': torch.zeros(self._oci_repl_width, dtype=self._oci_repl_dtype),
+            'oci_doc_off': torch.tensor(0, dtype=torch.long),
+            'oci_doc_len': torch.tensor(0, dtype=torch.long),
+            'oci_doc_repl': torch.zeros(self._oci_repl_width, dtype=self._oci_repl_dtype),
+            'oci_doc_repl_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_repl_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_truncated': torch.tensor(0, dtype=torch.long),
             'oci_role': torch.tensor(0, dtype=torch.long),

@@ -23,7 +23,8 @@ import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.environments.oci_layout import (
-    OCI_PLAIN_KEY, OCI_ROLE_KEY, PLAN_FOOTER, PLAN_HEADER, PLAN_LEAD,
+    OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, PLAN_FOOTER, PLAN_HEADER, PLAN_LEAD,
+    rank_on as _oci_rank_on, rank_tasks as _oci_rank_tasks,
     ROLE_DOC, ROLE_FOREIGN, render_document,
     search_document_lines as _search_document_lines,
     webshop_document_lines as _webshop_document_lines,
@@ -892,7 +893,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
                 OCI_PREFIX_KEY: list(self._oci_prefixes),
                 OCI_ROLE_KEY: list(self._oci_roles),
-                OCI_PLAIN_KEY: list(self._oci_plains)}, infos
+                OCI_PLAIN_KEY: list(self._oci_plains),
+                OCI_DOC_KEY: list(self._oci_docs)}, infos
     
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
@@ -924,7 +926,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs,
                              OCI_PREFIX_KEY: list(self._oci_prefixes),
                              OCI_ROLE_KEY: list(self._oci_roles),
-                             OCI_PLAIN_KEY: list(self._oci_plains)}
+                             OCI_PLAIN_KEY: list(self._oci_plains),
+                             OCI_DOC_KEY: list(self._oci_docs)}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -972,6 +975,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self._oci_prefixes = []
         self._oci_roles = []
         self._oci_plains = []
+        # The same turn with this instance's document in front of it, for the
+        # rank scorer. Built for EVERY row, not just a special slot: the scorer
+        # asks how likely each ordinary rollout is under the self that knows the
+        # answer, so every row needs the conditioning. '' when the switch is off
+        # or the document cannot be built.
+        self._oci_docs = []
+        _rank = (_oci_rank_on(self.config)
+                 and "alfworld" in _oci_rank_tasks(self.config))
         _envs = getattr(self, 'envs', None)
         postprocess_text_obs = []
         if not init and self.config.env.history_length > 0:
@@ -1049,6 +1060,11 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # arm wants too -- that one is stripped by its prefix instead.
             self._oci_plains.append(
                 plain_obs if (_role in (ROLE_DOC, ROLE_FOREIGN) and obs != plain_obs) else "")
+            # WHOLE DOCUMENT, NO PROGRESS LINE. The scorer does not act, so it
+            # needs no pointer -- and the pointer only advances on an exact
+            # action match, which an ordinary rollout does not give.
+            _doc_blk = self.document_block(i) if _rank else ""
+            self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
