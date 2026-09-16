@@ -87,6 +87,7 @@ COMPOSED_SCRIPTS = [
 COMPOSE_ONLY_SCRIPTS = [
     "examples/opd_grpo_trainer/run_multitask_oci_probe_qwen3.sh",
     "examples/opd_grpo_trainer/run_alfworld_oci_slots_probe_qwen3.sh",
+    "examples/opd_grpo_trainer/run_alfworld_oci_rank_probe_qwen3.sh",
 ]
 
 

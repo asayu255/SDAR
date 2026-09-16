@@ -150,24 +150,94 @@ if edit:
               "oci_doc_len": torch.tensor([0])})).tolist() == [False],
           "a row with no recorded edit is never counted as scored")
 
-# --- 4. aggregation ----------------------------------------------------------
-lp = torch.tensor([[-1.0, -3.0, 0.0], [-2.0, -2.0, -2.0]])
-msk = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-sc = orank.trajectory_scores(lp, msk, np.array(["a", "a"]))
-check(abs(sc["a"] - (-10.0 / 5.0)) < 1e-9,
-      f"a trajectory's score is its length-normalised mean log-prob ({sc['a']:.3f})")
-sc2 = orank.trajectory_scores(lp, msk, np.array(["a", "b"]))
-check(abs(sc2["a"] + 2.0) < 1e-9 and abs(sc2["b"] + 2.0) < 1e-9,
-      "and it is per trajectory, not per row")
+# --- 4. trajectories: token-weighted scores and the gain against plain --------
+recs = orank.build_trajectories(
+    uids=["g", "g"], tuids=["a", "a"], turn_steps=[1, 0], returns=[10.0, 10.0],
+    tasks=["alfworld"] * 2, gamefiles=["", ""], actions=["take x", "go to y"],
+    sums={"plain": np.array([-4.0, -2.0]), "privileged": np.array([-1.0, -1.0])},
+    counts=np.array([2.0, 2.0]))
+r = recs["a"]
+check(abs(r["score"]["plain"] + 1.5) < 1e-12 and abs(r["score"]["privileged"] + 0.5) < 1e-12,
+      f"a trajectory's score is its token-weighted mean over all rows ({r['score']['plain']}, {r['score']['privileged']})")
+check(abs(r["score"]["privileged_gain"] - 1.0) < 1e-12,
+      "and privileged_gain is the mean per-token log q - log pi against plain")
+check(r["actions"] == ["go to y", "take x"] and r["turns"] == 2,
+      "rows are put back in turn order before anything reads the actions")
 
-# --- 5. the AUC says what it claims ------------------------------------------
-check(orank.live_auc([(1.0, True), (0.0, False)]) == 1.0, "a perfect ranker scores AUC 1.0")
-check(orank.live_auc([(0.0, True), (1.0, False)]) == 0.0, "a reversed one scores 0.0")
-check(orank.live_auc([(1.0, True), (1.0, False)]) == 0.5, "ties score 0.5")
-check(orank.live_auc([(1.0, True), (1.0, True)]) is None,
-      "a group with no loser is not scored at all, rather than counted as perfect")
-check(orank.live_auc([(3.0, True), (2.0, True), (1.0, False), (4.0, False)]) == 0.5,
-      "and a scorer that orders no better than chance comes out at 0.5")
+# --- 5. the checks say what they claim ----------------------------------------
+check(orank.auc([1.0], [0.0]) == 1.0 and orank.auc([0.0], [1.0]) == 0.0
+      and orank.auc([1.0], [1.0]) == 0.5 and orank.auc([1.0], []) is None,
+      "AUC: 1 perfect, 0 reversed, 0.5 tie, None without both kinds")
+
+
+def synth(groups):
+    """groups: {uid: [(won, turns, {scorer: score})]} -> trajectory records."""
+    out = {}
+    for u, rows in groups.items():
+        for k, (won, turns, sc) in enumerate(rows):
+            t = f"{u}{k}"
+            out[t] = {"traj": t, "uid": u, "task": "alfworld", "gamefile": "", "ret": 10.0 if won else 0.0,
+                      "won": won, "turns": turns, "tokens": 1.0, "score": dict(sc), "actions": [], "_rows": []}
+    return out
+
+
+# A scorer that only reads length: losers run to the cap, winners are short.
+live = {f"L{j}": [(True, 10 + j, {"len": -(10 + j)}), (True, 14 + j, {"len": -(14 + j)}),
+                  (False, 50, {"len": -50}), (False, 50, {"len": -50})] for j in range(6)}
+rs = synth(live)
+st_ = orank.classify_groups(rs)
+raw = orank.group_auc_stats(rs, st_, "len", n_boot=200)
+adj = orank.group_auc_stats(rs, st_, "len", adjust="turns", n_boot=200)
+check(raw["auc_mean"] == 1.0 and adj["auc_mean"] == 0.5,
+      f"a length-only scorer is perfect raw ({raw['auc_mean']}) and near chance once turn count is "
+      f"removed ({adj['auc_mean']:.2f}) -- the confound the first probe ran into")
+check(raw["spearman_score_turns_mean"] is not None and raw["spearman_score_turns_mean"] < -0.9,
+      "and its score-turns correlation is reported, strongly negative")
+
+# first divergence: same prompt, one row each; the scorer prefers the winner's row
+def div_recs(prefer_winner):
+    rows_sum = {"plain": np.zeros(8), "privileged": np.zeros(8)}
+    cnt = np.ones(8)
+    recs = {}
+    layout = [("w1", True, ["go a", "take x"]), ("w2", True, ["go a", "take x"]),
+              ("l1", False, ["go a", "open b"]), ("l2", False, ["go a", "open b"])]
+    i = 0
+    for t, won, acts in layout:
+        rows = []
+        for step, act in enumerate(acts):
+            rows.append((step, i, act))
+            if step == 1:
+                rows_sum["privileged"][i] = (1.0 if won else -1.0) * (1 if prefer_winner else -1)
+            i += 1
+        recs[t] = {"traj": t, "uid": "D", "won": won, "turns": 2, "score": {}, "_rows": rows,
+                   "actions": acts, "ret": 10.0 if won else 0.0, "task": "alfworld", "gamefile": ""}
+    return recs, rows_sum, cnt
+
+
+for pref, want in ((True, 1.0), (False, 0.0)):
+    rr, sums_, cnt_ = div_recs(pref)
+    dv = orank.divergence_accuracy(rr, orank.classify_groups(rr), sums_, cnt_, "privileged", n_boot=50)
+    check(dv["accuracy_mean"] == want and dv["pairs"] == 4,
+          f"first-divergence accuracy is {want} when the scorer {'prefers' if pref else 'rejects'} the "
+          f"winners' rows at the turn the actions split ({dv})")
+rr, sums_, cnt_ = div_recs(True)
+dg = orank.divergence_accuracy(rr, orank.classify_groups(rr), sums_, cnt_, "privileged_gain", n_boot=50)
+check(dg["accuracy_mean"] == 1.0, "and the gain form reads the same rows minus plain")
+
+# walkthrough progress and the stuck-group diagnostic
+walk = ["go to a", "take x from a", "go to b", "put x in b"]
+cov, lcs = orank.walkthrough_progress(["go to a", "look", "take x from a", "go to c"], walk)
+check(abs(cov - 0.5) < 1e-12 and abs(lcs - 0.5) < 1e-12,
+      f"walkthrough progress: cover {cov}, lcs {lcs} for a trajectory that did the first two steps")
+stuck = {}
+for k, n_done in enumerate([0, 1, 2, 3]):
+    t = f"S{k}"
+    stuck[t] = {"traj": t, "uid": "S", "won": False, "turns": 50, "tokens": 1.0, "ret": 0.0,
+                "task": "alfworld", "gamefile": "g", "actions": walk[:n_done] + ["look"] * 3,
+                "score": {"privileged": float(n_done)}, "_rows": []}
+dd = orank.degenerate_diagnostics(stuck, orank.classify_groups(stuck), "privileged", walk_of=lambda gf: walk)
+check(dd["stuck"]["groups"] == 1 and dd["stuck"]["spearman_score_walk_cover_mean"] > 0.9,
+      f"inside a stuck group, a scorer that tracks walkthrough progress shows it ({dd['stuck']})")
 
 
 def test_rank():

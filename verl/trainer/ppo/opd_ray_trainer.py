@@ -1500,7 +1500,23 @@ class OPDRayTrainer(RayPPOTrainer):
         # re-score), so the role has to be read first or the single-candidate
         # reader below would take document and foreign rows for one candidate.
         _role_col = batch.batch.get("oci_role", None)
-        if _role_col is not None and bool((_role_col.reshape(-1) != 0).any()):
+        _slots_active = _role_col is not None and bool((_role_col.reshape(-1) != 0).any())
+        # RANK-ONLY: with the layout off there are no special rows and no single
+        # candidate either -- every group is eight ordinary rollouts, which is
+        # exactly what the rank scorers must be checked on.
+        if (not _slots_active
+                and bool((self.config.algorithm.get("oci_rank", None) or {}).get("enable", False))):
+            import json as _json
+            try:
+                rec["rank"] = self._oci_rank_report(batch, probe_cfg)
+            except Exception as exc:
+                rec["rank"] = {"error": f"{type(exc).__name__}: {exc}"}
+            _brief = {k: v for k, v in rec["rank"].items() if k != "records"}
+            print(f"[grad_probe] rank batch {n}: {_json.dumps(_brief, default=float)}", flush=True)
+            state.setdefault("oci", []).append(rec)
+            state["batches"] = n
+            return state
+        if _slots_active:
             return self._accumulate_slots_probe(batch, state, probe_cfg, rec, n)
 
         cand = batch.batch.get("oci_candidate", None)
@@ -1746,71 +1762,130 @@ class OPDRayTrainer(RayPPOTrainer):
         return state
 
     def _oci_rank_report(self, batch: DataProto, probe_cfg=None) -> dict:
-        """Both rank scores for every trajectory, and whether they order a live group.
+        """Three scorers on the same rows, and four checks of whether any of them
+        knows which trajectory is better.
 
-        TWO FORWARDS, NO BACKWARD, NOTHING GENERATED:
-          privileged  the actor's own weights on the DOCUMENT-CONDITIONED prompt,
-                      spliced from the edit the rollout recorded and verified
-          teacher     the task's teacher on the prompt the student actually had
+        SCORERS (all score the student's OWN sampled tokens; one forward each,
+        no backward, nothing generated):
+          plain       the actor on the prompt it had -- the control
+          privileged  the actor with the instance's document in front
+          teacher     the task's teacher checkpoint on the plain prompt
+        plus ``privileged_gain`` and ``teacher_gain`` (mean per-token log q -
+        log pi against ``plain``), the form most self-distillation work scores.
 
-        Both return a log-prob per response token at the tokens the student
-        sampled, which is all a ranking needs -- the top-k machinery the
-        distillation KL uses is not involved.
+        CHECKS (see verl/trainer/ppo/oci_rank.py): live-group AUC; the same
+        after removing a within-group fit on turn count (in alfworld a loss IS a
+        run to the cap, so the raw AUC mostly measures length); accuracy at the
+        first turn where a live group's actions diverge (same prompt, no length
+        confound); and inside stuck / saturated groups, the order against
+        walkthrough progress and turn count.
 
-        Diagnostic only: the caller writes the payload, nothing here touches the
-        advantages. What decides whether it ever should is ``auc_pooled`` on the
-        LIVE groups, where the outcome is known.
+        ONLY ORDINARY ROWS. Rows of the ten-slot layout's document and foreign
+        slots are excluded -- the first run of this probe counted a saturated
+        group with a foreign row as "live" and got AUC 0.985 from rows whose
+        prompt was different. Padding copies and trajectories with any row that
+        could not be conditioned are dropped too, so every trajectory is scored
+        on all of its tokens by all three scorers.
         """
         import numpy as np
 
-        from verl.trainer.ppo.oci_rank import (document_rows, rank_report,
-                                               trajectory_scores, with_document)
+        from agent_system.environments.oci_layout import ROLE_DOC, ROLE_FOREIGN
+        from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
+        from verl.trainer.ppo.oci_rank import (build_trajectories, document_rows,
+                                               parse_actions, rank_report, row_sums,
+                                               with_document)
 
-        cfg = self.config.algorithm.get("oci_rank", None)
-        tasks = tuple((cfg or {}).get("tasks", ["alfworld"]) or ["alfworld"])
-        rows = document_rows(batch)
-        rec = {"rows_with_document": int(rows.sum()), "rows": int(len(batch)), "tasks": list(tasks)}
-        if not rows.any():
-            rec["error"] = ("no row carries a document edit; is algorithm.oci_rank.enable "
+        cfg = self.config.algorithm.get("oci_rank", None) or {}
+        rec = {"rows": int(len(batch))}
+        nt = batch.non_tensor_batch
+        ok = document_rows(batch).copy()
+        role = batch.batch.get("oci_role", None)
+        if role is not None:
+            r = role.reshape(-1).detach().cpu().numpy()
+            ok &= ~np.isin(r, (ROLE_DOC, ROLE_FOREIGN))
+        pad_col = batch.batch.get(PADDING_ROW_KEY, None)
+        if pad_col is not None:
+            ok &= ~pad_col.reshape(-1).to(torch.bool).cpu().numpy()
+        rec["rows_ordinary_with_document"] = int(ok.sum())
+        if not ok.any():
+            rec["error"] = ("no ordinary row carries a document edit; is algorithm.oci_rank.enable "
                             "reaching the env manager, and does the task have a document?")
             return rec
+
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        doc_batch, spliced = with_document(batch, pad_id)
+        ok &= spliced
+        # Whole trajectories only: a trajectory missing a row would be scored on
+        # a subset of its tokens.
+        tuids = np.asarray([str(t) for t in nt["traj_uid"]])
+        bad = {t for t, k in zip(tuids, ok) if not k}
+        ok &= ~np.isin(tuids, list(bad))
+        idx = np.flatnonzero(ok)
+        rec["rows_scored"] = int(idx.size)
+        rec["trajectories_dropped_incomplete"] = len(bad)
+        if not idx.size:
+            rec["error"] = "no complete trajectory could be conditioned on its document"
+            return rec
+        rows = idx.tolist()
 
         mask = batch.batch["response_mask"] if "response_mask" in batch.batch.keys() else None
         if mask is None:
             from verl.trainer.ppo.ray_trainer import compute_response_mask
             mask = compute_response_mask(batch)
-        tuids = batch.non_tensor_batch["traj_uid"]
-        pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        scores = {}
+        mask = mask[rows]
 
-        # --- privileged: the same weights, the document in front -------------
+        sums, counts = {}, None
         try:
-            doc_batch, spliced = with_document(batch, pad)
-            rec["rows_spliced"] = int(spliced.sum())
-            sub = doc_batch[np.flatnonzero(spliced).tolist()]
-            out = self._padded_log_prob(self.actor_rollout_wg, sub)
-            scores["privileged"] = trajectory_scores(
-                out, mask[np.flatnonzero(spliced).tolist()], tuids[np.flatnonzero(spliced)])
+            lp = self._padded_log_prob(self.actor_rollout_wg, batch[rows])
+            sums["plain"], counts = row_sums(lp, mask)
+        except Exception as exc:
+            rec["plain_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            lp = self._padded_log_prob(self.actor_rollout_wg, doc_batch[rows])
+            sums["privileged"], c = row_sums(lp, mask)
+            counts = c if counts is None else counts
         except Exception as exc:
             rec["privileged_error"] = f"{type(exc).__name__}: {exc}"
-
-        # --- teacher: the task's checkpoint, the plain prompt -----------------
         try:
-            task_names = [self._normalize_task_name(t)
-                          for t in batch.non_tensor_batch["task_name"]]
-            per_task = {}
+            task_names = [self._normalize_task_name(t) for t in nt["task_name"]]
+            arr = np.full(idx.size, np.nan)
             for task, wg in self.teacher_wg.items():
-                idx = [i for i, t in enumerate(task_names) if t == task]
-                if not idx:
+                pos = [j for j, i in enumerate(rows) if task_names[i] == task]
+                if not pos:
                     continue
-                out = self._padded_log_prob(wg, batch[idx], ref=True)
-                per_task.update(trajectory_scores(out, mask[idx], tuids[idx]))
-            scores["teacher"] = per_task
+                lp = self._padded_log_prob(wg, batch[[rows[j] for j in pos]], ref=True)
+                sm, _ = row_sums(lp, mask[pos])
+                arr[pos] = sm
+            if not np.isnan(arr).any():
+                sums["teacher"] = arr
         except Exception as exc:
             rec["teacher_error"] = f"{type(exc).__name__}: {exc}"
+        if not sums:
+            return rec
 
-        if scores:
-            rec.update(rank_report(batch, scores, tasks=tasks))
+        rets = nt.get("episode_rewards", None)
+        returns = (np.asarray([float(x) for x in rets])[idx] if rets is not None
+                   else batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy()[idx])
+        actions = parse_actions(self.tokenizer, batch.batch["responses"][rows], mask)
+        gamefiles = nt.get("gamefile", None)
+        recs = build_trajectories(
+            uids=[str(nt["uid"][i]) for i in rows], tuids=tuids[idx],
+            turn_steps=[int(nt["turn_step"][i]) for i in rows], returns=returns,
+            tasks=[str(nt["task_name"][i]) for i in rows],
+            gamefiles=None if gamefiles is None else [str(gamefiles[i]) for i in rows],
+            actions=actions, sums=sums, counts=counts)
+
+        walk_of = None
+        if "alfworld" in tuple(cfg.get("tasks", ["alfworld"]) or ["alfworld"]):
+            from agent_system.environments.env_manager import _tw_pddl
+
+            def walk_of(gf):
+                try:
+                    return _tw_pddl(gf)[0] if gf else []
+                except Exception:
+                    return []
+        rec.update(rank_report(recs, sums, counts, walk_of=walk_of,
+                               n_boot=int((probe_cfg or {}).get("rank_bootstrap", 1000))))
         return rec
 
     def _padded_log_prob(self, wg, sub: DataProto, ref: bool = False):
