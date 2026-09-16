@@ -397,6 +397,116 @@ else:
               "real tokenizer: the null edit gives back the plain prompt and positions")
 
 
+# --- 9. the driver's report end to end, on fake workers ---------------------------
+# A fake model whose log-prob of each response token depends on every live token
+# before it and on its live position -- so it notices a wrong splice, a wrong
+# position or a padding leak, and is blind to left padding like a real one.
+from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer  # noqa: E402
+
+
+def _fake_lp(data):
+    ids, am = data.batch["input_ids"], data.batch["attention_mask"]
+    pos = data.batch["position_ids"]
+    R = int(data.batch["responses"].shape[1])
+    out = torch.zeros(ids.shape[0], R)
+    for i in range(ids.shape[0]):
+        live = am[i].bool()
+        toks, p = ids[i][live].tolist(), pos[i][live].tolist()
+        n_prompt = int(am[i, :ids.shape[1] - R].sum())
+        acc = 0
+        for t in range(len(toks)):
+            if t >= n_prompt:
+                out[i, t - n_prompt] = -((acc + 7 * p[t]) % 97) / 100.0
+            acc = (acc * 31 + toks[t]) % 1000003
+    return out
+
+
+class _FakeWG:
+    world_size = 2
+
+    def __init__(self, key):
+        self.key = key
+
+    def compute_log_prob(self, data):
+        return DataProto.from_dict(tensors={self.key: _fake_lp(data)})
+
+    compute_ref_log_prob = compute_log_prob
+
+
+def _rank_batch(corrupt_row=None):
+    R, rows = 3, []
+    layout = [("G1", "a", True), ("G1", "b", False), ("G2", "c", True), ("G2", "d", True)]
+    for uid, tr, won in layout:
+        for k in range(2):
+            plain = f"obs {uid} {tr} turn {k}\nNow act."
+            doc = f"DOC walkthrough for {uid}\nstep one\n\n" + plain
+            msgs = [{"role": "user", "content": plain}]
+            e = rl._oci_render_edit(tok, msgs, doc, 4096, {}, prompt_window=4096)
+            rows.append(dict(uid=uid, tr=tr, won=won, k=k, ids=tok.encode(tok.apply_chat_template(msgs)),
+                             edit=e, text=tok.apply_chat_template([{"role": "user", "content": doc}])))
+    rows.append(dict(rows[0], copy=True))   # adjust_batch's copies: same traj_uid as their source
+    rows.append(dict(rows[5], copy=True))
+    P = max(len(r["ids"]) for r in rows) + 2
+    n = len(rows)
+    ids = torch.zeros(n, P + R, dtype=torch.long); am = torch.zeros_like(ids); pos = torch.zeros_like(ids)
+    off, take, rl_ = (torch.zeros(n, dtype=torch.long) for _ in range(3))
+    repl = torch.zeros(n, 4096, dtype=torch.int32)
+    for i, r in enumerate(rows):
+        L = len(r["ids"])
+        ids[i, P - L:P] = torch.tensor(r["ids"]); am[i, P - L:P] = 1
+        pos[i, P - L:P] = torch.arange(L)
+        ids[i, P:] = torch.tensor([100 + i, 200 + r["k"], 300]); am[i, P:] = 1
+        pos[i, P:] = L - 1 + torch.arange(1, R + 1)
+        o, t_, rp = r["edit"]
+        off[i], take[i], rl_[i] = o + (1 if i == corrupt_row else 0), t_, len(rp)
+        repl[i, :len(rp)] = torch.tensor(list(rp), dtype=torch.int32)
+    b = DataProto.from_dict(
+        tensors={"input_ids": ids, "attention_mask": am, "position_ids": pos, "responses": ids[:, P:].clone(),
+                 "response_mask": am[:, P:].clone(), "oci_doc_off": off, "oci_doc_len": take,
+                 "oci_doc_repl": repl, "oci_doc_repl_len": rl_,
+                 "is_padding_row": torch.tensor([bool(r.get("copy")) for r in rows])},
+        non_tensors={"uid": np.array([r["uid"] for r in rows], dtype=object),
+                     "traj_uid": np.array([r["tr"] for r in rows], dtype=object),
+                     "turn_step": np.array([r["k"] for r in rows], dtype=object),
+                     "task_name": np.array(["alfworld"] * n, dtype=object),
+                     "gamefile": np.array([""] * n, dtype=object),
+                     "episode_rewards": np.array([10.0 if r["won"] else 0.0 for r in rows], dtype=object),
+                     "oci_doc_prompt": np.array([r["text"] for r in rows], dtype=object)})
+    return b
+
+
+tok.decode = lambda ids, skip_special_tokens=True: f"<think>x</think><action>act {ids[-1] % 2}</action>"
+_fake_self = SimpleNamespace(
+    config=OmegaConf.create({"algorithm": {"oci_rank": {"enable": True, "tasks": ["alfworld"],
+                                                        "self_check_rows": 4}}}),
+    tokenizer=tok, actor_rollout_wg=_FakeWG("old_log_probs"),
+    teacher_wg={"alfworld": _FakeWG("ref_log_prob")}, _normalize_task_name=lambda t: t)
+_fake_self._padded_log_prob = OPDRayTrainer._padded_log_prob.__get__(_fake_self)
+_fake_self._oci_rank_self_check = OPDRayTrainer._oci_rank_self_check.__get__(_fake_self)
+rep = OPDRayTrainer._oci_rank_report(_fake_self, _rank_batch(), {"rank_bootstrap": 20})
+sc = rep.get("self_check", {})
+check("error" not in rep and rep.get("rows_padding_copies") == 2 and rep.get("trajectories_dropped_incomplete") == 0
+      and rep.get("rows_scored") == 8 and rep.get("trajectories") == 4,
+      f"driver: two padding copies, all 4 trajectories scored on all 8 rows "
+      f"({ {k: rep.get(k) for k in ('rows_padding_copies', 'rows_scored', 'trajectories_dropped_incomplete')} })")
+check(rep.get("groups_by_class") == {"live": 1, "stuck": 0, "saturated": 1},
+      f"driver: classes from all real trajectories ({rep.get('groups_by_class')})")
+check("error" not in sc and sc.get("rows") == 4
+      and sc["null_edit"]["max_abs_row_sum_diff"] == 0.0 and sc["null_edit"]["rows_prompt_identical"] == 4
+      and sc["direct_render"]["max_abs_row_sum_diff"] == 0.0 and sc["direct_render"]["rows_prompt_identical"] == 4
+      and sc["noise_floor"]["plain"]["max_abs_row_sum_diff"] == 0.0,
+      f"driver self-checks pass on a correct splice ({sc})")
+# Every scored row checked (self_check_rows >= 8), one of them spliced one token off.
+_fake_self.config.algorithm.oci_rank.self_check_rows = 8
+bad_rep = OPDRayTrainer._oci_rank_report(_fake_self, _rank_batch(corrupt_row=1), {"rank_bootstrap": 20})
+bsc = bad_rep.get("self_check", {})
+check("direct_render" in bsc and bsc["direct_render"]["rows"] == 8
+      and bsc["direct_render"]["rows_prompt_identical"] == 7 and bsc["direct_render"]["max_abs_row_sum_diff"] > 0.0
+      and bsc["null_edit"]["max_abs_row_sum_diff"] == 0.0,
+      f"and the direct-render check catches an edit recorded one token off, which the null edit cannot "
+      f"({bsc.get('direct_render')})")
+
+
 def test_rank():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

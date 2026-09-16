@@ -1925,9 +1925,12 @@ class OPDRayTrainer(RayPPOTrainer):
                        prompt: the tokens must equal the spliced prompt's and
                        the scores must equal ``privileged``. No recorded edit is
                        involved.
-        Both on the same ``n_check`` scored rows, drawn with a fixed seed. The
-        same weights on the same tokens agree to numerical noise; the effect
-        being measured is tenths of a nat per token.
+        Both on the same ``n_check`` scored rows, drawn with a fixed seed, and
+        each compared with its reference RE-SCORED ON THOSE SAME ROWS, so a
+        different micro-batch composition is not mistaken for a difference;
+        ``noise_floor`` is that re-scoring against the full-batch score. The same
+        weights on the same tokens agree to numerical noise; the effect being
+        measured is tenths of a nat per token.
         """
         import numpy as np
 
@@ -1941,11 +1944,19 @@ class OPDRayTrainer(RayPPOTrainer):
         out = {"rows": int(len(sub))}
         grow = int(doc_batch.batch["input_ids"].shape[1]) - int(batch.batch["input_ids"].shape[1])
 
+        lp = self._padded_log_prob(self.actor_rollout_wg, batch[sub])
+        s_plain, _ = row_sums(lp, mask[pick_t])
+        lp = self._padded_log_prob(self.actor_rollout_wg, doc_batch[sub])
+        s_priv, _ = row_sums(lp, mask[pick_t])
+        out["noise_floor"] = {
+            "plain": compare_scores(s_plain, sums["plain"][pick], counts[pick]),
+            "privileged": compare_scores(s_priv, sums["privileged"][pick], counts[pick])}
+
         null_b, null_spliced = with_document(null_edit(batch), pad_id, min_grow=grow)
         same = [a == b for a, b in zip(prompt_tokens(null_b, sub), prompt_tokens(batch, sub))]
         lp = self._padded_log_prob(self.actor_rollout_wg, null_b[sub])
         s_null, _ = row_sums(lp, mask[pick_t])
-        out["null_edit"] = dict(compare_scores(s_null, sums["plain"][pick], counts[pick]),
+        out["null_edit"] = dict(compare_scores(s_null, s_plain, counts[pick]),
                                 rows_spliced=int(np.asarray(null_spliced, dtype=bool)[sub].sum()),
                                 rows_prompt_identical=int(sum(same)), widened_by=grow)
 
@@ -1964,7 +1975,7 @@ class OPDRayTrainer(RayPPOTrainer):
         s_dir, _ = row_sums(lp, mask[pick_t])
         k = np.asarray(keep, dtype=int)
         out["direct_render"] = dict(
-            compare_scores(s_dir[k], sums["privileged"][pick][k], counts[pick][k]),
+            compare_scores(s_dir[k], s_priv[k], counts[pick][k]),
             rows_too_long=len(too_long), rows_prompt_identical=int(sum(same)))
         return out
 
