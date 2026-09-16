@@ -163,6 +163,61 @@ def clipped_pg_losses(
     return losses
 
 
+def gated_pg_losses(
+    log_prob_plain: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    cliprange: float,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c: float = 3.0,
+):
+    """The ordinary clip for a POSITIVE advantage; for a NEGATIVE one, the
+    gradient survives only BELOW the band.
+
+    WHICH HALF OF A MANUFACTURED FAILURE IS WORTH SUPPRESSING. The foreign row
+    is this game's observation with another game's goal, so its response splits
+    in two: tokens the swapped goal produced (`hot mug`, `cabinet` -- rho well
+    under 1 when re-scored under the REAL goal) and tokens any alfworld rollout
+    writes (`go to`, `take`, `<think>`, the receptacle names in front of it --
+    rho about 1). The standard clip keeps exactly the wrong half: at a negative
+    advantage it flattens everything below 1-eps, so the goal-specific tokens
+    train nothing and the shared vocabulary is pushed down at full weight. The
+    second ten-slot run measured what that costs -- entropy 1.13 against the
+    first arm's 0.86 at steps 41-50 and 9.7 points of training success on the
+    same games.
+
+    Reversing the clamp for those rows,
+
+        loss = -A * min(rho, 1-eps)        (A < 0)
+
+    keeps the gradient where the two goals actually disagree and drops it where
+    they do not, and the weight it keeps is rho itself, so a token the real
+    goal already finds unlikely is barely touched.
+
+    NOT A TRUST REGION ANY MORE, and that is the trade. PPO's clip exists to
+    stop an update once the policy has moved away from the sampling policy;
+    this uses the same bound as a DIFFERENCE FILTER instead. It is bounded
+    (|A| * (1-eps) at worst, so no dual clip is needed) but it carries no
+    monotonic-improvement argument -- it is an arm, not a default.
+
+    The positive rows are untouched: they take ``clipped_pg_losses`` exactly as
+    ``special_loss='ppo'`` gives them, so a run of this mode differs from that
+    one in the foreign row and in nothing else.
+    """
+    base = clipped_pg_losses(
+        log_prob_plain, old_log_prob, advantages, response_mask,
+        cliprange=cliprange, cliprange_low=cliprange_low,
+        cliprange_high=cliprange_high, clip_ratio_c=clip_ratio_c)
+    low = cliprange if cliprange_low is None else cliprange_low
+    floor = 1.0 - float(low)
+    ratio = (log_prob_plain - old_log_prob).clamp(max=MAX_LOG_RHO).exp()
+    below = -advantages * torch.minimum(ratio, torch.full_like(ratio, floor))
+    return torch.where(advantages < 0, below, base)
+
+
 def shaping_diagnostics(
     log_prob_plain: torch.Tensor,
     old_log_prob: torch.Tensor,

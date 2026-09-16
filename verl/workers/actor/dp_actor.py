@@ -591,23 +591,38 @@ def _oci_shaped_rows(actor, micro_batch, pg_losses, inj, *, response_mask,
         f"the plain forward returned {None if lp_plain is None else tuple(lp_plain.shape)} "
         f"for log-probs of shape {tuple(old_log_prob[rows].shape)}")
 
-    if loss_mode == "ppo":
-        from verl.trainer.ppo.oci_shaping import clipped_pg_losses
+    if loss_mode in ("ppo", "gated"):
+        from verl.trainer.ppo.oci_shaping import clipped_pg_losses, gated_pg_losses
 
-        assert cliprange is not None, "loss_mode='ppo' needs the actor's clip range"
-        shaped = clipped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows],
-                                   response_mask[rows], cliprange=cliprange,
-                                   cliprange_low=cliprange_low, cliprange_high=cliprange_high,
-                                   clip_ratio_c=clip_ratio_c)
+        assert cliprange is not None, f"loss_mode={loss_mode!r} needs the actor's clip range"
+        _fn = clipped_pg_losses if loss_mode == "ppo" else gated_pg_losses
+        shaped = _fn(lp_plain, old_log_prob[rows], advantages[rows],
+                     response_mask[rows], cliprange=cliprange,
+                     cliprange_low=cliprange_low, cliprange_high=cliprange_high,
+                     clip_ratio_c=clip_ratio_c)
+        if loss_mode == "gated":
+            # Does the gate leave anything at all? The share of a negative row's
+            # tokens that sit below the band IS the foreign row's whole gradient
+            # under this mode; at zero it has become the virtual floor.
+            with torch.no_grad():
+                _r = (lp_plain.detach() - old_log_prob[rows]).exp()
+                _neg = response_mask[rows].to(torch.bool) & (advantages[rows] < 0)
+                _floor = 1.0 - float(cliprange if cliprange_low is None else cliprange_low)
+                diag["oci/shaping/gated_neg_tokens"] = float(int(_neg.sum()))
+                diag["oci/shaping/gated_neg_trained_frac"] = float(
+                    ((_r < _floor) & _neg).sum() / _neg.sum().clamp(min=1))
     else:
-        assert loss_mode == "shaped", f"oci loss_mode={loss_mode!r}; expected 'shaped' or 'ppo'"
+        assert loss_mode == "shaped", (
+            f"oci loss_mode={loss_mode!r}; expected 'shaped', 'ppo' or 'gated'")
         shaped = shaped_pg_losses(lp_plain, old_log_prob[rows], advantages[rows], gamma=gamma)
     out = pg_losses.clone()
     out[rows] = shaped.to(out.dtype)
     diag.update(shaping_diagnostics(lp_plain.detach(), old_log_prob[rows],
                                     response_mask[rows], gamma=gamma))
     # Which objective the replaced rows actually took, in the log: 1 = the clip.
-    diag["oci/shaping/loss_mode_ppo"] = 1.0 if loss_mode == "ppo" else 0.0
+    # 0 = LUFFY's f(rho), 1 = the ordinary clip, 2 = the clip with the negative
+    # rows' gate reversed.
+    diag["oci/shaping/loss_mode_ppo"] = float({"shaped": 0.0, "ppo": 1.0, "gated": 2.0}[loss_mode])
     return out, _on_device(diag)
 
 class DataParallelPPOActor(BasePPOActor):
@@ -2664,8 +2679,9 @@ class DataParallelPPOActor(BasePPOActor):
         # take the ordinary clip instead (see clipped_pg_losses for why).
         oci_special_loss = (str(_oci_slots_cfg.get("special_loss", "shaped") or "shaped")
                             if oci_slots_on else "shaped")
-        assert oci_special_loss in ("shaped", "ppo"), (
-            f"algorithm.oci_slots.special_loss={oci_special_loss!r}; expected 'shaped' or 'ppo'")
+        assert oci_special_loss in ("shaped", "ppo", "gated"), (
+            f"algorithm.oci_slots.special_loss={oci_special_loss!r}; expected 'shaped', "
+            "'ppo' or 'gated'")
         # Whether the special rows also train the distillation term. Off in the
         # arm, and off by default: see _oci_opd_keep.
         oci_opd_skip = oci_slots_on and not bool(_oci_slots_cfg.get("opd_on_special", False))

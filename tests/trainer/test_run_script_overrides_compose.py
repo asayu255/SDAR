@@ -74,6 +74,8 @@ COMPOSED_SCRIPTS = [
     # first's launcher with two overrides and its own lock, four
     # `trainer.expected_config` overrides deep.
     "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_ppo_qwen3.sh",
+    # Five deep: the third run execs the second, which execs the first.
+    "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_gated_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

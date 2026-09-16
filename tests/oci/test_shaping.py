@@ -317,6 +317,65 @@ ok &= check_bad
 print(("  OK  " if check_bad else "  FAIL") + " loss_mode='ppo' without a clip range is refused")
 
 
+# --- loss_mode="gated": the negative rows' gate, reversed ---------------------
+# The foreign row's tokens split by rho: those the swapped goal produced (rho
+# well under 1 under the real goal) and those any rollout writes (rho about 1).
+# The ordinary clip trains the second half and drops the first; this mode does
+# the opposite, and leaves the POSITIVE rows exactly as 'ppo' had them.
+from verl.trainer.ppo.oci_shaping import gated_pg_losses
+
+
+def _grad(fn, log_rho, a):
+    old = torch.zeros(1, 1, dtype=torch.float64)
+    plain = torch.tensor([[float(log_rho)]], dtype=torch.float64, requires_grad=True)
+    loss = fn(plain, old, torch.tensor([[float(a)]], dtype=torch.float64),
+              torch.ones(1, 1, dtype=torch.float64), cliprange=0.2)
+    loss.sum().backward()
+    return float(plain.grad[0, 0])
+
+
+print("  --- the swap, at A = -1 (the foreign row) ---")
+for rho, want_ppo, want_gated in ((0.5, 0.0, +0.5), (0.009, 0.0, +0.009), (1.0, +1.0, 0.0), (1.3, +1.3, 0.0)):
+    g_ppo = _grad(clipped_pg_losses, math.log(rho), -1.0)
+    g_gat = _grad(gated_pg_losses, math.log(rho), -1.0)
+    good = abs(g_ppo - want_ppo) < 1e-9 and abs(g_gat - want_gated) < 1e-9
+    ok &= good
+    print(("  OK  " if good else "  FAIL") +
+          f" rho={rho:<6g} clip {g_ppo:+.4f} -> gated {g_gat:+.4f}  "
+          f"({'suppressed' if g_gat > 0 else 'left alone'})")
+
+# the positive rows are the same function they were, point for point
+same = all(abs(_grad(clipped_pg_losses, math.log(r), +1.0) - _grad(gated_pg_losses, math.log(r), +1.0)) < 1e-12
+           for r in (0.009, 0.5, 0.9, 1.0, 1.1, 1.5))
+ok &= same
+print(("  OK  " if same else "  FAIL") +
+      " a positive advantage takes the ordinary clip unchanged, so a gated run differs "
+      "from a ppo run in the foreign row alone")
+
+# bounded without a dual clip: the worst a negative row can contribute is |A|(1-eps)
+big = gated_pg_losses(torch.tensor([[50.0]]), torch.zeros(1, 1), torch.tensor([[-math.sqrt(7)]]),
+                      torch.ones(1, 1), cliprange=0.2)
+good = torch.isfinite(big).all() and abs(float(big) - math.sqrt(7) * 0.8) < 1e-5
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" an absurd ratio on a negative row is bounded at |A|(1-eps) = {float(big):.4f}")
+
+# and through the real substitution, with the diagnostic that says whether the
+# gate left anything
+a4 = StubActor()
+mb4 = micro([0, 1, 0, 1], [0, 2, 0, 2])
+out4, diag4 = _oci_shaped_rows(a4, mb4, base.clone(), _oci_injected_rows(mb4), response_mask=rmask,
+                               advantages=adv, old_log_prob=torch.full((BS, RL), -0.2),
+                               temperature=1.0, gamma=G, loss_mode="gated", cliprange=0.2)
+good = (diag4["oci/shaping/loss_mode_ppo"].item() == 2.0
+        and "oci/shaping/gated_neg_trained_frac" in diag4
+        and diag4["oci/shaping/gated_neg_tokens"].item() == 2 * RL)
+ok &= good
+print(("  OK  " if good else "  FAIL") +
+      f" the actor path reports the mode and the share of negative tokens the gate keeps "
+      f"({diag4.get('oci/shaping/gated_neg_trained_frac')})")
+
+
 def test_shaping():
     """Collected by pytest; the checks above ran at import and set `ok`."""
     assert ok

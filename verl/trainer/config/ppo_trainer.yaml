@@ -463,6 +463,14 @@ algorithm:
     # a twelfth, so a rescued group trained a net push-down. The clip keeps
     # GRPO's zero sum and still drops the unreachable tokens (a positive
     # advantage below 1-eps carries -A*rho; a negative one carries nothing).
+    #
+    # "gated" is "ppo" with ONE change, on the negative rows only: the clamp is
+    # reversed, so loss = -A * min(rho, 1-eps) and the gradient survives only
+    # BELOW the band. The foreign row's response splits into tokens the swapped
+    # goal produced (rho well under 1 under the real goal) and tokens any
+    # rollout writes (rho about 1); the ordinary clip keeps the second half and
+    # drops the first, which is backwards, and the second ten-slot run paid
+    # entropy 1.13 against 0.86 and 9.7 points of success for it.
     special_loss: shaped
     # Whether the special row also trains the distillation term. False: the
     # teacher would be read on a prompt carrying a walkthrough, or on another
