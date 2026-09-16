@@ -43,7 +43,9 @@ import numpy as np
 
 __all__ = ["document_rows", "with_document", "row_sums", "parse_actions",
            "walkthrough_progress", "build_trajectories", "auc", "group_auc_stats",
-           "divergence_accuracy", "degenerate_diagnostics", "rank_report"]
+           "divergence_accuracy", "degenerate_diagnostics", "rank_report",
+           "select_scored_rows", "group_status_from_rows", "null_edit", "prompt_tokens",
+           "direct_render", "compare_scores"]
 
 DOC_OFF, DOC_LEN, DOC_REPL, DOC_REPL_LEN = (
     "oci_doc_off", "oci_doc_len", "oci_doc_repl", "oci_doc_repl_len")
@@ -62,7 +64,7 @@ def document_rows(batch) -> np.ndarray:
     return col.reshape(-1).detach().cpu().numpy() > 0
 
 
-def with_document(batch, pad_token_id: int):
+def with_document(batch, pad_token_id: int, min_grow: int = 0):
     """``(batch_with_document, spliced)``: the same rows, conditioned.
 
     The document makes the prompt LONGER, and ``splice_span`` refuses a row whose
@@ -71,6 +73,10 @@ def with_document(batch, pad_token_id: int):
     window is widened by the largest growth in the batch FIRST -- left-padding
     costs nothing at the forward, since the attention mask is what the model
     reads -- and ``spliced`` says which rows actually took the edit.
+
+    ``min_grow`` widens by at least that much: the null-edit self-check changes
+    no row's length and must still go through the same widening the document
+    batch did.
     """
     import torch
 
@@ -87,6 +93,7 @@ def with_document(batch, pad_token_id: int):
     repl = batch.batch[DOC_REPL]
     rlen = batch.batch[DOC_REPL_LEN].reshape(-1)
     grow = int(torch.clamp(rlen - take, min=0).max().item()) if len(batch) else 0
+    grow = max(grow, int(min_grow))
 
     if grow:
         pad = torch.full((ids.shape[0], grow), int(pad_token_id), dtype=ids.dtype, device=ids.device)
@@ -112,6 +119,154 @@ def with_document(batch, pad_token_id: int):
     out = DataProto.from_dict(tensors=tensors, non_tensors=dict(batch.non_tensor_batch))
     out.meta_info = dict(batch.meta_info)
     return out, spliced
+
+
+def select_scored_rows(tuids, candidate, ok):
+    """``(score_mask, dropped)``: the rows to score, and the trajectories left out.
+
+    ``candidate`` marks the REAL ordinary rows (not a padding copy, not a special
+    slot) and ``ok`` the rows that could be conditioned on the document. A
+    trajectory is left out only when one of its OWN real rows failed, so every
+    scored trajectory is scored on all of its tokens.
+
+    The first version built the drop set from every row that was not ok. A
+    padding copy -- adjust_batch appends duplicates of RANDOM rows, traj_uid
+    included, to make the batch divide -- is never ok, so each copy took its
+    source trajectory out with it. A 50-turn loss holds 50 chances to be copied
+    and a 12-turn win 12: the first rank probe dropped 44% of the losses and 13%
+    of the wins, and kept 40 of 84 winner-loser pairs.
+    """
+    tuids = np.asarray([str(t) for t in tuids])
+    candidate = np.asarray(candidate, dtype=bool)
+    ok = np.asarray(ok, dtype=bool)
+    dropped = sorted({t for t, c, k in zip(tuids, candidate, ok) if c and not k})
+    score = candidate & ok & ~np.isin(tuids, dropped)
+    return score, dropped
+
+
+def group_status_from_rows(uids, tuids, returns, candidate) -> Dict[str, str]:
+    """live / stuck / saturated for each group, from ALL its real trajectories.
+
+    ``classify_groups`` reads the trajectories that were scored, so a live group
+    whose losers were all left out would read as saturated there. This reads the
+    outcome of every real row, scored or not.
+    """
+    best = {}
+    for u, t, r, c in zip(uids, tuids, returns, candidate):
+        if not c:
+            continue
+        key = (str(u), str(t))
+        best[key] = max(best.get(key, float("-inf")), float(r))
+    by = defaultdict(list)
+    for (u, _), r in best.items():
+        by[u].append(r > 0.0)
+    return {u: ("saturated" if all(w) else "stuck" if not any(w) else "live")
+            for u, w in by.items()}
+
+
+def null_edit(batch):
+    """The same batch with every document edit replaced by one that changes
+    NOTHING: the span the edit would take out is also its replacement.
+
+    SELF-CHECK 1. Spliced by ``with_document`` with the window widened as far as
+    the real document widened it, every row comes back with the prompt it had,
+    so its log-prob must equal the plain one. A difference is the splice, the
+    widening or the position ids -- not the document.
+    """
+    import torch
+
+    from verl.protocol import DataProto
+
+    ids, am = batch.batch["input_ids"], batch.batch["attention_mask"]
+    plen = int(ids.shape[1]) - int(batch.batch["responses"].shape[1])
+    off = batch.batch[DOC_OFF].reshape(-1)
+    take = batch.batch[DOC_LEN].reshape(-1)
+    repl = torch.zeros_like(batch.batch[DOC_REPL])
+    for i in range(len(batch)):
+        k, o = int(take[i]), int(off[i])
+        if k <= 0:
+            continue
+        toks = ids[i, :plen][am[i, :plen].bool()]
+        if 0 <= o <= toks.numel() - k:
+            repl[i, :k] = toks[o:o + k].to(repl.dtype)
+    tensors = {k: v for k, v in batch.batch.items()}
+    tensors[DOC_REPL] = repl
+    tensors[DOC_REPL_LEN] = batch.batch[DOC_LEN].clone()
+    out = DataProto.from_dict(tensors=tensors, non_tensors=dict(batch.non_tensor_batch))
+    out.meta_info = dict(batch.meta_info)
+    return out
+
+
+def prompt_tokens(batch, rows) -> list:
+    """Each listed row's live prompt tokens (the left-padded window, unpadded)."""
+    ids, am = batch.batch["input_ids"], batch.batch["attention_mask"]
+    plen = int(ids.shape[1]) - int(batch.batch["responses"].shape[1])
+    return [ids[i, :plen][am[i, :plen].bool()].tolist() for i in rows]
+
+
+def direct_render(sub, texts, tokenizer, pad_token_id: int, width: int):
+    """``(batch, too_long)``: ``sub`` with each row's prompt rebuilt FROM TEXT.
+
+    SELF-CHECK 2. ``texts[i]`` is the document-conditioned prompt the rollout
+    rendered for row i. It is tokenized the way the rollout tokenizes every
+    prompt (tokenize_and_postprocess_data, left-padded to ``width``), the
+    response is copied, and positions are numbered the way generation numbers
+    them (the prompt's from its mask, the response's continuing from the last
+    prompt position). No recorded edit is used, so a row that equals the spliced
+    document batch token for token, and scores the same, shows the splice built
+    the prompt the environment rendered. A row whose text does not fit
+    ``width`` is listed in ``too_long`` and left with an empty prompt.
+    """
+    import torch
+
+    from verl.protocol import DataProto
+    from verl.utils.torch_functional import tokenize_and_postprocess_data
+
+    resp = sub.batch["responses"]
+    R = int(resp.shape[1])
+    full_am = sub.batch["attention_mask"]
+    pos_dtype = sub.batch["position_ids"].dtype if "position_ids" in sub.batch.keys() else torch.long
+    ids = torch.full((len(sub), width + R), int(pad_token_id), dtype=sub.batch["input_ids"].dtype)
+    am = torch.zeros((len(sub), width + R), dtype=full_am.dtype)
+    pos = torch.zeros((len(sub), width + R), dtype=pos_dtype)
+    too_long = []
+    for i, text in enumerate(texts):
+        try:
+            p_ids, p_am = tokenize_and_postprocess_data(
+                prompt=str(text), tokenizer=tokenizer, max_length=int(width),
+                pad_token_id=int(pad_token_id), left_pad=True, truncation="error")
+        except Exception:
+            too_long.append(i)
+            continue
+        ids[i, :width] = p_ids[0]
+        am[i, :width] = p_am[0]
+        p_pos = torch.clamp(torch.cumsum(p_am[0].long(), -1) - 1, min=0)
+        pos[i, :width] = p_pos.to(pos_dtype)
+        pos[i, width:] = (p_pos[-1] + torch.arange(1, R + 1)).to(pos_dtype)
+    ids[:, width:] = resp
+    am[:, width:] = full_am[:, -R:]
+    tensors = {k: v for k, v in sub.batch.items()}
+    tensors.update({"input_ids": ids, "attention_mask": am, "position_ids": pos})
+    out = DataProto.from_dict(tensors=tensors, non_tensors=dict(sub.non_tensor_batch))
+    out.meta_info = dict(sub.meta_info)
+    return out, too_long
+
+
+def compare_scores(a, b, counts) -> dict:
+    """How far two scorings of the same rows' tokens are apart, per row.
+
+    Summed log-probs and their per-token means. The same weights on the same
+    tokens should agree to numerical noise; anything that looks like a scorer's
+    effect (tenths of a nat per token) is a bug in the path, not a finding.
+    """
+    a, b, c = (np.asarray(v, dtype=float).reshape(-1) for v in (a, b, counts))
+    if not a.size:
+        return {"rows": 0}
+    d = np.abs(a - b)
+    dm = d / np.maximum(c, 1.0)
+    return {"rows": int(a.size), "max_abs_row_sum_diff": float(d.max()),
+            "max_abs_token_mean_diff": float(dm.max()),
+            "mean_abs_token_mean_diff": float(dm.mean())}
 
 
 def row_sums(log_probs, response_mask):
@@ -218,11 +373,38 @@ def auc(winners, losers) -> Optional[float]:
     return n / (len(winners) * len(losers))
 
 
+def _avg_ranks(v) -> np.ndarray:
+    """Ranks 0..n-1, tied values sharing the average of their ranks."""
+    v = np.asarray(v, dtype=float)
+    order = np.argsort(v, kind="mergesort")
+    sv = v[order]
+    ranks = np.empty(len(v), dtype=float)
+    i = 0
+    while i < len(v):
+        j = i
+        while j + 1 < len(v) and sv[j + 1] == sv[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
 def _spearman(x, y) -> Optional[float]:
+    """Spearman's rho with ties at their average rank; None for fewer than 3
+    points, a NaN, or a side that does not vary.
+
+    The first version ranked by ``argsort(argsort(x))``, which gives tied values
+    DIFFERENT ranks in array order, so a side that did not vary at all still
+    correlated (0.5 on five equal values). Ties are the common case here: 5 of
+    20 saturated groups in the first rank probe had one turn count throughout,
+    and walkthrough progress takes a handful of values.
+    """
     if len(x) < 3:
         return None
-    rx = np.argsort(np.argsort(x)).astype(float)
-    ry = np.argsort(np.argsort(y)).astype(float)
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if np.isnan(x).any() or np.isnan(y).any():
+        return None
+    rx, ry = _avg_ranks(x), _avg_ranks(y)
     if rx.std() == 0 or ry.std() == 0:
         return None
     return float(np.corrcoef(rx, ry)[0, 1])
@@ -300,7 +482,7 @@ def divergence_accuracy(recs, status, row_sums_by_name, counts, name, *, n_boot=
     for r in recs.values():
         if status.get(r["uid"]) == "live":
             groups[r["uid"]].append(r)
-    per, total_pairs = [], 0
+    per, total_pairs, per_group = [], 0, []
     for u, rs in groups.items():
         by_t = defaultdict(dict)
         for r in rs:
@@ -329,8 +511,11 @@ def divergence_accuracy(recs, status, row_sums_by_name, counts, name, *, n_boot=
         if n:
             per.append(hits / n)
             total_pairs += int(n)
+            per_group.append({"uid": u, "turn": int(t_div), "pairs": int(n), "hits": float(hits)})
+    # per_group is what lets batches be pooled: the row sums this reads are not
+    # kept in the payload, so without it only each batch's mean survives.
     out = {"groups": len(per), "pairs": total_pairs,
-           "accuracy_mean": float(np.mean(per)) if per else None}
+           "accuracy_mean": float(np.mean(per)) if per else None, "per_group": per_group}
     if len(per) >= 2:
         rng = np.random.default_rng(seed)
         boots = [float(np.mean(rng.choice(per, size=len(per), replace=True))) for _ in range(n_boot)]
@@ -376,9 +561,16 @@ def degenerate_diagnostics(recs, status, name, walk_of=None) -> dict:
     return out
 
 
-def rank_report(recs, row_sums_by_name, counts, *, walk_of=None, n_boot=1000) -> dict:
-    """Every check, for every scorer, in one payload."""
-    status = classify_groups(recs)
+def rank_report(recs, row_sums_by_name, counts, *, walk_of=None, n_boot=1000,
+                status=None) -> dict:
+    """Every check, for every scorer, in one payload.
+
+    ``status`` is each group's class from ALL its real trajectories
+    (``group_status_from_rows``). Without it the class is read off the scored
+    trajectories only, which calls a live group saturated once its losers were
+    left out.
+    """
+    status = dict(status) if status is not None else classify_groups(recs)
     names = sorted({n for r in recs.values() for n in r["score"]})
     out = {"trajectories": len(recs), "scorers": names,
            "groups_by_class": {c: sum(1 for v in status.values() if v == c)

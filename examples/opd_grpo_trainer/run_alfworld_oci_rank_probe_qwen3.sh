@@ -19,6 +19,9 @@
 #                              this at or below chance for a skill-conditioned self)
 #   degenerate                 inside stuck groups, order vs walkthrough progress;
 #                              inside saturated groups, order vs turn count
+#   self_check                 SELF_CHECK_ROWS rows per batch (default 32) re-scored
+#                              with a null edit (must equal plain) and from the
+#                              document prompt's own text (must equal privileged)
 set -euo pipefail
 STEP="${STEP:-300}"
 TEMP="${TEMP:-1.0}"
@@ -83,6 +86,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   algorithm.oci_slots.enable=False \
   algorithm.oci_rank.enable=True \
   'algorithm.oci_rank.tasks=[alfworld]' \
+  algorithm.oci_rank.self_check_rows="${SELF_CHECK_ROWS:-32}" \
   algorithm.compute_mean_std_cross_steps=True \
   +trainer.grad_probe.enable=True \
   +trainer.grad_probe.mode=oci \

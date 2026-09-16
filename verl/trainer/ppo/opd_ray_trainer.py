@@ -1780,53 +1780,69 @@ class OPDRayTrainer(RayPPOTrainer):
         confound); and inside stuck / saturated groups, the order against
         walkthrough progress and turn count.
 
-        ONLY ORDINARY ROWS. Rows of the ten-slot layout's document and foreign
-        slots are excluded -- the first run of this probe counted a saturated
-        group with a foreign row as "live" and got AUC 0.985 from rows whose
-        prompt was different. Padding copies and trajectories with any row that
-        could not be conditioned are dropped too, so every trajectory is scored
-        on all of its tokens by all three scorers.
+        ONLY REAL ORDINARY ROWS. Rows of the ten-slot layout's document and
+        foreign slots are excluded -- the first run of this probe counted a
+        saturated group with a foreign row as "live" and got AUC 0.985 from rows
+        whose prompt was different -- and so are adjust_batch's padding copies.
+        A trajectory is scored only if every one of its real rows could be
+        conditioned, so each is scored on all of its tokens by all three scorers;
+        a copy never disqualifies the trajectory it duplicates (the first version
+        let it, and dropped 44% of the losses). A group's class is read from ALL
+        its real trajectories, scored or not.
+
+        SELF-CHECKS (``algorithm.oci_rank.self_check_rows`` > 0): a null edit
+        must reproduce the plain score, and the document prompt tokenized from
+        its own text must reproduce the privileged one -- see
+        ``_oci_rank_self_check``.
         """
         import numpy as np
 
         from agent_system.environments.oci_layout import ROLE_DOC, ROLE_FOREIGN
         from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
         from verl.trainer.ppo.oci_rank import (build_trajectories, document_rows,
-                                               parse_actions, rank_report, row_sums,
+                                               group_status_from_rows, parse_actions,
+                                               rank_report, row_sums, select_scored_rows,
                                                with_document)
 
         cfg = self.config.algorithm.get("oci_rank", None) or {}
         rec = {"rows": int(len(batch))}
         nt = batch.non_tensor_batch
-        ok = document_rows(batch).copy()
+        candidate = np.ones(len(batch), dtype=bool)
         role = batch.batch.get("oci_role", None)
         if role is not None:
             r = role.reshape(-1).detach().cpu().numpy()
-            ok &= ~np.isin(r, (ROLE_DOC, ROLE_FOREIGN))
+            candidate &= ~np.isin(r, (ROLE_DOC, ROLE_FOREIGN))
         pad_col = batch.batch.get(PADDING_ROW_KEY, None)
         if pad_col is not None:
-            ok &= ~pad_col.reshape(-1).to(torch.bool).cpu().numpy()
-        rec["rows_ordinary_with_document"] = int(ok.sum())
-        if not ok.any():
+            pad = pad_col.reshape(-1).to(torch.bool).cpu().numpy()
+            rec["rows_padding_copies"] = int(pad.sum())
+            candidate &= ~pad
+        has_doc = document_rows(batch)
+        rec["rows_real_ordinary"] = int(candidate.sum())
+        rec["rows_ordinary_with_document"] = int((candidate & has_doc).sum())
+        if not (candidate & has_doc).any():
             rec["error"] = ("no ordinary row carries a document edit; is algorithm.oci_rank.enable "
                             "reaching the env manager, and does the task have a document?")
             return rec
 
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         doc_batch, spliced = with_document(batch, pad_id)
-        ok &= spliced
-        # Whole trajectories only: a trajectory missing a row would be scored on
-        # a subset of its tokens.
+        ok = has_doc & np.asarray(spliced, dtype=bool)
+        rec["rows_not_spliced"] = int((candidate & has_doc & ~ok).sum())
         tuids = np.asarray([str(t) for t in nt["traj_uid"]])
-        bad = {t for t, k in zip(tuids, ok) if not k}
-        ok &= ~np.isin(tuids, list(bad))
-        idx = np.flatnonzero(ok)
+        score_mask, dropped = select_scored_rows(tuids, candidate, ok)
+        idx = np.flatnonzero(score_mask)
+        rec["trajectories_real"] = int(len({t for t, c in zip(tuids, candidate) if c}))
         rec["rows_scored"] = int(idx.size)
-        rec["trajectories_dropped_incomplete"] = len(bad)
+        rec["trajectories_dropped_incomplete"] = len(dropped)
         if not idx.size:
             rec["error"] = "no complete trajectory could be conditioned on its document"
             return rec
         rows = idx.tolist()
+        rets = nt.get("episode_rewards", None)
+        all_returns = (np.asarray([float(x) for x in rets]) if rets is not None
+                       else batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy())
+        status = group_status_from_rows([str(u) for u in nt["uid"]], tuids, all_returns, candidate)
 
         mask = batch.batch["response_mask"] if "response_mask" in batch.batch.keys() else None
         if mask is None:
@@ -1863,9 +1879,7 @@ class OPDRayTrainer(RayPPOTrainer):
         if not sums:
             return rec
 
-        rets = nt.get("episode_rewards", None)
-        returns = (np.asarray([float(x) for x in rets])[idx] if rets is not None
-                   else batch.batch["token_level_rewards"].sum(-1).detach().float().cpu().numpy()[idx])
+        returns = all_returns[idx]
         actions = parse_actions(self.tokenizer, batch.batch["responses"][rows], mask)
         gamefiles = nt.get("gamefile", None)
         recs = build_trajectories(
@@ -1885,8 +1899,74 @@ class OPDRayTrainer(RayPPOTrainer):
                 except Exception:
                     return []
         rec.update(rank_report(recs, sums, counts, walk_of=walk_of,
-                               n_boot=int((probe_cfg or {}).get("rank_bootstrap", 1000))))
+                               n_boot=int((probe_cfg or {}).get("rank_bootstrap", 1000)),
+                               status=status))
+        n_check = int(cfg.get("self_check_rows", 0) or 0)
+        if n_check > 0 and "plain" in sums and "privileged" in sums:
+            try:
+                rec["self_check"] = self._oci_rank_self_check(
+                    batch, doc_batch, rows, mask, sums, counts, n_check, pad_id)
+            except Exception as exc:
+                rec["self_check"] = {"error": f"{type(exc).__name__}: {exc}"}
         return rec
+
+    def _oci_rank_self_check(self, batch: DataProto, doc_batch: DataProto, rows, mask,
+                             sums, counts, n_check: int, pad_id: int) -> dict:
+        """Two independent re-scorings that a wrong privileged score cannot pass.
+
+        null_edit      every document edit replaced by one that changes nothing,
+                       spliced and widened exactly as far as the document batch
+                       was: the prompts must come back identical and the scores
+                       must equal ``plain``. Tests the splice, the widening and
+                       the position ids with the document taken out of the
+                       question.
+        direct_render  the document prompt the rollout rendered, tokenized from
+                       its TEXT and laid out the way the rollout lays out any
+                       prompt: the tokens must equal the spliced prompt's and
+                       the scores must equal ``privileged``. No recorded edit is
+                       involved.
+        Both on the same ``n_check`` scored rows, drawn with a fixed seed. The
+        same weights on the same tokens agree to numerical noise; the effect
+        being measured is tenths of a nat per token.
+        """
+        import numpy as np
+
+        from verl.trainer.ppo.oci_rank import (compare_scores, direct_render, null_edit,
+                                               prompt_tokens, row_sums, with_document)
+
+        pick = np.sort(np.random.default_rng(0).choice(len(rows), size=min(int(n_check), len(rows)),
+                                                       replace=False))
+        sub = [rows[int(j)] for j in pick]
+        pick_t = torch.as_tensor(pick, dtype=torch.long)
+        out = {"rows": int(len(sub))}
+        grow = int(doc_batch.batch["input_ids"].shape[1]) - int(batch.batch["input_ids"].shape[1])
+
+        null_b, null_spliced = with_document(null_edit(batch), pad_id, min_grow=grow)
+        same = [a == b for a, b in zip(prompt_tokens(null_b, sub), prompt_tokens(batch, sub))]
+        lp = self._padded_log_prob(self.actor_rollout_wg, null_b[sub])
+        s_null, _ = row_sums(lp, mask[pick_t])
+        out["null_edit"] = dict(compare_scores(s_null, sums["plain"][pick], counts[pick]),
+                                rows_spliced=int(np.asarray(null_spliced, dtype=bool)[sub].sum()),
+                                rows_prompt_identical=int(sum(same)), widened_by=grow)
+
+        texts = batch.non_tensor_batch.get("oci_doc_prompt", None)
+        if texts is None:
+            out["direct_render"] = {"skipped": "no oci_doc_prompt column: the rollout stores it only "
+                                               "when algorithm.oci_rank.self_check_rows > 0"}
+            return out
+        width = int(doc_batch.batch["input_ids"].shape[1]) - int(doc_batch.batch["responses"].shape[1])
+        direct_b, too_long = direct_render(doc_batch[sub], [str(texts[i]) for i in sub],
+                                           self.tokenizer, pad_id, width)
+        keep = [j for j in range(len(sub)) if j not in set(too_long)]
+        same = [a == b for a, b in zip(prompt_tokens(direct_b, keep),
+                                       prompt_tokens(doc_batch, [sub[j] for j in keep]))]
+        lp = self._padded_log_prob(self.actor_rollout_wg, direct_b)
+        s_dir, _ = row_sums(lp, mask[pick_t])
+        k = np.asarray(keep, dtype=int)
+        out["direct_render"] = dict(
+            compare_scores(s_dir[k], sums["privileged"][pick][k], counts[pick][k]),
+            rows_too_long=len(too_long), rows_prompt_identical=int(sum(same)))
+        return out
 
     def _padded_log_prob(self, wg, sub: DataProto, ref: bool = False):
         """``compute_log_prob`` on a worker group, padded to its world size.

@@ -38,7 +38,7 @@ from verl.trainer.ppo.privileged_notice import (
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
 from agent_system.environments.oci_layout import (
     OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on,
-    rank_on as _oci_rank_on)
+    rank_on as _oci_rank_on, rank_self_check_rows as _oci_rank_self_check_rows)
 
 # Width of the oci_plan_repl column. The replacement is the no-plan render's
 # boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
@@ -949,6 +949,11 @@ class TrajectoryCollector:
         # the batch has been regrouped by task, padded and reordered. 0 when the
         # layout is off, where nothing reads it.
         self._oci_group_n = int(config.env.rollout.n) if _oci_slots_on(config) else 0
+        # The document-conditioned prompt as TEXT, for the rank probe's
+        # direct-render self-check only: it re-tokenizes this to test the splice
+        # without using the recorded edit. Off (no column at all) otherwise, since
+        # it is a few KB per row carried through every worker call.
+        self._oci_store_doc_prompt = _oci_rank_self_check_rows(config) > 0
         # The privileged multitask notice, STUDENT mode: a system message chosen by
         # the row's task, prepended to every turn's prompt at tokenisation time so
         # it is in the rollout and in the update alike (the two must agree, since
@@ -1221,6 +1226,17 @@ class TrajectoryCollector:
                 oci_doc_off, oci_doc_len, _doc_repl = _edit_doc
                 oci_doc_repl_len = len(_doc_repl)
                 oci_doc_repl = list(_doc_repl) + [0] * (self._oci_repl_width - len(_doc_repl))
+        _oci_doc_prompt = ""
+        if self._oci_store_doc_prompt and _oci_doc and _oci_doc != obs_content:
+            # The same render _oci_render_edit compares against: this row's
+            # messages with the user turn's content replaced by the document one.
+            _msgs_doc = [dict(_m) for _m in messages]
+            for _m in _msgs_doc:
+                if _m.get("role") == "user":
+                    _m["content"] = _oci_doc
+                    break
+            _oci_doc_prompt = tokenizer.apply_chat_template(
+                _msgs_doc, add_generation_prompt=True, tokenize=False, **apply_chat_template_kwargs)
 
         chat = np.array(messages)
         
@@ -1334,6 +1350,8 @@ class TrajectoryCollector:
             'oci_slot': torch.tensor(
                 (item % self._oci_group_n) if self._oci_group_n else 0, dtype=torch.long),
         })
+        if self._oci_store_doc_prompt:
+            row_dict['oci_doc_prompt'] = _oci_doc_prompt
 
         if 'task_name' in gen_batch.non_tensor_batch:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]
@@ -1401,6 +1419,8 @@ class TrajectoryCollector:
             'oci_slot': torch.tensor(
                 (item % self._oci_group_n) if self._oci_group_n else 0, dtype=torch.long),
         }
+        if self._oci_store_doc_prompt:
+            row_dict['oci_doc_prompt'] = ""
         if 'task_name' in gen_batch.non_tensor_batch:
             row_dict['task_name'] = gen_batch.non_tensor_batch['task_name'][item]
         if self.config.data.get('return_raw_chat', False):

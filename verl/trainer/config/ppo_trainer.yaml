@@ -434,6 +434,13 @@ algorithm:
     # Tasks whose rows carry the document-conditioned prompt. Every manager
     # exposes document_block(); only alfworld's is replay-verified (3553/3553).
     tasks: ["alfworld"]
+    # Scored rows per batch the probe re-scores two independent ways to check
+    # the privileged score itself (0 = off): a NULL edit spliced and widened like
+    # the document must reproduce the plain score, and the document prompt
+    # tokenized from its own text must reproduce the privileged score. When > 0
+    # the rollout also stores each row's document prompt text for the second
+    # check -- a probe setting, not a training one.
+    self_check_rows: 0
   oci_slots:
     # TEN ROLLOUTS PER GROUP, EIGHT OF THEM TRAINED. The switch; read by the
     # alfworld env manager off its own copy of this config (the same route, and

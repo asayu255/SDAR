@@ -105,6 +105,10 @@ class _Tok:
         toks = text.replace("<|im_start|>", " <|im_start|> ").replace("<|im_end|>", " <|im_end|> ").split()
         return [(zlib.crc32(t.encode()) % 50000) + 1 for t in toks]
 
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False, **kw):
+        ids = torch.tensor([self.encode(text)], dtype=torch.long)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
 
 tok = _Tok()
 plain_content = "obs: a room with a mug\nNow it's your turn to take an action."
@@ -149,6 +153,36 @@ if edit:
           and orank.document_rows(DataProto.from_dict(tensors={
               "oci_doc_len": torch.tensor([0])})).tolist() == [False],
           "a row with no recorded edit is never counted as scored")
+
+    # --- 3b. the two self-checks, on the same row ---------------------------
+    grow_doc = int(out.batch["input_ids"].shape[1]) - width
+    null_b, null_spl = orank.with_document(orank.null_edit(b), pad_token_id=0, min_grow=grow_doc)
+    check(bool(null_spl[0]) and tuple(null_b.batch["input_ids"].shape) == tuple(out.batch["input_ids"].shape),
+          f"self-check 1: a null edit splices, widened exactly as far as the document was (+{grow_doc})")
+    live_n = null_b.batch["attention_mask"][0].bool()
+    check(orank.prompt_tokens(null_b, [0]) == [ids_plain]
+          and null_b.batch["input_ids"][0][live_n].tolist() == ids_plain + [7, 8, 9]
+          and null_b.batch["position_ids"][0][live_n].tolist() == list(range(P + RESP)),
+          "and gives back the plain prompt, the response and the positions unchanged")
+    doc_text = tok.apply_chat_template([{"role": "user", "content": doc_content}],
+                                       add_generation_prompt=True, tokenize=False)
+    W = int(out.batch["input_ids"].shape[1]) - RESP
+    direct_b, too_long = orank.direct_render(out, [doc_text], tok, 0, W)
+    live_d, live_s = direct_b.batch["attention_mask"][0].bool(), out.batch["attention_mask"][0].bool()
+    check(not too_long and orank.prompt_tokens(direct_b, [0]) == orank.prompt_tokens(out, [0]) == [ids_doc]
+          and direct_b.batch["input_ids"][0][live_d].tolist() == out.batch["input_ids"][0][live_s].tolist()
+          and direct_b.batch["position_ids"][0][live_d].tolist() == out.batch["position_ids"][0][live_s].tolist(),
+          "self-check 2: the document prompt tokenized from its own text equals the splice "
+          "(prompt, response and positions)")
+    plain_text_render = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    wrong_b, _ = orank.direct_render(out, [plain_text_render], tok, 0, W)
+    check(orank.prompt_tokens(wrong_b, [0]) != orank.prompt_tokens(out, [0]),
+          "and it can fail: the plain prompt's text does not equal the spliced document prompt")
+    _, tl = orank.direct_render(out, [doc_text], tok, 0, len(ids_doc) - 1)
+    check(tl == [0], "a text that does not fit the window is reported, never truncated")
+    cmp_ = orank.compare_scores([-1.0, -2.0], [-1.0, -2.5], [2.0, 5.0])
+    check(abs(cmp_["max_abs_row_sum_diff"] - 0.5) < 1e-12 and abs(cmp_["max_abs_token_mean_diff"] - 0.1) < 1e-12,
+          f"score comparison per row and per token ({cmp_})")
 
 # --- 4. trajectories: token-weighted scores and the gain against plain --------
 recs = orank.build_trajectories(
@@ -217,9 +251,10 @@ def div_recs(prefer_winner):
 for pref, want in ((True, 1.0), (False, 0.0)):
     rr, sums_, cnt_ = div_recs(pref)
     dv = orank.divergence_accuracy(rr, orank.classify_groups(rr), sums_, cnt_, "privileged", n_boot=50)
-    check(dv["accuracy_mean"] == want and dv["pairs"] == 4,
+    check(dv["accuracy_mean"] == want and dv["pairs"] == 4
+          and dv["per_group"] == [{"uid": "D", "turn": 1, "pairs": 4, "hits": 4.0 * want}],
           f"first-divergence accuracy is {want} when the scorer {'prefers' if pref else 'rejects'} the "
-          f"winners' rows at the turn the actions split ({dv})")
+          f"winners' rows at the turn the actions split, kept per group for pooling ({dv})")
 rr, sums_, cnt_ = div_recs(True)
 dg = orank.divergence_accuracy(rr, orank.classify_groups(rr), sums_, cnt_, "privileged_gain", n_boot=50)
 check(dg["accuracy_mean"] == 1.0, "and the gain form reads the same rows minus plain")
@@ -238,6 +273,128 @@ for k, n_done in enumerate([0, 1, 2, 3]):
 dd = orank.degenerate_diagnostics(stuck, orank.classify_groups(stuck), "privileged", walk_of=lambda gf: walk)
 check(dd["stuck"]["groups"] == 1 and dd["stuck"]["spearman_score_walk_cover_mean"] > 0.9,
       f"inside a stuck group, a scorer that tracks walkthrough progress shows it ({dd['stuck']})")
+
+
+# --- 6. the three bugs the first rank probe had --------------------------------
+# (1) a padding copy must not take its source trajectory out with it
+tu = ["a", "a", "a", "b", "b"]
+cand = [True, True, False, True, True]   # row 2 is adjust_batch's copy of an "a" row
+okk = [True, True, False, True, False]   # row 4 is a real "b" row that could not be conditioned
+score_m, dropped_ = orank.select_scored_rows(tu, cand, okk)
+check(score_m.tolist() == [True, True, False, False, False] and dropped_ == ["b"],
+      "bug 1: a padding copy never drops the trajectory it duplicates; a real row that fails still does")
+
+# (2) rank correlation with ties
+check(orank._spearman([3, 3, 3, 3, 3], [0.1, 0.5, 0.2, 0.9, 0.3]) is None,
+      "bug 2: a side that does not vary has no rank correlation (the argsort ranking gave 0.5)")
+rho_t = orank._spearman([0, 0, 0, 1, 1], [5, 4, 3, 2, 1])
+check(rho_t is not None and abs(rho_t + 0.8660254037844386) < 1e-9,
+      f"and tied values share their average rank: {rho_t:.4f} (scipy -0.8660; the old ranking gave -1.0)")
+check(orank._spearman([1, 2, 3, 4], [10, 20, 30, 40]) == 1.0
+      and orank._spearman([1.0, 2.0, float("nan")], [1, 2, 3]) is None,
+      "a monotone pair is 1.0, and a NaN gives None")
+
+# (3) a group's class from ALL its trajectories, not the scored ones
+st_all = orank.group_status_from_rows(["G", "G", "G", "G", "H", "H"],
+                                      ["w1", "w1", "l1", "l2", "h1", "h2"],
+                                      [10.0, 10.0, 0.0, 0.0, 10.0, 10.0], [True] * 6)
+check(st_all == {"G": "live", "H": "saturated"}, f"bug 3: classes read from every real trajectory ({st_all})")
+check(orank.group_status_from_rows(["G", "G"], ["w", "l"], [10.0, 0.0], [True, False]) == {"G": "saturated"},
+      "and a padding copy or special row does not count as one of the group's trajectories")
+kept = synth({"G": [(True, 10, {"s": 1.0}), (True, 12, {"s": 0.5}), (True, 14, {"s": 0.2})]})
+rep_old = orank.rank_report(kept, {}, np.ones(1), n_boot=10)
+rep_new = orank.rank_report(kept, {}, np.ones(1), n_boot=10, status=st_all)
+check(rep_old["groups_by_class"]["saturated"] == 1 and rep_new["groups_by_class"]["live"] == 1
+      and rep_new["s"]["degenerate"]["saturated"]["groups"] == 0 and rep_new["records"][0]["status"] == "live",
+      "a live group whose losers were not scored stays live, and is not read as a saturated one")
+
+# --- 7. the rollout stores the document prompt text only when the check is on --
+import agent_system.multi_turn_rollout.rollout_loop as _rl  # noqa: E402
+from verl.utils.dataset.rl_dataset import collate_fn  # noqa: E402
+
+
+def _collector(self_check):
+    return _rl.TrajectoryCollector(
+        config=OmegaConf.create({
+            "data": {"max_prompt_length": 4096, "truncation": "left", "return_raw_chat": False,
+                     "apply_chat_template_kwargs": {}},
+            "env": {"rollout": {"n": 2}},
+            "algorithm": {"oci_slots": {"enable": False},
+                          "oci_rank": {"enable": True, "tasks": ["alfworld"],
+                                       "self_check_rows": self_check}},
+        }), tokenizer=tok, processor=None)
+
+
+from verl.protocol import DataProto as _DP  # noqa: E402
+
+gb2 = _DP.from_dict(tensors={"dummy": torch.zeros(2)},
+                    non_tensors={"raw_prompt": np.array([[{"role": "user", "content": "x"}]] * 2, dtype=object),
+                                 "data_source": np.array(["alfworld"] * 2, dtype=object),
+                                 "task_name": np.array(["alfworld"] * 2, dtype=object)})
+obs2 = {"text": [plain_content] * 2, ol.OCI_DOC_KEY: [doc_content, ""]}
+col_on = _collector(8)
+on_rows = [col_on.preprocess_single_sample(item=i, gen_batch=gb2, obs=obs2) for i in range(2)]
+check(on_rows[0].get("oci_doc_prompt") == tok.apply_chat_template(
+          [{"role": "user", "content": doc_content}], add_generation_prompt=True, tokenize=False)
+      and on_rows[1].get("oci_doc_prompt") == "" and int(on_rows[0]["oci_doc_len"]) > 0,
+      "self_check_rows > 0: a row carries the document prompt text its edit was taken against ('' without one)")
+ph = col_on._placeholder_single_sample(item=1, gen_batch=gb2, obs=obs2, template=on_rows[0])
+stacked2 = collate_fn([on_rows[0], ph])
+check(ph.get("oci_doc_prompt") == "" and len(stacked2["oci_doc_prompt"]) == 2,
+      "and a finished row carries an empty one, so collate sees one schema")
+off_row = _collector(0).preprocess_single_sample(item=0, gen_batch=gb2, obs=obs2)
+check("oci_doc_prompt" not in off_row and int(off_row["oci_doc_len"]) > 0,
+      "self_check_rows = 0: no text column at all, and the edit is still recorded")
+
+# --- 8. both self-checks on the real tokenizer ----------------------------------
+CKPT = "/opt1/ohara/offline_ladder/probe_hf/klwctl_step300"
+if not os.path.isdir(CKPT) or gf is None:
+    print(f"  SKIP  no tokenizer at {CKPT}; the real-tokenizer self-check needs one")
+else:
+    from transformers import AutoTokenizer
+
+    from verl.utils.torch_functional import tokenize_and_postprocess_data
+
+    rtok = AutoTokenizer.from_pretrained(CKPT)
+    real_plain = ("You are an expert agent operating in the ALFRED Embodied Environment.\n"
+                  "Your current observation is: You are in the middle of a room. Looking quickly around you, "
+                  "you see a cabinet 1, a countertop 1, and a microwave 1.\nYour admissible actions of the "
+                  "current situation are: [\n 'go to cabinet 1'\n 'go to countertop 1'\n 'look'].\n"
+                  "Now it's your turn to take an action.")
+    real_doc = em._build_wrong_plan(gf, "walkthrough") + real_plain
+    rmsgs = [{"role": "user", "content": real_plain}]
+    redit = rl._oci_render_edit(rtok, rmsgs, real_doc, 4096, {}, prompt_window=4096)
+    plain_r = rtok.apply_chat_template(rmsgs, add_generation_prompt=True, tokenize=False)
+    doc_r = rtok.apply_chat_template([{"role": "user", "content": real_doc}], add_generation_prompt=True,
+                                     tokenize=False)
+    check(redit is not None, "real tokenizer: the document edit is recordable")
+    if redit:
+        PW, RR = len(rtok(plain_r, add_special_tokens=False)["input_ids"]) + 7, 4
+        p_ids, p_am = tokenize_and_postprocess_data(plain_r, rtok, PW, 0, left_pad=True, truncation="error")
+        resp_ids = torch.tensor([[rtok.eos_token_id or 1, 11, 12, 0]])
+        resp_am = torch.tensor([[1, 1, 1, 0]])
+        p_pos = torch.clamp(torch.cumsum(p_am[0], -1) - 1, min=0)
+        rb = DataProto.from_dict(tensors={
+            "input_ids": torch.cat([p_ids, resp_ids], 1), "attention_mask": torch.cat([p_am, resp_am], 1),
+            "position_ids": torch.cat([p_pos, p_pos[-1] + torch.arange(1, RR + 1)]).unsqueeze(0),
+            "responses": resp_ids,
+            "oci_doc_off": torch.tensor([redit[0]]), "oci_doc_len": torch.tensor([redit[1]]),
+            "oci_doc_repl": torch.tensor([list(redit[2]) + [0] * (4096 - len(redit[2]))], dtype=torch.int32),
+            "oci_doc_repl_len": torch.tensor([len(redit[2])])})
+        rdoc, rspl = orank.with_document(rb, 0)
+        rW = int(rdoc.batch["input_ids"].shape[1]) - RR
+        rdir, rtl = orank.direct_render(rdoc, [doc_r], rtok, 0, rW)
+        mask_s, mask_d = rdoc.batch["attention_mask"][0].bool(), rdir.batch["attention_mask"][0].bool()
+        check(bool(rspl[0]) and not rtl
+              and rdir.batch["input_ids"][0][mask_d].tolist() == rdoc.batch["input_ids"][0][mask_s].tolist()
+              and rdir.batch["position_ids"][0][mask_d].tolist() == rdoc.batch["position_ids"][0][mask_s].tolist()
+              and orank.prompt_tokens(rdoc, [0])[0] == rtok(doc_r, add_special_tokens=False)["input_ids"],
+              "real tokenizer: the splice equals the document prompt tokenized from text (prompt, response, positions)")
+        rnull, _ = orank.with_document(orank.null_edit(rb), 0, min_grow=rW - PW)
+        check(orank.prompt_tokens(rnull, [0]) == orank.prompt_tokens(rb, [0])
+              and rnull.batch["position_ids"][0][rnull.batch["attention_mask"][0].bool()].tolist()
+              == rb.batch["position_ids"][0][rb.batch["attention_mask"][0].bool()].tolist(),
+              "real tokenizer: the null edit gives back the plain prompt and positions")
 
 
 def test_rank():

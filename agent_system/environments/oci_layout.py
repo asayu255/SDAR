@@ -170,6 +170,19 @@ def rank_tasks(config):
     return tuple(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
 
 
+def rank_self_check_rows(config) -> int:
+    """Rows per batch the rank probe re-scores to check its privileged score;
+    0 (off) unless the switch is on. When > 0 the rollout also stores each row's
+    document prompt text, which only the self-check reads."""
+    if not rank_on(config):
+        return 0
+    cfg = rank_cfg(config) or {}
+    try:
+        return max(0, int(cfg.get("self_check_rows", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def slot_tasks(config):
     """Tasks whose groups carry the layout. Others run plain rollouts only."""
     cfg = slots_cfg(config) or {}
