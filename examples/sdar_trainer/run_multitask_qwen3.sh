@@ -328,4 +328,5 @@ python3 -m verl.trainer.main_sdar \
     trainer.test_freq=150 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=300 \
-    trainer.val_before_train=False "${extra_rollout_args[@]}" $@ "${VAL_ONLY_ARGS[@]}"
+    trainer.val_before_train=False "${extra_rollout_args[@]}" $@ \
+    "${VAL_ONLY_ARGS[@]}"
