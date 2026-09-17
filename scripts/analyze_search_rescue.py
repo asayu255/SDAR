@@ -18,9 +18,39 @@ import collections
 import glob
 import json
 import os
+import re
 import sys
 
-ROLE_DOC = 3
+ROLE_DOC, ROLE_FOREIGN = 3, 4
+
+
+def tag_sources(rows, train_parquet):
+    """Label every record nq / hotpotqa off the training data.
+
+    The env manager sees only the reset kwargs (question and answers), so the
+    record's data_source is the task name. The split matters -- nq's questions
+    already return the answer to a verbatim search far more often than hotpotqa's
+    bridge questions do -- so it is recovered here by the question text.
+    """
+    import pyarrow.parquet as pq
+
+    def norm(s):
+        return re.sub(r"[^0-9a-z]+", " ", str(s).lower()).strip()
+
+    table = pq.read_table(train_parquet, columns=["data_source", "env_kwargs"])
+    by_q = {}
+    for src, kw in zip(table.column("data_source").to_pylist(),
+                       table.column("env_kwargs").to_pylist()):
+        q = (kw or {}).get("question")
+        if q:
+            by_q[norm(q)] = src
+    hit = 0
+    for r in rows:
+        src = by_q.get(norm(r.get("question")))
+        if src:
+            r["data_source"] = src
+            hit += 1
+    return hit, len(rows)
 
 
 def load(dump_dir):
@@ -48,7 +78,12 @@ def summarise(rows):
         groups[group_key(r)].append(r)
 
     out = {"rollouts": len(rows), "groups": len(groups),
-           "plain": {}, "rescue": {}, "by_source": {}}
+           "plain": {}, "rescue": {}, "by_source": {},
+           # A group is one question repeated group_n times (the batch is repeated
+           # with interleave=True). If that ever stops holding, the class of a
+           # group is read off rows from different questions and every number
+           # below is meaningless -- so it is counted rather than assumed.
+           "groups_mixed_question": 0, "groups_wrong_size": 0}
     cls_count = collections.Counter()
     # the eight ordinary rows, per class
     plain = {c: collections.Counter() for c in ("stuck", "live", "saturated")}
@@ -57,8 +92,12 @@ def summarise(rows):
     by_source = collections.defaultdict(collections.Counter)
 
     for key, rs in groups.items():
-        ordinary = [r for r in rs if int(r.get("role", 0)) != ROLE_DOC]
+        if len({r.get("question") for r in rs}) > 1:
+            out["groups_mixed_question"] += 1
+        ordinary = [r for r in rs if int(r.get("role", 0)) not in (ROLE_DOC, ROLE_FOREIGN)]
         doc = [r for r in rs if int(r.get("role", 0)) == ROLE_DOC]
+        if len(ordinary) != 8 or len(doc) > 1:
+            out["groups_wrong_size"] += 1
         if not ordinary:
             continue
         wins = [float(r.get("won") or 0.0) > 0 for r in ordinary]
@@ -90,8 +129,10 @@ def summarise(rows):
         for r in doc:
             d = resc[cls]
             d["rows"] += 1
-            if not r.get("answers"):
-                d["no_document"] += 1  # yes/no question: the rule cannot read it
+            # has_document is False for a yes/no question, whose slot ran plain:
+            # the rule is a string test and "yes" is in almost any passage.
+            if not r.get("has_document", bool(r.get("answers"))):
+                d["no_document"] += 1
                 continue
             won = float(r.get("won") or 0.0) > 0
             kept = won and not r.get("answer_early")
@@ -135,6 +176,9 @@ def summarise(rows):
 
 def report(s):
     print(f"rollouts {s['rollouts']}  groups {s['groups']}  classes {s['classes']}")
+    if s.get("groups_mixed_question") or s.get("groups_wrong_size"):
+        print(f"  WARNING  groups whose rows are not one question x 9: "
+              f"mixed question {s['groups_mixed_question']}, wrong size {s['groups_wrong_size']}")
     print("\n1. the eight ordinary rows")
     print(f"{'class':<10}{'groups':>7}{'success':>9}{'rows w/ evidence':>19}"
           f"{'groups w/ evidence':>20}{'wrote unseen':>14}")
@@ -164,11 +208,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_dir")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--train-parquet", default=None,
+                    help="the Search training data, to split the report into nq and hotpotqa")
     args = ap.parse_args()
     rows = load(args.dump_dir)
     if not rows:
         print(f"no records under {args.dump_dir}", file=sys.stderr)
         return 1
+    if args.train_parquet:
+        hit, total = tag_sources(rows, args.train_parquet)
+        print(f"dataset tagged for {hit}/{total} records")
     s = summarise(rows)
     report(s)
     if args.json:

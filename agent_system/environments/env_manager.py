@@ -18,6 +18,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import numpy as np
+import atexit
 from functools import partial
 import json
 import os
@@ -808,6 +809,12 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._answer_early = [False] * n
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
         self._probe_rows = [self._probe_new_row(i) for i in range(n)] if self._probe_dir else []
+        if self._probe_rows and not getattr(self, "_probe_atexit", False):
+            # Rows the environment never marked done are written at the NEXT reset,
+            # and the last batch of a probe has none -- without this its records
+            # (the rows that spent the turn budget, i.e. the failures) are lost.
+            atexit.register(self._probe_flush)
+            self._probe_atexit = True
 
         self.memory.reset(batch_size=len(obs))
 
@@ -916,10 +923,15 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         gt = p.get("ground_truth")
         # pid and reset identify the batch: `group` is a position inside one
         # reset of one worker, so it repeats across batches and across workers.
+        role = int(_slots_role(i, envs, self.config, foreign=False))
         return {"pid": os.getpid(), "reset": int(getattr(self, "_probe_reset", 0)),
-                "env": i, "group": i // group_n, "role": int(_slots_role(i, envs, self.config)),
+                "env": i, "group": i // group_n, "role": role,
                 "question": p.get("question"), "answers": _answer_strings(gt),
                 "data_source": p.get("data_source") or p.get("task_name"),
+                # Whether this row was actually SHOWN a document: a yes/no question
+                # has none (the rule is a string test and "yes" is in any passage),
+                # so its slot ran plain and must not be scored as a rescue.
+                "has_document": bool(self.document_block(i)) if role == ROLE_DOC else False,
                 "search_doc": _slots_search_doc(self.config), "turns": [], "won": None,
                 "open": True}
 
@@ -954,6 +966,11 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         row["n_turns"] = len(row["turns"])
         path = os.path.join(self._probe_dir, f"search_rollouts.{os.getpid()}.jsonl")
         os.makedirs(self._probe_dir, exist_ok=True)
+        if not getattr(self, "_probe_announced", False):
+            # SEARCH_PROBE_DUMP is read where the manager runs, not where the
+            # launcher exported it; one line in the log says it arrived.
+            print(f"[search_probe] writing rollout records to {path}", flush=True)
+            self._probe_announced = True
         with open(path, "a") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -1003,7 +1020,10 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             # before anything privileged is added -- the prompt the document
             # slot's tokens are re-scored on.
             plain_obs = obs_i
-            _role = _slots_role(i, _envs, self.config)
+            # foreign=False: search has no foreign slot (oci_layout.has_foreign_slot),
+            # so the last slot of the group is the document row and the other eight
+            # are ordinary rollouts -- exactly the eight control trains.
+            _role = _slots_role(i, _envs, self.config, foreign=False)
             self._oci_roles.append(_role)
             if _role == ROLE_DOC:
                 _blk = self.document_block(i)
@@ -1011,10 +1031,6 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                     obs_i = _blk + obs_i
                     if _rule:
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
-            # NO FOREIGN PROMPT FOR SEARCH. The foreign slot exists to put a
-            # plausible failure in a saturated group, and that arm is not what
-            # this task is being measured for; the slot runs as an ordinary
-            # rollout instead of spending its turns on another task's prompt.
             self._oci_plains.append(plain_obs if (_role == ROLE_DOC and obs_i != plain_obs) else "")
             # Whole document, no progress line: the rank scorer does not act.
             _doc_blk = self.document_block(i) if _rank else ""

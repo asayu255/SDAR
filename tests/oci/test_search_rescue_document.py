@@ -125,8 +125,19 @@ def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule"):
 KW = [{"question": QUESTION, "ground_truth": {"target": [ANSWER]}}]
 
 print("4. the rule, on a live manager")
-# Slot 7 of a group of 9 is the document slot (role_for_slot: g-1 foreign, g-2 doc).
-DOC_SLOT = [i for i in range(9) if ol.role_for_slot(i, 9) == ol.ROLE_DOC][0]
+# Search has no foreign slot, so the LAST slot of the group is the document row
+# and the other eight are ordinary rollouts -- the eight control trains.
+check(not ol.has_foreign_slot("search") and ol.has_foreign_slot("alfworld"),
+      "only search drops the foreign slot")
+check([ol.role_for_slot(i, 9, foreign=False) for i in range(9)]
+      == [ol.ROLE_PLAIN] * 7 + [ol.ROLE_RESERVE, ol.ROLE_DOC],
+      "nine slots: seven plain, one reserve, one document")
+check([ol.role_for_slot(i, 10) for i in range(10)]
+      == [ol.ROLE_PLAIN] * 7 + [ol.ROLE_RESERVE, ol.ROLE_DOC, ol.ROLE_FOREIGN],
+      "and alfworld's ten-slot layout is unchanged")
+check(ol.used_per_group(9, foreign=False) == 8 and ol.used_per_group(10) == 8,
+      "either way a group trains eight trajectories, as control does")
+DOC_SLOT = [i for i in range(9) if ol.role_for_slot(i, 9, foreign=False) == ol.ROLE_DOC][0]
 m = _manager(group_n=9, evidence_for={0, 1, DOC_SLOT})
 m.reset(KW * 9)
 early = [""] * 9
@@ -158,7 +169,7 @@ check(ol.PLAN_HEADER in texts[DOC_SLOT] and ANSWER in texts[DOC_SLOT],
       "the document slot sees the block and the answer")
 check(all(ol.PLAN_HEADER not in texts[i] and ANSWER not in texts[i]
           for i in range(9) if i != DOC_SLOT),
-      "no other slot does -- including the foreign slot, which runs plain on search")
+      "no other slot does -- the other eight are ordinary rollouts")
 check(ol.search_progress_line(False) in texts[DOC_SLOT],
       "and the waiting progress line, where the turn prompt starts")
 check(obs[ol.OCI_ROLE_KEY][DOC_SLOT] == ol.ROLE_DOC
@@ -277,6 +288,108 @@ check(summarise([_rec(1, 0, 0, 8, ol.ROLE_DOC, 0.0, False, False, answers=())]
                 + [_rec(1, 0, 0, i, 1, 0.0, False, False) for i in range(8)]
                 )["rescue"]["stuck"]["no_document"] == 1,
       "a yes/no question has no document row to score")
+
+print("9. the selection, on a search batch laid out by the manager")
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from verl import DataProto  # noqa: E402
+from verl.trainer.ppo.oci_slots import select_rollouts  # noqa: E402
+
+
+def _batch(n_groups=2, group_n=9, returns=None, plan_len=None):
+    """One row per rollout, marked the way the search manager marks them."""
+    n = n_groups * group_n
+    slots = [i % group_n for i in range(n)]
+    roles = [ol.role_for_slot(s, group_n, foreign=False) for s in slots]
+    rets = returns if returns is not None else [0.0] * n
+    plens = plan_len if plan_len is not None else [
+        7 if r == ol.ROLE_DOC else 0 for r in roles]
+    return DataProto.from_dict(
+        tensors={"oci_role": torch.tensor(roles, dtype=torch.long),
+                 "oci_slot": torch.tensor(slots, dtype=torch.long),
+                 "oci_plan_len": torch.tensor(plens, dtype=torch.long)},
+        non_tensors={
+            "uid": np.array([f"q{i // group_n}" for i in range(n)], dtype=object),
+            "traj_uid": np.array([f"t{i}" for i in range(n)], dtype=object),
+            "episode_rewards": np.array(rets, dtype=object),
+            "task_name": np.array(["search"] * n, dtype=object),
+        })
+
+
+# group 0 is stuck and its document row solved it; group 1 is live.
+rets = [0.0] * 9 + [0.0] * 9
+rets[8] = 1.0                      # the document row of group 0
+rets[9 + 0] = 1.0                  # one ordinary row of group 1
+keep, injected, metrics = select_rollouts(_batch(returns=rets), tasks=["search"], group_n=9)
+check(int(keep.sum()) == 16 and int(metrics["oci_slots/trained_per_group"]) == 8,
+      f"eight trajectories per group train, as control does ({int(keep.sum())} of 18)")
+check(bool(injected[8]) and int(injected.sum()) == 1,
+      "the stuck group's document row is the one injected")
+check(not keep[7] and keep[8],
+      "it replaces the reserve row, so the group is seven plain plus the rescue")
+check(keep[9 + 8] is np.False_ or not keep[9 + 8],
+      "the live group's document row is dropped -- its eight ordinary rows already differ")
+check(metrics.get("oci_slots/doc_rescue_rate/search") == 1.0
+      and "oci_slots/foreign_fail_rate/search" not in metrics,
+      "the rescue rate is reported; there is no foreign slot to report on")
+try:
+    select_rollouts(_batch(returns=rets), tasks=["alfworld"], group_n=9)
+    check(False, "a batch marked search must not pass as alfworld")
+except AssertionError:
+    check(True, "rows carrying a role off the configured task are refused")
+
+print("10. the document row's prompt is reconstructible")
+import zlib  # noqa: E402
+
+import agent_system.multi_turn_rollout.rollout_loop as rl  # noqa: E402
+
+
+class _Tok:
+    pad_token_id = 0
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False, **kw):
+        out = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+        return out + ("<|im_start|>assistant\n" if add_generation_prompt else "")
+
+    def _ids(self, text):
+        toks = text.replace("<|im_start|>", " <|im_start|> ").replace("<|im_end|>", " <|im_end|> ").split()
+        return [(zlib.crc32(t.encode()) % 50000) + 1 for t in toks]
+
+    def encode(self, text, add_special_tokens=False):
+        return self._ids(text)
+
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False, **kw):
+        ids = torch.tensor([self._ids(text)], dtype=torch.long)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+m5 = _manager(group_n=9, evidence_for={DOC_SLOT})
+obs5, _ = m5.reset(KW * 9)
+col = rl.TrajectoryCollector(
+    config=OmegaConf.create({
+        "data": {"max_prompt_length": 4096, "truncation": "left",
+                 "return_raw_chat": False, "apply_chat_template_kwargs": {}},
+        "env": {"rollout": {"n": 9}},
+        "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"],
+                                    "search_doc": "answer_rule", "foreign_task": "webshop"}},
+    }),
+    tokenizer=_Tok(), processor=None)
+gb = DataProto.from_dict(
+    tensors={"dummy": torch.zeros(9)},
+    non_tensors={"raw_prompt": np.array([[{"role": "user", "content": "x"}]] * 9, dtype=object),
+                 "data_source": np.array(["nq"] * 9, dtype=object),
+                 "task_name": np.array(["search"] * 9, dtype=object)})
+rows5 = [col.preprocess_single_sample(item=i, gen_batch=gb, obs=obs5) for i in range(9)]
+check(int(rows5[DOC_SLOT]["oci_candidate"]) == 1 and int(rows5[DOC_SLOT]["oci_plan_len"]) > 0
+      and int(rows5[DOC_SLOT]["oci_plan_repl_len"]) > 0,
+      "the document row's prompt is ONE replacement away from the plain one -- "
+      "the block at the head and the progress line before the turn prompt together")
+check(all(int(rows5[i]["oci_candidate"]) == 0 and int(rows5[i]["oci_plan_len"]) == 0
+          for i in range(9) if i != DOC_SLOT),
+      "and no ordinary row has anything to strip")
+check(all(int(rows5[i]["oci_role"]) == ol.role_for_slot(i, 9, foreign=False) for i in range(9)),
+      "every row records the role its slot predicts, which is what the selection asserts")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -64,6 +64,7 @@ from agent_system.environments.oci_layout import (
     ROLE_NONE,
     ROLE_PLAIN,
     ROLE_RESERVE,
+    has_foreign_slot,
     role_for_slot,
     used_per_group,
 )
@@ -160,7 +161,15 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
     role = _col(batch, ROLE_KEY).astype(int)
     slot = _col(batch, SLOT_KEY).astype(int)
     n = int(role.shape[0])
-    plain_n = used_per_group(group_n)
+    # Search has no foreign slot, so its groups are one row shorter in specials
+    # and one longer in ordinary rollouts. The arm covers one task at a time, so
+    # the layout is uniform across the batch's on-task rows.
+    foreign = all(has_foreign_slot(t) for t in tasks)
+    assert foreign or not any(has_foreign_slot(t) for t in tasks), (
+        f"algorithm.oci_slots.tasks={list(tasks)} mixes tasks that do and do not "
+        "spend a slot on another task's prompt; their groups would train different "
+        "numbers of trajectories")
+    plain_n = used_per_group(group_n, foreign=foreign)
 
     uids = batch.non_tensor_batch.get("uid", None)
     tuids = batch.non_tensor_batch.get("traj_uid", None)
@@ -195,7 +204,7 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
     # disagree, the batch is not the one the arm describes -- e.g. a manager built
     # with a different group size than env.rollout.n -- and every verdict below
     # would be taken on the wrong rows.
-    expected = np.array([role_for_slot(int(s), group_n) for s in slot], dtype=int)
+    expected = np.array([role_for_slot(int(s), group_n, foreign=foreign) for s in slot], dtype=int)
     bad = np.nonzero(on_task & (role != expected))[0]
     assert bad.size == 0, (
         f"{bad.size} of {int(on_task.sum())} rows on {sorted(wanted)} carry a role "
@@ -233,16 +242,18 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
                    for r in (ROLE_PLAIN, ROLE_RESERVE, ROLE_DOC, ROLE_FOREIGN)}
         layout = {r: _n_traj(tuids, idx) for r, idx in by_role.items()}
         assert layout == {ROLE_PLAIN: plain_n - 1, ROLE_RESERVE: 1,
-                          ROLE_DOC: 1, ROLE_FOREIGN: 1}, (
+                          ROLE_DOC: 1, ROLE_FOREIGN: 1 if foreign else 0}, (
             f"group carries {layout} trajectories by role, not "
-            f"{{plain: {plain_n - 1}, reserve: 1, document: 1, foreign: 1}}; the "
-            "generation was not laid out as the arm describes")
+            f"{{plain: {plain_n - 1}, reserve: 1, document: 1, "
+            f"foreign: {1 if foreign else 0}}}; the generation was not laid out as "
+            "the arm describes")
 
         level = float(g["ret"])
         doc_ret = float(ret[by_role[ROLE_DOC]].max())
-        foreign_ret = float(ret[by_role[ROLE_FOREIGN]].max())
         returns_seen["document"].append(doc_ret)
-        returns_seen["foreign"].append(foreign_ret)
+        foreign_ret = float(ret[by_role[ROLE_FOREIGN]].max()) if foreign else None
+        if foreign:
+            returns_seen["foreign"].append(foreign_ret)
 
         use = ROLE_RESERVE
         if g["status"] == "stuck" and doc_ret > level + _EPS:
@@ -251,7 +262,7 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
                 use = ROLE_DOC
             else:
                 counts[task]["doc_unstrippable"] += 1
-        elif g["status"] == "saturated" and foreign_ret < level - _EPS:
+        elif foreign and g["status"] == "saturated" and foreign_ret < level - _EPS:
             counts[task]["foreign_failed"] += 1
             if bool(strippable[by_role[ROLE_FOREIGN]].all()):
                 use = ROLE_FOREIGN

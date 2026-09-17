@@ -192,31 +192,45 @@ def slot_tasks(config):
     return tuple(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
 
 
-def used_per_group(group_n: int) -> int:
-    """How many trajectories a group trains: everything but the two special slots."""
-    return max(int(group_n) - 2, 0)
+def has_foreign_slot(task) -> bool:
+    """Whether this task's layout spends a slot on another task's prompt.
+
+    The foreign slot exists to put a plausible FAILURE in a saturated group. For
+    search there is nothing for it to wear: another task's prompt inside a search
+    episode produces actions the projection refuses, so the row would spend its
+    turns and hand the group what the virtual floor gives for free. Search's
+    layout is eight ordinary rollouts and the document row, and nothing else.
+    """
+    return str(task) != "search"
 
 
-def role_for_slot(slot: int, group_n: int) -> int:
+def used_per_group(group_n: int, foreign: bool = True) -> int:
+    """How many trajectories a group trains: everything but the special slots."""
+    return max(int(group_n) - (2 if foreign else 1), 0)
+
+
+def role_for_slot(slot: int, group_n: int, foreign: bool = True) -> int:
     """What the slot at position ``slot`` of a group of ``group_n`` is for.
 
     Below four the layout does not exist: it needs two ordinary rollouts to read
-    a verdict from and two more for the special slots.
+    a verdict from and two more for the special slots (three without the foreign
+    one, which search does not have -- see has_foreign_slot).
     """
     g = int(group_n)
-    if g < 4:
+    if g < (4 if foreign else 3):
         return ROLE_NONE
     j = int(slot) % g
-    if j == g - 1:
+    if foreign and j == g - 1:
         return ROLE_FOREIGN
-    if j == g - 2:
+    last = g - 1 if not foreign else g - 2
+    if j == last:
         return ROLE_DOC
-    if j == g - 3:
+    if j == last - 1:
         return ROLE_RESERVE
     return ROLE_PLAIN
 
 
-def slot_role(i: int, envs, config=None) -> int:
+def slot_role(i: int, envs, config=None, foreign: bool = True) -> int:
     """The role of env slot ``i`` in the manager that holds ``envs``.
 
     ASKS THE ENVS FOR THE GROUP SIZE, NOT THE CONFIG, and only marks a TRAINING
@@ -233,7 +247,7 @@ def slot_role(i: int, envs, config=None) -> int:
         g = int(getattr(envs, "group_n", 0))
     except (TypeError, ValueError):
         return ROLE_NONE
-    return role_for_slot(i, g)
+    return role_for_slot(i, g, foreign=foreign)
 
 
 # --------------------------------------------------------------------------- #
