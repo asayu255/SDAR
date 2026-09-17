@@ -355,6 +355,40 @@ python3 -m examples.data_preprocess.prepare_sdar_multitask \
     --val_per_task_size 126 \
     --seed 1
 
+# Scoring an existing checkpoint instead of training: VAL_ONLY=1 VAL_CKPT=<dir>.
+#
+# Assembled here as a unit rather than typed as trailing overrides: a single
+# missing backslash in an override chain ends the command early, hydra never
+# sees trainer.val_only, and the run TRAINS FROM SCRATCH into this arm's
+# checkpoint directory. VAL_CKPT is required rather than defaulted, because a
+# wrong-but-plausible default would resume the wrong step and report it under
+# the right name.
+#
+# Ported from run_multitask_cross_teacher_klw_control_qwen3.sh so every arm of
+# the 150/300 comparison is scored by the same path.
+VAL_ONLY_ARGS=()
+if [ "${VAL_ONLY:-0}" = "1" ]; then
+    : "${VAL_CKPT:?VAL_ONLY=1 needs VAL_CKPT=/path/to/.../global_step_N}"
+    case "$VAL_CKPT" in
+        *global_step_*) ;;
+        *) echo "VAL_CKPT must be a global_step_N directory, got: $VAL_CKPT" >&2; exit 1 ;;
+    esac
+    [ -d "$VAL_CKPT/actor" ] || {
+        echo "no actor/ under VAL_CKPT: $VAL_CKPT" >&2
+        echo "(the shards are named model_world_size_<N>_rank_<r>.pt, where N is" >&2
+        echo " n_gpus_per_node * nnodes -- a checkpoint saved on 2 GPUs cannot be" >&2
+        echo " read back on 3)" >&2
+        exit 1
+    }
+    VAL_ONLY_ARGS=(
+        trainer.val_only=True
+        trainer.resume_mode=resume_path
+        "trainer.resume_from_path=$VAL_CKPT"
+        trainer.del_local_ckpt_after_load=False
+    )
+    echo "[val-only] scoring $VAL_CKPT -- no training, no checkpoint written"
+fi
+
 python3 -m verl.trainer.main_opd \
     +trainer.expected_config=examples/opd_trainer/expected_multitask_config.yaml \
     algorithm.adv_estimator=grpo \
@@ -464,4 +498,4 @@ python3 -m verl.trainer.main_opd \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
-    trainer.val_before_train=False "$@"
+    trainer.val_before_train=False "$@" "${VAL_ONLY_ARGS[@]}"
