@@ -1242,6 +1242,15 @@ class RayPPOTrainer:
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+        self._dump_val_instances(
+            scores=reward_tensor,
+            task_names=task_names,
+            data_sources=data_sources,
+            traj_uids=traj_uids,
+            gamefiles=None,
+            tool_callings=tool_callings,
+            response_texts=None,
+        )
 
         # evaluate test_score based on data source
         data_source_reward = {}

@@ -257,7 +257,8 @@ python3 -m verl.trainer.main_sft_multitask \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
-    trainer.val_before_train=False "$@" "${VAL_ONLY_ARGS[@]}"
+    trainer.val_before_train=False "$@" \
+    "${VAL_ONLY_ARGS[@]}"
 # NOTE: trainer.total_training_steps is fixed at 300. With per_task_batch_size=15
 # and env.rollout.n=8, each step draws 15*8=120 trajectories/task, so a
 # 36000-trajectory pool is consumed exactly once over the 300 steps: one epoch, no
