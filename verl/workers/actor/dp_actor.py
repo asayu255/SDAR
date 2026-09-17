@@ -2879,6 +2879,22 @@ class DataParallelPPOActor(BasePPOActor):
                 f"algorithm.oci_slots.enable=True but the batch carries no {TASK_LOSS_WEIGHT_KEY}; "
                 "set algorithm.opd.normalize_loss_by_task=True."
             )
+        # MEASUREMENT ONLY (grad_probe.mode=mass). Every row's policy-gradient and
+        # teacher-KL loss mass, read off the same tensors the loss is built from --
+        # the student-indexed top-k KL cannot be computed anywhere but in this
+        # forward -- with no backward and no optimizer step. Records go to a file
+        # per rank because DataProto.concat keeps only the first worker's meta_info.
+        measure_terms = bool(data.meta_info.get("measure_terms_only", False))
+        measure_rows = [] if measure_terms else None
+        measure_path = str(data.meta_info.get("measure_dump_path", "") or "")
+        measure_tag = str(data.meta_info.get("measure_tag", "") or "")
+        if measure_terms:
+            assert task_weighted and pg_loss_coef != 0 and use_teacher_kl_loss, (
+                "measure_terms_only reads the task-weighted PG and teacher-KL terms; this "
+                "run has task weights={}, pg_loss_coef={}, use_teacher_kl_loss={}".format(
+                    task_weighted, pg_loss_coef, use_teacher_kl_loss))
+            assert measure_path, "measure_terms_only needs meta_info.measure_dump_path"
+            select_keys.append("probe_row_id")
         if task_weighted:
             select_keys.append(TASK_LOSS_WEIGHT_KEY)
             check_task_weighting_supported(
@@ -5414,6 +5430,28 @@ class DataParallelPPOActor(BasePPOActor):
                              loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                      else:
                          loss = policy_loss / self.gradient_accumulation
+                     if measure_rows is not None:
+                         # Per row: its tokens, sum|pg| (at ratio 1 this is sum|A|),
+                         # sum of the top-k KL, and the row weight each term is
+                         # multiplied by. Coefficients are applied by the driver.
+                         with torch.no_grad():
+                             _ids = data["probe_row_id"].reshape(-1).tolist()
+                             _tok = response_mask.sum(-1).tolist()
+                             _pga = (pg_losses.abs() * response_mask).sum(-1).tolist()
+                             _pgs = (pg_losses * response_mask).sum(-1).tolist()
+                             _klr = row_kl.detach().float().tolist()
+                             _w = task_loss_weight.reshape(-1).float().tolist()
+                             _kc = (_kl_row_coef.reshape(-1).float().tolist()
+                                    if _kl_row_coef is not None else [1.0] * len(_ids))
+                             for _j, _rid in enumerate(_ids):
+                                 measure_rows.append({
+                                     "row": int(_rid), "tokens": float(_tok[_j]),
+                                     "pg_abs": float(_pga[_j]), "pg_signed": float(_pgs[_j]),
+                                     "kl": float(_klr[_j]), "w": float(_w[_j]),
+                                     "kl_row_coef": float(_kc[_j]),
+                                     "teacher_kl_coef": float(teacher_kl_coef),
+                                 })
+                         continue
                      with _actor_phase("actor.bwd"):
                          loss.backward()
 
@@ -5598,14 +5636,18 @@ class DataParallelPPOActor(BasePPOActor):
 
                      assert_rows_were_owned_once()
 
-                 with _actor_phase("actor.optim"):
-                     # Named separately because it runs in the window between two
-                     # micro-batches, which the stall watch would otherwise report
-                     # as idle -- a reduce-scatter plus an Adam update over 570M
-                     # parameters is real kernels, and calling that idle puts a
-                     # noise floor under the stalls being looked for.
-                     with actor_capture.span("optim"):
-                         grad_norm = self._optimizer_step()
+                 if measure_rows is not None:
+                     # Nothing was backpropagated; the weights must not move.
+                     grad_norm = torch.zeros(())
+                 else:
+                     with _actor_phase("actor.optim"):
+                         # Named separately because it runs in the window between two
+                         # micro-batches, which the stall watch would otherwise report
+                         # as idle -- a reduce-scatter plus an Adam update over 570M
+                         # parameters is real kernels, and calling that idle puts a
+                         # noise floor under the stalls being looked for.
+                         with actor_capture.span("optim"):
+                             grad_norm = self._optimizer_step()
                  data = {"actor/grad_norm": grad_norm.detach().item()}
                  append_to_dict(metrics, data)
         finally:
@@ -5616,6 +5658,14 @@ class DataParallelPPOActor(BasePPOActor):
             self._lp_capture = None
             self._lp_hidden = None
         self.actor_optimizer.zero_grad()
+        if measure_rows is not None:
+            import json as _json
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            os.makedirs(measure_path, exist_ok=True)
+            with open(os.path.join(measure_path, f"terms.{measure_tag}.rank{_rank}.jsonl"), "w") as _f:
+                for _rec in measure_rows:
+                    _f.write(_json.dumps(_rec) + "\n")
+            metrics["probe/measured_rows"] = float(len(measure_rows))
         if logit_prec is not None:
             # One reduce for the whole step: every field is a plain sum over
             # rows, so the ranks combine by addition and nothing here needs to

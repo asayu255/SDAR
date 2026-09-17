@@ -1679,6 +1679,63 @@ class OPDRayTrainer(RayPPOTrainer):
         state["batches"] = n
         return state
 
+    def _accumulate_mass_probe(self, batch, state: dict, probe_cfg) -> dict:
+        """grad_probe.mode=mass: reward-driven vs teacher-driven update, per task and class.
+
+        Runs the actor's own loss on this batch with measure_terms_only set -- the
+        same forward, the same per-token PG and student-indexed top-k KL, no
+        backward and no optimizer step -- and folds the per-row sums into
+        (task, group class) cells. See verl/trainer/ppo/term_mass.py.
+        """
+        import glob as _glob
+        import json as _json
+        import os as _os
+
+        import numpy as np
+
+        from verl.trainer.ppo import term_mass as _tm
+        from verl.trainer.ppo.oci_saturated import classify_groups
+        from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
+
+        n = int(state.get("batches", 0)) + 1
+        dump = str(probe_cfg.get("out_path", "grad_probe.json")) + ".terms"
+        tag = f"b{n}"
+        _os.makedirs(dump, exist_ok=True)
+        for f in _glob.glob(_os.path.join(dump, f"terms.{tag}.rank*.jsonl")):
+            _os.remove(f)
+        # A row id that survives _balance_batch's reorder and the DP split.
+        batch.batch["probe_row_id"] = torch.arange(len(batch), dtype=torch.long)
+        batch.meta_info["measure_terms_only"] = True
+        batch.meta_info["measure_dump_path"] = dump
+        batch.meta_info["measure_tag"] = tag
+        self.actor_rollout_wg.update_actor(batch)
+
+        records = []
+        for f in sorted(_glob.glob(_os.path.join(dump, f"terms.{tag}.rank*.jsonl"))):
+            with open(f) as fh:
+                records += [_json.loads(line) for line in fh if line.strip()]
+
+        resp_len = batch.batch["responses"].shape[1]
+        multi_turn = bool(batch.meta_info.get("multi_turn", False))
+        key = "loss_mask" if (multi_turn and "loss_mask" in batch.batch.keys()) else "attention_mask"
+        mask = batch.batch[key][:, -resp_len:].float().cpu().numpy()
+        out = _tm.aggregate_term_mass(
+            classify_groups(batch), records,
+            row_mask=mask,
+            advantages=batch.batch["advantages"].float().cpu().numpy(),
+            task_weights=batch.batch[TASK_LOSS_WEIGHT_KEY].float().cpu().numpy(),
+            pg_loss_coef=float(self.config.actor_rollout_ref.actor.get("pg_loss_coef", 1.0)),
+        )
+        out["records"] = len(records)
+        acc = state.setdefault("mass_acc", {})
+        _tm.add_batches(acc, out)
+        state["mass"] = _tm.summarise(acc)
+        state.setdefault("mass_batches", []).append(_tm.summarise(_tm.add_batches({}, out)))
+        for line in _tm.format_report(state["mass_batches"][-1]):
+            print(f"[grad_probe] mass batch {n}: {line}", flush=True)
+        state["batches"] = n
+        return state
+
     def _accumulate_slots_probe(self, batch, state: dict, probe_cfg, rec: dict, n: int) -> dict:
         """The ten-slot layout's probe: what each special slot did, and its rho.
 
@@ -2378,7 +2435,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         )
 
                         probe_mode = str(probe_cfg.get("mode", "tau") or "tau")
-                        assert probe_mode in ("tau", "oci"), (
+                        assert probe_mode in ("tau", "oci", "mass"), (
                             f"grad_probe.mode={probe_mode!r}: this branch carries only the "
                             "zero-backward probe modes ('tau', 'oci'). 'halves' and 'terms' "
                             "need the worker-side gradient hooks, which were not ported -- "
@@ -2394,6 +2451,8 @@ class OPDRayTrainer(RayPPOTrainer):
                                 self, batch, self._grad_probe_state,
                                 seed=int(probe_cfg.get("seed", 0)),
                             )
+                        elif probe_mode == "mass":
+                            self._accumulate_mass_probe(batch, self._grad_probe_state, probe_cfg)
                         else:
                             self._accumulate_oci_probe(batch, self._grad_probe_state, probe_cfg)
 
@@ -2419,7 +2478,7 @@ class OPDRayTrainer(RayPPOTrainer):
                                 ),
                             }
                             for k in ("advantages", "tau", "groups", "prompt_len",
-                                      "oci", "reachability"):
+                                      "oci", "reachability", "mass", "mass_batches"):
                                 if self._grad_probe_state.get(k, None):
                                     payload[k] = self._grad_probe_state[k]
                             write_payload(payload, out_path)
