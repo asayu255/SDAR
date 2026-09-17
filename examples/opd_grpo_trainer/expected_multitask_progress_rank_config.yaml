@@ -257,7 +257,7 @@
 "algorithm.progress_rank.enable": true
 # The share of each task's typical reward-driven update (a) adds; see
 # verl/trainer/ppo/progress_rank.py for how c follows from it every step.
-"algorithm.progress_rank.rho": 0.05
+"algorithm.progress_rank.rho": 0.1
 "algorithm.progress_rank.ema_alpha": 0.2
 "algorithm.progress_rank.ema_floor": 0.01
 # Per-token cap: kappa times the EMA of the push successes get in live groups.
@@ -268,4 +268,18 @@
 # winning rollouts at step 300; the milestone count, by task type, is used.
 # Changing it is a different arm: edit here.
 "algorithm.progress_rank.alfworld_k": milestone
+# ---- speculative decoding (pinned although engine knobs are exempt) ----------
+# ON. It is not covered by the performance-knob exemption: it changes which
+# tokens are SAMPLED. Rejection sampling preserves the target distribution (the
+# n-gram proposer gives no draft probabilities, and training samples at
+# temperature 1.0 with no top_p/top_k), so this is the class of
+# enable_prefix_caching and enforce_eager=False, both already on here and in
+# xt1. Evidence it runs on this stack: the cross2 val-only run (tamago,
+# 2026-09-09) built the engine with these settings and finished. Expected gain,
+# from the 2026-09-08 profile: generation -15 to -30%, i.e. -8 to -17% a step.
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method": ngram
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens": 4
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min": 2
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max": 5
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.acceptance_method": rejection_sampler
 "trainer.test_freq": -1
