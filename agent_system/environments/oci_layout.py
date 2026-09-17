@@ -672,6 +672,70 @@ def search_flow_document_lines(question, target, path) -> list:
     return [f"<search> {q} </search>" for q in queries] + [f"<answer> {answers[0]} </answer>"]
 
 
+def route_query_matches(row_query, route_line, min_share: float = 0.5) -> bool:
+    """Did the row run this line of the route?
+
+    A route line is ``<search> q </search>``; the row's query is free text and
+    gets paraphrased, so an exact match (ALFWorld's rule, where actions come from
+    a fixed list) would leave the pointer stuck on a step the row has done. The
+    row counts as having run the step when its query carries at least half of
+    the route query's words.
+    """
+    m = re.search(r"<search>(.*?)</search>", str(route_line or ""), flags=re.S)
+    if not m:
+        return False
+    want = set(fold_text(m.group(1)).split())
+    have = set(fold_text(row_query).split())
+    return bool(want) and len(want & have) / len(want) >= min_share
+
+
+def advance_route(lines, ptr: int, row_query, found: bool) -> int:
+    """The route pointer after one turn.
+
+    A returned result that carries the answer sends the pointer to the answer
+    step whatever was searched. Otherwise it moves past a search step only when
+    that step's query was run, and it never reaches the answer step on searches
+    alone: a row that has run every query without the answer coming back must
+    not be told that its next action is to write it.
+    """
+    n = len(lines or [])
+    if n == 0:
+        return ptr
+    if found:
+        return n - 1
+    searches = n - 1
+    if ptr < searches and route_query_matches(row_query, lines[ptr]):
+        return ptr + 1
+    return ptr
+
+
+def search_route_line(lines, ptr: int, found: bool) -> str:
+    """The progress line for a route document: which step is owed, by name.
+
+    The two-state line below was written for the two-line documents (search,
+    answer). A route has several searches, and with the two-state line the row
+    was told "Do step 1" until the answer came back -- it was never pointed at
+    the second query, the same loss of position ALFWorld's pointer fixed (35% ->
+    88-95% of stuck groups). This names the next step the way _guide_line does.
+    The answer step is named only once a result has carried the answer.
+    """
+    n = len(lines or [])
+    if n == 0:
+        return ""
+    head = "[Privileged Solution Path progress]"
+    if found:
+        return (f"{head} A result you received contains the answer. "
+                f"Your next action is step {n} of {n}: write it inside <answer> </answer>.\n\n")
+    searches = n - 1
+    if ptr >= searches:
+        return (f"{head} All {searches} searches of the path are done, but no result you have "
+                "received contains the answer yet. Search again with a different query. "
+                "Do not write the answer anywhere until a result carries it.\n\n")
+    done = "" if ptr == 0 else (f"Step 1 of {n} is done. " if ptr == 1
+                                else f"Steps 1-{ptr} of {n} are done. ")
+    return f"{head} {done}Your next action is step {ptr + 1} of {n}: {lines[ptr]}\n\n"
+
+
 def search_progress_line(found: bool) -> str:
     """Where the slot stands: has a result carried the answer yet?
 

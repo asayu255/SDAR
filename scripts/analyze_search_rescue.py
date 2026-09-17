@@ -37,6 +37,38 @@ def hit_turn(r):
     return None
 
 
+def document_queries(rec, flows):
+    """The queries this row's document printed, or [] when it had none.
+
+    expert_flow prints a verified route; answer_rule and progress_only print the
+    question verbatim. Either way the row can simply copy them, which is what the
+    copy rate below measures.
+    """
+    if not rec.get("has_document"):
+        return []
+    if rec.get("variant") == "expert_flow":
+        return list((flows or {}).get(fold(rec.get("question")), []))
+    return [rec.get("question") or ""]
+
+
+def copy_rate(rec, flows):
+    """How much of what the row did was the document read back.
+
+    Returns (share of the row's queries that are a document query, whether every
+    document query was run in order). A rescue row that copies the route and then
+    copies the answer satisfies the rule and scores, which bounds what the rescue
+    rate can mean: it is an upper bound on the document's usefulness, not evidence
+    that anything was learned.
+    """
+    doc = [fold(q) for q in document_queries(rec, flows) if fold(q)]
+    mine = [fold(t.get("query")) for t in (rec.get("turns") or []) if fold(t.get("query"))]
+    if not doc or not mine:
+        return None, None
+    copied = sum(1 for q in mine if q in doc) / len(mine)
+    in_order = [q for q in mine if q in doc] == doc[:len([q for q in mine if q in doc])]
+    return copied, bool(in_order and len([q for q in mine if q in doc]) == len(doc))
+
+
 def query_overlap(rescue, ordinary):
     """How much the rescue row's queries look like its plain siblings'.
 
@@ -105,7 +137,7 @@ def rate(num, den):
     return None if not den else round(num / den, 3)
 
 
-def summarise(rows):
+def summarise(rows, flows=None):
     groups = collections.defaultdict(list)
     for r in rows:
         groups[group_key(r)].append(r)
@@ -123,6 +155,11 @@ def summarise(rows):
     # the document row, keyed by the class of its group's ordinary rows
     resc = {c: collections.Counter() for c in ("stuck", "live", "saturated")}
     by_variant = collections.defaultdict(collections.Counter)
+    # The same stuck groups, restricted to those where EVERY variant had a
+    # document: the only comparison in which the two documents answer for the
+    # same questions. by_variant above is the wider one, where a variant that has
+    # no route for a question is simply absent from its denominator.
+    paired = collections.defaultdict(collections.Counter)
     by_source = collections.defaultdict(collections.Counter)
 
     for key, rs in groups.items():
@@ -167,6 +204,8 @@ def summarise(rows):
             # comparison is what decides which document ships, and it only means
             # anything on the groups that need rescuing.
             targets = [resc[cls]] + ([by_variant[variant]] if cls == "stuck" else [])
+            if cls == "stuck" and all(d.get("has_document") for d in doc) and len(doc) > 1:
+                targets.append(paired[variant])
             # has_document is False for a yes/no question, whose slot ran plain:
             # the rule is a string test and "yes" is in almost any passage.
             if not r.get("has_document", bool(r.get("answers"))):
@@ -179,6 +218,7 @@ def summarise(rows):
             k = hit_turn(r)
             ov = query_overlap(r, ordinary)
             short = int(r.get("answer_words") or 0) <= 1
+            copied, copied_all = copy_rate(r, flows)
             for d in targets:
                 d["rows"] += 1
                 d["scored"] += 1 if won else 0
@@ -198,6 +238,10 @@ def summarise(rows):
                 if r.get("answer_numeric"):
                     d["numeric_rows"] += 1
                     d["numeric_kept"] += 1 if kept else 0
+                if copied is not None:
+                    d["copy_sum"] += copied
+                    d["copy_rows"] += 1
+                    d["copied_whole_route"] += 1 if copied_all else 0
 
     out["classes"] = dict(cls_count)
     def _rescue_block(d):
@@ -216,6 +260,13 @@ def summarise(rows):
             "kept_rule_long_answer": rate(d["long_kept"], d["long_rows"]),
             "numeric_answer_rows": d["numeric_rows"],
             "kept_rule_numeric_answer": rate(d["numeric_kept"], d["numeric_rows"]),
+            # TWO DENOMINATORS. "shown" is the questions this document exists for,
+            # which for expert_flow are the ones a route was FOUND for and so are
+            # the easier half; "all" counts a question with no document as a
+            # failure, which is what a training run would actually collect.
+            "kept_rule_over_all_rows": rate(d["scored_and_kept_rule"], d["rows"]),
+            "copied_document_queries": rate(d["copy_sum"], d["copy_rows"]),
+            "copied_whole_route": rate(d["copied_whole_route"], d["copy_rows"]),
         }
 
     for cls in ("stuck", "live", "saturated"):
@@ -231,6 +282,7 @@ def summarise(rows):
         }
         out["rescue"][cls] = _rescue_block(resc[cls])
     out["rescue_by_variant_on_stuck"] = {v: _rescue_block(d) for v, d in by_variant.items()}
+    out["rescue_paired_on_stuck"] = {v: _rescue_block(d) for v, d in paired.items()}
     for src, c in by_source.items():
         out["by_source"][src] = {
             "groups": c["groups"],
@@ -262,7 +314,21 @@ def report(s):
         print(f"{cls:<10}{d['rows']:>6}{str(d['scored']):>9}{str(d['scored_and_kept_rule']):>11}"
               f"{str(d['broke_rule']):>12}{str(d['evidence_seen']):>10}{d['no_document']:>8}")
 
-    if s.get("rescue_by_variant_on_stuck"):
+    for title, key in (("2b. which document, on the stuck groups that need one",
+                        "rescue_by_variant_on_stuck"),
+                       ("2c. the same, restricted to groups where BOTH documents existed",
+                        "rescue_paired_on_stuck")):
+        if not s.get(key):
+            continue
+        print(f"\n{title}")
+        print(f"{'variant':<15}{'rows':>6}{'kept (shown)':>14}{'kept (all rows)':>17}"
+              f"{'copied queries':>16}{'copied route':>14}{'searches':>10}")
+        for v, d in sorted(s[key].items()):
+            print(f"{v:<15}{d['rows']:>6}{str(d['scored_and_kept_rule']):>14}"
+                  f"{str(d['kept_rule_over_all_rows']):>17}"
+                  f"{str(d['copied_document_queries']):>16}{str(d['copied_whole_route']):>14}"
+                  f"{str(d['searches_to_hit']):>10}")
+    if False:
         print("\n2b. which document, on the stuck groups that need one")
         print(f"{'variant':<15}{'rows':>6}{'kept rule':>11}{'short ans':>11}{'long ans':>10}"
               f"{'numeric':>9}{'searches':>10}{'query overlap':>15}")
@@ -285,6 +351,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_dir")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--flows", default=None,
+                    help="the verified routes file, to measure how much the rescue row copied")
     ap.add_argument("--train-parquet", default=None,
                     help="the Search training data, to split the report into nq and hotpotqa")
     args = ap.parse_args()
@@ -292,10 +360,17 @@ def main():
     if not rows:
         print(f"no records under {args.dump_dir}", file=sys.stderr)
         return 1
+    flows = None
+    if args.flows and os.path.exists(args.flows):
+        blob = json.load(open(args.flows))
+        rowsf = blob.get("flows", blob)
+        flows = {fold(v["question"]): v.get("queries", [])
+                 for v in rowsf.values() if isinstance(v, dict) and v.get("hit")}
+        print(f"routes loaded: {len(flows)}")
     if args.train_parquet:
         hit, total = tag_sources(rows, args.train_parquet)
         print(f"dataset tagged for {hit}/{total} records")
-    s = summarise(rows)
+    s = summarise(rows, flows=flows)
     report(s)
     if args.json:
         with open(args.json, "w") as f:

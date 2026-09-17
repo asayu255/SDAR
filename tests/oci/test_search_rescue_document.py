@@ -495,10 +495,61 @@ try:
           "the second slot wears the route, with the answer under the rule")
     check("closest airport Lewisburg" not in t7[9] and ANSWER in t7[9],
           "the first still wears the plain answer document")
-    check(ol.search_progress_line(False) in t7[8],
-          "and the route row gets the same per-turn verdict line")
+    check("Your next action is step 1 of 3: <search> closest airport Lewisburg West Virginia"
+          in t7[8] and ol.search_progress_line(False) not in t7[8],
+          "and the route row gets a line that names its next query, not the two-state line")
 finally:
     os.remove(FLOW_FILE)
+    ol._SEARCH_FLOWS.clear()
+
+print("15. the route pointer")
+ROUTE = ["<search> Gulshan Kumar T-Series founder </search>",
+         "<search> Bhushan Kumar T-Series chairman wife </search>",
+         "<answer> Divya Dua </answer>"]
+first = ol.search_route_line(ROUTE, 0, False)
+check("Your next action is step 1 of 3: <search> Gulshan Kumar" in first,
+      "at the start the line names the first query")
+p1 = ol.advance_route(ROUTE, 0, "Gulshan Kumar T-Series founder", False)
+check(p1 == 1 and "Step 1 of 3 is done. Your next action is step 2 of 3: <search> Bhushan Kumar"
+      in ol.search_route_line(ROUTE, p1, False),
+      "after running it, the line names the SECOND query -- what the two-state line never did")
+check(ol.advance_route(ROUTE, 0, "who founded T-Series Gulshan Kumar", False) == 1,
+      "a paraphrase carrying most of the query's words counts as running the step")
+check(ol.advance_route(ROUTE, 0, "Bollywood music labels", False) == 0,
+      "an unrelated query does not move the pointer")
+check(ol.advance_route(ROUTE, 0, "anything", True) == 2
+      and "step 3 of 3: write it inside <answer>" in ol.search_route_line(ROUTE, 2, True),
+      "a result carrying the answer sends the row straight to the answer step")
+p2 = ol.advance_route(ROUTE, 1, "Bhushan Kumar T-Series chairman wife", False)
+line2 = ol.search_route_line(ROUTE, p2, False)
+check(p2 == 2 and "All 2 searches of the path are done" in line2 and "Divya Dua" not in line2
+      and "step 3" not in line2,
+      "every query run and no answer yet: search again -- the answer step is NOT named")
+check(ol.search_progress_line(False) == ("[Privileged Solution Path progress] No result you have "
+      "received contains the answer yet. Do step 1: search. Do not write the answer anywhere "
+      "until a result carries it.\n\n"),
+      "the two-line documents keep their line byte for byte, so arm A is the arm already measured")
+
+FLOW2 = os.path.join(tempfile.gettempdir(), f"flows2_{os.getpid()}.json")
+json.dump({"flows": {"0": {"question": QUESTION, "answers": [ANSWER], "hit": True,
+                           "queries": ["closest airport Lewisburg West Virginia",
+                                       "Greenbrier County airport"]}}}, open(FLOW2, "w"))
+try:
+    ol._SEARCH_FLOWS.clear()
+    m8 = _manager(group_n=10, evidence_for=set(), search_doc="answer_rule",
+                  search_doc_b="expert_flow", search_flow_path=FLOW2)
+    t8 = m8.reset(KW * 10)[0]["text"]
+    check("Your next action is step 1 of 3: <search> closest airport Lewisburg West Virginia"
+          in t8[8], "the route row starts pointed at its first query")
+    acts = [""] * 10
+    acts[8] = "<think> run step 1 </think><search> closest airport Lewisburg West Virginia </search>"
+    t8b = m8.step(acts)[0]["text"]
+    check("Your next action is step 2 of 3: <search> Greenbrier County airport" in t8b[8],
+          "after the first search the manager points it at the second")
+    check(ol.search_progress_line(False) in t8b[9],
+          "while the answer-rule row beside it keeps its own two-state line")
+finally:
+    os.remove(FLOW2)
     ol._SEARCH_FLOWS.clear()
 
 print("PASS" if ok else "FAIL")

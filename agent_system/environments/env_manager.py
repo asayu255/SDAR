@@ -34,6 +34,7 @@ from agent_system.environments.oci_layout import (
     search_doc_mode as _slots_search_doc, has_second_doc as _slots_second_doc,
     search_flow_document_lines as _search_flow_document_lines,
     search_flow_path as _slots_search_flow_path,
+    advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
     answer_strings as _answer_strings, is_numeric_answer as _is_numeric_answer,
     ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD, SEARCH_FLOW_LEAD,
@@ -820,6 +821,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         n = len(obs)
         self._evidence_seen = [False] * n
         self._answer_early = [False] * n
+        # Where each route-document row stands in its route (expert_flow only).
+        self._route_ptr = [0] * n
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
         self._probe_rows = [self._probe_new_row(i) for i in range(n)] if self._probe_dir else []
         if self._probe_rows and not getattr(self, "_probe_atexit", False):
@@ -890,6 +893,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "information": next_obs,
         })
         self._note_returned(next_obs)
+        self._note_route(text_actions)
         self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
 
         next_observations = {
@@ -942,6 +946,29 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         for i, obs in enumerate(list(next_obs)[:len(seen)]):
             if not seen[i] and _evidence_in_text(obs, self._answers(i), self._question(i)):
                 seen[i] = True
+
+    def _route_slot(self, i):
+        """'a' / 'b' when row i wears a route document, else None."""
+        envs = getattr(self, "envs", None)
+        role = _slots_role(i, envs, self.config, foreign=False,
+                           second_doc=_slots_second_doc(self.config))
+        slot = "a" if role == ROLE_DOC else ("b" if role == ROLE_DOC_B else None)
+        if slot and _slots_search_doc(self.config, slot=slot) == "expert_flow":
+            return slot
+        return None
+
+    def _note_route(self, text_actions) -> None:
+        """Move each route row's pointer past the step it just ran."""
+        ptrs = getattr(self, "_route_ptr", None)
+        if ptrs is None:
+            return
+        for i in range(min(len(ptrs), len(text_actions))):
+            slot = self._route_slot(i)
+            if not slot:
+                continue
+            lines = _block_lines(self.document_block(i, slot=slot))
+            ptrs[i] = _advance_route(lines, ptrs[i], _search_query(text_actions[i]),
+                                     bool(self._evidence_seen[i]))
 
     @property
     def _probe_dir(self) -> str:
@@ -1017,6 +1044,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         row["open"] = False
         row["evidence_seen"] = bool(self._evidence_seen[i])
         row["answer_early"] = bool(self._answer_early[i])
+        ptrs = getattr(self, "_route_ptr", None)
+        row["route_ptr"] = int(ptrs[i]) if ptrs is not None and i < len(ptrs) else None
         row["n_turns"] = len(row["turns"])
         path = os.path.join(self._probe_dir, f"search_rollouts.{os.getpid()}.jsonl")
         os.makedirs(self._probe_dir, exist_ok=True)
@@ -1084,8 +1113,12 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _blk = self.document_block(i, slot=_slot)
                 if _blk:
                     obs_i = _blk + obs_i
-                    if _slots_search_doc(self.config, slot=_slot) in (
-                            "answer_rule", "progress_only", "expert_flow"):
+                    _mode = _slots_search_doc(self.config, slot=_slot)
+                    if _mode == "expert_flow":
+                        _ptrs = getattr(self, "_route_ptr", None) or [0] * len(text_obs)
+                        obs_i = _insert_search_guide(
+                            obs_i, _search_route_line(_block_lines(_blk), _ptrs[i], bool(_seen[i])))
+                    elif _mode in ("answer_rule", "progress_only"):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
             self._oci_plains.append(
                 plain_obs if (_role in (ROLE_DOC, ROLE_DOC_B) and obs_i != plain_obs) else "")
