@@ -1287,6 +1287,16 @@ class RayPPOTrainer:
                 task_name_lst.append(batch_task_names)
                 tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
                 traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                # Rows must grow with batches. When the scoring block fell out of this
+                # loop the batch counter kept climbing and this total stayed at one
+                # batch's worth, which is the whole of that failure in one line.
+                if val_batch_index <= 3 or val_batch_index % 50 == 0:
+                    print(
+                        f"[val-progress] batches={val_batch_index} "
+                        f"rows={sum(int(t.shape[0]) for t in reward_tensor_lst)} "
+                        f"task={None if batch_task_names is None else batch_task_names[0]}",
+                        flush=True,
+                    )
                 # success rate
                 for k in test_batch.non_tensor_batch.keys():
                     if 'success_rate' in k:
