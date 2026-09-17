@@ -124,6 +124,12 @@ def summarise(acc: Dict) -> Dict:
         for c, v in tc.items():
             task["classes"][c] = {
                 "groups": v["groups"], "rows": v["rows"],
+                # The absolute counts as well as the shares: "how much of this
+                # task's update" and "how much text" are different questions, and
+                # a share alone cannot answer the second one.
+                "tokens": v["tokens"],
+                "tokens_per_row": (v["tokens"] / v["rows"]) if v["rows"] else None,
+                "pg_mass": v["pg_mass"], "kl_mass": v["kl_mass"],
                 "token_share": (v["tokens"] / tot["tokens"]) if tot["tokens"] else None,
                 "pg_share": (v["pg_mass"] / tot["pg_mass"]) if tot["pg_mass"] else None,
                 "kl_share": (v["kl_mass"] / tot["kl_mass"]) if tot["kl_mass"] else None,
@@ -138,13 +144,16 @@ def format_report(summary: Dict) -> List[str]:
     lines = [f"batches {summary['batches']}  rows missing from actor {summary['rows_missing_from_actor']}"
              f"  padding skipped {summary['padding_rows_skipped']}"
              f"  pg actor/driver {summary['pg_mass_actor_vs_driver']}"]
+    # The task is on EVERY line: these go through print() one line at a time, and
+    # a header-only task name is lost to any filter that reads the log.
     for t, task in summary["tasks"].items():
-        lines.append(f"\n[{t}] PG/KL overall: {task['pg_over_kl']}")
-        lines.append(f"  {'class':<19}{'groups':>7}{'tokens':>9}{'PG':>9}{'KL':>9}{'PG/KL':>9}")
+        over = "-" if task["pg_over_kl"] is None else f"{task['pg_over_kl']:.3g}"
+        lines.append(f"{t:<9} {'class':<19}{'groups':>7}{'tokens':>9}{'PG':>9}{'KL':>9}"
+                     f"{'PG/KL':>9}   (task PG/KL {over})")
         for c, v in task["classes"].items():
             def pct(x):
                 return "-" if x is None else f"{100 * x:.1f}%"
             ratio = "-" if v["pg_over_kl"] is None else f"{v['pg_over_kl']:.3g}"
-            lines.append(f"  {c:<19}{int(v['groups']):>7}{pct(v['token_share']):>9}"
+            lines.append(f"{t:<9} {c:<19}{int(v['groups']):>7}{pct(v['token_share']):>9}"
                          f"{pct(v['pg_share']):>9}{pct(v['kl_share']):>9}{ratio:>9}")
     return lines
