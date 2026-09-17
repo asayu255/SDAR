@@ -380,8 +380,6 @@ class OPDGRPORayTrainer(OPDRayTrainer):
 
     # --- (a) ------------------------------------------------------------------ #
 
-    PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
-
     def _progress_rank_controller(self, cfg):
         ctl = getattr(self, "_progress_rank", None)
         if ctl is None:
@@ -462,39 +460,6 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             real_rows=real, stat_rows=stat,
         )
         batch.batch["advantages"] = new_adv
-        return out
-
-    def _save_checkpoint(self):
-        super()._save_checkpoint()
-        ctl = getattr(self, "_progress_rank", None)
-        if ctl is None:
-            return
-        import json
-        import os
-
-        folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
-            json.dump(ctl.state_dict(), f)
-
-    def _load_checkpoint(self):
-        out = super()._load_checkpoint()
-        # (a)'s EMA is part of the run's state: without it a resumed run would
-        # restart every task's scale from one step's update.
-        import json
-        import os
-
-        if not self.global_steps:
-            return out
-        if self.config.trainer.resume_mode == "resume_path" and self.config.trainer.get("resume_from_path"):
-            folder = str(self.config.trainer.resume_from_path)
-        else:
-            folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
-        path = os.path.join(folder, self.PROGRESS_RANK_STATE_FILE)
-        if os.path.exists(path):
-            with open(path) as f:
-                self._progress_rank_pending_state = json.load(f)
-            print(f"[progress_rank] EMA restored from {path}: {self._progress_rank_pending_state}")
         return out
 
     def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:

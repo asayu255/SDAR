@@ -23,10 +23,13 @@
 #      and that progress_rank/<task>/stuck_fired and fired_token_share are sane.
 #      A few steps are enough:
 #        RHO=0 RUN_TAG=pr_identity \
-#        EXPECTED_CONFIG_WAIVE="trainer.total_training_steps" \
+#        EXPECTED_CONFIG_WAIVE="trainer.total_training_steps algorithm.progress_rank.rho" \
 #        bash examples/opd_grpo_trainer/run_multitask_progress_rank_qwen3.sh \
 #          trainer.total_training_steps=5 trainer.save_freq=-1
-#   2. RHO=0.05, to step 150, beside control on the same games.
+#   2. RHO=0.05, to step 150, beside a control run from the same commit. xt1 is NOT
+#      that control: it ran before the ALFWorld game-order fix (5a62ed9, 2026-09-14),
+#      so its game order differs from this checkout's. Re-run the control launcher
+#      at the same commit, same host type and seed, for 150 steps.
 #
 # WHAT TO WATCH (all logged every step).
 #   progress_rank/<task>/share_of_ema          = RHO unless capped
@@ -55,6 +58,7 @@ RHO="${RHO:-0.05}"
 export RUN_TAG="${RUN_TAG:-progress_rank_rho${RHO//./p}}"
 echo "progress_rank: rho=$RHO run_tag=$RUN_TAG"
 exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_multitask_cross_teacher_klw_control_qwen3.sh" \
+  ++trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_progress_rank_config.yaml \
   algorithm.progress_rank.enable=True \
   algorithm.progress_rank.rho="$RHO" \
   trainer.test_freq=-1 \

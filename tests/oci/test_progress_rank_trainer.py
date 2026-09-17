@@ -28,6 +28,7 @@ from omegaconf import OmegaConf  # noqa: E402
 from verl import DataProto  # noqa: E402
 from verl.trainer.ppo.opd_grpo_ray_trainer import OPDGRPORayTrainer  # noqa: E402
 from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer  # noqa: E402
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer  # noqa: E402
 
 ok = True
 
@@ -120,20 +121,23 @@ for arm in ("oci_sat", "oci_floor", "oci_slots", "oci_rank"):
 
 print("3. the EMA is checkpointed")
 tmp = tempfile.mkdtemp()
-orig_save, orig_load = OPDRayTrainer._save_checkpoint, OPDRayTrainer._load_checkpoint
+# The EMA lives in the shared OPD trainer's save/load; the model checkpoint under
+# it (RayPPOTrainer's) is replaced by a stub so no workers are needed.
+orig_save, orig_load = RayPPOTrainer._save_checkpoint, RayPPOTrainer._load_checkpoint
 try:
-    OPDRayTrainer._save_checkpoint = lambda self: None
+    RayPPOTrainer._save_checkpoint = lambda self: None
 
     def _fake_load(self):
         self.global_steps = 40
         return 40
 
-    OPDRayTrainer._load_checkpoint = _fake_load
+    RayPPOTrainer._load_checkpoint = _fake_load
     t = trainer(make_config(ckpt_dir=tmp))
     t._progress_rank = None
     ctl = t._progress_rank_controller(t.config.algorithm.progress_rank)
     ctl.ema.update({"alfworld": 0.31, "search": 0.12, "webshop": None})
     t.global_steps = 40
+    t._pre_peek_dataloader_state = None
     t._save_checkpoint()
     path = os.path.join(tmp, "global_step_40", OPDGRPORayTrainer.PROGRESS_RANK_STATE_FILE)
     check(os.path.exists(path) and json.load(open(path))["ema"]["alfworld"] == 0.31,
@@ -146,12 +150,12 @@ try:
           "and restored on resume before the first step uses it")
     fresh = trainer(make_config(ckpt_dir=os.path.join(tmp, "empty")))
     fresh._progress_rank = None
-    OPDRayTrainer._load_checkpoint = lambda self: 0
+    RayPPOTrainer._load_checkpoint = lambda self: 0
     fresh._load_checkpoint()
     check(all(v is None for v in fresh._progress_rank_controller(
         fresh.config.algorithm.progress_rank).ema.values()), "a fresh run starts uninitialised")
 finally:
-    OPDRayTrainer._save_checkpoint, OPDRayTrainer._load_checkpoint = orig_save, orig_load
+    RayPPOTrainer._save_checkpoint, RayPPOTrainer._load_checkpoint = orig_save, orig_load
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

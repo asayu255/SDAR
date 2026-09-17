@@ -86,7 +86,9 @@ def main():
 
     per_task = defaultdict(lambda: {"rows_up": 0, "rows_down": 0, "rows_zero": 0,
                                     "mass_up": 0.0, "mass_down": 0.0,
-                                    "tok_up": 0.0, "tok_down": 0.0, "tok_zero": 0.0})
+                                    "tok_up": 0.0, "tok_down": 0.0, "tok_zero": 0.0,
+                                    "abs_sum": 0.0, "tok_all": 0.0,
+                                    "abs_sum_nz": 0.0, "tok_nz": 0.0})
     absA = defaultdict(list)
     worst_label_err = 0.0
     n_rows = 0
@@ -113,6 +115,9 @@ def main():
                     c["rows_zero"] += 1; c["tok_zero"] += r["tokens"]
                 if r["tokens"] > 0 and r["pg_abs"] > 0:
                     absA[t].append(r["pg_abs"] / r["tokens"])
+                c["abs_sum"] += r["pg_abs"]; c["tok_all"] += r["tokens"]
+                if r["pg_abs"] > 0:
+                    c["abs_sum_nz"] += r["pg_abs"]; c["tok_nz"] += r["tokens"]
 
     print(f"records {n_rows:,} over {len(batches)} batches")
     print(f"task labels pinned by per-task PG mass; worst relative error "
@@ -147,6 +152,48 @@ def main():
         print(f"{t:<10}{len(x):>8,}{x.max():>9.3f}{np.percentile(x, 99):>9.3f}"
               f"{np.percentile(x, 90):>9.3f}{np.median(x):>9.3f}"
               f"{int((x > 5).sum()):>7}{int((x > 2).sum()):>7}")
+
+    # THE SCALE (a)'s coefficient is set against: token-mean |A| over ALL of a
+    # task's rows (what progress_rank's EMA tracks), and over only the rows that
+    # carry any advantage. Unweighted by the task weight, which is uniform within a
+    # task in a step. pg_abs / tokens is |A| because the probe's ratio is 1.
+    print()
+    print("token-mean |A| (what progress_rank's EMA tracks) and on rows with any advantage:")
+    print(f"{'task':<10}{'all rows':>10}{'rows A!=0':>11}{'zero rows':>11}{'zero tokens':>13}")
+    for t, c in per_task.items():
+        n_rows = c["rows_up"] + c["rows_down"] + c["rows_zero"]
+        print(f"{t:<10}{c['abs_sum'] / max(c['tok_all'], 1):>10.3f}{c['abs_sum_nz'] / max(c['tok_nz'], 1):>11.3f}"
+              f"{100 * c['rows_zero'] / max(n_rows, 1):>10.1f}%{100 * (1 - c['tok_nz'] / max(c['tok_all'], 1)):>12.1f}%")
+
+    # THE STEP-TO-STEP SWING of a task's PG mass. Measured over probe batches (7
+    # groups); a 15-group step pools 15/7 as many groups, so, treating groups as
+    # independent, its coefficient of variation is CV7 * sqrt(7/15); an EMA with
+    # alpha = 0.2 over independent steps has variance alpha / (2 - alpha) of one step's.
+    import statistics
+    print()
+    print("per-batch PG mass: coefficient of variation, and a per-step signal-presence reweighting:")
+    print(f"{'task':<10}{'CV@7':>7}{'CV@15':>8}{'EMA CV':>8}{'reweighted mean x':>19}{'sd x':>7}{'undefined':>11}")
+    alpha = 0.2
+    for t in p["mass"]["tasks"]:
+        vals, sig = [], []
+        for b in batches:
+            if t not in b["tasks"]:
+                continue
+            cl = b["tasks"][t]["classes"]
+            vals.append(b["tasks"][t]["totals"]["pg_mass"])
+            sig.append(int(cl["live"]["groups"]) + int(cl["stuck_mixed"]["groups"])
+                       + int(cl["saturated_mixed"]["groups"]))
+        if len(vals) < 2 or not statistics.mean(vals):
+            continue
+        cv7 = statistics.stdev(vals) / statistics.mean(vals)
+        cv15 = cv7 * (7.0 / 15.0) ** 0.5
+        ema = cv15 * (alpha / (2.0 - alpha)) ** 0.5
+        # Rescale each batch to "all 7 groups carried signal"; undefined with none.
+        re = [7.0 * v / g for v, g in zip(vals, sig) if g]
+        undefined = sum(1 for g in sig if not g)
+        mx = statistics.mean(re) / statistics.mean(vals) if re else float("nan")
+        sx = (statistics.stdev(re) / statistics.stdev(vals)) if len(re) > 1 else float("nan")
+        print(f"{t:<10}{cv7:>7.2f}{cv15:>8.2f}{ema:>8.2f}{mx:>19.1f}{sx:>7.1f}{undefined:>8}/{len(vals)}")
 
     # Zero-PG steps: the probe draws 7 groups per task, training draws 15. A rate
     # read off probe batches is a rate at 7, and must be converted before it is

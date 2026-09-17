@@ -766,14 +766,52 @@ class OPDRayTrainer(RayPPOTrainer):
         """
         pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
         if pre_peek_state is None:
-            return super()._save_checkpoint()
+            out = super()._save_checkpoint()
+            self._save_progress_rank_state()
+            return out
         # Shadow the bound state_dict with the pre-peek snapshot for the
         # duration of the base save (which calls train_dataloader.state_dict()).
         self.train_dataloader.state_dict = lambda: pre_peek_state
         try:
-            return super()._save_checkpoint()
+            out = super()._save_checkpoint()
         finally:
             del self.train_dataloader.state_dict
+        self._save_progress_rank_state()
+        return out
+
+    # ---- (a)'s EMA travels with the checkpoint --------------------------- #
+    # Here rather than in the OPD+GRPO subclass, which by design overrides only
+    # the objective hooks (tests/trainer/test_opd_grpo_arm.py): the checkpoint
+    # belongs to the shared loop. A no-op unless a progress_rank controller
+    # exists, which only the GRPO arm with algorithm.progress_rank.enable creates.
+
+    PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
+
+    def _save_progress_rank_state(self):
+        ctl = getattr(self, "_progress_rank", None)
+        if ctl is None:
+            return
+        folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
+            json.dump(ctl.state_dict(), f)
+
+    def _load_checkpoint(self):
+        out = super()._load_checkpoint()
+        # Without the EMA a resumed run would restart every task's scale from one
+        # step's update.
+        if not self.global_steps:
+            return out
+        if self.config.trainer.resume_mode == "resume_path" and self.config.trainer.get("resume_from_path"):
+            folder = str(self.config.trainer.resume_from_path)
+        else:
+            folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        path = os.path.join(folder, self.PROGRESS_RANK_STATE_FILE)
+        if os.path.exists(path):
+            with open(path) as f:
+                self._progress_rank_pending_state = json.load(f)
+            print(f"[progress_rank] EMA restored from {path}: {self._progress_rank_pending_state}")
+        return out
 
     # ------------------------------------------------------------------ #
     # Per-task teacher routing.

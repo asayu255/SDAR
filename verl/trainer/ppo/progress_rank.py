@@ -27,9 +27,11 @@ A stuck group with no difference is (b)'s, and is left at zero here.
 
 HOW c IS SET, PER TASK, EVERY STEP.
 
-    M_t   this step's token-mean |A| over the task's real rows, BEFORE (a)
+    M_t   this step's token-mean |A| over ALL the task's real rows, BEFORE (a)
     E_t   <- (1 - alpha) E_{t-1} + alpha M_t, floored        (EMA; alpha 0.2)
-    u_t   token-mean of |score| over the task's rows, fired trajectories only
+    u_t   sum over the rows of fired trajectories of |score| x tokens, divided by
+          ALL the task's real tokens (the same denominator as M_t -- not a mean
+          within the fired trajectories)
     c_t   = rho * E_t / u_t, capped so that c_t * max|score| <= kappa * E_t
 
 so the injected token-mean |A| is c_t * u_t = rho * E_t: a fixed share rho of
@@ -41,6 +43,17 @@ WHY AN EMA AND NOT M_t. At 15 groups Search's M_t swings +-52% step to step,
 and in about one step in ten it is exactly 0 -- a ratio to M_t would move c by
 several times per step and would switch (a) OFF on precisely the steps where it is
 the only reward-driven signal. E stays positive through those steps.
+
+WHAT THE SCALE IMPLIES, PER ROW. E is a mean over every row of the task, the
+zero-advantage ones included, so it sits far below the |A| of the rows that carry
+signal: at step 25, 0.123 for Search against 0.789 on its rows with any advantage
+(86% of its rows are exactly 0), 0.315 against 0.319 for ALFWorld. The cap then
+bounds what any single token gets from (a) by kappa * E -- about 0.12 on Search.
+And as degenerate groups grow, M and E fall, so (a)'s injected mass rho * E falls
+with them: (a) adds least, in absolute terms, to the task that is most stuck. That
+is the price of "a share of the task's typical update"; progress_rank/<task>/capped
+and injected_mean_abs_adv record how it plays out. Whether the cap binds is
+c * max|score| > kappa * E -- a c above E binds only when some score exceeds E / c.
 
 WHY u_t IS NOT SMOOTHED. c_t * u_t = rho * E_t whatever u_t is, so u_t is only the
 conversion from scores to the target mass. When it is tiny (one group, a
