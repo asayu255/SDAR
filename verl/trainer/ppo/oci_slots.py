@@ -117,10 +117,16 @@ def check_config(config) -> None:
         "verdict from and two more for the document and foreign slots.")
 
     tasks = list(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
-    assert tasks == ["alfworld"], (
-        f"algorithm.oci_slots.tasks={tasks}: only alfworld has a document to show "
-        "(the game's own walkthrough, which replays 30/30). A WebShop or Search "
+    assert tasks in (["alfworld"], ["search"]), (
+        f"algorithm.oci_slots.tasks={tasks}: alfworld shows the game's own walkthrough "
+        "(replays 30/30) and search shows the answer under the rule below. A WebShop "
         "document has to be built and replay-verified first.")
+    _search_doc = str(cfg.get("search_doc", "answer_only") or "answer_only")
+    assert not (tasks == ["search"] and _search_doc != "answer_rule"), (
+        "algorithm.oci_slots.tasks=[search] with search_doc=answer_only: Search's reward "
+        "reads only the final <answer> string and never checks that a search happened, so "
+        "that document rescues a group by being copied. search_doc=answer_rule shows the "
+        "same answer under the rule that a returned result must carry it first.")
 
     # The special rows are trained by the policy gradient alone, through the
     # shaped term, and that term is built only on the per-task-weighted branch of

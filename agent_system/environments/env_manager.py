@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import numpy as np
 from functools import partial
+import json
 import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
@@ -27,6 +28,10 @@ from agent_system.environments.oci_layout import (
     rank_on as _oci_rank_on, rank_tasks as _oci_rank_tasks,
     ROLE_DOC, ROLE_FOREIGN, render_document,
     search_document_lines as _search_document_lines,
+    search_rescue_document_lines as _search_rescue_document_lines,
+    search_progress_line as _search_progress_line,
+    search_doc_mode as _slots_search_doc, contains_answer as _contains_answer,
+    answer_strings as _answer_strings, SEARCH_RULE_LEAD,
     webshop_document_lines as _webshop_document_lines,
     doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
     foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
@@ -536,6 +541,17 @@ def _insert_guide(obs: str, line: str) -> str:
     return obs.replace(_GUIDE_ANCHOR, line + _GUIDE_ANCHOR, 1)
 
 
+# Search's turn prompt opens with its own sentence; the progress line goes in the
+# same place for the same reason (the line is read where the action is chosen).
+_SEARCH_GUIDE_ANCHOR = "Now it's your turn to respond for the current step."
+
+
+def _insert_search_guide(obs: str, line: str) -> str:
+    if not line or obs.count(_SEARCH_GUIDE_ANCHOR) != 1:
+        return obs
+    return obs.replace(_SEARCH_GUIDE_ANCHOR, line + _SEARCH_GUIDE_ANCHOR, 1)
+
+
 def _delay_lines(walk, banned, scene_recs, min_turns: int):
     """A tour that cannot be refuted, then the true path behind it.
 
@@ -766,10 +782,14 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
     """
     def __init__(self, envs, projection_f, config):
         self.memory = SearchMemory()
+        self._oci_roles = []
+        self._oci_plains = []
+        self._oci_docs = []
         super().__init__(envs, projection_f, config)
 
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
         obs, infos = self.envs.reset(kwargs=kwargs)
+        self._probe_flush()
         self.tasks = obs
         # The question and its accepted answers, for the document slot. Unlike
         # the other two tasks nothing has to be dug out of the environment: the
@@ -778,41 +798,71 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self.problems = [dict(k) if isinstance(k, dict) else {} for k in _kw]
         self.problems += [{}] * max(0, len(obs) - len(self.problems))
 
+        # THE RULE, PER ROW (search_doc=answer_rule). `_evidence_seen` flips the
+        # turn a returned result carries the answer; `_answer_early` records a row
+        # that wrote the answer -- in its thinking or in a query -- before that.
+        # Both are read by the progress line and by the probe dump; neither
+        # touches the reward, which stays exactly what control trains on.
+        n = len(obs)
+        self._evidence_seen = [False] * n
+        self._answer_early = [False] * n
+        self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
+        self._probe_rows = [self._probe_new_row(i) for i in range(n)] if self._probe_dir else []
+
         self.memory.reset(batch_size=len(obs))
 
         observations = {
             "text": self.build_text_obs(obs, init=True),
             "image": None,
-            "anchor": obs.copy()
+            "anchor": obs.copy(),
+            OCI_ROLE_KEY: list(self._oci_roles),
+            OCI_PLAIN_KEY: list(self._oci_plains),
+            OCI_DOC_KEY: list(self._oci_docs),
         }
-        
+
         return observations, infos
 
     def document_block(self, i: int) -> str:
         """The block that answers question ``i``, or '' when it cannot be built.
 
-        Same wrapper and numbering as the other two tasks; the second line is the
-        answer, which is what makes the rescue certain -- see
-        oci_layout.search_document_lines.
+        Same wrapper and numbering as the other two tasks. ``answer_only`` prints
+        the query and the answer and nothing stops the slot writing the answer at
+        once; ``answer_rule`` prints the same two lines under the rule that the
+        answer has to come back from a search first (oci_layout.SEARCH_RULE_LEAD).
         """
         problems = getattr(self, "problems", None) or []
         p = problems[i] if i < len(problems) else {}
+        # getattr: the accessor is also called on a bare manager (tests/oci/test_documents.py),
+        # where no config has been attached and the historical block is what is asked for.
+        if _slots_search_doc(getattr(self, "config", None)) == "answer_rule":
+            return render_document(
+                _search_rescue_document_lines(p.get("question"), p.get("ground_truth")),
+                lead=SEARCH_RULE_LEAD)
         return render_document(_search_document_lines(p.get("question"), p.get("ground_truth")))
 
     def step(self, text_actions: List[str]):
+        # ORDER MATTERS. What the row wrote is judged against the state it was in
+        # when it wrote it, so the "wrote it early" test runs before this turn's
+        # results are folded in.
+        self._note_written(text_actions)
         actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({
             "search": actions,
             "information": next_obs,
         })
+        self._note_returned(next_obs)
+        self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
             "image": None,
-            "anchor": next_obs.copy()
+            "anchor": next_obs.copy(),
+            OCI_ROLE_KEY: list(self._oci_roles),
+            OCI_PLAIN_KEY: list(self._oci_plains),
+            OCI_DOC_KEY: list(self._oci_docs),
         }
-        
+
         for i, info in enumerate(infos):
             info["is_action_valid"] = to_numpy(valids[i])
 
@@ -821,12 +871,114 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
 
+    # --- the rule, and the probe's record of it ---------------------------- #
+
+    def _answers(self, i):
+        problems = getattr(self, "problems", None) or []
+        p = problems[i] if i < len(problems) else {}
+        return p.get("ground_truth")
+
+    def _note_written(self, text_actions) -> None:
+        """A row that writes the answer before a result carried it breaks the rule."""
+        seen = getattr(self, "_evidence_seen", None)
+        if seen is None:
+            return
+        for i, text in enumerate(text_actions[:len(seen)]):
+            if not seen[i] and _contains_answer(text, self._answers(i)):
+                self._answer_early[i] = True
+
+    def _note_returned(self, next_obs) -> None:
+        """The progress line's only state: has a returned result carried the answer?"""
+        seen = getattr(self, "_evidence_seen", None)
+        if seen is None:
+            return
+        for i, obs in enumerate(list(next_obs)[:len(seen)]):
+            if not seen[i] and _contains_answer(obs, self._answers(i)):
+                seen[i] = True
+
+    @property
+    def _probe_dir(self) -> str:
+        """Where to write per-episode records, or '' (the default) for nowhere.
+
+        Off unless SEARCH_PROBE_DUMP names a directory: this is a measurement
+        hook for run_search_rescue_probe_qwen3.sh, not part of training.
+        """
+        return os.environ.get("SEARCH_PROBE_DUMP", "").strip()
+
+    def _probe_new_row(self, i: int) -> dict:
+        problems = getattr(self, "problems", None) or []
+        p = problems[i] if i < len(problems) else {}
+        envs = getattr(self, "envs", None)
+        try:
+            group_n = int(getattr(envs, "group_n", 0)) or 1
+        except (TypeError, ValueError):
+            group_n = 1
+        gt = p.get("ground_truth")
+        # pid and reset identify the batch: `group` is a position inside one
+        # reset of one worker, so it repeats across batches and across workers.
+        return {"pid": os.getpid(), "reset": int(getattr(self, "_probe_reset", 0)),
+                "env": i, "group": i // group_n, "role": int(_slots_role(i, envs, self.config)),
+                "question": p.get("question"), "answers": _answer_strings(gt),
+                "data_source": p.get("data_source") or p.get("task_name"),
+                "search_doc": _slots_search_doc(self.config), "turns": [], "won": None,
+                "open": True}
+
+    def _probe_note_turn(self, text_actions, next_obs, rewards, dones, infos) -> None:
+        rows = getattr(self, "_probe_rows", None)
+        if not rows:
+            return
+        obs_list, done_list = list(next_obs), list(dones)
+        for i, row in enumerate(rows):
+            if not row.get("open") or i >= len(obs_list):
+                continue
+            text = str(text_actions[i]) if i < len(text_actions) else ""
+            row["turns"].append({
+                "action": text,
+                "wrote_answer": bool(_contains_answer(text, self._answers(i))),
+                "info_has_answer": bool(_contains_answer(obs_list[i], self._answers(i))),
+                "info": str(obs_list[i]),
+            })
+            if bool(done_list[i]):
+                info = infos[i] if i < len(infos) else {}
+                row["won"] = float(info.get("won", 0.0)) if isinstance(info, dict) else None
+                self._probe_write(i)
+
+    def _probe_write(self, i: int) -> None:
+        rows = getattr(self, "_probe_rows", None)
+        if not rows or i >= len(rows) or not rows[i].get("open"):
+            return
+        row = rows[i]
+        row["open"] = False
+        row["evidence_seen"] = bool(self._evidence_seen[i])
+        row["answer_early"] = bool(self._answer_early[i])
+        row["n_turns"] = len(row["turns"])
+        path = os.path.join(self._probe_dir, f"search_rollouts.{os.getpid()}.jsonl")
+        os.makedirs(self._probe_dir, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _probe_flush(self) -> None:
+        """Write out rows the environment never marked done (turn budget spent)."""
+        rows = getattr(self, "_probe_rows", None)
+        for i in range(len(rows or [])):
+            self._probe_write(i)
+        self._probe_rows = []
+
     def build_text_obs(
         self,
         text_obs: List[str],
         init: bool = False
     ) -> List[str]:
         postprocess_text_obs: List[str] = []
+        # Rebuilt every turn, like alfworld's: the document slot's progress line
+        # depends on what has come back so far.
+        self._oci_roles = []
+        self._oci_plains = []
+        self._oci_docs = []
+        _envs = getattr(self, "envs", None)
+        _rank = _oci_rank_on(self.config) and "search" in _oci_rank_tasks(self.config)
+        _rule = _slots_search_doc(self.config) == "answer_rule"
+        _seen = getattr(self, "_evidence_seen", None) or [False] * len(text_obs)
 
         if not init and self.config.env.history_length > 0:
             memory_ctx, _ = self.memory.fetch(
@@ -846,6 +998,28 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                     memory_context=memory_ctx[i],
                     step_count=len(self.memory[i]),
                 )
+
+            # What the plain student would have been asked at this turn, kept
+            # before anything privileged is added -- the prompt the document
+            # slot's tokens are re-scored on.
+            plain_obs = obs_i
+            _role = _slots_role(i, _envs, self.config)
+            self._oci_roles.append(_role)
+            if _role == ROLE_DOC:
+                _blk = self.document_block(i)
+                if _blk:
+                    obs_i = _blk + obs_i
+                    if _rule:
+                        obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
+            # NO FOREIGN PROMPT FOR SEARCH. The foreign slot exists to put a
+            # plausible failure in a saturated group, and that arm is not what
+            # this task is being measured for; the slot runs as an ordinary
+            # rollout instead of spending its turns on another task's prompt.
+            self._oci_plains.append(plain_obs if (_role == ROLE_DOC and obs_i != plain_obs) else "")
+            # Whole document, no progress line: the rank scorer does not act.
+            _doc_blk = self.document_block(i) if _rank else ""
+            self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
+
             postprocess_text_obs.append(obs_i)
 
         return postprocess_text_obs

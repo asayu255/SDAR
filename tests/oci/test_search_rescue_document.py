@@ -1,0 +1,282 @@
+"""The Search rescue document that shows the answer AND makes finding it the rule.
+
+WHY THE RULE EXISTS. Search's reward reads only the final <answer> string and
+never checks that a search happened, so the older document (search_doc=
+answer_only) is rescued by being copied: the row can answer on turn one and
+score. ALFWorld and WebShop have no such hole -- their environments refuse an
+action whose preconditions are unmet -- which is why only Search needs this.
+
+WHAT IS CHECKED HERE, with no model and no retriever:
+  1 the block          two numbered lines, the rule's lead, nothing for yes/no
+  2 the answer test    whole word, accents folded, entities undone
+  3 the progress line  which of the two states it names, and where it sits
+  4 the rule, live     a row that writes the answer early is marked; one that
+                       waits until a returned result carries it is not
+  5 the slots          only the document slot's prompt carries the block
+  6 the probe dump     one JSON line per episode, with what the analysis reads
+"""
+import json, os, sys, tempfile
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+while not os.path.isdir(os.path.join(REPO, "agent_system")) and os.path.dirname(REPO) != REPO:
+    REPO = os.path.dirname(REPO)
+sys.path.insert(0, REPO)
+
+from omegaconf import OmegaConf  # noqa: E402
+
+import agent_system.environments.oci_layout as ol  # noqa: E402
+from agent_system.environments.env_manager import SearchEnvironmentManager  # noqa: E402
+
+ok = True
+
+
+def check(good, msg):
+    global ok
+    ok &= bool(good)
+    print(("  OK  " if good else "  FAIL") + " " + msg)
+
+
+QUESTION = "what is the closest airport to white sulphur springs west virginia?"
+ANSWER = "Greenbrier Valley Airport"
+EVIDENCE = ('Doc 1(Title: "Greenbrier Valley Airport") Greenbrier Valley Airport is a public '
+            "airport three miles north of Lewisburg in Greenbrier County, West Virginia.")
+NO_EVIDENCE = 'Doc 1(Title: "Lewisburg, West Virginia") Lewisburg is a city in West Virginia.'
+
+print("1. the block")
+lines = ol.search_rescue_document_lines(QUESTION, {"target": [ANSWER]})
+check(lines == [f"<search> {QUESTION} </search>", f"<answer> {ANSWER} </answer>"],
+      "the question as the first query, the answer as the second line")
+check(ol.search_rescue_document_lines(QUESTION, {"target": ["yes"]}) == []
+      and ol.search_rescue_document_lines(QUESTION, {"target": ["no"]}) == [],
+      "no block for a yes/no question -- 'yes' is in almost any passage, so the rule cannot read it")
+check(ol.search_rescue_document_lines("", {"target": [ANSWER]}) == []
+      and ol.search_rescue_document_lines(QUESTION, None) == [],
+      "no question or no answer -> no block")
+block = ol.render_document(lines, lead=ol.SEARCH_RULE_LEAD)
+check(block.startswith(ol.PLAN_HEADER) and block.rstrip().endswith(ol.PLAN_FOOTER)
+      and "\n1. <search>" in block and "\n2. <answer>" in block,
+      "same wrapper and numbering as the other two tasks")
+check("DO NOT WRITE THE ANSWER ANYWHERE" in block and ol.PLAN_LEAD not in block,
+      "the rule's lead replaces the walkthrough lead")
+check(ol.render_document(["go to cabinet 1"]).startswith(f"{ol.PLAN_HEADER}\n{ol.PLAN_LEAD}\n1. "),
+      "the default lead is untouched, so alfworld's block is byte-identical")
+
+print("2. the answer test")
+check(ol.contains_answer(EVIDENCE, {"target": [ANSWER]}), "found in a passage that holds it")
+check(not ol.contains_answer(NO_EVIDENCE, {"target": [ANSWER]}), "not found in one that does not")
+check(not ol.contains_answer("released in 1950", {"target": ["5"]})
+      and ol.contains_answer("a 5 day week", {"target": ["5"]}),
+      "whole word: '5' is not inside '1950'")
+check(ol.contains_answer("Joachim Löw was born in 1960", {"target": ["Joachim Löw"]}),
+      "the corpus stores accents decomposed; the answer is composed")
+check(ol.contains_answer("Ben & Jerry's is an ice cream company", {"target": ["Ben &amp; Jerry's"]}),
+      "dataset entities are undone before comparing")
+check(ol.contains_answer("the film was Kiss and Tell", {"target": ["wrong", "Kiss and Tell"]}),
+      "any accepted answer counts -- an alias written early still breaks the rule")
+check(ol.is_yesno({"target": ["yes"]}) and not ol.is_yesno({"target": [ANSWER]}),
+      "yes/no questions are recognised")
+
+print("3. the progress line")
+waiting, found = ol.search_progress_line(False), ol.search_progress_line(True)
+check("No result you have received contains the answer yet" in waiting and "Do step 1" in waiting,
+      "before: search, and do not write it")
+check("contains the answer" in found and "Do step 2" in found,
+      "after: write it")
+
+
+class _Envs:
+    """Canned search results: the first query returns evidence, the rest do not."""
+    is_train = True
+
+    def __init__(self, n, group_n, evidence_for):
+        self.group_n = group_n
+        self.n = n
+        self.evidence_for = evidence_for
+        self.turns = 0
+
+    def reset(self, kwargs=None):
+        return [QUESTION] * self.n, [{} for _ in range(self.n)]
+
+    def step(self, actions):
+        self.turns += 1
+        obs, rewards, dones, infos = [], [], [], []
+        for i, act in enumerate(actions):
+            answered = "<answer>" in str(act)
+            obs.append(EVIDENCE if (i in self.evidence_for and not answered) else NO_EVIDENCE)
+            won = 1.0 if answered else 0.0
+            rewards.append(won)
+            dones.append(answered or self.turns >= 4)
+            infos.append({"won": won})
+        return obs, rewards, dones, infos
+
+
+def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule"):
+    n = group_n if n is None else n
+    config = OmegaConf.create({
+        "env": {"history_length": 2, "rollout": {"n": group_n}},
+        "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"], "search_doc": search_doc,
+                                    "doc_mode": "walkthrough_stepwise", "foreign_task": "webshop"},
+                      "oci_rank": {"enable": False}},
+    })
+    envs = _Envs(n, group_n, set(evidence_for))
+    return SearchEnvironmentManager(envs, lambda acts: (list(acts), [1] * len(acts)), config)
+
+
+KW = [{"question": QUESTION, "ground_truth": {"target": [ANSWER]}}]
+
+print("4. the rule, on a live manager")
+# Slot 7 of a group of 9 is the document slot (role_for_slot: g-1 foreign, g-2 doc).
+DOC_SLOT = [i for i in range(9) if ol.role_for_slot(i, 9) == ol.ROLE_DOC][0]
+m = _manager(group_n=9, evidence_for={0, 1, DOC_SLOT})
+m.reset(KW * 9)
+early = [""] * 9
+early[0] = f"<think> the answer is {ANSWER} </think><search> {QUESTION} </search>"
+early[1] = f"<think> let me look </think><search> {ANSWER} </search>"
+early[2] = f"<think> let me look </think><search> {QUESTION} </search>"
+early[DOC_SLOT] = f"<think> I must search first </think><search> {QUESTION} </search>"
+m.step(early)
+check(m._answer_early[0] and m._answer_early[1],
+      "writing the answer in the thinking, or inside the query, before it came back is marked")
+check(not m._answer_early[2] and not m._answer_early[DOC_SLOT],
+      "a query that does not name the answer is not")
+check(m._evidence_seen[0] and m._evidence_seen[1],
+      "a row that broke the rule still has its own evidence state tracked")
+check(m._evidence_seen[DOC_SLOT] and not m._evidence_seen[2],
+      "a row whose result carried the answer is the only one whose progress flips")
+second = [""] * 9
+second[2] = f"<answer> {ANSWER} </answer>"
+second[DOC_SLOT] = f"<answer> {ANSWER} </answer>"
+m.step(second)
+check(m._answer_early[2] and not m._answer_early[DOC_SLOT],
+      "answering without ever seeing it breaks the rule; answering after a result carried it does not")
+
+print("5. what each slot is shown")
+m2 = _manager(group_n=9, evidence_for={DOC_SLOT})
+obs, _ = m2.reset(KW * 9)
+texts = obs["text"]
+check(ol.PLAN_HEADER in texts[DOC_SLOT] and ANSWER in texts[DOC_SLOT],
+      "the document slot sees the block and the answer")
+check(all(ol.PLAN_HEADER not in texts[i] and ANSWER not in texts[i]
+          for i in range(9) if i != DOC_SLOT),
+      "no other slot does -- including the foreign slot, which runs plain on search")
+check(ol.search_progress_line(False) in texts[DOC_SLOT],
+      "and the waiting progress line, where the turn prompt starts")
+check(obs[ol.OCI_ROLE_KEY][DOC_SLOT] == ol.ROLE_DOC
+      and obs[ol.OCI_PLAIN_KEY][DOC_SLOT] and not obs[ol.OCI_PLAIN_KEY][0],
+      "the row carries its role and the plain render the strip needs")
+after = m2.step([f"<search> {QUESTION} </search>"] * 9)[0]["text"]
+check(ol.search_progress_line(True) in after[DOC_SLOT],
+      "once a result carries the answer the line flips to 'write it'")
+m3 = _manager(group_n=9, search_doc="answer_only")
+check(ANSWER in m3.reset(KW * 9)[0]["text"][DOC_SLOT],
+      "answer_only still prints the old block, so an older arm reruns unchanged")
+
+print("6. the probe dump")
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["SEARCH_PROBE_DUMP"] = tmp
+    try:
+        m4 = _manager(group_n=9, evidence_for={DOC_SLOT})
+        m4.reset(KW * 9)
+        acts = [""] * 9
+        acts[0] = f"<answer> {ANSWER} </answer>"
+        acts[DOC_SLOT] = f"<search> {QUESTION} </search>"
+        m4.step(acts)
+        m4.step([f"<answer> {ANSWER} </answer>"] * 9)
+        m4._probe_flush()
+        path = os.path.join(tmp, f"search_rollouts.{os.getpid()}.jsonl")
+        rows = [json.loads(l) for l in open(path)]
+    finally:
+        os.environ.pop("SEARCH_PROBE_DUMP", None)
+check(len(rows) == 9, f"one record per row of the group ({len(rows)})")
+by_env = {r["env"]: r for r in rows}
+check(all(r["question"] == QUESTION and r["answers"] == [ANSWER] and r["group"] == 0 for r in rows),
+      "each record names the question it answers and the group it belongs to")
+check(by_env[DOC_SLOT]["role"] == ol.ROLE_DOC and by_env[0]["role"] != ol.ROLE_DOC,
+      "and which slot it was")
+check(by_env[0]["answer_early"] and not by_env[0]["evidence_seen"] and by_env[0]["won"] == 1.0,
+      "a row that answered from the prompt alone: scored, rule broken, nothing retrieved")
+check(by_env[DOC_SLOT]["evidence_seen"] and not by_env[DOC_SLOT]["answer_early"]
+      and by_env[DOC_SLOT]["won"] == 1.0,
+      "the rescue row: searched, the result carried the answer, then answered -- rule kept")
+check(all("info_has_answer" in t and "wrote_answer" in t for t in by_env[DOC_SLOT]["turns"]),
+      "per turn, what the row wrote and what came back")
+
+print("7. the arm's own config check")
+from verl.trainer.ppo import oci_slots  # noqa: E402
+
+
+def _run_config(tasks, search_doc):
+    return OmegaConf.create({
+        "algorithm": {"oci_slots": {"enable": True, "tasks": tasks, "search_doc": search_doc,
+                                    "gamma": 0.1, "special_loss": "shaped"},
+                      "oci_sat": {"enable": False}, "oci_floor": {"enable": False},
+                      "filter_groups": {"enable": False}},
+        "env": {"rollout": {"n": 9}},
+        "actor_rollout_ref": {"actor": {"pg_loss_coef": 1.0, "normalize_loss_by_task": True}},
+    })
+
+
+def _refused(tasks, search_doc):
+    try:
+        oci_slots.check_config(_run_config(tasks, search_doc))
+        return False
+    except AssertionError:
+        return True
+
+
+check(not _refused(["search"], "answer_rule"), "search is allowed with the rule document")
+check(_refused(["search"], "answer_only"),
+      "and refused without it -- an answer-only block is rescued by being copied")
+check(not _refused(["alfworld"], "answer_only"), "alfworld is unchanged")
+check(_refused(["webshop"], "answer_rule"), "webshop still has no verified document")
+
+print("8. the analysis over a dump")
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+from analyze_search_rescue import summarise  # noqa: E402
+
+
+def _rec(pid, reset, group, env, role, won, evidence, early, source="nq", answers=(ANSWER,)):
+    return {"pid": pid, "reset": reset, "group": group, "env": env, "role": role, "won": won,
+            "evidence_seen": evidence, "answer_early": early, "n_turns": 2,
+            "data_source": source, "answers": list(answers), "question": QUESTION, "turns": []}
+
+
+recs = []
+# a stuck group: every ordinary row failed, five of eight had the answer returned
+for i in range(8):
+    recs.append(_rec(1, 0, 0, i, 1, 0.0, i < 5, False))
+recs.append(_rec(1, 0, 0, 8, ol.ROLE_DOC, 1.0, True, False))          # rescued, rule kept
+# a second stuck group whose document row copied the answer out of the prompt
+for i in range(8):
+    recs.append(_rec(1, 0, 1, i, 1, 0.0, False, False, source="hotpotqa"))
+recs.append(_rec(1, 0, 1, 8, ol.ROLE_DOC, 1.0, False, True, source="hotpotqa"))
+# a live group, and a saturated one
+for i in range(8):
+    recs.append(_rec(1, 1, 0, i, 1, 1.0 if i < 3 else 0.0, True, False))
+recs.append(_rec(1, 1, 0, 8, ol.ROLE_DOC, 1.0, True, False))
+for i in range(8):
+    recs.append(_rec(2, 0, 0, i, 1, 1.0, True, False))
+recs.append(_rec(2, 0, 0, 8, ol.ROLE_DOC, 0.0, True, False))
+
+s = summarise(recs)
+check(s["groups"] == 4 and s["classes"] == {"stuck": 2, "live": 1, "saturated": 1},
+      f"groups keyed by (pid, reset, group): {s['classes']}")
+check(s["plain"]["stuck"]["groups"] == 2 and s["plain"]["stuck"]["row_success"] == 0.0,
+      "the class comes from the eight ordinary rows alone")
+check(s["plain"]["stuck"]["rows_with_evidence"] == round(5 / 16, 3)
+      and s["plain"]["stuck"]["groups_with_any_evidence"] == 0.5,
+      "and the stuck rows that DID retrieve the answer are counted -- question 1")
+check(s["rescue"]["stuck"]["scored"] == 1.0
+      and s["rescue"]["stuck"]["scored_and_kept_rule"] == 0.5
+      and s["rescue"]["stuck"]["broke_rule"] == 0.5,
+      "the copied rescue scores but does not keep the rule -- question 2")
+check(s["by_source"]["nq"]["groups"] == 3 and s["by_source"]["nq"]["stuck"] == round(1 / 3, 3)
+      and s["by_source"]["hotpotqa"]["stuck"] == 1.0,
+      "split by dataset, because nq and hotpotqa fail differently")
+check(summarise([_rec(1, 0, 0, 8, ol.ROLE_DOC, 0.0, False, False, answers=())]
+                + [_rec(1, 0, 0, i, 1, 0.0, False, False) for i in range(8)]
+                )["rescue"]["stuck"]["no_document"] == 1,
+      "a yes/no question has no document row to score")
+
+print("PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)

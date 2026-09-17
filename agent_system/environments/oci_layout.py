@@ -75,6 +75,9 @@ that are plausible under either goal. Whether it fails often enough, and what
 its rho is, are what run_alfworld_oci_slots_probe_qwen3.sh measures.
 """
 
+import html
+import re
+import unicodedata
 import zlib
 
 from agent_system.environments.prompts.webshop import WEBSHOP_TEMPLATE_NO_HIS
@@ -308,18 +311,21 @@ PLAN_LEAD = (
 )
 
 
-def render_document(lines) -> str:
+def render_document(lines, lead: str = PLAN_LEAD) -> str:
     """The numbered block, or '' when there is no path to print.
 
     Numbered because that is what ``_block_lines`` reads back and what the
     per-turn progress line counts against; the wrapper is byte-identical across
-    tasks so one strip handles all three.
+    tasks so one strip handles all three. ``lead`` is the only part that varies:
+    Search's rule document tells the slot to FIND the answer rather than to
+    replay a path (see SEARCH_RULE_LEAD), and its default leaves every existing
+    caller's bytes unchanged.
     """
     lines = [str(line).strip() for line in (lines or []) if str(line).strip()]
     if not lines:
         return ""
     body = "\n".join(f"{i + 1}. {line}" for i, line in enumerate(lines))
-    return f"{PLAN_HEADER}\n{PLAN_LEAD}\n{body}\n{PLAN_FOOTER}\n\n"
+    return f"{PLAN_HEADER}\n{lead}\n{body}\n{PLAN_FOOTER}\n\n"
 
 
 def webshop_document_lines(goal, query: str = "name") -> list:
@@ -387,6 +393,133 @@ def search_document_lines(question, target) -> list:
     if not q or not a:
         return []
     return [f"<search> {q} </search>", f"<answer> {a} </answer>"]
+
+
+# --------------------------------------------------------------------------- #
+# the search document that shows the answer AND makes finding it the condition
+# --------------------------------------------------------------------------- #
+#
+# WHY A SECOND SEARCH DOCUMENT. ``search_document_lines`` above prints the answer
+# and nothing stops the slot from writing it on turn one: Search's reward reads
+# only the final <answer> string and never checks that a search happened, so an
+# answer-only rollout always scores. What that rescue row then trains is "copy
+# the answer out of the prompt", which the plain prompt never contains.
+# ALFWorld and WebShop do not have this hole -- their environments refuse an
+# action whose preconditions are unmet, so a document can only be replayed by
+# actually executing every step.
+#
+# WHAT THIS MODE DOES. It shows the answer, and the run's own success test for
+# the row becomes: the answer string must not appear in anything the row WRITES
+# until a result it RECEIVED from <search> contains it. A row that writes it
+# early is discarded, so the only trained rescue rows are ones that searched,
+# read, and then answered -- with the answer present in the retrieved context,
+# which is exactly the state the plain student is in when it succeeds.
+SEARCH_RULE_LEAD = (
+    "THIS IS THE VERIFIED CORRECT ANSWER FOR THIS QUESTION, AND THE RULE THAT MAKES IT\n"
+    "COUNT. The answer is only earned if you FIND it: a result returned to you inside\n"
+    "<information> </information> must contain it BEFORE you write it. Until that\n"
+    "happens, DO NOT WRITE THE ANSWER ANYWHERE -- not in your thinking, not inside a\n"
+    "<search> query. A trajectory that writes it early is thrown away and teaches\n"
+    "nothing. Search, read what comes back, search again with a different query if it\n"
+    "is not there, and answer once it is.\n"
+    "\n"
+    "The path that solves this task:"
+)
+
+SEARCH_DOC_MODES = ("answer_only", "answer_rule")
+
+
+def search_doc_mode(config) -> str:
+    """Which Search document the layout's document slot shows.
+
+    ``answer_only`` is the historical block (query, then the answer) and stays
+    the default so a rerun of an older arm is byte-identical.
+    """
+    mode = str((slots_cfg(config) or {}).get("search_doc", "answer_only") or "answer_only")
+    if mode not in SEARCH_DOC_MODES:
+        raise ValueError(f"algorithm.oci_slots.search_doc={mode!r}; expected one of {SEARCH_DOC_MODES}")
+    return mode
+
+
+def answer_strings(target) -> list:
+    """Every accepted answer, as stripped strings.
+
+    The reward accepts any of them, so the rule has to watch all of them: a row
+    that writes an alias early has still written the answer.
+    """
+    if target is None:
+        return []
+    if isinstance(target, dict):
+        target = target.get("target")
+    if isinstance(target, (list, tuple)) or hasattr(target, "tolist"):
+        target = list(target) if not hasattr(target, "tolist") else list(target.tolist())
+    else:
+        target = [target]
+    return [str(t).strip() for t in target if str(t).strip()]
+
+
+def fold_text(s) -> str:
+    """Lowercase word stream: accents decomposed away, entities undone.
+
+    The corpus stores text decomposed (NFD: "Lo\\u0308w") while a dataset answer
+    is composed, so a naive comparison misses every accented answer.
+    """
+    s = unicodedata.normalize("NFKD", html.unescape(str(s)))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"[^0-9a-z]+", " ", s.lower()).strip()
+
+
+def contains_answer(text, target) -> bool:
+    """Whole-word containment of ANY accepted answer ("5" is not in "1950")."""
+    hay = f" {fold_text(text)} "
+    for a in answer_strings(target):
+        folded = fold_text(a)
+        if folded and f" {folded} " in hay:
+            return True
+    return False
+
+
+def is_yesno(target) -> bool:
+    """Yes/no questions have no document in this mode.
+
+    The rule is a string test, and "yes" appears in almost any passage, so the
+    progress line would read "found" before the first search. HotpotQA's
+    comparison questions are 8 of 156 in a seed-0 sample of the training data.
+    """
+    answers = [fold_text(a) for a in answer_strings(target)]
+    return bool(answers) and all(a in ("yes", "no") for a in answers)
+
+
+def search_rescue_document_lines(question, target) -> list:
+    """The first query to run, and the answer to write once it comes back.
+
+    Line 1 is the question verbatim -- the query that returns a passage holding
+    the answer for 79% of the annotated nq questions and 43% of the hotpotqa
+    bridge ones, and it contains no part of the answer, so running it can never
+    break the rule. Line 2 is the answer, which line 1's result has to contain
+    first; SEARCH_RULE_LEAD is what says so.
+    """
+    answers = answer_strings(target)
+    q = str(question or "").strip()
+    if not q or not answers or is_yesno(target):
+        return []
+    return [f"<search> {q} </search>", f"<answer> {answers[0]} </answer>"]
+
+
+def search_progress_line(found: bool) -> str:
+    """Where the slot stands: has a result carried the answer yet?
+
+    ALFWorld's pointer advances when the action taken IS the next line; here the
+    environment's own returns decide, which is the same idea on the only state
+    Search exposes. The line sits where the action is chosen, for the reason the
+    walkthrough pointer does: a slot that cannot tell where it is stops
+    following the block (35% rescued without the line, 88-95% with it).
+    """
+    if found:
+        return ("[Privileged Solution Path progress] A result you received contains the answer. "
+                "Do step 2 now: write it inside <answer> </answer>.\n\n")
+    return ("[Privileged Solution Path progress] No result you have received contains the answer yet. "
+            "Do step 1: search. Do not write the answer anywhere until a result carries it.\n\n")
 
 
 def foreign_prompt(task: str, key) -> str:

@@ -471,6 +471,16 @@ algorithm:
     # between 35% of stuck groups rescued and 88-95% -- the block alone is read
     # and then lost track of after about four steps, with two turns of history.
     doc_mode: walkthrough_stepwise
+    # What the SEARCH document slot prints, when tasks is ["search"].
+    # "answer_only": the question as a query, then the answer. Search's reward
+    #   reads only the final <answer> string and never checks that a search
+    #   happened, so this block is rescued by being copied -- the row trains
+    #   "write what the prompt says" and nothing about searching.
+    # "answer_rule": the same two lines under the rule that a result returned by
+    #   <search> must contain the answer BEFORE the row writes it anywhere, plus
+    #   the per-turn line saying whether one has. A row that writes it early is
+    #   recorded as rule-breaking (agent_system/environments/oci_layout.py).
+    search_doc: answer_only
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
     # five of those were measured on saturated groups and none reached 12%,
     # because a student that already knows what to do ignores a path it does not
