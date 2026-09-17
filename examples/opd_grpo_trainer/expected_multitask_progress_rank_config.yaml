@@ -260,7 +260,8 @@
 "algorithm.progress_rank.rho": 0.05
 "algorithm.progress_rank.ema_alpha": 0.2
 "algorithm.progress_rank.ema_floor": 0.01
-"algorithm.progress_rank.cap_kappa": 1.0
+# Per-token cap: kappa times the EMA of the push successes get in live groups.
+"algorithm.progress_rank.cap_kappa": 0.5
 "algorithm.progress_rank.min_top_k": {alfworld: 1, webshop: 2, search: 1}
 "algorithm.progress_rank.tasks": [alfworld, webshop, search]
 # Which ALFWorld count (a) ranks by. The walkthrough count scored below K on 70% of

@@ -389,7 +389,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 rho=float(cfg.get("rho", 0.0)),
                 ema_alpha=float(cfg.get("ema_alpha", 0.2)),
                 ema_floor=float(cfg.get("ema_floor", 0.01)),
-                cap_kappa=float(cfg.get("cap_kappa", 1.0)),
+                cap_kappa=float(cfg.get("cap_kappa", 0.5)),
                 min_top_k=dict(cfg.get("min_top_k", {}) or {}),
                 tasks=list(cfg.get("tasks", ["alfworld", "webshop", "search"])),
                 # The mean k is weighted the way the GRPO statistic weights samples,

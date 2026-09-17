@@ -32,35 +32,53 @@ HOW c IS SET, PER TASK, EVERY STEP.
 
     M_t   this step's token-mean |A| over ALL the task's real rows, BEFORE (a)
     E_t   <- (1 - alpha) E_{t-1} + alpha M_t, floored        (EMA; alpha 0.2)
+    P_t   this step's token-mean A over the rows of SUCCESSFUL trajectories in
+          the task's live groups, BEFORE (a): the push a success gets
+    S_t   <- (1 - alpha) S_{t-1} + alpha P_t, floored; not updated on a step
+          with no live group
     u_t   sum over the rows of fired trajectories of |score| x tokens, divided by
           ALL the task's real tokens (the same denominator as M_t -- not a mean
           within the fired trajectories)
-    c_t   = rho * E_t / u_t, capped so that c_t * max|score| <= kappa * E_t
+    c_t   = rho * E_t / u_t, capped so that c_t * max|score| <= kappa * S_t
 
-so the injected token-mean |A| is c_t * u_t = rho * E_t: a fixed share rho of
-the task's TYPICAL reward-driven update, whatever the task and whatever the step.
-Token-mean units because normalize_loss_by_task gives every row of a task the
-same weight within a step, so a ratio of token-means IS a ratio of loss mass.
+so the injected token-mean |A| is c_t * u_t = rho * E_t unless capped: a fixed
+share rho of the task's TYPICAL reward-driven update. Token-mean units because
+normalize_loss_by_task gives every row of a task the same weight within a step,
+so a ratio of token-means IS a ratio of loss mass.
+
+THE CAP IS ANCHORED ON WHAT A SUCCESS GETS, NOT ON E. With kappa 0.5 no failed
+trajectory is pushed up more than half as hard, per token, as the task's
+successes typically are. It was kappa * E first, and the step-75 probe records
+showed why that anchor was wrong. E is diluted by every zero row and inflated by
+the format channel's few large rows, so the same kappa meant different things
+per task: at training group counts the cap bound on every firing step in WebShop
+and Search, and the top push came to 0.71-0.75 of the median success push in
+WebShop (above its weakest successes, 0.28), 0.24-0.43 in Search and 0.14-0.28
+in ALFWorld. S measures the comparison the cap exists for, and it does not move
+with how many groups are stuck or whether the format penalty is lit.
 
 WHY AN EMA AND NOT M_t. At 15 groups Search's M_t swings +-52% step to step,
 and in about one step in ten it is exactly 0 -- a ratio to M_t would move c by
 several times per step and would switch (a) OFF on precisely the steps where it is
 the only reward-driven signal. E stays positive through those steps.
 
-WHAT THE SCALE IMPLIES, PER ROW. E is a mean over every row of the task, the
-zero-advantage ones included, so it sits far below the |A| of the rows that carry
-a signal: at step 25, 0.123 against 0.789 for Search (86% of its rows are exactly
-0), 0.315 against 0.740 for ALFWorld and 0.411 against 0.835 for WebShop. The cap
-then bounds what any single token gets from (a) by kappa * E -- under half of a
-signal row's |A| on ALFWorld and WebShop, about a sixth on Search. And as
-degenerate groups grow, M and E fall, so (a)'s injected mass rho * E falls with
-them: (a) adds least, in absolute terms, to the task that is most stuck. That is
-the price of "a share of the task's typical update"; progress_rank/<task>/capped,
-c_uncapped, c_cap and injected_mean_abs_adv record how it plays out.
+WHAT THE SCALE IMPLIES. E is a mean over every row of the task, the zero-advantage
+ones included, so it sits far below the |A| of the rows that carry a signal: at
+step 25, 0.123 against 0.789 for Search (86% of its rows are exactly 0), 0.315
+against 0.740 for ALFWorld and 0.411 against 0.835 for WebShop. As degenerate
+groups grow, M and E fall, so (a)'s injected mass rho * E falls with them: (a) adds
+least, in absolute terms, to the task that is most stuck. That is the price of "a
+share of the task's typical update". Per token the cap decides instead: with (a)
+firing on 0-1 groups a step, u is small and the cap binds often, and then the top
+push is exactly kappa * S. progress_rank/<task>/capped, c_uncapped, c_cap,
+top_push_over_success and injected_mean_abs_adv record how it plays out.
 
 WHY u_t IS NOT SMOOTHED. c_t * u_t = rho * E_t whatever u_t is, so u_t is only the
 conversion from scores to the target mass. When it is tiny (one group, a
 one-step difference) c_t would be large; that is what the cap is for.
+
+(a) WAITS FOR BOTH SCALES. Until a task has seen an update (E) and a success in a
+live group (S), c is 0 for it.
 
 M_t NEVER CONTAINS (a) ITSELF: it is read off the advantages before the addition,
 otherwise the target would chase its own output.
@@ -94,7 +112,7 @@ be re-run for want of the rows under one. So each step also leaves one record pe
 group in ``last_group_records`` -- per trajectory k, K, D, turns, tokens, reward,
 invalid turns and (a)'s score; per group the score spread, ProGPO's gate, the
 largest base |A| and the |A| mass (a) injected; per task c, c before the cap, the
-cap, the EMA and the token count -- which the trainer writes out as JSONL
+cap, E, S and the token count -- which the trainer writes out as JSONL
 (scripts/report_progress_groups.py reads them back).
 
 rho = 0 leaves every advantage bit-identical to control; that is stage 1's
@@ -263,15 +281,15 @@ def coverage_progress(d: Optional[float], turns: int) -> Optional[float]:
 
 
 class ProgressRankController:
-    """Holds each task's EMA across steps and turns scores into advantage.
+    """Holds each task's EMAs across steps and turns scores into advantage.
 
-    The only state is the EMA per task, and it is part of the run: the trainer
-    saves it beside the checkpoint so a resumed run does not restart (a) from an
-    uninitialised scale.
+    The only state is the two EMAs per task (E, the typical update; S, the typical
+    success push), and it is part of the run: the trainer saves it beside the
+    checkpoint so a resumed run does not restart (a) from uninitialised scales.
     """
 
     def __init__(self, *, rho: float, ema_alpha: float = 0.2, ema_floor: float = 0.01,
-                 cap_kappa: float = 1.0, min_top_k: Optional[Dict[str, float]] = None,
+                 cap_kappa: float = 0.5, min_top_k: Optional[Dict[str, float]] = None,
                  tasks: Iterable[str] = ("alfworld", "webshop", "search"),
                  cross_steps: bool = True):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
@@ -287,17 +305,23 @@ class ProgressRankController:
         self.tasks = [str(t) for t in tasks]
         self.cross_steps = bool(cross_steps)
         self.ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
+        # S: the EMA of the push a success gets in a live group (the cap's anchor).
+        self.success_ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
         # The last apply()'s groups, one dict per group; see GROUP RECORDS above.
         self.last_group_records: List[dict] = []
 
     # --- persistence ------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"version": 1, "ema": dict(self.ema)}
+        return {"version": 2, "ema": dict(self.ema), "success_ema": dict(self.success_ema)}
 
     def load_state_dict(self, state: dict) -> None:
-        for t, v in (state or {}).get("ema", {}).items():
+        state = state or {}
+        for t, v in state.get("ema", {}).items():
             self.ema[str(t)] = None if v is None else float(v)
+        # Version 1 carried E only; S then starts uninitialised and (a) waits for a live group.
+        for t, v in state.get("success_ema", {}).items():
+            self.success_ema[str(t)] = None if v is None else float(v)
 
     # --- one step ---------------------------------------------------------- #
 
@@ -311,6 +335,15 @@ class ProgressRankController:
         else:
             self.ema[task] = max(self.floor, (1.0 - self.alpha) * prev + self.alpha * m)
         return self.ema.get(task)
+
+    def _update_success_ema(self, task: str, p: Optional[float]) -> Optional[float]:
+        # No live group, or none whose successes were pushed up: nothing to learn
+        # the anchor from this step, so it keeps its last value.
+        if p is not None and p > 0.0:
+            prev = self.success_ema.get(task)
+            self.success_ema[task] = (max(self.floor, p) if prev is None
+                                      else max(self.floor, (1.0 - self.alpha) * prev + self.alpha * p))
+        return self.success_ema.get(task)
 
     def apply(self, *, advantages: torch.Tensor, mask: torch.Tensor, uids, tuids, task_names,
               episode_rewards, k_rows, total_rows, real_rows: np.ndarray,
@@ -401,6 +434,19 @@ class ProgressRankController:
             if not x["d_ok"]:
                 x["d"] = None
 
+        # The rows the cap is anchored on: successful trajectories in live groups,
+        # judged by the environment's reward like "stuck" is.
+        live_success = np.zeros(n, dtype=bool)
+        for g in groups.values():
+            xs = {str(tuids[i]) for i in g["rows"]}
+            if len(xs) < 2 or any(traj[t]["reward"] is None for t in xs):
+                continue
+            wins = [traj[t]["won"] for t in xs]
+            if any(wins) and not all(wins):
+                for i in g["rows"]:
+                    if traj[str(tuids[i])]["won"]:
+                        live_success[i] = True
+
         metrics: Dict[str, float] = {}
         coef = np.zeros(n, dtype=float)
         per_task: Dict[str, dict] = {}
@@ -412,15 +458,21 @@ class ProgressRankController:
                 continue
             m_t = float(abs_adv[rows].sum()) / task_tokens
             ema = self._update_ema(task, m_t)
+            srows = rows & live_success
+            s_tokens = float(tokens[srows].sum())
+            p_t = (float(signed[srows].sum()) / s_tokens) if s_tokens > 0 else None
+            s_ema = self._update_success_ema(task, p_t)
             fired_rows = rows & (row_score != 0.0)
             u = float((np.abs(row_score[fired_rows]) * tokens[fired_rows]).sum()) / task_tokens
             max_abs = float(np.abs(row_score[rows]).max()) if rows.any() else 0.0
 
             c, capped = 0.0, 0.0
             c_uncapped, cap = None, None
-            if self.rho > 0.0 and ema is not None and u > 0.0 and max_abs > 0.0:
+            if self.rho > 0.0 and ema is not None and s_ema is not None and u > 0.0 and max_abs > 0.0:
                 c_uncapped = self.rho * ema / u
-                cap = self.kappa * ema / max_abs
+                # No failed trajectory gets more, per token, than kappa times the
+                # push the task's successes typically get.
+                cap = self.kappa * s_ema / max_abs
                 c = c_uncapped
                 if c > cap:
                     c, capped = cap, 1.0
@@ -429,7 +481,7 @@ class ProgressRankController:
                 metrics[f"{p}/c_cap"] = cap
             coef[names == task] = c
             per_task[task] = {"c": c, "capped": bool(capped), "c_uncapped": c_uncapped, "c_cap": cap,
-                              "ema": ema, "task_tokens": task_tokens}
+                              "ema": ema, "success_push_ema": s_ema, "task_tokens": task_tokens}
 
             inj = row_score * c * tokens
             up = float(inj[rows & (row_score > 0)].sum()) / task_tokens
@@ -442,6 +494,13 @@ class ProgressRankController:
             metrics[f"{p}/ema_mean_abs_adv"] = float("nan") if ema is None else ema
             metrics[f"{p}/ema_initialized"] = float(ema is not None)
             metrics[f"{p}/mean_abs_adv"] = m_t
+            if p_t is not None:
+                metrics[f"{p}/success_push"] = p_t
+            metrics[f"{p}/success_push_ema"] = float("nan") if s_ema is None else s_ema
+            # The largest push any failed token got from (a); at most kappa * S.
+            metrics[f"{p}/top_push"] = c * max_abs
+            if s_ema:
+                metrics[f"{p}/top_push_over_success"] = c * max_abs / s_ema
             metrics[f"{p}/score_mass"] = u
             metrics[f"{p}/injected_mean_abs_adv"] = c * u
             # c * u / E = min(rho, kappa * u / max|score|): the share actually injected.
@@ -547,7 +606,8 @@ class ProgressRankController:
                                      if grows else 0.0),
                 "injected_abs_mass": float(np.sum(np.abs(row_score[grows] * coef[grows]) * tokens[grows])),
                 "c": info.get("c"), "capped": info.get("capped"), "c_uncapped": info.get("c_uncapped"),
-                "c_cap": info.get("c_cap"), "ema": info.get("ema"), "task_tokens": info.get("task_tokens"),
+                "c_cap": info.get("c_cap"), "ema": info.get("ema"),
+                "success_push_ema": info.get("success_push_ema"), "task_tokens": info.get("task_tokens"),
             })
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1

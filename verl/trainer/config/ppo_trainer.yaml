@@ -669,9 +669,14 @@ algorithm:
     # Keeps the EMA, and so c, defined through a run of steps with no update at
     # all. Well below the step-25 values (0.12 Search, 0.32 ALFWorld, 0.41 WebShop).
     ema_floor: 0.01
-    # No token gets more from (a) than cap_kappa times the task's typical |A|:
-    # the guard for a step where one group fires on a one-step difference.
-    cap_kappa: 1.0
+    # No failed token gets more from (a) than cap_kappa times the push the task's
+    # successes typically get (an EMA of the token-mean advantage on successful
+    # trajectories in live groups). The guard for a step where one group fires on
+    # a one-step difference -- and with (a) firing on 0-1 groups a step it binds
+    # often, so it sets (a)'s per-token strength. Anchored on successes rather
+    # than on the all-row |A| EMA: that one made kappa mean 0.7 of a success push
+    # in WebShop and 0.3 in Search at step 75 (see progress_rank.py).
+    cap_kappa: 0.5
     # A group fires only if its furthest rollout reached this many steps.
     # WebShop 2: its first step (a results page showing the product) is hit by
     # chance. ALFWorld 1 under the milestone count: its first milestone (took an

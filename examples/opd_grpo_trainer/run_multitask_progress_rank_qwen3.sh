@@ -15,8 +15,9 @@
 # it acts.
 #
 # c IS SET PER TASK, EVERY STEP, from an EMA: the added token-mean |A| is RHO times
-# the EMA of that task's ordinary token-mean |A|. RHO is the only knob, and it is
-# the same for all three tasks. See verl/trainer/ppo/progress_rank.py.
+# the EMA of that task's ordinary token-mean |A|, and no failed token gets more
+# than half the push the task's successes typically get. RHO is the only knob,
+# and it is the same for all three tasks. See verl/trainer/ppo/progress_rank.py.
 #
 # STAGE 1, IN ORDER.
 #   1. RHO=0. c is 0 on every step, so the advantages are bit-identical to control
@@ -28,15 +29,21 @@
 #        EXPECTED_CONFIG_WAIVE="trainer.total_training_steps algorithm.progress_rank.rho" \
 #        bash examples/opd_grpo_trainer/run_multitask_progress_rank_qwen3.sh \
 #          trainer.total_training_steps=5 trainer.save_freq=-1
-#   2. RHO=0.05, to step 150, beside a control run from the same commit. xt1 is NOT
-#      that control: it ran before the ALFWorld game-order fix (5a62ed9, 2026-09-14),
-#      so its game order differs from this checkout's. Re-run the control launcher
-#      at the same commit, same host type and seed, for 150 steps.
+#   2. RHO=0.05, to step 150 (trainer.stop_after_steps=150; total_training_steps
+#      stays 300 so the LR warmup matches), compared against xt1. xt1 differs in
+#      three same-expectation ways besides (a) -- ALFWorld's training game order
+#      (it predates the sort fix 5a62ed9), world size (3 GPUs), and the speedup
+#      commits since 2026-09-02 -- and a same-commit control would not remove the
+#      run-to-run spread of a one-run comparison. Score both runs' checkpoints on
+#      current code (identical validation games) and add a confirming run only if
+#      a difference holds across several checkpoints.
 #
 # WHAT TO WATCH (all logged every step).
 #   progress_rank/<task>/share_of_ema          = RHO unless capped
 #   progress_rank/<task>/capped, c_uncapped, c_cap
 #                                              how often the cap binds, and by how much
+#   progress_rank/<task>/top_push_over_success the largest push a failed token got,
+#                                              over the success push EMA (<= 0.5)
 #   progress_rank/<task>/inject_down_over_up   (a)'s push-down : push-up. Control's
 #                                              ordinary update reads 1.08; the
 #                                              ten-slot runs failed at 12:1

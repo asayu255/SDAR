@@ -8,7 +8,8 @@ WHAT IT PROTECTS.
     cannot become the net push-down that sank the ten-slot runs.
   * c is set from an EMA that stays positive on a step with no update, never
     from that step's update, and the injected mass is exactly rho * EMA.
-  * The cap binds when one group fires on a small difference.
+  * The cap binds when one group fires on a small difference, and it is anchored
+    on the push successes get in live groups (S), not on the all-row EMA.
   * Padding copies are kept out of every sum and still match their originals.
 No model and no GPU. The last section runs the real compute_grpo_outcome_advantage.
 """
@@ -204,8 +205,11 @@ new, m = ctl.apply(**b)
 per_token = float((new - b["advantages"])[-2:, 0].abs().max())
 check(m["progress_rank/alfworld/capped"] == 1.0, "the cap binds")
 # float32 advantages: the bound holds to their precision, not to float64's.
-check(per_token <= ctl.ema["alfworld"] * (1 + 1e-6),
-      f"no token gets more than kappa * EMA ({per_token:.4f} <= {ctl.ema['alfworld']:.4f})")
+check(per_token <= ctl.success_ema["alfworld"] * (1 + 1e-6),
+      f"no token gets more than kappa * S ({per_token:.4f} <= {ctl.success_ema['alfworld']:.4f})")
+check(abs(m["progress_rank/alfworld/top_push_over_success"] - 1.0) < 1e-9
+      and abs(m["progress_rank/alfworld/success_push_ema"] - 1.0) < 1e-9,
+      "and when it binds the top push is exactly kappa * S (S = the successes' +1.0)")
 
 print("9. padding copies")
 b = build([
@@ -244,7 +248,12 @@ check(abs(m["progress_rank/alfworld/injected_mean_abs_adv"] - 0.05 * ctl.ema["al
 print("11. state survives a checkpoint")
 ctl2 = pr.ProgressRankController(rho=0.05)
 ctl2.load_state_dict(ctl.state_dict())
-check(ctl2.ema == ctl.ema, "EMA round-trips through state_dict")
+check(ctl2.ema == ctl.ema and ctl2.success_ema == ctl.success_ema
+      and ctl.success_ema["alfworld"] is not None, "both EMAs round-trip through state_dict")
+ctl3 = pr.ProgressRankController(rho=0.05)
+ctl3.load_state_dict({"version": 1, "ema": {"alfworld": 0.3}})
+check(ctl3.ema["alfworld"] == 0.3 and ctl3.success_ema["alfworld"] is None,
+      "a version-1 state (E only) loads, and S starts uninitialised")
 
 print("12. on top of the real GRPO advantage")
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage  # noqa: E402
@@ -267,7 +276,8 @@ traj_index = np.array([r[0] for r in rows], dtype=object)
 adv, _ = compute_grpo_outcome_advantage(tlr, mask, index, traj_index, compute_mean_std_cross_steps=True)
 check(float(adv.abs().sum()) > 0, "the ordinary advantage is non-zero here (format channel)")
 ctl = pr.ProgressRankController(rho=0.05, cap_kappa=100.0)
-ctl.ema["alfworld"] = 0.3   # a scale from earlier steps
+ctl.ema["alfworld"] = 0.3   # scales from earlier steps
+ctl.success_ema["alfworld"] = 1.0
 new, m = ctl.apply(advantages=adv, mask=mask, uids=index, tuids=traj_index,
                    task_names=np.array(["alfworld"] * n, dtype=object),
                    episode_rewards=np.zeros(n, dtype=object),
@@ -332,6 +342,7 @@ kw = dict(advantages=adv, mask=mask, uids=index, tuids=traj_index,
           real_rows=np.ones(n, dtype=bool), stat_rows=np.ones(n, dtype=bool))
 ctl = pr.ProgressRankController(rho=0.05, cap_kappa=100.0)
 ctl.ema["alfworld"] = 0.3
+ctl.success_ema["alfworld"] = 1.0
 new, m = ctl.apply(**kw, row_scores=tlr.sum(-1).numpy(),
                    valid_rows=np.array([1.0 if r[2] == 0.0 else 0.0 for r in rows], dtype=object))
 p = "progress_rank/alfworld"
@@ -439,6 +450,41 @@ check(pr.spearman([1, 2, 3], [3, 2, 1]) == -1.0 and pr.spearman([1, 1], [0, 1]) 
       "Spearman is -1 for a reversed order and undefined when one side does not vary")
 check(pr.coverage_progress(5, 4) == 1.0 and pr.coverage_progress(None, 3) is None
       and pr.coverage_progress(2, 0) is None, "P = (D - 1) / T, undefined without D or T")
+
+print("19. the cap's anchor: what a success gets in a live group")
+# Live group: 3 successes (2 turns each, A +0.8) and 5 failures (1 turn, A -0.6);
+# a saturated group whose rows carry +0.3 (must not count); a stuck group firing.
+b = build([
+    ("lv", "webshop", [("w1", 2, 10.0, 5, 5, 0.8), ("w2", 2, 10.0, 5, 5, 0.8), ("w3", 2, 10.0, 5, 5, 0.8),
+                       ("f1", 1, 0.0, 1, 5, -0.6), ("f2", 1, 0.0, 1, 5, -0.6), ("f3", 1, 0.0, 1, 5, -0.6),
+                       ("f4", 1, 0.0, 1, 5, -0.6), ("f5", 1, 0.0, 1, 5, -0.6)]),
+    ("sat", "webshop", [("a1", 1, 10.0, 5, 5, 0.3), ("a2", 1, 10.0, 5, 5, 0.3)]),
+    ("st", "webshop", [("s1", 1, 0.0, 3, 5, 0.0), ("s2", 1, 0.0, 0, 5, 0.0)]),
+])
+ctl = pr.ProgressRankController(rho=0.5, cap_kappa=0.5)
+new, m = ctl.apply(**b)
+p = "progress_rank/webshop"
+check(abs(m[f"{p}/success_push"] - 0.8) < 1e-6 and abs(ctl.success_ema["webshop"] - 0.8) < 1e-6,
+      "P is the token-mean A on live groups' successful rows only (not failures, not saturated rows)")
+top = float((new - b["advantages"])[-2:, 0].abs().max())
+check(m[f"{p}/capped"] == 1.0 and abs(top - 0.5 * 0.8) < 1e-6
+      and abs(m[f"{p}/top_push_over_success"] - 0.5) < 1e-9,
+      f"capped: the top push is kappa * S = 0.4 ({top:.4f})")
+# float32 advantages: S carries their precision
+check(abs(m[f"{p}/c_cap"] * 0.3 - 0.4) < 1e-6, "c_cap is kappa * S / max|score| (score +-0.3 here)")
+# a step with no live group leaves S where it was, and (a) still fires
+b2 = build([("st", "webshop", [("s1", 1, 0.0, 3, 5, 0.0), ("s2", 1, 0.0, 0, 5, 0.0)]),
+            ("sat", "webshop", [("a1", 1, 10.0, 5, 5, 0.3), ("a2", 1, 10.0, 5, 5, 0.3)])])
+_, m2 = ctl.apply(**b2)
+check("progress_rank/webshop/success_push" not in m2 and abs(ctl.success_ema["webshop"] - 0.8) < 1e-6
+      and m2[f"{p}/c"] > 0, "no live group: S keeps its value and (a) is still on")
+# before any live group has been seen, (a) waits even with E set
+fresh = pr.ProgressRankController(rho=0.5, cap_kappa=0.5)
+_, m3 = fresh.apply(**b2)
+check(fresh.ema["webshop"] is not None and fresh.success_ema["webshop"] is None and m3[f"{p}/c"] == 0.0,
+      "S uninitialised: c is 0 although E is set")
+check(ctl.last_group_records[0]["success_push_ema"] == ctl.success_ema["webshop"],
+      "the records carry S")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

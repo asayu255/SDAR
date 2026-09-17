@@ -177,6 +177,7 @@ try:
     t._progress_rank = None
     ctl = t._progress_rank_controller(t.config.algorithm.progress_rank)
     ctl.ema.update({"alfworld": 0.31, "search": 0.12, "webshop": None})
+    ctl.success_ema.update({"alfworld": 0.9})
     t.global_steps = 40
     t._pre_peek_dataloader_state = None
     t._save_checkpoint()
@@ -187,8 +188,9 @@ try:
     r._progress_rank = None
     r._load_checkpoint()
     restored = r._progress_rank_controller(r.config.algorithm.progress_rank)
-    check(restored.ema == {"alfworld": 0.31, "search": 0.12, "webshop": None},
-          "and restored on resume before the first step uses it")
+    check(restored.ema == {"alfworld": 0.31, "search": 0.12, "webshop": None}
+          and restored.success_ema["alfworld"] == 0.9,
+          "and restored on resume before the first step uses it (E and the success push S)")
     fresh = trainer(make_config(ckpt_dir=os.path.join(tmp, "empty")))
     fresh._progress_rank = None
     RayPPOTrainer._load_checkpoint = lambda self: 0
