@@ -32,9 +32,11 @@ from agent_system.environments.oci_layout import (
     search_rescue_document_lines as _search_rescue_document_lines,
     search_progress_line as _search_progress_line,
     search_doc_mode as _slots_search_doc, has_second_doc as _slots_second_doc,
+    search_flow_document_lines as _search_flow_document_lines,
+    search_flow_path as _slots_search_flow_path,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
     answer_strings as _answer_strings, is_numeric_answer as _is_numeric_answer,
-    ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD,
+    ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD, SEARCH_FLOW_LEAD,
     webshop_document_lines as _webshop_document_lines,
     doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
     foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
@@ -859,6 +861,13 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         # getattr: the accessor is also called on a bare manager (tests/oci/test_documents.py),
         # where no config has been attached and the historical block is what is asked for.
         mode = _slots_search_doc(getattr(self, "config", None), slot=slot)
+        if mode == "expert_flow":
+            # Someone else's verified route, then the answer it ends at, under the
+            # same rule. '' for a question with no verified route.
+            return render_document(
+                _search_flow_document_lines(p.get("question"), p.get("ground_truth"),
+                                            _slots_search_flow_path(getattr(self, "config", None))),
+                lead=SEARCH_FLOW_LEAD)
         if mode in ("answer_rule", "progress_only"):
             show = mode == "answer_rule"
             return render_document(
@@ -1075,7 +1084,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _blk = self.document_block(i, slot=_slot)
                 if _blk:
                     obs_i = _blk + obs_i
-                    if _slots_search_doc(self.config, slot=_slot) in ("answer_rule", "progress_only"):
+                    if _slots_search_doc(self.config, slot=_slot) in (
+                            "answer_rule", "progress_only", "expert_flow"):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
             self._oci_plains.append(
                 plain_obs if (_role in (ROLE_DOC, ROLE_DOC_B) and obs_i != plain_obs) else "")

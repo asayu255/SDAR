@@ -490,6 +490,10 @@ algorithm:
     # names no part of "Lincoln"), at the cost of telling the row nothing about
     # what to search for.
     search_doc_b: none
+    # Where the verified search routes live for search_doc=expert_flow: a JSON
+    # file of question -> queries, written and checked by
+    # data/qa_annotations/verify_claude_flows.py (no query may name the answer).
+    search_flow_path: ""
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
     # five of those were measured on saturated groups and none reached 12%,
     # because a student that already knows what to do ignores a path it does not

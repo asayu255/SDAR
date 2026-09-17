@@ -76,6 +76,8 @@ its rho is, are what run_alfworld_oci_slots_probe_qwen3.sh measures.
 """
 
 import html
+import json
+import os
 import re
 import unicodedata
 import zlib
@@ -468,7 +470,27 @@ SEARCH_PROGRESS_LEAD = (
     "The path that solves this task:"
 )
 
-SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only")
+# THE THIRD DOCUMENT: SOMEONE ELSE'S SEARCH ROUTE. answer_rule and progress_only
+# both open with the question verbatim, which is the query the eight ordinary
+# rollouts already ran -- measured at step 150, a rescue row's queries overlap
+# its siblings' by 0.94 and find the answer exactly as often (34%). What the
+# stuck groups lack is a BETTER QUERY, so this mode prints queries written by a
+# stronger model and verified against this retriever: on the 92 stuck questions
+# of that probe they return the answer for 55, against 35 for the student's own
+# eight. No query may name the answer -- that is checked when the file is built
+# (data/qa_annotations/verify_claude_flows.py) and again here.
+SEARCH_FLOW_LEAD = (
+    "THIS IS A SEARCH ROUTE THAT IS KNOWN TO WORK FOR THIS QUESTION, AND THE ANSWER IT\n"
+    "ENDS AT. Run the queries below in order -- they are not the question restated,\n"
+    "they name what has to be looked up -- and read what comes back. The answer is\n"
+    "only earned if you FIND it: a result returned inside <information> </information>\n"
+    "must contain it before you write it. Until then, DO NOT WRITE THE ANSWER\n"
+    "ANYWHERE. A trajectory that writes it early is thrown away.\n"
+    "\n"
+    "The path that solves this task:"
+)
+
+SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow")
 
 
 def search_doc_mode(config, slot: str = "a") -> str:
@@ -485,6 +507,11 @@ def search_doc_mode(config, slot: str = "a") -> str:
     if mode not in allowed:
         raise ValueError(f"algorithm.oci_slots.{key}={mode!r}; expected one of {allowed}")
     return mode
+
+
+def search_flow_path(config) -> str:
+    """Where the verified routes live (algorithm.oci_slots.search_flow_path)."""
+    return str((slots_cfg(config) or {}).get("search_flow_path", "") or "")
 
 
 def has_second_doc(config) -> bool:
@@ -599,6 +626,50 @@ def search_rescue_document_lines(question, target, show_answer: bool = True) -> 
     last = (f"<answer> {answers[0]} </answer>" if show_answer
             else "<answer> what that result gives </answer>")
     return [f"<search> {q} </search>", last]
+
+
+_SEARCH_FLOWS: dict = {}
+
+
+def search_flows(path) -> dict:
+    """question -> verified queries, loaded once per path.
+
+    The file is written by data/qa_annotations/verify_claude_flows.py: only the
+    questions whose route actually returned the answer at this retriever's topk,
+    and only routes whose queries name no accepted answer. A question that is not
+    in it has no flow document, which the slot reports as "no document" rather
+    than falling back to something weaker.
+    """
+    key = str(path or "")
+    if key not in _SEARCH_FLOWS:
+        table = {}
+        if key and os.path.exists(key):
+            blob = json.load(open(key))
+            rows = blob.get("flows", blob)
+            for v in rows.values():
+                if not isinstance(v, dict) or not v.get("hit"):
+                    continue
+                queries = [str(q).strip() for q in v.get("queries", []) if str(q).strip()]
+                if queries and v.get("question"):
+                    table[fold_text(v["question"])] = queries
+        _SEARCH_FLOWS[key] = table
+    return _SEARCH_FLOWS[key]
+
+
+def search_flow_document_lines(question, target, path) -> list:
+    """The verified route, then the answer it ends at.
+
+    Returns [] when this question has no verified route, or when its answer
+    cannot be string-checked (yes/no), or when a query would name the answer --
+    the last is re-checked here so a hand-edited file cannot leak.
+    """
+    answers = answer_strings(target)
+    queries = search_flows(path).get(fold_text(question), [])
+    if not queries or not answers or is_yesno(target):
+        return []
+    if any(contains_answer(q, target) for q in queries):
+        return []
+    return [f"<search> {q} </search>" for q in queries] + [f"<answer> {answers[0]} </answer>"]
 
 
 def search_progress_line(found: bool) -> str:

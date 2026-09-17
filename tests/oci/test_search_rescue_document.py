@@ -110,12 +110,14 @@ class _Envs:
         return obs, rewards, dones, infos
 
 
-def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule", search_doc_b="none"):
+def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule", search_doc_b="none",
+             search_flow_path=""):
     n = group_n if n is None else n
     config = OmegaConf.create({
         "env": {"history_length": 2, "rollout": {"n": group_n}},
         "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"], "search_doc": search_doc,
                                     "search_doc_b": search_doc_b,
+                                    "search_flow_path": search_flow_path,
                                     "doc_mode": "walkthrough_stepwise", "foreign_task": "webshop"},
                       "oci_rank": {"enable": False}},
     })
@@ -459,6 +461,45 @@ check(int(keep2.sum()) == 16 and int(met2["oci_slots/trained_per_group"]) == 8,
 check(bool(inj2[9]) and not bool(inj2[8]) and int(inj2.sum()) == 1,
       "the shipped variant is the one injected; the second row is measurement only")
 check(not keep2[8], "and it is dropped rather than trained")
+
+print("14. the route written by a stronger model")
+FLOW_FILE = os.path.join(tempfile.gettempdir(), f"flows_{os.getpid()}.json")
+json.dump({"flows": {
+    "0": {"question": QUESTION, "answers": [ANSWER], "hit": True,
+          "queries": ["closest airport Lewisburg West Virginia", "Greenbrier County airport"]},
+    "1": {"question": "a question whose route did not work", "answers": ["x"], "hit": False,
+          "queries": ["something"]},
+    "2": {"question": "a route that names the answer", "answers": [ANSWER], "hit": True,
+          "queries": [f"{ANSWER} runway"]},
+}}, open(FLOW_FILE, "w"))
+try:
+    ol._SEARCH_FLOWS.clear()
+    lines = ol.search_flow_document_lines(QUESTION, {"target": [ANSWER]}, FLOW_FILE)
+    check(lines == ["<search> closest airport Lewisburg West Virginia </search>",
+                    "<search> Greenbrier County airport </search>",
+                    f"<answer> {ANSWER} </answer>"],
+          "the verified queries in order, then the answer they end at")
+    check(ol.search_flow_document_lines("a question whose route did not work",
+                                        {"target": ["x"]}, FLOW_FILE) == [],
+          "a route that did not return the answer is not shown")
+    check(ol.search_flow_document_lines("a route that names the answer",
+                                        {"target": [ANSWER]}, FLOW_FILE) == [],
+          "and one whose query names the answer is refused here too, not only when built")
+    check(ol.search_flow_document_lines("a question that is not in the file",
+                                        {"target": [ANSWER]}, FLOW_FILE) == [],
+          "a question with no route has no document")
+    m7 = _manager(group_n=10, evidence_for={9}, search_doc="answer_rule",
+                  search_doc_b="expert_flow", search_flow_path=FLOW_FILE)
+    t7 = m7.reset(KW * 10)[0]["text"]
+    check("closest airport Lewisburg West Virginia" in t7[8] and ANSWER in t7[8],
+          "the second slot wears the route, with the answer under the rule")
+    check("closest airport Lewisburg" not in t7[9] and ANSWER in t7[9],
+          "the first still wears the plain answer document")
+    check(ol.search_progress_line(False) in t7[8],
+          "and the route row gets the same per-turn verdict line")
+finally:
+    os.remove(FLOW_FILE)
+    ol._SEARCH_FLOWS.clear()
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

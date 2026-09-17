@@ -20,7 +20,8 @@
 #    write a query only someone who knows it would write ("president 1861 1865
 #    assassinated" names no part of "Lincoln"), and no string test catches that. The
 #    tenth row wears the variant that withholds the answer and shows only the verdict
-#    (search_doc_b=progress_only). Both rescue rows run on the SAME group, so the two
+#    (search_doc_b=expert_flow: queries written by a stronger model and verified against
+#    this retriever). Both rescue rows run on the SAME group, so the two
 #    rates are paired on the question, the eight siblings and the sampling.
 #
 # WHAT IT WRITES. One JSON line per rollout under SEARCH_PROBE_DUMP (question,
@@ -30,7 +31,7 @@
 # per-batch group classes and the injected row's own rescue rate beside them.
 #
 # GROUP_N=10, and search has no foreign slot: slots 0-6 plain, 7 reserve, 8 the
-# second document (progress_only), 9 the document the arm would ship. A group is
+# second document (the verified route), 9 the document the arm would ship. A group is
 # the eight ordinary rollouts control trains, plus the two rescue rows.
 set -euo pipefail
 STEP="${STEP:-150}"
@@ -42,7 +43,13 @@ TASKS="${TASKS:-search}"
 N_TASKS=$(awk -F, "{print NF}" <<< "$TASKS")
 GPUS="${GPUS:-4}"
 SEARCH_DOC="${SEARCH_DOC:-answer_rule}"
-SEARCH_DOC_B="${SEARCH_DOC_B:-progress_only}"
+SEARCH_DOC_B="${SEARCH_DOC_B:-expert_flow}"
+# Routes written by a stronger model and verified against this retriever:
+# 55 of the 92 stuck questions of the first run return the answer, against 35
+# for the student's own eight rollouts. Built by
+# data/qa_annotations/verify_claude_flows.py, which refuses any query naming
+# an answer.
+SEARCH_FLOW_PATH="${SEARCH_FLOW_PATH:-/opt1/ohara/data/qa_annotations/claude_flows_final.json}"
 TAG="${TAG:-search_rescue}"
 MODEL="${MODEL:-student}"
 case "$MODEL" in
@@ -76,7 +83,7 @@ export SEARCH_PROBE_DUMP="$DUMP"
 export RUN_TAG=searchrescue
 export RUN_TAG_SUFFIX=_searchrescue
 export HIGHLIGHT_CONFIGS='<search>:0,0,255;</search>:0,0,255;<information>:255,0,0;</information>:255,0,0'
-echo "probe: step=$STEP group_n=$GROUP_N per_task=$PER_TASK batches=$N_BATCHES search_doc=$SEARCH_DOC"
+echo "probe: step=$STEP group_n=$GROUP_N per_task=$PER_TASK batches=$N_BATCHES search_doc=$SEARCH_DOC/$SEARCH_DOC_B"
 echo "  questions: $(( PER_TASK * N_BATCHES )), rollouts: $(( PER_TASK * N_BATCHES * GROUP_N ))"
 echo "  dump: $DUMP"
 echo "  log:  $LOG"
@@ -104,6 +111,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   'algorithm.oci_slots.tasks=[search]' \
   algorithm.oci_slots.search_doc="$SEARCH_DOC" \
   algorithm.oci_slots.search_doc_b="$SEARCH_DOC_B" \
+  algorithm.oci_slots.search_flow_path="$SEARCH_FLOW_PATH" \
   algorithm.oci_slots.gamma=0.1 \
   algorithm.oci_slots.opd_on_special=False \
   algorithm.compute_mean_std_cross_steps=True \
