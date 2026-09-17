@@ -31,8 +31,10 @@ from agent_system.environments.oci_layout import (
     search_document_lines as _search_document_lines,
     search_rescue_document_lines as _search_rescue_document_lines,
     search_progress_line as _search_progress_line,
-    search_doc_mode as _slots_search_doc, contains_answer as _contains_answer,
-    answer_strings as _answer_strings, SEARCH_RULE_LEAD,
+    search_doc_mode as _slots_search_doc, has_second_doc as _slots_second_doc,
+    contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
+    answer_strings as _answer_strings, is_numeric_answer as _is_numeric_answer,
+    ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD,
     webshop_document_lines as _webshop_document_lines,
     doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
     foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
@@ -547,6 +549,15 @@ def _insert_guide(obs: str, line: str) -> str:
 _SEARCH_GUIDE_ANCHOR = "Now it's your turn to respond for the current step."
 
 
+def _search_query(text: str) -> str:
+    """The query a response asked for, or '' -- for comparing the rescue row's
+    queries with its eight plain siblings' (a query only a row that has READ the
+    answer could write is what no string rule can catch)."""
+    import re as _re
+    m = _re.search(r"<search>(.*?)</search>", str(text or ""), flags=_re.S)
+    return m.group(1).strip() if m else ""
+
+
 def _insert_search_guide(obs: str, line: str) -> str:
     if not line or obs.count(_SEARCH_GUIDE_ANCHOR) != 1:
         return obs
@@ -829,22 +840,33 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
         return observations, infos
 
-    def document_block(self, i: int) -> str:
+    def document_block(self, i: int, slot: str = "a") -> str:
         """The block that answers question ``i``, or '' when it cannot be built.
 
-        Same wrapper and numbering as the other two tasks. ``answer_only`` prints
-        the query and the answer and nothing stops the slot writing the answer at
-        once; ``answer_rule`` prints the same two lines under the rule that the
-        answer has to come back from a search first (oci_layout.SEARCH_RULE_LEAD).
+        Same wrapper and numbering as the other two tasks.
+        ``answer_only``    the query and the answer; nothing stops the slot from
+                           writing the answer at once, which is the hole this task
+                           has and the other two do not.
+        ``answer_rule``    the same two lines under the rule that a returned result
+                           must carry the answer first (SEARCH_RULE_LEAD).
+        ``progress_only``  no answer at all: only the per-turn verdict on whether a
+                           result has carried it (SEARCH_PROGRESS_LEAD).
+        ``slot`` picks the variant: "a" is the row the arm would ship, "b" the
+        measurement-only row generated beside it.
         """
         problems = getattr(self, "problems", None) or []
         p = problems[i] if i < len(problems) else {}
         # getattr: the accessor is also called on a bare manager (tests/oci/test_documents.py),
         # where no config has been attached and the historical block is what is asked for.
-        if _slots_search_doc(getattr(self, "config", None)) == "answer_rule":
+        mode = _slots_search_doc(getattr(self, "config", None), slot=slot)
+        if mode in ("answer_rule", "progress_only"):
+            show = mode == "answer_rule"
             return render_document(
-                _search_rescue_document_lines(p.get("question"), p.get("ground_truth")),
-                lead=SEARCH_RULE_LEAD)
+                _search_rescue_document_lines(p.get("question"), p.get("ground_truth"),
+                                              show_answer=show),
+                lead=SEARCH_RULE_LEAD if show else SEARCH_PROGRESS_LEAD)
+        if mode == "none":
+            return ""
         return render_document(_search_document_lines(p.get("question"), p.get("ground_truth")))
 
     def step(self, text_actions: List[str]):
@@ -885,6 +907,11 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         p = problems[i] if i < len(problems) else {}
         return p.get("ground_truth")
 
+    def _question(self, i):
+        problems = getattr(self, "problems", None) or []
+        p = problems[i] if i < len(problems) else {}
+        return p.get("question")
+
     def _note_written(self, text_actions) -> None:
         """A row that writes the answer before a result carried it breaks the rule."""
         seen = getattr(self, "_evidence_seen", None)
@@ -895,12 +922,16 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 self._answer_early[i] = True
 
     def _note_returned(self, next_obs) -> None:
-        """The progress line's only state: has a returned result carried the answer?"""
+        """The progress line's only state: has a returned result carried the answer?
+
+        Guarded for bare-number answers, which a passage can hold by accident --
+        see oci_layout.evidence_in_text.
+        """
         seen = getattr(self, "_evidence_seen", None)
         if seen is None:
             return
         for i, obs in enumerate(list(next_obs)[:len(seen)]):
-            if not seen[i] and _contains_answer(obs, self._answers(i)):
+            if not seen[i] and _evidence_in_text(obs, self._answers(i), self._question(i)):
                 seen[i] = True
 
     @property
@@ -923,17 +954,26 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         gt = p.get("ground_truth")
         # pid and reset identify the batch: `group` is a position inside one
         # reset of one worker, so it repeats across batches and across workers.
-        role = int(_slots_role(i, envs, self.config, foreign=False))
+        role = int(_slots_role(i, envs, self.config, foreign=False,
+                               second_doc=_slots_second_doc(self.config)))
+        slot = "a" if role == ROLE_DOC else ("b" if role == ROLE_DOC_B else None)
+        answers = _answer_strings(gt)
         return {"pid": os.getpid(), "reset": int(getattr(self, "_probe_reset", 0)),
                 "env": i, "group": i // group_n, "role": role,
-                "question": p.get("question"), "answers": _answer_strings(gt),
+                "question": p.get("question"), "answers": answers,
                 "data_source": p.get("data_source") or p.get("task_name"),
-                # Whether this row was actually SHOWN a document: a yes/no question
-                # has none (the rule is a string test and "yes" is in any passage),
-                # so its slot ran plain and must not be scored as a rescue.
-                "has_document": bool(self.document_block(i)) if role == ROLE_DOC else False,
-                "search_doc": _slots_search_doc(self.config), "turns": [], "won": None,
-                "open": True}
+                # Which variant this row wore, and whether it was SHOWN anything: a
+                # yes/no question has no document (the rule is a string test and
+                # "yes" is in any passage), so its slot ran plain and must not be
+                # scored as a rescue.
+                "variant": _slots_search_doc(self.config, slot=slot) if slot else None,
+                "has_document": bool(self.document_block(i, slot=slot)) if slot else False,
+                # For the split the rescue rate has to be read in: a one-word or
+                # bare-number answer is both easier to write and easier to match
+                # by accident.
+                "answer_words": min((len(str(a).split()) for a in answers), default=0),
+                "answer_numeric": bool(_is_numeric_answer(gt)),
+                "turns": [], "won": None, "open": True}
 
     def _probe_note_turn(self, text_actions, next_obs, rewards, dones, infos) -> None:
         rows = getattr(self, "_probe_rows", None)
@@ -944,10 +984,15 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             if not row.get("open") or i >= len(obs_list):
                 continue
             text = str(text_actions[i]) if i < len(text_actions) else ""
+            gt, question = self._answers(i), self._question(i)
             row["turns"].append({
                 "action": text,
-                "wrote_answer": bool(_contains_answer(text, self._answers(i))),
-                "info_has_answer": bool(_contains_answer(obs_list[i], self._answers(i))),
+                "query": _search_query(text),
+                "wrote_answer": bool(_contains_answer(text, gt)),
+                # Both tests: the guarded one drives the progress line and the
+                # rule, the raw one bounds how often the guard mattered.
+                "info_has_answer": bool(_evidence_in_text(obs_list[i], gt, question)),
+                "info_has_answer_raw": bool(_contains_answer(obs_list[i], gt)),
                 "info": str(obs_list[i]),
             })
             if bool(done_list[i]):
@@ -994,7 +1039,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._oci_docs = []
         _envs = getattr(self, "envs", None)
         _rank = _oci_rank_on(self.config) and "search" in _oci_rank_tasks(self.config)
-        _rule = _slots_search_doc(self.config) == "answer_rule"
+        _second = _slots_second_doc(self.config)
         _seen = getattr(self, "_evidence_seen", None) or [False] * len(text_obs)
 
         if not init and self.config.env.history_length > 0:
@@ -1021,17 +1066,19 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             # slot's tokens are re-scored on.
             plain_obs = obs_i
             # foreign=False: search has no foreign slot (oci_layout.has_foreign_slot),
-            # so the last slot of the group is the document row and the other eight
-            # are ordinary rollouts -- exactly the eight control trains.
-            _role = _slots_role(i, _envs, self.config, foreign=False)
+            # so the last slots of the group are the document rows and the other
+            # eight are ordinary rollouts -- exactly the eight control trains.
+            _role = _slots_role(i, _envs, self.config, foreign=False, second_doc=_second)
             self._oci_roles.append(_role)
-            if _role == ROLE_DOC:
-                _blk = self.document_block(i)
+            if _role in (ROLE_DOC, ROLE_DOC_B):
+                _slot = "a" if _role == ROLE_DOC else "b"
+                _blk = self.document_block(i, slot=_slot)
                 if _blk:
                     obs_i = _blk + obs_i
-                    if _rule:
+                    if _slots_search_doc(self.config, slot=_slot) in ("answer_rule", "progress_only"):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
-            self._oci_plains.append(plain_obs if (_role == ROLE_DOC and obs_i != plain_obs) else "")
+            self._oci_plains.append(
+                plain_obs if (_role in (ROLE_DOC, ROLE_DOC_B) and obs_i != plain_obs) else "")
             # Whole document, no progress line: the rank scorer does not act.
             _doc_blk = self.document_block(i) if _rank else ""
             self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")

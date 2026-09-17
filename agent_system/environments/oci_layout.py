@@ -85,6 +85,11 @@ from agent_system.environments.prompts.webshop import WEBSHOP_TEMPLATE_NO_HIS
 # What a row's slot is for. Travels as the `oci_role` column; ROLE_NONE is every
 # row of a run without the layout, and every row of a task it does not cover.
 ROLE_NONE, ROLE_PLAIN, ROLE_RESERVE, ROLE_DOC, ROLE_FOREIGN = 0, 1, 2, 3, 4
+# A SECOND DOCUMENT ROW, FOR MEASUREMENT ONLY. Two rescue documents differ in one
+# thing -- whether the answer is printed -- and the honest comparison is on the
+# SAME group: same question, same eight siblings, same sampling. This row is
+# never kept for training; the probe reads it and the selection drops it.
+ROLE_DOC_B = 5
 ROLE_NAMES = {ROLE_NONE: "none", ROLE_PLAIN: "plain", ROLE_RESERVE: "reserve",
               ROLE_DOC: "document", ROLE_FOREIGN: "foreign"}
 
@@ -204,20 +209,23 @@ def has_foreign_slot(task) -> bool:
     return str(task) != "search"
 
 
-def used_per_group(group_n: int, foreign: bool = True) -> int:
+def used_per_group(group_n: int, foreign: bool = True, second_doc: bool = False) -> int:
     """How many trajectories a group trains: everything but the special slots."""
-    return max(int(group_n) - (2 if foreign else 1), 0)
+    specials = (2 if foreign else 1) + (1 if second_doc else 0)
+    return max(int(group_n) - specials, 0)
 
 
-def role_for_slot(slot: int, group_n: int, foreign: bool = True) -> int:
+def role_for_slot(slot: int, group_n: int, foreign: bool = True, second_doc: bool = False) -> int:
     """What the slot at position ``slot`` of a group of ``group_n`` is for.
 
     Below four the layout does not exist: it needs two ordinary rollouts to read
     a verdict from and two more for the special slots (three without the foreign
-    one, which search does not have -- see has_foreign_slot).
+    one, which search does not have -- see has_foreign_slot). ``second_doc`` adds
+    the measurement-only variant row above (ROLE_DOC_B).
     """
     g = int(group_n)
-    if g < (4 if foreign else 3):
+    specials = (2 if foreign else 1) + (1 if second_doc else 0)
+    if g < specials + 2:
         return ROLE_NONE
     j = int(slot) % g
     if foreign and j == g - 1:
@@ -225,12 +233,14 @@ def role_for_slot(slot: int, group_n: int, foreign: bool = True) -> int:
     last = g - 1 if not foreign else g - 2
     if j == last:
         return ROLE_DOC
-    if j == last - 1:
+    if second_doc and j == last - 1:
+        return ROLE_DOC_B
+    if j == last - (2 if second_doc else 1):
         return ROLE_RESERVE
     return ROLE_PLAIN
 
 
-def slot_role(i: int, envs, config=None, foreign: bool = True) -> int:
+def slot_role(i: int, envs, config=None, foreign: bool = True, second_doc: bool = False) -> int:
     """The role of env slot ``i`` in the manager that holds ``envs``.
 
     ASKS THE ENVS FOR THE GROUP SIZE, NOT THE CONFIG, and only marks a TRAINING
@@ -247,7 +257,7 @@ def slot_role(i: int, envs, config=None, foreign: bool = True) -> int:
         g = int(getattr(envs, "group_n", 0))
     except (TypeError, ValueError):
         return ROLE_NONE
-    return role_for_slot(i, g, foreign=foreign)
+    return role_for_slot(i, g, foreign=foreign, second_doc=second_doc)
 
 
 # --------------------------------------------------------------------------- #
@@ -440,19 +450,46 @@ SEARCH_RULE_LEAD = (
     "The path that solves this task:"
 )
 
-SEARCH_DOC_MODES = ("answer_only", "answer_rule")
+# THE VARIANT THAT PRINTS NOTHING BUT THE VERDICT. Even under the rule, a row
+# that has read the answer can write a query only someone who knows it would
+# write ("president 1861 1865 assassinated" for Lincoln), and no string test
+# catches that -- what such a row then teaches may not survive the plain prompt.
+# This variant withholds the answer and keeps only the per-turn line saying
+# whether a result has carried it, which is the direct counterpart of ALFWorld's
+# progress pointer. It cannot help the row choose a query, which is exactly why
+# the two are generated side by side on the same group.
+SEARCH_PROGRESS_LEAD = (
+    "YOU ARE BEING TOLD WHEN YOU HAVE FOUND THE ANSWER, NOT WHAT IT IS. A checker\n"
+    "that knows the correct answer reads every result returned to you, and the\n"
+    "progress line below says whether one of them contains it. Search, read the\n"
+    "results, and search again with a different query until the line says a result\n"
+    "carries the answer. Then answer with what that result gives.\n"
+    "\n"
+    "The path that solves this task:"
+)
+
+SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only")
 
 
-def search_doc_mode(config) -> str:
-    """Which Search document the layout's document slot shows.
+def search_doc_mode(config, slot: str = "a") -> str:
+    """Which Search document a document slot shows.
 
     ``answer_only`` is the historical block (query, then the answer) and stays
-    the default so a rerun of an older arm is byte-identical.
+    the default so a rerun of an older arm is byte-identical. ``slot="b"`` reads
+    the measurement-only second row, which is "none" unless a probe asks for it.
     """
-    mode = str((slots_cfg(config) or {}).get("search_doc", "answer_only") or "answer_only")
-    if mode not in SEARCH_DOC_MODES:
-        raise ValueError(f"algorithm.oci_slots.search_doc={mode!r}; expected one of {SEARCH_DOC_MODES}")
+    cfg = slots_cfg(config) or {}
+    key, default = ("search_doc", "answer_only") if slot == "a" else ("search_doc_b", "none")
+    mode = str(cfg.get(key, default) or default)
+    allowed = SEARCH_DOC_MODES if slot == "a" else SEARCH_DOC_MODES + ("none",)
+    if mode not in allowed:
+        raise ValueError(f"algorithm.oci_slots.{key}={mode!r}; expected one of {allowed}")
     return mode
+
+
+def has_second_doc(config) -> bool:
+    """Whether the layout generates the measurement-only variant row."""
+    return search_doc_mode(config, slot="b") != "none"
 
 
 def answer_strings(target) -> list:
@@ -493,6 +530,47 @@ def contains_answer(text, target) -> bool:
     return False
 
 
+# Words a question shares with almost any passage; dropped before asking whether
+# a passage is about this question at all.
+_QUESTION_STOPWORDS = frozenset(
+    "a an the of in on at to for from by with and or is was were are be been am "
+    "what which who whom whose when where why how did do does done has have had "
+    "it its this that these those as into about many much first last name named".split())
+
+
+def question_words(question) -> set:
+    """The content words of a question, folded."""
+    return {w for w in fold_text(question).split()
+            if w not in _QUESTION_STOPWORDS and len(w) > 2}
+
+
+def is_numeric_answer(target) -> bool:
+    """Every accepted answer is a bare number: "1931", "5", "1861 1865"."""
+    answers = [fold_text(a) for a in answer_strings(target)]
+    return bool(answers) and all(a and all(tok.isdigit() for tok in a.split()) for a in answers)
+
+
+def evidence_in_text(text, target, question=None) -> bool:
+    """Does this passage carry the answer, rather than merely the same characters?
+
+    THE FALSE POSITIVE THIS GUARDS. A year or a small integer turns up in
+    passages that have nothing to do with the question: in the 300-question
+    sample, 21 of 103 annotated nq questions get a top-3 passage that holds the
+    answer string while holding none of the annotated evidence. For a bare-number
+    answer the passage must therefore also carry a content word of the question.
+    Everything else is judged by the answer alone, which is what the rescue row's
+    rule and the progress line read.
+    """
+    if not contains_answer(text, target):
+        return False
+    if question is None or not is_numeric_answer(target):
+        return True
+    words = question_words(question)
+    if not words:
+        return True
+    return bool(words & set(fold_text(text).split()))
+
+
 def is_yesno(target) -> bool:
     """Yes/no questions have no document in this mode.
 
@@ -504,20 +582,23 @@ def is_yesno(target) -> bool:
     return bool(answers) and all(a in ("yes", "no") for a in answers)
 
 
-def search_rescue_document_lines(question, target) -> list:
-    """The first query to run, and the answer to write once it comes back.
+def search_rescue_document_lines(question, target, show_answer: bool = True) -> list:
+    """The first query to run, and what to write once a result carries the answer.
 
     Line 1 is the question verbatim -- the query that returns a passage holding
     the answer for 79% of the annotated nq questions and 43% of the hotpotqa
     bridge ones, and it contains no part of the answer, so running it can never
-    break the rule. Line 2 is the answer, which line 1's result has to contain
-    first; SEARCH_RULE_LEAD is what says so.
+    break the rule. Line 2 is the answer when ``show_answer``; without it the row
+    is told only that a result will be recognised, which is the progress_only
+    variant (SEARCH_PROGRESS_LEAD).
     """
     answers = answer_strings(target)
     q = str(question or "").strip()
     if not q or not answers or is_yesno(target):
         return []
-    return [f"<search> {q} </search>", f"<answer> {answers[0]} </answer>"]
+    last = (f"<answer> {answers[0]} </answer>" if show_answer
+            else "<answer> what that result gives </answer>")
+    return [f"<search> {q} </search>", last]
 
 
 def search_progress_line(found: bool) -> str:

@@ -2015,10 +2015,13 @@ class OPDRayTrainer(RayPPOTrainer):
                                                 select_rollouts)
 
         check_config(self.config)
+        from agent_system.environments.oci_layout import has_second_doc
+
         keep, injected, slot_metrics = select_rollouts(
             batch,
             tasks=list(cfg.get("tasks", ["alfworld"]) or ["alfworld"]),
             group_n=int(self.config.env.rollout.n),
+            second_doc=has_second_doc(self.config),
         )
         metrics.update(slot_metrics)
         # Kept for the probe, which sees the batch only after this drop and so

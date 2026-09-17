@@ -62,6 +62,7 @@ from agent_system.environments.oci_layout import (
     ROLE_DOC,
     ROLE_FOREIGN,
     ROLE_NONE,
+    ROLE_DOC_B,
     ROLE_PLAIN,
     ROLE_RESERVE,
     has_foreign_slot,
@@ -123,11 +124,16 @@ def check_config(config) -> None:
         "(replays 30/30) and search shows the answer under the rule below. A WebShop "
         "document has to be built and replay-verified first.")
     _search_doc = str(cfg.get("search_doc", "answer_only") or "answer_only")
-    assert not (tasks == ["search"] and _search_doc != "answer_rule"), (
-        "algorithm.oci_slots.tasks=[search] with search_doc=answer_only: Search's reward "
+    assert not (tasks == ["search"] and _search_doc not in ("answer_rule", "progress_only")), (
+        f"algorithm.oci_slots.tasks=[search] with search_doc={_search_doc}: Search's reward "
         "reads only the final <answer> string and never checks that a search happened, so "
-        "that document rescues a group by being copied. search_doc=answer_rule shows the "
-        "same answer under the rule that a returned result must carry it first.")
+        "that document rescues a group by being copied. Use answer_rule (the answer under "
+        "the rule that a returned result must carry it first) or progress_only (no answer, "
+        "only the verdict).")
+    _search_doc_b = str(cfg.get("search_doc_b", "none") or "none")
+    assert _search_doc_b == "none" or tasks == ["search"], (
+        f"algorithm.oci_slots.search_doc_b={_search_doc_b} with tasks={tasks}: the second "
+        "document row is a search-only measurement.")
 
     # The special rows are trained by the policy gradient alone, through the
     # shaped term, and that term is built only on the per-task-weighted branch of
@@ -152,7 +158,7 @@ def check_config(config) -> None:
         "re-draws the layout's slots; the two are not compatible.")
 
 
-def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
+def select_rollouts(batch, *, tasks: Sequence[str], group_n: int, second_doc: bool = False):
     """``(keep, injected, metrics)``: row masks over the batch as it left the rollout.
 
     ``keep`` is the eight trajectories per group that train; ``injected`` is the
@@ -169,7 +175,7 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
         f"algorithm.oci_slots.tasks={list(tasks)} mixes tasks that do and do not "
         "spend a slot on another task's prompt; their groups would train different "
         "numbers of trajectories")
-    plain_n = used_per_group(group_n, foreign=foreign)
+    plain_n = used_per_group(group_n, foreign=foreign, second_doc=second_doc)
 
     uids = batch.non_tensor_batch.get("uid", None)
     tuids = batch.non_tensor_batch.get("traj_uid", None)
@@ -204,7 +210,8 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
     # disagree, the batch is not the one the arm describes -- e.g. a manager built
     # with a different group size than env.rollout.n -- and every verdict below
     # would be taken on the wrong rows.
-    expected = np.array([role_for_slot(int(s), group_n, foreign=foreign) for s in slot], dtype=int)
+    expected = np.array([role_for_slot(int(s), group_n, foreign=foreign, second_doc=second_doc)
+                         for s in slot], dtype=int)
     bad = np.nonzero(on_task & (role != expected))[0]
     assert bad.size == 0, (
         f"{bad.size} of {int(on_task.sum())} rows on {sorted(wanted)} carry a role "
@@ -239,14 +246,15 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int):
             continue
 
         by_role = {r: rows[role[rows] == r]
-                   for r in (ROLE_PLAIN, ROLE_RESERVE, ROLE_DOC, ROLE_FOREIGN)}
+                   for r in (ROLE_PLAIN, ROLE_RESERVE, ROLE_DOC, ROLE_FOREIGN, ROLE_DOC_B)}
         layout = {r: _n_traj(tuids, idx) for r, idx in by_role.items()}
-        assert layout == {ROLE_PLAIN: plain_n - 1, ROLE_RESERVE: 1,
-                          ROLE_DOC: 1, ROLE_FOREIGN: 1 if foreign else 0}, (
+        assert layout == {ROLE_PLAIN: plain_n - 1, ROLE_RESERVE: 1, ROLE_DOC: 1,
+                          ROLE_FOREIGN: 1 if foreign else 0,
+                          ROLE_DOC_B: 1 if second_doc else 0}, (
             f"group carries {layout} trajectories by role, not "
             f"{{plain: {plain_n - 1}, reserve: 1, document: 1, "
-            f"foreign: {1 if foreign else 0}}}; the generation was not laid out as "
-            "the arm describes")
+            f"foreign: {1 if foreign else 0}, document_b: {1 if second_doc else 0}}}; "
+            "the generation was not laid out as the arm describes")
 
         level = float(g["ret"])
         doc_ret = float(ret[by_role[ROLE_DOC]].max())

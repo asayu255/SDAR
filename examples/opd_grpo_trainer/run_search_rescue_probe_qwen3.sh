@@ -16,25 +16,33 @@
 #    the prompt, which is what Search's answer-only reward lets through, so the
 #    rescue rate that matters is "scored AND kept the rule".
 #
-# WHAT IT WRITES. One JSON line per rollout under SEARCH_PROBE_DUMP (question,
-# answers, slot role, every turn's action and result, evidence_seen,
-# answer_early, won), which scripts/analyze_search_rescue.py turns into both
-# answers. The grad_probe payload at OUT carries the usual per-batch group
-# classes and the injected row's own rescue rate beside them.
+# 3. WHICH RESCUE DOCUMENT? Even under the rule, a row that has READ the answer can
+#    write a query only someone who knows it would write ("president 1861 1865
+#    assassinated" names no part of "Lincoln"), and no string test catches that. The
+#    tenth row wears the variant that withholds the answer and shows only the verdict
+#    (search_doc_b=progress_only). Both rescue rows run on the SAME group, so the two
+#    rates are paired on the question, the eight siblings and the sampling.
 #
-# GROUP_N=9: slots 0-6 plain, 7 document, 8 foreign -- and search runs the
-# foreign slot plain (it has no other task's prompt to wear), so a group is eight
-# ordinary rollouts, exactly what control trains, plus one document row.
+# WHAT IT WRITES. One JSON line per rollout under SEARCH_PROBE_DUMP (question,
+# answers, slot role and variant, every turn's action, query and result,
+# evidence_seen, answer_early, won), which scripts/analyze_search_rescue.py turns
+# into all three answers. The grad_probe payload at OUT carries the usual
+# per-batch group classes and the injected row's own rescue rate beside them.
+#
+# GROUP_N=10, and search has no foreign slot: slots 0-6 plain, 7 reserve, 8 the
+# second document (progress_only), 9 the document the arm would ship. A group is
+# the eight ordinary rollouts control trains, plus the two rescue rows.
 set -euo pipefail
 STEP="${STEP:-150}"
 TEMP="${TEMP:-1.0}"
-GROUP_N="${GROUP_N:-9}"
-PER_TASK="${PER_TASK:-25}"
-N_BATCHES="${N_BATCHES:-8}"
+GROUP_N="${GROUP_N:-10}"
+PER_TASK="${PER_TASK:-20}"
+N_BATCHES="${N_BATCHES:-10}"
 TASKS="${TASKS:-search}"
 N_TASKS=$(awk -F, "{print NF}" <<< "$TASKS")
-GPUS="${GPUS:-3}"
+GPUS="${GPUS:-4}"
 SEARCH_DOC="${SEARCH_DOC:-answer_rule}"
+SEARCH_DOC_B="${SEARCH_DOC_B:-progress_only}"
 TAG="${TAG:-search_rescue}"
 MODEL="${MODEL:-student}"
 case "$MODEL" in
@@ -95,6 +103,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_qwen3.sh \
   algorithm.oci_slots.enable=True \
   'algorithm.oci_slots.tasks=[search]' \
   algorithm.oci_slots.search_doc="$SEARCH_DOC" \
+  algorithm.oci_slots.search_doc_b="$SEARCH_DOC_B" \
   algorithm.oci_slots.gamma=0.1 \
   algorithm.oci_slots.opd_on_special=False \
   algorithm.compute_mean_std_cross_steps=True \

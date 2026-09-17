@@ -481,6 +481,15 @@ algorithm:
     #   the per-turn line saying whether one has. A row that writes it early is
     #   recorded as rule-breaking (agent_system/environments/oci_layout.py).
     search_doc: answer_only
+    # A SECOND DOCUMENT ROW, GENERATED BESIDE THE FIRST, FOR MEASUREMENT ONLY.
+    # "none" (the default) means the group has one document row. Any other mode
+    # adds a row wearing that variant, never kept for training, so the two
+    # documents can be compared on the SAME question with the same eight
+    # siblings. "progress_only" is the variant that withholds the answer: it
+    # closes the hole that no string rule can ("president 1861 1865 assassinated"
+    # names no part of "Lincoln"), at the cost of telling the row nothing about
+    # what to search for.
+    search_doc_b: none
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
     # five of those were measured on saturated groups and none reached 12%,
     # because a student that already knows what to do ignores a path it does not

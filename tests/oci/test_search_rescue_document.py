@@ -110,11 +110,12 @@ class _Envs:
         return obs, rewards, dones, infos
 
 
-def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule"):
+def _manager(group_n=9, n=None, evidence_for=(), search_doc="answer_rule", search_doc_b="none"):
     n = group_n if n is None else n
     config = OmegaConf.create({
         "env": {"history_length": 2, "rollout": {"n": group_n}},
         "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"], "search_doc": search_doc,
+                                    "search_doc_b": search_doc_b,
                                     "doc_mode": "walkthrough_stepwise", "foreign_task": "webshop"},
                       "oci_rank": {"enable": False}},
     })
@@ -284,6 +285,22 @@ check(s["rescue"]["stuck"]["scored"] == 1.0
 check(s["by_source"]["nq"]["groups"] == 3 and s["by_source"]["nq"]["stuck"] == round(1 / 3, 3)
       and s["by_source"]["hotpotqa"]["stuck"] == 1.0,
       "split by dataset, because nq and hotpotqa fail differently")
+# the same stuck groups, now with the second variant's row beside the first
+recs_b = list(recs)
+recs_b.append(_rec(1, 0, 0, 7, ol.ROLE_DOC_B, 0.0, True, False))   # found it, answered wrong
+recs_b.append(_rec(1, 0, 1, 7, ol.ROLE_DOC_B, 1.0, True, False, source="hotpotqa"))
+for r in recs_b:
+    if r["role"] == ol.ROLE_DOC:
+        r["variant"] = "answer_rule"
+    elif r["role"] == ol.ROLE_DOC_B:
+        r["variant"] = "progress_only"
+    r["has_document"] = r["role"] in (ol.ROLE_DOC, ol.ROLE_DOC_B)
+sb = summarise(recs_b)["rescue_by_variant_on_stuck"]
+check(sb["answer_rule"]["rows"] == 2 and sb["progress_only"]["rows"] == 2,
+      "both variants are scored on the same stuck groups")
+check(sb["answer_rule"]["scored_and_kept_rule"] == 0.5
+      and sb["progress_only"]["scored_and_kept_rule"] == 0.5,
+      "and their rescue rates are reported side by side")
 check(summarise([_rec(1, 0, 0, 8, ol.ROLE_DOC, 0.0, False, False, answers=())]
                 + [_rec(1, 0, 0, i, 1, 0.0, False, False) for i in range(8)]
                 )["rescue"]["stuck"]["no_document"] == 1,
@@ -297,14 +314,14 @@ from verl import DataProto  # noqa: E402
 from verl.trainer.ppo.oci_slots import select_rollouts  # noqa: E402
 
 
-def _batch(n_groups=2, group_n=9, returns=None, plan_len=None):
+def _batch(n_groups=2, group_n=9, returns=None, plan_len=None, second_doc=False):
     """One row per rollout, marked the way the search manager marks them."""
     n = n_groups * group_n
     slots = [i % group_n for i in range(n)]
-    roles = [ol.role_for_slot(s, group_n, foreign=False) for s in slots]
+    roles = [ol.role_for_slot(s, group_n, foreign=False, second_doc=second_doc) for s in slots]
     rets = returns if returns is not None else [0.0] * n
     plens = plan_len if plan_len is not None else [
-        7 if r == ol.ROLE_DOC else 0 for r in roles]
+        7 if r in (ol.ROLE_DOC, ol.ROLE_DOC_B) else 0 for r in roles]
     return DataProto.from_dict(
         tensors={"oci_role": torch.tensor(roles, dtype=torch.long),
                  "oci_slot": torch.tensor(slots, dtype=torch.long),
@@ -390,6 +407,58 @@ check(all(int(rows5[i]["oci_candidate"]) == 0 and int(rows5[i]["oci_plan_len"]) 
       "and no ordinary row has anything to strip")
 check(all(int(rows5[i]["oci_role"]) == ol.role_for_slot(i, 9, foreign=False) for i in range(9)),
       "every row records the role its slot predicts, which is what the selection asserts")
+
+print("11. the variant that withholds the answer, generated beside the first")
+b_lines = ol.search_rescue_document_lines(QUESTION, {"target": [ANSWER]}, show_answer=False)
+b_block = ol.render_document(b_lines, lead=ol.SEARCH_PROGRESS_LEAD)
+check(ANSWER not in b_block and "what that result gives" in b_block,
+      "progress_only prints no answer anywhere in the block")
+check("A checker" in b_block and "NOT WHAT IT IS" in b_block,
+      "it says a checker is reading the results, which is all the row is told")
+check([ol.role_for_slot(i, 10, foreign=False, second_doc=True) for i in range(10)]
+      == [ol.ROLE_PLAIN] * 7 + [ol.ROLE_RESERVE, ol.ROLE_DOC_B, ol.ROLE_DOC],
+      "ten slots: eight ordinary rollouts and the two rescue rows")
+check(ol.used_per_group(10, foreign=False, second_doc=True) == 8,
+      "still eight trained trajectories a group")
+DOC_A, DOC_B = 9, 8
+m6 = _manager(group_n=10, evidence_for={DOC_A}, search_doc_b="progress_only")
+obs6, _ = m6.reset(KW * 10)
+t6 = obs6["text"]
+check(ANSWER in t6[DOC_A] and ol.PLAN_HEADER in t6[DOC_A],
+      "slot 9 wears the document that shows the answer")
+check(ol.PLAN_HEADER in t6[DOC_B] and ANSWER not in t6[DOC_B],
+      "slot 8 wears the one that does not")
+check(ol.search_progress_line(False) in t6[DOC_B],
+      "and both carry the same per-turn verdict line")
+check(all(ol.PLAN_HEADER not in t6[i] for i in range(8)),
+      "the eight ordinary rows see nothing")
+
+print("12. the guard on bare-number answers")
+YEAR_Q = "when was alka-seltzer launched?"
+check(ol.is_numeric_answer({"target": ["1931"]}) and not ol.is_numeric_answer({"target": [ANSWER]}),
+      "a bare-number answer is recognised")
+check(ol.evidence_in_text("Alka-Seltzer was launched in 1931.", {"target": ["1931"]}, YEAR_Q),
+      "a passage about the question that carries the year counts")
+check(not ol.evidence_in_text("The treaty of 1931 ended the war in Chaco.",
+                              {"target": ["1931"]}, YEAR_Q),
+      "one that merely contains the same digits does not")
+check(ol.contains_answer("The treaty of 1931 ended the war in Chaco.", {"target": ["1931"]}),
+      "the raw test still sees it -- the record keeps both, so the guard's size is measurable")
+check(ol.evidence_in_text(EVIDENCE, {"target": [ANSWER]}, QUESTION),
+      "a worded answer is judged by the answer alone")
+
+print("13. the selection with both rescue rows")
+rets2 = [0.0] * 20
+rets2[9] = 1.0        # the answer_rule row of group 0 solved it
+rets2[8] = 1.0        # so did the progress_only row
+keep2, inj2, met2 = select_rollouts(
+    _batch(n_groups=2, group_n=10, returns=rets2, second_doc=True),
+    tasks=["search"], group_n=10, second_doc=True)
+check(int(keep2.sum()) == 16 and int(met2["oci_slots/trained_per_group"]) == 8,
+      f"eight trajectories a group still train ({int(keep2.sum())} of 20)")
+check(bool(inj2[9]) and not bool(inj2[8]) and int(inj2.sum()) == 1,
+      "the shipped variant is the one injected; the second row is measurement only")
+check(not keep2[8], "and it is dropped rather than trained")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -21,7 +21,40 @@ import os
 import re
 import sys
 
-ROLE_DOC, ROLE_FOREIGN = 3, 4
+ROLE_DOC, ROLE_FOREIGN, ROLE_DOC_B = 3, 4, 5
+RESCUE_ROLES = (ROLE_DOC, ROLE_DOC_B)
+
+
+def fold(s):
+    return re.sub(r"[^0-9a-z]+", " ", str(s).lower()).strip()
+
+
+def hit_turn(r):
+    """Which search first returned the answer (1-based), or None."""
+    for k, t in enumerate(r.get("turns") or [], start=1):
+        if t.get("info_has_answer"):
+            return k
+    return None
+
+
+def query_overlap(rescue, ordinary):
+    """How much the rescue row's queries look like its plain siblings'.
+
+    A rescue row that has read the answer can write a query no plain row could --
+    naming the thing the answer is about without naming the answer. The rule
+    cannot catch that, so it is measured: the share of the rescue row's query
+    words that appear in some sibling's query.
+    """
+    sib = set()
+    for r in ordinary:
+        for t in r.get("turns") or []:
+            sib.update(fold(t.get("query")).split())
+    mine = set()
+    for t in rescue.get("turns") or []:
+        mine.update(fold(t.get("query")).split())
+    if not mine:
+        return None
+    return len(mine & sib) / len(mine)
 
 
 def tag_sources(rows, train_parquet):
@@ -89,14 +122,15 @@ def summarise(rows):
     plain = {c: collections.Counter() for c in ("stuck", "live", "saturated")}
     # the document row, keyed by the class of its group's ordinary rows
     resc = {c: collections.Counter() for c in ("stuck", "live", "saturated")}
+    by_variant = collections.defaultdict(collections.Counter)
     by_source = collections.defaultdict(collections.Counter)
 
     for key, rs in groups.items():
         if len({r.get("question") for r in rs}) > 1:
             out["groups_mixed_question"] += 1
-        ordinary = [r for r in rs if int(r.get("role", 0)) not in (ROLE_DOC, ROLE_FOREIGN)]
-        doc = [r for r in rs if int(r.get("role", 0)) == ROLE_DOC]
-        if len(ordinary) != 8 or len(doc) > 1:
+        ordinary = [r for r in rs if int(r.get("role", 0)) not in RESCUE_ROLES + (ROLE_FOREIGN,)]
+        doc = [r for r in rs if int(r.get("role", 0)) in RESCUE_ROLES]
+        if len(ordinary) != 8 or len(doc) > 2:
             out["groups_wrong_size"] += 1
         if not ordinary:
             continue
@@ -127,22 +161,63 @@ def summarise(rows):
         by_source[src][f"groups_{cls}"] += 1
 
         for r in doc:
-            d = resc[cls]
-            d["rows"] += 1
+            variant = r.get("variant") or ("answer_rule" if int(r.get("role", 0)) == ROLE_DOC
+                                           else "progress_only")
+            # The rescue rate is read per class AND per variant; the variant
+            # comparison is what decides which document ships, and it only means
+            # anything on the groups that need rescuing.
+            targets = [resc[cls]] + ([by_variant[variant]] if cls == "stuck" else [])
             # has_document is False for a yes/no question, whose slot ran plain:
             # the rule is a string test and "yes" is in almost any passage.
             if not r.get("has_document", bool(r.get("answers"))):
-                d["no_document"] += 1
+                for d in targets:
+                    d["rows"] += 1
+                    d["no_document"] += 1
                 continue
             won = float(r.get("won") or 0.0) > 0
             kept = won and not r.get("answer_early")
-            d["scored"] += 1 if won else 0
-            d["scored_and_kept_rule"] += 1 if kept else 0
-            d["broke_rule"] += 1 if r.get("answer_early") else 0
-            d["evidence_seen"] += 1 if r.get("evidence_seen") else 0
-            d["turns"] += int(r.get("n_turns") or 0)
+            k = hit_turn(r)
+            ov = query_overlap(r, ordinary)
+            short = int(r.get("answer_words") or 0) <= 1
+            for d in targets:
+                d["rows"] += 1
+                d["scored"] += 1 if won else 0
+                d["scored_and_kept_rule"] += 1 if kept else 0
+                d["broke_rule"] += 1 if r.get("answer_early") else 0
+                d["evidence_seen"] += 1 if r.get("evidence_seen") else 0
+                d["turns"] += int(r.get("n_turns") or 0)
+                if k is not None:
+                    d["hit_turns"] += k
+                    d["hit_rows"] += 1
+                if ov is not None:
+                    d["overlap_sum"] += ov
+                    d["overlap_rows"] += 1
+                d["short_rows" if short else "long_rows"] += 1
+                if kept:
+                    d["short_kept" if short else "long_kept"] += 1
+                if r.get("answer_numeric"):
+                    d["numeric_rows"] += 1
+                    d["numeric_kept"] += 1 if kept else 0
 
     out["classes"] = dict(cls_count)
+    def _rescue_block(d):
+        shown = d["rows"] - d["no_document"]
+        return {
+            "rows": d["rows"],
+            "no_document": d["no_document"],
+            "scored": rate(d["scored"], shown),
+            "scored_and_kept_rule": rate(d["scored_and_kept_rule"], shown),
+            "broke_rule": rate(d["broke_rule"], shown),
+            "evidence_seen": rate(d["evidence_seen"], shown),
+            "turns_per_row": rate(d["turns"], shown),
+            "searches_to_hit": rate(d["hit_turns"], d["hit_rows"]),
+            "query_overlap_with_siblings": rate(d["overlap_sum"], d["overlap_rows"]),
+            "kept_rule_short_answer": rate(d["short_kept"], d["short_rows"]),
+            "kept_rule_long_answer": rate(d["long_kept"], d["long_rows"]),
+            "numeric_answer_rows": d["numeric_rows"],
+            "kept_rule_numeric_answer": rate(d["numeric_kept"], d["numeric_rows"]),
+        }
+
     for cls in ("stuck", "live", "saturated"):
         c = plain[cls]
         out["plain"][cls] = {
@@ -154,16 +229,8 @@ def summarise(rows):
             "rows_wrote_answer_unseen": rate(c["rows_wrote_unseen"], c["rows"]),
             "turns_per_row": rate(c["turns"], c["rows"]),
         }
-        d = resc[cls]
-        out["rescue"][cls] = {
-            "rows": d["rows"],
-            "no_document": d["no_document"],
-            "scored": rate(d["scored"], d["rows"] - d["no_document"]),
-            "scored_and_kept_rule": rate(d["scored_and_kept_rule"], d["rows"] - d["no_document"]),
-            "broke_rule": rate(d["broke_rule"], d["rows"] - d["no_document"]),
-            "evidence_seen": rate(d["evidence_seen"], d["rows"] - d["no_document"]),
-            "turns_per_row": rate(d["turns"], d["rows"] - d["no_document"]),
-        }
+        out["rescue"][cls] = _rescue_block(resc[cls])
+    out["rescue_by_variant_on_stuck"] = {v: _rescue_block(d) for v, d in by_variant.items()}
     for src, c in by_source.items():
         out["by_source"][src] = {
             "groups": c["groups"],
@@ -187,13 +254,23 @@ def report(s):
         print(f"{cls:<10}{p['groups']:>7}{str(p['row_success']):>9}"
               f"{str(p['rows_with_evidence']):>19}{str(p['groups_with_any_evidence']):>20}"
               f"{str(p['rows_wrote_answer_unseen']):>14}")
-    print("\n2. the document row, by the class of its group")
+    print("\n2. the rescue rows, by the class of their group")
     print(f"{'class':<10}{'rows':>6}{'scored':>9}{'kept rule':>11}{'broke rule':>12}"
           f"{'evidence':>10}{'no doc':>8}")
     for cls in ("stuck", "live", "saturated"):
         d = s["rescue"][cls]
         print(f"{cls:<10}{d['rows']:>6}{str(d['scored']):>9}{str(d['scored_and_kept_rule']):>11}"
               f"{str(d['broke_rule']):>12}{str(d['evidence_seen']):>10}{d['no_document']:>8}")
+
+    if s.get("rescue_by_variant_on_stuck"):
+        print("\n2b. which document, on the stuck groups that need one")
+        print(f"{'variant':<15}{'rows':>6}{'kept rule':>11}{'short ans':>11}{'long ans':>10}"
+              f"{'numeric':>9}{'searches':>10}{'query overlap':>15}")
+        for v, d in sorted(s["rescue_by_variant_on_stuck"].items()):
+            print(f"{v:<15}{d['rows']:>6}{str(d['scored_and_kept_rule']):>11}"
+                  f"{str(d['kept_rule_short_answer']):>11}{str(d['kept_rule_long_answer']):>10}"
+                  f"{str(d['kept_rule_numeric_answer']):>9}{str(d['searches_to_hit']):>10}"
+                  f"{str(d['query_overlap_with_siblings']):>15}")
     if s["by_source"]:
         print("\n3. by dataset")
         print(f"{'source':<12}{'groups':>7}{'stuck':>8}{'stuck w/ evidence':>19}"
