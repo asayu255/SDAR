@@ -1208,34 +1208,44 @@ class RayPPOTrainer:
                 output_texts = self._decode_for_val_table(self.tokenizer, output_ids, self.config.trainer.log_val_generations)
                 sample_outputs.extend(output_texts)
 
-            # test_batch = test_batch.union(test_output_gen_batch)
+                # test_batch = test_batch.union(test_output_gen_batch)
 
-            # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                # evaluate using reward_function
+                result = self.val_reward_fn(test_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_scores.extend(scores)
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-            batch_task_names = get_task_names(test_batch)
-            if batch_task_names is None:
-                batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
-            task_name_lst.append(batch_task_names)
-            tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
-            traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
-            # success rate
-            for k in test_batch.non_tensor_batch.keys():
-                if 'success_rate' in k:
-                    if k not in success_rate_dict:
-                        success_rate_dict[k] = []
-                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
-                    # all success_rate should be the same
-                    for i in range(1, len(test_batch.non_tensor_batch[k])):
-                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+                reward_tensor_lst.append(reward_tensor)
+                data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                batch_task_names = get_task_names(test_batch)
+                if batch_task_names is None:
+                    batch_task_names = np.array([None] * reward_tensor.shape[0], dtype=object)
+                task_name_lst.append(batch_task_names)
+                tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
+                traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+                # success rate
+                for k in test_batch.non_tensor_batch.keys():
+                    if 'success_rate' in k:
+                        if k not in success_rate_dict:
+                            success_rate_dict[k] = []
+                        success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
+                        # all success_rate should be the same
+                        for i in range(1, len(test_batch.non_tensor_batch[k])):
+                            assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
+        # The per-batch scoring block lives INSIDE the generation loop. A
+        # refactor once de-indented it by one level: the loop still ran all 413
+        # batches, only the LAST was scored, and the metrics -- means over
+        # whatever arrived -- reported that one batch as the whole validation.
+        # Two hours of rollouts were thrown away before the row count was
+        # looked at, so the row count is checked here instead of trusted.
+        assert len(reward_tensor_lst) == val_batch_index, (
+            f"scored {len(reward_tensor_lst)} batches but generated {val_batch_index}: "
+            "the per-batch scoring block is outside the generation loop"
+        )
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         task_names = np.concatenate(task_name_lst, axis=0)
