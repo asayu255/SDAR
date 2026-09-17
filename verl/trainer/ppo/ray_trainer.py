@@ -1247,9 +1247,7 @@ class RayPPOTrainer:
             task_names=task_names,
             data_sources=data_sources,
             traj_uids=traj_uids,
-            gamefiles=None,
             tool_callings=tool_callings,
-            response_texts=None,
         )
 
         # evaluate test_score based on data source
