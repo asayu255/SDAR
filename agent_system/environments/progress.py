@@ -49,9 +49,9 @@ def alfworld_k_definition(config) -> str:
     """``algorithm.progress_rank.alfworld_k``: which ALFWorld count (a) ranks by."""
     try:
         cfg = (config.get("algorithm", {}) or {}).get("progress_rank", None) or {}
-        name = str(cfg.get("alfworld_k", "walkthrough") or "walkthrough")
+        name = str(cfg.get("alfworld_k", "milestone") or "milestone")
     except AttributeError:
-        name = "walkthrough"
+        name = "milestone"
     assert name in ALFWORLD_K_DEFINITIONS, (
         f"algorithm.progress_rank.alfworld_k={name!r}; expected one of {ALFWORLD_K_DEFINITIONS}")
     return name

@@ -671,10 +671,13 @@ algorithm:
     # the guard for a step where one group fires on a one-step difference.
     cap_kappa: 1.0
     # A group fires only if its furthest rollout reached this many steps.
-    # ALFWorld's first step ("go to X") and WebShop's (a results page showing the
-    # product) are hit by chance; Search has one step.
+    # WebShop 2: its first step (a results page showing the product) is hit by
+    # chance. ALFWorld 1 under the milestone count: its first milestone (took an
+    # object of the target type) is not, and at step 300 failed look_at rollouts
+    # stopped at k = 1 (17 of 19) -- a minimum of 2 would never fire there. The
+    # walkthrough count was designed with 2 ("go to X" matches by chance). Search 1.
     min_top_k:
-      alfworld: 2
+      alfworld: 1
       webshop: 2
       search: 1
     tasks: ["alfworld", "webshop", "search"]
@@ -682,9 +685,11 @@ algorithm:
     #   walkthrough  steps of the game's walkthrough, word for word and in order
     #   milestone    the task type's milestones by object type, in any order
     # The walkthrough count stops at the first step a rollout does differently --
-    # another receptacle, another instance of the same object -- and scored 0 on
-    # all eight winners of a step-75 group that went straight to the cup.
-    alfworld_k: walkthrough
+    # another receptacle, another instance of the same object: it scored below K on
+    # 68% (step 75) and 70% (step 300) of WINNING rollouts, against 6-7% for
+    # WebShop's count and 4% for Search's. Milestone is the default (a) ranks by;
+    # walkthrough stays recorded for comparison.
+    alfworld_k: milestone
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

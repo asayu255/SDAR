@@ -96,7 +96,7 @@ print("3. verdicts")
 cases = {
     "fired": [("a", 1, 0.0, 3, 6, 0.0), ("b", 1, 0.0, 1, 6, 0.0)],
     "no_difference": [("a", 1, 0.0, 2, 6, 0.0), ("b", 1, 0.0, 2, 6, 0.0)],
-    "top_below_min": [("a", 1, 0.0, 1, 6, 0.0), ("b", 1, 0.0, 0, 6, 0.0)],
+    "top_below_min": [("a", 1, 0.0, 1, 6, 0.0), ("b", 1, 0.0, 0, 6, 0.0)],   # judged at min 2 below
     "no_progress": [("a", 1, 0.0, 3, 6, 0.0), ("b", 1, 0.0, 0, 0, 0.0)],
 }
 for want, trajs in cases.items():
@@ -104,8 +104,15 @@ for want, trajs in cases.items():
     grp = pr.failed_groups(b["uids"], b["tuids"], b["task_names"], b["episode_rewards"], range(2))
     v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"],
                               traj_prog=pr.trajectory_progress(b["tuids"], b["k_rows"], b["total_rows"], range(2)),
-                              min_top_k=pr.DEFAULT_MIN_TOP_K, tasks=["alfworld"])
+                              min_top_k={"alfworld": 2}, tasks=["alfworld"])
     check(v["g"]["verdict"] == want, f"{want}")
+b = build([("g", "alfworld", [("a", 1, 0.0, 1, 2, 0.0), ("b", 1, 0.0, 0, 2, 0.0)])])
+grp = pr.failed_groups(b["uids"], b["tuids"], b["task_names"], b["episode_rewards"], range(2))
+v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"],
+                          traj_prog=pr.trajectory_progress(b["tuids"], b["k_rows"], b["total_rows"], range(2)),
+                          min_top_k=pr.DEFAULT_MIN_TOP_K, tasks=["alfworld"])
+check(v["g"]["verdict"] == "fired",
+      "ALFWorld fires on a one-milestone difference by default (failed look_at rollouts stop at k = 1 of 2)")
 b = build([("g", "search", [("a", 1, 0.0, 1, 1, 0.0), ("b", 1, 0.0, 0, 1, 0.0)])])
 grp = pr.failed_groups(b["uids"], b["tuids"], b["task_names"], b["episode_rewards"], range(2))
 v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"],

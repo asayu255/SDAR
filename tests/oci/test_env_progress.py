@@ -153,8 +153,12 @@ def _alf_proj(texts, pools):
     return [t.lower() for t in texts], [1] * len(texts)
 
 
+check(P.alfworld_k_definition(config(True)) == "milestone",
+      "the milestone count is what (a) ranks ALFWorld by unless told otherwise")
 for on in (True, False):
-    mgr = AlfWorldEnvironmentManager(_AlfEnvs(), _alf_proj, config(on))
+    _cfg = config(on)
+    _cfg.algorithm.progress_rank.alfworld_k = "walkthrough"   # this section tests the pointer
+    mgr = AlfWorldEnvironmentManager(_AlfEnvs(), _alf_proj, _cfg)
     mgr.reset(None)
     _, _, _, infos = mgr.step(["go to desk 1", "take pencil 2 from desk 1"])
     if on:

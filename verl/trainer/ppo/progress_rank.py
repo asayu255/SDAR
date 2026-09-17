@@ -21,8 +21,9 @@ term sums to zero over exactly what GRPO's own advantage sums to zero over. The
 ordinary advantage (format penalty included) is computed first and left as it is.
 
 A group fires only when its k are not all equal AND its furthest rollout reached
-``min_top_k`` steps (ALFWorld and WebShop 2: the first step, "go to X" / a results
-page showing the product, is hit by chance; Search 1, where there is one step).
+``min_top_k`` steps (WebShop 2: a results page showing the product is hit by
+chance; ALFWorld 1 under its milestone count, whose first milestone -- took an
+object of the target type -- is not; Search 1, where there is one step).
 A stuck group with no difference is (b)'s, and is left at zero here.
 
 HOW c IS SET, PER TASK, EVERY STEP.
@@ -78,7 +79,7 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "DEFAULT_MIN_TOP_K", "failed_
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
-DEFAULT_MIN_TOP_K = {"alfworld": 2, "webshop": 2, "search": 1}
+DEFAULT_MIN_TOP_K = {"alfworld": 1, "webshop": 2, "search": 1}
 
 # A group verdict, per stuck group.
 FIRED = "fired"

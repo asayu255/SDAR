@@ -261,8 +261,10 @@
 "algorithm.progress_rank.ema_alpha": 0.2
 "algorithm.progress_rank.ema_floor": 0.01
 "algorithm.progress_rank.cap_kappa": 1.0
-"algorithm.progress_rank.min_top_k": {alfworld: 2, webshop: 2, search: 1}
+"algorithm.progress_rank.min_top_k": {alfworld: 1, webshop: 2, search: 1}
 "algorithm.progress_rank.tasks": [alfworld, webshop, search]
-# Which ALFWorld count (a) ranks by. Changing it is a different arm: edit here.
-"algorithm.progress_rank.alfworld_k": walkthrough
+# Which ALFWorld count (a) ranks by. The walkthrough count scored below K on 70% of
+# winning rollouts at step 300; the milestone count, by task type, is used.
+# Changing it is a different arm: edit here.
+"algorithm.progress_rank.alfworld_k": milestone
 "trainer.test_freq": -1
