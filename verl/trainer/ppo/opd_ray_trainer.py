@@ -1736,6 +1736,66 @@ class OPDRayTrainer(RayPPOTrainer):
         state["batches"] = n
         return state
 
+    def _accumulate_progress_probe(self, batch, state: dict, probe_cfg) -> dict:
+        """grad_probe.mode=progress: one row per trajectory of (task, group, k, K, reward).
+
+        Checks the premise (a) rests on -- that reward rises with k -- with the
+        definitions the run uses, on the environment's own reward. Needs
+        algorithm.progress_rank.enable, which is what makes the managers count k;
+        no update is taken in a probe step, so rho does not matter here. The
+        records go to ``<out_path>.trajs/b<n>.jsonl`` and the running summary to
+        the payload. See verl/trainer/ppo/progress_probe.py.
+        """
+        import json as _json
+        import os as _os
+
+        import numpy as np
+
+        from verl.trainer.ppo import progress_probe as _pp
+        from verl.trainer.ppo.metric_utils import normalize_task_name
+        from verl.trainer.ppo.progress_rank import PROGRESS_K_KEY, PROGRESS_TOTAL_KEY
+
+        pr_cfg = self.config.algorithm.get("progress_rank", None)
+        assert pr_cfg is not None and bool(pr_cfg.get("enable", False)), (
+            "grad_probe.mode=progress reads the progress columns; launch with "
+            "algorithm.progress_rank.enable=True"
+        )
+        nt = batch.non_tensor_batch
+        missing = [k for k in ("uid", "traj_uid", "episode_rewards", PROGRESS_K_KEY, PROGRESS_TOTAL_KEY)
+                   if k not in nt]
+        assert not missing, f"grad_probe.mode=progress: the batch has no {missing}"
+        n_rows = len(batch)
+        real = np.ones(n_rows, dtype=bool)
+        pad = batch.batch.get(PADDING_ROW_KEY, None)
+        if pad is not None:
+            real &= ~pad.reshape(-1).to(torch.bool).cpu().numpy()
+        task_names = get_task_names(batch)
+        if task_names is None:
+            task_names = np.array([normalize_task_name(self.config.env.get("env_name", None))] * n_rows,
+                                  dtype=object)
+
+        n = int(state.get("batches", 0)) + 1
+        trajs = _pp.trajectory_table(
+            uids=nt["uid"], tuids=nt["traj_uid"], task_names=task_names,
+            episode_rewards=nt["episode_rewards"], k_rows=nt[PROGRESS_K_KEY],
+            total_rows=nt[PROGRESS_TOTAL_KEY], real_rows=real, gamefiles=nt.get("gamefile", None))
+        for rec in trajs:
+            rec["batch"] = n
+            rec["global_step"] = int(self.global_steps)
+        dump = str(probe_cfg.get("out_path", "grad_probe.json")) + ".trajs"
+        _os.makedirs(dump, exist_ok=True)
+        with open(_os.path.join(dump, f"b{n}.jsonl"), "w") as f:
+            for rec in trajs:
+                f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+
+        acc = state.setdefault("progress_trajs", [])
+        acc.extend(trajs)
+        state["progress"] = _pp.summarise_progress(acc, min_top_k=dict(pr_cfg.get("min_top_k", {}) or {}))
+        for line in _pp.format_progress_report(state["progress"]):
+            print(f"[grad_probe] progress batch {n}: {line}", flush=True)
+        state["batches"] = n
+        return state
+
     def _accumulate_slots_probe(self, batch, state: dict, probe_cfg, rec: dict, n: int) -> dict:
         """The ten-slot layout's probe: what each special slot did, and its rho.
 
@@ -2435,7 +2495,7 @@ class OPDRayTrainer(RayPPOTrainer):
                         )
 
                         probe_mode = str(probe_cfg.get("mode", "tau") or "tau")
-                        assert probe_mode in ("tau", "oci", "mass"), (
+                        assert probe_mode in ("tau", "oci", "mass", "progress"), (
                             f"grad_probe.mode={probe_mode!r}: this branch carries only the "
                             "zero-backward probe modes ('tau', 'oci'). 'halves' and 'terms' "
                             "need the worker-side gradient hooks, which were not ported -- "
@@ -2453,6 +2513,8 @@ class OPDRayTrainer(RayPPOTrainer):
                             )
                         elif probe_mode == "mass":
                             self._accumulate_mass_probe(batch, self._grad_probe_state, probe_cfg)
+                        elif probe_mode == "progress":
+                            self._accumulate_progress_probe(batch, self._grad_probe_state, probe_cfg)
                         else:
                             self._accumulate_oci_probe(batch, self._grad_probe_state, probe_cfg)
 
@@ -2478,7 +2540,7 @@ class OPDRayTrainer(RayPPOTrainer):
                                 ),
                             }
                             for k in ("advantages", "tau", "groups", "prompt_len",
-                                      "oci", "reachability", "mass", "mass_batches"):
+                                      "oci", "reachability", "mass", "mass_batches", "progress"):
                                 if self._grad_probe_state.get(k, None):
                                     payload[k] = self._grad_probe_state[k]
                             write_payload(payload, out_path)
