@@ -122,13 +122,19 @@
 # enable_gradient_checkpointing sits on the gradient path even though it looks
 # like a pure memory knob: a recomputed forward and a stored one differ in their
 # last bits under autocast, the same class as no_sync_grad_accum. It is pinned
-# ON. Turning it off is worth ~a third of actor.bwd, but it was measured: with it
-# off, step 1 OOMed in its first micro-batch on a 94.97 GiB card, so the ~13 GB of
-# activations it would keep does not exist. (Do not re-derive that headroom from
-# perf/max_memory_*: both of those high-water marks have printed values larger
-# than the card, because vLLM's allocator pool is counted by torch while its
-# pages are mapped and unmapped underneath. See the run script.)
-"actor_rollout_ref.model.enable_gradient_checkpointing": true
+# OFF on this arm, and that is a change from the control's ON.
+#
+# WHY IT IS AFFORDABLE HERE AND WAS NOT BEFORE. The measurement that pinned it ON
+# was on TWO GPUs: with it off, step 1 OOMed in its first micro-batch on a 94.97
+# GiB card, because the ~13 GB of activations it keeps had nowhere to go. This arm
+# runs on FOUR, which halves the actor/optimizer/teacher shards and halves each
+# engine's KV demand, so the update phase has roughly 10 GB more per card. It is
+# worth about a third of actor.bwd (~60 s a step). Untested in this combination:
+# if it OOMs, it OOMs at step 1 and the supervisor's first attempt shows it.
+# (Do not re-derive the headroom from perf/max_memory_*: both of those high-water
+# marks have printed values larger than the card, because vLLM's allocator pool is
+# counted by torch while its pages are mapped and unmapped underneath.)
+"actor_rollout_ref.model.enable_gradient_checkpointing": false
 # rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that only
 # half concerns log probs. This arm DOES run compute_log_prob (the policy
 # gradient needs old_log_prob), so the value sizes a real forward -- but that
