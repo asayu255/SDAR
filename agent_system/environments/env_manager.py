@@ -48,8 +48,9 @@ from agent_system.environments.oci_layout import (
 from agent_system.memory import SimpleMemory, SearchMemory
 from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
-    WebshopProgress, advance_walkthrough, alfworld_k_definition as _alfworld_k_definition,
-    progress_on as _progress_on, put_progress as _put_progress, search_progress as _search_progress)
+    ObservationCoverage, WebshopProgress, advance_walkthrough,
+    alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
+    put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +813,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         obs, infos = self.envs.reset(kwargs=kwargs)
         self._probe_flush()
         self.tasks = obs
+        # ProGPO's coverage, a shadow of (a)'s k: the raw question is o_1.
+        self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
         # The question and its accepted answers, for the document slot. Unlike
         # the other two tasks nothing has to be dug out of the environment: the
         # dataset row IS the problem, and it arrives here as the reset kwargs.
@@ -909,6 +912,10 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                                       answer_strings=_answer_strings, is_yesno=_is_yesno)
                      for i in range(len(infos))]
             _put_progress(infos, [p[0] for p in _prog], [p[1] for p in _prog])
+            _cov = getattr(self, "_coverage", None) or []
+            for i, cov in enumerate(_cov[:len(next_obs)]):
+                cov.step(next_obs[i])
+            _put_coverage(infos, _cov)
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
@@ -1186,6 +1193,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # own game file (traj_data.json beside it).
         self._milestones = ([AlfworldMilestones(gf) for gf in (self.gamefile or [None] * len(text_obs))]
                             if _progress_on(self.config) else [])
+        # ProGPO's coverage, a shadow of (a)'s k, from the game's own opening text.
+        self._coverage = ([ObservationCoverage(o) for o in text_obs] if _progress_on(self.config) else [])
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
@@ -1243,6 +1252,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 _put_progress(infos, _mk, _mt)
             else:
                 _put_progress(infos, _ptrs, _totals)
+            _cov = getattr(self, "_coverage", None) or []
+            for i, cov in enumerate(_cov[:len(text_obs)]):
+                cov.step(text_obs[i])
+            _put_coverage(infos, _cov)
 
         # add action_valid to infos
         for i, info in enumerate(infos):
@@ -1611,6 +1624,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         self._ws_progress = ([WebshopProgress(g, (info or {}).get('available_actions'))
                               for g, info in zip(self.goals, infos or [])]
                              if _progress_on(self.config) else [])
+        # ProGPO's coverage, a shadow of (a)'s k: the simulator's page text as it
+        # emitted it, BEFORE format_obs trims it for the prompt.
+        self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
         obs = self.format_obs(obs)
         # infos = [None] * self.envs.num_envs
         observations = {'text': self.build_text_obs(obs, infos, init=True), 
@@ -1638,6 +1654,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
+        _cov = getattr(self, "_coverage", None) or []
+        for i, cov in enumerate(_cov[:len(next_obs)]):
+            cov.step(next_obs[i])
 
         next_obs = self.format_obs(next_obs)
 
@@ -1654,6 +1673,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             for i, act in enumerate(actions[:len(_wsp)]):
                 _wsp[i].step(act, (infos[i] or {}).get('available_actions'))
             _put_progress(infos, [p.k for p in _wsp], [p.total for p in _wsp])
+        _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])

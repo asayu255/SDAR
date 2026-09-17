@@ -9,10 +9,21 @@ group does not stop a task from learning; it shifts that task's update from the
 reward toward the teacher. This module measures that shift, per task and per
 group class, on the loss the optimizer actually sees.
 
-THE CLASSES. live; stuck and saturated, each split by whether any advantage in
-the group is non-zero (``mixed``: the format channel is carrying it) or none is
-(``uniform``: the policy gradient is exactly zero there). Pooling the two would
-make a stalled task's policy gradient look healthy.
+THE CLASSES. live; stuck and saturated, each split by whether the group's row
+SCORES -- the penalty-inclusive values GRPO normalises -- differ (``mixed``: the
+format channel is carrying it) or are all the same (``uniform``: no signal).
+Pooling the two would make a stalled task's policy gradient look healthy.
+
+JUDGED ON THE SCORES, NOT ON |A|. A group whose rows all score the same non-zero
+value -- every turn penalised -0.1, which is every turn before the policy writes
+its own <think> tags -- gets an advantage that is float32 rounding, not zero:
+|A| = 0.0074 on every row of 400 (0.0147 at 300 rows, exactly 0 at 120). A test
+of |A| > 1e-12 called those groups mixed, and at xt1 step 25 it filed ALFWorld's
+33 and WebShop's 19 stuck groups there; their 1.3% and 0.6% "PG share" was that
+rounding. One differing row among 400 gives 0.05 and 19.9 instead, so a spread in
+the scores above SCORE_SPREAD_EPS (far below the smallest penalty, 0.01) is the
+test that separates the two. Payloads written before this change carry the old
+classes; read their stuck/saturated rows with |A| < 0.03 as rounding.
 
 THE NUMBERS, per (task, class):
   tokens         response tokens of the real rows (padding rows carry weight 0)
@@ -47,17 +58,26 @@ FIELDS = ("groups", "rows", "tokens", "pg_mass", "kl_mass", "pg_mass_driver",
 MAX_FIELDS = ("abs_a_max",)
 
 
-def group_class(status: str, advantages_abs_max: float, eps: float = 1e-12) -> str:
-    """The class of one group, from its verdict and its largest |advantage|."""
+SCORE_SPREAD_EPS = 1e-6
+
+
+def score_spread(scores) -> float:
+    """max - min of a group's row scores; 0 for no rows."""
+    s = np.asarray(scores, dtype=float)
+    return float(s.max() - s.min()) if s.size else 0.0
+
+
+def group_class(status: str, spread: float, eps: float = SCORE_SPREAD_EPS) -> str:
+    """The class of one group, from its verdict and the spread of its row scores."""
     if status == "live":
         return "live"
     if status not in ("stuck", "saturated"):
         raise ValueError(f"unknown group status {status!r}")
-    return f"{status}_{'mixed' if advantages_abs_max > eps else 'uniform'}"
+    return f"{status}_{'mixed' if spread > eps else 'uniform'}"
 
 
 def aggregate_term_mass(groups: Dict[str, Dict], records: Iterable[dict], *,
-                        row_mask: np.ndarray, advantages: np.ndarray,
+                        row_mask: np.ndarray, advantages: np.ndarray, row_scores: np.ndarray,
                         task_weights: np.ndarray, pg_loss_coef: float) -> Dict:
     """Sum the per-row terms into (task, class) cells.
 
@@ -66,6 +86,8 @@ def aggregate_term_mass(groups: Dict[str, Dict], records: Iterable[dict], *,
                     kl_row_coef, teacher_kl_coef)
     ``row_mask``    (rows, resp) response/loss mask of the batch as the actor saw it
     ``advantages``  (rows, resp) the batch's advantages
+    ``row_scores``  (rows,) the score GRPO normalised per row (token_level_rewards
+                    summed: the environment's reward minus the format penalty)
     ``task_weights`` (rows,) the per-task row weights; 0 marks adjust_batch padding
     """
     by_row = {}
@@ -73,6 +95,7 @@ def aggregate_term_mass(groups: Dict[str, Dict], records: Iterable[dict], *,
         by_row[int(rec["row"])] = rec
     mask = np.asarray(row_mask, dtype=float)
     adv = np.asarray(advantages, dtype=float)
+    scores = np.asarray(row_scores, dtype=float).reshape(-1)
     w = np.asarray(task_weights, dtype=float)
 
     cells: Dict = defaultdict(lambda: {f: 0.0 for f in FIELDS})
@@ -83,8 +106,7 @@ def aggregate_term_mass(groups: Dict[str, Dict], records: Iterable[dict], *,
         padding += len(g["rows"]) - len(rows)
         if not rows:
             continue
-        amax = float(np.max(np.abs(adv[rows] * mask[rows]))) if rows else 0.0
-        cls = group_class(g["status"], amax)
+        cls = group_class(g["status"], score_spread(scores[rows]))
         cell = cells[(str(g.get("task") or ""), cls)]
         cell["groups"] += 1
         for i in rows:

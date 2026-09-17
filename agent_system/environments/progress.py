@@ -28,10 +28,15 @@ THE SAME CORRECT SEQUENCES AS THE DOCUMENTS, per task:
             progress ("yes" is in almost any passage), and neither does a question
             with no answer to look for.
 
+BESIDE k, A SHADOW: ProGPO's first-visit observation coverage D (2607.22724), the
+closest published progress signal, counted on the same rollouts so the two can be
+compared without a run of their own (see ObservationCoverage). Nothing ranks by it.
+
 NOTHING HERE TOUCHES A REWARD OR AN OBSERVATION. The counts ride on the info
 dict to the rollout loop and from there to the trainer as columns.
 """
 
+import hashlib
 import re
 from typing import Iterable, Optional, Tuple
 
@@ -43,6 +48,8 @@ PROGRESS_TOTAL_INFO = "progress_total"
 PROGRESS_K_MILESTONE_INFO = "progress_k_milestone"
 PROGRESS_TOTAL_MILESTONE_INFO = "progress_total_milestone"
 ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone")
+# ProGPO's D, as of the row's turn: distinct observations seen, the first included.
+COVERAGE_D_INFO = "coverage_d"
 
 
 def alfworld_k_definition(config) -> str:
@@ -346,3 +353,47 @@ def put_progress(infos: Iterable, ks, totals, *, k_key: str = PROGRESS_K_INFO,
         if isinstance(info, dict):
             info[k_key] = int(k)
             info[total_key] = int(n)
+
+
+# --- ProGPO's coverage, as a shadow -------------------------------------- #
+
+def _observation_digest(observation) -> bytes:
+    text = "" if observation is None else str(observation)
+    return hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest()
+
+
+class ObservationCoverage:
+    """ProGPO's first-visit observation coverage of one trajectory, D.
+
+    D = |{o_1, ..., o_{T+1}}|: how many distinct observations the trajectory has
+    seen, the initial one included. ProGPO's progress is P = (D - 1) / T with T
+    the actions executed (their Proposition 4.1(i)); the trainer takes T as the
+    trajectory's turn rows. As their Section 8.2 specifies, observations are the
+    exact strings the environment emitted -- no case, whitespace or tokenisation
+    rule, the terminal observation treated like any other -- compared through a
+    128-bit digest, so a trajectory keeps 16 bytes per distinct observation
+    rather than the pages themselves.
+
+    A SHADOW. It is recorded beside k so the two progress signals can be compared
+    on the same rollouts (shadow/coverage/* metrics, the group records); no
+    advantage is ever computed from it.
+    """
+
+    __slots__ = ("_seen",)
+
+    def __init__(self, initial_observation):
+        self._seen = {_observation_digest(initial_observation)}
+
+    def step(self, observation) -> None:
+        self._seen.add(_observation_digest(observation))
+
+    @property
+    def d(self) -> int:
+        return len(self._seen)
+
+
+def put_coverage(infos: Iterable, coverages) -> None:
+    """Write each trajectory's D into its info dict, in place."""
+    for info, cov in zip(infos, coverages):
+        if isinstance(info, dict) and cov is not None:
+            info[COVERAGE_D_INFO] = int(cov.d)

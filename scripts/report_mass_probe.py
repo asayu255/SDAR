@@ -3,7 +3,13 @@
 WHAT IT ANSWERS. For one checkpoint of the 3-task run: how much of each task's
 update is reward-driven (policy gradient) and how much is teacher-driven
 (top-k KL), split by group class -- live, and stuck/saturated split by whether
-the format channel left any non-zero advantage in the group.
+the group's row scores differ (the format channel acts: "mixed") or not.
+
+PAYLOADS WRITTEN BEFORE THE SCORE-SPREAD CLASSES called a group mixed when any
+|A| > 1e-12, which float32 rounding satisfies in a group whose rows all score -0.1
+(|A| 0.0074 on every row). In those payloads -- mass_klwctl_step25.json among
+them -- ALFWorld's 33 and WebShop's 19 "stuck_mixed" groups are rounding, and so
+is their PG share; see verl/trainer/ppo/term_mass.py.
 
 WHY A SEPARATE SCRIPT. The trainer prints a running table while the probe runs;
 this one adds what a running table cannot have: the spread over batches, so a

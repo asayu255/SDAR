@@ -273,7 +273,8 @@ new, m = ctl.apply(advantages=adv, mask=mask, uids=index, tuids=traj_index,
                    episode_rewards=np.zeros(n, dtype=object),
                    k_rows=np.array([r[2] for r in rows], dtype=object),
                    total_rows=np.array([r[3] for r in rows], dtype=object),
-                   real_rows=np.ones(n, dtype=bool), stat_rows=np.ones(n, dtype=bool))
+                   real_rows=np.ones(n, dtype=bool), stat_rows=np.ones(n, dtype=bool),
+                   row_scores=tlr.sum(-1).numpy())
 delta = (new - adv)[:, 0]
 check(abs(float(delta.sum())) < 1e-6,
       "(a)'s addition sums to zero over the rows compute_grpo_outcome_advantage centres over")
@@ -284,6 +285,160 @@ check(len({round(float(delta[i]), 9) for i in same_k}) == 1,
       "two rollouts that got equally far get the same addition")
 check(m["progress_rank/alfworld/stuck_mixed"] == 1.0,
       "and the group is recorded as one the format channel already moves")
+
+
+def build2(groups, resp=4):
+    """``build`` plus per-row score, validity and coverage D, from
+    ``(traj, turns, env_reward, k, K, adv, score, valid, d)``; the last three may be
+    lists with one value per turn."""
+    b = build([(u, task, [x[:6] for x in trajs]) for u, task, trajs in groups], resp)
+    sc, va, dd = [], [], []
+    for _, _, trajs in groups:
+        for _traj, turns, _r, _k, _K, _a, s, v, d in trajs:
+            for j in range(turns):
+                sc.append(s[j] if isinstance(s, list) else s)
+                va.append(v[j] if isinstance(v, list) else v)
+                dd.append(d[j] if isinstance(d, list) else d)
+    b["row_scores"] = np.array(sc, dtype=float)
+    b["valid_rows"] = np.array(va, dtype=object)
+    b["coverage_rows"] = np.array(dd, dtype=object)
+    return b
+
+
+print("13. the format split is judged on the scores, not on |A|")
+# Two stuck groups of 8 x 50 turns and the same k: in one every turn is penalised
+# (the real GRPO statistic returns rounding there -- at 400 rows; some sizes happen
+# to round to exactly 0), the other has one valid turn.
+rows = []   # (uid, traj, score, k)
+for uid, prefix in (("allbad", "a"), ("onegood", "b")):
+    for j, k in enumerate((2, 1, 1, 0, 2, 1, 1, 0)):
+        for t in range(50):
+            rows.append((uid, f"{prefix}{j}", 0.0 if (uid == "onegood" and j == 0 and t == 0) else -0.1, k))
+n = len(rows)
+tlr = torch.zeros(n, 5)
+mask = torch.zeros(n, 5)
+mask[:, :4] = 1.0
+for i, r in enumerate(rows):
+    tlr[i, 3] = r[2]
+index = np.array([r[0] for r in rows], dtype=object)
+traj_index = np.array([r[1] for r in rows], dtype=object)
+adv, _ = compute_grpo_outcome_advantage(tlr, mask, index, traj_index, compute_mean_std_cross_steps=True)
+check(0.0 < float(adv[:400, 0].abs().max()) < 0.03,
+      f"the all -0.1 group's |A| is rounding ({float(adv[:400, 0].abs().max()):.4f}), not zero")
+kw = dict(advantages=adv, mask=mask, uids=index, tuids=traj_index,
+          task_names=np.array(["alfworld"] * n, dtype=object), episode_rewards=np.zeros(n, dtype=object),
+          k_rows=np.array([r[3] for r in rows], dtype=object),
+          total_rows=np.array([3] * n, dtype=object),
+          real_rows=np.ones(n, dtype=bool), stat_rows=np.ones(n, dtype=bool))
+ctl = pr.ProgressRankController(rho=0.05, cap_kappa=100.0)
+ctl.ema["alfworld"] = 0.3
+new, m = ctl.apply(**kw, row_scores=tlr.sum(-1).numpy(),
+                   valid_rows=np.array([1.0 if r[2] == 0.0 else 0.0 for r in rows], dtype=object))
+p = "progress_rank/alfworld"
+check(m[f"{p}/stuck_uniform"] == 1.0 and m[f"{p}/stuck_mixed"] == 1.0,
+      "uniform: the group whose scores are all -0.1; mixed: the one with a valid turn")
+check(m[f"{p}/q_fail"] == 1.0 and m["shadow/progpo/alfworld/q_fail"] == 0.0,
+      "both are stuck by the environment, and ProGPO's gate (every |score| < 1e-3) opens on neither")
+check(abs(m[f"{p}/inject_share_mixed"] - 0.5) < 1e-9
+      and abs(m[f"{p}/inject_up_mixed"] + m[f"{p}/inject_up_uniform"] - m[f"{p}/inject_up"]) < 1e-12,
+      "(a)'s push splits by class and the parts add up (two identical groups: half each)")
+# row 400 is the one valid turn (trajectory b0, k = 2 against a mean of 1, so its
+# score is +1/3): c / 3 per token, times its 4 tokens, over the task's tokens
+one_valid = m[f"{p}/c"] / 3.0 * 4 / float(mask.sum())
+check(abs(float(new[400, 0] - adv[400, 0]) - m[f"{p}/c"] / 3.0) < 1e-6, "(that row did get c / 3)")
+check(abs(m[f"{p}/inject_down_invalid"] - m[f"{p}/inject_down"]) < 1e-12
+      and abs(m[f"{p}/inject_up"] - m[f"{p}/inject_up_invalid"] - one_valid) < 1e-9,
+      "on invalid-turn rows: all of the push-down, and all of the push-up but the one valid row's")
+_, m_plain = pr.ProgressRankController(rho=0.05).apply(**kw)
+check(f"{p}/stuck_mixed" not in m_plain and "shadow/progpo/alfworld/q_fail" not in m_plain
+      and f"{p}/inject_up_invalid" not in m_plain,
+      "without scores or validity nothing is guessed from |A|: those metrics are absent")
+
+print("14. the cap, reported on both sides")
+b = build([("live", "alfworld", live),
+           ("stuck", "alfworld", [("s1", 1, 0.0, 2, 6, 0.0), ("s2", 1, 0.0, 1, 6, 0.0)])])
+_, m = pr.ProgressRankController(rho=0.5, cap_kappa=1.0).apply(**b)
+check(m[f"{p}/capped"] == 1.0 and m[f"{p}/c_uncapped"] > m[f"{p}/c_cap"]
+      and m[f"{p}/c"] == m[f"{p}/c_cap"], "capped: c is the cap, and the target above it is kept")
+b = build([("live", "alfworld", [("l1", 2, 10.0, 6, 6, 1.0), ("l2", 2, 0.0, 2, 6, -1.0)]),
+           ("stuck", "alfworld", [("s1", 2, 0.0, 4, 6, 0.0), ("s2", 2, 0.0, 1, 6, 0.0)])])
+_, m = pr.ProgressRankController(rho=0.05, cap_kappa=100.0).apply(**b)
+check(m[f"{p}/capped"] == 0.0 and m[f"{p}/c"] == m[f"{p}/c_uncapped"] < m[f"{p}/c_cap"],
+      "uncapped: c is the target, below the cap")
+check(abs(m[f"{p}/share_of_ema"] - 0.05) < 1e-9, "and share_of_ema is the share actually injected (rho)")
+
+print("15. winners the count gives nothing")
+b = build2([("live", "search", [("w1", 1, 1.0, 0, 1, 0.5, 1.0, 1.0, 2), ("w2", 1, 1.0, 1, 1, 0.5, 1.0, 1.0, 2),
+                                ("l1", 1, 0.0, 1, 1, -0.5, 0.0, 1.0, 2)]),
+            ("yesno", "search", [("w3", 1, 1.0, 0, 0, 0.5, 1.0, 1.0, 1), ("l2", 1, 0.0, 0, 0, -0.5, 0.0, 1.0, 1)])])
+_, m = pr.ProgressRankController(rho=0.05).apply(**b)
+check(abs(m["progress_rank/search/won_with_zero_k"] - 0.5) < 1e-12,
+      "k = 0 among winners that have a sequence: w1 of w1, w2 (w3's question has none)")
+check(abs(m["shadow/coverage/search/won_with_zero"] - 1.0 / 3.0) < 1e-12,
+      "coverage: a winner that saw one observation (D = 1) scores P = 0 -- w3 of three")
+
+print("16. ProGPO's coverage beside k, on the same groups")
+# g1: stuck, all turns valid (ProGPO's gate open), k and P both differ -> both fire
+#     a: T 4 D 5 P 1.0 k 3 | b: T 4 D 3 P 0.5 k 1 | c: T 2 D 2 P 0.5 k 2 | d: T 2 D 1 P 0 k 0
+# g2: stuck, one invalid turn (gate shut), k equal, P differs -> only coverage fires
+# g3: stuck, all valid, k differs, P equal -> only (a) fires
+# live and saturated groups for the counts and the records
+b = build2([
+    ("g1", "alfworld", [("a", 4, 0.0, 3, 3, 0.0, 0.0, 1.0, [2, 3, 4, 5]), ("b", 4, 0.0, 1, 3, 0.0, 0.0, 1.0, 3),
+                        ("c", 2, 0.0, 2, 3, 0.0, 0.0, 1.0, 2), ("d", 2, 0.0, 0, 3, 0.0, 0.0, 1.0, 1)]),
+    ("g2", "alfworld", [("e", 2, 0.0, 1, 3, 0.0, [-0.1, 0.0], [0.0, 1.0], 3), ("f", 2, 0.0, 1, 3, 0.0, 0.0, 1.0, 2)]),
+    ("g3", "alfworld", [("g", 2, 0.0, 2, 3, 0.0, 0.0, 1.0, 3), ("h", 2, 0.0, 0, 3, 0.0, 0.0, 1.0, 3)]),
+    ("lv", "alfworld", [("i", 1, 10.0, 3, 3, 1.0, 10.0, 1.0, 2), ("j", 1, 0.0, 1, 3, -1.0, 0.0, 1.0, 2)]),
+    ("st", "alfworld", [("k", 1, 10.0, 3, 3, 0.0, 10.0, 1.0, 2), ("l", 1, 10.0, 3, 3, 0.0, 10.0, 1.0, 2)]),
+])
+ctl = pr.ProgressRankController(rho=0.05, cap_kappa=100.0)
+new, m = ctl.apply(**b)
+s = "shadow/coverage/alfworld"
+check(m[f"{s}/stuck_fired"] == 2.0 and m[f"{s}/both_fired"] == 1.0
+      and m["shadow/progpo/alfworld/fired"] == 1.0,
+      "coverage fires in g1 and g2, both in g1 only, and ProGPO itself (gate open) in g1 only")
+check(abs(m[f"{s}/spearman_vs_k"] - 4.5 / np.sqrt(22.5)) < 1e-12,
+      "Spearman on average ranks in g1: k (3,1,2,0) against P (1,.5,.5,0) is 4.5/sqrt(22.5)")
+check(m[f"{p}/stuck_fired"] == 2.0 and m[f"{p}/stuck_no_difference"] == 1.0,
+      "(a) fires in g1 and g3 and not in g2, as before")
+check(abs(m[f"{p}/q_fail"] - 3 / 5) < 1e-12 and abs(m["shadow/progpo/alfworld/q_fail"] - 2 / 5) < 1e-12,
+      "q_fail: 3 of 5 stuck by the environment; ProGPO's gate opens on g1 and g3")
+check(torch.equal(new[12:16], b["advantages"][12:16]) and torch.equal(new[20:], b["advantages"][20:]),
+      "the shadow changes nothing: g2 (coverage fired, (a) did not) and the live and saturated rows keep theirs")
+
+print("17. the group records")
+recs = ctl.last_group_records
+by = {r["uid"]: r for r in recs}
+check(sorted(by) == ["g1", "g2", "g3", "lv", "st"], "one record per group")
+r1 = by["g1"]
+check(r1["trajs"] == ["a", "b", "c", "d"] and r1["k"] == [3.0, 1.0, 2.0, 0.0]
+      and r1["coverage_d"] == [5.0, 3.0, 2.0, 1.0] and r1["turns"] == [4, 4, 2, 2],
+      "per trajectory, in one order: k, D (the largest over its rows) and turns")
+check(r1["status"] == "stuck" and r1["verdict"] == "fired" and r1["progpo_gate"] is True
+      and r1["score_spread"] == 0.0 and r1["invalid_turns"] == [0, 0, 0, 0],
+      "the group's verdict, ProGPO's gate and the format spread")
+check(by["g2"]["score_spread"] > 0 and by["g2"]["invalid_turns"] == [1, 0] and by["g2"]["progpo_gate"] is False,
+      "g2 carries its invalid turn and a closed gate")
+check(by["lv"]["status"] == "live" and by["st"]["status"] == "saturated" and by["lv"]["verdict"] is None
+      and by["st"]["won"] == [True, True], "live and saturated groups are recorded too, with no verdict")
+g1_rows = [i for i, u in enumerate(b["uids"]) if u == "g1"]
+gained = float(((new - b["advantages"]).abs() * b["mask"])[g1_rows].sum())
+check(abs(r1["injected_abs_mass"] - gained) < 1e-5 and r1["c"] == m[f"{p}/c"] and r1["capped"] is False,
+      "the injected mass is what the advantages actually gained; c and the cap flag ride along")
+import json  # noqa: E402
+
+try:
+    json.dumps(recs)
+    check(True, "the records are plain JSON")
+except TypeError as e:
+    check(False, f"the records are plain JSON ({e})")
+
+print("18. ranks")
+check(list(pr.average_ranks([3, 1, 2, 2])) == [4.0, 1.0, 2.5, 2.5], "ties share their average rank")
+check(pr.spearman([1, 2, 3], [3, 2, 1]) == -1.0 and pr.spearman([1, 1], [0, 1]) is None,
+      "Spearman is -1 for a reversed order and undefined when one side does not vary")
+check(pr.coverage_progress(5, 4) == 1.0 and pr.coverage_progress(None, 3) is None
+      and pr.coverage_progress(2, 0) is None, "P = (D - 1) / T, undefined without D or T")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

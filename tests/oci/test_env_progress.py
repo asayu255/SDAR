@@ -359,5 +359,61 @@ tbl = record(True, [{"progress_k": 3, "progress_total": 6, "progress_k_milestone
 check(tbl[0][0]["progress_k_milestone"] == 2.0 and np.isnan(tbl[1][0]["progress_k_milestone"]),
       "the recorder carries the milestone columns too, NaN where a task has none")
 
+print("11. ProGPO's coverage D, a shadow beside k")
+cov = P.ObservationCoverage("You are in a room.")
+check(cov.d == 1, "the initial observation is in the set before the first action")
+cov.step("You arrive at desk 1.")
+cov.step("Nothing happens.")
+cov.step("Nothing happens.")
+cov.step("You arrive at desk 1.")
+check(cov.d == 3, "a repeated observation adds nothing, a revisit included")
+cov.step("you arrive at desk 1.")
+cov.step("You arrive at desk 1. ")
+check(cov.d == 5, "strings are compared exactly: case and whitespace are not normalised (ProGPO 8.2)")
+cov.step(None)
+cov.step("")
+check(cov.d == 6, "an empty observation is one observation, None the same one")
+
+for on in (True, False):
+    _cfg = config(on)
+    mgr = AlfWorldEnvironmentManager(_AlfEnvs(), _alf_proj, _cfg)
+    mgr.reset(None)
+    _, _, _, infos = mgr.step(["go to desk 1", "take pencil 2 from desk 1"])
+    if on:
+        check([i.get("coverage_d") for i in infos] == [2, 2], "ALFWorld: one new observation each")
+        _, _, _, infos = mgr.step(["look", "take pencil 2 from desk 1"])
+        check([i.get("coverage_d") for i in infos] == [3, 2],
+              "a second 'Nothing happens.' is not new; 'You did look.' is")
+    else:
+        check(all("coverage_d" not in i for i in infos), "ALFWorld off: nothing is written")
+
+for on in (True, False):
+    mgr = WebshopEnvironmentManager(_WsEnvs(), lambda acts: (list(acts), [1] * len(acts)), config(on))
+    mgr.reset(None)
+    _, _, _, infos = mgr.step(["search[black bag]", "search[shoes]"])
+    _, _, _, infos2 = mgr.step(["click[b07abc1234]", "click[b09zzz0000]"])
+    if on:
+        check([i.get("coverage_d") for i in infos] == [2, 2] and [i.get("coverage_d") for i in infos2] == [2, 2],
+              "WebShop: the landing page, then one page string the simulator repeats")
+    else:
+        check(all("coverage_d" not in i for i in infos), "WebShop off: nothing is written")
+
+for on in (True, False):
+    mgr = SearchEnvironmentManager(_SearchEnvs(), lambda acts: (list(acts), [1] * len(acts)), config(on))
+    mgr.reset([{"question": QUESTION, "ground_truth": {"target": ["Paris"]}}] * 2)
+    _, _, _, infos = mgr.step(["<search> capital of france </search>"] * 2)
+    _, _, _, infos2 = mgr.step(["<search> capital of france </search>"] * 2)
+    if on:
+        check([i.get("coverage_d") for i in infos] == [2, 2] and [i.get("coverage_d") for i in infos2] == [2, 2],
+              "Search: the question, then the returned results -- the same results twice count once")
+    else:
+        check(all("coverage_d" not in i for i in infos), "Search off: nothing is written")
+
+tbl = record(True, [{"progress_k": 1, "progress_total": 1, "coverage_d": 4}, {}])
+check(tbl[0][0]["coverage_d"] == 4.0 and np.isnan(tbl[1][0]["coverage_d"]),
+      "the recorder carries D, NaN where a row has none")
+tbl = record(False, [{"coverage_d": 4}, {}])
+check("coverage_d" not in tbl[0][0], "off: not even D reaches the batch")
+
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

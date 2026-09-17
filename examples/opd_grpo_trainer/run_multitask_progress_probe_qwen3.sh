@@ -10,8 +10,16 @@
 # on so the environment managers count k for every rollout, and grad_probe.mode=progress:
 # each batch writes one record per trajectory (task, group, k, K, environment
 # reward) to <out>.trajs/b<n>.jsonl, prints the running curve per task, and takes
-# no update. rho is 0, but no update is taken anyway, so the rollouts are control's.
-# See verl/trainer/ppo/progress_probe.py.
+# no update, so the rollouts are control's whatever RHO is. See
+# verl/trainer/ppo/progress_probe.py.
+#
+# (a)'s OWN NUMBERS AND ProGPO's, ON THE SAME ROLLOUTS. The trainer hook also runs on
+# every probe batch: it writes one record per group to <out>.groups/b<n>.jsonl
+# (k, K, ProGPO's coverage D, turns, invalid turns, the format spread, ProGPO's
+# gate, c, the cap) and keeps its metrics per batch in the payload
+# (progress_rank_metrics). RHO=0.05 makes c and the cap what the arm would use;
+# at RHO=0 they are 0. Read the records with
+#   python scripts/report_progress_groups.py <out>.groups
 #
 # STEP=75 and STEP=300 on tamago, one at a time. About 30 min each at 7 groups per
 # task x 10 batches on 4 GPUs (the step-25 mass probe: 7 min to the first batch,
@@ -23,9 +31,12 @@ N_BATCHES="${N_BATCHES:-10}"
 GPUS="${GPUS:-4}"
 TEMP="${TEMP:-1.0}"
 GROUP_N="${GROUP_N:-8}"
+RHO="${RHO:-0.0}"
 CKPT="${PROBE_CKPT_DIR:-$HOME/offline_ladder/probe_hf}/klwctl_step${STEP}"
-OUT="${OUT:-$HOME/grad_probe/progress_klwctl_step${STEP}.json}"
-LOG="${LOG:-$HOME/logs/progress_step${STEP}.log}"
+# A non-zero RHO gets its own payload name, so it never overwrites a rho = 0 probe.
+RHO_TAG=""; [ "$RHO" = "0" ] || [ "$RHO" = "0.0" ] || RHO_TAG="_rho${RHO//./p}"
+OUT="${OUT:-$HOME/grad_probe/progress_klwctl_step${STEP}${RHO_TAG}.json}"
+LOG="${LOG:-$HOME/logs/progress_step${STEP}${RHO_TAG}.log}"
 [ -f "$CKPT/model.safetensors" ] || { echo "no checkpoint at $CKPT" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")" "$(dirname "$LOG")"
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,7 +58,7 @@ export PRIVILEGED_SKILLS=""
 export PRIVILEGED_PLAN=""
 export RUN_TAG=progressprobe
 export RUN_TAG_SUFFIX=_progressprobe
-echo "progress probe: step=$STEP per_task=$PER_TASK batches=$N_BATCHES gpus=$GPUS"
+echo "progress probe: step=$STEP per_task=$PER_TASK batches=$N_BATCHES gpus=$GPUS rho=$RHO"
 echo "  groups: $(( PER_TASK * 3 )) per batch, $(( PER_TASK * 3 * N_BATCHES )) total"
 echo "  out: $OUT"
 echo "  log: $LOG"
@@ -67,7 +78,7 @@ exec bash examples/opd_grpo_trainer/run_multitask_cross_teacher_klw_control_qwen
   +trainer.grad_probe.enable=True \
   +trainer.grad_probe.mode=progress \
   algorithm.progress_rank.enable=True \
-  algorithm.progress_rank.rho=0.0 \
+  algorithm.progress_rank.rho="$RHO" \
   +trainer.grad_probe.n_batches="$N_BATCHES" \
   +trainer.grad_probe.seed=0 \
   +trainer.grad_probe.interim_every=1 \

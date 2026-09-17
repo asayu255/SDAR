@@ -59,6 +59,14 @@ cols["real_rows"][-1] = False
 cols["k_rows"][-1] = 99
 tab = {x["traj"]: x for x in pp.trajectory_table(**cols)}
 check(tab["b"]["turns"] == 4 and tab["b"]["k"] == 2, "padding copies are not counted, even with a different value")
+cols["real_rows"][-1] = True
+_d = np.array([1, 2, 2, 3] + [1, 1, 2, float("nan"), 2], dtype=object)
+_v = np.array([1, 0, 1, 1] + [0, 0, 1, 1, 1], dtype=object)
+tab = {x["traj"]: x for x in pp.trajectory_table(**cols, coverage_rows=_d, valid_rows=_v)}
+check(tab["a"]["coverage_d"] == 3.0 and tab["b"]["coverage_d"] is None,
+      "coverage_d is the largest D over the rows, None when a row lacks it")
+check(tab["a"]["invalid_turns"] == 1 and tab["b"]["invalid_turns"] == 2, "invalid_turns counts is_action_valid == 0")
+check("coverage_d" not in pp.trajectory_table(**cols)[0], "and neither appears when the columns are absent")
 
 print("2. the bins")
 check(pp.k_bin(0, 6) == "k=0" and pp.k_bin(2, 6) == "0<k/K<=1/3" and pp.k_bin(4, 6) == "1/3<k/K<=2/3"

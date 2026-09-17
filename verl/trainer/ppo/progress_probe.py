@@ -47,12 +47,16 @@ def k_bin(k: float, K: float) -> Optional[str]:
 
 
 def trajectory_table(*, uids, tuids, task_names, episode_rewards, k_rows, total_rows,
-                     real_rows, gamefiles=None, variants: Optional[Dict[str, tuple]] = None) -> List[dict]:
+                     real_rows, gamefiles=None, variants: Optional[Dict[str, tuple]] = None,
+                     coverage_rows=None, valid_rows=None) -> List[dict]:
     """One record per trajectory over the real rows (padding copies excluded).
 
     ``variants`` maps a name to another ``(k_rows, total_rows)`` pair counted on the
     same rollouts -- ALFWorld's milestone count beside the walkthrough one -- and
     each lands on the record as ``k_<name>`` / ``K_<name>``.
+    ``coverage_rows`` (ProGPO's D per row) adds ``coverage_d``, the largest over the
+    trajectory's rows, or None when a row lacks it; ``valid_rows`` (is_action_valid)
+    adds ``invalid_turns``.
     """
     rows = [i for i in range(len(tuids)) if real_rows[i]]
     prog = trajectory_progress(tuids, k_rows, total_rows, rows)
@@ -71,6 +75,23 @@ def trajectory_table(*, uids, tuids, task_names, episode_rewards, k_rows, total_
             rec["reward"] = max(rec["reward"], r)
         if gamefiles is not None and gamefiles[i]:
             rec["gamefile"] = str(gamefiles[i])
+        if coverage_rows is not None:
+            try:
+                d = float(coverage_rows[i])
+            except (TypeError, ValueError):
+                d = float("nan")
+            if not rec.get("_d_missing"):
+                if np.isfinite(d):
+                    rec["coverage_d"] = max(rec.get("coverage_d") or 0.0, d)
+                else:
+                    rec["_d_missing"] = True
+                    rec["coverage_d"] = None
+        if valid_rows is not None:
+            try:
+                bad = float(valid_rows[i]) == 0.0
+            except (TypeError, ValueError):
+                bad = False
+            rec["invalid_turns"] = rec.get("invalid_turns", 0) + int(bad)
     out = []
     for t, rec in recs.items():
         k, K = prog.get(t, (0.0, 0.0))
@@ -79,6 +100,7 @@ def trajectory_table(*, uids, tuids, task_names, episode_rewards, k_rows, total_
             vk, vK = p.get(t, (0.0, 0.0))
             rec[f"k_{name}"], rec[f"K_{name}"] = float(vk), float(vK)
         rec["won"] = bool(np.isfinite(rec["reward"]) and rec["reward"] > 0.0)
+        rec.pop("_d_missing", None)
         out.append(rec)
     return out
 

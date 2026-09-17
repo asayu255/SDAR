@@ -403,8 +403,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         return ctl
 
     def _apply_progress_rank(self, batch: DataProto, cfg) -> dict:
-        """Add (a)'s term to ``batch.batch["advantages"]`` in place; return its metrics."""
-        from verl.trainer.ppo.progress_rank import PROGRESS_K_KEY, PROGRESS_TOTAL_KEY
+        """Add (a)'s term to ``batch.batch["advantages"]`` in place; return its metrics.
+
+        Also writes the step's group records (see progress_rank.py, GROUP RECORDS)
+        unless ``record_groups`` is off: to ``<grad_probe.out_path>.groups/b<n>.jsonl``
+        in a probe, else ``<record_dir or default_local_dir/progress_rank_groups>/
+        step<N>.jsonl`` -- one file per step, so a step re-run after a resume
+        overwrites its own file instead of appending a second copy.
+        """
+        from verl.trainer.ppo.progress_rank import COVERAGE_D_KEY, PROGRESS_K_KEY, PROGRESS_TOTAL_KEY
 
         # ALONE, ON PURPOSE. The OCI arms move a group's statistic or its rows;
         # (a) is to be measured against control with nothing else changed.
@@ -451,6 +458,12 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             assert only is not None, "progress_rank needs per-row task names or env.env_name"
             task_names = np.array([only] * n, dtype=object)
 
+        # The score GRPO normalised, per row: the format split and ProGPO's gate are
+        # judged on it, never on |A| (float32 rounding makes |A| non-zero in a group
+        # whose rows all score alike).
+        tlr = batch.batch.get("token_level_rewards", None)
+        row_scores = None if tlr is None else tlr.sum(-1).double().cpu().numpy()
+
         ctl = self._progress_rank_controller(cfg)
         new_adv, out = ctl.apply(
             advantages=batch.batch["advantages"], mask=mask,
@@ -458,9 +471,45 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             episode_rewards=nt["episode_rewards"],
             k_rows=nt[PROGRESS_K_KEY], total_rows=nt[PROGRESS_TOTAL_KEY],
             real_rows=real, stat_rows=stat,
+            row_scores=row_scores,
+            valid_rows=nt["is_action_valid"] if "is_action_valid" in nt else None,
+            coverage_rows=nt[COVERAGE_D_KEY] if COVERAGE_D_KEY in nt else None,
         )
         batch.batch["advantages"] = new_adv
+        out.update(self._write_progress_rank_groups(ctl.last_group_records, cfg))
         return out
+
+    def _write_progress_rank_groups(self, records, cfg) -> dict:
+        """One JSON line per group; returns a metric that is 1 when the write failed.
+
+        A failed write is loud but not fatal: the records are a diagnostic, and a
+        full disk must not cost the training step they describe.
+        """
+        import json
+        import os
+
+        if not bool(cfg.get("record_groups", True)):
+            return {}
+        probe = self.config.trainer.get("grad_probe", None)
+        extra = {"step": int(getattr(self, "global_steps", 0))}
+        if probe is not None and bool(probe.get("enable", False)):
+            # The probe accumulates AFTER this hook, so its counter is one behind.
+            n = int((getattr(self, "_grad_probe_state", None) or {}).get("batches", 0)) + 1
+            path = os.path.join(f"{probe.get('out_path', 'grad_probe.json')}.groups", f"b{n}.jsonl")
+            extra["batch"] = n
+        else:
+            root = cfg.get("record_dir", None) or os.path.join(
+                str(self.config.trainer.default_local_dir), "progress_rank_groups")
+            path = os.path.join(str(root), f"step{extra['step']}.jsonl")
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                for rec in records:
+                    f.write(json.dumps({**extra, **rec}, ensure_ascii=False) + "\n")
+        except OSError as e:
+            print(f"[progress_rank] WARNING: group records not written to {path}: {e!r}", flush=True)
+            return {"progress_rank/record_write_failed": 1.0}
+        return {"progress_rank/record_write_failed": 0.0}
 
     def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:
         """Per row: its advantage, and whether its prompt group carried any signal.

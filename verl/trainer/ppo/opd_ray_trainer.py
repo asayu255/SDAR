@@ -1761,6 +1761,8 @@ class OPDRayTrainer(RayPPOTrainer):
             classify_groups(batch), records,
             row_mask=mask,
             advantages=batch.batch["advantages"].float().cpu().numpy(),
+            # The classes are judged on these, not on |A|: see term_mass.py.
+            row_scores=batch.batch["token_level_rewards"].sum(-1).float().cpu().numpy(),
             task_weights=batch.batch[TASK_LOSS_WEIGHT_KEY].float().cpu().numpy(),
             pg_loss_coef=float(self.config.actor_rollout_ref.actor.get("pg_loss_coef", 1.0)),
         )
@@ -1821,7 +1823,8 @@ class OPDRayTrainer(RayPPOTrainer):
             uids=nt["uid"], tuids=nt["traj_uid"], task_names=task_names,
             episode_rewards=nt["episode_rewards"], k_rows=nt[PROGRESS_K_KEY],
             total_rows=nt[PROGRESS_TOTAL_KEY], real_rows=real, gamefiles=nt.get("gamefile", None),
-            variants=variants)
+            variants=variants, coverage_rows=nt.get("coverage_d", None),
+            valid_rows=nt.get("is_action_valid", None))
         for rec in trajs:
             rec["batch"] = n
             rec["global_step"] = int(self.global_steps)
@@ -2555,6 +2558,14 @@ class OPDRayTrainer(RayPPOTrainer):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         if getattr(self, "_grad_probe_state", None) is None:
                             self._grad_probe_state = new_probe_state()
+                        # A probe step logs nothing, so (a)'s metrics and its
+                        # shadows are kept per batch in the payload instead; the
+                        # group records are already on disk beside it (.groups/).
+                        _pr_metrics = {k: float(v) for k, v in metrics.items()
+                                       if k.startswith(("progress_rank/", "shadow/"))}
+                        if _pr_metrics:
+                            _pr_metrics["batch"] = float(self._grad_probe_state.get("batches", 0) + 1)
+                            self._grad_probe_state.setdefault("progress_rank_metrics", []).append(_pr_metrics)
 
                         if probe_mode == "tau":
                             accumulate_tau_probe(
@@ -2591,7 +2602,7 @@ class OPDRayTrainer(RayPPOTrainer):
                             }
                             for k in ("advantages", "tau", "groups", "prompt_len",
                                       "oci", "reachability", "mass", "mass_batches", "progress",
-                                      "progress_milestone"):
+                                      "progress_milestone", "progress_rank_metrics"):
                                 if self._grad_probe_state.get(k, None):
                                     payload[k] = self._grad_probe_state[k]
                             write_payload(payload, out_path)

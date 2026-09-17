@@ -211,8 +211,10 @@ def main():
         cls = task["classes"]
         g = sum(int(cls[c]["groups"]) for c in cls)
         live = int(cls["live"]["groups"])
-        # A group whose format channel left a non-zero advantage also carries
-        # reward-driven gradient, so it counts here with live.
+        # A group whose scores differ in format also carries reward-driven
+        # gradient, so it counts here with live. In payloads written before the
+        # score-spread classes, "mixed" also holds groups whose only advantage is
+        # float32 rounding (term_mass.py): an overcount there, not a signal.
         mixed = int(cls["stuck_mixed"]["groups"]) + int(cls["saturated_mixed"]["groups"])
         rate = (live + mixed) / g if g else 0.0
         p7, pn = (1 - rate) ** 7, (1 - rate) ** n_train

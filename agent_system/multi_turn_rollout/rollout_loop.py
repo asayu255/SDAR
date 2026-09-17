@@ -1863,6 +1863,8 @@ class TrajectoryCollector:
                 # ALFWorld's second count, beside the first (NaN on other tasks).
                 rows[pos]['progress_k_milestone'] = float(_info.get('progress_k_milestone', float('nan')))
                 rows[pos]['progress_total_milestone'] = float(_info.get('progress_total_milestone', float('nan')))
+                # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
+                rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:

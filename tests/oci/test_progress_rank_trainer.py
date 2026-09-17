@@ -39,41 +39,52 @@ def check(good, msg):
     print(("  OK  " if good else "  FAIL") + " " + msg)
 
 
-def make_config(rho=0.05, ckpt_dir="/nonexistent", **arms):
+def make_config(rho=0.05, ckpt_dir=None, probe_out=None, **arms):
     alg = {"adv_estimator": "grpo", "compute_mean_std_cross_steps": True,
            "progress_rank": {"enable": True, "rho": rho, "ema_alpha": 0.2, "ema_floor": 0.01,
                              "cap_kappa": 100.0,
                              "min_top_k": {"alfworld": 2, "webshop": 2, "search": 1},
-                             "tasks": ["alfworld", "webshop", "search"]}}
+                             "tasks": ["alfworld", "webshop", "search"],
+                             "record_groups": True, "record_dir": None}}
     for name in ("oci_sat", "oci_floor", "oci_slots", "oci_rank"):
         alg[name] = {"enable": bool(arms.get(name, False))}
+    trainer_cfg = {"default_local_dir": ckpt_dir or tempfile.mkdtemp(), "resume_mode": "auto",
+                   "resume_from_path": None}
+    if probe_out is not None:
+        trainer_cfg["grad_probe"] = {"enable": True, "out_path": probe_out}
     return OmegaConf.create({
         "algorithm": alg,
         "actor_rollout_ref": {"rollout": {"multi_turn": {"enable": False}}},
         "env": {"env_name": "multitask"},
-        "trainer": {"default_local_dir": ckpt_dir, "resume_mode": "auto", "resume_from_path": None},
+        "trainer": trainer_cfg,
     })
 
 
 def make_batch(with_progress=True):
-    # A live alfworld group (a success) and a stuck one whose rollouts differ.
-    rows = [("live", "l1", 10.0, 6, 6, 1.0), ("live", "l2", 0.0, 1, 6, -1.0),
-            ("stuck", "s1", 0.0, 4, 6, 0.0), ("stuck", "s1", 0.0, 4, 6, 0.0),
-            ("stuck", "s2", 0.0, 1, 6, 0.0), ("stuck", "s2", 0.0, 1, 6, 0.0)]
+    # A live alfworld group (a success) and a stuck one whose rollouts differ; one of
+    # the stuck turns is invalid (-0.1 in its score).
+    rows = [("live", "l1", 10.0, 6, 6, 1.0, 10.0, 1, 3), ("live", "l2", 0.0, 1, 6, -1.0, 0.0, 1, 2),
+            ("stuck", "s1", 0.0, 4, 6, 0.0, 0.0, 1, 2), ("stuck", "s1", 0.0, 4, 6, 0.0, -0.1, 0, 3),
+            ("stuck", "s2", 0.0, 1, 6, 0.0, 0.0, 1, 2), ("stuck", "s2", 0.0, 1, 6, 0.0, 0.0, 1, 2)]
     n, P, R = len(rows), 3, 4
     attn = torch.ones(n, P + R, dtype=torch.long)
     attn[:, -1] = 0
     adv = torch.tensor([r[5] for r in rows], dtype=torch.float32).unsqueeze(-1) * attn[:, -R:].float()
+    tlr = torch.zeros(n, R)
+    tlr[:, R - 2] = torch.tensor([r[6] for r in rows])
     nt = {"uid": np.array([r[0] for r in rows], dtype=object),
           "traj_uid": np.array([r[1] for r in rows], dtype=object),
           "task_name": np.array(["alfworld"] * n, dtype=object),
-          "episode_rewards": np.array([r[2] for r in rows], dtype=object)}
+          "episode_rewards": np.array([r[2] for r in rows], dtype=object),
+          "is_action_valid": np.array([float(r[7]) for r in rows], dtype=object)}
     if with_progress:
         nt["progress_k"] = np.array([float(r[3]) for r in rows], dtype=object)
         nt["progress_total"] = np.array([float(r[4]) for r in rows], dtype=object)
+        nt["coverage_d"] = np.array([float(r[8]) for r in rows], dtype=object)
     return DataProto.from_dict(
         tensors={"responses": torch.zeros(n, R, dtype=torch.long), "attention_mask": attn,
-                 "advantages": adv, "is_padding_row": torch.zeros(n, dtype=torch.bool)},
+                 "advantages": adv, "token_level_rewards": tlr,
+                 "is_padding_row": torch.zeros(n, dtype=torch.bool)},
         non_tensors=nt)
 
 
@@ -97,6 +108,36 @@ check(float(after[2, 0]) > 0 and float(after[4, 0]) < 0, "the stuck group is ran
 check(float(after[2, -1]) == 0.0, "masked positions stay zero")
 check(m["progress_rank/alfworld/stuck_fired"] == 1.0 and m["progress_rank/alfworld/c"] > 0,
       "and the step reports what fired and at what c")
+check(m["progress_rank/alfworld/stuck_mixed"] == 1.0 and m["progress_rank/alfworld/inject_up_invalid"] > 0
+      and "shadow/coverage/alfworld/stuck_fired" in m,
+      "the scores, the validity and the coverage columns reach the controller")
+rec_path = os.path.join(t.config.trainer.default_local_dir, "progress_rank_groups", "step0.jsonl")
+recs = [json.loads(line) for line in open(rec_path)] if os.path.exists(rec_path) else []
+check(len(recs) == 2 and {r["uid"] for r in recs} == {"live", "stuck"} and all(r["step"] == 0 for r in recs)
+      and m["progress_rank/record_write_failed"] == 0.0,
+      "one record per group, under default_local_dir/progress_rank_groups/step<N>.jsonl")
+stuck_rec = next((r for r in recs if r["uid"] == "stuck"), {})
+check(stuck_rec.get("coverage_d") == [3.0, 2.0] and stuck_rec.get("invalid_turns") == [1, 0]
+      and stuck_rec.get("verdict") == "fired", "with the trajectories' coverage and invalid turns")
+
+tp_out = os.path.join(tempfile.mkdtemp(), "probe.json")
+tp = trainer(make_config(probe_out=tp_out))
+tp._grad_probe_state = {"batches": 2}
+tp._apply_progress_rank(make_batch(), tp.config.algorithm.progress_rank)
+check(os.path.exists(tp_out + ".groups/b3.jsonl")
+      and json.loads(open(tp_out + ".groups/b3.jsonl").readline())["batch"] == 3,
+      "in a probe the records go beside its payload, numbered by the batch about to be accumulated")
+bad_file = os.path.join(tempfile.mkdtemp(), "a_file")
+open(bad_file, "w").close()
+tb = trainer(make_config(ckpt_dir=bad_file))
+mb = tb._apply_progress_rank(make_batch(), tb.config.algorithm.progress_rank)
+check(mb["progress_rank/record_write_failed"] == 1.0 and mb["progress_rank/alfworld/stuck_fired"] == 1.0,
+      "a write that fails is reported and the step goes on")
+toff = trainer(make_config())
+toff.config.algorithm.progress_rank.record_groups = False
+toff._apply_progress_rank(make_batch(), toff.config.algorithm.progress_rank)
+check(not os.path.exists(os.path.join(toff.config.trainer.default_local_dir, "progress_rank_groups")),
+      "record_groups=False writes nothing")
 
 t0 = trainer(make_config(rho=0.0))
 b0 = make_batch()

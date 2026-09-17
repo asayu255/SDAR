@@ -8,9 +8,11 @@
 #
 #     A_i += c_task * (k_i - mean k) / K        (zero-sum over the group's samples)
 #
-# k is counted by the environment managers for every rollout (ALFWorld walkthrough
-# steps carried out; WebShop goal record; Search: a returned result held the
-# answer). Nothing is generated, no row is added, the reward is untouched.
+# k is counted by the environment managers for every rollout (ALFWorld: the task
+# type's milestones; WebShop goal record; Search: a returned result held the
+# answer). Nothing is generated, no row is added, the reward is untouched. (a) is
+# ADDED to the ordinary advantage, so the format penalty keeps its full size where
+# it acts.
 #
 # c IS SET PER TASK, EVERY STEP, from an EMA: the added token-mean |A| is RHO times
 # the EMA of that task's ordinary token-mean |A|. RHO is the only knob, and it is
@@ -33,16 +35,24 @@
 #
 # WHAT TO WATCH (all logged every step).
 #   progress_rank/<task>/share_of_ema          = RHO unless capped
-#   progress_rank/<task>/capped                how often the cap binds
+#   progress_rank/<task>/capped, c_uncapped, c_cap
+#                                              how often the cap binds, and by how much
 #   progress_rank/<task>/inject_down_over_up   (a)'s push-down : push-up. Control's
 #                                              ordinary update reads 1.08; the
 #                                              ten-slot runs failed at 12:1
-#   progress_rank/<task>/stuck_mixed           stuck groups the format penalty
-#                                              already moves -- what (a) dilutes
+#   progress_rank/<task>/stuck_mixed           stuck groups whose row SCORES differ
+#                                              in format (judged on the scores: an
+#                                              all -0.1 group has rounding |A| only)
+#   progress_rank/<task>/inject_share_mixed,   how much of (a) lands where the format
+#     inject_up_invalid                        penalty acts, and on its invalid rows
+#   shadow/progpo/<task>/q_fail, fired         what ProGPO's gate and coverage would
+#   shadow/coverage/<task>/*                   do on the same groups (never applied)
 #   actor entropy                              stop criterion: 2x control within
 #                                              the first 30 steps
-#   A mass probe at step 150 on this arm and on control (grad_probe.mode=mass)
-#   reads (a)'s share of the loss directly.
+#   Every step also writes one record per group to
+#   <default_local_dir>/progress_rank_groups/step<N>.jsonl; read them with
+#   scripts/report_progress_groups.py. A mass probe at step 150 on this arm and on
+#   control (grad_probe.mode=mass) reads (a)'s share of the loss directly.
 #
 # NO IN-TRAINING VALIDATION (test_freq=-1): _validate() runs before
 # _save_checkpoint(), so a failed validation loses the step. Score the saved

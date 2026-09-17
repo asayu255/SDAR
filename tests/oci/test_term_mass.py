@@ -29,15 +29,41 @@ def check(good, msg):
 
 
 print("1. which cell a group lands in")
-check(tm.group_class("live", 12.0) == "live", "a live group is live whatever its advantages are")
+check(tm.group_class("live", 10.0) == "live", "a live group is live whatever its scores are")
 check(tm.group_class("stuck", 0.0) == "stuck_uniform",
-      "all-fail with every advantage zero: the policy gradient is exactly nothing there")
-check(tm.group_class("stuck", 19.946) == "stuck_mixed",
-      "all-fail with the format channel carrying it is a different cell")
+      "all-fail with every row scoring the same: no signal there")
+check(tm.group_class("stuck", 0.1) == "stuck_mixed",
+      "all-fail with the format penalty making the scores differ is a different cell")
 check(tm.group_class("saturated", 0.0) == "saturated_uniform"
-      and tm.group_class("saturated", 5.0) == "saturated_mixed", "same split for all-success")
-check(tm.group_class("stuck", 1e-15) == "stuck_uniform",
+      and tm.group_class("saturated", 0.01) == "saturated_mixed",
+      "same split for all-success, down to Search's 0.01 penalty")
+check(tm.group_class("stuck", 1e-9) == "stuck_uniform",
       "and the split is on a tolerance, not on exact float equality")
+check(tm.score_spread([0.0, -0.1, 0.0]) > tm.SCORE_SPREAD_EPS and tm.score_spread([-0.1] * 5) == 0.0
+      and tm.score_spread([]) == 0.0, "score_spread is max - min")
+
+# THE CASE |A| GOT WRONG. Every row -0.1 (every turn penalised): the real GRPO
+# advantage is float32 rounding, 0.0074 on every row -- not zero, and not signal.
+import torch  # noqa: E402
+
+from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage  # noqa: E402
+
+_n = 400
+_tlr = torch.zeros(_n, 2)
+_tlr[:, -1] = -0.1
+_a, _ = compute_grpo_outcome_advantage(_tlr, torch.ones(_n, 2), np.array(["g"] * _n, dtype=object),
+                                       np.array([f"t{i % 8}" for i in range(_n)], dtype=object))
+_abs = float(_a.abs().max())
+check(0.001 < _abs < 0.01 and float(_a.abs().min()) == _abs,
+      f"400 rows all at -0.1: |A| = {_abs:.4f} on every row from rounding")
+check(tm.group_class("stuck", tm.score_spread(_tlr.sum(-1).numpy())) == "stuck_uniform",
+      "and the group is uniform, because its scores are")
+_tlr[0, -1] = 0.0
+_b, _ = compute_grpo_outcome_advantage(_tlr, torch.ones(_n, 2), np.array(["g"] * _n, dtype=object),
+                                       np.array([f"t{i % 8}" for i in range(_n)], dtype=object))
+check(float(_b.abs().max()) > 19.0 and float(_b.abs().min()) > 0.04
+      and tm.group_class("stuck", tm.score_spread(_tlr.sum(-1).numpy())) == "stuck_mixed",
+      "one valid turn among them is the real channel: 19.9 and 0.05, and mixed")
 
 print("2. the sums")
 # two groups of two rows, three response tokens each; one live, one stuck-uniform
@@ -45,6 +71,7 @@ rows = 4
 mask = np.ones((rows, 3))
 adv = np.array([[2.0, 2.0, 2.0], [-1.0, -1.0, -1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
 w = np.array([0.5, 0.5, 0.25, 0.25])
+scores = np.array([10.0, 0.0, 0.0, 0.0])
 groups = {"live1": {"rows": [0, 1], "status": "live", "task": "alfworld"},
           "stuck1": {"rows": [2, 3], "status": "stuck", "task": "search"}}
 records = [{"row": 0, "tokens": 3, "pg_abs": 6.0, "pg_signed": -6.0, "kl": 1.0, "w": 0.5,
@@ -55,7 +82,7 @@ records = [{"row": 0, "tokens": 3, "pg_abs": 6.0, "pg_signed": -6.0, "kl": 1.0, 
             "kl_row_coef": 1.0, "teacher_kl_coef": 0.01},
            {"row": 3, "tokens": 3, "pg_abs": 0.0, "pg_signed": 0.0, "kl": 4.0, "w": 0.25,
             "kl_row_coef": 1.0, "teacher_kl_coef": 0.01}]
-out = tm.aggregate_term_mass(groups, records, row_mask=mask, advantages=adv,
+out = tm.aggregate_term_mass(groups, records, row_mask=mask, advantages=adv, row_scores=scores,
                              task_weights=w, pg_loss_coef=1.0)
 c = out["cells"]
 check(set(c) == {"alfworld/live", "search/stuck_uniform"}, f"one cell per (task, class): {set(c)}")
@@ -71,12 +98,12 @@ check(c["search/stuck_uniform"]["pg_mass"] == 0.0
 
 print("3. padding and missing rows")
 w_pad = np.array([0.5, 0.5, 0.0, 0.25])
-out_pad = tm.aggregate_term_mass(groups, records, row_mask=mask, advantages=adv,
+out_pad = tm.aggregate_term_mass(groups, records, row_mask=mask, advantages=adv, row_scores=scores,
                                  task_weights=w_pad, pg_loss_coef=1.0)
 check(out_pad["padding_rows_skipped"] == 1
       and out_pad["cells"]["search/stuck_uniform"]["rows"] == 1,
       "a row with weight 0 is adjust_batch padding and is dropped, not counted")
-out_missing = tm.aggregate_term_mass(groups, records[:3], row_mask=mask, advantages=adv,
+out_missing = tm.aggregate_term_mass(groups, records[:3], row_mask=mask, advantages=adv, row_scores=scores,
                                      task_weights=w, pg_loss_coef=1.0)
 check(out_missing["rows_missing_from_actor"] == 1,
       "a row the actor never reported is counted rather than silently dropped")
@@ -91,7 +118,7 @@ check(c["alfworld/live"]["rows_up"] == 1 and c["alfworld/live"]["rows_down"] == 
 check(abs(c["alfworld/live"]["abs_a_max"] - 2.0) < 1e-9,
       "max |A| per token is the largest pg_abs/tokens in the cell (6/3 = 2)")
 big = [dict(records[0], row=0, pg_abs=3 * 19.946, pg_signed=-3 * 19.946)] + records[1:]
-out_big = tm.aggregate_term_mass(groups, big, row_mask=mask, advantages=adv,
+out_big = tm.aggregate_term_mass(groups, big, row_mask=mask, advantages=adv, row_scores=scores,
                                  task_weights=w, pg_loss_coef=1.0)
 check(abs(out_big["cells"]["alfworld/live"]["abs_a_max"] - 19.946) < 1e-6,
       "the format channel's fingerprint shows up as a large max, not a large sum")
