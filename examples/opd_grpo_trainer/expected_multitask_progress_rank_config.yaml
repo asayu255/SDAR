@@ -145,12 +145,20 @@
 # or the two arms are not training on the same rows.
 "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
 # ---- what bounds the training forward ----------------------------------------
-# Halved from 10 after this arm's first launch: it holds four models per row in
-# the hidden-state cache (teacher_cache/gb 16.3 against pure OPD's 4.1) while
-# vLLM is awake and holding its KV cache. Unlike the rollout key above it does
-# NOT enter adjust_batch's divisor, so it moves no rows and drops no data --
-# only how much is resident at once.
-"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
+# 10 on this arm, back up from the control's 5. The halving to 5 was for a 2-GPU
+# run, where the training forward holds four models per row in the hidden-state
+# cache while vLLM is awake. Measured on THIS run's first eight steps (four
+# GPUs): the update phase sits at 55-57 GB of 97.9, so 41 GB is free where the
+# doubling costs 7-13 GB, and update_actor was 233-279 s of a 413-481 s step --
+# the phase to shorten. Halving the number of micro-batches halves the
+# per-micro-batch all-gather of the ZeRO-2 parameters, which crosses PCIe here
+# (no NVLink). Expected: update -12 to -20%.
+# It does NOT enter adjust_batch's divisor -- at world size 4 that is lcm(40, 40,
+# 40) = 40, the same 40 it was at 5 -- so no row moves and no data is dropped.
+# What changes is the packing of the GEMM and the order the gradients accumulate
+# in: the no_sync_grad_accum class, not bit-identical, so it is pinned and must
+# not differ between compared runs.
+"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 10
 
 # NOT pinned, and deliberately so:
 #   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
