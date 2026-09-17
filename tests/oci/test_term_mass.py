@@ -81,7 +81,27 @@ out_missing = tm.aggregate_term_mass(groups, records[:3], row_mask=mask, advanta
 check(out_missing["rows_missing_from_actor"] == 1,
       "a row the actor never reported is counted rather than silently dropped")
 
-print("4. the report")
+print("4. the sign split and the advantage scale")
+# pg_loss = -A, so a NEGATIVE pg_signed is a row the update pushes up.
+check(abs(c["alfworld/live"]["pg_mass_up"] - 0.5 * 6.0) < 1e-9
+      and abs(c["alfworld/live"]["pg_mass_down"] - 0.5 * 3.0) < 1e-9,
+      "row 0 (pg_signed -6) is push-up mass, row 1 (pg_signed +3) is push-down")
+check(c["alfworld/live"]["rows_up"] == 1 and c["alfworld/live"]["rows_down"] == 1,
+      "and the row counts follow the same sign")
+check(abs(c["alfworld/live"]["abs_a_max"] - 2.0) < 1e-9,
+      "max |A| per token is the largest pg_abs/tokens in the cell (6/3 = 2)")
+big = [dict(records[0], row=0, pg_abs=3 * 19.946, pg_signed=-3 * 19.946)] + records[1:]
+out_big = tm.aggregate_term_mass(groups, big, row_mask=mask, advantages=adv,
+                                 task_weights=w, pg_loss_coef=1.0)
+check(abs(out_big["cells"]["alfworld/live"]["abs_a_max"] - 19.946) < 1e-6,
+      "the format channel's fingerprint shows up as a large max, not a large sum")
+acc_max = {}
+tm.add_batches(acc_max, out)
+tm.add_batches(acc_max, out_big)
+check(abs(acc_max["cells"]["alfworld/live"]["abs_a_max"] - 19.946) < 1e-6,
+      "a maximum is carried across batches as a maximum, never summed")
+
+print("5. the report")
 acc = {}
 tm.add_batches(acc, out)
 tm.add_batches(acc, out)
@@ -95,6 +115,8 @@ check(abs(s["tasks"]["alfworld"]["pg_over_kl"] - (9.0 / 0.03)) < 1e-6,
       "and a live task's PG/KL is the ratio of the two masses")
 check(any("stuck_uniform" in line for line in tm.format_report(s)),
       "the printed table names every class")
+check(abs(s["tasks"]["alfworld"]["pg_down_over_up"] - (1.5 / 3.0)) < 1e-9,
+      "the task line carries the push-down to push-up mass ratio")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

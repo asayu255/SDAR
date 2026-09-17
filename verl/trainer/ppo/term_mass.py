@@ -33,7 +33,18 @@ from typing import Dict, Iterable, List
 import numpy as np
 
 CLASSES = ("live", "stuck_uniform", "stuck_mixed", "saturated_uniform", "saturated_mixed")
-FIELDS = ("groups", "rows", "tokens", "pg_mass", "kl_mass", "pg_mass_driver")
+FIELDS = ("groups", "rows", "tokens", "pg_mass", "kl_mass", "pg_mass_driver",
+          # The sign split. |A| gives the same number to an update that mostly
+          # pushes rows up and one that mostly pushes them down; the failures in
+          # this line of work have all been the second kind (the ten-slot run's
+          # 12:1 push-down). pg_loss = -A, so pg_signed < 0 is a row pushed up.
+          "pg_mass_up", "pg_mass_down", "rows_up", "rows_down",
+          # The largest |A| per token in the cell. The format channel's mark is a
+          # LARGE advantage on the few rows whose format differs (19.946 for a
+          # lone correctly formatted row); a "mixed" cell whose max is small is
+          # ordinary spread and must not be described as that channel firing.
+          "abs_a_max")
+MAX_FIELDS = ("abs_a_max",)
 
 
 def group_class(status: str, advantages_abs_max: float, eps: float = 1e-12) -> str:
@@ -83,7 +94,18 @@ def aggregate_term_mass(groups: Dict[str, Dict], records: Iterable[dict], *,
                 continue
             cell["rows"] += 1
             cell["tokens"] += float(rec["tokens"])
-            cell["pg_mass"] += float(rec["w"]) * float(rec["pg_abs"]) * float(pg_loss_coef)
+            row_pg = float(rec["w"]) * float(rec["pg_abs"]) * float(pg_loss_coef)
+            cell["pg_mass"] += row_pg
+            signed = float(rec.get("pg_signed", 0.0))
+            if signed < 0:
+                cell["pg_mass_up"] += row_pg
+                cell["rows_up"] += 1
+            elif signed > 0:
+                cell["pg_mass_down"] += row_pg
+                cell["rows_down"] += 1
+            if rec["tokens"]:
+                cell["abs_a_max"] = max(cell["abs_a_max"],
+                                        float(rec["pg_abs"]) / float(rec["tokens"]))
             cell["kl_mass"] += (float(rec["w"]) * float(rec.get("kl_row_coef", 1.0))
                                 * float(rec["kl"]) * float(rec["teacher_kl_coef"]))
             cell["pg_mass_driver"] += (w[i] * float(np.sum(np.abs(adv[i]) * mask[i]))
@@ -98,7 +120,8 @@ def add_batches(acc: Dict, batch_out: Dict) -> Dict:
     for key, v in batch_out["cells"].items():
         c = cells.setdefault(key, {f: 0.0 for f in FIELDS})
         for f in FIELDS:
-            c[f] += v[f]
+            # A maximum does not add up; everything else does.
+            c[f] = max(c[f], v[f]) if f in MAX_FIELDS else c[f] + v[f]
     for k in ("rows_missing_from_actor", "padding_rows_skipped"):
         acc[k] = acc.get(k, 0) + batch_out.get(k, 0)
     acc["batches"] = acc.get("batches", 0) + 1
@@ -117,9 +140,12 @@ def summarise(acc: Dict) -> Dict:
     out["pg_mass_actor_vs_driver"] = (pg_all / drv_all) if drv_all else None
     for t in tasks:
         tc = {c: cells.get(f"{t}/{c}", {f: 0.0 for f in FIELDS}) for c in CLASSES}
-        tot = {f: sum(v[f] for v in tc.values()) for f in FIELDS}
+        tot = {f: (max((v[f] for v in tc.values()), default=0.0) if f in MAX_FIELDS
+                   else sum(v[f] for v in tc.values())) for f in FIELDS}
         task = {"totals": dict(tot),
                 "pg_over_kl": (tot["pg_mass"] / tot["kl_mass"]) if tot["kl_mass"] else None,
+                "pg_down_over_up": ((tot["pg_mass_down"] / tot["pg_mass_up"])
+                                    if tot["pg_mass_up"] else None),
                 "classes": {}}
         for c, v in tc.items():
             task["classes"][c] = {
@@ -130,6 +156,11 @@ def summarise(acc: Dict) -> Dict:
                 "tokens": v["tokens"],
                 "tokens_per_row": (v["tokens"] / v["rows"]) if v["rows"] else None,
                 "pg_mass": v["pg_mass"], "kl_mass": v["kl_mass"],
+                "pg_mass_up": v["pg_mass_up"], "pg_mass_down": v["pg_mass_down"],
+                "rows_up": v["rows_up"], "rows_down": v["rows_down"],
+                "pg_down_over_up": ((v["pg_mass_down"] / v["pg_mass_up"])
+                                    if v["pg_mass_up"] else None),
+                "abs_a_max": v["abs_a_max"],
                 "token_share": (v["tokens"] / tot["tokens"]) if tot["tokens"] else None,
                 "pg_share": (v["pg_mass"] / tot["pg_mass"]) if tot["pg_mass"] else None,
                 "kl_share": (v["kl_mass"] / tot["kl_mass"]) if tot["kl_mass"] else None,
@@ -148,12 +179,18 @@ def format_report(summary: Dict) -> List[str]:
     # a header-only task name is lost to any filter that reads the log.
     for t, task in summary["tasks"].items():
         over = "-" if task["pg_over_kl"] is None else f"{task['pg_over_kl']:.3g}"
+        du = "-" if task.get("pg_down_over_up") is None else f"{task['pg_down_over_up']:.3g}"
         lines.append(f"{t:<9} {'class':<19}{'groups':>7}{'tokens':>9}{'PG':>9}{'KL':>9}"
-                     f"{'PG/KL':>9}   (task PG/KL {over})")
+                     f"{'PG/KL':>9}{'down/up':>9}{'max|A|':>8}"
+                     f"   (task PG/KL {over}  down/up {du})")
         for c, v in task["classes"].items():
             def pct(x):
                 return "-" if x is None else f"{100 * x:.1f}%"
-            ratio = "-" if v["pg_over_kl"] is None else f"{v['pg_over_kl']:.3g}"
+
+            def g3(x):
+                return "-" if x is None else f"{x:.3g}"
             lines.append(f"{t:<9} {c:<19}{int(v['groups']):>7}{pct(v['token_share']):>9}"
-                         f"{pct(v['pg_share']):>9}{pct(v['kl_share']):>9}{ratio:>9}")
+                         f"{pct(v['pg_share']):>9}{pct(v['kl_share']):>9}"
+                         f"{g3(v['pg_over_kl']):>9}{g3(v.get('pg_down_over_up')):>9}"
+                         f"{g3(v.get('abs_a_max')):>8}")
     return lines

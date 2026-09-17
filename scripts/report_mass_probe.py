@@ -65,17 +65,20 @@ def main():
               f"  ({tot['tokens'] / tot['rows']:.0f}/row)"
               f"   task PG/KL {g3(task['pg_over_kl'])}")
         print(f"    {'class':<19}{'groups':>7}{'rows':>6}{'tokens':>10}{'tok/row':>9}"
-              f"{'tok%':>8}{'PG%':>8}{'KL%':>8}{'PG/KL':>9}")
+              f"{'tok%':>8}{'PG%':>8}{'KL%':>8}{'PG/KL':>9}{'down/up':>9}{'max|A|':>8}")
         for c in CLASSES:
             v = task["classes"].get(c)
             if not v:
                 continue
             tk = cls_tokens(v, tot["tokens"])
             rows = int(v["rows"])
+            # down/up and max|A| are absent from payloads written before the sign
+            # split; scripts/mass_probe_signs.py recovers them from the records.
             print(f"    {c:<19}{int(v['groups']):>7}{rows:>6}{int(tk):>10,}"
                   f"{(tk / rows if rows else 0):>9.0f}"
                   f"{pct(v['token_share']):>8}{pct(v['pg_share']):>8}"
-                  f"{pct(v['kl_share']):>8}{g3(v['pg_over_kl']):>9}")
+                  f"{pct(v['kl_share']):>8}{g3(v['pg_over_kl']):>9}"
+                  f"{g3(v.get('pg_down_over_up')):>9}{g3(v.get('abs_a_max')):>8}")
         # The spread matters more than the level: 10 batches of 7 groups is a
         # small sample, and one batch with no live group moves a share a long way.
         if batches:
