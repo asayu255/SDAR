@@ -508,4 +508,5 @@ python3 -m verl.trainer.main_opd_grpo \
     trainer.test_freq=150 \
     trainer.total_training_steps=300 \
     trainer.total_epochs=300 \
-    trainer.val_before_train=False "$@" "${VAL_ONLY_ARGS[@]}"
+    trainer.val_before_train=False "$@" \
+    "${VAL_ONLY_ARGS[@]}"
