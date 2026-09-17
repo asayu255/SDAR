@@ -98,6 +98,12 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         local_optim_path = copy_to_local(remote_optim_path)
         local_extra_state_path = copy_to_local(remote_extra_state_path)
 
+        # A shard saved by torch 2.7 carries a DeviceMesh with _dim_group_infos;
+        # 2.8 reads _dim_group_names and dies in _resolve_group_name on the first
+        # collective. The shim derives the new name from the old info, which is
+        # already in the file. A no-op on the torch that wrote the shard.
+        from verl.utils.device_mesh_compat import install as _install_mesh_compat
+        _install_mesh_compat()
         model_state_dict = torch.load(local_model_path, weights_only=False)
         optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
         extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
