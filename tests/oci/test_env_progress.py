@@ -253,5 +253,107 @@ check(np.isnan(tbl[1][0]["progress_k"]) and np.isnan(tbl[1][0]["progress_total"]
 tbl = record(False, [{"progress_k": 3, "progress_total": 6}, {}])
 check("progress_k" not in tbl[0][0], "off: the batch keeps control's columns")
 
+print("9. ALFWorld milestones: by object type, in any order")
+
+
+def game_dir(task_type, obj, recep="", lamp="", sliced=False):
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "traj_data.json"), "w") as f:
+        json.dump({"task_type": task_type, "pddl_params": {
+            "object_target": obj, "parent_target": recep, "toggle_target": lamp,
+            "mrecep_target": "", "object_sliced": sliced}}, f)
+    return os.path.join(d, "game.tw-pddl")
+
+
+OKOBS = "You did it."
+m = P.AlfworldMilestones(game_dir("pick_clean_then_place_in_recep", "Cup", "Microwave"))
+check(m.total == 3 and m.k == 0, "clean-then-place: K = 3")
+m.step("go to cabinet 2", OKOBS)
+m.step("take cup 1 from cabinet 2", OKOBS)
+check(m.k == 1, "the instance and the receptacle it came from do not matter")
+m.step("move cup 1 to microwave 1", OKOBS)
+check(m.k == 1, "placing an UNcleaned cup does not count")
+m.step("take cup 1 from microwave 1", OKOBS)
+m.step("clean cup 1 with sinkbasin 1", "Nothing happens.")
+check(m.k == 1, "a treatment the environment refused does not count")
+m.step("clean cup 1 with sinkbasin 1", OKOBS)
+check(m.k == 2, "the treatment does")
+m.step("move cup 1 to microwave 1", OKOBS)
+check(m.k == 3, "and placing the treated cup completes it")
+
+m = P.AlfworldMilestones(game_dir("look_at_obj_in_light", "AlarmClock", lamp="DeskLamp"))
+m.step("use desklamp 1", OKOBS)
+check(m.k == 1, "look-at: the lamp first counts (the walkthroughs do it in that order)")
+m.step("take alarmclock 2 from dresser 1", OKOBS)
+check(m.k == 2 and m.total == 2, "and taking the object completes it")
+m = P.AlfworldMilestones(game_dir("look_at_obj_in_light", "AlarmClock", lamp="DeskLamp"))
+m.step("use floorlamp 1", OKOBS)
+check(m.k == 0, "a lamp of another type does not count")
+
+m = P.AlfworldMilestones(game_dir("pick_two_obj_and_place", "Pencil", "Drawer"))
+for a in ("take pencil 2 from desk 1", "move pencil 2 to drawer 1", "take pencil 2 from drawer 1"):
+    m.step(a, OKOBS)
+check(m.k == 2, "pick-two: the same instance taken twice is still one object")
+m.step("take pencil 3 from desk 1", OKOBS)
+check(m.k == 3, "a second instance is the third milestone")
+m.step("put pencil 3 in/on drawer 1", OKOBS)
+check(m.k == 4 and m.total == 4, "and 'put ... in/on' places it like 'move ... to'")
+
+m = P.AlfworldMilestones(game_dir("pick_heat_then_place_in_recep", "Mug", "CoffeeMachine"))
+m.step("take mug 3 from countertop 1", OKOBS)
+m.step("heat mug 3 with microwave 1", OKOBS, won=True)
+check(m.k == 3, "a game the environment declares won is at K (goals are checked by type)")
+
+check(P.AlfworldMilestones(game_dir("pick_and_place_with_movable_recep", "Pen", "Bowl")).total == 0,
+      "a task type outside ALFWorld's six has no milestones")
+check(P.AlfworldMilestones(game_dir("pick_heat_then_place_in_recep", "Apple", "CounterTop", sliced=True)).total == 0,
+      "nor does a sliced-object task")
+check(P.AlfworldMilestones(None).total == 0 and P.alfworld_task("") == {},
+      "nor a row without a game file (never a stray traj_data.json in the working directory)")
+
+print("10. both ALFWorld counts reach the rows")
+gamefile2 = game_dir("pick_and_place_simple", "Pencil", "Shelf")
+with open(gamefile2, "w") as f:
+    json.dump({"walkthrough": walk, "pddl_params": {}, "pddl_problem": "(:init )"}, f)
+
+
+class _AlfEnvs2(_AlfEnvs):
+    def reset(self):
+        obs = ["You are in a room. Your task is to: put a pencil on a shelf."] * 2
+        return obs, None, [{"extra.gamefile": gamefile2}, {"extra.gamefile": gamefile2}]
+
+    def step(self, actions):
+        obs = ["Nothing happens." if a.startswith("move") else f"You did {a}." for a in actions]
+        return obs, None, [0.0, 0.0], [False, False], [{"extra.gamefile": gamefile2, "won": False}
+                                                        for _ in actions]
+
+
+for which in ("walkthrough", "milestone"):
+    cfg = config(True)
+    cfg.algorithm.progress_rank.alfworld_k = which
+    mgr = AlfWorldEnvironmentManager(_AlfEnvs2(), _alf_proj, cfg)
+    mgr.reset(None)
+    # row 0 takes a DIFFERENT pencil straight away (the walkthrough goes to desk 1 first)
+    _, _, _, infos = mgr.step(["take pencil 7 from shelf 3", "go to desk 1"])
+    if which == "walkthrough":
+        check([i["progress_k"] for i in infos] == [0, 1] and [i["progress_k_milestone"] for i in infos] == [1, 0],
+              "walkthrough mode: progress_k is the pointer, the milestone count rides beside it")
+        check(infos[0]["progress_total_milestone"] == 2 and infos[0]["progress_total"] == 4,
+              "each with its own K")
+    else:
+        check([i["progress_k"] for i in infos] == [1, 0], "milestone mode: (a) ranks by the milestones")
+cfg = config(True)
+cfg.algorithm.progress_rank.alfworld_k = "typo"
+try:
+    P.alfworld_k_definition(cfg)
+    check(False, "an unknown alfworld_k is refused")
+except AssertionError:
+    check(True, "an unknown alfworld_k is refused")
+
+tbl = record(True, [{"progress_k": 3, "progress_total": 6, "progress_k_milestone": 2,
+                     "progress_total_milestone": 3}, {}])
+check(tbl[0][0]["progress_k_milestone"] == 2.0 and np.isnan(tbl[1][0]["progress_k_milestone"]),
+      "the recorder carries the milestone columns too, NaN where a task has none")
+
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

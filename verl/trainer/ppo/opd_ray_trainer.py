@@ -1775,10 +1775,15 @@ class OPDRayTrainer(RayPPOTrainer):
                                   dtype=object)
 
         n = int(state.get("batches", 0)) + 1
+        # ALFWorld's second count, on the same rollouts, when the rollout recorded it.
+        variants = {}
+        if "progress_k_milestone" in nt and "progress_total_milestone" in nt:
+            variants["milestone"] = (nt["progress_k_milestone"], nt["progress_total_milestone"])
         trajs = _pp.trajectory_table(
             uids=nt["uid"], tuids=nt["traj_uid"], task_names=task_names,
             episode_rewards=nt["episode_rewards"], k_rows=nt[PROGRESS_K_KEY],
-            total_rows=nt[PROGRESS_TOTAL_KEY], real_rows=real, gamefiles=nt.get("gamefile", None))
+            total_rows=nt[PROGRESS_TOTAL_KEY], real_rows=real, gamefiles=nt.get("gamefile", None),
+            variants=variants)
         for rec in trajs:
             rec["batch"] = n
             rec["global_step"] = int(self.global_steps)
@@ -1790,9 +1795,16 @@ class OPDRayTrainer(RayPPOTrainer):
 
         acc = state.setdefault("progress_trajs", [])
         acc.extend(trajs)
-        state["progress"] = _pp.summarise_progress(acc, min_top_k=dict(pr_cfg.get("min_top_k", {}) or {}))
+        mtk = dict(pr_cfg.get("min_top_k", {}) or {})
+        state["progress"] = _pp.summarise_progress(acc, min_top_k=mtk)
         for line in _pp.format_progress_report(state["progress"]):
             print(f"[grad_probe] progress batch {n}: {line}", flush=True)
+        for name in variants:
+            recs = _pp.variant_records(acc, name)
+            if recs:
+                state[f"progress_{name}"] = _pp.summarise_progress(recs, min_top_k=mtk)
+                for line in _pp.format_progress_report(state[f"progress_{name}"], label=f"[{name}]"):
+                    print(f"[grad_probe] progress batch {n}: {line}", flush=True)
         state["batches"] = n
         return state
 
@@ -2540,7 +2552,8 @@ class OPDRayTrainer(RayPPOTrainer):
                                 ),
                             }
                             for k in ("advantages", "tau", "groups", "prompt_len",
-                                      "oci", "reachability", "mass", "mass_batches", "progress"):
+                                      "oci", "reachability", "mass", "mass_batches", "progress",
+                                      "progress_milestone"):
                                 if self._grad_probe_state.get(k, None):
                                     payload[k] = self._grad_probe_state[k]
                             write_payload(payload, out_path)

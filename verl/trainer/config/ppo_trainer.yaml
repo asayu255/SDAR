@@ -678,6 +678,13 @@ algorithm:
       webshop: 2
       search: 1
     tasks: ["alfworld", "webshop", "search"]
+    # Which ALFWorld count (a) ranks by. Both are always recorded.
+    #   walkthrough  steps of the game's walkthrough, word for word and in order
+    #   milestone    the task type's milestones by object type, in any order
+    # The walkthrough count stops at the first step a rollout does differently --
+    # another receptacle, another instance of the same object -- and scored 0 on
+    # all eight winners of a step-75 group that went straight to the cup.
+    alfworld_k: walkthrough
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

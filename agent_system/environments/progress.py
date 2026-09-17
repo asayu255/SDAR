@@ -37,6 +37,24 @@ from typing import Iterable, Optional, Tuple
 
 PROGRESS_K_INFO = "progress_k"
 PROGRESS_TOTAL_INFO = "progress_total"
+# The second ALFWorld count (milestones of the task type), recorded beside the
+# first so the two definitions can be compared on the same rollouts. NaN on the
+# other tasks' rows.
+PROGRESS_K_MILESTONE_INFO = "progress_k_milestone"
+PROGRESS_TOTAL_MILESTONE_INFO = "progress_total_milestone"
+ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone")
+
+
+def alfworld_k_definition(config) -> str:
+    """``algorithm.progress_rank.alfworld_k``: which ALFWorld count (a) ranks by."""
+    try:
+        cfg = (config.get("algorithm", {}) or {}).get("progress_rank", None) or {}
+        name = str(cfg.get("alfworld_k", "walkthrough") or "walkthrough")
+    except AttributeError:
+        name = "walkthrough"
+    assert name in ALFWORLD_K_DEFINITIONS, (
+        f"algorithm.progress_rank.alfworld_k={name!r}; expected one of {ALFWORLD_K_DEFINITIONS}")
+    return name
 
 
 def progress_on(config) -> bool:
@@ -49,6 +67,7 @@ def progress_on(config) -> bool:
         return bool(cfg is not None and cfg.get("enable", False))
     except AttributeError:
         return False
+
 
 # ALFWorld's failure line (alfworld/agents/controller/base.py and oracle.py).
 _ALFWORLD_NOTHING = "nothing happens"
@@ -75,6 +94,136 @@ def advance_walkthrough(walk, ptr: int, action, observation) -> int:
     if str(action).strip().lower() != str(walk[ptr]).strip().lower():
         return ptr
     return ptr + 1 if alfworld_executed(observation) else ptr
+
+
+# --- ALFWorld, by milestones of the task type ---------------------------- #
+#
+# WHY A SECOND COUNT. The walkthrough pointer compares actions to the walkthrough
+# word for word, so it is bound to that walkthrough's instance numbers and route.
+# Measured at step 75: a game whose walkthrough reads "go to cabinet 5", "take cup 1
+# from cabinet 2", ... is solved in seven actions by going straight to cabinet 2 and
+# replaying the rest verbatim -- and the pointer stays at 0, because step 1 never
+# matches and nothing after it can count. All eight winners of that group scored 0.
+# A different receptacle or a different instance of the same object blocks the
+# pointer for the rest of the episode.
+#
+# WHAT IT COUNTS. The task's own milestones, read off the actions the environment
+# carried out, by object TYPE rather than instance, in any order:
+#   pick_and_place_simple          took a target object; placed one in a target receptacle   K=2
+#   look_at_obj_in_light           took a target object; used a lamp of the target type       K=2
+#   pick_{clean,heat,cool}_then_*  took one; cleaned / heated / cooled one; placed a treated one K=3
+#   pick_two_obj_and_place         took one; placed one; took a second instance; placed two   K=4
+# The task type and targets come from traj_data.json beside the game file
+# (pddl_params). A task type outside these six, or a sliced-object task (no
+# walkthrough either), has no milestones: K = 0.
+
+_ALF_TAKE = re.compile(r"^take (\S+) (\d+) from (\S+) (\d+)$")
+_ALF_PLACE = re.compile(r"^(?:move (\S+) (\d+) to|put (\S+) (\d+) in/on) (\S+) (\d+)$")
+_ALF_TREAT = re.compile(r"^(clean|heat|cool) (\S+) (\d+) with (\S+) (\d+)$")
+_ALF_USE = re.compile(r"^use (\S+) (\d+)$")
+_ALF_TREATMENT = {"pick_clean_then_place_in_recep": "clean",
+                  "pick_heat_then_place_in_recep": "heat",
+                  "pick_cool_then_place_in_recep": "cool"}
+_ALF_TOTAL = {"pick_and_place_simple": 2, "look_at_obj_in_light": 2,
+              "pick_clean_then_place_in_recep": 3, "pick_heat_then_place_in_recep": 3,
+              "pick_cool_then_place_in_recep": 3, "pick_two_obj_and_place": 4}
+_ALF_TASK_CACHE: dict = {}
+
+
+def alfworld_task(gamefile) -> dict:
+    """``{task_type, object, receptacle, lamp, sliced}`` from traj_data.json, cached; {} if unreadable."""
+    import json
+    import os
+
+    key = str(gamefile or "")
+    if not key:
+        return {}
+    if key in _ALF_TASK_CACHE:
+        return _ALF_TASK_CACHE[key]
+    out = {}
+    d = key if os.path.isdir(key) else os.path.dirname(key)
+    path = os.path.join(d, "traj_data.json")
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+        pp = raw.get("pddl_params") or {}
+        out = {"task_type": str(raw.get("task_type") or ""),
+               "object": str(pp.get("object_target") or "").lower(),
+               "receptacle": str(pp.get("parent_target") or "").lower(),
+               "lamp": str(pp.get("toggle_target") or "").lower(),
+               "sliced": bool(pp.get("object_sliced"))}
+    except (OSError, ValueError, AttributeError):
+        out = {}
+    _ALF_TASK_CACHE[key] = out
+    return out
+
+
+class AlfworldMilestones:
+    """One episode's milestones for its task type (see the block comment above)."""
+
+    def __init__(self, gamefile):
+        t = alfworld_task(gamefile)
+        self.task_type = t.get("task_type", "")
+        self.object = t.get("object", "")
+        self.receptacle = t.get("receptacle", "")
+        self.lamp = t.get("lamp", "")
+        ok = (self.task_type in _ALF_TOTAL and self.object and not t.get("sliced")
+              and (self.lamp if self.task_type == "look_at_obj_in_light" else self.receptacle))
+        self.total = _ALF_TOTAL[self.task_type] if ok else 0
+        self.treatment = _ALF_TREATMENT.get(self.task_type)
+        self.took = set()        # target-object instances ever picked up
+        self.treated = set()     # target-object instances cleaned / heated / cooled
+        self.placed = set()      # target-object instances placed in a target receptacle
+        self.used_lamp = False
+        # The environment's own verdict. Some games are won before every milestone
+        # above is reached: "heat some mug and put it in coffeemachine" is won the
+        # moment a mug is heated when another mug already sits in the coffee
+        # machine, because the goal is checked by type. A won episode is at K.
+        self.won = False
+
+    def step(self, action, observation, won: bool = False) -> None:
+        if won:
+            self.won = True
+        if not self.total or not alfworld_executed(observation):
+            return
+        a = " ".join(str(action or "").strip().lower().split())
+        m = _ALF_TAKE.match(a)
+        if m:
+            if m.group(1) == self.object:
+                self.took.add(m.group(2))
+            return
+        m = _ALF_PLACE.match(a)
+        if m:
+            obj, idx = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+            if obj == self.object and m.group(5) == self.receptacle:
+                # A treatment task only counts a treated object going in.
+                if not self.treatment or idx in self.treated:
+                    self.placed.add(idx)
+            return
+        m = _ALF_TREAT.match(a)
+        if m:
+            if self.treatment and m.group(1) == self.treatment and m.group(2) == self.object:
+                self.treated.add(m.group(3))
+            return
+        m = _ALF_USE.match(a)
+        if m and m.group(1) == self.lamp:
+            self.used_lamp = True
+
+    @property
+    def k(self) -> int:
+        if not self.total:
+            return 0
+        if self.won:
+            return self.total
+        took = int(bool(self.took))
+        if self.task_type == "pick_and_place_simple":
+            return took + int(bool(self.placed))
+        if self.task_type == "look_at_obj_in_light":
+            return took + int(self.used_lamp)
+        if self.treatment:
+            return took + int(bool(self.treated)) + int(bool(self.placed))
+        # pick_two_obj_and_place
+        return took + int(len(self.placed) >= 1) + int(len(self.took) >= 2) + int(len(self.placed) >= 2)
 
 
 # --- WebShop ------------------------------------------------------------- #
@@ -190,9 +339,10 @@ def search_progress(evidence_seen: bool, target, *, answer_strings, is_yesno) ->
     return int(bool(evidence_seen)), 1
 
 
-def put_progress(infos: Iterable, ks, totals) -> None:
+def put_progress(infos: Iterable, ks, totals, *, k_key: str = PROGRESS_K_INFO,
+                 total_key: str = PROGRESS_TOTAL_INFO) -> None:
     """Write (k, K) into each info dict, in place."""
     for info, k, n in zip(infos, ks, totals):
         if isinstance(info, dict):
-            info[PROGRESS_K_INFO] = int(k)
-            info[PROGRESS_TOTAL_INFO] = int(n)
+            info[k_key] = int(k)
+            info[total_key] = int(n)

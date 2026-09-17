@@ -1860,6 +1860,9 @@ class TrajectoryCollector:
                 _info = infos[i] or {}
                 rows[pos]['progress_k'] = float(_info.get('progress_k', float('nan')))
                 rows[pos]['progress_total'] = float(_info.get('progress_total', float('nan')))
+                # ALFWorld's second count, beside the first (NaN on other tasks).
+                rows[pos]['progress_k_milestone'] = float(_info.get('progress_k_milestone', float('nan')))
+                rows[pos]['progress_total_milestone'] = float(_info.get('progress_total_milestone', float('nan')))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:

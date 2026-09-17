@@ -47,8 +47,9 @@ from agent_system.environments.oci_layout import (
     slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
 from agent_system.environments.progress import (
-    WebshopProgress, advance_walkthrough, progress_on as _progress_on,
-    put_progress as _put_progress, search_progress as _search_progress)
+    PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
+    WebshopProgress, advance_walkthrough, alfworld_k_definition as _alfworld_k_definition,
+    progress_on as _progress_on, put_progress as _put_progress, search_progress as _search_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1182,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # own walkthrough for every row and also requires the environment to have
         # carried the step out (see agent_system/environments/progress.py).
         self._walk_ptr = [0] * len(text_obs)
+        # The second count, by the task type's milestones; built per env from its
+        # own game file (traj_data.json beside it).
+        self._milestones = ([AlfworldMilestones(gf) for gf in (self.gamefile or [None] * len(text_obs))]
+                            if _progress_on(self.config) else [])
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
@@ -1226,7 +1231,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 _ptrs[i] = advance_walkthrough(_walk, _ptrs[i], act, text_obs[i])
                 _totals.append(len(_walk))
             self._walk_ptr = _ptrs
-            _put_progress(infos, _ptrs, _totals)
+            _ms = list(getattr(self, "_milestones", None) or [])
+            for i, act in enumerate(actions[:len(_ms)]):
+                _ms[i].step(act, text_obs[i], won=bool((infos[i] or {}).get("won", False)))
+            _mk = [m.k for m in _ms] + [0] * (len(actions) - len(_ms))
+            _mt = [m.total for m in _ms] + [0] * (len(actions) - len(_ms))
+            # Both counts are always recorded; alfworld_k says which one (a) ranks by.
+            _put_progress(infos, _mk, _mt, k_key=PROGRESS_K_MILESTONE_INFO,
+                          total_key=PROGRESS_TOTAL_MILESTONE_INFO)
+            if _alfworld_k_definition(self.config) == "milestone":
+                _put_progress(infos, _mk, _mt)
+            else:
+                _put_progress(infos, _ptrs, _totals)
 
         # add action_valid to infos
         for i, info in enumerate(infos):

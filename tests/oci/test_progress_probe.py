@@ -91,7 +91,20 @@ check(pp.summarise_progress(tie)["search"]["live_auc"] == 0.5, "a tie counts hal
 check(any("stuck groups for (a)" in line for line in pp.format_progress_report({"webshop": s})),
       "the report prints the verdict line")
 
-print("4. the trainer hook")
+print("4. a second count on the same rollouts")
+cols = rows_for([("g1", "a", "alfworld", 10.0, 0, 7, 3), ("g1", "b", "alfworld", 0.0, 2, 7, 3)])
+km = np.array([1, 2, 3, 1, 1, 1], dtype=object)
+Km = np.array([3, 3, 3, 3, 3, 3], dtype=object)
+tab = {x["traj"]: x for x in pp.trajectory_table(**cols, variants={"milestone": (km, Km)})}
+check(tab["a"]["k_milestone"] == 3 and tab["a"]["K_milestone"] == 3 and tab["b"]["k_milestone"] == 1,
+      "each record carries k_<name> / K_<name> beside k / K")
+recs = pp.variant_records(list(tab.values()), "milestone")
+check(recs and all(r["k"] == r["k_milestone"] and r["K"] == 3 for r in recs)
+      and pp.summarise_progress(recs)["alfworld"]["live_auc"] == 1.0
+      and pp.summarise_progress(list(tab.values()))["alfworld"]["live_auc"] == 0.0,
+      "and summarises on its own: here the milestones rank the winner first, the walkthrough last")
+
+print("5. the trainer hook")
 from verl import DataProto  # noqa: E402
 from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer  # noqa: E402
 

@@ -47,10 +47,16 @@ def k_bin(k: float, K: float) -> Optional[str]:
 
 
 def trajectory_table(*, uids, tuids, task_names, episode_rewards, k_rows, total_rows,
-                     real_rows, gamefiles=None) -> List[dict]:
-    """One record per trajectory over the real rows (padding copies excluded)."""
+                     real_rows, gamefiles=None, variants: Optional[Dict[str, tuple]] = None) -> List[dict]:
+    """One record per trajectory over the real rows (padding copies excluded).
+
+    ``variants`` maps a name to another ``(k_rows, total_rows)`` pair counted on the
+    same rollouts -- ALFWorld's milestone count beside the walkthrough one -- and
+    each lands on the record as ``k_<name>`` / ``K_<name>``.
+    """
     rows = [i for i in range(len(tuids)) if real_rows[i]]
     prog = trajectory_progress(tuids, k_rows, total_rows, rows)
+    extra = {name: trajectory_progress(tuids, kr, tr, rows) for name, (kr, tr) in (variants or {}).items()}
     recs: Dict[str, dict] = {}
     for i in rows:
         t = str(tuids[i])
@@ -69,6 +75,9 @@ def trajectory_table(*, uids, tuids, task_names, episode_rewards, k_rows, total_
     for t, rec in recs.items():
         k, K = prog.get(t, (0.0, 0.0))
         rec["k"], rec["K"] = float(k), float(K)
+        for name, p in extra.items():
+            vk, vK = p.get(t, (0.0, 0.0))
+            rec[f"k_{name}"], rec[f"K_{name}"] = float(vk), float(vK)
         rec["won"] = bool(np.isfinite(rec["reward"]) and rec["reward"] > 0.0)
         out.append(rec)
     return out
@@ -163,13 +172,25 @@ def summarise_progress(trajs: Iterable[dict], *, min_top_k: Optional[Dict[str, f
     return out
 
 
-def format_progress_report(summary: Dict) -> List[str]:
+def variant_records(trajs: Iterable[dict], name: str) -> List[dict]:
+    """The same trajectories with ``k_<name>`` / ``K_<name>`` as their k and K; only
+    those that carry that count (K > 0 under it)."""
+    out = []
+    for x in trajs:
+        K = x.get(f"K_{name}", 0.0) or 0.0
+        if K > 0:
+            out.append(dict(x, k=x.get(f"k_{name}", 0.0), K=K))
+    return out
+
+
+def format_progress_report(summary: Dict, label: str = "") -> List[str]:
     """The table the probe prints; the task name is on every line."""
     def pct(x):
         return "-" if x is None else f"{100 * x:.1f}%"
 
     lines = []
     for task, s in summary.items():
+        task = f"{task}{label}"
         lines.append(f"{task:<9} trajectories {s['trajectories']}  groups {s['groups']} "
                      f"(live {s['groups_live']}, stuck {s['groups_stuck']}, saturated {s['groups_saturated']})"
                      f"  win {pct(s['win_rate'])}  no-sequence {s['no_sequence']}")
