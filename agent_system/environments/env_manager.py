@@ -38,6 +38,7 @@ from agent_system.environments.oci_layout import (
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
     answer_strings as _answer_strings, is_numeric_answer as _is_numeric_answer,
     ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD, SEARCH_FLOW_LEAD,
+    search_lead as _search_lead,
     webshop_document_lines as _webshop_document_lines,
     doc_mode as _slots_doc_mode, doc_stepwise as _slots_doc_stepwise,
     foreign_prompt as _slots_foreign_prompt, foreign_task as _slots_foreign_task,
@@ -870,13 +871,14 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             return render_document(
                 _search_flow_document_lines(p.get("question"), p.get("ground_truth"),
                                             _slots_search_flow_path(getattr(self, "config", None))),
-                lead=SEARCH_FLOW_LEAD)
+                lead=_search_lead(SEARCH_FLOW_LEAD, p.get("ground_truth")))
         if mode in ("answer_rule", "progress_only"):
             show = mode == "answer_rule"
             return render_document(
                 _search_rescue_document_lines(p.get("question"), p.get("ground_truth"),
                                               show_answer=show),
-                lead=SEARCH_RULE_LEAD if show else SEARCH_PROGRESS_LEAD)
+                lead=(_search_lead(SEARCH_RULE_LEAD, p.get("ground_truth")) if show
+                      else SEARCH_PROGRESS_LEAD))
         if mode == "none":
             return ""
         return render_document(_search_document_lines(p.get("question"), p.get("ground_truth")))

@@ -44,20 +44,23 @@ NO_EVIDENCE = 'Doc 1(Title: "Lewisburg, West Virginia") Lewisburg is a city in W
 
 print("1. the block")
 lines = ol.search_rescue_document_lines(QUESTION, {"target": [ANSWER]})
-check(lines == [f"<search> {QUESTION} </search>", f"<answer> {ANSWER} </answer>"],
-      "the question as the first query, the answer as the second line")
+check(lines == [f"<search> {QUESTION} </search>"],
+      "the only numbered line is the search -- no line is a sendable <answer> action")
 check(ol.search_rescue_document_lines(QUESTION, {"target": ["yes"]}) == []
       and ol.search_rescue_document_lines(QUESTION, {"target": ["no"]}) == [],
       "no block for a yes/no question -- 'yes' is in almost any passage, so the rule cannot read it")
 check(ol.search_rescue_document_lines("", {"target": [ANSWER]}) == []
       and ol.search_rescue_document_lines(QUESTION, None) == [],
       "no question or no answer -> no block")
-block = ol.render_document(lines, lead=ol.SEARCH_RULE_LEAD)
+block = ol.render_document(lines, lead=ol.search_lead(ol.SEARCH_RULE_LEAD, {"target": [ANSWER]}))
 check(block.startswith(ol.PLAN_HEADER) and block.rstrip().endswith(ol.PLAN_FOOTER)
-      and "\n1. <search>" in block and "\n2. <answer>" in block,
-      "same wrapper and numbering as the other two tasks")
-check("DO NOT WRITE THE ANSWER ANYWHERE" in block and ol.PLAN_LEAD not in block,
-      "the rule's lead replaces the walkthrough lead")
+      and "\n1. <search>" in block and "<answer>" not in block,
+      "same wrapper and numbering as the other two tasks, and no <answer> tag anywhere in it")
+check(f"THE CORRECT ANSWER TO THIS QUESTION IS {ANSWER}, BUT YOU MAY NOT WRITE IT" in block
+      and block.count(ANSWER) == 1 and ol.PLAN_LEAD not in block,
+      "the answer appears once, as plain text inside the sentence that forbids writing it")
+check(ol.search_lead("IS {answer}.", {"target": ["a {b} c"]}) == "IS a {b} c.",
+      "an answer containing braces is written in verbatim")
 check(ol.render_document(["go to cabinet 1"]).startswith(f"{ol.PLAN_HEADER}\n{ol.PLAN_LEAD}\n1. "),
       "the default lead is untouched, so alfworld's block is byte-identical")
 
@@ -78,10 +81,12 @@ check(ol.is_yesno({"target": ["yes"]}) and not ol.is_yesno({"target": [ANSWER]})
 
 print("3. the progress line")
 waiting, found = ol.search_progress_line(False), ol.search_progress_line(True)
-check("No result you have received contains the answer yet" in waiting and "Do step 1" in waiting,
+check("No result you have received contains the answer yet" in waiting and "Search." in waiting
+      and "Do not write the answer" in waiting,
       "before: search, and do not write it")
-check("contains the answer" in found and "Do step 2" in found,
-      "after: write it")
+check("contains the answer" in found and "Now write it inside <answer> </answer>" in found
+      and "step 2" not in found,
+      "after: write it -- no step number that no longer exists")
 
 
 class _Envs:
@@ -476,9 +481,8 @@ try:
     ol._SEARCH_FLOWS.clear()
     lines = ol.search_flow_document_lines(QUESTION, {"target": [ANSWER]}, FLOW_FILE)
     check(lines == ["<search> closest airport Lewisburg West Virginia </search>",
-                    "<search> Greenbrier County airport </search>",
-                    f"<answer> {ANSWER} </answer>"],
-          "the verified queries in order, then the answer they end at")
+                    "<search> Greenbrier County airport </search>"],
+          "the verified queries in order, and nothing after them")
     check(ol.search_flow_document_lines("a question whose route did not work",
                                         {"target": ["x"]}, FLOW_FILE) == [],
           "a route that did not return the answer is not shown")
@@ -495,22 +499,22 @@ try:
           "the second slot wears the route, with the answer under the rule")
     check("closest airport Lewisburg" not in t7[9] and ANSWER in t7[9],
           "the first still wears the plain answer document")
-    check("Your next action is step 1 of 3: <search> closest airport Lewisburg West Virginia"
-          in t7[8] and ol.search_progress_line(False) not in t7[8],
-          "and the route row gets a line that names its next query, not the two-state line")
+    check("Your next action is search 1 of 2: <search> closest airport Lewisburg West Virginia"
+          in t7[8] and ol.search_progress_line(False) not in t7[8] and "<answer>" not in
+          t7[8].split("Now it's your turn")[0].replace("inside <answer> </answer>", ""),
+          "the route row names its next query, and its block holds no <answer> action")
 finally:
     os.remove(FLOW_FILE)
     ol._SEARCH_FLOWS.clear()
 
 print("15. the route pointer")
 ROUTE = ["<search> Gulshan Kumar T-Series founder </search>",
-         "<search> Bhushan Kumar T-Series chairman wife </search>",
-         "<answer> Divya Dua </answer>"]
+         "<search> Bhushan Kumar T-Series chairman wife </search>"]
 first = ol.search_route_line(ROUTE, 0, False)
-check("Your next action is step 1 of 3: <search> Gulshan Kumar" in first,
+check("Your next action is search 1 of 2: <search> Gulshan Kumar" in first,
       "at the start the line names the first query")
 p1 = ol.advance_route(ROUTE, 0, "Gulshan Kumar T-Series founder", False)
-check(p1 == 1 and "Step 1 of 3 is done. Your next action is step 2 of 3: <search> Bhushan Kumar"
+check(p1 == 1 and "Search 1 of 2 is done. Your next action is search 2 of 2: <search> Bhushan Kumar"
       in ol.search_route_line(ROUTE, p1, False),
       "after running it, the line names the SECOND query -- what the two-state line never did")
 check(ol.advance_route(ROUTE, 0, "who founded T-Series Gulshan Kumar", False) == 1,
@@ -518,17 +522,13 @@ check(ol.advance_route(ROUTE, 0, "who founded T-Series Gulshan Kumar", False) ==
 check(ol.advance_route(ROUTE, 0, "Bollywood music labels", False) == 0,
       "an unrelated query does not move the pointer")
 check(ol.advance_route(ROUTE, 0, "anything", True) == 2
-      and "step 3 of 3: write it inside <answer>" in ol.search_route_line(ROUTE, 2, True),
-      "a result carrying the answer sends the row straight to the answer step")
+      and "Now write it inside <answer> </answer>" in ol.search_route_line(ROUTE, 2, True),
+      "a result carrying the answer tells the row to write it, whatever it searched")
 p2 = ol.advance_route(ROUTE, 1, "Bhushan Kumar T-Series chairman wife", False)
 line2 = ol.search_route_line(ROUTE, p2, False)
 check(p2 == 2 and "All 2 searches of the path are done" in line2 and "Divya Dua" not in line2
-      and "step 3" not in line2,
-      "every query run and no answer yet: search again -- the answer step is NOT named")
-check(ol.search_progress_line(False) == ("[Privileged Solution Path progress] No result you have "
-      "received contains the answer yet. Do step 1: search. Do not write the answer anywhere "
-      "until a result carries it.\n\n"),
-      "the two-line documents keep their line byte for byte, so arm A is the arm already measured")
+      and "write it" not in line2,
+      "every query run and no answer yet: search again -- it is NOT told to write")
 
 FLOW2 = os.path.join(tempfile.gettempdir(), f"flows2_{os.getpid()}.json")
 json.dump({"flows": {"0": {"question": QUESTION, "answers": [ANSWER], "hit": True,
@@ -539,12 +539,12 @@ try:
     m8 = _manager(group_n=10, evidence_for=set(), search_doc="answer_rule",
                   search_doc_b="expert_flow", search_flow_path=FLOW2)
     t8 = m8.reset(KW * 10)[0]["text"]
-    check("Your next action is step 1 of 3: <search> closest airport Lewisburg West Virginia"
+    check("Your next action is search 1 of 2: <search> closest airport Lewisburg West Virginia"
           in t8[8], "the route row starts pointed at its first query")
     acts = [""] * 10
     acts[8] = "<think> run step 1 </think><search> closest airport Lewisburg West Virginia </search>"
     t8b = m8.step(acts)[0]["text"]
-    check("Your next action is step 2 of 3: <search> Greenbrier County airport" in t8b[8],
+    check("Your next action is search 2 of 2: <search> Greenbrier County airport" in t8b[8],
           "after the first search the manager points it at the second")
     check(ol.search_progress_line(False) in t8b[9],
           "while the answer-rule row beside it keeps its own two-state line")

@@ -440,16 +440,20 @@ def search_document_lines(question, target) -> list:
 # early is discarded, so the only trained rescue rows are ones that searched,
 # read, and then answered -- with the answer present in the retrieved context,
 # which is exactly the state the plain student is in when it succeeds.
+# THE ANSWER IS STATED, NEVER PRINTED AS AN ACTION. The first version ended the
+# block with a line of the form <answer> X </answer> -- a complete, sendable
+# action sitting in front of a model that is being told not to send it. Rule
+# breaks rose from 35% to 46% when the route version pushed that line further
+# down the block, where it stood out more. The answer now appears once, as a
+# fact inside the sentence that forbids writing it; only searches are tagged.
 SEARCH_RULE_LEAD = (
-    "THIS IS THE VERIFIED CORRECT ANSWER FOR THIS QUESTION, AND THE RULE THAT MAKES IT\n"
-    "COUNT. The answer is only earned if you FIND it: a result returned to you inside\n"
-    "<information> </information> must contain it BEFORE you write it. Until that\n"
-    "happens, DO NOT WRITE THE ANSWER ANYWHERE -- not in your thinking, not inside a\n"
-    "<search> query. A trajectory that writes it early is thrown away and teaches\n"
-    "nothing. Search, read what comes back, search again with a different query if it\n"
-    "is not there, and answer once it is.\n"
+    "THE CORRECT ANSWER TO THIS QUESTION IS {answer}, BUT YOU MAY NOT WRITE IT -- not in\n"
+    "your thinking, not inside a <search> query, not as your answer -- until a result\n"
+    "returned to you inside <information> </information> contains it. A trajectory that\n"
+    "writes it early is thrown away and teaches nothing. Search, read what comes back,\n"
+    "search again with a different query if it is not there, and answer once it is.\n"
     "\n"
-    "The path that solves this task:"
+    "The search that leads to it:"
 )
 
 # THE VARIANT THAT PRINTS NOTHING BUT THE VERDICT. Even under the rule, a row
@@ -467,7 +471,7 @@ SEARCH_PROGRESS_LEAD = (
     "results, and search again with a different query until the line says a result\n"
     "carries the answer. Then answer with what that result gives.\n"
     "\n"
-    "The path that solves this task:"
+    "The search to start with:"
 )
 
 # THE THIRD DOCUMENT: SOMEONE ELSE'S SEARCH ROUTE. answer_rule and progress_only
@@ -480,15 +484,24 @@ SEARCH_PROGRESS_LEAD = (
 # eight. No query may name the answer -- that is checked when the file is built
 # (data/qa_annotations/verify_claude_flows.py) and again here.
 SEARCH_FLOW_LEAD = (
-    "THIS IS A SEARCH ROUTE THAT IS KNOWN TO WORK FOR THIS QUESTION, AND THE ANSWER IT\n"
-    "ENDS AT. Run the queries below in order -- they are not the question restated,\n"
-    "they name what has to be looked up -- and read what comes back. The answer is\n"
-    "only earned if you FIND it: a result returned inside <information> </information>\n"
-    "must contain it before you write it. Until then, DO NOT WRITE THE ANSWER\n"
-    "ANYWHERE. A trajectory that writes it early is thrown away.\n"
+    "THIS IS A SEARCH ROUTE THAT IS KNOWN TO WORK FOR THIS QUESTION. Run the queries below\n"
+    "in order -- they are not the question restated, they name what has to be looked up --\n"
+    "and read what comes back. THE CORRECT ANSWER IS {answer}, BUT YOU MAY NOT WRITE IT --\n"
+    "not in your thinking, not inside a query, not as your answer -- until a result\n"
+    "returned inside <information> </information> contains it. A trajectory that writes\n"
+    "it early is thrown away.\n"
     "\n"
-    "The path that solves this task:"
+    "The searches that lead to it:"
 )
+
+
+def search_lead(template: str, target) -> str:
+    """A lead with the first accepted answer written into its sentence.
+
+    str.replace, not str.format: an answer can itself contain braces.
+    """
+    answers = answer_strings(target)
+    return template.replace("{answer}", answers[0] if answers else "")
 
 SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow")
 
@@ -623,9 +636,8 @@ def search_rescue_document_lines(question, target, show_answer: bool = True) -> 
     q = str(question or "").strip()
     if not q or not answers or is_yesno(target):
         return []
-    last = (f"<answer> {answers[0]} </answer>" if show_answer
-            else "<answer> what that result gives </answer>")
-    return [f"<search> {q} </search>", last]
+    # show_answer now only decides the lead (search_lead); no line is an answer.
+    return [f"<search> {q} </search>"]
 
 
 _SEARCH_FLOWS: dict = {}
@@ -669,7 +681,7 @@ def search_flow_document_lines(question, target, path) -> list:
         return []
     if any(contains_answer(q, target) for q in queries):
         return []
-    return [f"<search> {q} </search>" for q in queries] + [f"<answer> {answers[0]} </answer>"]
+    return [f"<search> {q} </search>" for q in queries]
 
 
 def route_query_matches(row_query, route_line, min_share: float = 0.5) -> bool:
@@ -702,9 +714,8 @@ def advance_route(lines, ptr: int, row_query, found: bool) -> int:
     if n == 0:
         return ptr
     if found:
-        return n - 1
-    searches = n - 1
-    if ptr < searches and route_query_matches(row_query, lines[ptr]):
+        return n
+    if ptr < n and route_query_matches(row_query, lines[ptr]):
         return ptr + 1
     return ptr
 
@@ -725,15 +736,14 @@ def search_route_line(lines, ptr: int, found: bool) -> str:
     head = "[Privileged Solution Path progress]"
     if found:
         return (f"{head} A result you received contains the answer. "
-                f"Your next action is step {n} of {n}: write it inside <answer> </answer>.\n\n")
-    searches = n - 1
-    if ptr >= searches:
-        return (f"{head} All {searches} searches of the path are done, but no result you have "
+                "Now write it inside <answer> </answer>.\n\n")
+    if ptr >= n:
+        return (f"{head} All {n} searches of the path are done, but no result you have "
                 "received contains the answer yet. Search again with a different query. "
                 "Do not write the answer anywhere until a result carries it.\n\n")
-    done = "" if ptr == 0 else (f"Step 1 of {n} is done. " if ptr == 1
-                                else f"Steps 1-{ptr} of {n} are done. ")
-    return f"{head} {done}Your next action is step {ptr + 1} of {n}: {lines[ptr]}\n\n"
+    done = "" if ptr == 0 else (f"Search 1 of {n} is done. " if ptr == 1
+                                else f"Searches 1-{ptr} of {n} are done. ")
+    return f"{head} {done}Your next action is search {ptr + 1} of {n}: {lines[ptr]}\n\n"
 
 
 def search_progress_line(found: bool) -> str:
@@ -747,9 +757,9 @@ def search_progress_line(found: bool) -> str:
     """
     if found:
         return ("[Privileged Solution Path progress] A result you received contains the answer. "
-                "Do step 2 now: write it inside <answer> </answer>.\n\n")
+                "Now write it inside <answer> </answer>.\n\n")
     return ("[Privileged Solution Path progress] No result you have received contains the answer yet. "
-            "Do step 1: search. Do not write the answer anywhere until a result carries it.\n\n")
+            "Search. Do not write the answer anywhere until a result carries it.\n\n")
 
 
 def foreign_prompt(task: str, key) -> str:
