@@ -1299,6 +1299,16 @@ class RayPPOTrainer:
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
+        # The per-batch scoring block lives INSIDE the generation loop. A
+        # refactor once de-indented it by one level: the loop still ran all 413
+        # batches, only the LAST was scored, and the metrics -- means over
+        # whatever arrived -- reported that one batch as the whole validation.
+        # Two hours of rollouts were thrown away before the row count was
+        # looked at, so the row count is checked here instead of trusted.
+        assert len(reward_tensor_lst) == val_batch_index, (
+            f"scored {len(reward_tensor_lst)} batches but generated {val_batch_index}: "
+            "the per-batch scoring block is outside the generation loop"
+        )
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         task_names = np.concatenate(task_name_lst, axis=0)
