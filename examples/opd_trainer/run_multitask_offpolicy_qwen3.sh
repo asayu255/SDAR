@@ -252,7 +252,7 @@ fi
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
@@ -334,7 +334,7 @@ fi
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
@@ -416,7 +416,7 @@ fi
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
@@ -496,7 +496,7 @@ python3 -m verl.trainer.main_opd_offpolicy \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     env.env_name=multitask \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.history_length=4 \
     env.rollout.n=8 \
