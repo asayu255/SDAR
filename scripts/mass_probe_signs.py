@@ -118,13 +118,21 @@ def main():
     print(f"task labels pinned by per-task PG mass; worst relative error "
           f"{worst_label_err:.2e}  (a large value means the labelling is wrong)")
     print()
+    # Mass per row as well as mass: GRPO is zero-sum within a group, so "many
+    # rows up, few rows down, equal mass" means the few are pushed down hard
+    # while the many drift up gently -- a different update from an even one, and
+    # invisible if only the totals are printed.
     print(f"{'task':<10}{'rows up':>9}{'rows down':>11}{'rows A=0':>10}"
-          f"{'mass up':>11}{'mass down':>11}{'down/up':>9}")
+          f"{'mass up':>11}{'mass down':>11}{'down/up':>9}{'per-row d/u':>13}")
     for t, c in per_task.items():
         ratio = (c["mass_down"] / c["mass_up"]) if c["mass_up"] else None
+        pr_up = c["mass_up"] / c["rows_up"] if c["rows_up"] else 0.0
+        pr_dn = c["mass_down"] / c["rows_down"] if c["rows_down"] else 0.0
+        per_row = (pr_dn / pr_up) if pr_up else None
         print(f"{t:<10}{c['rows_up']:>9,}{c['rows_down']:>11,}{c['rows_zero']:>10,}"
               f"{c['mass_up']:>11.4g}{c['mass_down']:>11.4g}"
-              f"{'-' if ratio is None else f'{ratio:.3g}':>9}")
+              f"{'-' if ratio is None else f'{ratio:.3g}':>9}"
+              f"{'-' if per_row is None else f'{per_row:.3g}':>13}")
     tot = {k: sum(c[k] for c in per_task.values())
            for k in ("rows_up", "rows_down", "rows_zero", "mass_up", "mass_down")}
     print(f"{'ALL':<10}{tot['rows_up']:>9,}{tot['rows_down']:>11,}{tot['rows_zero']:>10,}"
