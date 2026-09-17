@@ -1,10 +1,11 @@
 import json
 import logging
+import os
 import requests
 import uuid
 import time
 import threading
-from typing import Tuple, Optional, Any, Dict
+from typing import Tuple, Optional, Any, Dict, List, Union
 from urllib.parse import urlparse
 
 from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.core import tool, ToolGroup
@@ -82,9 +83,10 @@ class _RetryableServerError(Exception):
         self.status_code = status_code
         self.attempts = attempts
 
-def call_search_api(
+
+def _search_api_request(
     retrieval_service_url: str,
-    query: str,
+    query: Union[str, List[str]],
     topk: int = 3,
     return_scores: bool = True,
     timeout: Optional[int] = DEFAULT_TIMEOUT,
