@@ -37,6 +37,7 @@ from agent_system.environments.oci_layout import (
     advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
     answer_strings as _answer_strings, is_numeric_answer as _is_numeric_answer,
+    is_yesno as _is_yesno,
     ROLE_DOC_B, SEARCH_RULE_LEAD, SEARCH_PROGRESS_LEAD, SEARCH_FLOW_LEAD,
     search_lead as _search_lead,
     webshop_document_lines as _webshop_document_lines,
@@ -45,6 +46,9 @@ from agent_system.environments.oci_layout import (
     alfworld_foreign_obs as _slots_foreign_alfworld_obs,
     slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
+from agent_system.environments.progress import (
+    WebshopProgress, advance_walkthrough, progress_on as _progress_on,
+    put_progress as _put_progress, search_progress as _search_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +901,13 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._note_returned(next_obs)
         self._note_route(text_actions)
         self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
+        if _progress_on(self.config):
+            # (a)'s k for EVERY row: has a returned result carried the answer?
+            # The same flag the progress line reads, kept for all rows already.
+            _prog = [_search_progress(bool(self._evidence_seen[i]), self._answers(i),
+                                      answer_strings=_answer_strings, is_yesno=_is_yesno)
+                     for i in range(len(infos))]
+            _put_progress(infos, [p[0] for p in _prog], [p[1] for p in _prog])
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
@@ -1165,6 +1176,11 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.gamefile = parse_gamefile(infos)
         # walkthrough_stepwise: every slot starts at step 1 of its path.
         self._guide_ptr = [0] * len(text_obs)
+        # (a)'s pointer. Separate from _guide_ptr, which walks the block a document
+        # row is SHOWN and advances on the text alone; this one walks the game's
+        # own walkthrough for every row and also requires the environment to have
+        # carried the step out (see agent_system/environments/progress.py).
+        self._walk_ptr = [0] * len(text_obs)
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
@@ -1200,6 +1216,17 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
+
+        if _progress_on(self.config):
+            _gfs = list(getattr(self, "gamefile", None) or [])
+            _ptrs = list(getattr(self, "_walk_ptr", None) or [0] * len(actions))
+            _totals = []
+            for i, act in enumerate(actions):
+                _walk = _tw_pddl(_gfs[i])[0] if i < len(_gfs) and _gfs[i] else []
+                _ptrs[i] = advance_walkthrough(_walk, _ptrs[i], act, text_obs[i])
+                _totals.append(len(_walk))
+            self._walk_ptr = _ptrs
+            _put_progress(infos, _ptrs, _totals)
 
         # add action_valid to infos
         for i, info in enumerate(infos):
@@ -1564,6 +1591,10 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # document slot needs them on every turn and reset is the only place
         # they appear.
         self.goals = [(info or {}).get('goal') for info in (infos or [])]
+        # (a)'s walk along the goal record, one per env, from the landing page on.
+        self._ws_progress = ([WebshopProgress(g, (info or {}).get('available_actions'))
+                              for g, info in zip(self.goals, infos or [])]
+                             if _progress_on(self.config) else [])
         obs = self.format_obs(obs)
         # infos = [None] * self.envs.num_envs
         observations = {'text': self.build_text_obs(obs, infos, init=True), 
@@ -1602,6 +1633,11 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             'image': None,
             'anchor': next_obs.copy()
         }
+        _wsp = getattr(self, "_ws_progress", None) or []
+        if _wsp:
+            for i, act in enumerate(actions[:len(_wsp)]):
+                _wsp[i].step(act, (infos[i] or {}).get('available_actions'))
+            _put_progress(infos, [p.k for p in _wsp], [p.total for p in _wsp])
         # add action_valid to infos
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])

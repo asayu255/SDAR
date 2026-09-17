@@ -918,6 +918,7 @@ class TrajectoryCollector:
     _oci_repl_width = OCI_REPL_WIDTH
     _oci_repl_dtype = torch.long
     _oci_group_n = 0
+    _progress_rank_on = False
 
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
@@ -931,6 +932,8 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        from agent_system.environments.progress import progress_on as _progress_on
+        self._progress_rank_on = _progress_on(config)
         # HOW WIDE THE REPLACEMENT COLUMN IS. The single-candidate arm's edit puts
         # back one boundary token (see OCI_REPL_WIDTH). The ten-slot layout's
         # document slot edits the prompt in two places at once and its foreign
@@ -1850,6 +1853,13 @@ class TrajectoryCollector:
             # only in the info dict; carried here, where the row and its info are the
             # same index by construction. Empty on tasks that have no such id.
             rows[pos]['gamefile'] = str((infos[i] or {}).get('extra.gamefile') or '')
+            if self._progress_rank_on:
+                # (a)'s count as of this turn (agent_system/environments/progress.py).
+                # On every recorded row, NaN where the task has none, so collate_fn
+                # sees one schema; off, the batch has exactly control's columns.
+                _info = infos[i] or {}
+                rows[pos]['progress_k'] = float(_info.get('progress_k', float('nan')))
+                rows[pos]['progress_total'] = float(_info.get('progress_total', float('nan')))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:

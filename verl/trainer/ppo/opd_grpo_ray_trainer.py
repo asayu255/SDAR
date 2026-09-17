@@ -363,9 +363,139 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                         batch.batch["response_mask"] * _keep.unsqueeze(-1).to(
                             batch.batch["response_mask"].dtype))
 
+            # ---- (a): rank stuck groups by progress (algorithm.progress_rank) ----
+            # AFTER compute_advantage, and adding to it rather than touching the
+            # reward: the ordinary advantage -- format penalty included -- is left
+            # exactly as control computes it, and the ranking is a term on top. Mixing
+            # progress into the reward would renormalise it together with the -0.1
+            # penalty, which only acts inside degenerate groups and is what holds
+            # verbosity down. See verl/trainer/ppo/progress_rank.py.
+            pr_cfg = self.config.algorithm.get("progress_rank", None)
+            if pr_cfg is not None and bool(pr_cfg.get("enable", False)):
+                metrics.update(self._apply_progress_rank(batch, pr_cfg))
+
             batch = self._attach_advantage_reliability_columns(batch)
 
         return batch, reward_extra_infos_dict
+
+    # --- (a) ------------------------------------------------------------------ #
+
+    PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
+
+    def _progress_rank_controller(self, cfg):
+        ctl = getattr(self, "_progress_rank", None)
+        if ctl is None:
+            from verl.trainer.ppo.progress_rank import ProgressRankController
+
+            ctl = ProgressRankController(
+                rho=float(cfg.get("rho", 0.0)),
+                ema_alpha=float(cfg.get("ema_alpha", 0.2)),
+                ema_floor=float(cfg.get("ema_floor", 0.01)),
+                cap_kappa=float(cfg.get("cap_kappa", 1.0)),
+                min_top_k=dict(cfg.get("min_top_k", {}) or {}),
+                tasks=list(cfg.get("tasks", ["alfworld", "webshop", "search"])),
+                # The mean k is weighted the way the GRPO statistic weights samples,
+                # so the ranking sums to zero over what the advantage sums to zero over.
+                cross_steps=bool(self.config.algorithm.get("compute_mean_std_cross_steps", True)),
+            )
+            pending = getattr(self, "_progress_rank_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending)
+            self._progress_rank = ctl
+        return ctl
+
+    def _apply_progress_rank(self, batch: DataProto, cfg) -> dict:
+        """Add (a)'s term to ``batch.batch["advantages"]`` in place; return its metrics."""
+        from verl.trainer.ppo.progress_rank import PROGRESS_K_KEY, PROGRESS_TOTAL_KEY
+
+        # ALONE, ON PURPOSE. The OCI arms move a group's statistic or its rows;
+        # (a) is to be measured against control with nothing else changed.
+        for other in ("oci_sat", "oci_floor", "oci_slots", "oci_rank"):
+            ocfg = self.config.algorithm.get(other, None)
+            assert not (ocfg is not None and bool(ocfg.get("enable", False))), (
+                f"algorithm.progress_rank.enable and algorithm.{other}.enable are both on; "
+                "(a) is measured against control with nothing else changed"
+            )
+        assert self.config.algorithm.adv_estimator == "grpo", (
+            "progress_rank adds to outcome-GRPO advantages (one value per row); "
+            f"adv_estimator={self.config.algorithm.adv_estimator!r} is not that"
+        )
+        nt = batch.non_tensor_batch
+        missing = [k for k in ("uid", "traj_uid", "episode_rewards", PROGRESS_K_KEY, PROGRESS_TOTAL_KEY)
+                   if k not in nt]
+        assert not missing, (
+            f"algorithm.progress_rank.enable=True but the batch has no {missing}. The counts "
+            "are written by the environment managers and recorded by the rollout loop, both of "
+            "which read algorithm.progress_rank.enable off their own copy of the config."
+        )
+        n = len(batch)
+        real = np.ones(n, dtype=bool)
+        pad = batch.batch.get(PADDING_ROW_KEY, None)
+        if pad is not None:
+            real &= ~pad.reshape(-1).to(torch.bool).cpu().numpy()
+        stat = real.copy()
+        exc = batch.batch.get(GRPO_STAT_EXCLUDE_KEY, None)
+        if exc is not None:
+            stat &= ~exc.reshape(-1).to(torch.bool).cpu().numpy()
+        # The mask the actor's loss reads (dp_actor: loss_mask in multi-turn mode,
+        # else the response part of attention_mask).
+        resp_len = batch.batch["responses"].shape[1]
+        key = ("loss_mask" if (self.config.actor_rollout_ref.rollout.multi_turn.enable
+                               and "loss_mask" in batch.batch.keys()) else "attention_mask")
+        mask = batch.batch[key][:, -resp_len:]
+
+        task_names = get_task_names(batch)
+        if task_names is None:
+            # A single-task run carries no task_name column; its one task is the env's.
+            from verl.trainer.ppo.metric_utils import normalize_task_name
+
+            only = normalize_task_name(self.config.env.get("env_name", None))
+            assert only is not None, "progress_rank needs per-row task names or env.env_name"
+            task_names = np.array([only] * n, dtype=object)
+
+        ctl = self._progress_rank_controller(cfg)
+        new_adv, out = ctl.apply(
+            advantages=batch.batch["advantages"], mask=mask,
+            uids=nt["uid"], tuids=nt["traj_uid"], task_names=task_names,
+            episode_rewards=nt["episode_rewards"],
+            k_rows=nt[PROGRESS_K_KEY], total_rows=nt[PROGRESS_TOTAL_KEY],
+            real_rows=real, stat_rows=stat,
+        )
+        batch.batch["advantages"] = new_adv
+        return out
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        ctl = getattr(self, "_progress_rank", None)
+        if ctl is None:
+            return
+        import json
+        import os
+
+        folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
+            json.dump(ctl.state_dict(), f)
+
+    def _load_checkpoint(self):
+        out = super()._load_checkpoint()
+        # (a)'s EMA is part of the run's state: without it a resumed run would
+        # restart every task's scale from one step's update.
+        import json
+        import os
+
+        if not self.global_steps:
+            return out
+        if self.config.trainer.resume_mode == "resume_path" and self.config.trainer.get("resume_from_path"):
+            folder = str(self.config.trainer.resume_from_path)
+        else:
+            folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        path = os.path.join(folder, self.PROGRESS_RANK_STATE_FILE)
+        if os.path.exists(path):
+            with open(path) as f:
+                self._progress_rank_pending_state = json.load(f)
+            print(f"[progress_rank] EMA restored from {path}: {self._progress_rank_pending_state}")
+        return out
 
     def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:
         """Per row: its advantage, and whether its prompt group carried any signal.

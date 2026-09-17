@@ -633,6 +633,51 @@ algorithm:
       # Where the coefficient's band sits: it peaks at rho = gamma with a
       # ceiling of 1/4. LUFFY's value.
       gamma: 0.1
+  progress_rank:
+    # (a): RANK A STUCK GROUP'S ROLLOUTS BY HOW FAR THEY GOT ALONG THE TASK'S
+    # CORRECT SEQUENCE, and add that ranking to the advantage.
+    #
+    # WHY. A group of eight failures has an advantage of exactly zero. At step 25
+    # of the 3-task control those groups held 57% / 62% / 51% of ALFWorld's /
+    # Search's / WebShop's response tokens. ALFWorld's and WebShop's carried 1.3%
+    # and 0.6% of those tasks' reward-driven update; 34 of Search's 36 carried
+    # none (two format-mixed ones carried 33%). Nothing is generated and no row is
+    # added: the eight rollouts are the student's own, and only their advantages
+    # change.
+    #
+    # WHAT. The environment managers count k of K for every rollout (see
+    # agent_system/environments/progress.py): ALFWorld's walkthrough steps the
+    # environment carried out; WebShop's goal record (results page showing the
+    # product, opened, each required option, bought); Search, whether a returned
+    # result carried the answer. In a group where every rollout failed and the k
+    # differ, A_i += c * (k_i - mean k) / K on every turn of rollout i -- zero-sum
+    # over the samples GRPO's own statistic uses. See verl/trainer/ppo/progress_rank.py.
+    #
+    # c IS NOT A HYPERPARAMETER. Per task and per step it is set so that the added
+    # token-mean |A| is rho times an EMA of that task's ordinary token-mean |A|.
+    # A fixed c would give (a) a 4x different share across the three tasks at
+    # step 25, and the share would drift as training moves the tasks' signal.
+    enable: False
+    # The share of each task's typical reward-driven update that (a) adds. 0 is
+    # control, bit for bit: the identity check stage 1 starts from.
+    rho: 0.0
+    # The EMA of the ordinary token-mean |A|. 0.2 averages about the last 10 steps:
+    # at 15 groups Search's step value swings +-52% and is 0 about one step in ten.
+    ema_alpha: 0.2
+    # Keeps the EMA, and so c, defined through a run of steps with no update at
+    # all. Well below the step-25 values (0.12 Search, 0.32 ALFWorld, 0.41 WebShop).
+    ema_floor: 0.01
+    # No token gets more from (a) than cap_kappa times the task's typical |A|:
+    # the guard for a step where one group fires on a one-step difference.
+    cap_kappa: 1.0
+    # A group fires only if its furthest rollout reached this many steps.
+    # ALFWorld's first step ("go to X") and WebShop's (a results page showing the
+    # product) are hit by chance; Search has one step.
+    min_top_k:
+      alfworld: 2
+      webshop: 2
+      search: 1
+    tasks: ["alfworld", "webshop", "search"]
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
