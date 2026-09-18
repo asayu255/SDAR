@@ -193,6 +193,13 @@ class RLSDRayTrainer(RayPPOTrainer):
         position; saving the live (post-peek) state would make a resumed run
         skip that batch entirely.
         """
+        if bool(self.config.trainer.get("val_only", False)):
+            # A val_only process scores a checkpoint. It has no business writing one,
+            # and the one time it did it destroyed four of them.
+            raise RuntimeError(
+                "trainer.val_only=True tried to save a checkpoint -- refusing: "
+                "a scoring run must not write to default_local_dir"
+            )
         pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
         if pre_peek_state is None:
             return super()._save_checkpoint()
@@ -223,13 +230,22 @@ class RLSDRayTrainer(RayPPOTrainer):
         self._load_checkpoint()
         self._fast_forward_env_schedules()
 
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        # val_only is checked on its own, not nested under val_before_train. The run
+        # scripts end with trainer.val_before_train=False (the initial eval costs a
+        # full validation pass and says nothing a resumed run does not already know),
+        # and with the check nested a "validate this checkpoint and stop" command
+        # skipped the block entirely and fell through to TRAINING from the checkpoint.
+        # That is not a silent no-op: it resumed at 150 and overwrote the 175, 200,
+        # 225 and 250 checkpoints of the run being measured before anyone looked.
+        val_only = bool(self.config.trainer.get("val_only", False))
+        if self.val_reward_fn is not None and (val_only or self.config.trainer.get("val_before_train", True)):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        if val_only:
+            assert self.val_reward_fn is not None, "trainer.val_only=True but no validation reward fn is configured"
+            return
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="RLSD Training")
         self.global_steps += 1
