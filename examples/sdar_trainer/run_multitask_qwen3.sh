@@ -1,6 +1,10 @@
 set -x
-ENGINE=${1:-vllm}
-shift || true
+# The engine used to be argv[1], which silently ate the first Hydra override a
+# caller passed -- `bash run.sh trainer.n_gpus_per_node=3` became
+# `actor_rollout_ref.rollout.name=trainer.n_gpus_per_node=3` and hydra refused
+# the whole command. Anything with an '=' is an override, not an engine name.
+ENGINE=${ENGINE:-vllm}
+if [ $# -gt 0 ] && [ "${1#*=}" = "$1" ]; then ENGINE=$1; shift; fi
 
 num_cpus_per_env_worker=0.1
 
