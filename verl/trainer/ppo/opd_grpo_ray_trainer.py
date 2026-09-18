@@ -68,6 +68,13 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         position; saving the live (post-peek) state would make a resumed run
         skip that batch entirely.
         """
+        if bool(self.config.trainer.get("val_only", False)):
+            # A val_only process scores a checkpoint. It has no business writing one,
+            # and the one time it did it destroyed four of them.
+            raise RuntimeError(
+                "trainer.val_only=True tried to save a checkpoint -- refusing: "
+                "a scoring run must not write to default_local_dir"
+            )
         pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
         if pre_peek_state is None:
             return super()._save_checkpoint()
