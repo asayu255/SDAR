@@ -691,6 +691,11 @@ algorithm:
     # Which ALFWorld count (a) ranks by. Both are always recorded.
     #   walkthrough  steps of the game's walkthrough, word for word and in order
     #   milestone    the task type's milestones by object type, in any order
+    #   milestone_arrive  the same plus one: stood at a receptacle of the target type (the
+    #                lamp, for look_at) holding the target object, treated if the task
+    #                treats it. K + 1. Every win passes through it; it separates "carried
+    #                it there" from "took it and wandered" among rollouts the milestones
+    #                tie (progress.py). The milestone columns keep the base count.
     # The walkthrough count stops at the first step a rollout does differently --
     # another receptacle, another instance of the same object: it scored below K on
     # 68% (step 75) and 70% (step 300) of WINNING rollouts, against 6-7% for

@@ -47,7 +47,7 @@ PROGRESS_TOTAL_INFO = "progress_total"
 # other tasks' rows.
 PROGRESS_K_MILESTONE_INFO = "progress_k_milestone"
 PROGRESS_TOTAL_MILESTONE_INFO = "progress_total_milestone"
-ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone")
+ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive")
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 
@@ -123,11 +123,48 @@ def advance_walkthrough(walk, ptr: int, action, observation) -> int:
 # The task type and targets come from traj_data.json beside the game file
 # (pddl_params). A task type outside these six, or a sliced-object task (no
 # walkthrough either), has no milestones: K = 0.
+#
+# ONE MORE, UNDER alfworld_k = milestone_arrive: "arrived" -- the rollout stood at a
+# receptacle of the TARGET type (pddl_params parent_target; for look_at, where a lamp
+# of the target type is) while holding an object of the target type, TREATED if the
+# task has a treatment. K grows by one for every task type.
+#   WHY. It is the state the last milestone needs: nothing can be placed (or looked at
+#   under the lamp) from anywhere else, so every win passes through it -- except the
+#   wins the environment grants early by type (2-4% of wins, all treatment tasks),
+#   which the won => K rule below already covers -- and a won episode is still at K
+#   (657 of 657). Replayed on 1,372 validation trajectories (2026-09-19),
+#   winners reached it before losers in 24 of 27 (alfworld-only) and 21 of 25
+#   (multitask) mixed games -- the best of the candidates tried; "stood where the
+#   object is" and "saw the object" were not added, because winners take the object
+#   one turn after seeing it and the count would only repeat "took". What it
+#   separates: "carried it there and failed to place it" from "took it and wandered",
+#   which the base count ties at the same k.
+#   WHY TREATED. An untreated object at the target is off the path -- placing it does
+#   not count either (see `placed`) -- so marking it would pay for skipping the
+#   treatment. Order is still free: the flag is independent of the others.
+#   HOW IT IS READ, from actions the environment carried out, no game state needed:
+#   the receptacles the rollout is known to stand at are the last "go to X" plus any
+#   receptacle it has since taken from, placed in, opened, closed or treated with
+#   (several receptacles can share a location: "go to coffeemachine 1" then "take
+#   tomato 2 from countertop 1" is a legal pair); in hand is the last object taken and
+#   not yet put down; a lamp is "here" when the arrival text names one or it was used.
+#   A counted placement sets the flag too, so placed => arrived and k never skips it.
+#   Checked against the game's own facts (agent location, receptacles there, object in
+#   hand, isclean/ishot/iscool) on those replays: set on the same turn in 863 of 864
+#   trajectories, one turn late in one, never missed and never set without the facts.
+#   WHAT TO EXPECT. Small. Same-game failures tied at k >= 1 mostly share the flag:
+#   it split 3% of such pairs (alfworld-only, 35 validations of one checkpoint) and 1 of
+#   6 (multitask); it bites in pick_two at k = 1 and in treatment tasks at k = 2, and
+#   never in look_at (0 of 57 look_at failures at k >= 1 held the object at a lamp).
+#   In pick_two it is often set at the take itself: an object taken from a receptacle of
+#   the target type is already held at the target, so tied failures there mostly share it.
 
 _ALF_TAKE = re.compile(r"^take (\S+) (\d+) from (\S+) (\d+)$")
 _ALF_PLACE = re.compile(r"^(?:move (\S+) (\d+) to|put (\S+) (\d+) in/on) (\S+) (\d+)$")
 _ALF_TREAT = re.compile(r"^(clean|heat|cool) (\S+) (\d+) with (\S+) (\d+)$")
 _ALF_USE = re.compile(r"^use (\S+) (\d+)$")
+_ALF_GOTO = re.compile(r"^go to (\S+) (\d+)$")
+_ALF_OPEN_CLOSE = re.compile(r"^(?:open|close) (\S+) (\d+)$")
 _ALF_TREATMENT = {"pick_clean_then_place_in_recep": "clean",
                   "pick_heat_then_place_in_recep": "heat",
                   "pick_cool_then_place_in_recep": "cool"}
@@ -182,6 +219,12 @@ class AlfworldMilestones:
         self.treated = set()     # target-object instances cleaned / heated / cooled
         self.placed = set()      # target-object instances placed in a target receptacle
         self.used_lamp = False
+        # "arrived" (alfworld_k = milestone_arrive; tracked always, counted only there).
+        self.arrived = False
+        self._here = set()       # receptacle types the rollout is known to stand at
+        self._lamp_here = False  # a lamp of the target type is where it stands
+        self._holding = None     # (object type, instance) in hand
+        self._lamp_re = re.compile(r"\b" + re.escape(self.lamp) + r" \d+\b") if self.lamp else None
         # The environment's own verdict. Some games are won before every milestone
         # above is reached: "heat some mug and put it in coffeemachine" is won the
         # moment a mug is heated when another mug already sits in the coffee
@@ -194,6 +237,10 @@ class AlfworldMilestones:
         if not self.total or not alfworld_executed(observation):
             return
         a = " ".join(str(action or "").strip().lower().split())
+        self._milestone(a)
+        self._locate(a, observation)
+
+    def _milestone(self, a: str) -> None:
         m = _ALF_TAKE.match(a)
         if m:
             if m.group(1) == self.object:
@@ -206,6 +253,7 @@ class AlfworldMilestones:
                 # A treatment task only counts a treated object going in.
                 if not self.treatment or idx in self.treated:
                     self.placed.add(idx)
+                    self.arrived = True      # placed => arrived
             return
         m = _ALF_TREAT.match(a)
         if m:
@@ -215,6 +263,37 @@ class AlfworldMilestones:
         m = _ALF_USE.match(a)
         if m and m.group(1) == self.lamp:
             self.used_lamp = True
+
+    def _locate(self, a: str, observation) -> None:
+        """Where the rollout stands and what it holds, after one executed action; then "arrived"."""
+        m = _ALF_GOTO.match(a)
+        if m:
+            self._here = {m.group(1)}
+            self._lamp_here = bool(m.group(1) == self.lamp or (
+                self._lamp_re is not None and self._lamp_re.search(str(observation or "").lower())))
+        else:
+            m = _ALF_TAKE.match(a)
+            if m:
+                self._holding = (m.group(1), m.group(2))
+                self._here.add(m.group(3))
+            else:
+                m = _ALF_PLACE.match(a)
+                if m:
+                    self._holding = None
+                    self._here.add(m.group(5))
+                else:
+                    m = _ALF_TREAT.match(a) or _ALF_OPEN_CLOSE.match(a)
+                    if m:
+                        self._here.add(m.group(4) if m.re is _ALF_TREAT else m.group(1))
+                    else:
+                        m = _ALF_USE.match(a)
+                        if m and m.group(1) == self.lamp:
+                            self._lamp_here = True
+        held = self._holding
+        if held is None or held[0] != self.object or (self.treatment and held[1] not in self.treated):
+            return
+        if self._lamp_here if self.task_type == "look_at_obj_in_light" else (self.receptacle in self._here):
+            self.arrived = True
 
     @property
     def k(self) -> int:
@@ -231,6 +310,19 @@ class AlfworldMilestones:
             return took + int(bool(self.treated)) + int(bool(self.placed))
         # pick_two_obj_and_place
         return took + int(len(self.placed) >= 1) + int(len(self.took) >= 2) + int(len(self.placed) >= 2)
+
+    @property
+    def total_arrive(self) -> int:
+        """K under alfworld_k = milestone_arrive: one more than ``total``."""
+        return self.total + 1 if self.total else 0
+
+    @property
+    def k_arrive(self) -> int:
+        if not self.total:
+            return 0
+        if self.won:
+            return self.total_arrive
+        return self.k + int(self.arrived)
 
 
 # --- WebShop ------------------------------------------------------------- #

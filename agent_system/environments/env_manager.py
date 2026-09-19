@@ -1248,8 +1248,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # Both counts are always recorded; alfworld_k says which one (a) ranks by.
             _put_progress(infos, _mk, _mt, k_key=PROGRESS_K_MILESTONE_INFO,
                           total_key=PROGRESS_TOTAL_MILESTONE_INFO)
-            if _alfworld_k_definition(self.config) == "milestone":
+            _kdef = _alfworld_k_definition(self.config)
+            if _kdef == "milestone":
                 _put_progress(infos, _mk, _mt)
+            elif _kdef == "milestone_arrive":
+                # The milestones plus "arrived"; the base count stays in the columns above.
+                _put_progress(infos, [m.k_arrive for m in _ms] + [0] * (len(actions) - len(_ms)),
+                              [m.total_arrive for m in _ms] + [0] * (len(actions) - len(_ms)))
             else:
                 _put_progress(infos, _ptrs, _totals)
             _cov = getattr(self, "_coverage", None) or []

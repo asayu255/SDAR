@@ -315,6 +315,83 @@ check(P.AlfworldMilestones(game_dir("pick_heat_then_place_in_recep", "Apple", "C
 check(P.AlfworldMilestones(None).total == 0 and P.alfworld_task("") == {},
       "nor a row without a game file (never a stray traj_data.json in the working directory)")
 
+print("9b. ALFWorld 'arrived': at a target receptacle, holding the (treated) target object")
+m = P.AlfworldMilestones(game_dir("pick_and_place_simple", "Mug", "Shelf"))
+check(m.total == 2 and m.total_arrive == 3 and m.k_arrive == 0, "milestone_arrive: K + 1")
+m.step("go to shelf 1", OKOBS)
+check(m.k_arrive == 0, "standing at the target with empty hands is not it")
+m.step("go to desk 1", OKOBS)
+m.step("take mug 2 from desk 1", OKOBS)
+check(m.k_arrive == 1 and not m.arrived, "holding it somewhere else is not it either")
+m.step("go to shelf 3", "Nothing happens.")
+check(not m.arrived, "a 'go to' the environment refused moves nobody")
+m.step("go to shelf 3", OKOBS)
+check(m.arrived and m.k_arrive == 2 and m.k == 1, "carried to ANY shelf: arrived; the base count is untouched")
+m.step("go to desk 1", OKOBS)
+check(m.k_arrive == 2, "and it stays (k never goes down)")
+
+m = P.AlfworldMilestones(game_dir("pick_clean_then_place_in_recep", "Cup", "Microwave"))
+m.step("take cup 1 from cabinet 2", OKOBS)
+m.step("go to microwave 1", OKOBS)
+check(not m.arrived and m.k_arrive == 1, "treatment task: an UNtreated cup at the target is off the path")
+m.step("go to sinkbasin 1", OKOBS)
+m.step("clean cup 1 with sinkbasin 1", OKOBS)
+check(m.k_arrive == 2 and not m.arrived, "treated, not yet carried")
+m.step("go to microwave 1", OKOBS)
+check(m.arrived and m.k_arrive == 3 and m.total_arrive == 4, "the treated cup at the target: arrived")
+m.step("move cup 1 to microwave 1", OKOBS)
+check(m.k_arrive == 4 and m.k == 3, "placing completes both counts")
+
+m = P.AlfworldMilestones(game_dir("pick_heat_then_place_in_recep", "Tomato", "CounterTop"))
+m.step("take tomato 2 from countertop 1", OKOBS)
+m.step("go to microwave 1", OKOBS)
+m.step("heat tomato 2 with microwave 1", OKOBS)
+m.step("go to coffeemachine 1", OKOBS)
+check(not m.arrived, "a receptacle sharing the target's location is not known to be the target")
+m.step("move tomato 2 to countertop 1", OKOBS)
+check(m.arrived and m.k_arrive == m.total_arrive == 4, "but a counted placement implies arrived (placed => arrived)")
+
+m = P.AlfworldMilestones(game_dir("pick_and_place_simple", "Tomato", "CounterTop"))
+m.step("go to coffeemachine 1", OKOBS)
+m.step("take tomato 2 from countertop 1", OKOBS)
+check(m.arrived, "taking FROM a receptacle proves the rollout stands at it")
+m = P.AlfworldMilestones(game_dir("pick_and_place_simple", "Mug", "Fridge"))
+m.step("take mug 1 from desk 1", OKOBS)
+m.step("go to countertop 1", OKOBS)
+m.step("open fridge 1", OKOBS)
+check(m.arrived, "so does opening it")
+
+m = P.AlfworldMilestones(game_dir("look_at_obj_in_light", "Bowl", lamp="DeskLamp"))
+m.step("go to dresser 1", "You arrive at dresser 1. On the dresser 1, you see a desklamp 1, and a pen 2.")
+check(not m.arrived and m.total_arrive == 3, "look-at: at the lamp without the object is not it")
+m.step("go to desk 1", "You arrive at desk 1. On the desk 1, you see a bowl 1.")
+m.step("take bowl 1 from desk 1", OKOBS)
+check(not m.arrived, "the lamp was at the PREVIOUS place")
+m.step("go to dresser 1", "You arrive at dresser 1. On the dresser 1, you see a desklamp 1, and a pen 2.")
+check(m.arrived and m.k_arrive == 2, "holding the bowl where the arrival text names the lamp: arrived")
+m.step("use desklamp 1", OKOBS, won=True)
+check(m.k_arrive == 3 and m.k == 2, "won is at K in both counts")
+m = P.AlfworldMilestones(game_dir("look_at_obj_in_light", "Bowl", lamp="DeskLamp"))
+m.step("go to desk 1", "You arrive at desk 1. On the desk 1, you see a bowl 1, and a desklamp 1.")
+m.step("take bowl 1 from desk 1", OKOBS)
+check(m.arrived, "object and lamp at the same place: taking it is arriving")
+
+m = P.AlfworldMilestones(game_dir("pick_two_obj_and_place", "Pencil", "Drawer"))
+m.step("take pencil 2 from desk 1", OKOBS)
+m.step("go to drawer 1", OKOBS)
+check(m.k_arrive == 2 and m.total_arrive == 5, "pick-two: one flag, K = 5")
+m.step("move pencil 2 to drawer 1", OKOBS)
+m.step("go to desk 1", OKOBS)
+m.step("take pencil 3 from desk 1", OKOBS)
+m.step("move pencil 3 to drawer 1", OKOBS)
+check(m.k_arrive == 5, "and the full path reaches it")
+m = P.AlfworldMilestones(game_dir("pick_heat_then_place_in_recep", "Mug", "CoffeeMachine"))
+m.step("take mug 3 from countertop 1", OKOBS)
+m.step("heat mug 3 with microwave 1", OKOBS, won=True)
+check(m.k_arrive == m.total_arrive == 4, "a game won early is at K here too")
+check(P.AlfworldMilestones(None).total_arrive == 0 and P.AlfworldMilestones(None).k_arrive == 0,
+      "no milestones, no arrived")
+
 print("10. both ALFWorld counts reach the rows")
 gamefile2 = game_dir("pick_and_place_simple", "Pencil", "Shelf")
 with open(gamefile2, "w") as f:
@@ -332,7 +409,7 @@ class _AlfEnvs2(_AlfEnvs):
                                                         for _ in actions]
 
 
-for which in ("walkthrough", "milestone"):
+for which in ("walkthrough", "milestone", "milestone_arrive"):
     cfg = config(True)
     cfg.algorithm.progress_rank.alfworld_k = which
     mgr = AlfWorldEnvironmentManager(_AlfEnvs2(), _alf_proj, cfg)
@@ -344,8 +421,14 @@ for which in ("walkthrough", "milestone"):
               "walkthrough mode: progress_k is the pointer, the milestone count rides beside it")
         check(infos[0]["progress_total_milestone"] == 2 and infos[0]["progress_total"] == 4,
               "each with its own K")
+    elif which == "milestone":
+        check([i["progress_k"] for i in infos] == [1, 0] and infos[0]["progress_total"] == 2,
+              "milestone mode: (a) ranks by the milestones")
     else:
-        check([i["progress_k"] for i in infos] == [1, 0], "milestone mode: (a) ranks by the milestones")
+        # row 0 took the pencil FROM a shelf, the target type: it is holding it at the target
+        check([i["progress_k"] for i in infos] == [2, 0] and infos[0]["progress_total"] == 3
+              and [i["progress_k_milestone"] for i in infos] == [1, 0] and infos[0]["progress_total_milestone"] == 2,
+              "milestone_arrive mode: (a) ranks by milestones + arrived; the milestone columns keep the base count")
 cfg = config(True)
 cfg.algorithm.progress_rank.alfworld_k = "typo"
 try:
