@@ -697,6 +697,22 @@ algorithm:
     # WebShop's count and 4% for Search's. Milestone is the default (a) ranks by;
     # walkthrough stays recorded for comparison.
     alfworld_k: milestone
+    # SATURATED GROUPS: the same term for groups whose rollouts ALL won, ranked by
+    # turn count instead of k -- A_i += c_sat * (mean T - T_i) / T_task, zero-sum
+    # over the GRPO statistic's samples, c_sat = sat_rho * E / u_sat under the same
+    # cap (kappa * S). The slower winners of one ALFWorld game spent 30-37% of their
+    # turns seeing nothing new (the fastest 4%). 0 = off, bit for bit.
+    sat_rho: 0.0
+    # Search is not here: its turn count is the number of searches.
+    sat_tasks: ["alfworld", "webshop"]
+    # A saturated group fires only if its turn counts differ by at least this.
+    sat_min_spread:
+      alfworld: 2
+      webshop: 1
+    # T_task, the scale a turn difference is divided by: the task's turn cap.
+    sat_turn_scale:
+      alfworld: 50
+      webshop: 15
     # One JSON line per group per step: per trajectory k, K, ProGPO's coverage D,
     # turns, tokens, reward, invalid turns and (a)'s score; per group the score
     # spread, ProGPO's gate, the largest base |A|, the mass (a) injected; per task c,

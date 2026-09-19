@@ -117,6 +117,28 @@ cap, E, S and the token count -- which the trainer writes out as JSONL
 
 rho = 0 leaves every advantage bit-identical to control; that is stage 1's
 identity check.
+
+SATURATED GROUPS (sat_rho). The same construction on the other degenerate kind:
+a group whose eight rollouts ALL won gives GRPO nothing either, and late in
+training those are 41-57% of ALFWorld's and WebShop's groups. Inside one, the
+winners that took fewer turns are pushed up and the slower ones down:
+
+    score_i = (mean T - T_i) / T_task      T_i = trajectory i's turns
+    A_i    += c_sat * score_i              on every turn row of trajectory i
+
+with the mean weighted like the GRPO statistic (zero-sum over its samples) and
+T_task the task's turn cap (ALFWorld 50, WebShop 15). WHY TURNS: in saturated
+ALFWorld groups the slowest winner took 20-23 turns against the fastest's 8, and
+30-37% of its turns saw no new observation (4% for the fastest) -- the same
+revisiting that makes every ALFWorld failure run into the 50-turn cap. A winner
+that looped through invalid turns is longer, so it lands on the pushed-down side.
+Search is left out: its turn count is the number of searches. A group fires only
+when its turn counts differ by at least sat_min_spread (ALFWorld 2, WebShop 1).
+c_sat = sat_rho * E / u_sat per task and step, under the same cap (no winning
+token pushed up more than kappa * S); it waits for E and S like (a) does, and
+sat_rho = 0 adds nothing. Prior art for the idea (step-discounted or step-decayed
+returns, e.g. GiGPO and StraTA) changes the return everywhere; this adds a bounded,
+zero-sum term only where the return has no spread.
 """
 
 import math
@@ -130,8 +152,9 @@ from verl.trainer.ppo.term_mass import SCORE_SPREAD_EPS, score_spread
 
 __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MIN_TOP_K",
            "PROGPO_TAU_R", "PROGPO_TAU_P", "failed_groups", "trajectory_progress",
-           "score_stuck_groups", "average_ranks", "spearman", "coverage_progress",
-           "ProgressRankController"]
+           "score_stuck_groups", "score_saturated_groups", "average_ranks", "spearman",
+           "coverage_progress", "DEFAULT_SAT_TASKS", "DEFAULT_SAT_MIN_SPREAD",
+           "DEFAULT_SAT_TURN_SCALE", "ProgressRankController"]
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
@@ -146,8 +169,16 @@ PROGPO_TAU_P = 1e-4
 # A group verdict, per stuck group.
 FIRED = "fired"
 NO_PROGRESS = "no_progress"      # some rollout has no sequence (K = 0 / missing)
-NO_DIFFERENCE = "no_difference"  # all k equal -- (b)'s groups
+NO_DIFFERENCE = "no_difference"  # all k equal -- (b)'s groups; in a saturated group, all turn counts equal
 TOP_BELOW_MIN = "top_below_min"  # differ, but nobody reached min_top_k
+SPREAD_BELOW_MIN = "spread_below_min"  # saturated: turn counts differ by less than sat_min_spread
+
+# Saturated groups (sat_rho): which tasks, the smallest turn difference that fires,
+# and the scale a turn difference is divided by (the task's turn cap). Search is
+# not on the list: its turn count is the number of searches, and fewer is not better.
+DEFAULT_SAT_TASKS = ("alfworld", "webshop")
+DEFAULT_SAT_MIN_SPREAD = {"alfworld": 2.0, "webshop": 1.0}
+DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 
 
 def _finite(x) -> Optional[float]:
@@ -250,6 +281,51 @@ def score_stuck_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
     return out
 
 
+def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
+                           traj: Dict[str, dict], tasks: Iterable[str],
+                           min_spread: Dict[str, float], turn_scale: Dict[str, float],
+                           cross_steps: bool = True) -> Dict[str, Dict]:
+    """Per SATURATED group on ``tasks`` (every rollout won): whether it fired, and the scores.
+
+    The mirror of :func:`score_stuck_groups` with the count replaced by the turn
+    count, sign reversed: ``score_i = (mean T - T_i) / turn_scale``, so the
+    rollouts that won in fewer turns are pushed up. ``traj`` is apply()'s
+    per-trajectory table (turns = real rows, won by the environment's reward);
+    the mean is weighted the way the GRPO statistic weights samples, so the term
+    sums to zero over exactly what the group's own advantage sums to zero over.
+    """
+    tasks = set(tasks)
+    out: Dict[str, Dict] = {}
+    for uid, g in groups.items():
+        task = str(g.get("task") or "")
+        if task not in tasks:
+            continue
+        xs = [traj.get(t) for t in sorted({str(tuids[i]) for i in g["rows"]})]
+        if len(xs) < 2 or any(x is None or x["reward"] is None or not x["won"] for x in xs):
+            continue
+        weight: Dict[str, float] = defaultdict(float)
+        for i in g["rows"]:
+            if stat_rows[i]:
+                t = str(tuids[i])
+                weight[t] = (weight[t] + 1.0) if cross_steps else 1.0
+        trajs = sorted(weight)
+        turns = np.asarray([traj[t]["turns"] for t in trajs], dtype=float)
+        rec = {"task": task, "verdict": NO_DIFFERENCE, "scores": {}, "turns": turns.tolist(),
+               "spread": float(turns.max() - turns.min()) if len(turns) else 0.0}
+        out[uid] = rec
+        if len(trajs) < 2 or rec["spread"] <= 0.0:
+            continue
+        if rec["spread"] < float(min_spread.get(task, 1.0)):
+            rec["verdict"] = SPREAD_BELOW_MIN
+            continue
+        w = np.asarray([weight[t] for t in trajs], dtype=float)
+        mean = float((w * turns).sum() / w.sum())
+        scale = float(turn_scale.get(task) or turns.max())
+        rec["verdict"] = FIRED
+        rec["scores"] = {t: (mean - float(n_turns)) / scale for t, n_turns in zip(trajs, turns)}
+    return out
+
+
 def average_ranks(x) -> np.ndarray:
     """Ranks 1..n, ties sharing their average rank."""
     x = np.asarray(x, dtype=float)
@@ -291,8 +367,21 @@ class ProgressRankController:
     def __init__(self, *, rho: float, ema_alpha: float = 0.2, ema_floor: float = 0.01,
                  cap_kappa: float = 0.5, min_top_k: Optional[Dict[str, float]] = None,
                  tasks: Iterable[str] = ("alfworld", "webshop", "search"),
-                 cross_steps: bool = True):
+                 cross_steps: bool = True, sat_rho: float = 0.0,
+                 sat_tasks: Iterable[str] = DEFAULT_SAT_TASKS,
+                 sat_min_spread: Optional[Dict[str, float]] = None,
+                 sat_turn_scale: Optional[Dict[str, float]] = None):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
+        assert sat_rho >= 0.0, f"progress_rank.sat_rho must be >= 0, got {sat_rho}"
+        self.sat_rho = float(sat_rho)
+        self.sat_tasks = [str(t) for t in sat_tasks]
+        unknown = [t for t in self.sat_tasks if t not in [str(x) for x in tasks]]
+        assert not unknown, f"progress_rank.sat_tasks {unknown} are not in progress_rank.tasks"
+        self.sat_min_spread = dict(DEFAULT_SAT_MIN_SPREAD)
+        self.sat_min_spread.update({str(k): float(v) for k, v in (sat_min_spread or {}).items()})
+        self.sat_turn_scale = dict(DEFAULT_SAT_TURN_SCALE)
+        self.sat_turn_scale.update({str(k): float(v) for k, v in (sat_turn_scale or {}).items()})
+        assert all(v > 0 for v in self.sat_turn_scale.values()), "progress_rank.sat_turn_scale must be > 0"
         assert 0.0 < ema_alpha <= 1.0, f"progress_rank.ema_alpha must be in (0, 1], got {ema_alpha}"
         assert ema_floor > 0.0, "progress_rank.ema_floor must be > 0: it is what keeps c defined"
         assert cap_kappa > 0.0, f"progress_rank.cap_kappa must be > 0, got {cap_kappa}"
@@ -447,8 +536,25 @@ class ProgressRankController:
                     if traj[str(tuids[i])]["won"]:
                         live_success[i] = True
 
+        # Saturated groups (every rollout won by the environment's reward): the
+        # turn-count ranking. Scored on every step -- the records and the sat_*
+        # counts report it -- and added to the advantage only when sat_rho > 0.
+        sat_verdicts = score_saturated_groups(
+            groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=self.sat_tasks,
+            min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
+            cross_steps=self.cross_steps)
+        traj_sat: Dict[str, float] = {}
+        for rec in sat_verdicts.values():
+            traj_sat.update(rec["scores"])
+        row_sat = np.zeros(n, dtype=float)
+        for i in range(n):
+            s = traj_sat.get(str(tuids[i]))
+            if s is not None and (stat[i] or not real[i]):
+                row_sat[i] = s
+
         metrics: Dict[str, float] = {}
         coef = np.zeros(n, dtype=float)
+        coef_sat = np.zeros(n, dtype=float)
         per_task: Dict[str, dict] = {}
         for task in self.tasks:
             rows = real & (names == task)
@@ -480,8 +586,49 @@ class ProgressRankController:
                 metrics[f"{p}/c_uncapped"] = c_uncapped
                 metrics[f"{p}/c_cap"] = cap
             coef[names == task] = c
+
+            # The saturated-group term: its own share sat_rho of the same E, and
+            # the same cap -- no winning token is pushed up more than kappa times
+            # what a success typically gets in a live group.
+            sat_fired = rows & (row_sat != 0.0)
+            u_sat = float((np.abs(row_sat[sat_fired]) * tokens[sat_fired]).sum()) / task_tokens
+            max_abs_sat = float(np.abs(row_sat[rows]).max()) if rows.any() else 0.0
+            c_sat, sat_capped = 0.0, 0.0
+            c_sat_uncapped, sat_cap = None, None
+            if (self.sat_rho > 0.0 and task in self.sat_tasks and ema is not None and s_ema is not None
+                    and u_sat > 0.0 and max_abs_sat > 0.0):
+                c_sat_uncapped = self.sat_rho * ema / u_sat
+                sat_cap = self.kappa * s_ema / max_abs_sat
+                c_sat = c_sat_uncapped
+                if c_sat > sat_cap:
+                    c_sat, sat_capped = sat_cap, 1.0
+                metrics[f"{p}/sat_c_uncapped"] = c_sat_uncapped
+                metrics[f"{p}/sat_c_cap"] = sat_cap
+            coef_sat[names == task] = c_sat
             per_task[task] = {"c": c, "capped": bool(capped), "c_uncapped": c_uncapped, "c_cap": cap,
-                              "ema": ema, "success_push_ema": s_ema, "task_tokens": task_tokens}
+                              "ema": ema, "success_push_ema": s_ema, "task_tokens": task_tokens,
+                              "sat_c": c_sat, "sat_capped": bool(sat_capped),
+                              "sat_c_uncapped": c_sat_uncapped, "sat_c_cap": sat_cap}
+            if task in self.sat_tasks:
+                inj_sat = row_sat * c_sat * tokens
+                metrics[f"{p}/sat_c"] = c_sat
+                metrics[f"{p}/sat_capped"] = sat_capped
+                metrics[f"{p}/sat_score_mass"] = u_sat
+                metrics[f"{p}/sat_injected_mean_abs_adv"] = c_sat * u_sat
+                metrics[f"{p}/sat_share_of_ema"] = (c_sat * u_sat / ema) if ema else 0.0
+                metrics[f"{p}/sat_top_push"] = c_sat * max_abs_sat
+                if s_ema:
+                    metrics[f"{p}/sat_top_push_over_success"] = c_sat * max_abs_sat / s_ema
+                metrics[f"{p}/sat_fired_token_share"] = float(tokens[sat_fired].sum()) / task_tokens
+                metrics[f"{p}/sat_inject_up"] = float(inj_sat[rows & (row_sat > 0)].sum()) / task_tokens
+                metrics[f"{p}/sat_inject_down"] = float(-inj_sat[rows & (row_sat < 0)].sum()) / task_tokens
+                if invalid is not None:
+                    # A longer winner often carries invalid turns: the push-down on
+                    # those rows is the part aimed at the loop behaviour itself.
+                    metrics[f"{p}/sat_inject_down_invalid"] = (
+                        float(-inj_sat[rows & invalid & (row_sat < 0)].sum()) / task_tokens)
+                    metrics[f"{p}/sat_inject_up_invalid"] = (
+                        float(inj_sat[rows & invalid & (row_sat > 0)].sum()) / task_tokens)
 
             inj = row_score * c * tokens
             up = float(inj[rows & (row_score > 0)].sum()) / task_tokens
@@ -568,7 +715,10 @@ class ProgressRankController:
                 status = "saturated" if all(x["won"] for x in xs) else "live"
             else:
                 status = "other"
+            if status == "saturated":
+                counts[task]["groups_saturated"] += 1
             verdict = verdicts.get(uid, {}).get("verdict")
+            sat_verdict = sat_verdicts.get(uid, {}).get("verdict")
 
             # ProGPO on this group: its gate, and whether its coverage would fire.
             if gate.get(uid, False):
@@ -608,9 +758,22 @@ class ProgressRankController:
                 "c": info.get("c"), "capped": info.get("capped"), "c_uncapped": info.get("c_uncapped"),
                 "c_cap": info.get("c_cap"), "ema": info.get("ema"),
                 "success_push_ema": info.get("success_push_ema"), "task_tokens": info.get("task_tokens"),
+                # The saturated-group term (sat_rho): verdict, per-trajectory score and mass.
+                "sat_verdict": sat_verdict,
+                "sat_score": [traj_sat.get(t, 0.0) for t in trajs],
+                "sat_injected_abs_mass": float(np.sum(np.abs(row_sat[grows] * coef_sat[grows]) * tokens[grows])),
+                "sat_c": info.get("sat_c"), "sat_capped": info.get("sat_capped"),
+                "sat_c_uncapped": info.get("sat_c_uncapped"), "sat_c_cap": info.get("sat_c_cap"),
             })
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1
+        sat_spreads: Dict[str, List[float]] = defaultdict(list)
+        for rec in sat_verdicts.values():
+            counts[rec["task"]][f"sat_{rec['verdict']}"] += 1
+            sat_spreads[rec["task"]].append(rec["spread"])
+        for task, sp in sat_spreads.items():
+            # How far apart the winners of one game are, in turns: the signal's size.
+            metrics[f"progress_rank/{task}/sat_turn_spread_mean"] = float(np.mean(sp))
         for task, cs in counts.items():
             for key, v in cs.items():
                 metrics[f"progress_rank/{task}/{key}"] = float(v)
@@ -628,10 +791,11 @@ class ProgressRankController:
                     metrics[f"shadow/coverage/{task}/spearman_vs_k"] = float(np.mean(rhos[task]))
         self.last_group_records = records
 
-        delta = torch.as_tensor(row_score * coef, dtype=advantages.dtype, device=advantages.device)
+        delta = torch.as_tensor(row_score * coef + row_sat * coef_sat,
+                                dtype=advantages.dtype, device=advantages.device)
         if not bool((delta != 0).any()):
-            # Nothing to add: hand back the very same tensor, so rho = 0 (or a step
-            # where nothing fired) is bit-identical to control by construction.
+            # Nothing to add: hand back the very same tensor, so rho = sat_rho = 0
+            # (or a step where nothing fired) is bit-identical to control by construction.
             return advantages, metrics
         new = advantages + delta.unsqueeze(-1) * mask.to(advantages.dtype)
         return new, metrics

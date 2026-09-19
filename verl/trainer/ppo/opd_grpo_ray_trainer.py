@@ -454,6 +454,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # The mean k is weighted the way the GRPO statistic weights samples,
                 # so the ranking sums to zero over what the advantage sums to zero over.
                 cross_steps=bool(self.config.algorithm.get("compute_mean_std_cross_steps", True)),
+                # Saturated groups: winners ranked by turn count (0 = off).
+                sat_rho=float(cfg.get("sat_rho", 0.0)),
+                sat_tasks=list(cfg.get("sat_tasks", ["alfworld", "webshop"])),
+                sat_min_spread=dict(cfg.get("sat_min_spread", {}) or {}),
+                sat_turn_scale=dict(cfg.get("sat_turn_scale", {}) or {}),
             )
             pending = getattr(self, "_progress_rank_pending_state", None)
             if pending:
