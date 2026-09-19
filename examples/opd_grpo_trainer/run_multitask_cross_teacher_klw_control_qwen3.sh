@@ -1187,7 +1187,16 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
         "trainer.resume_from_path=$VAL_CKPT"
         trainer.del_local_ckpt_after_load=False
     )
-    echo "[val-only] scoring $VAL_CKPT -- no training, no checkpoint written"
+    # SCORING IS DETERMINISTIC. ROLLOUT_ASYNC_GENERATE defaults to 1 above for
+    # training; with ROLLOUT_KEEP_VLLM_AWAKE=1 that makes a score move by up to
+    # 2 pp between repeats of one checkpoint, and three scoring jobs ran that way
+    # on 2026-09-19 although the rule was written down. So a val-only run turns it
+    # off here, and verl/utils/val_scoring.py refuses the pair if it arrives on.
+    # VAL_ALLOW_NONDETERMINISTIC=1 is the only way to keep it on.
+    if [ "${VAL_ALLOW_NONDETERMINISTIC:-0}" != "1" ]; then
+        export ROLLOUT_ASYNC_GENERATE=0
+    fi
+    echo "[val-only] scoring $VAL_CKPT -- no training, no checkpoint written (ROLLOUT_ASYNC_GENERATE=$ROLLOUT_ASYNC_GENERATE)"
 fi
 
 python3 -m verl.trainer.main_opd_grpo \

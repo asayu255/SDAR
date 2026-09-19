@@ -448,6 +448,16 @@ def build_and_fit(config, *, inject_fn, trainer_cls, tag: str, label: str, examp
     )
     enforce_expected_config(config, expect_file, tag=f"{tag} expected-config")
 
+    # A scoring run must be deterministic and must say how it scored (see
+    # verl/utils/val_scoring.py for why this is enforced here and not left to notes).
+    if bool(config.trainer.get("val_only", False)):
+        from verl.utils.val_scoring import check_deterministic_scoring, write_scoring_config
+
+        print(f"[{tag} val-only] {check_deterministic_scoring()}", flush=True)
+        _path = write_scoring_config(config, config.trainer.get("val_instance_log_dir", None))
+        if _path:
+            print(f"[{tag} val-only] scoring configuration written to {_path}", flush=True)
+
     local_path = copy_to_local(
         config.actor_rollout_ref.model.path,
         use_shm=config.actor_rollout_ref.model.get("use_shm", False),
