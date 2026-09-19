@@ -4427,6 +4427,12 @@ def gradient_metrics(sums: dict, prefix: str = "kl_weight") -> dict:
         out[f"{head}/grpo/grad_norm_grpo"] = grpo
         if grpo > 1e-12:
             out[f"{head}/grpo/grad_norm_ratio"] = opd / grpo
+            # The term's first-order effect on the reward objective, in units of the
+            # objective's own step: <g_opd, g_grpo> / |g_grpo|^2 = cosine * ratio,
+            # taken from the sums so it is exact where either factor is tiny. Positive:
+            # the teacher adds to what GRPO does; negative: it takes away. The one
+            # number a per-task retirement rule can be read from.
+            out[f"{head}/grpo/first_order"] = tot["g_dot"] / (grpo * grpo)
         if opd > 1e-12 and grpo > 1e-12:
             out[f"{head}/grpo/grad_cosine"] = tot["g_dot"] / (opd * grpo)
 

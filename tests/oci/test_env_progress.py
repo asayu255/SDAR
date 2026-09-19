@@ -424,6 +424,8 @@ for which in ("walkthrough", "milestone", "milestone_arrive"):
     elif which == "milestone":
         check([i["progress_k"] for i in infos] == [1, 0] and infos[0]["progress_total"] == 2,
               "milestone mode: (a) ranks by the milestones")
+        check([i["progress_k_arrive"] for i in infos] == [2, 0] and infos[0]["progress_total_arrive"] == 3,
+              "and the count with 'arrived' is recorded beside it, so a run can see what it would split")
     else:
         # row 0 took the pencil FROM a shelf, the target type: it is holding it at the target
         check([i["progress_k"] for i in infos] == [2, 0] and infos[0]["progress_total"] == 3
@@ -441,6 +443,15 @@ tbl = record(True, [{"progress_k": 3, "progress_total": 6, "progress_k_milestone
                      "progress_total_milestone": 3}, {}])
 check(tbl[0][0]["progress_k_milestone"] == 2.0 and np.isnan(tbl[1][0]["progress_k_milestone"]),
       "the recorder carries the milestone columns too, NaN where a task has none")
+tbl = record(True, [{"progress_k": 3, "progress_total": 6, "progress_k_arrive": 3, "progress_total_arrive": 4},
+                    {"progress_k": 1, "progress_total": 5, "task_score": 0.6}])
+check(tbl[0][0]["progress_k_arrive"] == 3.0 and tbl[0][0]["progress_total_arrive"] == 4.0
+      and np.isnan(tbl[1][0]["progress_k_arrive"]), "and the count with 'arrived', NaN where a task has none")
+check(tbl[1][0]["task_score"] == 0.6 and np.isnan(tbl[0][0]["task_score"]),
+      "WebShop's purchase score rides along too, NaN on the tasks that have none")
+tbl = record(False, [{"progress_k_arrive": 3, "task_score": 0.6}, {}])
+check("progress_k_arrive" not in tbl[0][0] and "task_score" not in tbl[0][0],
+      "off: none of them, the batch keeps control's columns")
 
 print("11. ProGPO's coverage D, a shadow beside k")
 cov = P.ObservationCoverage("You are in a room.")

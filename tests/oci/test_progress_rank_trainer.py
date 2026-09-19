@@ -200,5 +200,54 @@ try:
 finally:
     RayPPOTrainer._save_checkpoint, RayPPOTrainer._load_checkpoint = orig_save, orig_load
 
+print("7. the columns the rollout adds reach the metrics and the records")
+cfg = make_config()
+cfg.env.multitask = {"max_steps": {"alfworld": 50}}
+t = trainer(cfg)
+t._progress_rank = None
+b = make_batch()
+n = len(b)
+b.non_tensor_batch["episode_lengths"] = np.array([2.0, 50.0, 50.0, 50.0, 50.0, 50.0], dtype=object)
+b.non_tensor_batch["progress_k_milestone"] = b.non_tensor_batch["progress_k"].copy()
+b.non_tensor_batch["progress_total_milestone"] = b.non_tensor_batch["progress_total"].copy()
+b.non_tensor_batch["progress_k_arrive"] = np.array([7.0, 1.0, 5.0, 5.0, 1.0, 1.0], dtype=object)
+b.non_tensor_batch["progress_total_arrive"] = np.array([7.0] * n, dtype=object)
+b.non_tensor_batch["task_score"] = np.array([float("nan")] * n, dtype=object)
+before = b.batch["advantages"].clone()
+m7 = t._apply_progress_rank(b, t.config.algorithm.progress_rank)
+check(t._turn_caps(["alfworld", "webshop", "search"]) == {"alfworld": 50, "webshop": 15, "search": 4},
+      "turn caps come from the managers' own resolver (configured ALFWorld, defaults for the rest)")
+check(m7.get("traj/alfworld/fail_at_cap") == 1.0 and m7.get("traj/alfworld/fail_turns") == 50.0,
+      "failures' turns are the episode's (50), not their rows (1-2): all three at the cap")
+check(m7.get("traj/alfworld/win_turns_live") == 2.0, "the live group's winner took 2 turns")
+check("progress_rank/alfworld/alt_arrive/stuck_compared" in m7
+      and "progress_rank/alfworld/alt_milestone/stuck_compared" not in m7,
+      "ranking by the milestones, the count with 'arrived' is the one compared")
+recs = {r["uid"]: r for r in t._progress_rank.last_group_records}
+check(recs["stuck"]["length"] == [50.0, 50.0] and recs["stuck"]["k_arrive"] == [5.0, 1.0],
+      "the records carry the episode lengths and the other count")
+cfg2 = make_config()
+cfg2.algorithm.progress_rank.alfworld_k = "milestone_arrive"
+t2 = trainer(cfg2)
+t2._progress_rank = None
+m8 = t2._apply_progress_rank(make_batch(), t2.config.algorithm.progress_rank)
+check(not any("/alt_" in k for k in m8), "a batch without the other columns: nothing compared, nothing guessed")
+b9 = make_batch()
+b9.non_tensor_batch["progress_k_milestone"] = b9.non_tensor_batch["progress_k"].copy()
+b9.non_tensor_batch["progress_total_milestone"] = b9.non_tensor_batch["progress_total"].copy()
+m9 = t2._apply_progress_rank(b9, t2.config.algorithm.progress_rank)
+check("progress_rank/alfworld/alt_milestone/stuck_compared" in m9,
+      "ranking by milestones + arrived, the base milestones are the ones compared")
+
+print("8. the teacher's first-order effect is remembered after the update")
+t._progress_rank.first_order = {}
+out = t._progress_rank.observe_update({"opd/alfworld/grpo/first_order": -0.02})
+check(out == {"opd/alfworld/grpo/first_order_pos_frac": 0.0, "opd/alfworld/grpo/first_order_window": 1.0},
+      "one negative step: 0 of 1 positive")
+src = open(os.path.join(REPO, "verl/trainer/ppo/opd_ray_trainer.py")).read()
+i = src.index("actor_output_metrics = reduce_metrics(actor_output.meta_info[\"metrics\"])")
+check("observe_update(actor_output_metrics)" in src[i:i + 600],
+      "the training loop hands the update's metrics to the controller right after the update")
+
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

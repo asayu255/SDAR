@@ -154,7 +154,8 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MI
            "PROGPO_TAU_R", "PROGPO_TAU_P", "failed_groups", "trajectory_progress",
            "score_stuck_groups", "score_saturated_groups", "average_ranks", "spearman",
            "coverage_progress", "DEFAULT_SAT_TASKS", "DEFAULT_SAT_MIN_SPREAD",
-           "DEFAULT_SAT_TURN_SCALE", "ProgressRankController"]
+           "DEFAULT_SAT_TURN_SCALE", "ProgressRankController", "group_status",
+           "trajectory_metrics", "FIRST_ORDER_WINDOW"]
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
@@ -356,6 +357,150 @@ def coverage_progress(d: Optional[float], turns: int) -> Optional[float]:
     return (float(d) - 1.0) / float(turns)
 
 
+# How many steps the teacher's first-order effect is remembered over (see
+# ProgressRankController.observe_update). 25 is the window the retirement rule
+# was read with on the rho=0.1 run's records: fewer than 10 of the last 25 steps
+# positive put WebShop's retirement at steps 145-149 and never retired the others.
+FIRST_ORDER_WINDOW = 25
+
+
+def group_status(g: Dict, xs: List[dict]) -> str:
+    """stuck (no rollout scored) / saturated (all scored) / live (both) / other."""
+    if g.get("status") == "stuck":
+        return "stuck"
+    if len(xs) >= 2 and all(x["reward"] is not None for x in xs):
+        return "saturated" if all(x["won"] for x in xs) else "live"
+    return "other"
+
+
+def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids, real: np.ndarray,
+                       tasks: Iterable[str], traj_prog: Dict[str, tuple],
+                       turn_caps: Optional[Dict[str, float]] = None,
+                       alt_prog: Optional[Dict[str, Dict[str, tuple]]] = None,
+                       have_invalid: bool = False) -> Dict[str, float]:
+    """What the rollouts looked like, per task: measured, never fed back.
+
+    The step's success rate says whether a mechanism helps; these say HOW, and they
+    are what the next mechanisms are judged on:
+
+    SATURATED-GROUP RANKING (sat_rho) can only lift success by transferring
+    "fewer turns" from the groups it acts on (all won) to the ones it does not (live
+    groups, and the failures -- all of ALFWorld's failures stop at the turn cap). So:
+      win_turns_saturated / win_turns_live / win_turns   winners' turns by group kind
+      win_excess_saturated / win_excess_live   a winner's turns beyond its group's
+                               fastest win (groups with >= 2 winners): the waste
+                               the ranking targets, measured against the group's own
+                               witness, not a constant
+      win_fastest_saturated    that witness (the group's fastest win), averaged
+      fail_turns, fail_at_cap  failures' turns; the share that ran into the task's
+                               turn cap rather than ending on their own
+      win_tokens_per_turn / fail_tokens_per_turn   fewer turns bought with longer
+                               turns would show here
+    THE TEACHER'S TERM (OPD, and what replaces it) eroded WebShop's format before
+    its success moved (the </final> collapse): winners carrying an invalid turn went
+    0% -> 37% -> 80% while success was still flat. So:
+      win_with_invalid_turn    share of winners with at least one invalid turn
+      win_invalid_turn_share / fail_invalid_turn_share   invalid turns / turns
+    (a) on stuck groups:
+      fail_progress            failures' k / K: do they get further before failing
+      fail_distinct_obs_per_turn   ProGPO's P on failures (distinct observations per
+                               turn): loops show as a low value; a shadow, not a signal
+      groups_{stuck,live,saturated}_share   what the batch's groups were
+    and, per alternative count (ALFWorld's milestones with / without "arrived"):
+      progress_rank/<task>/alt_<name>/stuck_split_where_tied    stuck groups the
+                               ranked count ties and the alternative would split
+      progress_rank/<task>/alt_<name>/stuck_tied_where_split    and the reverse
+    Turns are the trajectory's episode length where the batch carries it (rows can
+    be dropped to make the batch divisible), else its rows here.
+    """
+    tasks = [str(t) for t in tasks]
+    acc: Dict[str, Dict[str, list]] = {t: defaultdict(list) for t in tasks}
+    alt_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    n_groups: Dict[str, Dict[str, int]] = {t: defaultdict(int) for t in tasks}
+    caps = {str(k): float(v) for k, v in (turn_caps or {}).items()}
+    turns_of = lambda x: float(x["length"]) if x.get("length") is not None else float(x["turns"])
+    for uid, g in groups.items():
+        task = str(g.get("task") or "")
+        if task not in acc:
+            continue
+        trajs = sorted({str(tuids[i]) for i in g["rows"] if real[i]})
+        xs = [traj[t] for t in trajs if t in traj]
+        status = group_status(g, xs)
+        n_groups[task][status] += 1
+        a = acc[task]
+        wins = [x for x in xs if x["won"]]
+        if status in ("live", "saturated"):
+            for x in wins:
+                a[f"win_turns_{status}"].append(turns_of(x))
+            if len(wins) >= 2:
+                fastest = min(turns_of(x) for x in wins)
+                a[f"win_excess_{status}"].extend(turns_of(x) - fastest for x in wins)
+                if status == "saturated":
+                    a["win_fastest_saturated"].append(fastest)
+        for t, x in zip(trajs, xs):
+            if x["reward"] is None:
+                continue
+            T = turns_of(x)
+            rows_here = max(1, int(x["turns"]))
+            if x["won"]:
+                a["win_turns"].append(T)
+                a["win_tokens_per_turn"].append(x["tokens"] / rows_here)
+                if have_invalid:
+                    a["win_with_invalid_turn"].append(float(x["invalid"] > 0))
+                    a["_win_invalid"].append(float(x["invalid"]))
+                    a["_win_rows"].append(float(x["turns"]))
+            else:
+                a["fail_turns"].append(T)
+                a["fail_tokens_per_turn"].append(x["tokens"] / rows_here)
+                if task in caps and x.get("length") is not None:
+                    a["fail_at_cap"].append(float(T >= caps[task]))
+                if have_invalid:
+                    a["_fail_invalid"].append(float(x["invalid"]))
+                    a["_fail_rows"].append(float(x["turns"]))
+                k, K = traj_prog.get(t, (0.0, 0.0))
+                if K > 0:
+                    a["fail_progress"].append(k / K)
+                cov = coverage_progress(x.get("d"), int(x["turns"]))
+                if cov is not None:
+                    a["fail_distinct_obs_per_turn"].append(cov)
+                if x.get("task_score") is not None:
+                    a["fail_task_score"].append(float(x["task_score"]))
+        if status == "stuck" and alt_prog:
+            ranked = [traj_prog.get(t, (0.0, 0.0)) for t in trajs]
+            if len(ranked) >= 2 and all(K > 0 for _, K in ranked):
+                tied = len({k for k, _ in ranked}) == 1
+                for name, prog in alt_prog.items():
+                    alt = [prog.get(t, (0.0, 0.0)) for t in trajs]
+                    if not all(K > 0 for _, K in alt):
+                        continue
+                    alt_tied = len({k for k, _ in alt}) == 1
+                    ac = alt_counts[(task, name)]
+                    ac["stuck_compared"] += 1
+                    ac["stuck_split_where_tied"] += int(tied and not alt_tied)
+                    ac["stuck_tied_where_split"] += int(alt_tied and not tied)
+    out: Dict[str, float] = {}
+    for task, a in acc.items():
+        p = f"traj/{task}"
+        for key, vals in a.items():
+            if vals and not key.startswith("_"):
+                out[f"{p}/{key}"] = float(np.mean(vals))
+        for key in ("win_turns_live", "win_turns_saturated", "fail_turns"):
+            if a.get(key):
+                out[f"{p}/{key}_n"] = float(len(a[key]))
+        if a.get("_win_rows"):
+            out[f"{p}/win_invalid_turn_share"] = float(np.sum(a["_win_invalid"]) / max(1.0, np.sum(a["_win_rows"])))
+        if a.get("_fail_rows"):
+            out[f"{p}/fail_invalid_turn_share"] = float(np.sum(a["_fail_invalid"]) / max(1.0, np.sum(a["_fail_rows"])))
+        total = sum(n_groups[task].values())
+        if total:
+            for status in ("stuck", "live", "saturated"):
+                out[f"{p}/groups_{status}_share"] = n_groups[task].get(status, 0) / total
+    for (task, name), cs in alt_counts.items():
+        for key, v in cs.items():
+            out[f"progress_rank/{task}/alt_{name}/{key}"] = float(v)
+    return out
+
+
 class ProgressRankController:
     """Holds each task's EMAs across steps and turns scores into advantage.
 
@@ -398,11 +543,15 @@ class ProgressRankController:
         self.success_ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
         # The last apply()'s groups, one dict per group; see GROUP RECORDS above.
         self.last_group_records: List[dict] = []
+        # The teacher term's first-order effect on the GRPO objective, per task, over
+        # the last FIRST_ORDER_WINDOW updates (observe_update). Measured, not acted on.
+        self.first_order: Dict[str, List[float]] = {}
 
     # --- persistence ------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"version": 2, "ema": dict(self.ema), "success_ema": dict(self.success_ema)}
+        return {"version": 3, "ema": dict(self.ema), "success_ema": dict(self.success_ema),
+                "first_order": {t: list(v) for t, v in self.first_order.items()}}
 
     def load_state_dict(self, state: dict) -> None:
         state = state or {}
@@ -411,6 +560,35 @@ class ProgressRankController:
         # Version 1 carried E only; S then starts uninitialised and (a) waits for a live group.
         for t, v in state.get("success_ema", {}).items():
             self.success_ema[str(t)] = None if v is None else float(v)
+        # Version 2 and earlier carried no window; it then refills from the next update.
+        for t, v in (state.get("first_order", {}) or {}).items():
+            self.first_order[str(t)] = [float(x) for x in v][-FIRST_ORDER_WINDOW:]
+
+    def observe_update(self, metrics: dict) -> Dict[str, float]:
+        """After the actor update: the teacher term's first-order effect, remembered.
+
+        ``opd/<task>/grpo/first_order`` is <g_OPD, g_GRPO> / |g_GRPO|^2 on the logit
+        gradients (cross_teacher_kl_weight.gradient_metrics): how much the teacher's
+        term adds to, or takes from, the reward objective's own step. On the rho=0.1
+        run it turned negative on WebShop at step ~126 in both runs, went to ~0 on
+        ALFWorld and stayed positive on Search. Returned per task:
+          first_order_pos_frac   positive share over the last FIRST_ORDER_WINDOW steps
+                                 (the retirement rule read "fewer than 10 of 25")
+          first_order_window     how many steps that share is over (it restarts empty
+                                 on a checkpoint written before this existed)
+        Absent when the teacher's term is off (coef 0): nothing to measure.
+        """
+        out: Dict[str, float] = {}
+        for task in self.tasks:
+            v = _finite(metrics.get(f"opd/{task}/grpo/first_order"))
+            if v is None:
+                continue
+            w = self.first_order.setdefault(task, [])
+            w.append(v)
+            del w[:-FIRST_ORDER_WINDOW]
+            out[f"opd/{task}/grpo/first_order_pos_frac"] = sum(1 for x in w if x > 0.0) / len(w)
+            out[f"opd/{task}/grpo/first_order_window"] = float(len(w))
+        return out
 
     # --- one step ---------------------------------------------------------- #
 
@@ -437,7 +615,8 @@ class ProgressRankController:
     def apply(self, *, advantages: torch.Tensor, mask: torch.Tensor, uids, tuids, task_names,
               episode_rewards, k_rows, total_rows, real_rows: np.ndarray,
               stat_rows: np.ndarray, row_scores=None, valid_rows=None,
-              coverage_rows=None) -> tuple:
+              coverage_rows=None, episode_lengths=None, turn_caps=None,
+              alt_counts=None, task_score_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -451,6 +630,13 @@ class ProgressRankController:
                              invalid turns is not reported.
         ``coverage_rows``    per row, ProGPO's D as of that turn. Without it the
                              coverage shadow is not reported.
+        ``episode_lengths``  per row, its trajectory's length in turns (the rollout's
+                             count, untouched by rows dropped from the batch)
+        ``turn_caps``        ``{task: max turns}``, for the share of failures at the cap
+        ``alt_counts``       ``{name: (k_rows, total_rows)}``, other progress counts to
+                             compare with the ranked one on the same stuck groups
+        ``task_score_rows``  per row, WebShop's continuous purchase score
+        None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
         """
@@ -504,8 +690,17 @@ class ProgressRankController:
             x = traj.get(t)
             if x is None:
                 x = traj[t] = {"task": names[i], "turns": 0, "tokens": 0.0, "reward": None,
-                               "invalid": 0, "d": None, "d_ok": coverage_rows is not None}
+                               "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
+                               "length": None, "task_score": None}
             x["turns"] += 1
+            if episode_lengths is not None:
+                ln = _finite(episode_lengths[i])
+                if ln is not None:
+                    x["length"] = ln if x["length"] is None else max(x["length"], ln)
+            if task_score_rows is not None:
+                ts = _finite(task_score_rows[i])
+                if ts is not None:
+                    x["task_score"] = ts if x["task_score"] is None else max(x["task_score"], ts)
             x["tokens"] += float(tokens[i])
             r = _finite(episode_rewards[i])
             if r is not None:
@@ -692,6 +887,14 @@ class ProgressRankController:
             if won_d:
                 metrics[f"shadow/coverage/{task}/won_with_zero"] = sum(1 for d in won_d if d <= 1) / len(won_d)
 
+        # What the rollouts looked like (turns, format, the cap, other counts): measured only.
+        alt_prog = {str(name): trajectory_progress(tuids, kr, tr, range(n))
+                    for name, (kr, tr) in (alt_counts or {}).items()}
+        metrics.update(trajectory_metrics(
+            groups, traj, tuids=tuids, real=real,
+            tasks=list(dict.fromkeys(self.tasks + self.sat_tasks)), traj_prog=traj_prog,
+            turn_caps=turn_caps, alt_prog=alt_prog, have_invalid=invalid is not None))
+
         # Group counts, the shadows, and the records.
         counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         shadow: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -705,18 +908,16 @@ class ProgressRankController:
             grows = [i for i in g["rows"] if real[i]]
             trajs = sorted({str(tuids[i]) for i in grows})
             xs = [traj[t] for t in trajs]
-            stuck = g.get("status") == "stuck"
+            status = group_status(g, xs)
+            stuck = status == "stuck"
             if stuck:
-                status = "stuck"
                 counts[task]["groups_stuck"] += 1
                 if uid in spread:
                     counts[task]["stuck_mixed" if spread[uid] > SCORE_SPREAD_EPS else "stuck_uniform"] += 1
-            elif len(xs) >= 2 and all(x["reward"] is not None for x in xs):
-                status = "saturated" if all(x["won"] for x in xs) else "live"
-            else:
-                status = "other"
             if status == "saturated":
                 counts[task]["groups_saturated"] += 1
+            if status == "live":
+                counts[task]["groups_live"] += 1
             verdict = verdicts.get(uid, {}).get("verdict")
             sat_verdict = sat_verdicts.get(uid, {}).get("verdict")
 
@@ -749,6 +950,12 @@ class ProgressRankController:
                 "reward": [x["reward"] for x in xs],
                 "won": [x["won"] for x in xs],
                 "invalid_turns": None if invalid is None else [x["invalid"] for x in xs],
+                # The rollout's own length (rows can be dropped from the batch), WebShop's
+                # continuous purchase score, and the other progress counts, per trajectory.
+                "length": [x["length"] for x in xs],
+                "task_score": [x["task_score"] for x in xs],
+                **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
+                **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],
                 "score_spread": spread.get(uid),
                 "progpo_gate": gate.get(uid),

@@ -528,6 +528,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         tlr = batch.batch.get("token_level_rewards", None)
         row_scores = None if tlr is None else tlr.sum(-1).double().cpu().numpy()
 
+        # The OTHER progress counts, for comparison on the same stuck groups: ALFWorld's
+        # milestones with and without "arrived", whichever of them (a) is not ranking by.
+        kdef = str(cfg.get("alfworld_k", "milestone") or "milestone")
+        alt_counts = {}
+        for name, kcol, tcol, active in (("milestone", "progress_k_milestone", "progress_total_milestone", "milestone"),
+                                         ("arrive", "progress_k_arrive", "progress_total_arrive", "milestone_arrive")):
+            if kdef != active and kcol in nt and tcol in nt:
+                alt_counts[name] = (nt[kcol], nt[tcol])
+
         ctl = self._progress_rank_controller(cfg)
         new_adv, out = ctl.apply(
             advantages=batch.batch["advantages"], mask=mask,
@@ -538,10 +547,32 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             row_scores=row_scores,
             valid_rows=nt["is_action_valid"] if "is_action_valid" in nt else None,
             coverage_rows=nt[COVERAGE_D_KEY] if COVERAGE_D_KEY in nt else None,
+            episode_lengths=nt["episode_lengths"] if "episode_lengths" in nt else None,
+            turn_caps=self._turn_caps(ctl.tasks),
+            alt_counts=alt_counts,
+            task_score_rows=nt["task_score"] if "task_score" in nt else None,
         )
         batch.batch["advantages"] = new_adv
         out.update(self._write_progress_rank_groups(ctl.last_group_records, cfg))
         return out
+
+    def _turn_caps(self, tasks) -> dict:
+        """``{task: max turns}`` as the environment managers apply them; {} if unknown."""
+        caps = getattr(self, "_turn_caps_cache", None)
+        if caps is None:
+            caps = {}
+            try:
+                if self.config.env.get("multitask", None):
+                    from agent_system.environments.env_manager import _get_multitask_task_max_steps
+
+                    caps = _get_multitask_task_max_steps(self.config, [str(t) for t in tasks])
+                elif self.config.env.get("max_steps", None) is not None and len(tasks) == 1:
+                    caps = {str(tasks[0]): int(self.config.env.max_steps)}
+            except (KeyError, TypeError, ValueError, AttributeError) as e:
+                print(f"[progress_rank] turn caps unknown ({e!r}); traj/<task>/fail_at_cap not reported")
+                caps = {}
+            self._turn_caps_cache = caps
+        return caps
 
     def _write_progress_rank_groups(self, records, cfg) -> dict:
         """One JSON line per group; returns a metric that is 1 when the write failed.

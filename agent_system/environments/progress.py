@@ -47,6 +47,10 @@ PROGRESS_TOTAL_INFO = "progress_total"
 # other tasks' rows.
 PROGRESS_K_MILESTONE_INFO = "progress_k_milestone"
 PROGRESS_TOTAL_MILESTONE_INFO = "progress_total_milestone"
+# The milestones plus "arrived" (alfworld_k = milestone_arrive), also always recorded:
+# a run ranking by one count measures, on its own rollouts, what the other would split.
+PROGRESS_K_ARRIVE_INFO = "progress_k_arrive"
+PROGRESS_TOTAL_ARRIVE_INFO = "progress_total_arrive"
 ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive")
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"

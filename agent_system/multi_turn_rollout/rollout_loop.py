@@ -1863,8 +1863,14 @@ class TrajectoryCollector:
                 # ALFWorld's second count, beside the first (NaN on other tasks).
                 rows[pos]['progress_k_milestone'] = float(_info.get('progress_k_milestone', float('nan')))
                 rows[pos]['progress_total_milestone'] = float(_info.get('progress_total_milestone', float('nan')))
+                # ...and the milestones plus "arrived" (NaN on other tasks).
+                rows[pos]['progress_k_arrive'] = float(_info.get('progress_k_arrive', float('nan')))
+                rows[pos]['progress_total_arrive'] = float(_info.get('progress_total_arrive', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))
+                # WebShop's continuous purchase score (envs.py keeps it beside the binary
+                # reward; 0 until the episode ends); NaN on the tasks that have none.
+                rows[pos]['task_score'] = float(_info.get('task_score', float('nan')))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:

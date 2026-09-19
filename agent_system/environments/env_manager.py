@@ -48,6 +48,7 @@ from agent_system.environments.oci_layout import (
 from agent_system.memory import SimpleMemory, SearchMemory
 from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
+    PROGRESS_K_ARRIVE_INFO, PROGRESS_TOTAL_ARRIVE_INFO,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress)
@@ -1243,18 +1244,22 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             _ms = list(getattr(self, "_milestones", None) or [])
             for i, act in enumerate(actions[:len(_ms)]):
                 _ms[i].step(act, text_obs[i], won=bool((infos[i] or {}).get("won", False)))
-            _mk = [m.k for m in _ms] + [0] * (len(actions) - len(_ms))
-            _mt = [m.total for m in _ms] + [0] * (len(actions) - len(_ms))
-            # Both counts are always recorded; alfworld_k says which one (a) ranks by.
+            _pad = [0] * (len(actions) - len(_ms))
+            _mk = [m.k for m in _ms] + _pad
+            _mt = [m.total for m in _ms] + _pad
+            _ak = [m.k_arrive for m in _ms] + _pad
+            _at = [m.total_arrive for m in _ms] + _pad
+            # Every count is always recorded; alfworld_k says which one (a) ranks by.
             _put_progress(infos, _mk, _mt, k_key=PROGRESS_K_MILESTONE_INFO,
                           total_key=PROGRESS_TOTAL_MILESTONE_INFO)
+            _put_progress(infos, _ak, _at, k_key=PROGRESS_K_ARRIVE_INFO,
+                          total_key=PROGRESS_TOTAL_ARRIVE_INFO)
             _kdef = _alfworld_k_definition(self.config)
             if _kdef == "milestone":
                 _put_progress(infos, _mk, _mt)
             elif _kdef == "milestone_arrive":
-                # The milestones plus "arrived"; the base count stays in the columns above.
-                _put_progress(infos, [m.k_arrive for m in _ms] + [0] * (len(actions) - len(_ms)),
-                              [m.total_arrive for m in _ms] + [0] * (len(actions) - len(_ms)))
+                # The milestones plus "arrived"; the base count stays in its own columns.
+                _put_progress(infos, _ak, _at)
             else:
                 _put_progress(infos, _ptrs, _totals)
             _cov = getattr(self, "_coverage", None) or []
