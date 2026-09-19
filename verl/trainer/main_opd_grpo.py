@@ -64,6 +64,17 @@ def inject_opd_grpo_config(config) -> None:
             "OPD+GRPO requires actor_rollout_ref.actor.pg_loss_coef -- it is the "
             "weight of the policy gradient against the teacher KL"
         )
+        # Self-distillation (OPSD): the SDAR gated loss against the skill-
+        # conditioned self, computed by the trainer (teacher_log_probs) and
+        # aggregated in the actor by the same per-task row weights as the policy
+        # gradient. After inject_distillation_config, which turns use_sdar_loss
+        # off for every distillation arm; only an explicit algorithm.opsd.enable
+        # turns it back on. The external teacher's coefficient is left to the run.
+        opsd = config.algorithm.get("opsd", None)
+        if opsd is not None and bool(opsd.get("enable", False)):
+            config.actor_rollout_ref.actor.use_sdar_loss = True
+            config.actor_rollout_ref.actor.sdar_loss_coef = float(opsd.get("coef", 0.01))
+            config.actor_rollout_ref.actor.sdar_gate_beta = float(opsd.get("gate_beta", 5.0))
 
 
 def run_opd_grpo(config) -> None:

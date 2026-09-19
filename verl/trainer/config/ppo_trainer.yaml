@@ -715,6 +715,17 @@ algorithm:
   pf_ppo:
     reweight_method: pow  # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  # On-policy SELF-distillation for the OPD+GRPO trainer: the SDAR gated loss
+  # against the model itself with the task's skill documents in the prompt
+  # (the SDAR runs' teacher), aggregated by the per-task row weights. Off by
+  # default; enabling it does not touch the external teacher's coefficient.
+  opsd:
+    enable: False
+    coef: 0.01            # SDAR's sdar_coef
+    gate_beta: 5.0        # SDAR's gate_beta
+    skills_dir: skills/alfworld
+    skills_dirs: {alfworld: skills/alfworld, webshop: skills/webshop, search: skills/search}
+    skill_all: False
   gigpo:
     step_advantage_w: 1.0
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"

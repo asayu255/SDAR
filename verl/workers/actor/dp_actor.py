@@ -354,7 +354,11 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
         "per-task loss normalisation is for the distillation loss, but "
         "use_teacher_kl_loss is off"
     )
-    for other in ("use_kl_loss", "use_sdl_loss", "use_sdar_loss"):
+    # use_sdar_loss is NOT refused: its branch aggregates the gated self-distillation
+    # term by the same row weights as the policy gradient (see the SDAR block in
+    # update_policy), which is what lets an OPD+GRPO run switch its distillation
+    # from an external teacher to the skill-conditioned self (algorithm.opsd).
+    for other in ("use_kl_loss", "use_sdl_loss"):
         assert not config.get(other, False), (
             f"per-task loss normalisation weights the policy-gradient, entropy and "
             f"teacher-KL terms; {other} is set and would keep the plain token-mean"
@@ -4469,17 +4473,30 @@ class DataParallelPPOActor(BasePPOActor):
                          metrics["actor/sdl_coef"] = sdl_coef
 
                      if self.config.get("use_sdar_loss", False):
-                         from verl.trainer.ppo.sdar_utils import compute_sdar_loss
+                         from verl.trainer.ppo.sdar_utils import compute_sdar_loss, sdar_gated_kl
                          teacher_log_probs = data["teacher_log_probs"]
+                         _sdar_beta = self.config.get("sdar_gate_beta", 5.0)
+                         # Reported as the plain token-mean on every path, so the
+                         # number stays comparable with the SDAR runs.
                          sdar_loss, sdar_metrics = compute_sdar_loss(
                              student_log_probs=log_prob,
                              teacher_log_probs=teacher_log_probs,
                              response_mask=response_mask,
-                             gate_beta=self.config.get("sdar_gate_beta", 5.0),
+                             gate_beta=_sdar_beta,
                              loss_agg_mode=loss_agg_mode,
                          )
+                         if task_agg_scale is None:
+                             sdar_term = sdar_loss
+                         else:
+                             # Under per-task normalisation the term the optimiser
+                             # takes is the same per-token gated KL, aggregated by
+                             # the row weights the policy gradient uses -- exactly
+                             # as the teacher-KL term it replaces is.
+                             _sdar_tok, _, _ = sdar_gated_kl(log_prob, teacher_log_probs, _sdar_beta)
+                             sdar_term = _task_agg(_sdar_tok)
+                             _defer("sdar/loss_weighted", sdar_term)
                          sdar_coef = self.config.get("sdar_loss_coef", 0.1)
-                         policy_loss = policy_loss + sdar_loss * sdar_coef
+                         policy_loss = policy_loss + sdar_term * sdar_coef
                          metrics.update(sdar_metrics)
                          metrics["sdar/coef"] = sdar_coef
 

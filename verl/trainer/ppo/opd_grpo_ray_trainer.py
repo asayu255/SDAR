@@ -92,6 +92,18 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             old_log_prob.batch.pop("entropys")
             batch = batch.union(old_log_prob)
 
+        # ---- self-distillation teacher (algorithm.opsd) ----
+        # The skill-conditioned SELF as the distillation teacher, exactly as the
+        # SDAR runs build it: the same current weights, the student's own
+        # responses, the prompt prefixed with the task's skill documents. Written
+        # to teacher_log_probs, which the actor reads under use_sdar_loss. After
+        # old_log_prob and before the advantages, so the rows are already in the
+        # order (and padding) the actor will see.
+        opsd_cfg = self.config.algorithm.get("opsd", None)
+        if opsd_cfg is not None and bool(opsd_cfg.get("enable", False)):
+            with _timer("opsd_teacher", timing_raw):
+                batch.batch["teacher_log_probs"] = self._compute_self_teacher_log_probs(batch, opsd_cfg, metrics)
+
         # ---- advantages (GRPO) ----
         with _timer("adv", timing_raw):
             batch.batch["token_level_scores"] = reward_tensor
@@ -379,6 +391,53 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         return batch, reward_extra_infos_dict
 
     # --- (a) ------------------------------------------------------------------ #
+
+    def _compute_self_teacher_log_probs(self, batch: DataProto, cfg, metrics: dict) -> torch.Tensor:
+        """log pi_theta(y_t | skills + x, y_<t) on every row, for the SDAR loss.
+
+        Reuses the SDAR trainers' own pieces (``build_teacher_batch``,
+        ``SkillProvider``) rather than a copy, so the teacher here is the one the
+        SDAR baseline trained against. The external teachers keep running (their
+        coefficient is the run's choice); they write ``teacher_cache_ids`` under
+        student-indexed top-k, never ``teacher_log_probs`` -- checked at the first
+        call, because the single-token OPD estimator writes that same column and
+        would silently replace this one.
+        """
+        from verl.trainer.ppo.rlsd_ray_trainer import build_teacher_batch
+        from verl.trainer.ppo.rlsd_utils import SkillProvider
+
+        if getattr(self, "_opsd_skill_provider", None) is None:
+            assert self.config.algorithm.opd.get("kl_loss_type", None) == "topk_kl", (
+                "algorithm.opsd needs the external OPD path in top-k mode: the "
+                "single-token OPD estimator writes batch['teacher_log_probs'] too and "
+                "would overwrite the self-teacher's column"
+            )
+            skills_dirs = cfg.get("skills_dirs", None)
+            self._opsd_skill_provider = SkillProvider(
+                skills_dir=cfg.get("skills_dir", "skills/alfworld"),
+                skill_all=bool(cfg.get("skill_all", False)),
+                skills_dirs=dict(skills_dirs) if skills_dirs is not None else None,
+            )
+        max_prompt_length = self.config.data.max_prompt_length
+        teacher_batch = build_teacher_batch(
+            batch=batch,
+            skill_provider=self._opsd_skill_provider,
+            tokenizer=self.tokenizer,
+            max_prompt_length=max_prompt_length,
+            truncation=self.config.data.get("truncation", "left"),
+        )
+        out = self.actor_rollout_wg.compute_log_prob(teacher_batch)
+
+        # How much the skill prefix added, and how often the teacher prompt hit
+        # the cap. build_teacher_batch keeps the END of an over-long prompt, so a
+        # capped row lost the start of its skill text -- the one thing that makes
+        # the teacher a teacher.
+        response_length = batch.batch["responses"].size(1)
+        student_len = batch.batch["attention_mask"][:, :-response_length].sum(-1).float()
+        teacher_len = teacher_batch.batch["attention_mask"][:, :-response_length].sum(-1).float()
+        metrics["opsd/prompt_tokens_added/mean"] = float((teacher_len - student_len).mean())
+        metrics["opsd/prompt_capped_ratio"] = float((teacher_len >= max_prompt_length).float().mean())
+        return out.batch["old_log_probs"]
 
     def _progress_rank_controller(self, cfg):
         ctl = getattr(self, "_progress_rank", None)

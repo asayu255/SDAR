@@ -11,6 +11,29 @@ import torch
 from verl.trainer.ppo.core_algos import agg_loss
 
 
+def sdar_gated_kl(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    gate_beta: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The per-token SDAR term before aggregation: ``g_t * (log pi_T - log pi_S)``.
+
+    Split out of :func:`compute_sdar_loss` so that an actor which aggregates by
+    per-task row weights (``agg_loss_by_task_weights``) applies exactly the same
+    per-token quantity as the token-mean path does. Only the student log-probs
+    carry gradients; the gate and the teacher are detached.
+
+    Returns:
+        gated_kl: (bs, response_length), carries gradients through the student.
+        gate:     (bs, response_length), detached.
+        delta:    (bs, response_length), ``log pi_T - log pi_S``, detached.
+    """
+    teacher_log_probs = teacher_log_probs.detach()
+    delta = teacher_log_probs - student_log_probs.detach()
+    gate = torch.sigmoid(gate_beta * delta).detach()
+    return gate * (teacher_log_probs - student_log_probs), gate, delta
+
+
 def compute_sdar_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -39,15 +62,7 @@ def compute_sdar_loss(
         sdar_loss: scalar loss.
         metrics: dict with gating statistics.
     """
-    teacher_log_probs = teacher_log_probs.detach()
-
-    delta_t = teacher_log_probs - student_log_probs.detach()
-
-    gate = torch.sigmoid(gate_beta * delta_t).detach()
-
-    kl_per_token = teacher_log_probs - student_log_probs
-
-    gated_kl = gate * kl_per_token
+    gated_kl, gate, delta_t = sdar_gated_kl(student_log_probs, teacher_log_probs, gate_beta)
 
     loss = agg_loss(loss_mat=gated_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
