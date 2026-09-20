@@ -1187,6 +1187,23 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
         "trainer.resume_from_path=$VAL_CKPT"
         trainer.del_local_ckpt_after_load=False
     )
+    # AND IT IS SCORED THE WAY THE BASELINES WERE. Every arm of the comparison
+    # table was scored at VAL_PIPELINE_DEPTH=3 with gpu_memory_utilization=0.6
+    # (logs/val2026/*.log); a number taken with other values is not a row in that
+    # table. Both change how batches are formed -- the KV budget decides how many
+    # sequences run at once, the depth how many callers fill a batch -- and one
+    # ALFWorld game is 0.79 points, so "it should not matter" is not a claim this
+    # repo gets to make for free. A val-only run therefore takes that recipe here
+    # rather than inheriting whatever the training launcher passed: these args sit
+    # after "$@" in the command, so they also beat a trailing override.
+    # VAL_REFERENCE_CONFIG=0 opts out, for a deliberate sweep of these two knobs.
+    if [ "${VAL_REFERENCE_CONFIG:-1}" = "1" ]; then
+        export VAL_PIPELINE_DEPTH=3
+        VAL_ONLY_ARGS+=(actor_rollout_ref.rollout.gpu_memory_utilization=0.6)
+        echo "[val-only] reference scoring config: VAL_PIPELINE_DEPTH=3 gpu_memory_utilization=0.6"
+    else
+        echo "[val-only] VAL_REFERENCE_CONFIG=0: depth=$VAL_PIPELINE_DEPTH and the caller's gpu_memory_utilization"
+    fi
     # SCORING IS DETERMINISTIC. ROLLOUT_ASYNC_GENERATE defaults to 1 above for
     # training; with ROLLOUT_KEEP_VLLM_AWAKE=1 that makes a score move by up to
     # 2 pp between repeats of one checkpoint, and three scoring jobs ran that way
