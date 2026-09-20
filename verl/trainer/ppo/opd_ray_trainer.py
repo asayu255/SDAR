@@ -785,16 +785,51 @@ class OPDRayTrainer(RayPPOTrainer):
     # belongs to the shared loop. A no-op unless a progress_rank controller
     # exists, which only the GRPO arm with algorithm.progress_rank.enable creates.
 
+    RETIREMENT_STATE_FILE = "teacher_retirement_state.json"
+
+    def _teacher_retirement(self):
+        """The per-task retirement controller, or None when the run does not retire.
+
+        algorithm.opd.retire.enable is off by default, so every existing arm keeps
+        its teacher for the whole run and passes no multipliers at all.
+        """
+        cfg = (self.config.algorithm.get("opd", None) or {}).get("retire", None)
+        if cfg is None or not bool(cfg.get("enable", False)):
+            return None
+        ctl = getattr(self, "_retirement_ctl", None)
+        if ctl is None:
+            from verl.trainer.ppo.teacher_retirement import (
+                RETIRE_WARMUP, RETIRE_WINDOW, TeacherRetirement,
+            )
+
+            tasks = list(self.config.env.get("multitask", {}).get("tasks", []) or [])
+            assert tasks, ("algorithm.opd.retire needs env.multitask.tasks: the rule is per "
+                           "task and a single-task run has nothing to retire against")
+            ctl = TeacherRetirement(tasks,
+                                    window=int(cfg.get("window", RETIRE_WINDOW)),
+                                    warmup=int(cfg.get("warmup", RETIRE_WARMUP)))
+            pending = getattr(self, "_retirement_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending)
+                print(f"[teacher-retirement] restored: {ctl.retired}", flush=True)
+            self._retirement_ctl = ctl
+        return ctl
+
     PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
 
     def _save_progress_rank_state(self):
-        ctl = getattr(self, "_progress_rank", None)
-        if ctl is None:
-            return
         folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
-            json.dump(ctl.state_dict(), f)
+        ctl = getattr(self, "_progress_rank", None)
+        if ctl is not None:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
+                json.dump(ctl.state_dict(), f)
+        # Which teachers have retired, so a resume does not revive them.
+        ret = getattr(self, "_retirement_ctl", None)
+        if ret is not None:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, self.RETIREMENT_STATE_FILE), "w") as f:
+                json.dump(ret.state_dict(), f)
 
     def _load_checkpoint(self):
         out = super()._load_checkpoint()
@@ -811,6 +846,12 @@ class OPDRayTrainer(RayPPOTrainer):
             with open(path) as f:
                 self._progress_rank_pending_state = json.load(f)
             print(f"[progress_rank] EMA restored from {path}: {self._progress_rank_pending_state}")
+        rpath = os.path.join(folder, self.RETIREMENT_STATE_FILE)
+        if os.path.exists(rpath):
+            with open(rpath) as f:
+                self._retirement_pending_state = json.load(f)
+            print(f"[teacher-retirement] state restored from {rpath}: "
+                  f"{self._retirement_pending_state.get('retired')}")
         return out
 
     # ------------------------------------------------------------------ #
@@ -2643,9 +2684,17 @@ class OPDRayTrainer(RayPPOTrainer):
                             batch.meta_info["cross_teacher_curriculum_rho"] = (
                                 _rho["pair"], _rho["own"],
                             )
+                        _retire = self._teacher_retirement()
+                        if _retire is not None:
+                            # This step's per-task multipliers, read by the actor's
+                            # teacher_kl_row_coef. Set before the update so a task
+                            # that retired on the previous step is already at zero.
+                            batch.meta_info["teacher_kl_coef_by_task"] = _retire.coef_by_task()
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
+                    if _retire is not None:
+                        metrics.update(_retire.observe(actor_output_metrics, self.global_steps))
                     # The teacher term's first-order effect, remembered over steps by the
                     # progress_rank controller (and checkpointed with it). Metrics only.
                     _ctl = getattr(self, "_progress_rank", None)

@@ -1767,7 +1767,8 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs, topk_out
 
-    def teacher_kl_row_coef(self, task_ids, task_id_names, n_rows, *, device, dtype):
+    def teacher_kl_row_coef(self, task_ids, task_id_names, n_rows, *, device, dtype,
+                            runtime_by_task=None):
         """Per-row multiplier on the teacher-KL term, or ``None`` when unset.
 
         WHAT THIS IS FOR. ``teacher_kl_loss_coef`` is one scalar for all three
@@ -1787,6 +1788,16 @@ class DataParallelPPOActor(BasePPOActor):
         uniform coefficient while the config says otherwise.
         """
         by_task = self.config.get("teacher_kl_loss_coef_by_task", None)
+        # THE RETIREMENT CHANNEL. algorithm.opd.retire hands the step's multipliers
+        # down with the batch (trainer: batch.meta_info["teacher_kl_coef_by_task"]),
+        # because a retired task's coefficient changes DURING the run and the
+        # config cannot. The two compose: a run that also halves a task by config
+        # keeps that half until the task retires, and then gets zero.
+        if runtime_by_task:
+            merged = {str(k): float(v) for k, v in dict(by_task or {}).items()}
+            for k, v in dict(runtime_by_task).items():
+                merged[str(k)] = merged.get(str(k), 1.0) * float(v)
+            by_task = merged
         if not by_task:
             return None
         by_task = {str(k): float(v) for k, v in dict(by_task).items()}
@@ -2861,6 +2872,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Multitask runs tag every row with its task id (see RayPPOTrainer._attach_task_ids)
         # so the loss metrics below can also be reported per task. Absent in single-task runs.
         task_id_names = data.meta_info.get("task_id_names", None)
+        # Per-task multipliers for THIS step (algorithm.opd.retire); None on
+        # every run that does not retire, which is what keeps them identical.
+        teacher_coef_by_task = data.meta_info.get("teacher_kl_coef_by_task", None)
         if "task_ids" in data.batch.keys():
             select_keys.append("task_ids")
         # Once, here, on the whole arranged batch. Every check inside reads a
@@ -4634,6 +4648,7 @@ class DataParallelPPOActor(BasePPOActor):
                          _kl_row_coef = self.teacher_kl_row_coef(
                              task_ids, task_id_names, teacher_kld.size(0),
                              device=teacher_kld.device, dtype=teacher_kld.dtype,
+                             runtime_by_task=teacher_coef_by_task,
                          )
                          _teacher_kl_coef_scalar = float(
                              self.config.get("teacher_kl_loss_coef", 1.0)
