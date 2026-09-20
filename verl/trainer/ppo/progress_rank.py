@@ -383,6 +383,12 @@ def think_block_metrics(*, responses, mask, task_names, real=None,
     invalid -- 0.000 on the control and on this run alike, with success at 0.6. So
     the guard is counted here, on the ids the collapse analysis used.
 
+    ALFWORLD AND WEBSHOP ONLY, and a Search 0.000 is not damage. Search's rollouts
+    carry no <think> block at all -- its responses open with the stray </think> the
+    template invites -- and its own rule is the <search>/<answer> tag pair, which
+    `valid_action_ratio/search` does report (0.983 on the control). Checked on 200
+    recorded responses per task at step 150: ALFWorld 100%, WebShop 99%, Search 0%.
+
     Measured, never fed back: like the rest of trajectory_metrics, this is a
     reading of the rollouts and touches no advantage.
     """
