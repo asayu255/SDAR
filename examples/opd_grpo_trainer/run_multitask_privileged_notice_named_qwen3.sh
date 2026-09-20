@@ -1213,14 +1213,24 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
         # them. "++" adds or overrides, so this works whether or not the caller
         # already passed the key.
         local_spec=actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config
-        VAL_ONLY_ARGS+=(
-            actor_rollout_ref.rollout.gpu_memory_utilization=0.6
-            "++$local_spec.method=ngram"
-            "++$local_spec.num_speculative_tokens=4"
-            "++$local_spec.prompt_lookup_min=2"
-            "++$local_spec.prompt_lookup_max=5"
-            "++$local_spec.acceptance_method=rejection_sampler"
-        )
+        VAL_ONLY_ARGS+=(actor_rollout_ref.rollout.gpu_memory_utilization=0.6)
+        # ...unless the caller already passed them. Older scoring scripts add the
+        # same five with "+", and this is not the place to find out how hydra
+        # feels about "+key" and "++key" for one key in one command line. A
+        # caller that passes DIFFERENT values is caught by the expectations lock,
+        # which pins all five.
+        case " $* " in
+            *speculative_config*)
+                echo "[val-only] speculative settings come from the caller" ;;
+            *)
+                VAL_ONLY_ARGS+=(
+                    "++$local_spec.method=ngram"
+                    "++$local_spec.num_speculative_tokens=4"
+                    "++$local_spec.prompt_lookup_min=2"
+                    "++$local_spec.prompt_lookup_max=5"
+                    "++$local_spec.acceptance_method=rejection_sampler"
+                ) ;;
+        esac
         # Speculative decoding and sleep() both live in the V1 engine. vLLM 0.9+
         # defaults to it; 0.8.5 (kanaria, wasabi) defaults to V0, whose worker has
         # no sleep() -- the run dies in init_workers -- and which does not take

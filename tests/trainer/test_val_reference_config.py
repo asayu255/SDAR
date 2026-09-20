@@ -33,7 +33,7 @@ def _block(path):
     return "VAL_ONLY_ARGS=()\n" + src[start:end]
 
 
-def _run(path, env):
+def _run(path, env, args=()):
     """Execute the branch and report what it left behind."""
     script = _block(path) + (
         '\nprintf "DEPTH=%s\\n" "${VAL_PIPELINE_DEPTH:-unset}"\n'
@@ -43,7 +43,7 @@ def _run(path, env):
     )
     e = dict(os.environ, VAL_ONLY="1")
     e.update(env)
-    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=e)
+    out = subprocess.run(["bash", "-c", script, "bash", *args], capture_output=True, text=True, env=e)
     return out
 
 
@@ -106,3 +106,19 @@ def test_a_training_run_is_untouched(tmp_path):
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=e)
     assert out.returncode == 0, out.stderr[-400:]
     assert "DEPTH=1" in out.stdout and "N=0" in out.stdout
+
+
+@pytest.mark.parametrize("path", SCRIPTS, ids=lambda p: os.path.basename(p))
+def test_a_caller_that_already_passes_the_speculative_keys_is_not_duplicated(path, tmp_path):
+    """The chain's own scoring helper adds the same five with "+"; one key must not
+    arrive twice in one command line."""
+    ck = tmp_path / "global_step_150"
+    (ck / "actor").mkdir(parents=True)
+    spec = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
+    out = _run(path, {"VAL_CKPT": str(ck)}, args=[f"+{spec}.method=ngram"])
+    assert out.returncode == 0, out.stderr[-600:]
+    args = [l for l in out.stdout.splitlines() if l.startswith("ARG=")]
+    assert not any("speculative_config" in a for a in args), args
+    # the recipe's other halves are still applied
+    assert "DEPTH=3" in out.stdout and "ASYNC=0" in out.stdout
+    assert any("gpu_memory_utilization=0.6" in a for a in args), args
