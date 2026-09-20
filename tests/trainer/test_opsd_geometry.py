@@ -291,3 +291,30 @@ def test_the_webshop_manager_renders_the_goal_record_beside_the_plain_prompt():
     plain_text, plain_docs = render(_layout_cfg())
     assert plain_text == text and plain_docs == [""]
     assert ol.OCI_DOC_KEY == "oci_doc"
+
+
+def test_the_think_block_share_counts_the_turns_that_open_one():
+    import numpy as np
+
+    from verl.trainer.ppo.progress_rank import THINK_OPEN_IDS, think_block_metrics
+
+    open_id, special = THINK_OPEN_IDS
+    pad = 7
+    # rows: alfworld with a block, alfworld without, webshop with the SPECIAL id
+    # (a response re-tokenized from text), and a padding row that is not counted.
+    responses = torch.tensor([[1, open_id, 2, pad],
+                              [1, 2, 3, pad],
+                              [special, 4, 5, pad],
+                              [open_id, open_id, open_id, open_id]])
+    mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 0], [1, 1, 1, 0], [1, 1, 1, 1]])
+    tasks = np.array(["alfworld", "alfworld", "webshop", "alfworld"], dtype=object)
+    out = think_block_metrics(responses=responses, mask=mask, task_names=tasks,
+                              real=np.array([True, True, True, False]))
+    assert out["traj/alfworld/think_block_share"] == pytest.approx(0.5)
+    assert out["traj/webshop/think_block_share"] == pytest.approx(1.0)
+    assert out["traj/think_block_share"] == pytest.approx(2 / 3)
+    # a token outside the mask (padding) does not count as a block
+    masked_out = think_block_metrics(
+        responses=torch.tensor([[1, 2, 3, open_id]]), mask=torch.tensor([[1, 1, 1, 0]]),
+        task_names=np.array(["search"], dtype=object))
+    assert masked_out["traj/search/think_block_share"] == pytest.approx(0.0)

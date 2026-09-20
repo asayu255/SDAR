@@ -613,6 +613,12 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             task_score_rows=nt["task_score"] if "task_score" in nt else None,
         )
         batch.batch["advantages"] = new_adv
+        # The format channel, counted where the responses are (the controller sees
+        # trajectories, not tokens). A guard, not a term: nothing reads it back.
+        from verl.trainer.ppo.progress_rank import think_block_metrics
+
+        out.update(think_block_metrics(responses=batch.batch["responses"], mask=mask,
+                                       task_names=task_names, real=real))
         out.update(self._write_progress_rank_groups(ctl.last_group_records, cfg))
         return out
 

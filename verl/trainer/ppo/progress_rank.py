@@ -155,7 +155,8 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MI
            "score_stuck_groups", "score_saturated_groups", "average_ranks", "spearman",
            "coverage_progress", "DEFAULT_SAT_TASKS", "DEFAULT_SAT_MIN_SPREAD",
            "DEFAULT_SAT_TURN_SCALE", "ProgressRankController", "group_status",
-           "trajectory_metrics", "FIRST_ORDER_WINDOW"]
+           "trajectory_metrics", "FIRST_ORDER_WINDOW",
+           "think_block_metrics", "THINK_OPEN_IDS"]
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
@@ -362,6 +363,47 @@ def coverage_progress(d: Optional[float], turns: int) -> Optional[float]:
 # was read with on the rho=0.1 run's records: fewer than 10 of the last 25 steps
 # positive put WebShop's retirement at steps 145-149 and never retired the others.
 FIRST_ORDER_WINDOW = 25
+
+# The mid-response think block, as the POLICY writes it ("<th" -- the chat template
+# has already closed an empty <think></think>, so the special id only appears when a
+# response is re-tokenized from text) and as a re-encoding yields it.
+THINK_OPEN_IDS = (13708, 151667)
+
+
+def think_block_metrics(*, responses, mask, task_names, real=None,
+                        ids=THINK_OPEN_IDS) -> Dict[str, float]:
+    """Per task, the share of TURNS whose response opens a think block.
+
+    THE CHANNEL WITH NO METRIC. ALFWorld and WebShop only score a turn whose
+    response carries <think> </think>, and that is the channel whose erosion took
+    WebShop to 0.000 at step 300 while the teacher pushed "<th" down (-6 at step
+    151, -128 at 296 in the token dumps). The run's own `valid_action_ratio` cannot
+    report it: the template closes an empty block, the policy writes its own in
+    plain text, and the strict rule then calls every ALFWorld and WebShop action
+    invalid -- 0.000 on the control and on this run alike, with success at 0.6. So
+    the guard is counted here, on the ids the collapse analysis used.
+
+    Measured, never fed back: like the rest of trajectory_metrics, this is a
+    reading of the rollouts and touches no advantage.
+    """
+    out: Dict[str, float] = {}
+    if responses is None or mask is None or task_names is None:
+        return out
+    keep = mask.to(torch.bool)
+    has = torch.zeros(responses.shape[0], dtype=torch.bool, device=responses.device)
+    for tid in ids:
+        has |= ((responses == int(tid)) & keep).any(dim=-1)
+    has = has.detach().cpu().numpy()
+    names = np.asarray(task_names, dtype=object).reshape(-1)
+    rows = np.ones(len(names), dtype=bool) if real is None else np.asarray(real, dtype=bool)
+    for task in dict.fromkeys(names[rows].tolist()):
+        sel = rows & (names == task)
+        if not sel.any():
+            continue
+        out[f"traj/{task}/think_block_share"] = float(has[sel].mean())
+    if rows.any():
+        out["traj/think_block_share"] = float(has[rows].mean())
+    return out
 
 
 def group_status(g: Dict, xs: List[dict]) -> str:
