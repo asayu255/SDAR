@@ -37,6 +37,8 @@ def _run(path, env):
     """Execute the branch and report what it left behind."""
     script = _block(path) + (
         '\nprintf "DEPTH=%s\\n" "${VAL_PIPELINE_DEPTH:-unset}"\n'
+        'printf "V1=%s\\n" "${VLLM_USE_V1:-unset}"\n'
+        'printf "ASYNC=%s\\n" "${ROLLOUT_ASYNC_GENERATE:-unset}"\n'
         'printf "ARG=%s\\n" "${VAL_ONLY_ARGS[@]}"\n'
     )
     e = dict(os.environ, VAL_ONLY="1")
@@ -59,6 +61,16 @@ def test_val_only_takes_the_reference_scoring_recipe(path, tmp_path):
     assert "DEPTH=3" in out.stdout, f"depth not forced: {out.stdout!r}"
     assert "ARG=actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in out.stdout, out.stdout
     assert "ARG=trainer.val_only=True" in out.stdout
+    # the sweep's speculative decoding, added or overridden whatever the caller did
+    spec = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
+    for key, val in (("method", "ngram"), ("num_speculative_tokens", "4"),
+                     ("prompt_lookup_min", "2"), ("prompt_lookup_max", "5"),
+                     ("acceptance_method", "rejection_sampler")):
+        assert f"ARG=++{spec}.{key}={val}" in out.stdout, (key, out.stdout)
+    # spec decode and sleep() both need the V1 engine; 0.8.5 hosts default to V0
+    assert "V1=1" in out.stdout, out.stdout
+    # and the score has to reproduce
+    assert "ASYNC=0" in out.stdout, out.stdout
 
 
 @pytest.mark.parametrize("path", SCRIPTS[:1], ids=lambda p: os.path.basename(p))
@@ -71,6 +83,9 @@ def test_the_opt_out_leaves_both_to_the_caller(path, tmp_path):
     # the opt-out says so in its own line, so look at the ARGS, not the whole output
     args = [l for l in out.stdout.splitlines() if l.startswith("ARG=")]
     assert not any("gpu_memory_utilization" in a for a in args), args
+    assert not any("speculative_config" in a for a in args), args
+    # the opt-out is about the recipe, not about reproducibility
+    assert "ASYNC=0" in out.stdout, out.stdout
 
 
 @pytest.mark.parametrize("path", SCRIPTS, ids=lambda p: os.path.basename(p))

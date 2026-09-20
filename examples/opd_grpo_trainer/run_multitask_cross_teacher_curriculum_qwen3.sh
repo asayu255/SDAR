@@ -1239,10 +1239,37 @@ if [ "${VAL_ONLY:-0}" = "1" ]; then
     # VAL_REFERENCE_CONFIG=0 opts out, for a deliberate sweep of these two knobs.
     if [ "${VAL_REFERENCE_CONFIG:-1}" = "1" ]; then
         export VAL_PIPELINE_DEPTH=3
-        VAL_ONLY_ARGS+=(actor_rollout_ref.rollout.gpu_memory_utilization=0.6)
-        echo "[val-only] reference scoring config: VAL_PIPELINE_DEPTH=3 gpu_memory_utilization=0.6"
+        # The same five speculative keys the sweep ran (ngram, 4 tokens, lookup
+        # 2-5, rejection sampler): they are part of the recipe, the expectations
+        # lock pins them, and until now they arrived only if the CALLER passed
+        # them -- a scoring job written from a training launcher silently dropped
+        # them. "++" adds or overrides, so this works whether or not the caller
+        # already passed the key.
+        local_spec=actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config
+        VAL_ONLY_ARGS+=(
+            actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+            "++$local_spec.method=ngram"
+            "++$local_spec.num_speculative_tokens=4"
+            "++$local_spec.prompt_lookup_min=2"
+            "++$local_spec.prompt_lookup_max=5"
+            "++$local_spec.acceptance_method=rejection_sampler"
+        )
+        # Speculative decoding and sleep() both live in the V1 engine. vLLM 0.9+
+        # defaults to it; 0.8.5 (kanaria, wasabi) defaults to V0, whose worker has
+        # no sleep() -- the run dies in init_workers -- and which does not take
+        # this speculative_config. A scoring job must not depend on which host it
+        # landed on, so the engine is pinned here too.
+        export VLLM_USE_V1=${VLLM_USE_V1:-1}
+        echo "[val-only] reference scoring config: VAL_PIPELINE_DEPTH=3 gpu_memory_utilization=0.6 ngram spec decode, VLLM_USE_V1=$VLLM_USE_V1"
     else
-        echo "[val-only] VAL_REFERENCE_CONFIG=0: depth=$VAL_PIPELINE_DEPTH and the caller's gpu_memory_utilization"
+        echo "[val-only] VAL_REFERENCE_CONFIG=0: depth=$VAL_PIPELINE_DEPTH, the caller's gpu_memory_utilization and speculative settings"
+    fi
+    # AND THE SCORE MUST REPRODUCE. verl/utils/val_scoring.py refuses async
+    # generation in a val-only run outright (one checkpoint re-scored gave 0.744
+    # to 0.811 with it on); turning it off here is what makes the refusal a
+    # non-event rather than a failed job.
+    if [ "${VAL_ALLOW_NONDETERMINISTIC:-0}" != "1" ]; then
+        export ROLLOUT_ASYNC_GENERATE=0
     fi
     echo "[val-only] scoring $VAL_CKPT -- no training, no checkpoint written"
 fi
