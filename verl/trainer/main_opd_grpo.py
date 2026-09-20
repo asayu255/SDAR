@@ -80,17 +80,9 @@ def inject_opd_grpo_config(config) -> None:
             config.actor_rollout_ref.actor.opsd_measure_only = measure_only
             config.actor_rollout_ref.actor.sdar_loss_coef = float(opsd.get("coef", 0.01))
             config.actor_rollout_ref.actor.sdar_gate_beta = float(opsd.get("gate_beta", 5.0))
-            if str(opsd.get("source", "skill") or "skill") == "document":
-                # The document edit the privileged prompt is built from is
-                # recorded by the rollout only under this switch; enabling it
-                # adds no work to the training step (its report runs in the
-                # probe path). Refused rather than silently defaulted: without
-                # the edit the teacher would be the student on its own prompt.
-                rank = config.algorithm.get("oci_rank", None)
-                assert rank is not None and bool(rank.get("enable", False)), (
-                    "algorithm.opsd.source=document needs algorithm.oci_rank.enable=True: "
-                    "that is what makes the rollout record each row's document edit"
-                )
+            # source=document needs no second switch: oci_layout.document_render_on
+            # turns the render on for this setting too, so (a) -- which refuses to
+            # run beside the rank arm -- is not dragged in by it.
 
 
 def run_opd_grpo(config) -> None:

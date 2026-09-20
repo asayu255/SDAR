@@ -180,6 +180,51 @@ def rank_tasks(config):
     return tuple(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
 
 
+# Every task whose manager can build a document. The rank scorer names its own
+# subset (it was measured on ALFWorld first); the self-distillation teacher wants
+# all of them, because its term is per task.
+DOCUMENT_TASKS = ("alfworld", "webshop", "search")
+
+
+def opsd_cfg(config):
+    """``algorithm.opsd`` off whatever config object the caller holds, or None."""
+    if config is None:
+        return None
+    try:
+        return config.algorithm.get("opsd", None)
+    except Exception:
+        return None
+
+
+def opsd_document_on(config) -> bool:
+    """Is the self-distillation teacher conditioned on THIS instance's document?"""
+    cfg = opsd_cfg(config)
+    return bool(cfg is not None and cfg.get("enable", False)
+                and str(cfg.get("source", "skill") or "skill") == "document")
+
+
+def document_render_on(config) -> bool:
+    """Should rows carry the document-conditioned render beside the plain one?
+
+    Two mechanisms read it and neither changes the prompt the policy is given:
+    the rank scorer (algorithm.oci_rank) and the self-distillation teacher when
+    it is conditioned on the document (algorithm.opsd.source=document). Either
+    one turns the render on, which is why this is not `rank_on` -- (a) refuses to
+    run beside the rank arm, and borrowing that switch to feed the teacher would
+    have made the two mutually exclusive for no reason.
+    """
+    return rank_on(config) or opsd_document_on(config)
+
+
+def document_render_tasks(config) -> tuple:
+    """Which tasks carry it: the rank arm's own list, plus every task when the
+    self-distillation teacher asks (its term is computed per task)."""
+    tasks = set(rank_tasks(config)) if rank_on(config) else set()
+    if opsd_document_on(config):
+        tasks |= set(DOCUMENT_TASKS)
+    return tuple(t for t in DOCUMENT_TASKS if t in tasks)
+
+
 def rank_self_check_rows(config) -> int:
     """Rows per batch the rank probe re-scores to check its privileged score;
     0 (off) unless the switch is on. When > 0 the rollout also stores each row's

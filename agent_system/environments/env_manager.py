@@ -27,6 +27,7 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.environments.oci_layout import (
     OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, PLAN_FOOTER, PLAN_HEADER, PLAN_LEAD,
     rank_on as _oci_rank_on, rank_tasks as _oci_rank_tasks,
+    document_render_on as _doc_render_on, document_render_tasks as _doc_render_tasks,
     ROLE_DOC, ROLE_FOREIGN, render_document,
     search_document_lines as _search_document_lines,
     search_rescue_document_lines as _search_rescue_document_lines,
@@ -1098,7 +1099,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._oci_plains = []
         self._oci_docs = []
         _envs = getattr(self, "envs", None)
-        _rank = _oci_rank_on(self.config) and "search" in _oci_rank_tasks(self.config)
+        _rank = _doc_render_on(self.config) and "search" in _doc_render_tasks(self.config)
         _second = _slots_second_doc(self.config)
         _seen = getattr(self, "_evidence_seen", None) or [False] * len(text_obs)
 
@@ -1329,8 +1330,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # answer, so every row needs the conditioning. '' when the switch is off
         # or the document cannot be built.
         self._oci_docs = []
-        _rank = (_oci_rank_on(self.config)
-                 and "alfworld" in _oci_rank_tasks(self.config))
+        _rank = (_doc_render_on(self.config)
+                 and "alfworld" in _doc_render_tasks(self.config))
         _envs = getattr(self, 'envs', None)
         postprocess_text_obs = []
         if not init and self.config.env.history_length > 0:
@@ -1656,6 +1657,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         # observation, so it is available here and is stable
                         # across steps for a given episode seed.
                         'anchor': [f"{t} [SEP] {o}" for t, o in zip(self.tasks, obs)],
+                        OCI_DOC_KEY: list(getattr(self, "_oci_docs", [])),
                         }
         self.pre_text_obs = obs
         self.memory.reset(batch_size = len(infos))
@@ -1676,7 +1678,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         next_observations = {
             'text': self.build_text_obs(next_obs, infos),
             'image': None,
-            'anchor': next_obs.copy()
+            'anchor': next_obs.copy(),
+            OCI_DOC_KEY: list(getattr(self, "_oci_docs", [])),
         }
         _wsp = getattr(self, "_ws_progress", None) or []
         if _wsp:
@@ -1748,6 +1751,14 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        # The same turn with this instance's goal record in front of it, for the
+        # readers that need "what would the self that knows the answer have
+        # written" (the rank scorer, the document-conditioned self-distillation
+        # teacher). Rebuilt every turn like the other two tasks', '' when neither
+        # asks for it or the record cannot be built. The prompt the policy is
+        # given -- what this function returns -- is untouched either way.
+        self._oci_docs = []
+        _doc = _doc_render_on(self.config) and "webshop" in _doc_render_tasks(self.config)
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
@@ -1782,6 +1793,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         current_observation=text_obs[i],
                         available_actions=reformatted_available_actions
                     )
+
+            _blk = self.document_block(i) if _doc else ""
+            self._oci_docs.append(_blk + obs if _blk else "")
 
             postprocess_text_obs.append(obs)
 

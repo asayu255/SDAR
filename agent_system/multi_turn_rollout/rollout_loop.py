@@ -38,7 +38,8 @@ from verl.trainer.ppo.privileged_notice import (
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
 from agent_system.environments.oci_layout import (
     OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on,
-    rank_on as _oci_rank_on, rank_self_check_rows as _oci_rank_self_check_rows)
+    rank_on as _oci_rank_on, rank_self_check_rows as _oci_rank_self_check_rows,
+    document_render_on as _oci_doc_render_on)
 
 # Width of the oci_plan_repl column. The replacement is the no-plan render's
 # boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
@@ -943,7 +944,7 @@ class TrajectoryCollector:
         # and token ids fit it; a row whose replacement does not fit is recorded
         # as not strippable, exactly as before.
         self._oci_repl_width = (int(config.data.max_prompt_length)
-                                if (_oci_slots_on(config) or _oci_rank_on(config))
+                                if (_oci_slots_on(config) or _oci_doc_render_on(config))
                                 else OCI_REPL_WIDTH)
         self._oci_repl_dtype = (torch.long if self._oci_repl_width <= OCI_REPL_WIDTH
                                 else torch.int32)

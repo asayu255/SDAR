@@ -10,8 +10,8 @@ to hold:
 * a gate that says nothing (constant) against zero-sum advantages reports ~0, and
   a gate that opens on the tokens the reward pushes up reports positive: that is
   the whole decision the metric exists for;
-* measure_only leaves use_sdar_loss off, and source=document refuses a run whose
-  rollout never recorded the document edit;
+* measure_only leaves use_sdar_loss off, and source=document turns the document
+  render on by itself rather than borrowing the rank arm's switch;
 * a row whose document did not fit its prompt window is excluded rather than
   scored against the student's own prompt.
 """
@@ -131,7 +131,7 @@ def test_rows_without_a_document_are_excluded_from_the_sums():
     assert stats.sums()[None]["n"] == pytest.approx(2 * T)
 
 
-def test_measure_only_leaves_the_loss_alone_and_document_needs_the_rank_columns():
+def test_measure_only_leaves_the_loss_alone_and_document_turns_the_render_on():
     from verl.trainer.main_opd_grpo import inject_opd_grpo_config
 
     def _cfg(**opsd):
@@ -150,11 +150,14 @@ def test_measure_only_leaves_the_loss_alone_and_document_needs_the_rank_columns(
     assert applied.actor_rollout_ref.actor.use_sdar_loss is True
     assert applied.actor_rollout_ref.actor.opsd_measure_only is False
 
-    with pytest.raises(AssertionError, match="oci_rank"):
-        inject_opd_grpo_config(_cfg(source="document", measure_only=True))
-    ok = _cfg(source="document", measure_only=True)
-    ok.algorithm.oci_rank = {"enable": True}
-    inject_opd_grpo_config(ok)
+    # source=document does NOT borrow the rank arm's switch: (a) refuses to run
+    # beside that arm, and the render it needs is turned on by the layout gate.
+    from agent_system.environments import oci_layout as ol
+
+    doc = _cfg(source="document", measure_only=True)
+    inject_opd_grpo_config(doc)
+    assert doc.actor_rollout_ref.actor.opsd_measure_only is True
+    assert ol.document_render_on(doc) and "webshop" in ol.document_render_tasks(doc)
 
     with pytest.raises(AssertionError, match="source"):
         from verl.trainer.ppo.opd_grpo_ray_trainer import OPDGRPORayTrainer
@@ -239,3 +242,52 @@ def test_the_document_teacher_refuses_a_batch_with_no_document_edit(monkeypatch)
     }
     with pytest.raises(AssertionError, match="oci_rank.enable"):
         _doc_self(tensors, [False, False], monkeypatch)
+
+
+def _layout_cfg(**algorithm):
+    from types import SimpleNamespace
+    return SimpleNamespace(env=SimpleNamespace(history_length=2),
+                           data=SimpleNamespace(max_prompt_length=4096),
+                           algorithm=algorithm)
+
+
+def test_the_document_render_follows_either_reader_not_just_the_rank_arm():
+    from agent_system.environments import oci_layout as ol
+
+    rank = _layout_cfg(oci_rank={"enable": True, "tasks": ["alfworld"]})
+    assert ol.document_render_on(rank) and ol.document_render_tasks(rank) == ("alfworld",)
+
+    # The self-distillation teacher asks for all three: its term is per task.
+    opsd = _layout_cfg(opsd={"enable": True, "source": "document"})
+    assert ol.document_render_on(opsd)
+    assert ol.document_render_tasks(opsd) == ("alfworld", "webshop", "search")
+
+    # ...and only when it is the document it is conditioned on.
+    skill = _layout_cfg(opsd={"enable": True, "source": "skill"})
+    assert not ol.document_render_on(skill) and ol.document_render_tasks(skill) == ()
+    assert not ol.document_render_on(_layout_cfg())
+
+    both = _layout_cfg(oci_rank={"enable": True, "tasks": ["search"]},
+                       opsd={"enable": True, "source": "document"})
+    assert ol.document_render_tasks(both) == ("alfworld", "webshop", "search")
+
+
+def test_the_webshop_manager_renders_the_goal_record_beside_the_plain_prompt():
+    import agent_system.environments.env_manager as em
+    from agent_system.environments import oci_layout as ol
+
+    def render(cfg):
+        m = em.WebshopEnvironmentManager.__new__(em.WebshopEnvironmentManager)
+        m.config = cfg
+        m.tasks = ["Find me a red dress"]
+        m.document_block = lambda i: "[Privileged Solution Path]\nsearch[red dress]\n"
+        infos = [{"available_actions": {"has_search_bar": True, "clickables": ["Search"]}}]
+        text = em.WebshopEnvironmentManager.build_text_obs(m, ["'Search'"], infos, init=True)
+        return text, m._oci_docs
+
+    text, docs = render(_layout_cfg(opsd={"enable": True, "source": "document"}))
+    assert docs[0] == "[Privileged Solution Path]\nsearch[red dress]\n" + text[0]
+    # the prompt the policy is given is the plain one either way
+    plain_text, plain_docs = render(_layout_cfg())
+    assert plain_text == text and plain_docs == [""]
+    assert ol.OCI_DOC_KEY == "oci_doc"
