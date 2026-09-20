@@ -144,6 +144,12 @@ from verl.trainer.ppo.opd_cross_gate import (
     CrossGateStats,
     cross_gate_forward,
 )
+from verl.trainer.ppo.opsd_geometry import (
+    OPSD_TERMS,
+    gate_and_gap as opsd_gate_and_gap,
+    geometry_terms as opsd_geometry_terms,
+    opsd_metrics,
+)
 from verl.trainer.ppo.sign_weights import ROLE_NAMES as _CG_ROLE_NAMES
 
 # Columns of the per-task group bitmap (see OpdTaskDiagStats).
@@ -2539,6 +2545,16 @@ class DataParallelPPOActor(BasePPOActor):
                 select_keys.append("kl_loss_coef")
         if self.config.get("use_sdl_loss", False) or self.config.get("use_sdar_loss", False) or (use_teacher_kl_loss and not teacher_topk_kl):
             select_keys.append("teacher_log_probs")
+        # The measured-only self-distillation teacher travels under its own name
+        # (see the trainer's algorithm.opsd block) so it can never be mistaken
+        # for a column something applies.
+        # Read HERE, where `data` is still the whole DataProto: inside the
+        # micro-batch loop the name is rebound to one chunk.
+        opsd_column = bool(self.config.get("opsd_measure_only", False)) and (
+            "opsd_teacher_log_probs" in data.batch.keys()
+        )
+        if opsd_column:
+            select_keys += ["opsd_teacher_log_probs", "opsd_valid"]
         # Whose top-k the KL's support comes from. Student-indexed resolves the
         # teacher from cached hidden states at update time, so the pre-scored
         # columns are replaced by the cache key that locates them.
@@ -3009,6 +3025,19 @@ class DataParallelPPOActor(BasePPOActor):
         # the rewrite. Gated on the CONFIG only -- see sign_cfg_on above.
         sign_dev = next(self.actor_module.parameters()).device
         n_task = len(task_id_names or [])
+        # ---- the self-distillation term, measured and not applied ----------
+        # algorithm.opsd.measure_only: the term is built from the privileged
+        # self's log-probs and reported under opsd/<task>/, beside the external
+        # teacher's opd/<task>/, so "would this help if the teacher were
+        # retired" is a number rather than a run. Nothing here touches the loss.
+        # Gated on the CONFIG for the accumulator (it runs a collective) and on
+        # the COLUMN for the update, which is what a batch without the
+        # privileged pass leaves out.
+        opsd_measure_only = bool(self.config.get("opsd_measure_only", False))
+        opsd_stats = (
+            ScopeTermStats(names=OPSD_TERMS, n_tasks=n_task, device=sign_dev)
+            if opsd_measure_only else None
+        )
         target_mode = sign_cfg_on and str((sign_cfg or {}).get("mode", "target")) == "target"
         transfer_on = sign_cfg_on and bool(
             ((sign_cfg or {}).get("transfer_stats", None) or {}).get("enable", False)
@@ -4499,6 +4528,39 @@ class DataParallelPPOActor(BasePPOActor):
                          policy_loss = policy_loss + sdar_term * sdar_coef
                          metrics.update(sdar_metrics)
                          metrics["sdar/coef"] = sdar_coef
+
+                     if opsd_stats is not None and opsd_column and pg_loss_coef != 0:
+                         # THE SAME TERM, NOT ADDED. Its gradient is parallel to
+                         # the policy gradient at every position (see
+                         # opsd_geometry), so the geometry follows from the gate
+                         # and the policy gradient's own coefficient -- no second
+                         # backward, and the optimizer's step is untouched.
+                         _opsd_gate, _opsd_gap = opsd_gate_and_gap(
+                             log_prob.detach(), data["opsd_teacher_log_probs"],
+                             float(self.config.get("sdar_gate_beta", 5.0)),
+                         )
+                         _opsd_pgc = policy_loss_gradient_coef(
+                             old_log_prob=old_log_prob,
+                             log_prob=log_prob,
+                             advantages=advantages,
+                             cliprange=clip_ratio,
+                             cliprange_low=clip_ratio_low,
+                             cliprange_high=clip_ratio_high,
+                             clip_ratio_c=clip_ratio_c,
+                         ).detach() if xt_pg_grad_coef is None else xt_pg_grad_coef
+                         # A row whose document did not fit its prompt window was
+                         # scored on the plain prompt; its gap is zero by
+                         # construction and counting it would report a gate of
+                         # one half that no teacher produced.
+                         _opsd_mask = response_mask * data["opsd_valid"].reshape(-1, 1).to(response_mask.dtype)
+                         opsd_stats.update(
+                             opsd_geometry_terms(
+                                 gate=_opsd_gate, gap=_opsd_gap, pg_grad_coef=_opsd_pgc,
+                                 coef=float(self.config.get("sdar_loss_coef", 0.01)),
+                                 pg_coef=float(pg_loss_coef), row_weight=task_loss_weight,
+                             ),
+                             response_mask=_opsd_mask, task_ids=task_ids,
+                         )
 
                      if use_teacher_kl_loss:
                          # On-policy distillation: KL between student and a (per-task) teacher,
@@ -6096,6 +6158,14 @@ class DataParallelPPOActor(BasePPOActor):
             metrics.update(
                 opd_attribution_metrics(opd_grad_stats.sums(task_names=task_id_names))
             )
+        # ---- the measured-only self-distillation term, rendered -------------
+        # Same shape of key under its own prefix, so opsd/<task>/grpo/first_order
+        # is read against opd/<task>/grpo/first_order on one chart: the two
+        # candidates for what the distillation slot should hold, measured on the
+        # same policy, the same rows and the same positions.
+        if opsd_stats is not None:
+            opsd_stats.all_reduce()
+            metrics.update(opsd_metrics(opsd_stats.sums(task_names=task_id_names)))
         if opd_role_grad_stats is not None:
             opd_role_grad_stats.all_reduce()
             # Same prefix shape and same curation as the weighted role cut, so

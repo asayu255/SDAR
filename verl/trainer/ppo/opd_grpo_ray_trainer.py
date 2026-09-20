@@ -102,7 +102,16 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         opsd_cfg = self.config.algorithm.get("opsd", None)
         if opsd_cfg is not None and bool(opsd_cfg.get("enable", False)):
             with _timer("opsd_teacher", timing_raw):
-                batch.batch["teacher_log_probs"] = self._compute_self_teacher_log_probs(batch, opsd_cfg, metrics)
+                lp, valid = self._compute_self_teacher_log_probs(batch, opsd_cfg, metrics)
+                if bool(opsd_cfg.get("measure_only", False)):
+                    # ITS OWN COLUMN. measure_only builds the term to report its
+                    # geometry and adds nothing to the loss, so nothing that
+                    # consumes teacher_log_probs may see it -- least of all the
+                    # external teacher's own path, which writes that name too.
+                    batch.batch["opsd_teacher_log_probs"] = lp
+                    batch.batch["opsd_valid"] = valid
+                else:
+                    batch.batch["teacher_log_probs"] = lp
 
         # ---- advantages (GRPO) ----
         with _timer("adv", timing_raw):
@@ -392,19 +401,37 @@ class OPDGRPORayTrainer(OPDRayTrainer):
 
     # --- (a) ------------------------------------------------------------------ #
 
-    def _compute_self_teacher_log_probs(self, batch: DataProto, cfg, metrics: dict) -> torch.Tensor:
-        """log pi_theta(y_t | skills + x, y_<t) on every row, for the SDAR loss.
+    def _compute_self_teacher_log_probs(self, batch: DataProto, cfg, metrics: dict):
+        """``(log pi_theta(y_t | privileged + x, y_<t), valid_rows)`` on every row.
 
-        Reuses the SDAR trainers' own pieces (``build_teacher_batch``,
-        ``SkillProvider``) rather than a copy, so the teacher here is the one the
-        SDAR baseline trained against. The external teachers keep running (their
-        coefficient is the run's choice); they write ``teacher_cache_ids`` under
-        student-indexed top-k, never ``teacher_log_probs`` -- checked at the first
-        call, because the single-token OPD estimator writes that same column and
-        would silently replace this one.
+        Two conditionings, ``algorithm.opsd.source``:
+
+        ``skill``     the task's skill documents in front of the observation --
+                      the SDAR baseline's own teacher, built from its own pieces
+                      (``build_teacher_batch``, ``SkillProvider``) rather than a
+                      copy. Every row is valid.
+        ``document``  THIS instance's correct document (alfworld's walkthrough,
+                      webshop's goal record, search's answer) spliced in by
+                      :func:`oci_rank.with_document`, which is the same edit the
+                      rank scorer is measured on. A row whose document did not
+                      fit its prompt window is marked invalid rather than scored
+                      on the plain prompt, which would read as a gap of zero.
+
+        The external teachers keep running (their coefficient is the run's
+        choice); they write ``teacher_cache_ids`` under student-indexed top-k,
+        never ``teacher_log_probs`` -- checked at the first call, because the
+        single-token OPD estimator writes that same column and would silently
+        replace this one.
         """
         from verl.trainer.ppo.rlsd_ray_trainer import build_teacher_batch
         from verl.trainer.ppo.rlsd_utils import SkillProvider
+
+        source = str(cfg.get("source", "skill") or "skill")
+        assert source in ("skill", "document"), (
+            f"algorithm.opsd.source={source!r}; expected 'skill' or 'document'"
+        )
+        if source == "document":
+            return self._self_teacher_on_document(batch, metrics)
 
         if getattr(self, "_opsd_skill_provider", None) is None:
             assert self.config.algorithm.opd.get("kl_loss_type", None) == "topk_kl", (
@@ -437,7 +464,40 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         teacher_len = teacher_batch.batch["attention_mask"][:, :-response_length].sum(-1).float()
         metrics["opsd/prompt_tokens_added/mean"] = float((teacher_len - student_len).mean())
         metrics["opsd/prompt_capped_ratio"] = float((teacher_len >= max_prompt_length).float().mean())
-        return out.batch["old_log_probs"]
+        lp = out.batch["old_log_probs"]
+        return lp, torch.ones(lp.shape[0], dtype=torch.float32, device=lp.device)
+
+    def _self_teacher_on_document(self, batch: DataProto, metrics: dict):
+        """The same weights with this instance's correct document in the prompt.
+
+        The rollout records the edit that turns a row's prompt into its
+        document-conditioned one (``oci_doc_off`` and friends), and it does so
+        only when ``algorithm.oci_rank.enable`` is on -- by itself that switch
+        costs no GPU work in the training step, it is what makes the columns
+        exist. A run that asks for this teacher without them would otherwise be
+        scored on the plain prompt, i.e. against itself, which reads as a gate of
+        exactly one half everywhere; it is refused instead.
+        """
+        from verl.trainer.ppo.oci_rank import document_rows, with_document
+
+        rows = document_rows(batch)
+        assert rows.any(), (
+            "algorithm.opsd.source=document, but no row carries a document edit. The rollout "
+            "records it only under algorithm.oci_rank.enable=True (and for the tasks in "
+            "algorithm.oci_rank.tasks); without it the 'privileged' teacher would be the "
+            "student's own prompt"
+        )
+        doc_batch, spliced = with_document(batch, self.tokenizer.pad_token_id)
+        out = self.actor_rollout_wg.compute_log_prob(doc_batch)
+        lp = out.batch["old_log_probs"]
+        valid = torch.as_tensor(spliced, dtype=torch.float32, device=lp.device)
+
+        response_length = batch.batch["responses"].size(1)
+        student_len = batch.batch["attention_mask"][:, :-response_length].sum(-1).float()
+        doc_len = doc_batch.batch["attention_mask"][:, :-response_length].sum(-1).float()
+        metrics["opsd/doc_rows_share"] = float(valid.mean())
+        metrics["opsd/prompt_tokens_added/mean"] = float((doc_len - student_len)[valid > 0].mean())
+        return lp, valid
 
     def _progress_rank_controller(self, cfg):
         ctl = getattr(self, "_progress_rank", None)

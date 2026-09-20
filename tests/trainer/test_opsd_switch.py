@@ -196,8 +196,11 @@ def test_the_trainer_builds_the_skill_prefixed_teacher_from_the_real_skill_files
         "skills_dirs": {t: os.path.join(REPO, f"skills/{t}") for t in ("alfworld", "webshop", "search")},
     })
     metrics = {}
-    out = OPDGRPORayTrainer._compute_self_teacher_log_probs(me, batch, cfg, metrics)
+    out, valid = OPDGRPORayTrainer._compute_self_teacher_log_probs(me, batch, cfg, metrics)
     assert out.shape == batch.batch["responses"].shape and torch.all(out == -1.5)
+    # The skill prefix is built for every row, so none of them is excluded; the
+    # document source is the one that can fail to condition a row.
+    assert valid.shape == (len(batch),) and torch.all(valid == 1.0)
     tb = seen["batch"]
     # Same responses, longer prompts carrying the skill header, nothing capped.
     assert torch.equal(tb.batch["responses"], batch.batch["responses"])

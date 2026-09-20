@@ -72,9 +72,25 @@ def inject_opd_grpo_config(config) -> None:
         # turns it back on. The external teacher's coefficient is left to the run.
         opsd = config.algorithm.get("opsd", None)
         if opsd is not None and bool(opsd.get("enable", False)):
-            config.actor_rollout_ref.actor.use_sdar_loss = True
+            # measure_only: the privileged pass still runs and the term's
+            # geometry is reported, but use_sdar_loss stays OFF, so the loss --
+            # and the optimizer's step -- are those of the run without it.
+            measure_only = bool(opsd.get("measure_only", False))
+            config.actor_rollout_ref.actor.use_sdar_loss = not measure_only
+            config.actor_rollout_ref.actor.opsd_measure_only = measure_only
             config.actor_rollout_ref.actor.sdar_loss_coef = float(opsd.get("coef", 0.01))
             config.actor_rollout_ref.actor.sdar_gate_beta = float(opsd.get("gate_beta", 5.0))
+            if str(opsd.get("source", "skill") or "skill") == "document":
+                # The document edit the privileged prompt is built from is
+                # recorded by the rollout only under this switch; enabling it
+                # adds no work to the training step (its report runs in the
+                # probe path). Refused rather than silently defaulted: without
+                # the edit the teacher would be the student on its own prompt.
+                rank = config.algorithm.get("oci_rank", None)
+                assert rank is not None and bool(rank.get("enable", False)), (
+                    "algorithm.opsd.source=document needs algorithm.oci_rank.enable=True: "
+                    "that is what makes the rollout record each row's document edit"
+                )
 
 
 def run_opd_grpo(config) -> None:

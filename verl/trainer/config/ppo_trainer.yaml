@@ -747,6 +747,31 @@ algorithm:
     skills_dir: skills/alfworld
     skills_dirs: {alfworld: skills/alfworld, webshop: skills/webshop, search: skills/search}
     skill_all: False
+    # WHAT THE SELF IS CONDITIONED ON.
+    #   skill     the task's skill files above -- the SDAR baseline's teacher.
+    #   document  THIS instance's correct document (alfworld's walkthrough,
+    #             webshop's goal record, search's answer), spliced in by the
+    #             edit the rollout records for the rank scorer. Needs
+    #             algorithm.oci_rank.enable=True, which is what makes that edit
+    #             exist and which costs no GPU work in the training step by
+    #             itself; without it the "privileged" prompt would be the plain
+    #             one and the run is refused rather than scored against itself.
+    # Why the choice matters: at step 240 the skill-conditioned self read a
+    # teacher-student gap of -0.031 -- a gate stuck at one half, i.e. a term that
+    # only pushes up whatever was sampled -- and it lost to switching the teacher
+    # off on all three tasks. The document-conditioned self reads about +1.6 nats
+    # per token on ALFWorld in the offline probe.
+    source: skill
+    # MEASURE, DO NOT APPLY. The privileged pass runs and the term's geometry
+    # against the reward objective is logged per task (opsd/<task>/grpo/
+    # first_order, grad_cosine, grad_norm_ratio, plus gate_mean and gap_mean),
+    # but nothing is added to the loss: the optimizer's step is bit-for-bit the
+    # run without it. This is how "should the distillation slot hold the
+    # privileged self, or nothing at all, once the external teacher is retired"
+    # is answered without spending a run on it -- read opsd/<task>/grpo/
+    # first_order beside opd/<task>/grpo/first_order. Costs one extra forward
+    # pass per step (no backward).
+    measure_only: False
   gigpo:
     step_advantage_w: 1.0
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
