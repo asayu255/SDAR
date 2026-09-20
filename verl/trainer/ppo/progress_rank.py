@@ -374,14 +374,19 @@ def think_block_metrics(*, responses, mask, task_names, real=None,
                         ids=THINK_OPEN_IDS) -> Dict[str, float]:
     """Per task, the share of TURNS whose response opens a think block.
 
-    THE CHANNEL WITH NO METRIC. ALFWorld and WebShop only score a turn whose
-    response carries <think> </think>, and that is the channel whose erosion took
-    WebShop to 0.000 at step 300 while the teacher pushed "<th" down (-6 at step
-    151, -128 at 296 in the token dumps). The run's own `valid_action_ratio` cannot
-    report it: the template closes an empty block, the policy writes its own in
-    plain text, and the strict rule then calls every ALFWorld and WebShop action
-    invalid -- 0.000 on the control and on this run alike, with success at 0.6. So
-    the guard is counted here, on the ids the collapse analysis used.
+    THE CHANNEL, SEPARATED FROM THE ACTION FORMAT. ALFWorld and WebShop only score
+    a turn whose response carries <think> </think>, and that is the channel whose
+    erosion took WebShop to 0.000 at step 300 while the teacher pushed "<th" down
+    (-6 at step 151, -128 at 296 in the token dumps).
+
+    The run's own `valid_action_ratio` does move with it, but it is a late and
+    shallow reading of it. It is ~0 until the policy ACQUIRES the format at all --
+    the control crosses 0.5 at step 124 (ALFWorld) and 129 (WebShop), this run
+    ~25 steps later -- then sits near 0.99, and through the collapse it falls only
+    from 0.990 (steps 151-175) to 0.909 (276-300) while validation goes to 0.000.
+    It also mixes the block with the action grammar, so a fall does not say which
+    one broke. This counts the block itself, on the ids the collapse analysis
+    used, and leaves the reading of it to whoever sets a threshold.
 
     ALFWORLD AND WEBSHOP ONLY, and a Search 0.000 is not damage. Search's rollouts
     carry no <think> block at all -- its responses open with the stray </think> the
