@@ -592,11 +592,13 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         row_scores = None if tlr is None else tlr.sum(-1).double().cpu().numpy()
 
         # The OTHER progress counts, for comparison on the same stuck groups: ALFWorld's
-        # milestones with and without "arrived", whichever of them (a) is not ranking by.
+        # milestones with and without "arrived" and the walkthrough as a set, whichever
+        # of them (a) is not ranking by.
         kdef = str(cfg.get("alfworld_k", "milestone") or "milestone")
         alt_counts = {}
         for name, kcol, tcol, active in (("milestone", "progress_k_milestone", "progress_total_milestone", "milestone"),
-                                         ("arrive", "progress_k_arrive", "progress_total_arrive", "milestone_arrive")):
+                                         ("arrive", "progress_k_arrive", "progress_total_arrive", "milestone_arrive"),
+                                         ("walkset", "progress_k_walkset", "progress_total_walkset", "walkthrough_set")):
             if kdef != active and kcol in nt and tcol in nt:
                 alt_counts[name] = (nt[kcol], nt[tcol])
 

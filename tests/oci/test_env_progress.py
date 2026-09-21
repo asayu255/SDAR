@@ -409,7 +409,7 @@ class _AlfEnvs2(_AlfEnvs):
                                                         for _ in actions]
 
 
-for which in ("walkthrough", "milestone", "milestone_arrive"):
+for which in ("walkthrough", "milestone", "milestone_arrive", "walkthrough_set"):
     cfg = config(True)
     cfg.algorithm.progress_rank.alfworld_k = which
     mgr = AlfWorldEnvironmentManager(_AlfEnvs2(), _alf_proj, cfg)
@@ -426,11 +426,21 @@ for which in ("walkthrough", "milestone", "milestone_arrive"):
               "milestone mode: (a) ranks by the milestones")
         check([i["progress_k_arrive"] for i in infos] == [2, 0] and infos[0]["progress_total_arrive"] == 3,
               "and the count with 'arrived' is recorded beside it, so a run can see what it would split")
-    else:
+    elif which == "milestone_arrive":
         # row 0 took the pencil FROM a shelf, the target type: it is holding it at the target
         check([i["progress_k"] for i in infos] == [2, 0] and infos[0]["progress_total"] == 3
               and [i["progress_k_milestone"] for i in infos] == [1, 0] and infos[0]["progress_total_milestone"] == 2,
               "milestone_arrive mode: (a) ranks by milestones + arrived; the milestone columns keep the base count")
+        check([i["progress_k_walkset"] for i in infos] == [0, 1] and infos[0]["progress_total_walkset"] == 4,
+              "and the walkthrough-set count rides beside it in its own columns")
+    else:
+        # walkthrough_set: row 1's `go to desk 1` is a line of the set (type-normalised);
+        # row 0's take from a SHELF is not in this walkthrough at all. K is the distinct
+        # normalised line count, and the pointer / milestone columns keep their own values.
+        check([i["progress_k"] for i in infos] == [0, 1] and infos[0]["progress_total"] == 4,
+              "walkthrough_set mode: (a) ranks by the set of normalised walkthrough lines")
+        check([i["progress_k_milestone"] for i in infos] == [1, 0] and infos[0]["progress_total_milestone"] == 2,
+              "the milestone count still rides beside it")
 cfg = config(True)
 cfg.algorithm.progress_rank.alfworld_k = "typo"
 try:
@@ -438,6 +448,42 @@ try:
     check(False, "an unknown alfworld_k is refused")
 except AssertionError:
     check(True, "an unknown alfworld_k is refused")
+
+print("11. the walkthrough as a set (alfworld_k = walkthrough_set)")
+check(P.normalize_alfworld_action("  Take Pan 1 From StoveBurner 2 ") == "take pan from stoveburner",
+      "normalise: lowercase, single spaces, instance numbers gone")
+check(P.normalize_alfworld_action("put cup 3 in/on shelf 12") == "put cup in/on shelf",
+      "normalise keeps 'in/on' and strips a two-digit instance")
+clean = ["go to cabinet 5", "take cup 1 from cabinet 5", "go to sinkbasin 1",
+         "clean cup 1 with sinkbasin 1", "go to shelf 2", "put cup 1 in/on shelf 2"]
+ws = P.AlfworldWalkSet(clean)
+check(ws.total == 6 and ws.k == 0, "six distinct lines, none done")
+ws.step("go to shelf 2", "You arrive at shelf 2.")
+check(ws.k == 1, "ORDER-FREE: the fifth line counts first")
+ws.step("go to cabinet 2", "You arrive at cabinet 2. On the cabinet 2, you see a cup 1.")
+check(ws.k == 2, "TYPE-NORMALISED: cabinet 2 is the walkthrough's cabinet 5")
+ws.step("take cup 1 from cabinet 2", "Nothing happens.")
+check(ws.k == 2, "EXECUTED ONLY: a take the environment refused does not count")
+ws.step("take cup 1 from cabinet 2", "You pick up the cup 1 from the cabinet 2.")
+check(ws.k == 3, "...and counts once it is carried out")
+ws.step("go to shelf 2", "You arrive at shelf 2.")
+check(ws.k == 3, "a line done twice is one line")
+ws.step("examine shelf 2", "On the shelf 2, you see nothing.")
+check(ws.k == 3, "an action outside the walkthrough leaves k alone")
+ws.step("look", "You are facing the shelf 2.", won=True)
+check(ws.k == 6, "won => K, as the other counts hold")
+two = ["go to desk 1", "take pencil 2 from desk 1", "go to shelf 1", "move pencil 2 to shelf 1",
+       "go to desk 1", "take pencil 3 from desk 1", "go to shelf 1", "move pencil 3 to shelf 1"]
+w2 = P.AlfworldWalkSet(two)
+check(w2.total == 4, "DEDUPLICATED: pick_two's eight lines are four distinct ones")
+w2.step("take pencil 3 from desk 1", "You pick up the pencil 3 from the desk 1.")
+w2.step("take pencil 2 from desk 1", "You pick up the pencil 2 from the desk 1.")
+check(w2.k == 1, "...so two takes of one type are one line (the pick_two cost, by design)")
+check(P.AlfworldWalkSet([]).total == 0 and P.AlfworldWalkSet(None).k == 0, "no walkthrough, no progress")
+e = P.AlfworldWalkSet(clean)
+e.step("go to cabinet 5", "You arrive at cabinet 5.", won=True)
+check(e.k == 6, "a win on the first line is still at K")
+check("walkthrough_set" in P.ALFWORLD_K_DEFINITIONS, "the definition is registered")
 
 tbl = record(True, [{"progress_k": 3, "progress_total": 6, "progress_k_milestone": 2,
                      "progress_total_milestone": 3}, {}])

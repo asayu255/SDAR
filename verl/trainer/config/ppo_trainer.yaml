@@ -701,6 +701,12 @@ algorithm:
     # 68% (step 75) and 70% (step 300) of WINNING rollouts, against 6-7% for
     # WebShop's count and 4% for Search's. Milestone is the default (a) ranks by;
     # walkthrough stays recorded for comparison.
+    #   walkthrough_set  the walkthrough as a SET of type-normalised lines: order-free,
+    #                instance-free, deduplicated, executed-only (progress.py). K grows
+    #                from 2-4 to 3-8, so it refines the groups the milestones already
+    #                split and the mixed groups' failures; a group tied at "reached the
+    #                destination, never the object" stays tied (at 1 instead of 0).
+    #                Every definition's count is always recorded beside the active one.
     alfworld_k: milestone
     # SATURATED GROUPS: the same term for groups whose rollouts ALL won, ranked by
     # turn count instead of k -- A_i += c_sat * (mean T - T_i) / T_task, zero-sum

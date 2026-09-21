@@ -50,6 +50,7 @@ from agent_system.memory import SimpleMemory, SearchMemory
 from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
     PROGRESS_K_ARRIVE_INFO, PROGRESS_TOTAL_ARRIVE_INFO,
+    PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress)
@@ -1195,6 +1196,11 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # own game file (traj_data.json beside it).
         self._milestones = ([AlfworldMilestones(gf) for gf in (self.gamefile or [None] * len(text_obs))]
                             if _progress_on(self.config) else [])
+        # The fourth count: the walkthrough as a set of type-normalised lines
+        # (alfworld_k = walkthrough_set), from the same game.tw-pddl the pointer walks.
+        self._walkset = ([AlfworldWalkSet(_tw_pddl(gf)[0] if gf else [])
+                          for gf in (self.gamefile or [None] * len(text_obs))]
+                         if _progress_on(self.config) else [])
         # ProGPO's coverage, a shadow of (a)'s k, from the game's own opening text.
         self._coverage = ([ObservationCoverage(o) for o in text_obs] if _progress_on(self.config) else [])
         # initialize the history buffer
@@ -1255,12 +1261,23 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                           total_key=PROGRESS_TOTAL_MILESTONE_INFO)
             _put_progress(infos, _ak, _at, k_key=PROGRESS_K_ARRIVE_INFO,
                           total_key=PROGRESS_TOTAL_ARRIVE_INFO)
+            _ws = list(getattr(self, "_walkset", None) or [])
+            for i, act in enumerate(actions[:len(_ws)]):
+                _ws[i].step(act, text_obs[i], won=bool((infos[i] or {}).get("won", False)))
+            _wpad = [0] * (len(actions) - len(_ws))
+            _wk = [w.k for w in _ws] + _wpad
+            _wt = [w.total for w in _ws] + _wpad
+            _put_progress(infos, _wk, _wt, k_key=PROGRESS_K_WALKSET_INFO,
+                          total_key=PROGRESS_TOTAL_WALKSET_INFO)
             _kdef = _alfworld_k_definition(self.config)
             if _kdef == "milestone":
                 _put_progress(infos, _mk, _mt)
             elif _kdef == "milestone_arrive":
                 # The milestones plus "arrived"; the base count stays in its own columns.
                 _put_progress(infos, _ak, _at)
+            elif _kdef == "walkthrough_set":
+                # The walkthrough as a set; the pointer and the milestones keep their columns.
+                _put_progress(infos, _wk, _wt)
             else:
                 _put_progress(infos, _ptrs, _totals)
             _cov = getattr(self, "_coverage", None) or []

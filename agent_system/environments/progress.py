@@ -51,7 +51,13 @@ PROGRESS_TOTAL_MILESTONE_INFO = "progress_total_milestone"
 # a run ranking by one count measures, on its own rollouts, what the other would split.
 PROGRESS_K_ARRIVE_INFO = "progress_k_arrive"
 PROGRESS_TOTAL_ARRIVE_INFO = "progress_total_arrive"
-ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive")
+# The walkthrough as a SET of type-normalised lines (alfworld_k = walkthrough_set),
+# also always recorded: order-free and instance-free, executed-only (see
+# AlfworldWalkSet). A rollout that solves the game by another route or another
+# instance still scores the lines it did carry out.
+PROGRESS_K_WALKSET_INFO = "progress_k_walkset"
+PROGRESS_TOTAL_WALKSET_INFO = "progress_total_walkset"
+ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive", "walkthrough_set")
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 
@@ -105,6 +111,83 @@ def advance_walkthrough(walk, ptr: int, action, observation) -> int:
     if str(action).strip().lower() != str(walk[ptr]).strip().lower():
         return ptr
     return ptr + 1 if alfworld_executed(observation) else ptr
+
+
+# --- ALFWorld, by the walkthrough as a set -------------------------------- #
+#
+# WHY A FOURTH COUNT. The milestones count RESULTS (took / treated / placed / lamp),
+# 2-4 of them, and the runs' stuck groups are tied at k = 0 on 76-81% of them. Yet
+# 54% of a failure's actions are `go to`, executed and grammatical -- the one thing
+# a failure does right, and the milestones never look at it. The walkthrough names
+# those moves. Its pointer form (advance_walkthrough) is bound to the reference
+# route and its instance numbers -- all eight winners of one group scored 0 -- so
+# this count takes the walkthrough as a SET:
+#   order-free       ALFWorld's goals are conjunctions (look_at is isToggled AND
+#                    holds); the real dependencies (nothing is placed before it is
+#                    taken) are PDDL preconditions the environment enforces with
+#                    "Nothing happens.", so demanding the reference ORDER was
+#                    stricter than the game itself;
+#   type-normalised  `cabinet 5` and `cabinet 2` are one line, the way the
+#                    milestones and the goal check compare by type;
+#   deduplicated     normalising merges lines; K is the distinct count.
+# The one thing kept strict is the executed check: with the order gone, a
+# failure's invalid `take` (47% of them) would otherwise advance the count.
+#
+# WHAT IT CHANGES. K grows from 2-4 to 3-8 (mean 5.2), so one line is worth less
+# of the (k - mean)/K score; pick_two grows least (its two takes of one type merge)
+# and keeps the most weight per line -- watch that in the records. WHAT IT DOES
+# NOT CHANGE: a stuck group whose eight rollouts all reached the destination and
+# none the object's receptacle is still tied, at 1 instead of 0 (the 2026-09-21
+# continuation probe: 53/56 and 0/56). Its target is the mixed groups' failures
+# and the stuck groups the milestones already split -- resolution, not rescue.
+
+_ALF_INSTANCE = re.compile(r"\s+\d+\b")
+
+
+def normalize_alfworld_action(action) -> str:
+    """The action by TYPE: lowercase, single spaces, every instance number gone.
+
+    ``take pan 1 from stoveburner 2`` -> ``take pan from stoveburner``.
+    """
+    a = " ".join(str(action or "").strip().lower().split())
+    return _ALF_INSTANCE.sub("", a)
+
+
+class AlfworldWalkSet:
+    """One episode's coverage of its walkthrough as a set of normalised lines.
+
+    ``total`` is the number of distinct normalised lines (0 without a
+    walkthrough, and the row then has no progress at all); ``k`` the number of
+    them the rollout has carried out, in any order, counted only when the
+    environment executed the action. A won episode is at K, as the other counts
+    hold, so a rollout that wins by another route is not scored below one that
+    lost along the reference one.
+    """
+
+    def __init__(self, walk):
+        lines = [normalize_alfworld_action(w) for w in (walk or [])]
+        self.lines = tuple(dict.fromkeys(l for l in lines if l))   # distinct, first-seen order
+        self._set = frozenset(self.lines)
+        self.total = len(self.lines)
+        self.done = set()
+        self.won = False
+
+    def step(self, action, observation, won: bool = False) -> None:
+        if won:
+            self.won = True
+        if not self.total or not alfworld_executed(observation):
+            return
+        a = normalize_alfworld_action(action)
+        if a in self._set:
+            self.done.add(a)
+
+    @property
+    def k(self) -> int:
+        if not self.total:
+            return 0
+        if self.won:
+            return self.total
+        return len(self.done)
 
 
 # --- ALFWorld, by milestones of the task type ---------------------------- #

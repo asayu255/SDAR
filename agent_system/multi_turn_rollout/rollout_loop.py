@@ -1867,6 +1867,9 @@ class TrajectoryCollector:
                 # ...and the milestones plus "arrived" (NaN on other tasks).
                 rows[pos]['progress_k_arrive'] = float(_info.get('progress_k_arrive', float('nan')))
                 rows[pos]['progress_total_arrive'] = float(_info.get('progress_total_arrive', float('nan')))
+                # ...and the walkthrough as a set of type-normalised lines (NaN on other tasks).
+                rows[pos]['progress_k_walkset'] = float(_info.get('progress_k_walkset', float('nan')))
+                rows[pos]['progress_total_walkset'] = float(_info.get('progress_total_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))
                 # WebShop's continuous purchase score (envs.py keeps it beside the binary
