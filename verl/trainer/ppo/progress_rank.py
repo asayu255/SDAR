@@ -156,7 +156,8 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MI
            "coverage_progress", "DEFAULT_SAT_TASKS", "DEFAULT_SAT_MIN_SPREAD",
            "DEFAULT_SAT_TURN_SCALE", "ProgressRankController", "group_status",
            "trajectory_metrics", "FIRST_ORDER_WINDOW",
-           "think_block_metrics", "THINK_OPEN_IDS"]
+           "think_block_metrics", "THINK_OPEN_IDS",
+           "score_mixed_groups", "sign_preserving_scale", "FEW_FAILURES"]
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
@@ -174,6 +175,7 @@ NO_PROGRESS = "no_progress"      # some rollout has no sequence (K = 0 / missing
 NO_DIFFERENCE = "no_difference"  # all k equal -- (b)'s groups; in a saturated group, all turn counts equal
 TOP_BELOW_MIN = "top_below_min"  # differ, but nobody reached min_top_k
 SPREAD_BELOW_MIN = "spread_below_min"  # saturated: turn counts differ by less than sat_min_spread
+FEW_FAILURES = "few_failures"    # mixed: fewer than two failed rollouts, nothing to rank
 
 # Saturated groups (sat_rho): which tasks, the smallest turn difference that fires,
 # and the scale a turn difference is divided by (the task's turn cap). Search is
@@ -326,6 +328,93 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
         rec["verdict"] = FIRED
         rec["scores"] = {t: (mean - float(n_turns)) / scale for t, n_turns in zip(trajs, turns)}
     return out
+
+
+def score_mixed_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
+                       traj_prog: Dict[str, tuple], traj: Dict[str, dict],
+                       min_top_k: Dict[str, float], tasks: Iterable[str],
+                       cross_steps: bool = True) -> Dict[str, Dict]:
+    """Per MIXED group on ``tasks`` (some rollouts won, some did not): the failures ranked.
+
+    The stuck-group ranking applied to the failed rollouts of a group whose outcome
+    already separates them from its winners: ``score_i = (k_i - mean k_fail) / K`` for
+    each failure, the mean taken over the failures only and weighted the way the GRPO
+    statistic weights samples. The winners get nothing -- the reward has already said
+    what it has to say about them -- and the term sums to zero over the failures, so
+    the group's own push is redistributed among its losers, never added to.
+
+    WHY IT IS WORTH HAVING. In the (a)+sat run's own group records, mixed groups held
+    0.8x as many ALFWorld failures as stuck groups did (0.5x WebShop, 0.3x Search), and
+    in half of the ALFWorld and WebShop ones the failures' k differ. Among WebShop's,
+    k orders the failures the way the environment's own partial score does (mean
+    Spearman +0.43 over 341 groups). Search's k almost never differs there (10%).
+
+    ``traj`` is apply()'s per-trajectory table (won by the environment's reward).
+    """
+    tasks = set(tasks)
+    out: Dict[str, Dict] = {}
+    for uid, g in groups.items():
+        task = str(g.get("task") or "")
+        if task not in tasks:
+            continue
+        xs = {t: traj.get(t) for t in sorted({str(tuids[i]) for i in g["rows"]})}
+        if len(xs) < 2 or any(x is None or x["reward"] is None for x in xs.values()):
+            continue
+        won = [x["won"] for x in xs.values()]
+        if all(won) or not any(won):
+            continue                        # saturated or stuck: another term's business
+        weight: Dict[str, float] = defaultdict(float)
+        for i in g["rows"]:
+            t = str(tuids[i])
+            if stat_rows[i] and not xs[t]["won"]:
+                if cross_steps:
+                    weight[t] += 1.0
+                else:
+                    weight[t] = 1.0
+        fails = sorted(weight)
+        prog = [traj_prog.get(t, (0.0, 0.0)) for t in fails]
+        rec = {"task": task, "verdict": None, "scores": {},
+               "k": [p[0] for p in prog], "K": max((p[1] for p in prog), default=0.0)}
+        out[uid] = rec
+        if len(fails) < 2:
+            rec["verdict"] = FEW_FAILURES
+            continue
+        if any(n <= 0 for _, n in prog):
+            rec["verdict"] = NO_PROGRESS
+            continue
+        ks = np.asarray([p[0] for p in prog], dtype=float)
+        K = float(max(p[1] for p in prog))
+        if float(ks.max()) == float(ks.min()):
+            rec["verdict"] = NO_DIFFERENCE
+            continue
+        if float(ks.max()) < float(min_top_k.get(task, 2)):
+            rec["verdict"] = TOP_BELOW_MIN
+            continue
+        w = np.asarray([weight[t] for t in fails], dtype=float)
+        mean = float((w * ks).sum() / w.sum())
+        rec["verdict"] = FIRED
+        rec["scores"] = {t: (float(k) - mean) / K for t, k in zip(fails, ks)}
+    return out
+
+
+def sign_preserving_scale(adds: np.ndarray, base: np.ndarray) -> float:
+    """The largest s in [0, 1] with base_i + s * adds_i <= 0 for every row.
+
+    A mixed group's failures carry a negative advantage (their reward is below the
+    group's mean); a ranking term large enough to lift one of them past zero would
+    tell the policy to do MORE of a rollout that lost, reversing the outcome's own
+    verdict on it. One scale for the whole group, so the term's zero sum survives.
+    A failure whose advantage is already >= 0 (possible only through another
+    mechanism's edit) leaves nothing to preserve and the group adds nothing.
+    """
+    if adds.size == 0:
+        return 0.0
+    if bool((base >= 0.0).any()):
+        return 0.0
+    up = adds > 0.0
+    if not bool(up.any()):
+        return 1.0
+    return float(min(1.0, float(np.min(-base[up] / adds[up]))))
 
 
 def average_ranks(x) -> np.ndarray:
@@ -568,8 +657,16 @@ class ProgressRankController:
                  cross_steps: bool = True, sat_rho: float = 0.0,
                  sat_tasks: Iterable[str] = DEFAULT_SAT_TASKS,
                  sat_min_spread: Optional[Dict[str, float]] = None,
-                 sat_turn_scale: Optional[Dict[str, float]] = None):
+                 sat_turn_scale: Optional[Dict[str, float]] = None,
+                 mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
+        # (a) on MIXED groups: its own share of the same E, on the failures only,
+        # under the same cap and a per-group scale that keeps every failure <= 0.
+        assert mixed_rho >= 0.0, f"progress_rank.mixed_rho must be >= 0, got {mixed_rho}"
+        self.mixed_rho = float(mixed_rho)
+        self.mixed_tasks = [str(t) for t in (mixed_tasks if mixed_tasks is not None else tasks)]
+        unknown_mixed = [t for t in self.mixed_tasks if t not in [str(x) for x in tasks]]
+        assert not unknown_mixed, f"progress_rank.mixed_tasks {unknown_mixed} are not in progress_rank.tasks"
         assert sat_rho >= 0.0, f"progress_rank.sat_rho must be >= 0, got {sat_rho}"
         self.sat_rho = float(sat_rho)
         self.sat_tasks = [str(t) for t in sat_tasks]
@@ -800,6 +897,27 @@ class ProgressRankController:
             if s is not None and (stat[i] or not real[i]):
                 row_sat[i] = s
 
+        # Mixed groups: the failures ranked among themselves. Scored on every step
+        # (the records and the mixed_* counts report it); added only when mixed_rho > 0.
+        mixed_verdicts = score_mixed_groups(
+            groups, tuids=tuids, stat_rows=stat, traj_prog=traj_prog, traj=traj,
+            min_top_k=self.min_top_k, tasks=self.mixed_tasks, cross_steps=self.cross_steps)
+        traj_mix: Dict[str, float] = {}
+        traj_mix_uid: Dict[str, str] = {}
+        for uid_m, rec in mixed_verdicts.items():
+            traj_mix.update(rec["scores"])
+            for t in rec["scores"]:
+                traj_mix_uid[t] = uid_m
+        row_mix = np.zeros(n, dtype=float)
+        for i in range(n):
+            s_m = traj_mix.get(str(tuids[i]))
+            if s_m is not None and (stat[i] or not real[i]):
+                row_mix[i] = s_m
+        # the base advantage per token, which the sign-preserving scale is held against
+        base_tok = signed / np.maximum(tokens, 1.0)
+        delta_mix = np.zeros(n, dtype=float)
+        mix_scale: Dict[str, float] = {}
+
         metrics: Dict[str, float] = {}
         coef = np.zeros(n, dtype=float)
         coef_sat = np.zeros(n, dtype=float)
@@ -853,10 +971,57 @@ class ProgressRankController:
                 metrics[f"{p}/sat_c_uncapped"] = c_sat_uncapped
                 metrics[f"{p}/sat_c_cap"] = sat_cap
             coef_sat[names == task] = c_sat
+
+            # The mixed-group term: its own share mixed_rho of the same E and the same
+            # cap, then shrunk per group until no failure's advantage crosses zero.
+            mix_fired = rows & (row_mix != 0.0)
+            u_mix = float((np.abs(row_mix[mix_fired]) * tokens[mix_fired]).sum()) / task_tokens
+            max_abs_mix = float(np.abs(row_mix[rows]).max()) if rows.any() else 0.0
+            c_mix, mix_capped = 0.0, 0.0
+            c_mix_uncapped, mix_cap = None, None
+            if (self.mixed_rho > 0.0 and task in self.mixed_tasks and ema is not None
+                    and s_ema is not None and u_mix > 0.0 and max_abs_mix > 0.0):
+                c_mix_uncapped = self.mixed_rho * ema / u_mix
+                mix_cap = self.kappa * s_ema / max_abs_mix
+                c_mix = c_mix_uncapped
+                if c_mix > mix_cap:
+                    c_mix, mix_capped = mix_cap, 1.0
+                metrics[f"{p}/mixed_c_uncapped"] = c_mix_uncapped
+                metrics[f"{p}/mixed_c_cap"] = mix_cap
+            scaled = 0
+            if c_mix > 0.0:
+                for uid_m, rec in mixed_verdicts.items():
+                    if rec["task"] != task or rec["verdict"] != FIRED:
+                        continue
+                    grows_m = [i for i in groups[uid_m]["rows"] if row_mix[i] != 0.0]
+                    held = [i for i in grows_m if real[i]]
+                    adds = c_mix * row_mix[held]
+                    sc = sign_preserving_scale(adds, base_tok[held])
+                    mix_scale[uid_m] = sc
+                    scaled += int(sc < 1.0)
+                    for i in grows_m:
+                        delta_mix[i] = sc * c_mix * row_mix[i]
+            if task in self.mixed_tasks:
+                inj_mix = delta_mix * tokens
+                metrics[f"{p}/mixed_c"] = c_mix
+                metrics[f"{p}/mixed_capped"] = mix_capped
+                metrics[f"{p}/mixed_score_mass"] = u_mix
+                metrics[f"{p}/mixed_fired_token_share"] = float(tokens[mix_fired].sum()) / task_tokens
+                metrics[f"{p}/mixed_inject_up"] = float(inj_mix[rows & (delta_mix > 0)].sum()) / task_tokens
+                metrics[f"{p}/mixed_inject_down"] = float(-inj_mix[rows & (delta_mix < 0)].sum()) / task_tokens
+                metrics[f"{p}/mixed_injected_mean_abs_adv"] = float(np.abs(inj_mix[rows]).sum()) / task_tokens
+                metrics[f"{p}/mixed_share_of_ema"] = (
+                    metrics[f"{p}/mixed_injected_mean_abs_adv"] / ema) if ema else 0.0
+                task_scales = [v for u_, v in mix_scale.items() if mixed_verdicts[u_]["task"] == task]
+                if task_scales:
+                    # How often the sign guard had to shrink a group, and by how much.
+                    metrics[f"{p}/mixed_sign_scaled_groups"] = float(scaled)
+                    metrics[f"{p}/mixed_scale_mean"] = float(np.mean(task_scales))
             per_task[task] = {"c": c, "capped": bool(capped), "c_uncapped": c_uncapped, "c_cap": cap,
                               "ema": ema, "success_push_ema": s_ema, "task_tokens": task_tokens,
                               "sat_c": c_sat, "sat_capped": bool(sat_capped),
-                              "sat_c_uncapped": c_sat_uncapped, "sat_c_cap": sat_cap}
+                              "sat_c_uncapped": c_sat_uncapped, "sat_c_cap": sat_cap,
+                              "mixed_c": c_mix, "mixed_capped": bool(mix_capped)}
             if task in self.sat_tasks:
                 inj_sat = row_sat * c_sat * tokens
                 metrics[f"{p}/sat_c"] = c_sat
@@ -1024,9 +1189,18 @@ class ProgressRankController:
                 "sat_injected_abs_mass": float(np.sum(np.abs(row_sat[grows] * coef_sat[grows]) * tokens[grows])),
                 "sat_c": info.get("sat_c"), "sat_capped": info.get("sat_capped"),
                 "sat_c_uncapped": info.get("sat_c_uncapped"), "sat_c_cap": info.get("sat_c_cap"),
+                # The mixed-group term: verdict, per-trajectory score (failures only),
+                # the sign guard's scale and the mass it added.
+                "mixed_verdict": mixed_verdicts.get(uid, {}).get("verdict"),
+                "mixed_score": [traj_mix.get(t, 0.0) for t in trajs],
+                "mixed_scale": mix_scale.get(uid),
+                "mixed_injected_abs_mass": float(np.sum(np.abs(delta_mix[grows]) * tokens[grows])),
+                "mixed_c": info.get("mixed_c"), "mixed_capped": info.get("mixed_capped"),
             })
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1
+        for rec in mixed_verdicts.values():
+            counts[rec["task"]][f"mixed_{rec['verdict']}"] += 1
         sat_spreads: Dict[str, List[float]] = defaultdict(list)
         for rec in sat_verdicts.values():
             counts[rec["task"]][f"sat_{rec['verdict']}"] += 1
@@ -1051,10 +1225,10 @@ class ProgressRankController:
                     metrics[f"shadow/coverage/{task}/spearman_vs_k"] = float(np.mean(rhos[task]))
         self.last_group_records = records
 
-        delta = torch.as_tensor(row_score * coef + row_sat * coef_sat,
+        delta = torch.as_tensor(row_score * coef + row_sat * coef_sat + delta_mix,
                                 dtype=advantages.dtype, device=advantages.device)
         if not bool((delta != 0).any()):
-            # Nothing to add: hand back the very same tensor, so rho = sat_rho = 0
+            # Nothing to add: hand back the very same tensor, so rho = sat_rho = mixed_rho = 0
             # (or a step where nothing fired) is bit-identical to control by construction.
             return advantages, metrics
         new = advantages + delta.unsqueeze(-1) * mask.to(advantages.dtype)

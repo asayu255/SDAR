@@ -718,6 +718,19 @@ algorithm:
     sat_turn_scale:
       alfworld: 50
       webshop: 15
+    # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
+    # whose outcome already separates them from its winners -- A_i += s_g * c_mix
+    # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get
+    # nothing), c_mix = mixed_rho * E / u_mix under the same cap (kappa * S), and
+    # s_g in [0, 1] the largest per-group scale that keeps every failure's
+    # advantage <= 0, so a rollout that lost is never pushed up past zero. In the
+    # (a)+sat run's records mixed groups held 0.8x as many ALFWorld failures as
+    # stuck groups (WebShop 0.5x, Search 0.3x), their k differed in about half of
+    # the ALFWorld and WebShop ones, and WebShop's k ordered the failures like the
+    # environment's partial score (Spearman +0.43). 0 = off, bit for bit.
+    mixed_rho: 0.0
+    # Defaults to `tasks`. Search rarely fires here (its failures' k almost never differ).
+    mixed_tasks: null
     # One JSON line per group per step: per trajectory k, K, ProGPO's coverage D,
     # turns, tokens, reward, invalid turns and (a)'s score; per group the score
     # spread, ProGPO's gate, the largest base |A|, the mass (a) injected; per task c,

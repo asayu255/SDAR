@@ -519,6 +519,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 sat_tasks=list(cfg.get("sat_tasks", ["alfworld", "webshop"])),
                 sat_min_spread=dict(cfg.get("sat_min_spread", {}) or {}),
                 sat_turn_scale=dict(cfg.get("sat_turn_scale", {}) or {}),
+                # Mixed groups: the failures ranked among themselves (0 = off).
+                mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
+                mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),
             )
             pending = getattr(self, "_progress_rank_pending_state", None)
             if pending:

@@ -2693,13 +2693,15 @@ class OPDRayTrainer(RayPPOTrainer):
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
-                    if _retire is not None:
-                        metrics.update(_retire.observe(actor_output_metrics, self.global_steps))
                     # The teacher term's first-order effect, remembered over steps by the
                     # progress_rank controller (and checkpointed with it). Metrics only.
                     _ctl = getattr(self, "_progress_rank", None)
                     if _ctl is not None:
                         metrics.update(_ctl.observe_update(actor_output_metrics))
+                    # ...and ACTED on by the retirement controller, when the run retires:
+                    # the multipliers it hands the next update come from this reading.
+                    if _retire is not None:
+                        metrics.update(_retire.observe(actor_output_metrics, self.global_steps))
                     self._dump_sign_token_report(actor_output)
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
