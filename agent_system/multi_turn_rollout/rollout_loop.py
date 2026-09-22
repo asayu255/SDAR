@@ -1870,6 +1870,14 @@ class TrajectoryCollector:
                 # ...and the walkthrough as a set of type-normalised lines (NaN on other tasks).
                 rows[pos]['progress_k_walkset'] = float(_info.get('progress_k_walkset', float('nan')))
                 rows[pos]['progress_total_walkset'] = float(_info.get('progress_total_walkset', float('nan')))
+                # Search's two counts and its answered flag (NaN on other tasks):
+                # evidence (K 1), evidence_answered (K 2), and 1/0 "sent an <answer>".
+                rows[pos]['progress_k_search_evidence'] = float(_info.get('progress_k_search_evidence', float('nan')))
+                rows[pos]['progress_total_search_evidence'] = float(_info.get('progress_total_search_evidence', float('nan')))
+                rows[pos]['progress_k_search_answered'] = float(_info.get('progress_k_search_answered', float('nan')))
+                rows[pos]['progress_total_search_answered'] = float(_info.get('progress_total_search_answered', float('nan')))
+                _sa = _info.get('search_answered', None)
+                rows[pos]['search_answered'] = float('nan') if _sa is None else float(bool(_sa))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))
                 # WebShop's continuous purchase score (envs.py keeps it beside the binary

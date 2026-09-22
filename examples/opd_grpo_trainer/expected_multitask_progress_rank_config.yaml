@@ -278,6 +278,9 @@
 # winning rollouts at step 300; the milestone count, by task type, is used.
 # Changing it is a different arm: edit here.
 "algorithm.progress_rank.alfworld_k": milestone
+# Which Search count (a) ranks by: evidence (K 1) or evidence_answered (K 2, the
+# answer as a second stage). Changing it is a different arm: edit here.
+"algorithm.progress_rank.search_k": evidence
 # ---- speculative decoding (pinned although engine knobs are exempt) ----------
 # ON. It is not covered by the performance-knob exemption: it changes which
 # tokens are SAMPLED. Rejection sampling preserves the target distribution (the

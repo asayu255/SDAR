@@ -58,6 +58,17 @@ PROGRESS_TOTAL_ARRIVE_INFO = "progress_total_arrive"
 PROGRESS_K_WALKSET_INFO = "progress_k_walkset"
 PROGRESS_TOTAL_WALKSET_INFO = "progress_total_walkset"
 ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive", "walkthrough_set")
+# SEARCH, TWO COUNTS, both always recorded (see search_progress_answered):
+#   evidence           k = 1 once a returned result carried the answer          K = 1
+#   evidence_answered  0 not seen / 1 seen, no answer / 2 seen and answered     K = 2
+# plus the per-row flag "search_answered": has the rollout sent an <answer> the
+# environment took. The flag is what makes "pushed up yet never answered" countable.
+SEARCH_K_DEFINITIONS = ("evidence", "evidence_answered")
+PROGRESS_K_SEARCH_EVIDENCE_INFO = "progress_k_search_evidence"
+PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO = "progress_total_search_evidence"
+PROGRESS_K_SEARCH_ANSWERED_INFO = "progress_k_search_answered"
+PROGRESS_TOTAL_SEARCH_ANSWERED_INFO = "progress_total_search_answered"
+SEARCH_ANSWERED_INFO = "search_answered"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 
@@ -71,6 +82,18 @@ def alfworld_k_definition(config) -> str:
         name = "milestone"
     assert name in ALFWORLD_K_DEFINITIONS, (
         f"algorithm.progress_rank.alfworld_k={name!r}; expected one of {ALFWORLD_K_DEFINITIONS}")
+    return name
+
+
+def search_k_definition(config) -> str:
+    """``algorithm.progress_rank.search_k``: which Search count (a) ranks by."""
+    try:
+        cfg = (config.get("algorithm", {}) or {}).get("progress_rank", None) or {}
+        name = str(cfg.get("search_k", "evidence") or "evidence")
+    except AttributeError:
+        name = "evidence"
+    assert name in SEARCH_K_DEFINITIONS, (
+        f"algorithm.progress_rank.search_k={name!r}; expected one of {SEARCH_K_DEFINITIONS}")
     return name
 
 
@@ -523,6 +546,34 @@ def search_progress(evidence_seen: bool, target, *, answer_strings, is_yesno) ->
     if not list(answer_strings(target)) or is_yesno(target):
         return 0, 0
     return int(bool(evidence_seen)), 1
+
+
+def search_progress_answered(evidence_seen: bool, answered: bool, target, *,
+                             answer_strings, is_yesno) -> Tuple[int, int]:
+    """``(k, K)`` for one Search row, counting the answer as the second stage.
+
+    The correct sequence is retrieve, then answer: k = 1 once a returned result
+    carried the answer, 2 once the rollout has also sent an <answer> after that
+    (right or wrong), K = 2. An answer sent WITHOUT the evidence stays at 0, so a
+    guess is never paid for; seeing the evidence and never answering stays at 1,
+    below every rollout that did both.
+
+    WHY A THIRD LEVEL, NOT A TWO-LEVEL "seen AND answered". The two forms order every
+    pair of rollouts the same way but one: "seen, never answered" against "not seen".
+    Three levels keep today's order there (the first stage counts, as "took" does in
+    ALFWorld and "found" in WebShop) and add "answered > not answered" among the
+    rollouts that saw it -- which today's K = 1 ties, e.g. a stuck group whose eight
+    rollouts all saw the answer. Whether ranking "seen, never answered" above "not
+    seen" feeds a search-to-the-cap habit is not settled (2026-09-22: pushed up 2%
+    vs pushed down 9% never answered in stuck groups at step 150, 16% vs 0% among
+    mixed-group failures); SEARCH_ANSWERED_INFO is recorded so any run can measure it.
+
+    Unjudgeable questions (no answer strings, yes/no) have K = 0 under both counts.
+    """
+    if not list(answer_strings(target)) or is_yesno(target):
+        return 0, 0
+    seen = bool(evidence_seen)
+    return int(seen) + int(seen and bool(answered)), 2
 
 
 def put_progress(infos: Iterable, ks, totals, *, k_key: str = PROGRESS_K_INFO,

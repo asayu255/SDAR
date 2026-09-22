@@ -601,6 +601,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                                          ("walkset", "progress_k_walkset", "progress_total_walkset", "walkthrough_set")):
             if kdef != active and kcol in nt and tcol in nt:
                 alt_counts[name] = (nt[kcol], nt[tcol])
+        # ...and Search's two counts: the evidence alone (K 1) and evidence then answer
+        # (K 2), whichever of them (a) is not ranking by.
+        sdef = str(cfg.get("search_k", "evidence") or "evidence")
+        for name, kcol, tcol, active in (("search_evidence", "progress_k_search_evidence",
+                                          "progress_total_search_evidence", "evidence"),
+                                         ("search_answered", "progress_k_search_answered",
+                                          "progress_total_search_answered", "evidence_answered")):
+            if sdef != active and kcol in nt and tcol in nt:
+                alt_counts[name] = (nt[kcol], nt[tcol])
 
         ctl = self._progress_rank_controller(cfg)
         new_adv, out = ctl.apply(
@@ -616,6 +625,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             turn_caps=self._turn_caps(ctl.tasks),
             alt_counts=alt_counts,
             task_score_rows=nt["task_score"] if "task_score" in nt else None,
+            answered_rows=nt["search_answered"] if "search_answered" in nt else None,
         )
         batch.batch["advantages"] = new_adv
         # The format channel, counted where the responses are (the controller sees

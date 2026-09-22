@@ -766,7 +766,7 @@ class ProgressRankController:
               episode_rewards, k_rows, total_rows, real_rows: np.ndarray,
               stat_rows: np.ndarray, row_scores=None, valid_rows=None,
               coverage_rows=None, episode_lengths=None, turn_caps=None,
-              alt_counts=None, task_score_rows=None) -> tuple:
+              alt_counts=None, task_score_rows=None, answered_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -786,6 +786,10 @@ class ProgressRankController:
         ``alt_counts``       ``{name: (k_rows, total_rows)}``, other progress counts to
                              compare with the ranked one on the same stuck groups
         ``task_score_rows``  per row, WebShop's continuous purchase score
+        ``answered_rows``    per row, Search's "has sent an <answer>" (1/0, NaN elsewhere).
+                             With it the records carry ``answered`` per trajectory and the
+                             metrics report how many of the rollouts (a) pushed up, and of
+                             those it pushed down, never answered.
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -841,7 +845,7 @@ class ProgressRankController:
             if x is None:
                 x = traj[t] = {"task": names[i], "turns": 0, "tokens": 0.0, "reward": None,
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
-                               "length": None, "task_score": None}
+                               "length": None, "task_score": None, "answered": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -851,6 +855,10 @@ class ProgressRankController:
                 ts = _finite(task_score_rows[i])
                 if ts is not None:
                     x["task_score"] = ts if x["task_score"] is None else max(x["task_score"], ts)
+            if answered_rows is not None:
+                an = _finite(answered_rows[i])
+                if an is not None:
+                    x["answered"] = bool(x["answered"]) or an > 0.5
             x["tokens"] += float(tokens[i])
             r = _finite(episode_rewards[i])
             if r is not None:
@@ -1172,6 +1180,7 @@ class ProgressRankController:
                 # continuous purchase score, and the other progress counts, per trajectory.
                 "length": [x["length"] for x in xs],
                 "task_score": [x["task_score"] for x in xs],
+                "answered": [x["answered"] for x in xs],
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],
@@ -1197,6 +1206,30 @@ class ProgressRankController:
                 "mixed_injected_abs_mass": float(np.sum(np.abs(delta_mix[grows]) * tokens[grows])),
                 "mixed_c": info.get("mixed_c"), "mixed_capped": info.get("mixed_capped"),
             })
+        # WHO GETS PUSHED, BY WHETHER THEY ANSWERED (tasks with an answered flag).
+        # Among the rollouts of fired stuck groups, and the failures of fired mixed
+        # groups: the share that never sent an answer, on the side (a) pushed up and
+        # on the side it pushed down. If the pushed-up side leans to "never answered",
+        # the count is feeding a search-to-the-cap habit.
+        unans: Dict[tuple, List[int]] = defaultdict(lambda: [0, 0])
+        for rec in records:
+            flags = rec.get("answered") or []
+            if not any(a is not None for a in flags):
+                continue
+            for kind, verdict_key, score_key in (("stuck", "verdict", "score"),
+                                                 ("mixed", "mixed_verdict", "mixed_score")):
+                if rec.get(verdict_key) != FIRED:
+                    continue
+                for a, sc in zip(flags, rec.get(score_key) or []):
+                    if a is None or abs(float(sc)) <= 1e-12:
+                        continue
+                    side = "up" if sc > 0 else "down"
+                    c = unans[(rec["task"], kind, side)]
+                    c[0] += 1
+                    c[1] += int(not a)
+        for (task, kind, side), (n_side, n_unans) in unans.items():
+            metrics[f"progress_rank/{task}/{kind}_{side}_n"] = float(n_side)
+            metrics[f"progress_rank/{task}/{kind}_{side}_unanswered"] = n_unans / n_side
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1
         for rec in mixed_verdicts.values():

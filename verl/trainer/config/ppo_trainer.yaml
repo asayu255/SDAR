@@ -708,6 +708,17 @@ algorithm:
     #                destination, never the object" stays tied (at 1 instead of 0).
     #                Every definition's count is always recorded beside the active one.
     alfworld_k: milestone
+    # Which Search count (a) ranks by. Both are always recorded, with the per-row
+    # flag search_answered ("sent an <answer> the environment took").
+    #   evidence           k = 1 once a returned result carried the answer (K = 1)
+    #   evidence_answered  0 not seen / 1 seen, never answered / 2 seen and answered,
+    #                      right or wrong (K = 2). Orders every pair as evidence does
+    #                      and adds "answered > not" among the rollouts that saw it;
+    #                      an answer without the evidence stays at 0 (no pay for
+    #                      guessing). progress_rank/search/{stuck,mixed}_{up,down}_
+    #                      unanswered say whether the pushed-up side leans to rollouts
+    #                      that never answered.
+    search_k: evidence
     # SATURATED GROUPS: the same term for groups whose rollouts ALL won, ranked by
     # turn count instead of k -- A_i += c_sat * (mean T - T_i) / T_task, zero-sum
     # over the GRPO statistic's samples, c_sat = sat_rho * E / u_sat under the same

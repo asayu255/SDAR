@@ -51,9 +51,12 @@ from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
     PROGRESS_K_ARRIVE_INFO, PROGRESS_TOTAL_ARRIVE_INFO,
     PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
+    PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
+    PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
-    put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress)
+    put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
+    search_k_definition as _search_k_definition, search_progress_answered as _search_progress_answered)
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +836,14 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         n = len(obs)
         self._evidence_seen = [False] * n
         self._answer_early = [False] * n
+        # Has the row sent an <answer> the environment took (the projected action,
+        # which is what the env ends the episode on)? Read by search_k=evidence_answered
+        # and recorded for every run, so "pushed up yet never answered" is countable.
+        self._answered = [False] * n
+        # ...and did it answer AFTER a result had carried the answer (the second stage).
+        # The environment ends the episode on an answer, so the two only differ if one
+        # ever did not; the count is still defined by the order, not by luck.
+        self._answered_after_seen = [False] * n
         # Where each route-document row stands in its route (expert_flow only).
         self._route_ptr = [0] * n
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
@@ -905,16 +916,32 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "search": actions,
             "information": next_obs,
         })
+        self._note_answered(actions)
         self._note_returned(next_obs)
         self._note_route(text_actions)
         self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
         if _progress_on(self.config):
-            # (a)'s k for EVERY row: has a returned result carried the answer?
-            # The same flag the progress line reads, kept for all rows already.
-            _prog = [_search_progress(bool(self._evidence_seen[i]), self._answers(i),
-                                      answer_strings=_answer_strings, is_yesno=_is_yesno)
-                     for i in range(len(infos))]
+            # (a)'s k for EVERY row, both counts: has a returned result carried the
+            # answer (evidence), and has the row also answered after it
+            # (evidence_answered). The active one goes in progress_k, both in their
+            # own columns, and the answered flag beside them.
+            _ans = list(getattr(self, "_answered", None) or [False] * len(infos))
+            _after = list(getattr(self, "_answered_after_seen", None) or [False] * len(infos))
+            _ev = [_search_progress(bool(self._evidence_seen[i]), self._answers(i),
+                                    answer_strings=_answer_strings, is_yesno=_is_yesno)
+                   for i in range(len(infos))]
+            _ea = [_search_progress_answered(bool(self._evidence_seen[i]), bool(_after[i]), self._answers(i),
+                                             answer_strings=_answer_strings, is_yesno=_is_yesno)
+                   for i in range(len(infos))]
+            _prog = _ea if _search_k_definition(self.config) == "evidence_answered" else _ev
             _put_progress(infos, [p[0] for p in _prog], [p[1] for p in _prog])
+            _put_progress(infos, [p[0] for p in _ev], [p[1] for p in _ev],
+                          k_key=PROGRESS_K_SEARCH_EVIDENCE_INFO, total_key=PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO)
+            _put_progress(infos, [p[0] for p in _ea], [p[1] for p in _ea],
+                          k_key=PROGRESS_K_SEARCH_ANSWERED_INFO, total_key=PROGRESS_TOTAL_SEARCH_ANSWERED_INFO)
+            for i, info in enumerate(infos):
+                if isinstance(info, dict):
+                    info[SEARCH_ANSWERED_INFO] = bool(_ans[i]) if i < len(_ans) else False
             _cov = getattr(self, "_coverage", None) or []
             for i, cov in enumerate(_cov[:len(next_obs)]):
                 cov.step(next_obs[i])
@@ -957,6 +984,24 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         for i, text in enumerate(text_actions[:len(seen)]):
             if not seen[i] and _contains_answer(text, self._answers(i)):
                 self._answer_early[i] = True
+
+    def _note_answered(self, actions) -> None:
+        """The row sent an answer: its PROJECTED action is an <answer> block.
+
+        That is the string the environment receives and ends the episode on
+        (search_projection keeps the first <search> block before any <answer>, so a
+        turn carrying both is a search). Sticky: once answered, always answered.
+        """
+        done = getattr(self, "_answered", None)
+        if done is None:
+            return
+        after = getattr(self, "_answered_after_seen", None) or [False] * len(done)
+        seen = getattr(self, "_evidence_seen", None) or [False] * len(done)
+        for i, a in enumerate(list(actions)[:len(done)]):
+            if str(a or "").lstrip().lower().startswith("<answer>"):
+                done[i] = True
+                if seen[i]:
+                    after[i] = True
 
     def _note_returned(self, next_obs) -> None:
         """The progress line's only state: has a returned result carried the answer?
