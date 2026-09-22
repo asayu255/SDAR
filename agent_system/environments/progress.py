@@ -69,6 +69,16 @@ PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO = "progress_total_search_evidence"
 PROGRESS_K_SEARCH_ANSWERED_INFO = "progress_k_search_answered"
 PROGRESS_TOTAL_SEARCH_ANSWERED_INFO = "progress_total_search_answered"
 SEARCH_ANSWERED_INFO = "search_answered"
+# SHADOW COLUMNS, every task, never ranked by (see RevisitCounter and the notes below):
+#   revisits               actions the rollout had already taken once, taken again
+#   committed              the rollout sent its task's TERMINAL action: Search's
+#                          <answer>, WebShop's buy (ALFWorld has none: nothing is
+#                          written and the row reads NaN)
+#   progress_done_walkset  ALFWorld: walkthrough lines actually carried out, WITHOUT
+#                          the won => K rule the ranked counts apply
+REVISITS_INFO = "revisits"
+COMMITTED_INFO = "committed"
+PROGRESS_DONE_WALKSET_INFO = "progress_done_walkset"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 
@@ -134,6 +144,41 @@ def advance_walkthrough(walk, ptr: int, action, observation) -> int:
     if str(action).strip().lower() != str(walk[ptr]).strip().lower():
         return ptr
     return ptr + 1 if alfworld_executed(observation) else ptr
+
+
+# --- Revisits, every task ---------------------------------------------------- #
+#
+# WHY. The saturated-group term ranks a game's winners by TURN COUNT. On the 2026-09-22
+# validation dumps (3,681 winners of 90 games) a winner's 13.8 turns were 4.4 repeats
+# of an action it had already taken, 4.0 first visits off the walkthrough and the
+# walkthrough's own lines; failures (all at the 50-turn cap) were 59% repeats. Ranking
+# winners by repeats alone orders 18% of same-game winner pairs differently from turns,
+# and needs no walkthrough matcher, so it is the candidate to compare against turns.
+# Recorded, never ranked by: the next run's records answer "what would change".
+#
+# WHAT COUNTS. The action string the manager sent to the environment, lower-cased and
+# whitespace-collapsed, instance numbers KEPT ("go to cabinet 1" twice is a revisit,
+# "go to cabinet 2" is not), executed or not (a refused repeat is still a wasted turn).
+# A walkthrough that legitimately repeats a line (pick_two's second "go to") is not
+# excused here; the analysis can subtract it, the count cannot know it.
+
+class RevisitCounter:
+    """How many of a rollout's actions repeated one it had already taken."""
+
+    __slots__ = ("_seen", "revisits")
+
+    def __init__(self):
+        self._seen = set()
+        self.revisits = 0
+
+    def step(self, action) -> None:
+        a = " ".join(str(action or "").strip().lower().split())
+        if not a:
+            return
+        if a in self._seen:
+            self.revisits += 1
+        else:
+            self._seen.add(a)
 
 
 # --- ALFWorld, by the walkthrough as a set -------------------------------- #
@@ -210,6 +255,12 @@ class AlfworldWalkSet:
             return 0
         if self.won:
             return self.total
+        return len(self.done)
+
+    @property
+    def raw_done(self) -> int:
+        """Lines carried out, with no won => K: what a winner actually did of the
+        walkthrough. Recorded as progress_done_walkset; the ranked count is ``k``."""
         return len(self.done)
 
 

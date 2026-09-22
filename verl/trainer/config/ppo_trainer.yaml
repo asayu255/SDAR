@@ -725,16 +725,31 @@ algorithm:
     # cap (kappa * S). The slower winners of one ALFWorld game spent 30-37% of their
     # turns seeing nothing new (the fastest 4%). 0 = off, bit for bit.
     sat_rho: 0.0
-    # Search is not here: its turn count is the number of searches.
+    # The default keeps Search out by name (its turn count is its number of searches,
+    # and a second search helps there). With sat_gate on, list all three and let the
+    # condition decide.
     sat_tasks: ["alfworld", "webshop"]
+    # THE GATE. A task's saturated groups are ranked only while the task's share of
+    # saturated groups exceeds its share of stuck groups (both EMAs with ema_alpha).
+    # Why that line: a game the policy solves with probability p is all-won with p^8
+    # and all-lost with (1-p)^8, so "saturated > stuck" is "the typical game is solved
+    # more often than not" -- the regime where the remaining failures are wandering
+    # (every ALFWorld failure hits the cap) and "fewer turns" is the right push; below
+    # it, the task still needs the search that "shorter" would cut. Replayed on three
+    # runs' records: ALFWorld opens near step 62-73, WebShop 63-81, keeping ~90% of
+    # the ungated firings; Search opens on 2-3 steps near 196 (and never at all without
+    # the EMA on 39-47 steps). Off = every listed task fires whenever a group qualifies.
+    sat_gate: false
     # A saturated group fires only if its turn counts differ by at least this.
     sat_min_spread:
       alfworld: 2
       webshop: 1
+      search: 1
     # T_task, the scale a turn difference is divided by: the task's turn cap.
     sat_turn_scale:
       alfworld: 50
       webshop: 15
+      search: 4
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

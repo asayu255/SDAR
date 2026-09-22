@@ -175,13 +175,15 @@ NO_PROGRESS = "no_progress"      # some rollout has no sequence (K = 0 / missing
 NO_DIFFERENCE = "no_difference"  # all k equal -- (b)'s groups; in a saturated group, all turn counts equal
 TOP_BELOW_MIN = "top_below_min"  # differ, but nobody reached min_top_k
 SPREAD_BELOW_MIN = "spread_below_min"  # saturated: turn counts differ by less than sat_min_spread
+GATE_CLOSED = "gate_closed"      # saturated: the task's gate is shut (stuck share >= saturated share)
 FEW_FAILURES = "few_failures"    # mixed: fewer than two failed rollouts, nothing to rank
 
 # Saturated groups (sat_rho): which tasks, the smallest turn difference that fires,
 # and the scale a turn difference is divided by (the task's turn cap). Search is
-# not on the list: its turn count is the number of searches, and fewer is not better.
+# not on the default list: its turn count is the number of searches, and fewer is
+# not better. With the gate (sat_gate) it can be listed and the condition decides.
 DEFAULT_SAT_TASKS = ("alfworld", "webshop")
-DEFAULT_SAT_MIN_SPREAD = {"alfworld": 2.0, "webshop": 1.0}
+DEFAULT_SAT_MIN_SPREAD = {"alfworld": 2.0, "webshop": 1.0, "search": 1.0}
 DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 
 
@@ -547,6 +549,11 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
       fail_progress            failures' k / K: do they get further before failing
       fail_distinct_obs_per_turn   ProGPO's P on failures (distinct observations per
                                turn): loops show as a low value; a shadow, not a signal
+      fail_uncommitted         failures that never sent the terminal action (WebShop buy,
+                               Search answer): the option-loop signature, per step
+      win_revisits / fail_revisits   repeated actions per trajectory (a shadow ranking
+                               key for saturated groups; progress.RevisitCounter)
+      win_done_walkset / fail_done_walkset   ALFWorld walkthrough lines actually done
       groups_{stuck,live,saturated}_share   what the batch's groups were
     and, per alternative count (ALFWorld's milestones with / without "arrived"):
       progress_rank/<task>/alt_<name>/stuck_split_where_tied    stuck groups the
@@ -587,6 +594,10 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
             if x["won"]:
                 a["win_turns"].append(T)
                 a["win_tokens_per_turn"].append(x["tokens"] / rows_here)
+                if x.get("revisits") is not None:
+                    a["win_revisits"].append(float(x["revisits"]))
+                if x.get("done_walkset") is not None:
+                    a["win_done_walkset"].append(float(x["done_walkset"]))
                 if have_invalid:
                     a["win_with_invalid_turn"].append(float(x["invalid"] > 0))
                     a["_win_invalid"].append(float(x["invalid"]))
@@ -607,6 +618,14 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
                     a["fail_distinct_obs_per_turn"].append(cov)
                 if x.get("task_score") is not None:
                     a["fail_task_score"].append(float(x["task_score"]))
+                if x.get("revisits") is not None:
+                    a["fail_revisits"].append(float(x["revisits"]))
+                if x.get("done_walkset") is not None:
+                    a["fail_done_walkset"].append(float(x["done_walkset"]))
+                # Failures that never sent the task's terminal action (WebShop buy, Search
+                # answer): the val-side signature of the option-loop collapse, per step.
+                if x.get("committed") is not None:
+                    a["fail_uncommitted"].append(float(not x["committed"]))
         if status == "stuck" and alt_prog:
             ranked = [traj_prog.get(t, (0.0, 0.0)) for t in trajs]
             if len(ranked) >= 2 and all(K > 0 for _, K in ranked):
@@ -658,8 +677,15 @@ class ProgressRankController:
                  sat_tasks: Iterable[str] = DEFAULT_SAT_TASKS,
                  sat_min_spread: Optional[Dict[str, float]] = None,
                  sat_turn_scale: Optional[Dict[str, float]] = None,
-                 mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None):
+                 mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None,
+                 sat_gate: bool = False):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
+        # THE GATE on the saturated-group term: per task, fire only while the EMA of
+        # the task's saturated-group share exceeds the EMA of its stuck-group share.
+        # p^8 > (1-p)^8 <=> p > 1/2: "the typical game is solved more often than not",
+        # the regime where the remaining failures are wandering and "fewer turns" is
+        # the right push. Same alpha as E and S; no new constant.
+        self.sat_gate = bool(sat_gate)
         # (a) on MIXED groups: its own share of the same E, on the failures only,
         # under the same cap and a per-group scale that keeps every failure <= 0.
         assert mixed_rho >= 0.0, f"progress_rank.mixed_rho must be >= 0, got {mixed_rho}"
@@ -691,6 +717,9 @@ class ProgressRankController:
         self.ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
         # S: the EMA of the push a success gets in a live group (the cap's anchor).
         self.success_ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
+        # The gate's two EMAs per task (shares of the task's groups this step).
+        self.gate_stuck_ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
+        self.gate_sat_ema: Dict[str, Optional[float]] = {t: None for t in self.tasks}
         # The last apply()'s groups, one dict per group; see GROUP RECORDS above.
         self.last_group_records: List[dict] = []
         # The teacher term's first-order effect on the GRPO objective, per task, over
@@ -700,8 +729,9 @@ class ProgressRankController:
     # --- persistence ------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"version": 3, "ema": dict(self.ema), "success_ema": dict(self.success_ema),
-                "first_order": {t: list(v) for t, v in self.first_order.items()}}
+        return {"version": 4, "ema": dict(self.ema), "success_ema": dict(self.success_ema),
+                "first_order": {t: list(v) for t, v in self.first_order.items()},
+                "gate_stuck_ema": dict(self.gate_stuck_ema), "gate_sat_ema": dict(self.gate_sat_ema)}
 
     def load_state_dict(self, state: dict) -> None:
         state = state or {}
@@ -713,6 +743,10 @@ class ProgressRankController:
         # Version 2 and earlier carried no window; it then refills from the next update.
         for t, v in (state.get("first_order", {}) or {}).items():
             self.first_order[str(t)] = [float(x) for x in v][-FIRST_ORDER_WINDOW:]
+        # Version 3 and earlier carried no gate EMAs; they then start from the next step's shares.
+        for key, store in (("gate_stuck_ema", self.gate_stuck_ema), ("gate_sat_ema", self.gate_sat_ema)):
+            for t, v in (state.get(key, {}) or {}).items():
+                store[str(t)] = None if v is None else float(v)
 
     def observe_update(self, metrics: dict) -> Dict[str, float]:
         """After the actor update: the teacher term's first-order effect, remembered.
@@ -766,7 +800,8 @@ class ProgressRankController:
               episode_rewards, k_rows, total_rows, real_rows: np.ndarray,
               stat_rows: np.ndarray, row_scores=None, valid_rows=None,
               coverage_rows=None, episode_lengths=None, turn_caps=None,
-              alt_counts=None, task_score_rows=None, answered_rows=None) -> tuple:
+              alt_counts=None, task_score_rows=None, committed_rows=None,
+              revisit_rows=None, done_walkset_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -786,10 +821,15 @@ class ProgressRankController:
         ``alt_counts``       ``{name: (k_rows, total_rows)}``, other progress counts to
                              compare with the ranked one on the same stuck groups
         ``task_score_rows``  per row, WebShop's continuous purchase score
-        ``answered_rows``    per row, Search's "has sent an <answer>" (1/0, NaN elsewhere).
-                             With it the records carry ``answered`` per trajectory and the
-                             metrics report how many of the rollouts (a) pushed up, and of
-                             those it pushed down, never answered.
+        ``committed_rows``   per row, "has sent the task's terminal action" (Search's
+                             <answer>, WebShop's buy; 1/0, NaN on ALFWorld). With it the
+                             records carry ``committed`` per trajectory and the metrics
+                             report how many of the rollouts a term pushed up, and of those
+                             it pushed down, never committed.
+        ``revisit_rows``     per row, actions the trajectory had already taken once, taken
+                             again (a shadow ranking key for saturated groups; see
+                             progress.RevisitCounter)
+        ``done_walkset_rows`` per row, ALFWorld's walkthrough lines actually done, no won => K
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -845,7 +885,8 @@ class ProgressRankController:
             if x is None:
                 x = traj[t] = {"task": names[i], "turns": 0, "tokens": 0.0, "reward": None,
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
-                               "length": None, "task_score": None, "answered": None}
+                               "length": None, "task_score": None, "committed": None,
+                               "revisits": None, "done_walkset": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -855,10 +896,15 @@ class ProgressRankController:
                 ts = _finite(task_score_rows[i])
                 if ts is not None:
                     x["task_score"] = ts if x["task_score"] is None else max(x["task_score"], ts)
-            if answered_rows is not None:
-                an = _finite(answered_rows[i])
-                if an is not None:
-                    x["answered"] = bool(x["answered"]) or an > 0.5
+            if committed_rows is not None:
+                cm = _finite(committed_rows[i])
+                if cm is not None:
+                    x["committed"] = bool(x["committed"]) or cm > 0.5
+            for col, key in ((revisit_rows, "revisits"), (done_walkset_rows, "done_walkset")):
+                if col is not None:
+                    v = _finite(col[i])
+                    if v is not None:
+                        x[key] = v if x[key] is None else max(x[key], v)
             x["tokens"] += float(tokens[i])
             r = _finite(episode_rewards[i])
             if r is not None:
@@ -892,10 +938,46 @@ class ProgressRankController:
         # Saturated groups (every rollout won by the environment's reward): the
         # turn-count ranking. Scored on every step -- the records and the sat_*
         # counts report it -- and added to the advantage only when sat_rho > 0.
+        # THE GATE, decided from this step's group shares folded into the EMAs (the
+        # replay that chose the rule used exactly this: EMA including the current step).
+        gate_open: Dict[str, bool] = {}
+        gate_q: Dict[str, Optional[float]] = {}
+        shares: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for g in groups.values():
+            task = str(g.get("task") or "")
+            if task not in self.tasks:
+                continue
+            xs = [traj[t] for t in sorted({str(tuids[i]) for i in g["rows"] if real[i]}) if t in traj]
+            if len(xs) < 2 or any(x["reward"] is None for x in xs):
+                continue
+            shares[task]["n"] += 1
+            shares[task][group_status(g, xs)] += 1
+        for task in self.tasks:
+            n_t = shares[task]["n"]
+            if n_t:
+                st_share = shares[task]["stuck"] / n_t
+                sa_share = shares[task]["saturated"] / n_t
+                for store, val in ((self.gate_stuck_ema, st_share), (self.gate_sat_ema, sa_share)):
+                    prev = store.get(task)
+                    store[task] = val if prev is None else (1.0 - self.alpha) * prev + self.alpha * val
+            es, ea = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
+            condition = es is not None and ea is not None and ea > es
+            gate_q[task] = (es / (es + ea)) if (es is not None and ea is not None and es + ea > 0) else None
+            gate_open[task] = condition if self.sat_gate else True
+        sat_tasks_now = [t for t in self.sat_tasks if gate_open.get(t, True)]
         sat_verdicts = score_saturated_groups(
-            groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=self.sat_tasks,
+            groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=sat_tasks_now,
             min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
             cross_steps=self.cross_steps)
+        closed_tasks = [t for t in self.sat_tasks if t not in sat_tasks_now]
+        if closed_tasks:
+            # Still scored for the records, but the verdict says the gate held them.
+            for uid, rec in score_saturated_groups(
+                    groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=closed_tasks,
+                    min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
+                    cross_steps=self.cross_steps).items():
+                rec["verdict"], rec["scores"] = GATE_CLOSED, {}
+                sat_verdicts[uid] = rec
         traj_sat: Dict[str, float] = {}
         for rec in sat_verdicts.values():
             traj_sat.update(rec["scores"])
@@ -979,6 +1061,16 @@ class ProgressRankController:
                 metrics[f"{p}/sat_c_uncapped"] = c_sat_uncapped
                 metrics[f"{p}/sat_c_cap"] = sat_cap
             coef_sat[names == task] = c_sat
+            # The gate, reported whether or not it is enforced: the condition, the two
+            # EMAs and q = stuck / (stuck + saturated) among the task's dead groups.
+            _es, _ea = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
+            if _es is not None and _ea is not None:
+                metrics[f"{p}/sat_gate_stuck_ema"] = _es
+                metrics[f"{p}/sat_gate_sat_ema"] = _ea
+                metrics[f"{p}/sat_gate_condition"] = float(_ea > _es)
+                if gate_q.get(task) is not None:
+                    metrics[f"{p}/sat_gate_q"] = gate_q[task]
+            metrics[f"{p}/sat_gated_out"] = float(self.sat_gate and task in self.sat_tasks and not gate_open.get(task, True))
 
             # The mixed-group term: its own share mixed_rho of the same E and the same
             # cap, then shrunk per group until no failure's advantage crosses zero.
@@ -1180,7 +1272,9 @@ class ProgressRankController:
                 # continuous purchase score, and the other progress counts, per trajectory.
                 "length": [x["length"] for x in xs],
                 "task_score": [x["task_score"] for x in xs],
-                "answered": [x["answered"] for x in xs],
+                "committed": [x["committed"] for x in xs],
+                "revisits": [x["revisits"] for x in xs],
+                "done_walkset": [x["done_walkset"] for x in xs],
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],
@@ -1206,14 +1300,15 @@ class ProgressRankController:
                 "mixed_injected_abs_mass": float(np.sum(np.abs(delta_mix[grows]) * tokens[grows])),
                 "mixed_c": info.get("mixed_c"), "mixed_capped": info.get("mixed_capped"),
             })
-        # WHO GETS PUSHED, BY WHETHER THEY ANSWERED (tasks with an answered flag).
-        # Among the rollouts of fired stuck groups, and the failures of fired mixed
-        # groups: the share that never sent an answer, on the side (a) pushed up and
-        # on the side it pushed down. If the pushed-up side leans to "never answered",
-        # the count is feeding a search-to-the-cap habit.
+        # WHO GETS PUSHED, BY WHETHER THEY COMMITTED (tasks with a terminal action:
+        # Search's answer, WebShop's buy). Among the rollouts of fired stuck groups, and
+        # the failures of fired mixed groups: the share that never committed, on the
+        # side the term pushed up and on the side it pushed down. A pushed-up side that
+        # leans to "never committed" is the option-loop / search-to-the-cap failure
+        # ([[mixed-term-rewards-webshop-option-loops]]) being rewarded.
         unans: Dict[tuple, List[int]] = defaultdict(lambda: [0, 0])
         for rec in records:
-            flags = rec.get("answered") or []
+            flags = rec.get("committed") or []
             if not any(a is not None for a in flags):
                 continue
             for kind, verdict_key, score_key in (("stuck", "verdict", "score"),
@@ -1229,7 +1324,32 @@ class ProgressRankController:
                     c[1] += int(not a)
         for (task, kind, side), (n_side, n_unans) in unans.items():
             metrics[f"progress_rank/{task}/{kind}_{side}_n"] = float(n_side)
-            metrics[f"progress_rank/{task}/{kind}_{side}_unanswered"] = n_unans / n_side
+            metrics[f"progress_rank/{task}/{kind}_{side}_uncommitted"] = n_unans / n_side
+        # THE ALL-FAIL GROUPS' OWN GRADIENT. Their environment reward is flat, but the
+        # -0.1 invalid-action penalty enters before the group statistic, and the turn-
+        # level std normalisation blows one penalised turn up to |A| 8-20 per token
+        # (85% of ALFWorld's all-fail groups at steps 151-300, task mean |A| 0.64). So
+        # "no task signal", never "no gradient": what each stuck group already carries.
+        stuck_base: Dict[str, List[float]] = defaultdict(list)
+        sat_agree: Dict[str, List[float]] = defaultdict(list)
+        for rec in records:
+            if rec["status"] == "stuck":
+                stuck_base[rec["task"]].append(float(rec.get("base_abs_adv_max") or 0.0))
+            # In a FIRED saturated group: would ranking by revisits agree with turns?
+            # Over pairs of winners with different turn counts, the share ordered the
+            # same way by revisits (ties count as disagreement).
+            if rec.get("sat_verdict") == FIRED:
+                rv, tn = rec.get("revisits") or [], rec.get("turns") or []
+                pairs = [(a, b) for a in range(len(tn)) for b in range(a + 1, len(tn))
+                         if tn[a] != tn[b] and rv[a] is not None and rv[b] is not None]
+                if pairs:
+                    same = sum(1 for a, b in pairs if (tn[a] < tn[b]) == (rv[a] < rv[b]) and rv[a] != rv[b])
+                    sat_agree[rec["task"]].append(same / len(pairs))
+        for task, vals in stuck_base.items():
+            metrics[f"progress_rank/{task}/stuck_base_abs_adv_mean"] = float(np.mean(vals))
+            metrics[f"progress_rank/{task}/stuck_base_abs_adv_nonzero_share"] = float(np.mean([v > 1e-6 for v in vals]))
+        for task, vals in sat_agree.items():
+            metrics[f"progress_rank/{task}/sat_revisit_agreement"] = float(np.mean(vals))
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1
         for rec in mixed_verdicts.values():

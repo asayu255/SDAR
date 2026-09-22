@@ -519,6 +519,10 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 sat_tasks=list(cfg.get("sat_tasks", ["alfworld", "webshop"])),
                 sat_min_spread=dict(cfg.get("sat_min_spread", {}) or {}),
                 sat_turn_scale=dict(cfg.get("sat_turn_scale", {}) or {}),
+                # The gate: a task's winners are ranked only while its saturated groups
+                # outnumber its stuck ones (EMA), i.e. while a typical game is solved
+                # more often than not. No new constant: the same EMA alpha.
+                sat_gate=bool(cfg.get("sat_gate", False)),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),
@@ -625,7 +629,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             turn_caps=self._turn_caps(ctl.tasks),
             alt_counts=alt_counts,
             task_score_rows=nt["task_score"] if "task_score" in nt else None,
-            answered_rows=nt["search_answered"] if "search_answered" in nt else None,
+            committed_rows=nt["committed"] if "committed" in nt else None,
+            revisit_rows=nt["revisits"] if "revisits" in nt else None,
+            done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
         )
         batch.batch["advantages"] = new_adv
         # The format channel, counted where the responses are (the controller sees

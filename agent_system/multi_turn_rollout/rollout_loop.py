@@ -1878,6 +1878,13 @@ class TrajectoryCollector:
                 rows[pos]['progress_total_search_answered'] = float(_info.get('progress_total_search_answered', float('nan')))
                 _sa = _info.get('search_answered', None)
                 rows[pos]['search_answered'] = float('nan') if _sa is None else float(bool(_sa))
+                # Shadows on every task (NaN where a task has none): repeated actions, the
+                # task's terminal action sent (Search answer / WebShop buy), and ALFWorld's
+                # walkthrough lines actually done without the won => K rule.
+                rows[pos]['revisits'] = float(_info.get('revisits', float('nan')))
+                _cm = _info.get('committed', None)
+                rows[pos]['committed'] = float('nan') if _cm is None else float(bool(_cm))
+                rows[pos]['progress_done_walkset'] = float(_info.get('progress_done_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))
                 # WebShop's continuous purchase score (envs.py keeps it beside the binary

@@ -11,9 +11,9 @@ WHAT IT PROTECTS.
     environment ends the episode on), so a turn carrying <search> and <answer>
     is a search; the flag is sticky.
   * The loop: the new columns reach the rows, NaN where a task has none.
-  * The controller: the records carry "answered" per trajectory, and the metrics
-    say how many of the rollouts (a) pushed up -- and of those it pushed down --
-    never answered, in stuck groups and among mixed-group failures.
+  * The controller: the records carry "committed" per trajectory (Search: answered),
+    and the metrics say how many of the rollouts (a) pushed up -- and of those it
+    pushed down -- never committed, in stuck groups and among mixed-group failures.
 No model, no retriever: fake environments throughout.
 """
 import os
@@ -182,7 +182,7 @@ def build(groups, resp=4):
                 uids=obj(cols["uids"]), tuids=obj(cols["tuids"]), task_names=obj(["search"] * n),
                 episode_rewards=obj(cols["rew"]), k_rows=obj(cols["ks"]), total_rows=obj(cols["Ks"]),
                 real_rows=np.ones(n, dtype=bool), stat_rows=np.ones(n, dtype=bool),
-                answered_rows=np.array(cols["ans"], dtype=float))
+                committed_rows=np.array(cols["ans"], dtype=float))
 
 
 # A live group (gives the scales), a stuck group ranked by today's count -- the two
@@ -198,25 +198,25 @@ ctl = pr.ProgressRankController(rho=0.1, mixed_rho=0.1, tasks=["alfworld", "webs
 b = build([LIVE, STUCK, MIX])
 new, m = ctl.apply(**b)
 recs = {r["uid"]: r for r in ctl.last_group_records}
-check(recs["stuck"]["answered"] == [True, False, True, True], "the stuck group's record carries answered per trajectory")
+check(recs["stuck"]["committed"] == [True, False, True, True], "the stuck group's record carries committed per trajectory")
 check(recs["stuck"]["verdict"] == "fired", "the stuck group fires on today's count")
-check(m.get("progress_rank/search/stuck_up_n") == 2.0 and m.get("progress_rank/search/stuck_up_unanswered") == 0.5,
-      f"pushed up: 2, of which never answered 1/2 ({m.get('progress_rank/search/stuck_up_unanswered')})")
-check(m.get("progress_rank/search/stuck_down_n") == 2.0 and m.get("progress_rank/search/stuck_down_unanswered") == 0.0,
+check(m.get("progress_rank/search/stuck_up_n") == 2.0 and m.get("progress_rank/search/stuck_up_uncommitted") == 0.5,
+      f"pushed up: 2, of which never answered 1/2 ({m.get('progress_rank/search/stuck_up_uncommitted')})")
+check(m.get("progress_rank/search/stuck_down_n") == 2.0 and m.get("progress_rank/search/stuck_down_uncommitted") == 0.0,
       "pushed down: 2, all answered")
 if recs["mix"]["mixed_verdict"] == "fired":
-    check(m.get("progress_rank/search/mixed_up_unanswered") == 1.0 and m.get("progress_rank/search/mixed_down_unanswered") == 0.0,
+    check(m.get("progress_rank/search/mixed_up_uncommitted") == 1.0 and m.get("progress_rank/search/mixed_down_uncommitted") == 0.0,
           "mixed failures: the one pushed up never answered, the one pushed down did")
 else:
     check(False, f"the mixed group should fire (verdict {recs['mix']['mixed_verdict']})")
 b2 = build([LIVE, STUCK, MIX])
-b2.pop("answered_rows")
+b2.pop("committed_rows")
 ctl2 = pr.ProgressRankController(rho=0.1, mixed_rho=0.1, tasks=["alfworld", "webshop", "search"],
                                  min_top_k={"search": 1})
 new2, m2 = ctl2.apply(**b2)
 check(torch.equal(new, new2), "the flag never touches the advantage")
-check(not any("unanswered" in k for k in m2) and all(r["answered"] == [None] * len(r["trajs"]) for r in ctl2.last_group_records),
-      "without the column: no push-side metric, answered is None in the records")
+check(not any("uncommitted" in k for k in m2) and all(r["committed"] == [None] * len(r["trajs"]) for r in ctl2.last_group_records),
+      "without the column: no push-side metric, committed is None in the records")
 
 print("\nPASS" if ok else "\nFAIL")
 sys.exit(0 if ok else 1)

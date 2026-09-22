@@ -166,6 +166,10 @@ for on in (True, False):
               "every row carries k of K; the refused step did not count")
         _, _, _, infos = mgr.step(["look", "go to desk 1"])
         check([i.get("progress_k") for i in infos] == [1, 1], "and the pointer persists across turns")
+        check([i.get("revisits") for i in infos] == [0, 0] and [i.get("progress_done_walkset") for i in infos] == [1, 1],
+              "shadows: no repeat yet; both rows did one walkthrough line (the refused take did not count)")
+        _, _, _, infos = mgr.step(["go to desk 1", "look"])
+        check([i.get("revisits") for i in infos] == [1, 0], "row 0 repeated 'go to desk 1': revisits 1")
     else:
         check(all("progress_k" not in i for i in infos), "off: nothing is written")
 
@@ -199,6 +203,11 @@ for on in (True, False):
               "the results page showing the product counts for both rows")
         _, _, _, infos = mgr.step(["click[b07abc1234]", "click[b09zzz0000]"])
         check([i.get("progress_k") for i in infos] == [2, 1], "only the row that opened the goal moves on")
+        check([i.get("committed") for i in infos] == [False, False] and [i.get("revisits") for i in infos] == [0, 0],
+              "shadows: nobody bought yet, no repeated action")
+        _, _, _, infos = mgr.step(["click[b07abc1234]", "click[buy now]"])
+        check(infos[0]["revisits"] == 1 and infos[1]["committed"] is True and infos[0]["committed"] is False,
+              "row 0 repeated a click (revisits 1); row 1's buy is the terminal action (committed), goal or not")
     else:
         check(all("progress_k" not in i for i in infos), "off: nothing is written")
 

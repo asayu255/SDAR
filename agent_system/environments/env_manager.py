@@ -53,6 +53,7 @@ from agent_system.environments.progress import (
     PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
     PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
     PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
+    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
@@ -844,6 +845,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         # The environment ends the episode on an answer, so the two only differ if one
         # ever did not; the count is still defined by the order, not by luck.
         self._answered_after_seen = [False] * n
+        # Repeated queries (shadow column `revisits`), one counter per row.
+        self._revisit = [RevisitCounter() for _ in range(n)]
         # Where each route-document row stands in its route (expert_flow only).
         self._route_ptr = [0] * n
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
@@ -917,6 +920,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "information": next_obs,
         })
         self._note_answered(actions)
+        for i, rc in enumerate(list(getattr(self, "_revisit", None) or [])[:len(actions)]):
+            rc.step(actions[i])
         self._note_returned(next_obs)
         self._note_route(text_actions)
         self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
@@ -939,9 +944,13 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                           k_key=PROGRESS_K_SEARCH_EVIDENCE_INFO, total_key=PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO)
             _put_progress(infos, [p[0] for p in _ea], [p[1] for p in _ea],
                           k_key=PROGRESS_K_SEARCH_ANSWERED_INFO, total_key=PROGRESS_TOTAL_SEARCH_ANSWERED_INFO)
+            _rv = list(getattr(self, "_revisit", None) or [])
             for i, info in enumerate(infos):
                 if isinstance(info, dict):
                     info[SEARCH_ANSWERED_INFO] = bool(_ans[i]) if i < len(_ans) else False
+                    # The terminal action of this task is the answer.
+                    info[COMMITTED_INFO] = bool(_ans[i]) if i < len(_ans) else False
+                    info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
             _cov = getattr(self, "_coverage", None) or []
             for i, cov in enumerate(_cov[:len(next_obs)]):
                 cov.step(next_obs[i])
@@ -1246,6 +1255,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self._walkset = ([AlfworldWalkSet(_tw_pddl(gf)[0] if gf else [])
                           for gf in (self.gamefile or [None] * len(text_obs))]
                          if _progress_on(self.config) else [])
+        # Repeated actions (shadow column `revisits`), executed or not.
+        self._revisit = [RevisitCounter() for _ in text_obs] if _progress_on(self.config) else []
         # ProGPO's coverage, a shadow of (a)'s k, from the game's own opening text.
         self._coverage = ([ObservationCoverage(o) for o in text_obs] if _progress_on(self.config) else [])
         # initialize the history buffer
@@ -1314,6 +1325,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             _wt = [w.total for w in _ws] + _wpad
             _put_progress(infos, _wk, _wt, k_key=PROGRESS_K_WALKSET_INFO,
                           total_key=PROGRESS_TOTAL_WALKSET_INFO)
+            # Shadows: the walkthrough lines actually done (no won => K), and revisits.
+            _rv = list(getattr(self, "_revisit", None) or [])
+            for i, act in enumerate(actions[:len(_rv)]):
+                _rv[i].step(act)
+            for i, info in enumerate(infos):
+                if isinstance(info, dict):
+                    info[PROGRESS_DONE_WALKSET_INFO] = int(_ws[i].raw_done) if i < len(_ws) else 0
+                    info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
             _kdef = _alfworld_k_definition(self.config)
             if _kdef == "milestone":
                 _put_progress(infos, _mk, _mt)
@@ -1697,6 +1716,12 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         self._ws_progress = ([WebshopProgress(g, (info or {}).get('available_actions'))
                               for g, info in zip(self.goals, infos or [])]
                              if _progress_on(self.config) else [])
+        # Repeated actions (shadow column `revisits`): the same click or search again.
+        self._revisit = [RevisitCounter() for _ in self.goals] if _progress_on(self.config) else []
+        # The terminal action sent (shadow column `committed`): a "click[buy now]" on ANY
+        # product -- WebshopProgress.bought is the goal product only, which is k's
+        # business; committed asks whether the rollout decided at all.
+        self._ws_bought = [False] * len(self.goals) if _progress_on(self.config) else []
         # ProGPO's coverage, a shadow of (a)'s k: the simulator's page text as it
         # emitted it, BEFORE format_obs trims it for the prompt.
         self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
@@ -1748,6 +1773,17 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             for i, act in enumerate(actions[:len(_wsp)]):
                 _wsp[i].step(act, (infos[i] or {}).get('available_actions'))
             _put_progress(infos, [p.k for p in _wsp], [p.total for p in _wsp])
+            # Shadows: the terminal action here is the purchase; and revisits.
+            _rv = list(getattr(self, "_revisit", None) or [])
+            _bt = getattr(self, "_ws_bought", None) or []
+            for i, act in enumerate(actions[:len(_rv)]):
+                _rv[i].step(act)
+                if i < len(_bt) and "buy now" in str(act or "").lower():
+                    _bt[i] = True
+            for i, info in enumerate(infos):
+                if isinstance(info, dict):
+                    info[COMMITTED_INFO] = bool(_bt[i]) if i < len(_bt) else False
+                    info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
         _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):
