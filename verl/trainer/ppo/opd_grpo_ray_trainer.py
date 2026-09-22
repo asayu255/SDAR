@@ -520,9 +520,14 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 sat_min_spread=dict(cfg.get("sat_min_spread", {}) or {}),
                 sat_turn_scale=dict(cfg.get("sat_turn_scale", {}) or {}),
                 # The gate: a task's winners are ranked only while its saturated groups
-                # outnumber its stuck ones (EMA), i.e. while a typical game is solved
-                # more often than not. No new constant: the same EMA alpha.
+                # outnumber its stuck ones (EMA): its reliably solved games outnumber
+                # its reliably failed ones. No new constant: the same EMA alpha.
                 sat_gate=bool(cfg.get("sat_gate", False)),
+                # What a saturated group's turn difference is divided by: the task's
+                # turn cap (task_constant, the default), the group's own document
+                # length (document) or the group's own mean turns (group_mean). The
+                # order inside a group never changes; only the weight between groups.
+                sat_turn_scale_mode=str(cfg.get("sat_turn_scale_mode", "task_constant") or "task_constant"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),
@@ -632,6 +637,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             committed_rows=nt["committed"] if "committed" in nt else None,
             revisit_rows=nt["revisits"] if "revisits" in nt else None,
             done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
+            doc_len_rows=self._document_lengths(nt, task_names),
+            gamefile_rows=nt["gamefile"] if "gamefile" in nt else None,
         )
         batch.batch["advantages"] = new_adv
         # The format channel, counted where the responses are (the controller sees
@@ -641,6 +648,27 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         out.update(think_block_metrics(responses=batch.batch["responses"], mask=mask,
                                        task_names=task_names, real=real))
         out.update(self._write_progress_rank_groups(ctl.last_group_records, cfg))
+        return out
+
+    @staticmethod
+    def _document_lengths(nt, task_names):
+        """Per row, the length of its task's document for this game, or NaN.
+
+        ALFWorld: the walkthrough as a set of lines (progress_total_walkset).
+        WebShop: the goal record's steps, 3 + options (progress_total).
+        Search: 2 (a search that returns the answer, then the answer).
+        What sat_turn_scale_mode=document divides a saturated group's turn
+        differences by; recorded in the group records either way.
+        """
+        names = np.asarray([str(t) for t in task_names])
+        out = np.full(len(names), np.nan)
+        if "progress_total_walkset" in nt:
+            v = np.asarray(nt["progress_total_walkset"], dtype=float)
+            out = np.where(names == "alfworld", v, out)
+        if "progress_total" in nt:
+            v = np.asarray(nt["progress_total"], dtype=float)
+            out = np.where(names == "webshop", v, out)
+        out = np.where(names == "search", 2.0, out)
         return out
 
     def _turn_caps(self, tasks) -> dict:

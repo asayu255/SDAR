@@ -730,15 +730,18 @@ algorithm:
     # condition decide.
     sat_tasks: ["alfworld", "webshop"]
     # THE GATE. A task's saturated groups are ranked only while the task's share of
-    # saturated groups exceeds its share of stuck groups (both EMAs with ema_alpha).
-    # Why that line: a game the policy solves with probability p is all-won with p^8
-    # and all-lost with (1-p)^8, so "saturated > stuck" is "the typical game is solved
-    # more often than not" -- the regime where the remaining failures are wandering
-    # (every ALFWorld failure hits the cap) and "fewer turns" is the right push; below
-    # it, the task still needs the search that "shorter" would cut. Replayed on three
-    # runs' records: ALFWorld opens near step 62-73, WebShop 63-81, keeping ~90% of
-    # the ungated firings; Search opens on 2-3 steps near 196 (and never at all without
-    # the EMA on 39-47 steps). Off = every listed task fires whenever a group qualifies.
+    # saturated groups exceeds its share of stuck groups (both EMAs with ema_alpha):
+    # while its games are more often solved by all eight rollouts than failed by all
+    # eight -- the reliably solved games outnumber the reliably failed ones. That is
+    # the regime where the remaining failures are wandering (every ALFWorld failure
+    # hits the cap) and "fewer turns" is the right push; while failures dominate, the
+    # task still needs the search that "shorter" would cut. It is NOT "the mean
+    # success exceeds 1/2": the games differ, so the shares are set by the games near
+    # p = 1 and p = 0 (ALFWorld late: saturated 0.54 with stuck 0.11, where one common
+    # p would give stuck ~1e-9). Replayed on three runs' records: ALFWorld opens near
+    # step 62-73, WebShop 63-81, keeping ~90% of the ungated firings; Search opens on
+    # 2-3 of 300 steps near step 196 -- almost never, not never (39-47 steps without
+    # the EMA). Off = every listed task fires whenever a group qualifies.
     sat_gate: false
     # A saturated group fires only if its turn counts differ by at least this.
     sat_min_spread:
@@ -750,6 +753,18 @@ algorithm:
       alfworld: 50
       webshop: 15
       search: 4
+    # What a saturated group's turn difference is divided by (the order inside a
+    # group never changes; only the weight between groups, at the same total mass):
+    #   task_constant  sat_turn_scale above, the task's turn cap (what ran so far)
+    #   document       the group's own document length: ALFWorld's walkthrough lines
+    #                  (as a set), WebShop's 3 + options, Search's 2. Short games weigh
+    #                  more: on the training games look_at (3.6 lines) would get 1.66x
+    #                  the average weight and pick_two (8.3) 0.73x -- while sat measured
+    #                  -22.5 pt on look_at and +10-15 pt on clean/heat (T=1.0, 8 seeds).
+    #   group_mean     the group's own mean turns (no document at all)
+    # The records carry doc_len and sat_scale per group, so a run on one mode can
+    # replay the others.
+    sat_turn_scale_mode: task_constant
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

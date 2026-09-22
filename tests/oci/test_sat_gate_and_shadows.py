@@ -144,6 +144,56 @@ REV = ("rev", "alfworld", [("R1", 4, 10.0, 2, 2, 0.0, 5, None), ("R2", 12, 10.0,
 b, new, m = run(ctl, [LIVE, REV, SAT2(1), SAT2(2), SAT2(3)])
 check(m["progress_rank/alfworld/sat_revisit_agreement"] < 1.0, "a group where the fast winner revisited more lowers the agreement")
 
+print("4b. what the gate held back, and where the base gradient sits")
+ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_tasks=["alfworld", "webshop", "search"], sat_gate=True)
+b, new, m = run(ctl, [LIVE, SAT, STUCK(1), STUCK(2), STUCK(3), SLIVE, SSAT, SSTUCK(1), SSTUCK(2)])
+recs = {r["uid"]: r for r in ctl.last_group_records}
+check(recs["sat"]["sat_verdict"] == "gate_closed" and recs["sat"]["sat_verdict_ungated"] == "fired",
+      "a held group keeps what it would have been (sat_verdict_ungated = fired)")
+check(m.get("progress_rank/alfworld/sat_fired_ungated") == 1.0 and m.get("progress_rank/alfworld/sat_gate_kept_share") == 0.0,
+      "one group would have fired, the gate let none through: kept share 0")
+check("progress_rank/alfworld/stuck_base_mass_share" in m and "progress_rank/alfworld/saturated_base_mass_share" in m,
+      "base |A| mass shares by group kind are reported")
+check(all("_base_mass" not in r for r in ctl.last_group_records), "the working column does not leak into the records")
+# a batch whose stuck groups carry base |A| (the format penalty's effect) and a live group
+FMT_STUCK = ("fmt", "alfworld", [("P1", 5, 0.0, 1, 2, 2.0, 0, None), ("P2", 5, 0.0, 0, 2, -2.0, 0, None)])
+ctl = pr.ProgressRankController(rho=0.0)
+b, new, m = run(ctl, [LIVE, FMT_STUCK])
+# live: 3 rows x |1| + 3 rows x |1| = 6 rows x 3 tokens; stuck: 10 rows x |2| x 3 tokens
+check(abs(m["progress_rank/alfworld/stuck_base_mass_share"] - (60.0 / (60.0 + 18.0))) < 1e-9,
+      f"stuck share of the base mass is what it carries: {m['progress_rank/alfworld/stuck_base_mass_share']:.3f}")
+
+print("4c. the scale modes: the order inside a group never moves, the weight between groups does")
+def with_doc(b, doc):
+    b = dict(b); b["doc_len_rows"] = np.array([doc.get(t, np.nan) for t in b["tuids"]], dtype=float); return b
+SHORT = ("short", "alfworld", [("A1", 4, 10.0, 2, 2, 0.0, 0, None), ("A2", 8, 10.0, 2, 2, 0.0, 0, None)])
+LONG = ("long", "alfworld", [("B1", 4, 10.0, 2, 2, 0.0, 0, None), ("B2", 8, 10.0, 2, 2, 0.0, 0, None)])
+doc = {"A1": 4, "A2": 4, "B1": 8, "B2": 8}
+out = {}
+for mode in ("task_constant", "document", "group_mean"):
+    ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_turn_scale_mode=mode, cap_kappa=100.0)
+    b = with_doc(build([LIVE, SHORT, LONG]), doc)
+    new, m = ctl.apply(**b)
+    d = (new - b["advantages"])[:, 0].numpy()
+    out[mode] = {t: float(d[rows_of(b, t)][0]) for t in ("A1", "A2", "B1", "B2")}
+    recs = {r["uid"]: r for r in ctl.last_group_records}
+    check(out[mode]["A1"] > 0 > out[mode]["A2"] and out[mode]["B1"] > 0 > out[mode]["B2"],
+          f"{mode}: the faster winner goes up in both groups")
+    if mode == "document":
+        check(recs["short"]["sat_scale"] == 4.0 and recs["long"]["sat_scale"] == 8.0, "document: each group's own length")
+check(abs(out["task_constant"]["A1"] - out["task_constant"]["B1"]) < 1e-9, "task_constant: equal turn gaps weigh the same")
+check(abs(out["document"]["A1"] / out["document"]["B1"] - 2.0) < 1e-6, "document: the 4-line game weighs twice the 8-line one")
+check(abs(out["group_mean"]["A1"] - out["group_mean"]["B1"]) < 1e-9, "group_mean: equal mean turns, equal weight")
+try:
+    pr.ProgressRankController(rho=0.0, sat_turn_scale_mode="turns")
+    check(False, "an unknown scale mode is refused")
+except AssertionError:
+    check(True, "an unknown scale mode is refused")
+b = build([LIVE, SHORT]); b["gamefile_rows"] = np.array(["/g/short.tw-pddl"] * len(b["tuids"]), dtype=object)
+ctl = pr.ProgressRankController(rho=0.0)
+ctl.apply(**b)
+check({r["uid"]: r["gamefile"] for r in ctl.last_group_records}["short"] == "/g/short.tw-pddl", "records carry the group's game file")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):

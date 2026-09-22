@@ -185,6 +185,14 @@ FEW_FAILURES = "few_failures"    # mixed: fewer than two failed rollouts, nothin
 DEFAULT_SAT_TASKS = ("alfworld", "webshop")
 DEFAULT_SAT_MIN_SPREAD = {"alfworld": 2.0, "webshop": 1.0, "search": 1.0}
 DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
+# What a saturated group's turn difference is divided by. task_constant: the task's
+# turn cap (the numbers above). document: the group's own document length -- ALFWorld's
+# walkthrough as a set of lines, WebShop's 3 + options, Search's 2 (search, answer) --
+# so twelve turns on a four-line game weigh more than twelve on an eight-line one.
+# group_mean: the group's own weighted mean turns (no document at all). A per-group
+# constant in every case: the order INSIDE a group is untouched, only the weight
+# between groups moves, and the total mass is still sat_rho * E per task.
+SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
 
 
 def _finite(x) -> Optional[float]:
@@ -290,7 +298,7 @@ def score_stuck_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
 def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
                            traj: Dict[str, dict], tasks: Iterable[str],
                            min_spread: Dict[str, float], turn_scale: Dict[str, float],
-                           cross_steps: bool = True) -> Dict[str, Dict]:
+                           cross_steps: bool = True, scale_mode: str = "task_constant") -> Dict[str, Dict]:
     """Per SATURATED group on ``tasks`` (every rollout won): whether it fired, and the scores.
 
     The mirror of :func:`score_stuck_groups` with the count replaced by the turn
@@ -327,6 +335,13 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
         w = np.asarray([weight[t] for t in trajs], dtype=float)
         mean = float((w * turns).sum() / w.sum())
         scale = float(turn_scale.get(task) or turns.max())
+        if scale_mode == "document":
+            docs = [traj[t].get("doc_len") for t in trajs if traj[t].get("doc_len")]
+            if docs:
+                scale = float(max(docs))
+        elif scale_mode == "group_mean":
+            scale = max(mean, 1.0)
+        rec["scale"] = scale
         rec["verdict"] = FIRED
         rec["scores"] = {t: (mean - float(n_turns)) / scale for t, n_turns in zip(trajs, turns)}
     return out
@@ -678,14 +693,18 @@ class ProgressRankController:
                  sat_min_spread: Optional[Dict[str, float]] = None,
                  sat_turn_scale: Optional[Dict[str, float]] = None,
                  mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None,
-                 sat_gate: bool = False):
+                 sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant"):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
         # THE GATE on the saturated-group term: per task, fire only while the EMA of
-        # the task's saturated-group share exceeds the EMA of its stuck-group share.
-        # p^8 > (1-p)^8 <=> p > 1/2: "the typical game is solved more often than not",
-        # the regime where the remaining failures are wandering and "fewer turns" is
-        # the right push. Same alpha as E and S; no new constant.
+        # the task's saturated-group share exceeds the EMA of its stuck-group share --
+        # while its reliably solved games outnumber its reliably failed ones, the
+        # regime where the remaining failures are wandering and "fewer turns" is the
+        # right push. Not "mean success > 1/2": games differ, and the shares are set
+        # by the games near p = 1 and p = 0. Same alpha as E and S; no new constant.
         self.sat_gate = bool(sat_gate)
+        assert sat_turn_scale_mode in SAT_SCALE_MODES, (
+            f"progress_rank.sat_turn_scale_mode={sat_turn_scale_mode!r}; expected one of {SAT_SCALE_MODES}")
+        self.sat_turn_scale_mode = str(sat_turn_scale_mode)
         # (a) on MIXED groups: its own share of the same E, on the failures only,
         # under the same cap and a per-group scale that keeps every failure <= 0.
         assert mixed_rho >= 0.0, f"progress_rank.mixed_rho must be >= 0, got {mixed_rho}"
@@ -801,7 +820,8 @@ class ProgressRankController:
               stat_rows: np.ndarray, row_scores=None, valid_rows=None,
               coverage_rows=None, episode_lengths=None, turn_caps=None,
               alt_counts=None, task_score_rows=None, committed_rows=None,
-              revisit_rows=None, done_walkset_rows=None) -> tuple:
+              revisit_rows=None, done_walkset_rows=None, doc_len_rows=None,
+              gamefile_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -830,6 +850,9 @@ class ProgressRankController:
                              again (a shadow ranking key for saturated groups; see
                              progress.RevisitCounter)
         ``done_walkset_rows`` per row, ALFWorld's walkthrough lines actually done, no won => K
+        ``doc_len_rows``     per row, the length of its task's document for this game (the
+                             scale sat_turn_scale_mode=document divides by)
+        ``gamefile_rows``    per row, ALFWorld's game file; the records carry one per group
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -886,7 +909,8 @@ class ProgressRankController:
                 x = traj[t] = {"task": names[i], "turns": 0, "tokens": 0.0, "reward": None,
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
                                "length": None, "task_score": None, "committed": None,
-                               "revisits": None, "done_walkset": None}
+                               "revisits": None, "done_walkset": None, "doc_len": None,
+                               "gamefile": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -900,7 +924,12 @@ class ProgressRankController:
                 cm = _finite(committed_rows[i])
                 if cm is not None:
                     x["committed"] = bool(x["committed"]) or cm > 0.5
-            for col, key in ((revisit_rows, "revisits"), (done_walkset_rows, "done_walkset")):
+            if gamefile_rows is not None and x["gamefile"] is None:
+                gf = gamefile_rows[i]
+                if isinstance(gf, str) and gf:
+                    x["gamefile"] = gf
+            for col, key in ((revisit_rows, "revisits"), (done_walkset_rows, "done_walkset"),
+                             (doc_len_rows, "doc_len")):
                 if col is not None:
                     v = _finite(col[i])
                     if v is not None:
@@ -968,14 +997,17 @@ class ProgressRankController:
         sat_verdicts = score_saturated_groups(
             groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=sat_tasks_now,
             min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
-            cross_steps=self.cross_steps)
+            cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode)
         closed_tasks = [t for t in self.sat_tasks if t not in sat_tasks_now]
         if closed_tasks:
             # Still scored for the records, but the verdict says the gate held them.
             for uid, rec in score_saturated_groups(
                     groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=closed_tasks,
                     min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
-                    cross_steps=self.cross_steps).items():
+                    cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode).items():
+                # What it WOULD have been: kept, so "how much firing the gate held back"
+                # is a live number, not only a replay.
+                rec["verdict_ungated"] = rec["verdict"]
                 rec["verdict"], rec["scores"] = GATE_CLOSED, {}
                 sat_verdicts[uid] = rec
         traj_sat: Dict[str, float] = {}
@@ -1275,11 +1307,14 @@ class ProgressRankController:
                 "committed": [x["committed"] for x in xs],
                 "revisits": [x["revisits"] for x in xs],
                 "done_walkset": [x["done_walkset"] for x in xs],
+                "doc_len": [x["doc_len"] for x in xs],
+                "gamefile": next((x["gamefile"] for x in xs if x.get("gamefile")), None),
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],
                 "score_spread": spread.get(uid),
                 "progpo_gate": gate.get(uid),
+                "_base_mass": float(abs_adv[grows].sum()) if grows else 0.0,
                 "base_abs_adv_max": (float(np.max(abs_adv[grows] / np.maximum(tokens[grows], 1.0)))
                                      if grows else 0.0),
                 "injected_abs_mass": float(np.sum(np.abs(row_score[grows] * coef[grows]) * tokens[grows])),
@@ -1288,6 +1323,8 @@ class ProgressRankController:
                 "success_push_ema": info.get("success_push_ema"), "task_tokens": info.get("task_tokens"),
                 # The saturated-group term (sat_rho): verdict, per-trajectory score and mass.
                 "sat_verdict": sat_verdict,
+                "sat_verdict_ungated": sat_verdicts.get(uid, {}).get("verdict_ungated", sat_verdict),
+                "sat_scale": sat_verdicts.get(uid, {}).get("scale"),
                 "sat_score": [traj_sat.get(t, 0.0) for t in trajs],
                 "sat_injected_abs_mass": float(np.sum(np.abs(row_sat[grows] * coef_sat[grows]) * tokens[grows])),
                 "sat_c": info.get("sat_c"), "sat_capped": info.get("sat_capped"),
@@ -1330,6 +1367,20 @@ class ProgressRankController:
         # level std normalisation blows one penalised turn up to |A| 8-20 per token
         # (85% of ALFWorld's all-fail groups at steps 151-300, task mean |A| 0.64). So
         # "no task signal", never "no gradient": what each stuck group already carries.
+        # WHERE THE BASE GRADIENT SITS. Per task, the share of the base |A| mass (before
+        # (a), summed over tokens) that lies in stuck groups and in saturated groups --
+        # groups whose environment reward is flat, so whatever mass they carry comes
+        # from the format penalty through the turn-level std normalisation.
+        mass_by: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for rec in records:
+            mass_by[rec["task"]][rec["status"]] += float(rec.get("_base_mass") or 0.0)
+            mass_by[rec["task"]]["_all"] += float(rec.get("_base_mass") or 0.0)
+        for task, mb in mass_by.items():
+            if mb["_all"] > 0:
+                metrics[f"progress_rank/{task}/stuck_base_mass_share"] = mb["stuck"] / mb["_all"]
+                metrics[f"progress_rank/{task}/saturated_base_mass_share"] = mb["saturated"] / mb["_all"]
+        for rec in records:
+            rec.pop("_base_mass", None)
         stuck_base: Dict[str, List[float]] = defaultdict(list)
         sat_agree: Dict[str, List[float]] = defaultdict(list)
         for rec in records:
@@ -1357,7 +1408,12 @@ class ProgressRankController:
         sat_spreads: Dict[str, List[float]] = defaultdict(list)
         for rec in sat_verdicts.values():
             counts[rec["task"]][f"sat_{rec['verdict']}"] += 1
+            counts[rec["task"]]["sat_fired_ungated"] += int(rec.get("verdict_ungated", rec["verdict"]) == FIRED)
             sat_spreads[rec["task"]].append(rec["spread"])
+        for task, cs in list(counts.items()):
+            if cs.get("sat_fired_ungated", 0):
+                # Of the saturated groups that would fire, the share the gate let through.
+                metrics[f"progress_rank/{task}/sat_gate_kept_share"] = cs.get("sat_fired", 0) / cs["sat_fired_ungated"]
         for task, sp in sat_spreads.items():
             # How far apart the winners of one game are, in turns: the signal's size.
             metrics[f"progress_rank/{task}/sat_turn_spread_mean"] = float(np.mean(sp))
