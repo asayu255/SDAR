@@ -241,6 +241,42 @@ except AssertionError:
 yaml_cfg = OmegaConf.load(os.path.join(REPO, "verl/trainer/config/ppo_trainer.yaml"))
 check(yaml_cfg.algorithm.progress_rank.sat_placebo == "none", "the config default is none: every existing arm is unchanged")
 
+print("4e. the dose-matched placebo: the APPLIED token mass equals the true ranking's, cap binding")
+# Real runs bind the cap (kappa 0.5) and rows differ in length, which is where "shuffle" drifted.
+def build_tok(groups, tok):
+    """build() with a per-trajectory number of response tokens per row (1..resp)."""
+    b = build(groups)
+    m = torch.zeros_like(b["mask"])
+    for i, t in enumerate(b["tuids"]):
+        m[i, :tok.get(str(t), 3)] = 1.0
+    b["advantages"] = b["advantages"][:, :1] * m
+    b["mask"] = m
+    return b
+TOK = {"P1a": 1, "P1b": 4, "P1c": 2, "P2a": 4, "P2b": 1, "P2c": 3, "P3a": 2, "P3b": 4, "P3c": 1, "P4a": 3, "P4b": 2, "P4c": 4}
+# A live group with a small success push S, so kappa * S / max|s| binds under a strong sat_rho.
+LIVE_S = ("live", "alfworld", [("L1", 3, 10.0, 2, 2, 0.1, 0, None), ("L2", 3, 0.0, 1, 2, -0.1, 4, None)])
+BATCH_CAP = [LIVE_S, P3(1, 4, 8, 14), P3(2, 5, 9, 12), P3(3, 3, 7, 16), P3(4, 6, 10, 13)]
+def token_mass(ctl):
+    bb = build_tok(BATCH_CAP, TOK)
+    new, mm = ctl.apply(**bb)
+    rows = np.array([str(x).startswith("P") for x in bb["tuids"]])
+    d = (new - bb["advantages"]).abs() * bb["mask"]
+    return float(d[torch.from_numpy(rows)].sum()), mm, ctl
+mt, m_t, c_t = token_mass(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5))
+ms, m_s, _ = token_mass(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="shuffle"))
+md, m_d, c_d = token_mass(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="shuffle_dose"))
+check(m_t.get("progress_rank/alfworld/sat_capped", 0.0) == 1.0, "the cap binds in this batch (as in the real runs)")
+check(abs(ms - mt) / mt > 0.01, f"the old shuffle placebo drifts off the true dose ({ms / mt:.3f} of it)")
+check(abs(md - mt) / mt < 1e-6, f"shuffle_dose applies the true dose ({md:.6f} vs {mt:.6f})")
+check(abs(m_d["progress_rank/alfworld/sat_placebo_mass_ratio"] - 1.0) < 1e-9, "and says so in its metric (mass ratio 1)")
+check("progress_rank/alfworld/sat_placebo_peak_over_cap" in m_d, "its peak push is reported, not capped")
+check(m_d["progress_rank/alfworld/sat_score_turn_corr"] > -0.99, "the content is still destroyed (correlation broken)")
+rd = {r["uid"]: r for r in c_d.last_group_records}
+check(all(rd[u]["sat_placebo"] == "shuffle_dose" for u in pg), "records name the dose-matched arm")
+_, _, c_d2 = token_mass(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="shuffle_dose"))
+check(all(np.allclose(rd[u]["sat_score"], {r["uid"]: r for r in c_d2.last_group_records}[u]["sat_score"]) for u in pg),
+      "deterministic across instances (a resume redraws the same permutation)")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):

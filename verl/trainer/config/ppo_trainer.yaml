@@ -771,6 +771,9 @@ algorithm:
     # same). If this arm matches the true ranking, the effect is the injection channel,
     # not the content. The records keep sat_score_true beside the applied sat_score, and
     # progress_rank/<task>/sat_score_turn_corr is -1 for the true ranking, ~0 here.
+    # "shuffle_dose": the same permutation, DOSE-MATCHED -- the applied token-mean mass equals
+    # what the true ranking would inject on the same rollouts (its own coefficient, cap included);
+    # "shuffle" matched only the turn-weighted L1 mass and drifted to ~52-63% of the true dose.
     sat_placebo: none
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix

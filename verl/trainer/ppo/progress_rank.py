@@ -196,7 +196,7 @@ DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
 # The null control for the saturated-group term: "shuffle" keeps every group that fires,
 # its turn-weighted zero-sum and its L1 mass, and permutes which winner gets which score.
-SAT_PLACEBO_MODES = ("none", "shuffle")
+SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose")
 
 
 def _finite(x) -> Optional[float]:
@@ -320,6 +320,13 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
     run redraws the same). The true scores are kept in ``scores_true`` for the
     records. What a permutation cannot preserve at the same time is the
     correlation with the rollouts' lengths, which is the point.
+
+    ``placebo="shuffle_dose"`` draws the same permutation; apply() then sets its coefficient so
+    that the APPLIED token-mean mass equals what the true ranking would have injected on the
+    same rollouts (its own c, cap included). "shuffle" only matches the turn-weighted L1 mass
+    of the scores, while the loss and the budget are token-weighted and the cap depends on
+    max|s|, so its applied mass drifted to ~52% (ALFWorld) / ~63% (WebShop) of the true one
+    in a replay of steps 105-124 (critical_plan_review.md, 2026-09-23).
     """
     tasks = set(tasks)
     out: Dict[str, Dict] = {}
@@ -357,7 +364,7 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
         rec["scale"] = scale
         rec["verdict"] = FIRED
         rec["scores"] = {t: (mean - float(n_turns)) / scale for t, n_turns in zip(trajs, turns)}
-        if placebo == "shuffle":
+        if placebo in ("shuffle", "shuffle_dose"):
             true = np.asarray([rec["scores"][t] for t in trajs], dtype=float)
             rng = np.random.default_rng(zlib.crc32(str(uid).encode()) ^ int(placebo_seed))
             fake = true[rng.permutation(len(trajs))]
@@ -1044,11 +1051,22 @@ class ProgressRankController:
         traj_sat: Dict[str, float] = {}
         for rec in sat_verdicts.values():
             traj_sat.update(rec["scores"])
+        # The TRUE ranking's per-row scores (== the applied ones unless a placebo permuted them):
+        # the dose-matched placebo sizes its coefficient on what the true ranking would inject.
+        traj_sat_true: Dict[str, float] = {}
+        for rec in sat_verdicts.values():
+            if rec["scores"]:
+                traj_sat_true.update(rec.get("scores_true", rec["scores"]))
         row_sat = np.zeros(n, dtype=float)
         for i in range(n):
             s = traj_sat.get(str(tuids[i]))
             if s is not None and (stat[i] or not real[i]):
                 row_sat[i] = s
+        row_sat_true = np.zeros(n, dtype=float)
+        for i in range(n):
+            s_t = traj_sat_true.get(str(tuids[i]))
+            if s_t is not None and (stat[i] or not real[i]):
+                row_sat_true[i] = s_t
 
         # Mixed groups: the failures ranked among themselves. Scored on every step
         # (the records and the mixed_* counts report it); added only when mixed_rho > 0.
@@ -1123,6 +1141,24 @@ class ProgressRankController:
                     c_sat, sat_capped = sat_cap, 1.0
                 metrics[f"{p}/sat_c_uncapped"] = c_sat_uncapped
                 metrics[f"{p}/sat_c_cap"] = sat_cap
+                if self.sat_placebo == "shuffle_dose":
+                    # DOSE-MATCHED placebo: inject exactly the token-mean mass the TRUE ranking
+                    # would have injected on these same rollouts -- its own coefficient, cap
+                    # included -- spread over the permuted scores. The placebo's peak per-token
+                    # push is then whatever the permutation gives; it is reported, not capped.
+                    tr_fired = rows & (row_sat_true != 0.0)
+                    u_true = float((np.abs(row_sat_true[tr_fired]) * tokens[tr_fired]).sum()) / task_tokens
+                    max_true = float(np.abs(row_sat_true[rows]).max()) if rows.any() else 0.0
+                    if u_true > 0.0 and max_true > 0.0:
+                        c_true = min(self.sat_rho * ema / u_true, self.kappa * s_ema / max_true)
+                        target = c_true * u_true
+                        c_sat = target / u_sat
+                        sat_capped = float(self.sat_rho * ema / u_true > self.kappa * s_ema / max_true)
+                        metrics[f"{p}/sat_placebo_true_c"] = c_true
+                        metrics[f"{p}/sat_placebo_mass_ratio"] = (c_sat * u_sat) / target
+                        metrics[f"{p}/sat_placebo_peak_over_cap"] = c_sat * max_abs_sat / (self.kappa * s_ema)
+                    else:
+                        c_sat, sat_capped = 0.0, 0.0
             coef_sat[names == task] = c_sat
             # The gate, reported whether or not it is enforced: the condition, the two
             # EMAs and q = stuck / (stuck + saturated) among the task's dead groups.
