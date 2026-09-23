@@ -277,6 +277,33 @@ _, _, c_d2 = token_mass(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kapp
 check(all(np.allclose(rd[u]["sat_score"], {r["uid"]: r for r in c_d2.last_group_records}[u]["sat_score"]) for u in pg),
       "deterministic across instances (a resume redraws the same permutation)")
 
+print("4f. the sign placebo: every magnitude of the true arm, only the direction randomised")
+P8 = [P3(i, 3 + i % 3, 8 + i % 4, 13 + i % 5) for i in range(1, 9)]
+TOK8 = {f"P{i}{x}": 1 + (i + j) % 4 for i in range(1, 9) for j, x in enumerate("abc")}
+def run_tok(ctl, groups, tok):
+    bb = build_tok(groups, tok)
+    new, mm = ctl.apply(**bb)
+    return bb, new, mm, ctl
+B8 = [LIVE_S] + P8
+bt, nt, mt8, ct = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5), B8, TOK8)
+bs, ns, ms8, cs = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="sign"), B8, TOK8)
+check(mt8.get("progress_rank/alfworld/sat_capped", 0.0) == 1.0, "the cap binds here too")
+dt = ((nt - bt["advantages"]) * bt["mask"]); ds = ((ns - bs["advantages"]) * bs["mask"])
+check(torch.allclose(dt.abs(), ds.abs(), atol=1e-7), "every row's |dA| is exactly the true arm's (mass, peak and cap identical)")
+check(abs(ms8["progress_rank/alfworld/sat_c"] - mt8["progress_rank/alfworld/sat_c"]) < 1e-12, "the same coefficient")
+rs8 = {r["uid"]: r for r in cs.last_group_records}
+signs = [rs8[f"p{i}"].get("sat_placebo_sign") for i in range(1, 9)]
+check(1.0 in signs and -1.0 in signs, f"some groups keep the direction, some flip it ({signs})")
+check(all(np.allclose(np.asarray(rs8[f"p{i}"]["sat_score"]), signs[i - 1] * np.asarray(rs8[f"p{i}"]["sat_score_true"])) for i in range(1, 9)),
+      "each group's applied scores are its true scores times its coin")
+check(abs(ms8["progress_rank/alfworld/sat_score_turn_corr"]) < 1.0, "the average score-turns correlation is no longer -1")
+check(abs(ms8["progress_rank/alfworld/sat_placebo_flip_share"] - signs.count(-1.0) / 8) < 1e-12,
+      f"the flip share is reported ({ms8['progress_rank/alfworld/sat_placebo_flip_share']:.3f})")
+check(all(r.get("sat_placebo_sign") is None for r in ct.last_group_records)
+      and "progress_rank/alfworld/sat_placebo_flip_share" not in mt8, "the true arm carries no coin")
+_, ns2, _, _ = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="sign"), B8, TOK8)
+check(torch.equal(ns2, ns), "deterministic (a resume redraws the same coins)")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):

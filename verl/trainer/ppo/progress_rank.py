@@ -196,7 +196,7 @@ DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
 # The null control for the saturated-group term: "shuffle" keeps every group that fires,
 # its turn-weighted zero-sum and its L1 mass, and permutes which winner gets which score.
-SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose")
+SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose", "sign")
 
 
 def _finite(x) -> Optional[float]:
@@ -326,7 +326,12 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
     same rollouts (its own c, cap included). "shuffle" only matches the turn-weighted L1 mass
     of the scores, while the loss and the budget are token-weighted and the cap depends on
     max|s|, so its applied mass drifted to ~52% (ALFWorld) / ~63% (WebShop) of the true one
-    in a replay of steps 105-124 (critical_plan_review.md, 2026-09-23).
+    in a replay of steps 105-124 (critical_plan_review.md, 2026-09-23). Matching the mass that way
+    lets the placebo's PEAK push reach 1.5-1.8x the cap at the median and 8.6x at worst (replay of
+    the satgate run), because the recentring after the permutation makes the scores spikier.
+
+    ``placebo="sign"`` (the G1 control) matches EVERY magnitude: per group a coin keeps the true
+    scores or flips their sign, so only the direction (fewer vs more turns) is randomised.
     """
     tasks = set(tasks)
     out: Dict[str, Dict] = {}
@@ -375,6 +380,19 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
             rec["scores_true"] = dict(zip(trajs, true.tolist()))
             rec["scores"] = dict(zip(trajs, fake.tolist()))
             rec["placebo"] = placebo
+        elif placebo == "sign":
+            # Every magnitude of the true arm, only the DIRECTION randomised: per group a fair
+            # coin (drawn from the uid, so a resume redraws it) keeps the true scores or flips
+            # their sign. |score| per trajectory, the turn-weighted zero-sum, the token mass, the
+            # peak and therefore the cap and the coefficient are all exactly the true arm's;
+            # across groups the push favours fewer turns and more turns equally often.
+            true = np.asarray([rec["scores"][t] for t in trajs], dtype=float)
+            rng = np.random.default_rng(zlib.crc32(str(uid).encode()) ^ int(placebo_seed))
+            sgn = 1.0 if rng.random() < 0.5 else -1.0
+            rec["scores_true"] = dict(zip(trajs, true.tolist()))
+            rec["scores"] = dict(zip(trajs, (sgn * true).tolist()))
+            rec["placebo"] = placebo
+            rec["placebo_sign"] = sgn
     return out
 
 
@@ -1393,9 +1411,11 @@ class ProgressRankController:
                 "sat_verdict_ungated": sat_verdicts.get(uid, {}).get("verdict_ungated", sat_verdict),
                 "sat_scale": sat_verdicts.get(uid, {}).get("scale"),
                 "sat_score": [traj_sat.get(t, 0.0) for t in trajs],
-                # Under sat_placebo=shuffle, sat_score is the permuted one that was applied
-                # and sat_score_true the turn ranking it replaced; equal otherwise.
+                # Under a sat_placebo, sat_score is the score that was applied (permuted, or
+                # the true one times the group's coin under "sign") and sat_score_true the
+                # turn ranking it replaced; equal otherwise.
                 "sat_placebo": self.sat_placebo,
+                "sat_placebo_sign": sat_verdicts.get(uid, {}).get("placebo_sign"),
                 "sat_score_true": [sat_verdicts.get(uid, {}).get("scores_true", {}).get(t, traj_sat.get(t, 0.0))
                                    for t in trajs],
                 "sat_injected_abs_mass": float(np.sum(np.abs(row_sat[grows] * coef_sat[grows]) * tokens[grows])),
@@ -1470,7 +1490,7 @@ class ProgressRankController:
                     same = sum(1 for a, b in pairs if (tn[a] < tn[b]) == (rv[a] < rv[b]) and rv[a] != rv[b])
                     sat_agree[rec["task"]].append(same / len(pairs))
                 # The applied score against the turns: -1 for the true ranking (an affine
-                # function of turns), near 0 on average under the shuffle placebo. The
+                # function of turns), near 0 on average under the shuffle and sign placebos. The
                 # check that the placebo arm is a placebo, live in every step's metrics.
                 sc = np.asarray(rec.get("sat_score") or [], dtype=float)
                 tt = np.asarray(tn, dtype=float)
@@ -1488,10 +1508,16 @@ class ProgressRankController:
         for rec in mixed_verdicts.values():
             counts[rec["task"]][f"mixed_{rec['verdict']}"] += 1
         sat_spreads: Dict[str, List[float]] = defaultdict(list)
+        sat_flips: Dict[str, List[float]] = defaultdict(list)
         for rec in sat_verdicts.values():
             counts[rec["task"]][f"sat_{rec['verdict']}"] += 1
             counts[rec["task"]]["sat_fired_ungated"] += int(rec.get("verdict_ungated", rec["verdict"]) == FIRED)
             sat_spreads[rec["task"]].append(rec["spread"])
+            if rec["verdict"] == FIRED and "placebo_sign" in rec:
+                sat_flips[rec["task"]].append(float(rec["placebo_sign"] < 0.0))
+        for task, fl in sat_flips.items():
+            # sat_placebo=sign: the share of the fired groups whose ranking was reversed (~0.5).
+            metrics[f"progress_rank/{task}/sat_placebo_flip_share"] = float(np.mean(fl))
         for task, cs in list(counts.items()):
             if cs.get("sat_fired_ungated", 0):
                 # Of the saturated groups that would fire, the share the gate let through.
