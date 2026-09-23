@@ -194,6 +194,53 @@ ctl = pr.ProgressRankController(rho=0.0)
 ctl.apply(**b)
 check({r["uid"]: r["gamefile"] for r in ctl.last_group_records}["short"] == "/g/short.tw-pddl", "records carry the group's game file")
 
+print("4d. the placebo: same groups, same zero-sum, same mass -- the ranking's content destroyed")
+# Three saturated groups with three distinct winners each, so a permutation can move something.
+P3 = lambda i, a, b, c: (f"p{i}", "alfworld", [(f"P{i}a", a, 10.0, 2, 2, 0.0, 0, None),  # noqa: E731
+                                              (f"P{i}b", b, 10.0, 2, 2, 0.0, 0, None),
+                                              (f"P{i}c", c, 10.0, 2, 2, 0.0, 0, None)])
+BATCH = [LIVE, P3(1, 4, 8, 14), P3(2, 5, 9, 12), P3(3, 3, 7, 16), P3(4, 6, 10, 13)]
+true_ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, cap_kappa=100.0)
+b, new_true, m_true = run(true_ctl, BATCH)
+fake_ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, cap_kappa=100.0, sat_placebo="shuffle")
+b2, new_fake, m_fake = run(fake_ctl, BATCH)
+rt = {r["uid"]: r for r in true_ctl.last_group_records}
+rf = {r["uid"]: r for r in fake_ctl.last_group_records}
+pg = [f"p{i}" for i in range(1, 5)]
+check(all(rt[u]["sat_verdict"] == rf[u]["sat_verdict"] == "fired" for u in pg), "the same groups fire")
+zs, l1 = [], []
+for u in pg:
+    w = np.asarray(rf[u]["turns"], dtype=float)
+    s_fake, s_true = np.asarray(rf[u]["sat_score"]), np.asarray(rf[u]["sat_score_true"])
+    zs.append(abs(float((w * s_fake).sum())))
+    l1.append(abs(float((w * np.abs(s_fake)).sum() - (w * np.abs(s_true)).sum())))
+check(max(zs) < 1e-12, f"turn-weighted zero-sum kept in every group (max |sum w s| {max(zs):.1e})")
+check(max(l1) < 1e-12, f"turn-weighted L1 mass kept in every group (max diff {max(l1):.1e})")
+check(all(np.allclose(rf[u]["sat_score_true"], rt[u]["sat_score"]) for u in pg),
+      "the records keep the true ranking beside the applied one")
+check(any(not np.allclose(rf[u]["sat_score"], rf[u]["sat_score_true"]) for u in pg),
+      "and the applied scores differ from it in at least one group")
+mass_true = float((new_true - b["advantages"]).abs().sum())
+mass_fake = float((new_fake - b2["advantages"]).abs().sum())
+check(abs(mass_true - mass_fake) / mass_true < 1e-6,
+      f"the injected |dA| mass matches the true arm's ({mass_fake:.6f} vs {mass_true:.6f})")
+check(abs(m_true["progress_rank/alfworld/sat_score_turn_corr"] + 1.0) < 1e-9,
+      "true ranking: applied score vs turns correlates at -1")
+check(m_fake["progress_rank/alfworld/sat_score_turn_corr"] > -0.99,
+      f"placebo: the correlation is broken ({m_fake['progress_rank/alfworld/sat_score_turn_corr']:+.2f})")
+again = pr.ProgressRankController(rho=0.0, sat_rho=0.2, cap_kappa=100.0, sat_placebo="shuffle")
+b3, new_again, _ = run(again, BATCH)
+check(torch.equal(new_again, new_fake), "deterministic: the same groups draw the same permutation (a resume redraws it)")
+check(all(r["sat_placebo"] == "none" for r in true_ctl.last_group_records)
+      and all(r["sat_placebo"] == "shuffle" for r in fake_ctl.last_group_records), "records name the arm")
+try:
+    pr.ProgressRankController(rho=0.0, sat_placebo="random")
+    check(False, "an unknown placebo mode is refused")
+except AssertionError:
+    check(True, "an unknown placebo mode is refused")
+yaml_cfg = OmegaConf.load(os.path.join(REPO, "verl/trainer/config/ppo_trainer.yaml"))
+check(yaml_cfg.algorithm.progress_rank.sat_placebo == "none", "the config default is none: every existing arm is unchanged")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):

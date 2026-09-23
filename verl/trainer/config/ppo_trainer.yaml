@@ -765,6 +765,13 @@ algorithm:
     # The records carry doc_len and sat_scale per group, so a run on one mode can
     # replay the others.
     sat_turn_scale_mode: task_constant
+    # THE PLACEBO ARM for the saturated-group term. "shuffle": the same groups fire
+    # with the same turn-weighted zero-sum and the same L1 mass, but which winner gets
+    # which score is a permutation (drawn from the group's uid, so a resume redraws the
+    # same). If this arm matches the true ranking, the effect is the injection channel,
+    # not the content. The records keep sat_score_true beside the applied sat_score, and
+    # progress_rank/<task>/sat_score_turn_corr is -1 for the true ranking, ~0 here.
+    sat_placebo: none
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

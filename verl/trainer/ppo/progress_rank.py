@@ -142,6 +142,7 @@ zero-sum term only where the return has no spread.
 """
 
 import math
+import zlib
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional
 
@@ -193,6 +194,9 @@ DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 # constant in every case: the order INSIDE a group is untouched, only the weight
 # between groups moves, and the total mass is still sat_rho * E per task.
 SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
+# The null control for the saturated-group term: "shuffle" keeps every group that fires,
+# its turn-weighted zero-sum and its L1 mass, and permutes which winner gets which score.
+SAT_PLACEBO_MODES = ("none", "shuffle")
 
 
 def _finite(x) -> Optional[float]:
@@ -298,7 +302,8 @@ def score_stuck_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
 def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndarray,
                            traj: Dict[str, dict], tasks: Iterable[str],
                            min_spread: Dict[str, float], turn_scale: Dict[str, float],
-                           cross_steps: bool = True, scale_mode: str = "task_constant") -> Dict[str, Dict]:
+                           cross_steps: bool = True, scale_mode: str = "task_constant",
+                           placebo: str = "none", placebo_seed: int = 0) -> Dict[str, Dict]:
     """Per SATURATED group on ``tasks`` (every rollout won): whether it fired, and the scores.
 
     The mirror of :func:`score_stuck_groups` with the count replaced by the turn
@@ -307,6 +312,14 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
     per-trajectory table (turns = real rows, won by the environment's reward);
     the mean is weighted the way the GRPO statistic weights samples, so the term
     sums to zero over exactly what the group's own advantage sums to zero over.
+
+    ``placebo="shuffle"`` is the null control for "the CONTENT of the ranking
+    matters, not the channel": the same groups fire with the same turn-weighted
+    zero-sum and the same L1 mass ``sum_i w_i |s_i|``, but which rollout gets which
+    score is a permutation drawn from the group's uid (deterministic, so a resumed
+    run redraws the same). The true scores are kept in ``scores_true`` for the
+    records. What a permutation cannot preserve at the same time is the
+    correlation with the rollouts' lengths, which is the point.
     """
     tasks = set(tasks)
     out: Dict[str, Dict] = {}
@@ -344,6 +357,17 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
         rec["scale"] = scale
         rec["verdict"] = FIRED
         rec["scores"] = {t: (mean - float(n_turns)) / scale for t, n_turns in zip(trajs, turns)}
+        if placebo == "shuffle":
+            true = np.asarray([rec["scores"][t] for t in trajs], dtype=float)
+            rng = np.random.default_rng(zlib.crc32(str(uid).encode()) ^ int(placebo_seed))
+            fake = true[rng.permutation(len(trajs))]
+            fake = fake - float((w * fake).sum() / w.sum())          # turn-weighted zero-sum, as the true one
+            mass_true, mass_fake = float((w * np.abs(true)).sum()), float((w * np.abs(fake)).sum())
+            if mass_fake > 0.0:
+                fake = fake * (mass_true / mass_fake)               # same L1 mass under the same weights
+            rec["scores_true"] = dict(zip(trajs, true.tolist()))
+            rec["scores"] = dict(zip(trajs, fake.tolist()))
+            rec["placebo"] = placebo
     return out
 
 
@@ -693,8 +717,13 @@ class ProgressRankController:
                  sat_min_spread: Optional[Dict[str, float]] = None,
                  sat_turn_scale: Optional[Dict[str, float]] = None,
                  mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None,
-                 sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant"):
+                 sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant",
+                 sat_placebo: str = "none"):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
+        # The placebo arm: same firing, same mass, the ranking's content destroyed.
+        assert sat_placebo in SAT_PLACEBO_MODES, (
+            f"progress_rank.sat_placebo={sat_placebo!r}; expected one of {SAT_PLACEBO_MODES}")
+        self.sat_placebo = str(sat_placebo)
         # THE GATE on the saturated-group term: per task, fire only while the EMA of
         # the task's saturated-group share exceeds the EMA of its stuck-group share --
         # while its reliably solved games outnumber its reliably failed ones, the
@@ -997,14 +1026,16 @@ class ProgressRankController:
         sat_verdicts = score_saturated_groups(
             groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=sat_tasks_now,
             min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
-            cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode)
+            cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode,
+            placebo=self.sat_placebo)
         closed_tasks = [t for t in self.sat_tasks if t not in sat_tasks_now]
         if closed_tasks:
             # Still scored for the records, but the verdict says the gate held them.
             for uid, rec in score_saturated_groups(
                     groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=closed_tasks,
                     min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
-                    cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode).items():
+                    cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode,
+                    placebo=self.sat_placebo).items():
                 # What it WOULD have been: kept, so "how much firing the gate held back"
                 # is a live number, not only a replay.
                 rec["verdict_ungated"] = rec["verdict"]
@@ -1326,6 +1357,11 @@ class ProgressRankController:
                 "sat_verdict_ungated": sat_verdicts.get(uid, {}).get("verdict_ungated", sat_verdict),
                 "sat_scale": sat_verdicts.get(uid, {}).get("scale"),
                 "sat_score": [traj_sat.get(t, 0.0) for t in trajs],
+                # Under sat_placebo=shuffle, sat_score is the permuted one that was applied
+                # and sat_score_true the turn ranking it replaced; equal otherwise.
+                "sat_placebo": self.sat_placebo,
+                "sat_score_true": [sat_verdicts.get(uid, {}).get("scores_true", {}).get(t, traj_sat.get(t, 0.0))
+                                   for t in trajs],
                 "sat_injected_abs_mass": float(np.sum(np.abs(row_sat[grows] * coef_sat[grows]) * tokens[grows])),
                 "sat_c": info.get("sat_c"), "sat_capped": info.get("sat_capped"),
                 "sat_c_uncapped": info.get("sat_c_uncapped"), "sat_c_cap": info.get("sat_c_cap"),
@@ -1383,6 +1419,7 @@ class ProgressRankController:
             rec.pop("_base_mass", None)
         stuck_base: Dict[str, List[float]] = defaultdict(list)
         sat_agree: Dict[str, List[float]] = defaultdict(list)
+        sat_corr: Dict[str, List[float]] = defaultdict(list)
         for rec in records:
             if rec["status"] == "stuck":
                 stuck_base[rec["task"]].append(float(rec.get("base_abs_adv_max") or 0.0))
@@ -1396,11 +1433,20 @@ class ProgressRankController:
                 if pairs:
                     same = sum(1 for a, b in pairs if (tn[a] < tn[b]) == (rv[a] < rv[b]) and rv[a] != rv[b])
                     sat_agree[rec["task"]].append(same / len(pairs))
+                # The applied score against the turns: -1 for the true ranking (an affine
+                # function of turns), near 0 on average under the shuffle placebo. The
+                # check that the placebo arm is a placebo, live in every step's metrics.
+                sc = np.asarray(rec.get("sat_score") or [], dtype=float)
+                tt = np.asarray(tn, dtype=float)
+                if len(sc) >= 3 and sc.std() > 0 and tt.std() > 0:
+                    sat_corr[rec["task"]].append(float(np.corrcoef(sc, tt)[0, 1]))
         for task, vals in stuck_base.items():
             metrics[f"progress_rank/{task}/stuck_base_abs_adv_mean"] = float(np.mean(vals))
             metrics[f"progress_rank/{task}/stuck_base_abs_adv_nonzero_share"] = float(np.mean([v > 1e-6 for v in vals]))
         for task, vals in sat_agree.items():
             metrics[f"progress_rank/{task}/sat_revisit_agreement"] = float(np.mean(vals))
+        for task, vals in sat_corr.items():
+            metrics[f"progress_rank/{task}/sat_score_turn_corr"] = float(np.mean(vals))
         for rec in verdicts.values():
             counts[rec["task"]][f"stuck_{rec['verdict']}"] += 1
         for rec in mixed_verdicts.values():

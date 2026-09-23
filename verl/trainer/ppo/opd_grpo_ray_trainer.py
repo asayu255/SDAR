@@ -528,6 +528,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # length (document) or the group's own mean turns (group_mean). The
                 # order inside a group never changes; only the weight between groups.
                 sat_turn_scale_mode=str(cfg.get("sat_turn_scale_mode", "task_constant") or "task_constant"),
+                # The null control: same firing and mass, the winners' scores permuted.
+                sat_placebo=str(cfg.get("sat_placebo", "none") or "none"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),
