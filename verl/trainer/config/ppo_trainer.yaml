@@ -776,7 +776,10 @@ algorithm:
     # "shuffle" matched only the turn-weighted L1 mass and drifted to ~52-63% of the true dose;
     # "shuffle_dose" matches the mass but its peak push reaches 1.5-8.6x the cap.
     # "sign": per group a coin keeps the true scores or flips their sign -- every magnitude
-    # (mass, peak, cap, coefficient, zero-sum) is exactly the true arm's; only the direction is random.
+    # (mass, peak, cap, coefficient, zero-sum) is exactly the true arm's; the direction AND the sign
+    # of the uniform per-trajectory bonus the turn-weighted mean leaves (b = mean of the scores) are random.
+    # "bonus": every rollout of a fired group gets b alone, with the true arm's coefficient -- the
+    # true arm minus this one is exactly the ranking part.
     sat_placebo: none
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix

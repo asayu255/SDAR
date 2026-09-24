@@ -304,6 +304,39 @@ check(all(r.get("sat_placebo_sign") is None for r in ct.last_group_records)
 _, ns2, _, _ = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="sign"), B8, TOK8)
 check(torch.equal(ns2, ns), "deterministic (a resume redraws the same coins)")
 
+print("4g. the bonus-only arm: the true arm's uniform bonus, its coefficient, no ranking")
+bb_, nb, mb8, cb = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="bonus"), B8, TOK8)
+db = ((nb - bb_["advantages"]) * bb_["mask"])
+check(abs(mb8["progress_rank/alfworld/sat_c"] - mt8["progress_rank/alfworld/sat_c"]) < 1e-12
+      and mb8.get("progress_rank/alfworld/sat_capped") == mt8.get("progress_rank/alfworld/sat_capped") == 1.0,
+      "the true arm's coefficient, cap binding in both (not re-sized to the bonus's smaller mass)")
+rb8 = {r["uid"]: r for r in cb.last_group_records}
+rt8 = {r["uid"]: r for r in ct.last_group_records}
+ok_scores = ok_rows = ok_sum = ok_rank = ok_diff = True
+c8 = mt8["progress_rank/alfworld/sat_c"]
+for i in range(1, 9):
+    true_s = np.asarray(rt8[f"p{i}"]["sat_score"], dtype=float)
+    b_ = float(true_s.mean())
+    ok_scores &= bool(np.allclose(rb8[f"p{i}"]["sat_score"], b_) and np.allclose(rb8[f"p{i}"]["sat_score_true"], true_s))
+    ok_sum &= abs(float(np.sum(rb8[f"p{i}"]["sat_score"])) - float(true_s.sum())) < 1e-12
+    ok_rank &= abs(float((true_s - b_).sum())) < 1e-12 and b_ > 0.0
+    for j, x in enumerate("abc"):
+        sel = torch.tensor([str(t) == f"P{i}{x}" for t in bb_["tuids"]])
+        on = bb_["mask"][sel] > 0
+        vals = db[sel][on]
+        ok_rows &= bool(torch.allclose(vals, torch.full_like(vals, c8 * b_), atol=1e-6))
+        # true arm minus this arm, token by token: c times the ranking part alone
+        gap = (dt[sel] - db[sel])[on]
+        ok_diff &= bool(torch.allclose(gap, torch.full_like(gap, c8 * (float(true_s[j]) - b_)), atol=1e-6))
+check(ok_scores, "every rollout of a fired group gets b = the mean of its true scores; the true scores are recorded")
+check(ok_rank, "true = ranking (sums to 0 over the rollouts) + b > 0: the turn-weighted centring's bonus")
+check(ok_sum, "per group the summed per-trajectory push equals the true arm's (only the ordering is gone)")
+check(ok_rows, "every token of every fired rollout gets c * b, c the true arm's coefficient")
+check(ok_diff, "true arm minus this arm = c * (s_i - b) on every token: exactly the ranking part")
+check("progress_rank/alfworld/sat_score_turn_corr" not in mb8, "no score-turn correlation is reported for constant scores")
+_, nb2, _, _ = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="bonus"), B8, TOK8)
+check(torch.equal(nb2, nb), "deterministic")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):

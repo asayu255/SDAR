@@ -196,7 +196,7 @@ DEFAULT_SAT_TURN_SCALE = {"alfworld": 50.0, "webshop": 15.0, "search": 4.0}
 SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
 # The null control for the saturated-group term: "shuffle" keeps every group that fires,
 # its turn-weighted zero-sum and its L1 mass, and permutes which winner gets which score.
-SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose", "sign")
+SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose", "sign", "bonus")
 
 
 def _finite(x) -> Optional[float]:
@@ -331,7 +331,14 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
     the satgate run), because the recentring after the permutation makes the scores spikier.
 
     ``placebo="sign"`` (the G1 control) matches EVERY magnitude: per group a coin keeps the true
-    scores or flips their sign, so only the direction (fewer vs more turns) is randomised.
+    scores or flips their sign. That randomises the direction of the ranking AND the sign of the
+    uniform bonus below, so G1 compares ranking + bonus against neither (found 2026-09-24).
+
+    ``placebo="bonus"`` (user, 2026-09-25) keeps only the bonus. With the turn-weighted mean the
+    true scores are s_i = r_i + b: a ranking r_i = (plain mean T - T_i) / scale that sums to 0 over
+    the group's rollouts, plus b = mean_i s_i >= 0, the same for all of them. Every rollout gets b;
+    apply() sizes the coefficient on the TRUE scores (cap included), so each group receives exactly
+    the bonus component of the true arm's term, and true minus this arm is the ranking's effect.
     """
     tasks = set(tasks)
     out: Dict[str, Dict] = {}
@@ -393,6 +400,15 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
             rec["scores"] = dict(zip(trajs, (sgn * true).tolist()))
             rec["placebo"] = placebo
             rec["placebo_sign"] = sgn
+        elif placebo == "bonus":
+            # The bonus alone: the true scores' plain mean over the group's rollouts, for every
+            # rollout (the ranking part sums to zero, so this is exactly b); no ordering is left.
+            true = np.asarray([rec["scores"][t] for t in trajs], dtype=float)
+            b = float(true.mean())
+            rec["scores_true"] = dict(zip(trajs, true.tolist()))
+            rec["scores"] = {t: b for t in trajs}
+            rec["placebo"] = placebo
+            rec["placebo_bonus"] = b
     return out
 
 
@@ -1175,6 +1191,25 @@ class ProgressRankController:
                         metrics[f"{p}/sat_placebo_true_c"] = c_true
                         metrics[f"{p}/sat_placebo_mass_ratio"] = (c_sat * u_sat) / target
                         metrics[f"{p}/sat_placebo_peak_over_cap"] = c_sat * max_abs_sat / (self.kappa * s_ema)
+                    else:
+                        c_sat, sat_capped = 0.0, 0.0
+                elif self.sat_placebo == "bonus":
+                    # BONUS-ONLY control: the TRUE arm's coefficient -- computed from the true
+                    # scores, cap included -- applied to the uniform bonus alone, so each fired
+                    # group gets exactly the bonus inside the true arm's term, and no more.
+                    tr_fired = rows & (row_sat_true != 0.0)
+                    u_true = float((np.abs(row_sat_true[tr_fired]) * tokens[tr_fired]).sum()) / task_tokens
+                    max_true = float(np.abs(row_sat_true[rows]).max()) if rows.any() else 0.0
+                    if u_true > 0.0 and max_true > 0.0:
+                        c_true_uncapped = self.sat_rho * ema / u_true
+                        c_true_cap = self.kappa * s_ema / max_true
+                        c_sat = min(c_true_uncapped, c_true_cap)
+                        sat_capped = float(c_true_uncapped > c_true_cap)
+                        # report the coefficient that was applied, as the true arm would
+                        c_sat_uncapped, sat_cap = c_true_uncapped, c_true_cap
+                        metrics[f"{p}/sat_c_uncapped"] = c_sat_uncapped
+                        metrics[f"{p}/sat_c_cap"] = sat_cap
+                        metrics[f"{p}/sat_placebo_true_c"] = c_sat
                     else:
                         c_sat, sat_capped = 0.0, 0.0
             coef_sat[names == task] = c_sat
