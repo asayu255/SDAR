@@ -781,6 +781,11 @@ algorithm:
     # "bonus": every rollout of a fired group gets b alone, with the true arm's coefficient -- the
     # true arm minus this one is exactly the ranking part.
     sat_placebo: none
+    # Which mean a saturated group's turn counts are centred on. turn (default): weighted by rows, as
+    # the GRPO statistic -- zero-sum per turn, leaving a uniform per-trajectory bonus b >= 0 on every
+    # winner. trajectory: the plain mean -- zero-sum per trajectory (no bonus; every winner longer than
+    # the group's mean is pushed down), with a larger net token push-down.
+    sat_centring: turn
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

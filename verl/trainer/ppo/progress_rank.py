@@ -197,6 +197,12 @@ SAT_SCALE_MODES = ("task_constant", "document", "group_mean")
 # The null control for the saturated-group term: "shuffle" keeps every group that fires,
 # its turn-weighted zero-sum and its L1 mass, and permutes which winner gets which score.
 SAT_PLACEBO_MODES = ("none", "shuffle", "shuffle_dose", "sign", "bonus")
+# Which mean a saturated group's turn counts are centred on. turn: weighted by each rollout's rows
+# (the GRPO statistic's weighting; the per-TURN sum is zero and a uniform per-trajectory bonus
+# b = mean_i s_i >= 0 remains). trajectory: the plain mean over the group's rollouts (user
+# 2026-09-25): the per-trajectory sum is zero, so no bonus -- every winner longer than the group's
+# mean is pushed down -- at the price of a larger net token push-down.
+SAT_CENTRING_MODES = ("turn", "trajectory")
 
 
 def _finite(x) -> Optional[float]:
@@ -303,7 +309,8 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
                            traj: Dict[str, dict], tasks: Iterable[str],
                            min_spread: Dict[str, float], turn_scale: Dict[str, float],
                            cross_steps: bool = True, scale_mode: str = "task_constant",
-                           placebo: str = "none", placebo_seed: int = 0) -> Dict[str, Dict]:
+                           placebo: str = "none", placebo_seed: int = 0,
+                           centring: str = "turn") -> Dict[str, Dict]:
     """Per SATURATED group on ``tasks`` (every rollout won): whether it fired, and the scores.
 
     The mirror of :func:`score_stuck_groups` with the count replaced by the turn
@@ -365,7 +372,7 @@ def score_saturated_groups(groups: Dict[str, Dict], *, tuids, stat_rows: np.ndar
             rec["verdict"] = SPREAD_BELOW_MIN
             continue
         w = np.asarray([weight[t] for t in trajs], dtype=float)
-        mean = float((w * turns).sum() / w.sum())
+        mean = float((w * turns).sum() / w.sum()) if centring == "turn" else float(turns.mean())
         scale = float(turn_scale.get(task) or turns.max())
         if scale_mode == "document":
             docs = [traj[t].get("doc_len") for t in trajs if traj[t].get("doc_len")]
@@ -759,12 +766,18 @@ class ProgressRankController:
                  sat_turn_scale: Optional[Dict[str, float]] = None,
                  mixed_rho: float = 0.0, mixed_tasks: Optional[Iterable[str]] = None,
                  sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant",
-                 sat_placebo: str = "none"):
+                 sat_placebo: str = "none", sat_centring: str = "turn"):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
         # The placebo arm: same firing, same mass, the ranking's content destroyed.
         assert sat_placebo in SAT_PLACEBO_MODES, (
             f"progress_rank.sat_placebo={sat_placebo!r}; expected one of {SAT_PLACEBO_MODES}")
         self.sat_placebo = str(sat_placebo)
+        assert sat_centring in SAT_CENTRING_MODES, (
+            f"progress_rank.sat_centring={sat_centring!r}; expected one of {SAT_CENTRING_MODES}")
+        # the bonus-only control IS the turn centring's uniform part: it is 0 under trajectory centring
+        assert not (sat_centring == "trajectory" and sat_placebo == "bonus"), (
+            "progress_rank.sat_placebo=bonus needs sat_centring=turn (the bonus is 0 under trajectory centring)")
+        self.sat_centring = str(sat_centring)
         # THE GATE on the saturated-group term: per task, fire only while the EMA of
         # the task's saturated-group share exceeds the EMA of its stuck-group share --
         # while its reliably solved games outnumber its reliably failed ones, the
@@ -1068,7 +1081,7 @@ class ProgressRankController:
             groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=sat_tasks_now,
             min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
             cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode,
-            placebo=self.sat_placebo)
+            placebo=self.sat_placebo, centring=self.sat_centring)
         closed_tasks = [t for t in self.sat_tasks if t not in sat_tasks_now]
         if closed_tasks:
             # Still scored for the records, but the verdict says the gate held them.
@@ -1076,7 +1089,7 @@ class ProgressRankController:
                     groups, tuids=tuids, stat_rows=stat, traj=traj, tasks=closed_tasks,
                     min_spread=self.sat_min_spread, turn_scale=self.sat_turn_scale,
                     cross_steps=self.cross_steps, scale_mode=self.sat_turn_scale_mode,
-                    placebo=self.sat_placebo).items():
+                    placebo=self.sat_placebo, centring=self.sat_centring).items():
                 # What it WOULD have been: kept, so "how much firing the gate held back"
                 # is a live number, not only a replay.
                 rec["verdict_ungated"] = rec["verdict"]
@@ -1450,6 +1463,7 @@ class ProgressRankController:
                 # the true one times the group's coin under "sign") and sat_score_true the
                 # turn ranking it replaced; equal otherwise.
                 "sat_placebo": self.sat_placebo,
+                "sat_centring": self.sat_centring,
                 "sat_placebo_sign": sat_verdicts.get(uid, {}).get("placebo_sign"),
                 "sat_score_true": [sat_verdicts.get(uid, {}).get("scores_true", {}).get(t, traj_sat.get(t, 0.0))
                                    for t in trajs],

@@ -530,6 +530,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 sat_turn_scale_mode=str(cfg.get("sat_turn_scale_mode", "task_constant") or "task_constant"),
                 # The null control: same firing and mass, the winners' scores permuted.
                 sat_placebo=str(cfg.get("sat_placebo", "none") or "none"),
+                # Which mean the winners' turns are centred on: turn (weighted by rows, the default)
+                # or trajectory (the plain mean: no uniform bonus).
+                sat_centring=str(cfg.get("sat_centring", "turn") or "turn"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),

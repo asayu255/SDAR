@@ -337,6 +337,37 @@ check("progress_rank/alfworld/sat_score_turn_corr" not in mb8, "no score-turn co
 _, nb2, _, _ = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_placebo="bonus"), B8, TOK8)
 check(torch.equal(nb2, nb), "deterministic")
 
+print("4h. sat_centring=trajectory: the plain mean, no bonus; the default is unchanged")
+_, nd, md8, cd = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_centring="turn"), B8, TOK8)
+check(torch.equal(nd, nt) and all(r.get("sat_centring") == "turn" for r in ct.last_group_records),
+      "sat_centring=turn is the default, bit for bit, and the records name it")
+_, np_, mp8, cp = run_tok(pr.ProgressRankController(rho=0.0, sat_rho=2.0, cap_kappa=0.5, sat_centring="trajectory"), B8, TOK8)
+rp8 = {r["uid"]: r for r in cp.last_group_records}
+ok_sum = ok_rank = ok_order = True
+for i in range(1, 9):
+    true_s = np.asarray(rt8[f"p{i}"]["sat_score"], dtype=float)          # turn-centred: ranking + b
+    plain = np.asarray(rp8[f"p{i}"]["sat_score"], dtype=float)
+    ok_sum &= abs(float(plain.sum())) < 1e-12
+    ok_rank &= bool(np.allclose(plain, true_s - true_s.mean()))           # exactly the ranking part r_i
+    turns = np.asarray(rp8[f"p{i}"]["turns"], dtype=float)
+    ok_order &= bool(np.all(np.argsort(-plain, kind="stable") == np.argsort(turns, kind="stable")) or np.corrcoef(plain, turns)[0, 1] < -0.999)
+check(ok_sum, "per group the scores sum to 0 over the rollouts (no uniform bonus)")
+check(ok_rank, "they are the turn-centred scores minus their mean: the ranking part r_i alone")
+check(ok_order and mp8["progress_rank/alfworld/sat_score_turn_corr"] < -0.999, "fewer turns still ranks higher (score-turn corr -1)")
+check("progress_rank/alfworld/sat_c" in mp8 and all(r.get("sat_centring") == "trajectory" for r in cp.last_group_records),
+      "the coefficient is set from these scores in the usual way; the records name the centring")
+try:
+    pr.ProgressRankController(rho=0.0, sat_centring="rows")
+    check(False, "an unknown centring is refused")
+except AssertionError:
+    check(True, "an unknown centring is refused")
+try:
+    pr.ProgressRankController(rho=0.0, sat_centring="trajectory", sat_placebo="bonus")
+    check(False, "trajectory centring with the bonus-only control is refused")
+except AssertionError:
+    check(True, "trajectory centring with the bonus-only control is refused (its bonus is 0)")
+check(yaml_cfg.algorithm.progress_rank.sat_centring == "turn", "the config default is turn: every existing arm is unchanged")
+
 print("5. the counters")
 rc = P.RevisitCounter()
 for a in ("go to cabinet 1", "Go To  Cabinet 1", "go to cabinet 2", "", "go to cabinet 2"):
