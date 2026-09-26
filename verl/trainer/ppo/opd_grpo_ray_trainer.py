@@ -533,6 +533,11 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # Which mean the winners' turns are centred on: turn (weighted by rows, the default)
                 # or trajectory (the plain mean: no uniform bonus).
                 sat_centring=str(cfg.get("sat_centring", "turn") or "turn"),
+                # How the two sides' strength is set: budget_cap (rho E budget, kappa S cap, the gate if
+                # on) or beta_mirror (a per-task Beta from the tied-group shares; see progress_rank).
+                scale_mode=str(cfg.get("scale_mode", "budget_cap") or "budget_cap"),
+                beta_pseudo_count=float(cfg.get("beta_pseudo_count", 1.0)),
+                beta_group_size=int(cfg.get("beta_group_size", 8)),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),

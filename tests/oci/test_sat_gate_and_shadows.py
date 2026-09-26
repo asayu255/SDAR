@@ -125,8 +125,8 @@ print("3. the EMAs survive a state round-trip")
 state = ctl.state_dict()
 ctl2 = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_tasks=["alfworld", "webshop", "search"], sat_gate=True)
 ctl2.load_state_dict(state)
-check(state["version"] == 4 and ctl2.gate_stuck_ema == ctl.gate_stuck_ema and ctl2.gate_sat_ema == ctl.gate_sat_ema,
-      "version 4 carries both gate EMAs")
+check(state["version"] >= 4 and ctl2.gate_stuck_ema == ctl.gate_stuck_ema and ctl2.gate_sat_ema == ctl.gate_sat_ema,
+      "version 4 and later carry both gate EMAs (5 adds the beta_mirror state)")
 ctl3 = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_gate=True)
 ctl3.load_state_dict({"version": 3, "ema": {}, "success_ema": {}})
 check(all(v is None for v in ctl3.gate_stuck_ema.values()), "a version-3 state loads with the gate EMAs unset")

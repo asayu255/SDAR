@@ -786,6 +786,15 @@ algorithm:
     # winner. trajectory: the plain mean -- zero-sum per trajectory (no bonus; every winner longer than
     # the group's mean is pushed down), with a larger net token push-down.
     sat_centring: turn
+    # STRENGTH RULE. budget_cap (default): rho * E budget, kappa * S cap, the gate if sat_gate. beta_mirror:
+    # per task a Beta(a, b) solved from the EMA shares of all-fail / all-success groups (jointly smoothed
+    # with beta_pseudo_count on each of the three kinds), each side's strength = the posterior E[2 sqrt(p(1-p))]
+    # (Beta(a, b+G) for all-fail, Beta(a+G, b) for all-success), scaled per task so the mean |push| over the
+    # fired groups' trajectories equals it. No cap. rho > 0 / sat_rho > 0 only switch the sides on; it
+    # refuses sat_gate, the sat placebos and mixed_rho > 0. beta_group_size must equal the rollout group size.
+    scale_mode: budget_cap
+    beta_pseudo_count: 1.0
+    beta_group_size: 8
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get
