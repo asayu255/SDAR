@@ -76,6 +76,10 @@ COMPOSED_SCRIPTS = [
     "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_ppo_qwen3.sh",
     # Five deep: the third run execs the second, which execs the first.
     "examples/opd_grpo_trainer/run_alfworld_only_oci_slots_gated_qwen3.sh",
+    # The beta-mirror arm: a wrapper of the (a) script with its own lock. The (a) script itself is not
+    # listed: its host launchers pass the knobs its lock pins (speculative decoding, micro batch 5,
+    # gradient checkpointing off), where this wrapper carries them.
+    "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

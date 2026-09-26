@@ -645,6 +645,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             alt_counts=alt_counts,
             task_score_rows=nt["task_score"] if "task_score" in nt else None,
             committed_rows=nt["committed"] if "committed" in nt else None,
+            search_count_rows=nt["searches"] if "searches" in nt else None,
             revisit_rows=nt["revisits"] if "revisits" in nt else None,
             done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
             doc_len_rows=self._document_lengths(nt, task_names),

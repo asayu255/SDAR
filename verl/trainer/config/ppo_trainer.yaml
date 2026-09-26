@@ -791,7 +791,9 @@ algorithm:
     # with beta_pseudo_count on each of the three kinds), each side's strength = the posterior E[2 sqrt(p(1-p))]
     # (Beta(a, b+G) for all-fail, Beta(a+G, b) for all-success), scaled per task so the mean |push| over the
     # fired groups' trajectories equals it. No cap. rho > 0 / sat_rho > 0 only switch the sides on; it
-    # refuses sat_gate, the sat placebos and mixed_rho > 0. beta_group_size must equal the rollout group size.
+    # refuses sat_gate, the sat placebos and mixed_rho > 0. beta_group_size must equal env.rollout.n
+    # (main_opd_grpo refuses a launch where it does not); a group without exactly that many real rollouts
+    # is kept out of the shares, the fit and both updates (progress_rank/<task>/beta/groups_not_G).
     scale_mode: budget_cap
     beta_pseudo_count: 1.0
     beta_group_size: 8

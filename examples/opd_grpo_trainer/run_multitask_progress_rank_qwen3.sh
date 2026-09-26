@@ -74,7 +74,10 @@ RHO="${RHO:-0.05}"
 # the control launcher derives every name from it.
 export RUN_TAG="${RUN_TAG:-progress_rank_rho${RHO//./p}}"
 echo "progress_rank: rho=$RHO run_tag=$RUN_TAG"
-exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_multitask_cross_teacher_klw_control_qwen3.sh" \
+# The sibling spelled through _HERE, which tests/trainer/test_run_script_overrides_compose
+# follows, so a wrapper of this script can be composed and checked against its lock.
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
   ++trainer.expected_config=examples/opd_grpo_trainer/expected_multitask_progress_rank_config.yaml \
   algorithm.progress_rank.enable=True \
   algorithm.progress_rank.rho="$RHO" \

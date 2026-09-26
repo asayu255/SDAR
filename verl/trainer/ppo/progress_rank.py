@@ -158,7 +158,7 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MI
            "DEFAULT_SAT_TURN_SCALE", "ProgressRankController", "group_status",
            "trajectory_metrics", "FIRST_ORDER_WINDOW",
            "think_block_metrics", "THINK_OPEN_IDS",
-           "score_mixed_groups", "sign_preserving_scale", "FEW_FAILURES"]
+           "score_mixed_groups", "sign_preserving_scale", "FEW_FAILURES", "GROUP_NOT_G"]
 
 PROGRESS_K_KEY = "progress_k"
 PROGRESS_TOTAL_KEY = "progress_total"
@@ -178,6 +178,9 @@ TOP_BELOW_MIN = "top_below_min"  # differ, but nobody reached min_top_k
 SPREAD_BELOW_MIN = "spread_below_min"  # saturated: turn counts differ by less than sat_min_spread
 GATE_CLOSED = "gate_closed"      # saturated: the task's gate is shut (stuck share >= saturated share)
 FEW_FAILURES = "few_failures"    # mixed: fewer than two failed rollouts, nothing to rank
+# scale_mode=beta_mirror: the group does not hold exactly beta_group_size real rollouts, so the
+# G-rollout model neither describes it nor sizes a push for it (verdict_if_complete keeps the rest).
+GROUP_NOT_G = "group_not_G"
 
 # Saturated groups (sat_rho): which tasks, the smallest turn difference that fires,
 # and the scale a turn difference is divided by (the task's turn cap). Search is
@@ -752,11 +755,18 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
 # --- scale_mode=beta_mirror: the two tied-group shares as a Beta over the task's success rates --- #
 #
 # (2026-09-26) One rule in place of rho, kappa and the gate. Per task and step:
-#   1. The EMA shares of all-fail (q_f) and all-success (q_s) groups -- the gate's own EMAs -- are
-#      smoothed JOINTLY with the mixed share: a pseudo-count on each of the three kinds over an
-#      effective number of groups (this step's groups / ema_alpha). Finite Beta shapes only produce
-#      0 < q_f, q_s with q_f + q_s < 1, and an independent floor cannot guarantee that ((1, 0) becomes
-#      (1, .01), which has no solution).
+#   0. Only COMPLETE groups -- exactly G = beta_group_size real rollouts -- are inside the model. Any
+#      other group (adjust_batch dropped every row of one of its rollouts, or the rollout count is not G)
+#      enters neither the shares, nor the histogram, nor either side's scores (beta/groups_not_G).
+#   1. The EMA shares of all-fail (q_f) and all-success (q_s) complete groups -- the gate's own EMAs,
+#      which under this mode count complete groups only -- are smoothed JOINTLY with the mixed share: a
+#      pseudo-count on each of the three kinds over n_eff = this step's complete groups / ema_alpha (a
+#      smoothing scale chosen here, not the EMA's statistical effective sample size n (2 - alpha) / alpha).
+#      The joint form keeps q_f + q_s < 1, which an independent floor cannot ((1, 0) becomes (1, .01)).
+#      It does NOT make every pair solvable: any p on [0, 1] has q_f^(1/G) + q_s^(1/G) >= 1, so two
+#      small shares have no Beta (raw (0, 0) at n_eff 300 smooths to 1/303 each, .979 < 1). At G = 8 the
+#      smoothed (0, 0) is solvable while n_eff + 3 < 2^8 -- the planned 15 groups / .2 = 75 is -- and a
+#      failed fit adds nothing (step 2).
 #   2. p ~ Beta(a, b) is solved from q_f = E[(1-p)^G] and q_s = E[p^G] (Newton on log a, log b with a
 #      backtracking line search; the residual is recomputed at the parameters returned). A failed fit
 #      adds nothing for that task and step and is reported (beta/fit_failed).
@@ -1061,6 +1071,10 @@ class ProgressRankController:
         metrics[f"{pb}/share_correction"] = abs(bi["q_f"] - bi["q_f_raw"]) + abs(bi["q_s"] - bi["q_s_raw"])
         metrics[f"{pb}/fit_failed"] = float(not bi["ok"])
         metrics[f"{pb}/groups_not_G"] = float(bi["groups_not_G"])
+        for side, vd in (("a", verdicts), ("sat", sat_verdicts)):
+            metrics[f"{pb}/groups_not_G_fired_{side}"] = float(sum(
+                1 for rec in vd.values() if rec["task"] == task and rec["verdict"] == GROUP_NOT_G
+                and rec.get("verdict_if_complete") == FIRED))
         # The gate's condition on the raw EMAs and on the fitted shares, and a > b (== the latter).
         metrics[f"{pb}/qs_gt_qf_raw"] = float(bi["q_s_raw"] > bi["q_f_raw"])
         metrics[f"{pb}/qs_gt_qf"] = float(bi["q_s"] > bi["q_f"])
@@ -1163,16 +1177,20 @@ class ProgressRankController:
             metrics[f"{pb}/stuck_k_spread_over_K"] = float(np.mean(spread_k))
         if known:
             metrics[f"{pb}/stuck_all_k0_share"] = all_zero / known
-        # Search: searches and answers of winners and failures, with their counts.
+        # Search: searches and answers of winners and failures, with their counts. A search is a
+        # query the environment sent to the retriever (the `searches` column), NOT turns minus
+        # answered: a rollout that hit the turn cap spent its last turn without one.
         if task == "search":
             for kind, won_ in (("win", True), ("fail", False)):
                 xs_t = [x for x in traj.values() if x["task"] == task and x["won"] == won_]
                 metrics[f"{pb}/search_{kind}_n"] = float(len(xs_t))
-                with_c = [x for x in xs_t if x.get("committed") is not None]
-                if with_c:
-                    ns = [x["turns"] - (1 if x["committed"] else 0) for x in with_c]
+                with_s = [x for x in xs_t if x.get("searches") is not None]
+                if with_s:
+                    ns = [float(x["searches"]) for x in with_s]
                     metrics[f"{pb}/search_{kind}_searches_mean"] = float(np.mean(ns))
                     metrics[f"{pb}/search_{kind}_two_plus_share"] = float(np.mean([s_ >= 2 for s_ in ns]))
+                with_c = [x for x in xs_t if x.get("committed") is not None]
+                if with_c:
                     metrics[f"{pb}/search_{kind}_no_answer_share"] = float(np.mean([not x["committed"] for x in with_c]))
 
     def apply(self, *, advantages: torch.Tensor, mask: torch.Tensor, uids, tuids, task_names,
@@ -1181,7 +1199,7 @@ class ProgressRankController:
               coverage_rows=None, episode_lengths=None, turn_caps=None,
               alt_counts=None, task_score_rows=None, committed_rows=None,
               revisit_rows=None, done_walkset_rows=None, doc_len_rows=None,
-              gamefile_rows=None) -> tuple:
+              gamefile_rows=None, search_count_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -1213,6 +1231,8 @@ class ProgressRankController:
         ``doc_len_rows``     per row, the length of its task's document for this game (the
                              scale sat_turn_scale_mode=document divides by)
         ``gamefile_rows``    per row, ALFWorld's game file; the records carry one per group
+        ``search_count_rows`` per row, Search's queries actually sent to the retriever so far
+                             (the env's tool calls; NaN on other tasks)
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -1231,10 +1251,23 @@ class ProgressRankController:
 
         real_idx = [i for i in range(n) if real[i]]
         groups = failed_groups(uids, tuids, names, episode_rewards, real_idx)
+        # scale_mode=beta_mirror describes a group by exactly G = beta_group_size rollouts. A group
+        # with any other number of real ones (adjust_batch dropped all of one's rows, or the rollout
+        # count is not G) is outside that model, so it is kept out of everything the model touches:
+        # the shares the Beta is fitted to, the histogram, and both sides' scores. Counted per task in
+        # beta/groups_not_G (and beta/groups_not_G_fired_*: those that would have fired).
+        not_g_uids: set = set()
+        if self.scale_mode == "beta_mirror":
+            not_g_uids = {u for u, g in groups.items()
+                          if len({str(tuids[i]) for i in g["rows"]}) != self.beta_group_size}
         traj_prog = trajectory_progress(tuids, k_rows, total_rows, range(n))
         verdicts = score_stuck_groups(groups, tuids=tuids, stat_rows=stat, traj_prog=traj_prog,
                                       min_top_k=self.min_top_k, tasks=self.tasks,
                                       cross_steps=self.cross_steps)
+        for u in not_g_uids:
+            rec = verdicts.get(u)
+            if rec is not None:
+                rec["verdict_if_complete"], rec["verdict"], rec["scores"] = rec["verdict"], GROUP_NOT_G, {}
         # trajectory -> score, for the groups that fired
         traj_score: Dict[str, float] = {}
         for rec in verdicts.values():
@@ -1270,7 +1303,7 @@ class ProgressRankController:
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
                                "length": None, "task_score": None, "committed": None,
                                "revisits": None, "done_walkset": None, "doc_len": None,
-                               "gamefile": None}
+                               "gamefile": None, "searches": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -1289,7 +1322,7 @@ class ProgressRankController:
                 if isinstance(gf, str) and gf:
                     x["gamefile"] = gf
             for col, key in ((revisit_rows, "revisits"), (done_walkset_rows, "done_walkset"),
-                             (doc_len_rows, "doc_len")):
+                             (doc_len_rows, "doc_len"), (search_count_rows, "searches")):
                 if col is not None:
                     v = _finite(col[i])
                     if v is not None:
@@ -1332,9 +1365,9 @@ class ProgressRankController:
         gate_open: Dict[str, bool] = {}
         gate_q: Dict[str, Optional[float]] = {}
         shares: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for g in groups.values():
+        for u, g in groups.items():
             task = str(g.get("task") or "")
-            if task not in self.tasks:
+            if task not in self.tasks or u in not_g_uids:
                 continue
             xs = [traj[t] for t in sorted({str(tuids[i]) for i in g["rows"] if real[i]}) if t in traj]
             if len(xs) < 2 or any(x["reward"] is None for x in xs):
@@ -1361,15 +1394,14 @@ class ProgressRankController:
             G = self.beta_group_size
             hist: Dict[str, List[int]] = defaultdict(lambda: [0] * (G + 1))
             not_g: Dict[str, int] = defaultdict(int)
-            for g in groups.values():
+            for u in not_g_uids:
+                not_g[str(groups[u].get("task") or "")] += 1
+            for u, g in groups.items():
                 task = str(g.get("task") or "")
-                if task not in self.tasks:
+                if task not in self.tasks or u in not_g_uids:
                     continue
                 xs = [traj[t] for t in sorted({str(tuids[i]) for i in g["rows"] if real[i]}) if t in traj]
-                if len(xs) < 2 or any(x["reward"] is None for x in xs):
-                    continue
-                if len(xs) != G:
-                    not_g[task] += 1
+                if len(xs) != G or any(x["reward"] is None for x in xs):
                     continue
                 hist[task][sum(1 for x in xs if x["won"])] += 1
             for task in self.tasks:
@@ -1407,6 +1439,11 @@ class ProgressRankController:
                 rec["verdict_ungated"] = rec["verdict"]
                 rec["verdict"], rec["scores"] = GATE_CLOSED, {}
                 sat_verdicts[uid] = rec
+        for u in not_g_uids:
+            rec = sat_verdicts.get(u)
+            if rec is not None:
+                rec["verdict_if_complete"], rec["verdict"], rec["scores"] = rec["verdict"], GROUP_NOT_G, {}
+                rec.pop("scores_true", None)
         traj_sat: Dict[str, float] = {}
         for rec in sat_verdicts.values():
             traj_sat.update(rec["scores"])
@@ -1831,7 +1868,11 @@ class ProgressRankController:
                 **({"scale_mode": self.scale_mode, "beta_a": info.get("beta_a"), "beta_b": info.get("beta_b"),
                     "beta_m": (info.get("beta_m_f") if status == "stuck"
                                else info.get("beta_m_s") if status == "saturated" else None),
-                    "beta_fit_ok": info.get("beta_fit_ok"), "cf_c": info.get("cf_c"), "cf_sat_c": info.get("cf_sat_c")}
+                    "beta_fit_ok": info.get("beta_fit_ok"), "cf_c": info.get("cf_c"), "cf_sat_c": info.get("cf_sat_c"),
+                    # a group without exactly beta_group_size real rollouts: what it would have been
+                    "n_real_rollouts": len(trajs), "in_model": uid not in not_g_uids,
+                    "verdict_if_complete": verdicts.get(uid, {}).get("verdict_if_complete"),
+                    "sat_verdict_if_complete": sat_verdicts.get(uid, {}).get("verdict_if_complete")}
                    if self.scale_mode == "beta_mirror" else {}),
             })
         # WHO GETS PUSHED, BY WHETHER THEY COMMITTED (tasks with a terminal action:

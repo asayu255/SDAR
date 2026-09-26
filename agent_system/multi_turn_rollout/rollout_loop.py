@@ -1884,6 +1884,8 @@ class TrajectoryCollector:
                 rows[pos]['revisits'] = float(_info.get('revisits', float('nan')))
                 _cm = _info.get('committed', None)
                 rows[pos]['committed'] = float('nan') if _cm is None else float(bool(_cm))
+                # Search's queries actually sent to the retriever so far (NaN on other tasks).
+                rows[pos]['searches'] = float(_info.get('searches', float('nan')))
                 rows[pos]['progress_done_walkset'] = float(_info.get('progress_done_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))

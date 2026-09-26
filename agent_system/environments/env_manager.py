@@ -53,7 +53,7 @@ from agent_system.environments.progress import (
     PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
     PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
     PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
-    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, RevisitCounter,
+    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
@@ -847,6 +847,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._answered_after_seen = [False] * n
         # Repeated queries (shadow column `revisits`), one counter per row.
         self._revisit = [RevisitCounter() for _ in range(n)]
+        # Queries actually sent to the retriever (shadow column `searches`).
+        self._searches = [0] * n
         # Where each route-document row stands in its route (expert_flow only).
         self._route_ptr = [0] * n
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
@@ -920,6 +922,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "information": next_obs,
         })
         self._note_answered(actions)
+        self._note_searches(infos)
         for i, rc in enumerate(list(getattr(self, "_revisit", None) or [])[:len(actions)]):
             rc.step(actions[i])
         self._note_returned(next_obs)
@@ -945,12 +948,14 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             _put_progress(infos, [p[0] for p in _ea], [p[1] for p in _ea],
                           k_key=PROGRESS_K_SEARCH_ANSWERED_INFO, total_key=PROGRESS_TOTAL_SEARCH_ANSWERED_INFO)
             _rv = list(getattr(self, "_revisit", None) or [])
+            _ns = list(getattr(self, "_searches", None) or [])
             for i, info in enumerate(infos):
                 if isinstance(info, dict):
                     info[SEARCH_ANSWERED_INFO] = bool(_ans[i]) if i < len(_ans) else False
                     # The terminal action of this task is the answer.
                     info[COMMITTED_INFO] = bool(_ans[i]) if i < len(_ans) else False
                     info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
+                    info[SEARCHES_INFO] = int(_ns[i]) if i < len(_ns) else 0
             _cov = getattr(self, "_coverage", None) or []
             for i, cov in enumerate(_cov[:len(next_obs)]):
                 cov.step(next_obs[i])
@@ -1011,6 +1016,30 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 done[i] = True
                 if seen[i]:
                     after[i] = True
+
+    def _note_searches(self, infos) -> None:
+        """Count the queries the environment sent to the retriever this turn.
+
+        SearchEnv.step marks a turn that ran the tool with tool_calling=True and the
+        parsed query in tool_input ([None] when the action had no <search> block, and
+        the tool then has nothing to send). The turn that ends the episode -- an
+        answer, or the turn cap, which returns done BEFORE the tool -- carries
+        tool_calling=False. So turns minus answered over-counts a rollout that hit the
+        cap by one; this does not.
+        """
+        counts = getattr(self, "_searches", None)
+        if counts is None:
+            return
+        for i, info in enumerate(list(infos)[:len(counts)]):
+            if not isinstance(info, dict) or not info.get("tool_calling"):
+                continue
+            query = info.get("tool_input")
+            if isinstance(query, (list, tuple)):
+                sent = any(q is not None for q in query)
+            else:
+                sent = query is not None
+            if sent:
+                counts[i] += 1
 
     def _note_returned(self, next_obs) -> None:
         """The progress line's only state: has a returned result carried the answer?

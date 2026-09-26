@@ -76,9 +76,16 @@ SEARCH_ANSWERED_INFO = "search_answered"
 #                          written and the row reads NaN)
 #   progress_done_walkset  ALFWorld: walkthrough lines actually carried out, WITHOUT
 #                          the won => K rule the ranked counts apply
+#   searches               Search: queries the environment has sent to the retriever
+#                          so far. Counted from the env's own tool call (tool_calling
+#                          with a parsed <search> query), not from the turn count: the
+#                          turn that ends the episode -- an answer, or the turn cap,
+#                          where SearchEnv.step returns done before any tool runs --
+#                          sends none, and neither does a turn with no <search> block.
 REVISITS_INFO = "revisits"
 COMMITTED_INFO = "committed"
 PROGRESS_DONE_WALKSET_INFO = "progress_done_walkset"
+SEARCHES_INFO = "searches"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 

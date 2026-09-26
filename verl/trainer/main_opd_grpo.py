@@ -20,7 +20,7 @@ adds is the one difference the arm is named for.
 
 import hydra
 import ray
-from omegaconf import open_dict
+from omegaconf import OmegaConf, open_dict
 
 from verl.trainer.main_opd import (
     build_and_fit,
@@ -83,6 +83,18 @@ def inject_opd_grpo_config(config) -> None:
             # source=document needs no second switch: oci_layout.document_render_on
             # turns the render on for this setting too, so (a) -- which refuses to
             # run beside the rank arm -- is not dragged in by it.
+        # progress_rank.scale_mode=beta_mirror fits a Beta to groups of beta_group_size rollouts
+        # and keeps every group of another size out of the fit and the update, so the two numbers
+        # must agree or no group would ever be inside the model. Checked here, in the first seconds
+        # of a launch, rather than at the first update an hour in.
+        pr = config.algorithm.get("progress_rank", None)
+        if (pr is not None and bool(pr.get("enable", False))
+                and str(pr.get("scale_mode", "budget_cap") or "budget_cap") == "beta_mirror"):
+            n_roll = OmegaConf.select(config, "env.rollout.n", default=None)
+            g_size = int(pr.get("beta_group_size", 8))
+            assert n_roll is not None and int(n_roll) == g_size, (
+                f"progress_rank.scale_mode=beta_mirror: beta_group_size={g_size} but "
+                f"env.rollout.n={n_roll}; the Beta is fitted to groups of exactly that size")
 
 
 def run_opd_grpo(config) -> None:
