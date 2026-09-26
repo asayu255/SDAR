@@ -79,7 +79,7 @@ def test_per_task_weighting_accepts_the_sdar_term():
     )
 
 
-@pytest.mark.parametrize("key", ["use_kl_loss", "use_sdl_loss"])
+@pytest.mark.parametrize("key", ["use_sdl_loss"])
 def test_per_task_weighting_still_refuses_the_terms_it_does_not_weight(key):
     from verl.workers.actor.dp_actor import check_task_weighting_supported
 

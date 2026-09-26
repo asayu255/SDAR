@@ -364,7 +364,9 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
     # term by the same row weights as the policy gradient (see the SDAR block in
     # update_policy), which is what lets an OPD+GRPO run switch its distillation
     # from an external teacher to the skill-conditioned self (algorithm.opsd).
-    for other in ("use_kl_loss", "use_sdl_loss"):
+    # use_kl_loss is NOT refused either (2026-09-26): its branch aggregates the reference-KL
+    # term by the same row weights (see the KL block in update_policy), like the entropy term.
+    for other in ("use_sdl_loss",):
         assert not config.get(other, False), (
             f"per-task loss normalisation weights the policy-gradient, entropy and "
             f"teacher-KL terms; {other} is set and would keep the plain token-mean"
@@ -4486,7 +4488,20 @@ class DataParallelPPOActor(BasePPOActor):
                          kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                          kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                          kl_loss_coef = data.get("kl_loss_coef", None)
-                         if kl_loss_coef is None:
+                         if task_agg_scale is not None:
+                             # Under per-task normalisation the reference-KL term is aggregated
+                             # by the row weights the policy gradient uses -- as the entropy and
+                             # teacher-KL terms are -- so kl_loss_coef keeps meaning what it says.
+                             # actor/kl_loss stays the plain token-mean on every path.
+                             if kl_loss_coef is None:
+                                 kl_term = _task_agg(kld) * self.config.kl_loss_coef
+                                 metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                             else:
+                                 kl_term = _task_agg(kld * kl_loss_coef.reshape(-1, 1).to(kld.dtype))
+                                 metrics["actor/kl_coef"] = kl_loss_coef.float().mean().detach().item()
+                             policy_loss = policy_loss + kl_term
+                             _defer("actor/kl_loss_weighted", kl_term)
+                         elif kl_loss_coef is None:
                              policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                              metrics["actor/kl_coef"] = self.config.kl_loss_coef
                          else:
