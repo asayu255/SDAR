@@ -454,7 +454,9 @@ def test_per_task_weighting_now_accepts_a_policy_gradient():
         ({"ppo_epochs": 2}, "one pass"),
         ({"loss_agg_mode": "seq-mean-token-mean"}, "weighted"),
         ({"policy_loss": {"loss_mode": "gspo"}}, "vanilla"),
-        ({"use_kl_loss": True}, "use_kl_loss"),
+        # use_kl_loss is no longer refused: the reference KL is aggregated by the same row
+        # weights (tests/trainer/test_ref_kl_task_weighting.py); use_sdl_loss still is.
+        ({"use_sdl_loss": True}, "use_sdl_loss"),
     ],
 )
 def test_per_task_weighting_still_refuses_what_would_silently_undo_it(mutation, message):
