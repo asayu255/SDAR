@@ -49,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     get_task_names,
 )
 from verl.trainer.ppo.ray_trainer import (
+    AdvantageEstimator,
     RayPPOTrainer,
     Role,
     _timer,
@@ -2212,6 +2213,25 @@ class OPDRayTrainer(RayPPOTrainer):
                 return out.batch[key]
         raise KeyError(f"no log-prob column in {sorted(out.batch.keys())}")
 
+    def _attach_gigpo_step_returns(self, batch: DataProto) -> DataProto:
+        """GiGPO's per-turn discounted returns (Eq. 5 of 2505.10978), when the estimator is GiGPO.
+
+        RayPPOTrainer.fit computes ``step_rewards`` right after the rollout, and compute_advantage's
+        GiGPO branch reads it (with ``anchor_obs``) for the step-level term; this loop never did, so
+        ``adv_estimator=gigpo`` failed here with a missing column. Computed at the same point: every
+        row of every trajectory is still in the batch, before _select_oci_slots and adjust_batch drop
+        or duplicate rows (the column then travels with its rows). apply_invalid_action_penalty
+        later subtracts the penalty from it exactly as from the token-level scores. A no-op for any
+        other estimator.
+        """
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GiGPO:
+            return batch
+        from gigpo import core_gigpo
+
+        batch.batch["step_rewards"] = core_gigpo.compute_step_discounted_returns(
+            batch=batch, gamma=self.config.algorithm.gamma)
+        return batch
+
     def _select_oci_slots(self, batch: DataProto, metrics: dict) -> DataProto:
         """Keep the eight rollouts each group trains and drop the other two.
 
@@ -2412,6 +2432,7 @@ class OPDRayTrainer(RayPPOTrainer):
 
                     del batch
                     batch = gen_batch_output
+                    batch = self._attach_gigpo_step_returns(batch)
 
                     # TEN GENERATED, EIGHT TRAINED (algorithm.oci_slots), and the
                     # two that are not trained leave HERE -- before anything starts

@@ -80,6 +80,8 @@ COMPOSED_SCRIPTS = [
     # listed: its host launchers pass the knobs its lock pins (speculative decoding, micro batch 5,
     # gradient checkpointing off), where this wrapper carries them.
     "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_qwen3.sh",
+    # OPD+GiGPO: a wrapper of the control with its own lock (GRPO's advantage replaced by GiGPO's).
+    "examples/opd_grpo_trainer/run_multitask_opd_gigpo_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement
