@@ -12,7 +12,8 @@ WHAT IT PROTECTS.
     (the role sat plays); turns that share an anchor and a return get no step term.
   * The launcher composes, matches its own lock (no waiver), differs from the control only where
     the lock says, writes to its own checkpoint directory, and the lock catches a GRPO run.
-  * algorithm.gigpo.exact_statistics (the arm turns it on): a tied step group gets exactly 0 instead
+  * algorithm.gigpo.exact_statistics (OFF on the arm: GiGPO as released; kept for a sensitivity
+    check): when on, a tied step group gets exactly 0 instead
     of a float32 round-off push; adjust_batch's copies leave the real rows' advantages untouched; with
     step_advantage_w = 0 the advantage IS the GRPO arm's, bit for bit; and off, the function is the
     reference implementation bit for bit.
@@ -147,10 +148,11 @@ LOCK = os.path.join(REPO, cfg.trainer.expected_config)
 check(cfg.trainer.expected_config.endswith("expected_multitask_opd_gigpo_config.yaml")
       and check_expected_config(cfg, LOCK) == [], "the wrapper composes and matches its own lock, no waiver")
 check(cfg.algorithm.adv_estimator == "gigpo" and cfg.algorithm.gamma == 0.95
-      and cfg.algorithm.gigpo.mode == "mean_std_norm" and cfg.algorithm.gigpo.exact_statistics
+      and cfg.algorithm.gigpo.mode == "mean_std_norm" and cfg.algorithm.gigpo.exact_statistics is False
       and not cfg.algorithm.progress_rank.enable
       and cfg.actor_rollout_ref.actor.teacher_kl_loss_coef == 0.01 and cfg.trainer.test_freq == -1,
-      "gigpo (gamma .95, mean_std_norm), (a) off, the control's teacher coefficient 0.01, no in-training validation")
+      "gigpo as released (gamma .95, mean_std_norm, reference statistics), (a) off, the control's teacher "
+      "coefficient 0.01, no in-training validation")
 c12 = composed(WRAP, ["algorithm.adv_estimator=grpo"])
 inject_opd_grpo_config(c12)
 check([m[0] for m in check_expected_config(c12, LOCK)] == ["algorithm.adv_estimator"], "the lock catches a GRPO run")
@@ -183,8 +185,7 @@ diff = sorted(k for k in set(fw) | set(fc) if fw.get(k) != fc.get(k))
 IDENT = {"trainer.expected_config", "trainer.project_name", "trainer.experiment_name", "trainer.default_local_dir",
          "trainer.val_instance_log_dir", "trainer.sign_token_dump_dir"}
 # gigpo.mode differs from the config default the control carries (mean_norm), which GRPO never reads.
-EXPECTED = {"algorithm.adv_estimator", "algorithm.gamma", "algorithm.gigpo.mode", "algorithm.gigpo.exact_statistics",
-            "trainer.test_freq",
+EXPECTED = {"algorithm.adv_estimator", "algorithm.gamma", "algorithm.gigpo.mode", "trainer.test_freq",
             "actor_rollout_ref.model.enable_gradient_checkpointing"}
 spec = {k for k in diff if ".speculative_config." in k}
 rest = set(diff) - IDENT - EXPECTED - spec
