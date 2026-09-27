@@ -146,9 +146,24 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
+                                   padding_mask: torch.Tensor = None,
+                                   exact_statistics: bool = False,
                                    ):
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
+
+    ``exact_statistics`` (off by default: the reference implementation, unchanged):
+      * adjust_batch's copies (``padding_mask``) are kept out of both group statistics -- the
+        episode group's and each step group's -- exactly as compute_grpo_outcome_advantage keeps
+        them out of GRPO's. A copy carries its original's uid and anchor, so it would otherwise be
+        counted twice in the yardstick every real row is measured against. Copies still receive an
+        advantage, from their originals' statistic.
+      * the STEP statistic is formed in float64, and a step group whose returns are all equal gets
+        exactly 0. In float32, (x - mean) / (std + 1e-6) turns the round-off of a mean of equal,
+        non-representable returns (10 * 0.95^k, or 9.9 after the invalid-action penalty) into a
+        uniform push of up to ~0.6 on every member -- an artifact of the arithmetic, not of Eq. 7.
+      The EPISODE statistic keeps GRPO's own float32 arithmetic, so with step_advantage_w = 0 this
+      function returns exactly what compute_grpo_outcome_advantage returns on the same rows.
     """
     if mode == "mean_std_norm":
         remove_std = False
@@ -157,14 +172,17 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     else:
         raise ValueError(f"Unknown mode: {mode}")
     
+    pad = padding_mask if exact_statistics else None
     # Compute episode relative advantages (Eq. 3 in the paper).
-    episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std)
+    episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std,
+                                             padding_mask=pad)
     
     # Anchor state grouping (Eq. 6 in the paper).
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
 
     # Compute step relative advantages (Eq. 7 in the paper).
-    step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
+    step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std,
+                                       padding_mask=pad, exact=exact_statistics)
 
     # Compute joint advantages (Eq. 8 in the paper).
     scores = episode_advantages + step_advantage_w * step_advantages
@@ -178,6 +196,7 @@ def episode_norm_reward(token_level_rewards: torch.Tensor,
                         epsilon: float = 1e-6,
                         remove_std: bool = True,
                         compute_mean_std_cross_steps: bool = True,
+                        padding_mask: torch.Tensor = None,
                         ):
     """
     Compute episode-level advantage using mean-std normalization for GiGPO.
@@ -215,6 +234,10 @@ def episode_norm_reward(token_level_rewards: torch.Tensor,
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
+            # adjust_batch's copies stay out of the statistic (compute_grpo_outcome_advantage does
+            # the same); they still get an advantage below, from their originals' statistic.
+            if padding_mask is not None and bool(padding_mask[i]):
+                continue
             if (index[i], traj_index[i]) in seen_pairs:
                 continue
             id2score[index[i]].append(scores[i])
@@ -336,9 +359,13 @@ def step_norm_reward(step_rewards: torch.Tensor,
                       index: np.array,
                       epsilon: float = 1e-6,
                       remove_std: bool = True,
+                      padding_mask: torch.Tensor = None,
+                      exact: bool = False,
                       ):
     """
     Compute step-level advantage using mean-std normalization for GiGPO.
+    ``padding_mask`` rows stay out of the statistic; ``exact`` forms it in float64 and gives a step
+    group whose returns are all equal exactly 0 (see compute_gigpo_outcome_advantage).
     Args:
         step_rewards: `(torch.Tensor)`
             shape: (bs,)
@@ -361,7 +388,27 @@ def step_norm_reward(step_rewards: torch.Tensor,
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
+            if padding_mask is not None and bool(padding_mask[i]):
+                continue
             id2score[index[i]].append(scores[i])
+
+        if exact:
+            # float64, and equal returns -> exactly 0 (no round-off push on a tied step group)
+            out = torch.zeros(bsz, dtype=torch.float64)
+            stats = {}
+            for idx, vals in id2score.items():
+                v = torch.tensor([float(x) for x in vals], dtype=torch.float64)
+                tied = bool(v.max() == v.min())
+                std = torch.std(v) if v.numel() > 1 else torch.tensor(1.0, dtype=torch.float64)
+                stats[idx] = (torch.mean(v), std, tied)
+            for i in range(bsz):
+                mean, std, tied = stats[index[i]]
+                if tied:
+                    continue
+                x = float(scores[i])
+                out[i] = (x - mean) if remove_std else (x - mean) / (std + epsilon)
+            scores = out.to(scores.dtype)
+            return scores.unsqueeze(-1).tile([1, response_length]) * response_mask
 
         for idx in id2score:
             if len(id2score[idx]) == 1:

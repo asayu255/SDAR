@@ -265,6 +265,12 @@
 "algorithm.gigpo.step_advantage_w": 1.0
 "algorithm.gigpo.mode": mean_std_norm
 "algorithm.gigpo.enable_similarity": false
+# adjust_batch's copies stay out of both group statistics, as GRPO's do on the control, and the
+# step statistic is formed in float64 with a tied step group at exactly 0 (in float32 the mean of
+# equal, non-representable returns such as 10*0.95^k or 9.9 is off by round-off, and std + 1e-6
+# turns that into a uniform push of up to ~0.6 on every member). The episode statistic keeps GRPO's
+# own arithmetic, so with step_advantage_w 0 the advantage would be the control's exactly.
+"algorithm.gigpo.exact_statistics": true
 # ---- off -------------------------------------------------------------------------
 # (a), sat and every progress_rank shadow: this is a baseline, not an ablation of the
 # method. (progress_rank also refuses any estimator but grpo.)

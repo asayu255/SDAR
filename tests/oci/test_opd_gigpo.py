@@ -12,6 +12,10 @@ WHAT IT PROTECTS.
     (the role sat plays); turns that share an anchor and a return get no step term.
   * The launcher composes, matches its own lock (no waiver), differs from the control only where
     the lock says, writes to its own checkpoint directory, and the lock catches a GRPO run.
+  * algorithm.gigpo.exact_statistics (the arm turns it on): a tied step group gets exactly 0 instead
+    of a float32 round-off push; adjust_batch's copies leave the real rows' advantages untouched; with
+    step_advantage_w = 0 the advantage IS the GRPO arm's, bit for bit; and off, the function is the
+    reference implementation bit for bit.
 No model and no GPU.
 """
 import inspect
@@ -143,7 +147,8 @@ LOCK = os.path.join(REPO, cfg.trainer.expected_config)
 check(cfg.trainer.expected_config.endswith("expected_multitask_opd_gigpo_config.yaml")
       and check_expected_config(cfg, LOCK) == [], "the wrapper composes and matches its own lock, no waiver")
 check(cfg.algorithm.adv_estimator == "gigpo" and cfg.algorithm.gamma == 0.95
-      and cfg.algorithm.gigpo.mode == "mean_std_norm" and not cfg.algorithm.progress_rank.enable
+      and cfg.algorithm.gigpo.mode == "mean_std_norm" and cfg.algorithm.gigpo.exact_statistics
+      and not cfg.algorithm.progress_rank.enable
       and cfg.actor_rollout_ref.actor.teacher_kl_loss_coef == 0.01 and cfg.trainer.test_freq == -1,
       "gigpo (gamma .95, mean_std_norm), (a) off, the control's teacher coefficient 0.01, no in-training validation")
 c12 = composed(WRAP, ["algorithm.adv_estimator=grpo"])
@@ -178,12 +183,100 @@ diff = sorted(k for k in set(fw) | set(fc) if fw.get(k) != fc.get(k))
 IDENT = {"trainer.expected_config", "trainer.project_name", "trainer.experiment_name", "trainer.default_local_dir",
          "trainer.val_instance_log_dir", "trainer.sign_token_dump_dir"}
 # gigpo.mode differs from the config default the control carries (mean_norm), which GRPO never reads.
-EXPECTED = {"algorithm.adv_estimator", "algorithm.gamma", "algorithm.gigpo.mode", "trainer.test_freq",
+EXPECTED = {"algorithm.adv_estimator", "algorithm.gamma", "algorithm.gigpo.mode", "algorithm.gigpo.exact_statistics",
+            "trainer.test_freq",
             "actor_rollout_ref.model.enable_gradient_checkpointing"}
 spec = {k for k in diff if ".speculative_config." in k}
 rest = set(diff) - IDENT - EXPECTED - spec
 check(not rest, f"against the control it differs only in the estimator and its knobs, test_freq, gradient "
       f"checkpointing, speculative decoding and the run's identity (other: {sorted(rest)})")
+
+print("5. exact statistics")
+import subprocess  # noqa: E402
+import types  # noqa: E402
+
+from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY  # noqa: E402
+from gigpo import core_gigpo as cg  # noqa: E402
+from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage  # noqa: E402
+
+for vals in ([10 * G ** 7] * 7, [9.9] * 6, [10 * G ** 3 - 0.1] * 5):
+    n = len(vals)
+    kw = dict(response_mask=torch.ones(n, 1), index=np.array(["s"] * n, dtype=object), epsilon=1e-6, remove_std=False)
+    ref = float(cg.step_norm_reward(torch.tensor(vals, dtype=torch.float32), **kw)[0, 0])
+    ex = cg.step_norm_reward(torch.tensor(vals, dtype=torch.float32), exact=True, **kw)
+    check(float(ex.abs().max()) == 0.0, f"tied step group of {n} x {vals[0]:.4f}: exactly 0 (float32 reference gives {ref:+.3f})")
+
+rng = np.random.default_rng(0)
+
+
+def random_batch(n_groups=4, pad=0):
+    """Groups of 4 rollouts, 2-6 turns each, anchors from a small vocabulary (so step groups form),
+    success = 10 at the last turn, invalid turns lose 0.1 -- then ``pad`` copies as adjust_batch makes."""
+    cols = {k: [] for k in ("uid", "traj_uid", "anchor_obs", "rewards", "active_masks", "valid")}
+    for g in range(n_groups):
+        for t in range(4):
+            T = int(rng.integers(2, 7)); won = bool(rng.random() < 0.5)
+            for j in range(T):
+                for key, v in zip(cols, (f"g{g}", f"g{g}t{t}", f"s{int(rng.integers(0, 4))}" if j < T - 1 else "goal",
+                                         10.0 if (won and j == T - 1) else 0.0, True, bool(rng.random() < 0.7))):
+                    cols[key].append(v)
+    n = len(cols["uid"])
+    nt = {k: np.array(v, dtype=object) for k, v in cols.items() if k not in ("valid", "rewards", "active_masks")}
+    nt["rewards"] = np.array(cols["rewards"], dtype=np.float32)
+    nt["active_masks"] = np.array(cols["active_masks"], dtype=bool)
+    b = DataProto.from_dict(tensors={"input_ids": torch.zeros(n, 3, dtype=torch.long)}, non_tensors=nt)
+    b = OPDRayTrainer._attach_gigpo_step_returns(_Cfg("gigpo"), b)
+    ep = {}
+    for tr, r in zip(cols["traj_uid"], cols["rewards"]):
+        ep[tr] = max(ep.get(tr, 0.0), r)
+    tlr = torch.zeros(n, R)
+    for i, (tr, v) in enumerate(zip(cols["traj_uid"], cols["valid"])):
+        tlr[i, -1] = ep[tr] - (0.0 if v else 0.1)
+        if not v:
+            b.batch["step_rewards"][i] -= 0.1
+    b.batch["token_level_rewards"] = tlr
+    b.batch["response_mask"] = torch.ones(n, R)
+    b.batch[PADDING_ROW_KEY] = torch.zeros(n, dtype=torch.bool)
+    if pad:
+        dup = b.select_idxs(rng.choice(n, pad, replace=False))
+        dup.batch[PADDING_ROW_KEY] = torch.ones(pad, dtype=torch.bool)
+        b = DataProto.concat([b, dup])
+    return b, n
+
+
+def gigpo(b, w=1.0, exact=True):
+    a, _ = cg.compute_gigpo_outcome_advantage(
+        token_level_rewards=b.batch["token_level_rewards"], step_rewards=b.batch["step_rewards"],
+        response_mask=b.batch["response_mask"], anchor_obs=b.non_tensor_batch["anchor_obs"],
+        index=b.non_tensor_batch["uid"], traj_index=b.non_tensor_batch["traj_uid"], step_advantage_w=w,
+        mode="mean_std_norm", padding_mask=b.batch[PADDING_ROW_KEY], exact_statistics=exact)
+    return a
+
+
+bp, n_real = random_batch(pad=5)
+b0 = bp.select_idxs(np.arange(n_real))
+check(torch.equal(gigpo(bp)[:n_real], gigpo(b0)), "adjust_batch's copies leave every real row's advantage unchanged")
+check(not torch.equal(gigpo(bp, exact=False)[:n_real], gigpo(b0, exact=False)),
+      "(the reference implementation lets them move it)")
+grpo, _ = compute_grpo_outcome_advantage(
+    token_level_rewards=bp.batch["token_level_rewards"], response_mask=bp.batch["response_mask"],
+    index=bp.non_tensor_batch["uid"], traj_index=bp.non_tensor_batch["traj_uid"], norm_adv_by_std_in_grpo=True,
+    compute_mean_std_cross_steps=True, padding_mask=bp.batch[PADDING_ROW_KEY])
+check(torch.equal(gigpo(bp, w=0.0), grpo), "step_advantage_w = 0: exactly the GRPO arm's advantage, copies included")
+src_ref = subprocess.run(["git", "-C", REPO, "show", "743f426:gigpo/core_gigpo.py"], capture_output=True, text=True).stdout
+ref_mod = types.ModuleType("core_gigpo_ref")
+exec(compile(src_ref, "core_gigpo_ref", "exec"), ref_mod.__dict__)
+same = True
+for k in range(5):
+    bk, _ = random_batch(pad=3)
+    a_new = gigpo(bk, exact=False)
+    a_ref, _ = ref_mod.compute_gigpo_outcome_advantage(
+        token_level_rewards=bk.batch["token_level_rewards"], step_rewards=bk.batch["step_rewards"],
+        response_mask=bk.batch["response_mask"], anchor_obs=bk.non_tensor_batch["anchor_obs"],
+        index=bk.non_tensor_batch["uid"], traj_index=bk.non_tensor_batch["traj_uid"], step_advantage_w=1.0,
+        mode="mean_std_norm")
+    same &= bool(torch.equal(a_new, a_ref))
+check(same, "exact_statistics off: bit for bit the reference implementation (743f426) on 5 random batches")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

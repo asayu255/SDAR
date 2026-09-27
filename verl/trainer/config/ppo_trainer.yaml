@@ -869,6 +869,11 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+    # True: adjust_batch's copies stay out of both group statistics (as GRPO's do), and the step
+    # statistic is formed in float64 with a tied step group at exactly 0 -- in float32 the round-off of a
+    # mean of equal, non-representable returns (10*0.95^k, 9.9) becomes a uniform push of up to ~0.6.
+    # False (default): the reference implementation, unchanged.
+    exact_statistics: False
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

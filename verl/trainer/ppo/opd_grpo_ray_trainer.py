@@ -338,6 +338,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 gigpo_mode=self.config.algorithm.gigpo.mode,
                 gigpo_enable_similarity=self.config.algorithm.gigpo.enable_similarity,
                 gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                gigpo_exact_statistics=bool(self.config.algorithm.gigpo.get("exact_statistics", False)),
                 # See ray_trainer: pinned rather than defaulted, because an
                 # injected row changes its group's baseline through its length
                 # under the turn-weighted statistic.

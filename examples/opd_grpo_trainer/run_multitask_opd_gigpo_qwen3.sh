@@ -15,6 +15,14 @@
 #                                     nowhere else on this path
 #   algorithm.gigpo.step_advantage_w=1.0, mode=mean_std_norm (as GRPO's std division on
 #                                     the control), enable_similarity=False (exact anchors)
+#   algorithm.gigpo.exact_statistics=True
+#                                     adjust_batch's copies out of both group statistics (as
+#                                     GRPO's on the control), and the step statistic in float64
+#                                     with a tied step group at exactly 0: in float32 the
+#                                     round-off of a mean of equal returns (10*0.95^k, 9.9) is
+#                                     blown up by std+1e-6 into a uniform push of up to ~0.6.
+#                                     The episode statistic stays GRPO's own arithmetic, so the
+#                                     step term is the only difference from the control.
 # The per-turn returns are computed by OPDRayTrainer._attach_gigpo_step_returns right
 # after the rollout (this loop did not compute them before, so gigpo could not run here).
 # The sampling and gradient-path knobs the lock pins (speculative decoding, micro batch
@@ -34,6 +42,7 @@ exec bash "$_HERE/run_multitask_cross_teacher_klw_control_qwen3.sh" \
   algorithm.gigpo.step_advantage_w=1.0 \
   algorithm.gigpo.mode=mean_std_norm \
   algorithm.gigpo.enable_similarity=False \
+  algorithm.gigpo.exact_statistics=True \
   trainer.test_freq=-1 \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4" \

@@ -359,7 +359,7 @@ def assert_grpo_groups_are_one_prompt(data: DataProto) -> None:
     )
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, gigpo_exact_statistics=False, **kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -496,6 +496,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             mode=gigpo_mode,
             enable_similarity=gigpo_enable_similarity,
             similarity_thresh=gigpo_similarity_thresh,
+            # algorithm.gigpo.exact_statistics: adjust_batch's copies out of both statistics (as
+            # GRPO's), the step statistic in float64 with tied returns at exactly 0. Off = reference.
+            padding_mask=data.batch.get(PADDING_ROW_KEY, None),
+            exact_statistics=gigpo_exact_statistics,
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -1998,6 +2002,7 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            gigpo_exact_statistics=bool(self.config.algorithm.gigpo.get("exact_statistics", False)),
                         )
 
                     # tag rows with their task so the actor can split its metrics
