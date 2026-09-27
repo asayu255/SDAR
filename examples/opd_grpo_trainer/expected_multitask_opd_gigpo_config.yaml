@@ -3,7 +3,9 @@
 # by GiGPO's (2505.10978) and nothing else changed. A baseline for the multitask
 # table: it differs from the beta_mirror arm only in how the advantage is formed
 # (GiGPO's anchor-state step groups instead of (a)/sat inside tied groups), and
-# from the control only in the estimator.
+# from the control in the estimator -- plus one detail of the statistics, because GiGPO
+# runs as released: it counts adjust_batch's copies in its group statistics, which this
+# repo's GRPO leaves out (a small shift of the real rows' advantages in groups with a copy).
 #
 # The control's file (expected_multitask_cross_teacher_klw_control_config.yaml)
 # below this header, with two values changed -- adv_estimator gigpo, and gradient
@@ -256,7 +258,8 @@
 # read nowhere else on this path (no GAE). step_advantage_w 1.0 weighs the step
 # term equally with the episode term (Eq. 8). mean_std_norm divides both terms by
 # their group std, as GRPO does on the control (norm_adv_by_std_in_grpo), so the
-# step term is the only change to the advantage; examples/gigpo_trainer uses it for
+# step term is the change to the advantage (apart from the copies, counted here and left
+# out by this repo's GRPO -- see exact_statistics below); examples/gigpo_trainer uses it for
 # ALFWorld and Search (WebShop's example uses mean_norm; one setting has to serve
 # all three tasks here). Anchor states are grouped by exact match (similarity off,
 # the GiGPO default); the rollout loop records the current observation as
@@ -266,9 +269,10 @@
 "algorithm.gigpo.mode": mean_std_norm
 "algorithm.gigpo.enable_similarity": false
 # false: GiGPO as released (user 2026-09-27), the reference core_gigpo arithmetic bit for bit --
-# float32 group statistics, adjust_batch's copies counted in them -- as the proposed method's GRPO
-# also runs as released. true (copies out, the step statistic in float64 with a tied step group at
-# exactly 0 instead of a round-off push of up to ~0.6) is for a sensitivity check, not this arm.
+# float32 group statistics, adjust_batch's copies counted in them. This repo's GRPO keeps the same
+# float32 arithmetic but leaves the copies out, so the two arms differ in that detail too. true
+# (copies out, the step statistic in float64 with a tied step group at exactly 0 instead of a
+# round-off push of up to ~0.6) is for a sensitivity check, not this arm.
 "algorithm.gigpo.exact_statistics": false
 # ---- off -------------------------------------------------------------------------
 # (a), sat and every progress_rank shadow: this is a baseline, not an ablation of the

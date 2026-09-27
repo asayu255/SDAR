@@ -207,8 +207,10 @@ def test_the_expectations_files_pin_it_to_null():
         assert exp["actor_rollout_ref.actor.teacher_kl_loss_coef_by_task"] is None, f
 
 
-def test_unset_takes_the_original_expressions_in_both_branches():
-    """b unset must reproduce the previous loss exactly, not approximately."""
+def _opd_term_block():
+    """update_policy's OPD-term assembly (``if task_loss_weight is None: ... _opd_term ...``), as an
+    AST node that can be EXECUTED, so the test reads the numbers the actor produces rather than
+    the text it is written in (a refactor that keeps the arithmetic must not fail it)."""
     import ast
     import inspect
 
@@ -216,13 +218,74 @@ def test_unset_takes_the_original_expressions_in_both_branches():
 
     fn = next(n for n in ast.walk(ast.parse(inspect.getsource(m)))
               if isinstance(n, ast.FunctionDef) and n.name == "update_policy")
+    blocks = [n for n in ast.walk(fn)
+              if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+              and isinstance(n.test.left, ast.Name) and n.test.left.id == "task_loss_weight"
+              and any(isinstance(o, ast.Is) for o in n.test.ops) and "_opd_term" in ast.unparse(n)]
+    assert len(blocks) == 1, "the OPD-term assembly in update_policy is gone or duplicated"
+    return fn, blocks[0]
+
+
+def _run_opd_term(block, **ns):
+    import ast
+    from types import SimpleNamespace
+
+    from verl.trainer.ppo.core_algos import agg_loss
+
+    env = {"agg_loss": agg_loss, "_defer": lambda *a, **k: None,
+           "self": SimpleNamespace(task_dp_world_size=4, gradient_accumulation=3)}
+    env.update(ns)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[block], type_ignores=[])), "<opd_term>", "exec"), env)
+    return env["_opd_term"]
+
+
+def test_unset_takes_the_original_expressions_in_both_branches():
+    """b unset must reproduce the previous loss exactly, not approximately -- checked on the
+    actor's own code, executed, in both aggregation branches, value and gradient."""
+    import ast
+
+    from verl.trainer.ppo.core_algos import agg_loss
+
+    fn, block = _opd_term_block()
+    torch.manual_seed(0)
+    kld = torch.rand(3, 5, requires_grad=True)
+    mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]], dtype=torch.float32)
+    coef = 0.01
+
+    # token-mean branch: the original was teacher_kl_loss * teacher_kl_coef
+    tkl = agg_loss(loss_mat=kld, loss_mask=mask, loss_agg_mode="token-mean")
+    got = _run_opd_term(block, task_loss_weight=None, _kl_row_coef=None, _pb_w=None, _kld_for_loss=kld,
+                        teacher_kl_loss=tkl, teacher_kl_coef=coef, response_mask=mask,
+                        loss_agg_mode="token-mean")
+    want = tkl * coef
+    assert torch.equal(got, want)
+    g_got = torch.autograd.grad(got, kld, retain_graph=True)[0]
+    g_want = torch.autograd.grad(want, kld, retain_graph=True)[0]
+    assert torch.equal(g_got, g_want)
+
+    # per-task-weighted branch: the original was sum(row_kl * w) * (dp_world * grad_accum) * coef
+    w = torch.tensor([0.2, 0.5, 0.3])
+    got = _run_opd_term(block, task_loss_weight=w, _kl_row_coef=None, _pb_w=None, _kld_for_loss=kld,
+                        teacher_kl_loss=tkl, teacher_kl_coef=coef, response_mask=mask,
+                        loss_agg_mode="token-mean")
+    want = ((kld * mask).sum(-1) * w).sum() * (4 * 3) * coef
+    assert torch.equal(got, want)
+    assert torch.equal(torch.autograd.grad(got, kld, retain_graph=True)[0],
+                       torch.autograd.grad(want, kld, retain_graph=True)[0])
+
+    # ...and b set scales exactly its task's rows in that branch
+    b = _coef({"webshop": 0.5}, [0, 1, 2])
+    got_b = _run_opd_term(block, task_loss_weight=w, _kl_row_coef=b, _pb_w=None, _kld_for_loss=kld,
+                          teacher_kl_loss=tkl, teacher_kl_coef=coef, response_mask=mask,
+                          loss_agg_mode="token-mean")
+    want_b = ((kld * mask).sum(-1) * (w * b)).sum() * (4 * 3) * coef
+    assert torch.equal(got_b, want_b) and not torch.equal(got_b, want)
+
+    # the term reaches the loss once, added to policy_loss
+    adds = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+            and ast.unparse(n) == "policy_loss = policy_loss + _opd_term"]
+    assert len(adds) == 1
     src = ast.unparse(fn)
-    assert ("if _kl_row_coef is None:\n"
-            "                            policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef"
-            ) in src.replace("\n                        ", "\n                            ") or (
-        "policy_loss = policy_loss + teacher_kl_loss * teacher_kl_coef" in src)
-    assert ("_row_w = task_loss_weight if _kl_row_coef is None "
-            "else task_loss_weight * _kl_row_coef") in src
     # and the effective-coefficient metric is only emitted when b is set. It is
     # built from the CONFIG at the end of the call rather than read off the row
     # tensor per micro-batch: b_task is a constant, and the read was three host

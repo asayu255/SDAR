@@ -6,7 +6,12 @@
 # 0.01, per-task loss normalisation, the invalid-action penalty), so that it differs
 #   - from the beta_mirror arm only in how the advantage is formed: GiGPO's step-level
 #     term over anchor-state groups instead of (a)/sat inside tied groups;
-#   - from the control only in the estimator.
+#   - from the control in the estimator -- and, because GiGPO runs as released, in one
+#     detail of the statistics: GiGPO counts adjust_batch's copies (up to 39 rows a step)
+#     in its group statistics, where this repo's GRPO leaves them out. A copy moves the
+#     real rows' advantages of its own group only (median ~0.01, at most ~0.06 in std
+#     units on groups of 8 rollouts x 5-40 turns); "the step term is the only change" is
+#     therefore not exact.
 # GiGPO's step term also works inside all-success groups (the discounted return
 # favours reaching success sooner), which is why it is the baseline sat has to beat.
 #
@@ -21,8 +26,9 @@
 #                                     group statistics (a tied step group of equal returns such
 #                                     as 10*0.95^k or 9.9 can get a round-off push of up to
 #                                     ~0.6) and adjust_batch's copies counted in the statistics,
-#                                     as in verl-agent. The proposed method's GRPO runs as
-#                                     released too. True is kept for a sensitivity check only.
+#                                     as in verl-agent. This repo's GRPO has the same float32
+#                                     arithmetic but leaves the copies out of its statistics.
+#                                     True is kept for a sensitivity check only.
 # The per-turn returns are computed by OPDRayTrainer._attach_gigpo_step_returns right
 # after the rollout (this loop did not compute them before, so gigpo could not run here).
 # The sampling and gradient-path knobs the lock pins (speculative decoding, micro batch
