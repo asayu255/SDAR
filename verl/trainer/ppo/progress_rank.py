@@ -26,6 +26,8 @@ A group fires only when its k are not all equal AND its furthest rollout reached
 ``min_top_k`` steps (WebShop 2: a results page showing the product is hit by
 chance; ALFWorld 1 under its milestone count, whose first milestone -- took an
 object of the target type -- is not; Search 1, where there is one step).
+min_top_k 0 turns the minimum off (k are non-negative integers, so a group whose
+k differ always has top k >= 1); the beta-mirror v2 arm does, on every task.
 A stuck group with no difference is (b)'s, and is left at zero here.
 
 HOW c IS SET, PER TASK, EVERY STEP.
@@ -133,7 +135,8 @@ ALFWorld groups the slowest winner took 20-23 turns against the fastest's 8, and
 revisiting that makes every ALFWorld failure run into the 50-turn cap. A winner
 that looped through invalid turns is longer, so it lands on the pushed-down side.
 Search is left out: its turn count is the number of searches. A group fires only
-when its turn counts differ by at least sat_min_spread (ALFWorld 2, WebShop 1).
+when its turn counts differ by at least sat_min_spread (ALFWorld 2, WebShop 1;
+0 = any gap, as in the beta-mirror v2 arm -- equal turns never fire anyway).
 c_sat = sat_rho * E / u_sat per task and step, under the same cap (no winning
 token pushed up more than kappa * S); it waits for E and S like (a) does, and
 sat_rho = 0 adds nothing. Prior art for the idea (step-discounted or step-decayed

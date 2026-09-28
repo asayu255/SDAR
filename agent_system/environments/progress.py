@@ -288,6 +288,16 @@ class AlfworldWalkSet:
 #   look_at_obj_in_light           took a target object; used a lamp of the target type       K=2
 #   pick_{clean,heat,cool}_then_*  took one; cleaned / heated / cooled one; placed a treated one K=3
 #   pick_two_obj_and_place         took one; placed one; took a second instance; placed two   K=4
+# "PLACED" MEANS IN THE RECEPTACLE AT ONCE (2026-09-28): the milestone counts the most
+# target objects the rollout has had inside ONE receptacle instance at the same time,
+# not every instance it has ever put down. The goal checks two objects in the same
+# receptacle at the same moment, and a replay of 2,813 validation trajectories against
+# the game's facts found 13 of 609 pick_two failures that the ever-count put at K (K+1
+# with arrived), level with a win: 12 put one object in, took it back out and put the
+# other in, and 1 put one each into drawer 1 and drawer 2. A take from a receptacle
+# removes the object from it; nothing else can (put/move need the object in hand).
+# Every other task type wins, and ends, on its first counted placement, so the two
+# counts agree there.
 # The task type and targets come from traj_data.json beside the game file
 # (pddl_params). A task type outside these six, or a sliced-object task (no
 # walkthrough either), has no milestones: K = 0.
@@ -385,7 +395,11 @@ class AlfworldMilestones:
         self.treatment = _ALF_TREATMENT.get(self.task_type)
         self.took = set()        # target-object instances ever picked up
         self.treated = set()     # target-object instances cleaned / heated / cooled
-        self.placed = set()      # target-object instances placed in a target receptacle
+        self.placed = set()      # target-object instances ever placed in a target receptacle
+        # target-object instances inside each receptacle instance of the target type now,
+        # and the most there have been in one of them at once (the counted milestone)
+        self._inside = {}
+        self.placed_at_once = 0
         self.used_lamp = False
         # "arrived" (alfworld_k = milestone_arrive; tracked always, counted only there).
         self.arrived = False
@@ -413,6 +427,8 @@ class AlfworldMilestones:
         if m:
             if m.group(1) == self.object:
                 self.took.add(m.group(2))
+                if m.group(3) == self.receptacle:
+                    self._inside.get(m.group(4), set()).discard(m.group(2))
             return
         m = _ALF_PLACE.match(a)
         if m:
@@ -421,6 +437,9 @@ class AlfworldMilestones:
                 # A treatment task only counts a treated object going in.
                 if not self.treatment or idx in self.treated:
                     self.placed.add(idx)
+                    here = self._inside.setdefault(m.group(6), set())
+                    here.add(idx)
+                    self.placed_at_once = max(self.placed_at_once, len(here))
                     self.arrived = True      # placed => arrived
             return
         m = _ALF_TREAT.match(a)
@@ -470,14 +489,15 @@ class AlfworldMilestones:
         if self.won:
             return self.total
         took = int(bool(self.took))
+        placed1 = int(self.placed_at_once >= 1)
         if self.task_type == "pick_and_place_simple":
-            return took + int(bool(self.placed))
+            return took + placed1
         if self.task_type == "look_at_obj_in_light":
             return took + int(self.used_lamp)
         if self.treatment:
-            return took + int(bool(self.treated)) + int(bool(self.placed))
-        # pick_two_obj_and_place
-        return took + int(len(self.placed) >= 1) + int(len(self.took) >= 2) + int(len(self.placed) >= 2)
+            return took + int(bool(self.treated)) + placed1
+        # pick_two_obj_and_place: both objects in one receptacle at the same time
+        return took + placed1 + int(len(self.took) >= 2) + int(self.placed_at_once >= 2)
 
     @property
     def total_arrive(self) -> int:

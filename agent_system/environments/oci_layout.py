@@ -659,9 +659,16 @@ def evidence_in_text(text, target, question=None) -> bool:
 def is_yesno(target) -> bool:
     """Yes/no questions have no document in this mode.
 
-    The rule is a string test, and "yes" appears in almost any passage, so the
-    progress line would read "found" before the first search. HotpotQA's
-    comparison questions are 8 of 156 in a seed-0 sample of the training data.
+    The rule is a string test, and the answer to a yes/no question is a judgement
+    over facts (two entities' nationalities, dates, ...), never a string a passage
+    carries. Measured 2026-09-27 on 700 replayed validation trajectories: in none of
+    the 21 yes/no questions (12 won) did a retrieved result contain the answer word;
+    "yes" was in 0 of 1,298 retrieved results, "no" in 9.2% -- as numbering ("No. 5")
+    or a split "Noe" -- so the test would never fire on "yes" and would fire on "no"
+    for reasons unrelated to the question. (An earlier version of this comment said
+    "yes" appears in almost any passage; the data say the opposite, and the exclusion
+    stands for the reason above.) HotpotQA's comparison questions are 8 of 156 in a
+    seed-0 sample of the training data.
     """
     answers = [fold_text(a) for a in answer_strings(target)]
     return bool(answers) and all(a in ("yes", "no") for a in answers)

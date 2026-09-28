@@ -120,6 +120,23 @@ v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"],
                           traj_prog=pr.trajectory_progress(b["tuids"], b["k_rows"], b["total_rows"], range(2)),
                           min_top_k=pr.DEFAULT_MIN_TOP_K, tasks=["search"])
 check(v["g"]["verdict"] == "fired", "Search fires on its single step (min_top_k 1)")
+# The beta-mirror v2 arm: min_top_k 0 on every task. A WebShop group whose furthest rollout only saw the product on
+# a results page (top k = 1) is top_below_min under the default 2 and fires at 0; a tied group still does not.
+b = build([("g", "webshop", [("a", 1, 0.0, 1, 5, 0.0), ("b", 1, 0.0, 0, 5, 0.0)])])
+grp = pr.failed_groups(b["uids"], b["tuids"], b["task_names"], b["episode_rewards"], range(2))
+tp = pr.trajectory_progress(b["tuids"], b["k_rows"], b["total_rows"], range(2))
+v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"], traj_prog=tp,
+                          min_top_k=pr.DEFAULT_MIN_TOP_K, tasks=["webshop"])
+check(v["g"]["verdict"] == "top_below_min", "WebShop top k = 1 is below the default minimum 2")
+v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"], traj_prog=tp,
+                          min_top_k={"alfworld": 0, "webshop": 0, "search": 0}, tasks=["webshop"])
+check(v["g"]["verdict"] == "fired", "min_top_k 0: the same group fires")
+b = build([("g", "webshop", [("a", 1, 0.0, 1, 5, 0.0), ("b", 1, 0.0, 1, 5, 0.0)])])
+grp = pr.failed_groups(b["uids"], b["tuids"], b["task_names"], b["episode_rewards"], range(2))
+v = pr.score_stuck_groups(grp, tuids=b["tuids"], stat_rows=b["stat_rows"],
+                          traj_prog=pr.trajectory_progress(b["tuids"], b["k_rows"], b["total_rows"], range(2)),
+                          min_top_k={"alfworld": 0, "webshop": 0, "search": 0}, tasks=["webshop"])
+check(v["g"]["verdict"] == "no_difference", "min_top_k 0: a tied group still does not fire")
 
 print("4. the score is zero-sum over what the GRPO statistic counts")
 # Three rollouts of different LENGTHS: 5, 2 and 1 turns. Under the cross-steps

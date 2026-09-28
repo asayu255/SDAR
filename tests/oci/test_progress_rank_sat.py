@@ -148,5 +148,13 @@ except AssertionError:
 ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_min_spread={"alfworld": 1})
 b, new, m = run(ctl, [LIVE, NARROW, WS_LIVE])
 check(float((new - b["advantages"])[rows_of(b, "N1")].abs().sum()) > 0, "sat_min_spread is read")
+# The beta-mirror v2 arm: sat_min_spread 0 on every task = fire on any turn gap; equal turns still never fire.
+EQUAL = ("equal", "alfworld", [("E1", 6, 10.0, 2, 2, 0.0, 0), ("E2", 6, 10.0, 2, 2, 0.0, 0)])
+ctl = pr.ProgressRankController(rho=0.0, sat_rho=0.2, sat_min_spread={"alfworld": 0, "webshop": 0, "search": 0})
+b, new, m = run(ctl, [LIVE, NARROW, EQUAL, WS_LIVE])
+check(float((new - b["advantages"])[rows_of(b, "N1")].abs().sum()) > 0, "sat_min_spread 0: a one-turn gap fires")
+check(float((new - b["advantages"])[np.concatenate([rows_of(b, "E1"), rows_of(b, "E2")])].abs().sum()) == 0.0,
+      "sat_min_spread 0: a group of equal turns still gets nothing")
+check(m.get("progress_rank/alfworld/sat_spread_below_min", 0.0) == 0.0, "sat_min_spread 0: nothing is 'below the spread'")
 
 sys.exit(0 if ok else 1)

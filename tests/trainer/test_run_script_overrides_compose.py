@@ -80,6 +80,9 @@ COMPOSED_SCRIPTS = [
     # listed: its host launchers pass the knobs its lock pins (speculative decoding, micro batch 5,
     # gradient checkpointing off), where this wrapper carries them.
     "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_qwen3.sh",
+    # Its v2 (the next-run recipe of 2026-09-27: no firing minimum, no sat spread minimum, search_k
+    # evidence_answered), with its own lock.
+    "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement
