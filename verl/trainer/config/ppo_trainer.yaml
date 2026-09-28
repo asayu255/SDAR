@@ -799,7 +799,9 @@ algorithm:
     beta_group_size: 8
     # Keep WebShop groups whose goal the environment cannot pay (its option-matching bug caps the correct
     # purchase below 1.0: ~8% of training goals, 12/126 validation goals; flagged per row as goal_capped)
-    # out of the tied-group shares and the success histogram. Their rankings are untouched.
+    # out of the tied-group shares and the success histogram: the Beta then describes F(p | not capped).
+    # Their rankings are untouched: (a) on them is procedure shaping at the uncapped groups' m_f, not an
+    # imputation of their (zero) outcome signal.
     beta_exclude_capped: false
     # How the Beta's input shares are kept. ema (default): the gate's EMAs, started at the first step's
     # share, with the pseudo-count spread over (this step's groups) / ema_alpha from the first step on.
@@ -809,12 +811,14 @@ algorithm:
     beta_share_estimator: ema
     # What each side's scores are divided by. step (default): this step's mean |s| over the side's fired
     # trajectories, so every step's mean push is exactly m and a lone group gets m whatever its gap.
-    # max_discounted: max(that, its discounted mean over recent steps, retention 1 - ema_alpha): smaller-
-    # than-typical gaps are pushed less than m, none more (m is the ceiling of a step's mean push).
+    # max_discounted: max(that, its discounted mean over recent TRAINING STEPS -- the sums decay by
+    # 1 - ema_alpha every step, fired or not): smaller-than-typical gaps are pushed less than m, none more
+    # (this design takes m as the ceiling of a step's mean push).
     beta_denominator: step
-    # none (default) or max_outcome: no trajectory pushed harder per token than L, the discounted mean of
-    # each step's largest per-token outcome advantage in the task's live groups; a group over it is scaled
-    # by L / its peak (zero-sum and order kept), the others untouched. An outlier guard.
+    # none (default) or max_outcome: no trajectory pushed harder per token than L, the discounted mean (every
+    # training step) of each step's largest per-token BASE advantage (format penalty included) in the task's
+    # live groups; a group over it is scaled by L / its peak, padding copies included (zero-sum and order
+    # kept), the others untouched. No cap before the task's first live group. An outlier guard.
     beta_cap: none
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix

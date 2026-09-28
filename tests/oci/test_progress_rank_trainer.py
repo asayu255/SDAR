@@ -216,6 +216,8 @@ b.non_tensor_batch["task_score"] = np.array([float("nan")] * n, dtype=object)
 # The goal columns as the rollout writes them (NaN outside WebShop); here the batch pretends they came from one.
 b.non_tensor_batch["goal_id"] = np.array([4242.0, 4242.0, 0.0, 0.0, 0.0, 0.0], dtype=object)
 b.non_tensor_batch["goal_price_upper"] = np.array([40.0, 40.0, 1000000.0, 1000000.0, 1000000.0, 1000000.0], dtype=object)
+b.non_tensor_batch["env_seed"] = np.array([3.0, 3.0, 5.0, 5.0, 5.0, 5.0], dtype=object)
+b.non_tensor_batch["goal_product_price"] = np.array([21.5, 21.5, 9.0, 9.0, 9.0, 9.0], dtype=object)
 before = b.batch["advantages"].clone()
 m7 = t._apply_progress_rank(b, t.config.algorithm.progress_rank)
 check(t._turn_caps(["alfworld", "webshop", "search"]) == {"alfworld": 50, "webshop": 15, "search": 4},
@@ -229,8 +231,9 @@ check("progress_rank/alfworld/alt_arrive/stuck_compared" in m7
 recs = {r["uid"]: r for r in t._progress_rank.last_group_records}
 check(recs["stuck"]["length"] == [50.0, 50.0] and recs["stuck"]["k_arrive"] == [5.0, 1.0],
       "the records carry the episode lengths and the other count")
-check(recs["live"]["goal_id"] == 4242 and recs["stuck"]["goal_id"] == 0 and recs["live"]["goal_price_upper"] == 40.0,
-      "...and the goal number and price bound, one per group")
+check(recs["live"]["goal_id"] == 4242 and recs["stuck"]["goal_id"] == 0 and recs["live"]["goal_price_upper"] == 40.0
+      and recs["live"]["env_seed"] == 3 and recs["stuck"]["goal_product_price"] == 9.0,
+      "...and the goal number, price bound, env seed and the goal product's price, one per group")
 cfg2 = make_config()
 cfg2.algorithm.progress_rank.alfworld_k = "milestone_arrive"
 t2 = trainer(cfg2)

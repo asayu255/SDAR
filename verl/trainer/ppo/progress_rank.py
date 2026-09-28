@@ -788,15 +788,19 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
 # No cap: m <= 1 bounds the mean, not one trajectory's push (m max|s| / mean|s|; up to ~2 S in a replay
 # of the satgate run).
 #   5. (beta_denominator=max_discounted) The mean |s| a side is divided by is max(this step's mean |s|,
-#      its discounted mean over the side's recent fired trajectories, retention 1 - alpha): a step whose
-#      gaps are smaller than the recent typical ones is pushed less than m, none more. With the step's
-#      own mean (step, the default) a lone group gets exactly m whatever its gap, so a one-milestone lead
-#      could out-push a group where three rollouts got far. m is then the CEILING of each step's mean push.
+#      its discounted mean over the side's fired trajectories of recent TRAINING STEPS -- the sums decay by
+#      1 - alpha every step, fired or not): a step whose gaps are smaller than the recent typical ones is
+#      pushed less than m, none more. With the step's own mean (step, the default) a lone group gets
+#      exactly m whatever its gap, so a one-milestone lead could out-push a group where three rollouts got
+#      far. Taking m as the CEILING of a step's mean push is this design's choice, not a consequence of
+#      the Beta (m is an expectation; it implies no optimal or safe size for a proxy's update).
 #   6. (beta_cap=max_outcome) No trajectory is pushed harder, per token, than L: the discounted mean
-#      (same retention) of each step's largest per-token outcome advantage in the task's live groups --
-#      a proxy never out-pushes the strongest recent outcome evidence. Applied per GROUP: a group whose
-#      peak exceeds L is scaled by L / peak (its zero-sum and order kept), the others are untouched.
-#      An outlier guard, not a strength rule: in replays of the beta-mirror run it never bound. rho > 0 and sat_rho > 0 only switch the two sides on; their values, cap_kappa and
+#      (same retention, every training step) of each step's largest per-token BASE advantage in the task's
+#      live groups (the GRPO advantage as the base computed it, format penalty included). Applied per
+#      GROUP, padding copies included: a group whose peak exceeds L is scaled by L / peak (its zero-sum
+#      and order kept), the others are untouched. Before the task's first live group there is no L and
+#      no cap (beta/cap_reference_available). An outlier guard, not a strength rule and not a safety
+#      argument (L is large by construction): in replays of the beta-mirror run it never bound. rho > 0 and sat_rho > 0 only switch the two sides on; their values, cap_kappa and
 # the E/S EMAs do not enter the strength (E and S are still kept for the reports).
 SCALE_MODES = ("budget_cap", "beta_mirror")
 BETA_SHARE_ESTIMATORS = ("ema", "discounted_counts")
@@ -1101,6 +1105,16 @@ class ProgressRankController:
         self.beta_counts[task] = {"stuck": keep * c["stuck"] + st, "saturated": keep * c["saturated"] + sa,
                                   "mixed": keep * c["mixed"] + (n - st - sa)}
 
+    def _tick_beta_references(self, task: str) -> None:
+        """One training step passes for the task: the denominator's and the cap's discounted sums decay by
+        1 - alpha whether or not anything fired, so "recent" means recent training steps (the policy moves
+        every step), not recent firings. Called once per task per apply(), before this step's data."""
+        keep = 1.0 - self.alpha
+        for ref in list((self.beta_den_ref.get(task) or {}).values()) + [self.beta_cap_ref.get(task)]:
+            if ref:
+                ref[0] *= keep
+                ref[1] *= keep
+
     def _beta_denominator(self, task: str, side: str, abs_scores: List[float], bi: dict) -> float:
         """What one side's scores are divided by this step (beta_denominator; SCALE_MODES step 5).
 
@@ -1113,36 +1127,38 @@ class ProgressRankController:
         d = float(sum(abs_scores)) / len(abs_scores)
         if self.beta_denominator != "max_discounted":
             return d
-        keep = 1.0 - self.alpha
+        # Already decayed for this step (_tick_beta_references); add this step's trajectories.
         ref = self.beta_den_ref.setdefault(task, {"a": None, "sat": None}).get(side) or [0.0, 0.0]
-        ref = [keep * ref[0] + float(sum(abs_scores)), keep * ref[1] + float(len(abs_scores))]
+        ref = [ref[0] + float(sum(abs_scores)), ref[1] + float(len(abs_scores))]
         self.beta_den_ref[task][side] = ref
         d_ref = ref[0] / ref[1]
         den = max(d, d_ref)
-        bi[f"D_ref_{side}"], bi[f"den_{side}"], bi[f"mean_push_over_m_{side}"] = d_ref, den, d / den
+        # the denominator's own effect (before any cap); the applied mean push is mean_push_over_m_<side>
+        bi[f"D_ref_{side}"], bi[f"den_{side}"], bi[f"denominator_ratio_{side}"] = d_ref, den, d / den
         return den
 
     def _beta_cap_reference(self, task: str, row_mask: np.ndarray, abs_adv: np.ndarray,
                             tokens: np.ndarray) -> Optional[float]:
         """L for beta_cap=max_outcome (SCALE_MODES step 6): the discounted mean of each step's largest
-        per-token outcome advantage in the task's live groups; this step's rows in ``row_mask``. A step
-        with no live group leaves it as it was; None until the task has had one."""
+        per-token base advantage in the task's live groups; this step's rows in ``row_mask``. A step with
+        no live group adds nothing (the sums still decayed); None until the task has had one."""
         if self.beta_cap != "max_outcome":
             return None
         if row_mask.any():
+            # Already decayed for this step (_tick_beta_references); add this step's maximum.
             step_max = float(np.max(abs_adv[row_mask] / np.maximum(tokens[row_mask], 1.0)))
-            keep = 1.0 - self.alpha
             ref = self.beta_cap_ref.get(task) or [0.0, 0.0]
-            self.beta_cap_ref[task] = [keep * ref[0] + step_max, keep * ref[1] + 1.0]
+            self.beta_cap_ref[task] = [ref[0] + step_max, ref[1] + 1.0]
         ref = self.beta_cap_ref.get(task)
         return (ref[0] / ref[1]) if ref and ref[1] > 0.0 else None
 
     def _beta_cap_groups(self, task: str, side: str, c: float, vd: Dict[str, Dict], groups: Dict[str, Dict],
                          coef_rows: np.ndarray, scale_out: Dict[str, float], L: Optional[float],
-                         bi: dict) -> None:
+                         bi: dict, uid_rows: Optional[Dict[str, List[int]]] = None) -> None:
         """beta_cap=max_outcome: scale each fired group of the side whose peak push c * max|s| exceeds L
-        by L / peak -- its rows' coefficient only, so its zero-sum and order are kept and the other
-        groups are untouched. Every fired group's factor (1.0 when not scaled) goes to ``scale_out``."""
+        by L / peak -- its rows' coefficient only (``uid_rows``: every row of the group, padding copies
+        included, so a trajectory's rows keep one coefficient), so its zero-sum and order are kept and the
+        other groups are untouched. Every fired group's factor (1.0 when not scaled) goes to ``scale_out``."""
         if self.beta_cap != "max_outcome" or L is None or L <= 0.0 or c <= 0.0:
             return
         worst, n_scaled = 0.0, 0
@@ -1155,11 +1171,23 @@ class ProgressRankController:
             scale_out[uid] = scale
             if scale < 1.0:
                 n_scaled += 1
-                for i in groups[uid]["rows"]:
+                for i in (uid_rows or {}).get(uid, groups[uid]["rows"]):
                     coef_rows[i] = c * scale
         bi["cap_L"] = L
         bi[f"peak_over_L_{side}"] = worst
         bi[f"groups_capped_{side}"] = n_scaled
+
+    @staticmethod
+    def _beta_applied_mean(task: str, side: str, c: float, vd: Dict[str, Dict], scale: Dict[str, float],
+                           bi: dict, m: Optional[float]) -> None:
+        """The APPLIED mean |push| over the side's fired trajectories, over m (after the denominator and
+        any per-group cap): 1.0 under the step rule with no cap."""
+        if not m or c <= 0.0:
+            return
+        pushes = [abs(c * scale.get(uid, 1.0) * float(s)) for uid, rec in vd.items()
+                  if rec["task"] == task and rec["verdict"] == FIRED for s in rec["scores"].values()]
+        if pushes:
+            bi[f"mean_push_over_m_{side}"] = (sum(pushes) / len(pushes)) / float(m)
 
     def observe_update(self, metrics: dict) -> Dict[str, float]:
         """After the actor update: the teacher term's first-order effect, remembered.
@@ -1210,7 +1238,8 @@ class ProgressRankController:
         return self.success_ema.get(task)
 
     def _beta_metrics(self, metrics: dict, p: str, task: str, bi: dict, *, rows, tokens, task_tokens,
-                      row_score, row_sat, verdicts, sat_verdicts, traj, invalid, u, u_sat, c_sat, cf) -> None:
+                      row_score, row_sat, verdicts, sat_verdicts, traj, invalid, u, u_sat, c_sat, cf,
+                      coef=None, coef_sat=None, cap_scale_a=None, cap_scale_s=None) -> None:
         """scale_mode=beta_mirror, per task: the fit, the strengths, the budget_cap counterfactual, the
         terms' net push by unit, sat's ranking vs uniform part, and each side's premise where it acts."""
         G = self.beta_group_size
@@ -1225,6 +1254,8 @@ class ProgressRankController:
         metrics[f"{pb}/groups_capped"] = float(bi.get("groups_capped", 0))
         metrics[f"{pb}/fired_a_capped"] = float(bi.get("fired_a_capped", 0))
         metrics[f"{pb}/capped_excluded"] = float(bool(bi.get("capped_excluded", False)))
+        # groups whose goal_capped flag was known (WebShop: every group; 0 elsewhere): the audit of the flag
+        metrics[f"{pb}/groups_capped_known"] = float(bi.get("groups_capped_known", 0))
         for side, vd in (("a", verdicts), ("sat", sat_verdicts)):
             metrics[f"{pb}/groups_not_G_fired_{side}"] = float(sum(
                 1 for rec in vd.values() if rec["task"] == task and rec["verdict"] == GROUP_NOT_G
@@ -1254,7 +1285,8 @@ class ProgressRankController:
                 if mid_o and mid_p > 0.0:
                     metrics[f"{pb}/hist_tv_mid"] = 0.5 * sum(abs(obs[k] / mid_o - pred[k] / mid_p) for k in range(1, G))
         for key in ("c_a", "c_sat", "D_a", "D_s", "D_ref_a", "D_ref_sat", "den_a", "den_sat",
-                    "mean_push_over_m_a", "mean_push_over_m_sat", "cap_L", "peak_over_L_a", "peak_over_L_sat",
+                    "denominator_ratio_a", "denominator_ratio_sat", "mean_push_over_m_a", "mean_push_over_m_sat",
+                    "cap_L", "cap_reference_available", "peak_over_L_a", "peak_over_L_sat",
                     "groups_capped_a", "groups_capped_sat"):
             if key in bi:
                 metrics[f"{pb}/{key}"] = float(bi[key])
@@ -1268,29 +1300,33 @@ class ProgressRankController:
         metrics[f"{p}/cf/sat_gate_open"] = gate_raw
         metrics[f"{p}/cf/injected_mean_abs_adv"] = float(cf_c) * float(u)
         metrics[f"{p}/cf/sat_injected_mean_abs_adv"] = float(cf_sat_c) * float(u_sat) * gate_raw
-        # Each term's net push: sum s / sum |s| over trajectories, over turns (rows) and over tokens.
-        for side, row_s, vd in (("a", row_score, verdicts), ("sat", row_sat, sat_verdicts)):
-            ts = [float(s) for rec in vd.values() if rec["task"] == task and rec["verdict"] == FIRED
-                  for s in rec["scores"].values()]
+        # Each term's net push: sum / sum |.| of the APPLIED pushes over trajectories, turns (rows) and
+        # tokens -- each group's own cap factor included (a common coefficient cancels in the ratios).
+        cap_a, cap_s = cap_scale_a or {}, cap_scale_s or {}
+        for side, row_s, vd, row_c, cap in (("a", row_score, verdicts, coef, cap_a),
+                                            ("sat", row_sat, sat_verdicts, coef_sat, cap_s)):
+            ts = [cap.get(uid, 1.0) * float(s) for uid, rec in vd.items() if rec["task"] == task
+                  and rec["verdict"] == FIRED for s in rec["scores"].values()]
             if ts and sum(abs(s) for s in ts) > 0.0:
                 metrics[f"{pb}/{side}_net_traj"] = sum(ts) / sum(abs(s) for s in ts)
-            rs, tk = row_s[rows], tokens[rows]
+            rs, tk = row_s[rows] * (row_c[rows] if row_c is not None else 1.0), tokens[rows]
             if float(np.abs(rs).sum()) > 0.0:
                 metrics[f"{pb}/{side}_net_turn"] = float(rs.sum() / np.abs(rs).sum())
                 metrics[f"{pb}/{side}_net_token"] = float((rs * tk).sum() / (np.abs(rs) * tk).sum())
         # sat's injection split into the within-group ranking (s - mean_g s) and the uniform part.
         rank_m = bonus_m = bonus_signed = 0.0
         rep, rep_max, rep_spread, turns_mean, turns_spread, with_invalid = [], [], [], [], [], []
-        for rec in sat_verdicts.values():
+        for uid_s, rec in sat_verdicts.items():
             if rec["task"] != task or rec["verdict"] != FIRED or not rec["scores"]:
                 continue
             sc = rec["scores"]
             sbar = sum(sc.values()) / len(sc)
+            c_g = c_sat * cap_s.get(uid_s, 1.0)          # the group's APPLIED coefficient
             for t, s in sc.items():
                 tok_t = float(traj[t]["tokens"])
-                rank_m += abs(c_sat * (s - sbar)) * tok_t
-                bonus_m += abs(c_sat * sbar) * tok_t
-                bonus_signed += c_sat * sbar * tok_t
+                rank_m += abs(c_g * (s - sbar)) * tok_t
+                bonus_m += abs(c_g * sbar) * tok_t
+                bonus_signed += c_g * sbar * tok_t
             rv = [traj[t]["revisits"] for t in sc if traj[t]["revisits"] is not None]
             if rv:
                 rep.append(float(np.mean(rv)))
@@ -1356,7 +1392,7 @@ class ProgressRankController:
               alt_counts=None, task_score_rows=None, committed_rows=None,
               revisit_rows=None, done_walkset_rows=None, doc_len_rows=None,
               gamefile_rows=None, search_count_rows=None, capped_rows=None, goal_rows=None,
-              goal_price_rows=None) -> tuple:
+              goal_price_rows=None, env_seed_rows=None, goal_product_price_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -1400,6 +1436,9 @@ class ProgressRankController:
                              same goal can be found.
         ``goal_price_rows``  per row, that goal's price bound (drawn per worker seed, so the same number
                              can come with another bound); the records carry it beside the number.
+        ``env_seed_rows``    per row, WebShop's worker seed: it also draws the catalog's prices, so the
+                             environment is (env seed, goal number), not the number alone
+        ``goal_product_price_rows`` per row, the goal product's price in that environment
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -1471,7 +1510,8 @@ class ProgressRankController:
                                "length": None, "task_score": None, "committed": None,
                                "revisits": None, "done_walkset": None, "doc_len": None,
                                "gamefile": None, "searches": None, "capped": None, "goal": None,
-                               "goal_price": None}
+                               "goal_price": None, "capped_known": False, "env_seed": None,
+                               "goal_product_price": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -1489,12 +1529,19 @@ class ProgressRankController:
                 cp = _finite(capped_rows[i])
                 if cp is not None:
                     x["capped"] = bool(x["capped"]) or cp > 0.5
+                    x["capped_known"] = True
             if goal_rows is not None and x["goal"] is None:
                 gv = _finite(goal_rows[i])
                 if gv is not None:
                     x["goal"] = int(gv)
             if goal_price_rows is not None and x["goal_price"] is None:
                 x["goal_price"] = _finite(goal_price_rows[i])
+            if env_seed_rows is not None and x["env_seed"] is None:
+                es_ = _finite(env_seed_rows[i])
+                if es_ is not None:
+                    x["env_seed"] = int(es_)
+            if goal_product_price_rows is not None and x["goal_product_price"] is None:
+                x["goal_product_price"] = _finite(goal_product_price_rows[i])
             if gamefile_rows is not None and x["gamefile"] is None:
                 gf = gamefile_rows[i]
                 if isinstance(gf, str) and gf:
@@ -1550,6 +1597,7 @@ class ProgressRankController:
         gate_open: Dict[str, bool] = {}
         gate_q: Dict[str, Optional[float]] = {}
         shares: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        share_uids: set = set()          # the groups that entered the shares (records: beta_fit_included)
         for u, g in groups.items():
             task = str(g.get("task") or "")
             if task not in self.tasks or u in not_g_uids or u in share_skip:
@@ -1559,8 +1607,12 @@ class ProgressRankController:
                 continue
             shares[task]["n"] += 1
             shares[task][group_status(g, xs)] += 1
+            share_uids.add(u)
         for task in self.tasks:
             n_t = shares[task]["n"]
+            if not n_t and self.beta_share_estimator == "discounted_counts" and self.beta_counts.get(task):
+                # a training step with no complete group still passes: the counts decay (the clock is steps)
+                self.beta_counts[task] = {k: (1.0 - self.alpha) * v for k, v in self.beta_counts[task].items()}
             if n_t:
                 st_share = shares[task]["stuck"] / n_t
                 sa_share = shares[task]["saturated"] / n_t
@@ -1585,6 +1637,10 @@ class ProgressRankController:
                 not_g[str(groups[u].get("task") or "")] += 1
             capped_n: Dict[str, int] = defaultdict(int)
             capped_fired: Dict[str, int] = defaultdict(int)
+            capped_known_n: Dict[str, int] = defaultdict(int)
+            for u, g in groups.items():
+                if any((traj.get(str(tuids[i])) or {}).get("capped_known") for i in g["rows"] if real[i]):
+                    capped_known_n[str(g.get("task") or "")] += 1
             for u in capped_uids:
                 t_ = str(groups[u].get("task") or "")
                 capped_n[t_] += 1
@@ -1620,6 +1676,7 @@ class ProgressRankController:
                         "n_eff": n_eff, "a": a_, "b": b_, "residual": res, "ok": ok,
                         "hist": list(hist[task]), "groups_not_G": int(not_g[task]),
                         "groups_capped": int(capped_n[task]), "fired_a_capped": int(capped_fired[task]),
+                        "groups_capped_known": int(capped_known_n[task]),
                         "capped_excluded": bool(self.beta_exclude_capped)}
                 if ok:
                     self.beta_ab[task] = (a_, b_)
@@ -1695,8 +1752,14 @@ class ProgressRankController:
         coef_sat = np.zeros(n, dtype=float)
         cap_scale_a: Dict[str, float] = {}
         cap_scale_s: Dict[str, float] = {}
+        uid_rows_all: Dict[str, List[int]] = defaultdict(list)     # every row of a group, padding included
+        if self.beta_cap != "none":
+            for i in range(n):
+                uid_rows_all[str(uids[i])].append(i)
         per_task: Dict[str, dict] = {}
         for task in self.tasks:
+            if self.scale_mode == "beta_mirror":
+                self._tick_beta_references(task)
             rows = real & (names == task)
             p = f"progress_rank/{task}"
             task_tokens = float(tokens[rows].sum())
@@ -1730,8 +1793,10 @@ class ProgressRankController:
             # What the budget_cap rule gives on this step: the counterfactual under beta_mirror.
             cf_c, cf_capped = c, capped
             bi = beta_info.get(task) if self.scale_mode == "beta_mirror" else None
-            if bi is not None and L_task is not None:
-                bi["cap_L"] = L_task
+            if bi is not None and self.beta_cap != "none":
+                bi["cap_reference_available"] = float(L_task is not None)
+                if L_task is not None:
+                    bi["cap_L"] = L_task
             if self.scale_mode == "beta_mirror":
                 # (a) at strength m_f: the mean |push| over the trajectories of the task's fired stuck
                 # groups (zero scores included, each trajectory once) is m_f.
@@ -1747,7 +1812,8 @@ class ProgressRankController:
                     bi["c_a"] = c
             coef[names == task] = c
             if bi is not None:
-                self._beta_cap_groups(task, "a", c, verdicts, groups, coef, cap_scale_a, L_task, bi)
+                self._beta_cap_groups(task, "a", c, verdicts, groups, coef, cap_scale_a, L_task, bi, uid_rows_all)
+                self._beta_applied_mean(task, "a", c, verdicts, cap_scale_a, bi, bi.get("m_f"))
 
             # The saturated-group term: its own share sat_rho of the same E, and
             # the same cap -- no winning token is pushed up more than kappa times
@@ -1819,7 +1885,9 @@ class ProgressRankController:
                     bi["c_sat"] = c_sat
             coef_sat[names == task] = c_sat
             if bi is not None:
-                self._beta_cap_groups(task, "sat", c_sat, sat_verdicts, groups, coef_sat, cap_scale_s, L_task, bi)
+                self._beta_cap_groups(task, "sat", c_sat, sat_verdicts, groups, coef_sat, cap_scale_s, L_task, bi,
+                                      uid_rows_all)
+                self._beta_applied_mean(task, "sat", c_sat, sat_verdicts, cap_scale_s, bi, bi.get("m_s"))
             # The gate, reported whether or not it is enforced: the condition, the two
             # EMAs and q = stuck / (stuck + saturated) among the task's dead groups.
             _es, _ea = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
@@ -1966,7 +2034,8 @@ class ProgressRankController:
                 self._beta_metrics(metrics, p, task, bi, rows=rows, tokens=tokens, task_tokens=task_tokens,
                                    row_score=row_score, row_sat=row_sat, verdicts=verdicts,
                                    sat_verdicts=sat_verdicts, traj=traj, invalid=invalid, u=u, u_sat=u_sat,
-                                   c_sat=c_sat, cf=(cf_c, cf_capped, cf_sat_c, cf_sat_capped))
+                                   c_sat=c_sat, cf=(cf_c, cf_capped, cf_sat_c, cf_sat_capped),
+                                   coef=coef, coef_sat=coef_sat, cap_scale_a=cap_scale_a, cap_scale_s=cap_scale_s)
 
             # Winners the count gives nothing: the analogue of ProGPO's Proposition
             # 4.1(ii), which puts every success above zero coverage. Trajectories
@@ -2056,6 +2125,13 @@ class ProgressRankController:
                 # WebShop: the goal's number, the same on every worker (envs.goal_order).
                 "goal_id": next((x["goal"] for x in xs if x.get("goal") is not None), None),
                 "goal_price_upper": next((x["goal_price"] for x in xs if x.get("goal_price") is not None), None),
+                # WebShop: the worker seed (it also drew the catalog's prices) and the goal product's price there;
+                # (env_seed, goal_id) is the environment, goal_id alone is not.
+                "env_seed": next((x["env_seed"] for x in xs if x.get("env_seed") is not None), None),
+                "goal_product_price": next((x["goal_product_price"] for x in xs
+                                            if x.get("goal_product_price") is not None), None),
+                # whether the goal_capped flag was known for this group (goal_capped False can mean unknown)
+                "goal_capped_known": any(x.get("capped_known") for x in xs),
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],
@@ -2102,8 +2178,15 @@ class ProgressRankController:
                     "verdict_if_complete": verdicts.get(uid, {}).get("verdict_if_complete"),
                     "sat_verdict_if_complete": sat_verdicts.get(uid, {}).get("verdict_if_complete"),
                     # beta_cap: the factor this group's push was scaled by (1.0 unscaled; None: not fired
-                    # on that side, or no cap)
-                    "cap_scale": cap_scale_a.get(uid), "sat_cap_scale": cap_scale_s.get(uid)}
+                    # on that side, or no cap); c / sat_c above are the TASK's coefficients before it, and
+                    # c_applied / sat_c_applied what this group's rows actually got.
+                    "cap_scale": cap_scale_a.get(uid), "sat_cap_scale": cap_scale_s.get(uid),
+                    "c_applied": ((info.get("c") or 0.0) * cap_scale_a.get(uid, 1.0) if verdict == FIRED else None),
+                    "sat_c_applied": ((info.get("sat_c") or 0.0) * cap_scale_s.get(uid, 1.0)
+                                      if sat_verdict == FIRED else None),
+                    # in the Beta's input this step (complete, rewards known, not excluded as capped); in_model
+                    # above says only "complete"
+                    "beta_fit_included": uid in share_uids}
                    if self.scale_mode == "beta_mirror" else {}),
             })
         # WHO GETS PUSHED, BY WHETHER THEY COMMITTED (tasks with a terminal action:

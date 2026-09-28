@@ -185,8 +185,9 @@ class _WsEnvs:
         obs = ["WebShop [SEP] Instruction: [SEP] buy a black large bag [SEP] Search"] * 2
         # Row 0's goal is one the environment cannot pay (WebshopWorker.reset's goal_capped); both carry
         # their goal's number (WebshopWorker.reset's goal_id), 0 included.
-        infos = [{"available_actions": landing, "goal": goal, "goal_capped": c, "goal_id": n, "goal_price_upper": pu}
-                 for c, n, pu in ((True, 0, 40.0), (False, 4242, 1000000))]
+        infos = [{"available_actions": landing, "goal": goal, "goal_capped": c, "goal_id": n, "goal_price_upper": pu,
+                  "env_seed": sd, "goal_product_price": pp}
+                 for c, n, pu, sd, pp in ((True, 0, 40.0, 3, 21.5), (False, 4242, 1000000, 4, 9.99))]
         return obs, infos
 
     def step(self, actions):
@@ -208,6 +209,8 @@ for on in (True, False):
               "every row carries its goal's goal_capped from the worker's reset")
         check([i.get("goal_id") for i in infos] == [0, 4242] and [i.get("goal_price_upper") for i in infos] == [40.0, 1000000],
               "...and its goal's number and price bound")
+        check([i.get("env_seed") for i in infos] == [3, 4] and [i.get("goal_product_price") for i in infos] == [21.5, 9.99],
+              "...and the worker seed (which drew the catalog's prices) and the goal product's price")
         _, _, _, infos = mgr.step(["click[b07abc1234]", "click[b09zzz0000]"])
         check([i.get("progress_k") for i in infos] == [2, 1], "only the row that opened the goal moves on")
         check([i.get("committed") for i in infos] == [False, False] and [i.get("revisits") for i in infos] == [0, 0],
@@ -217,7 +220,8 @@ for on in (True, False):
               "row 0 repeated a click (revisits 1); row 1's buy is the terminal action (committed), goal or not")
     else:
         check(all("progress_k" not in i for i in infos) and all("goal_capped" not in i for i in infos)
-              and all("goal_id" not in i and "goal_price_upper" not in i for i in infos), "off: nothing is written")
+              and all("goal_id" not in i and "goal_price_upper" not in i and "env_seed" not in i for i in infos),
+              "off: nothing is written")
 
 
 print("6b. WebShop goal numbers: one goal, one number, on every worker seed")
@@ -242,7 +246,8 @@ check(random.getstate() == _rng_state, "goal_order leaves the global RNG alone (
 
 class _WsServer:
     def __init__(self, goals):
-        self.goals, self.user_sessions, self.product_item_dict, self.product_prices = goals, {}, {}, {}
+        self.goals, self.user_sessions, self.product_item_dict = goals, {}, {}
+        self.product_prices = {g["asin"]: 10.0 + j / 10 for j, g in enumerate(goals)}
 
 
 class _WsTextEnv:
@@ -265,11 +270,12 @@ random.seed(3)
 random.shuffle(goals)
 random.setstate(_rng_state)
 w = WS.WebshopWorker.__new__(WS.WebshopWorker)
-w.env, w._goal_order = _WsTextEnv(goals), WS.goal_order(3, len(goals))
+w.env, w._goal_order, w._env_seed = _WsTextEnv(goals), WS.goal_order(3, len(goals)), 3
 _, winfo = w.reset(42)
 check(pool[winfo["goal_id"]] is goals[42] and winfo["goal"]["asin"] == goals[42]["asin"]
-      and winfo["goal_price_upper"] == goals[42]["price_upper"],
-      "reset reports the unshuffled number of the goal it was given, and its price bound")
+      and winfo["goal_price_upper"] == goals[42]["price_upper"] and winfo["env_seed"] == 3
+      and winfo["goal_product_price"] == w.env.server.product_prices[goals[42]["asin"]],
+      "reset reports the unshuffled number of the goal it was given, its price bound, the seed and the product's price")
 _, winfo = w.reset(np.int64(42))
 check(pool[winfo["goal_id"]] is goals[7], "a non-int index draws a goal: the number is the drawn goal's, found by the object")
 w._goal_order = None
@@ -328,11 +334,14 @@ tbl = record(True, [{"progress_k": 3, "progress_total": 6}, {}])
 check(tbl[0][0]["progress_k"] == 3.0 and tbl[0][0]["progress_total"] == 6.0, "on: the row carries k and K")
 check(np.isnan(tbl[1][0]["progress_k"]) and np.isnan(tbl[1][0]["progress_total"]),
       "a row whose task has no count gets NaN, so every row has the same columns")
-tbl = record(True, [{"goal_id": 4242, "goal_price_upper": 40.0}, {"goal_id": 0, "goal_price_upper": 1000000}])
-check(tbl[0][0]["goal_id"] == 4242.0 and tbl[1][0]["goal_id"] == 0.0 and tbl[0][0]["goal_price_upper"] == 40.0,
-      "WebShop rows carry the goal number (0 is a number) and its price bound")
+tbl = record(True, [{"goal_id": 4242, "goal_price_upper": 40.0, "env_seed": 7, "goal_product_price": 21.5},
+                    {"goal_id": 0, "goal_price_upper": 1000000, "env_seed": 0, "goal_product_price": 3.0}])
+check(tbl[0][0]["goal_id"] == 4242.0 and tbl[1][0]["goal_id"] == 0.0 and tbl[0][0]["goal_price_upper"] == 40.0
+      and tbl[0][0]["env_seed"] == 7.0 and tbl[1][0]["env_seed"] == 0.0 and tbl[0][0]["goal_product_price"] == 21.5,
+      "WebShop rows carry the goal number (0 is a number), its price bound, the env seed and the product's price")
 tbl = record(True, [{}, {}])
-check(np.isnan(tbl[0][0]["goal_id"]) and np.isnan(tbl[0][0]["goal_price_upper"]), "...NaN where the task has none")
+check(np.isnan(tbl[0][0]["goal_id"]) and np.isnan(tbl[0][0]["goal_price_upper"]) and np.isnan(tbl[0][0]["env_seed"])
+      and np.isnan(tbl[0][0]["goal_product_price"]), "...NaN where the task has none")
 tbl = record(False, [{"progress_k": 3, "progress_total": 6}, {}])
 check("progress_k" not in tbl[0][0] and "goal_id" not in tbl[0][0], "off: the batch keeps control's columns")
 

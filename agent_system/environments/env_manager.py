@@ -54,7 +54,7 @@ from agent_system.environments.progress import (
     PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
     PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
     REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, GOAL_CAPPED_INFO, GOAL_ID_INFO,
-    GOAL_PRICE_INFO, RevisitCounter,
+    GOAL_PRICE_INFO, ENV_SEED_INFO, GOAL_PRODUCT_PRICE_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
@@ -1764,6 +1764,11 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # The goal's price bound beside it: drawn per worker seed, so the number alone is not the instruction.
         self._goal_price = ([(info or {}).get('goal_price_upper') for info in (infos or [])]
                             if _progress_on(self.config) else [])
+        # ...the worker seed (it drew the catalog's prices too) and the goal product's price there.
+        self._env_seed = ([(info or {}).get('env_seed') for info in (infos or [])]
+                          if _progress_on(self.config) else [])
+        self._goal_product_price = ([(info or {}).get('goal_product_price') for info in (infos or [])]
+                                    if _progress_on(self.config) else [])
         # ProGPO's coverage, a shadow of (a)'s k: the simulator's page text as it
         # emitted it, BEFORE format_obs trims it for the prompt.
         self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
@@ -1825,6 +1830,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             _gc = getattr(self, "_goal_capped", None) or []
             _gid = getattr(self, "_goal_id", None) or []
             _gpr = getattr(self, "_goal_price", None) or []
+            _esd = getattr(self, "_env_seed", None) or []
+            _gpp = getattr(self, "_goal_product_price", None) or []
             for i, info in enumerate(infos):
                 if isinstance(info, dict):
                     info[COMMITTED_INFO] = bool(_bt[i]) if i < len(_bt) else False
@@ -1832,6 +1839,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                     info[GOAL_CAPPED_INFO] = _gc[i] if i < len(_gc) else None
                     info[GOAL_ID_INFO] = _gid[i] if i < len(_gid) else None
                     info[GOAL_PRICE_INFO] = _gpr[i] if i < len(_gpr) else None
+                    info[ENV_SEED_INFO] = _esd[i] if i < len(_esd) else None
+                    info[GOAL_PRODUCT_PRICE_INFO] = _gpp[i] if i < len(_gpp) else None
         _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):

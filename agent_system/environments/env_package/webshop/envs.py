@@ -99,6 +99,9 @@ class WebshopWorker:
 
         env_kwargs['seed'] = seed
         self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
+        # The seed is also what drew the catalog's prices (engine.generate_product_prices), so the records
+        # need it beside the goal number to name the environment (info['env_seed'] at reset).
+        self._env_seed = int(seed)
         # Every position's goal number (goal_order), for info['goal_id']. Reproducible only when the
         # env's server built and shuffled the whole list itself: no shared server, no goal filter or limit.
         self._goal_order = None
@@ -176,6 +179,8 @@ class WebshopWorker:
             info['goal_capped'] = goal_capped(self.env.server, goal)
             info['goal_id'] = self._goal_id(goal, idx)
             info['goal_price_upper'] = goal.get('price_upper')
+            info['env_seed'] = getattr(self, '_env_seed', None)
+            info['goal_product_price'] = self.env.server.product_prices.get(goal.get('asin'))
         except (AttributeError, KeyError, TypeError):
             pass
         return obs, info

@@ -669,5 +669,92 @@ check(c16.algorithm.progress_rank.beta_denominator == "max_discounted"
 check(composed().algorithm.progress_rank.beta_denominator == "step" and composed().algorithm.progress_rank.beta_cap == "none",
       "the beta-mirror (v1) launcher keeps the step rule and no cap")
 
+print("17. the cap in the diagnostics, padding, the training-step clock, no L yet, and the new record fields")
+
+
+def live_with(adv):
+    return ("wlive", "webshop", [(f"WL{i}", 4, 10.0 if i < 4 else 0.0, 5 if i < 4 else 3, 5, adv if i < 4 else -adv, 0, 1)
+                                 for i in range(8)])
+
+
+WSAT2 = ("wsat2", "webshop", [(f"WT{i}", 4 + 3 * (i % 2), 10.0, 5, 5, 0.0, 0, 1) for i in range(8)])   # wider gaps
+BS = build([live_with(1.0), WSAT, WSAT2])
+_, m_nc = beta_ctl(beta_denominator="max_discounted").apply(**BS)
+ctl_pk = beta_ctl(beta_denominator="max_discounted")
+ctl_pk.apply(**BS)
+rp = {r["uid"]: r for r in ctl_pk.last_group_records}
+c_s = m_nc[f"{PW}/beta/c_sat"]
+peaks = {u: c_s * max(abs(x) for x in rp[u]["sat_score"]) for u in ("wsat", "wsat2")}
+Lm = 0.5 * (peaks["wsat"] + peaks["wsat2"])          # between the two groups' peaks: only the wider one is scaled
+wide, narrow = max(peaks, key=peaks.get), min(peaks, key=peaks.get)
+BSc = build([live_with(Lm), WSAT, WSAT2], pad=("WT0",))
+ctl_c17 = beta_ctl(beta_denominator="max_discounted", beta_cap="max_outcome")
+new_c, m_c = ctl_c17.apply(**BSc)
+rr = {r["uid"]: r for r in ctl_c17.last_group_records}
+sc_w = rr[wide]["sat_cap_scale"]
+check(abs(sc_w - Lm / peaks[wide]) < 1e-5 and rr[narrow]["sat_cap_scale"] == 1.0 and m_c[f"{PW}/beta/groups_capped_sat"] == 1.0,
+      "only the wider group is scaled, by L / its peak")
+check(abs(rr[wide]["sat_c_applied"] - m_c[f"{PW}/beta/c_sat"] * sc_w) < 1e-9 and rr[narrow]["sat_c_applied"] == m_c[f"{PW}/beta/c_sat"],
+      "records: sat_c is the task's coefficient before the cap, sat_c_applied what each group got")
+ts = [rr[u]["sat_cap_scale"] * x for u in (wide, narrow) for x in rr[u]["sat_score"]]
+tsr = [x for u in (wide, narrow) for x in rr[u]["sat_score"]]
+check(abs(m_c[f"{PW}/beta/sat_net_traj"] - sum(ts) / sum(abs(x) for x in ts)) < 1e-9
+      and abs(m_nc[f"{PW}/beta/sat_net_traj"] - sum(tsr) / sum(abs(x) for x in tsr)) < 1e-9,
+      "the net push is the APPLIED pushes' (each group's own factor in); without the cap, the raw scores'")
+check(m_c[f"{PW}/beta/sat_rank_mass"] < m_nc[f"{PW}/beta/sat_rank_mass"]
+      and abs(m_c[f"{PW}/beta/mean_push_over_m_sat"] - (1.0 * sum(abs(x) for x in ts)) / sum(abs(x) for x in tsr)) < 1e-9
+      and m_c[f"{PW}/beta/denominator_ratio_sat"] == 1.0,
+      "rank mass and the applied mean push / m fall with the cap; the denominator's own ratio stays 1.0 (before it)")
+pad_i = [i for i in range(len(BSc["tuids"])) if str(BSc["tuids"][i]) == "WT0"]
+real_i = [i for i in pad_i if BSc["real_rows"][i]]
+padd_i = [i for i in pad_i if not BSc["real_rows"][i]]
+d_real = float(new_c[real_i[0], 0] - BSc["advantages"][real_i[0], 0])
+d_pad = float(new_c[padd_i[0], 0] - BSc["advantages"][padd_i[0], 0])
+check(len(padd_i) == 1 and abs(d_pad - d_real) < 1e-6 and abs(d_real) <= Lm * (1 + 1e-5),
+      f"a padding copy of a scaled trajectory gets its trajectory's push ({d_pad:.4f} vs {d_real:.4f}), at most L")
+
+WQ = ("wq", "webshop", [(f"WQ{i}", 6, 0.0, 1, 5, 0.0, 0, 0) for i in range(8)])      # all-fail, all k equal: no (a)
+ctl_clock = beta_ctl(beta_denominator="max_discounted")
+ctl_clock.apply(**build([WLIVE, WSAT0, WY]))
+for _ in range(3):
+    ctl_clock.apply(**build([WLIVE, WSAT0, WQ]))
+_, m_clk = ctl_clock.apply(**build([WLIVE, WSAT0, WX]))
+d_step = (0.8 ** 4 * 3.0 + 0.35) / (0.8 ** 4 * 8 + 8)
+check(abs(m_clk[f"{PW}/beta/D_ref_a"] - d_step) < 1e-12,
+      f"the clock is training steps: three steps without an (a) firing still decay it (D_ref {d_step:.4f}; "
+      f"by firings it would be {(0.8 * 3.0 + 0.35) / (0.8 * 8 + 8):.4f})")
+
+ctl_noL = beta_ctl(beta_denominator="max_discounted", beta_cap="max_outcome")
+new_n, m_n = ctl_noL.apply(**build([WSAT0, WY]))
+_, m_n2 = ctl_noL.apply(**build([live_with(1.0), WSAT0, WY]))
+check(m_n[f"{PW}/beta/cap_reference_available"] == 0.0 and f"{PW}/beta/cap_L" not in m_n
+      and m_n2[f"{PW}/beta/cap_reference_available"] == 1.0 and abs(m_n2[f"{PW}/beta/cap_L"] - 1.0) < 1e-6,
+      "before the task's first live group there is no L and no cap, and it is reported; then L exists")
+
+AW = ("aw", "alfworld", [(f"AW{i}", 3, 10.0 if i < 4 else 0.0, 1, 2, 1.0 if i < 4 else -1.0, 0, 1) for i in range(8)])
+ctl_cnt = beta_ctl(beta_share_estimator="discounted_counts")
+ctl_cnt.apply(**build([WLIVE, WSAT0, WY]))
+t1 = sum(ctl_cnt.beta_counts["webshop"].values())
+ctl_cnt.apply(**build([AW]))
+check(abs(t1 - 3.0) < 1e-12 and abs(sum(ctl_cnt.beta_counts["webshop"].values()) - 0.8 * t1) < 1e-12,
+      "a step with no complete WebShop group still decays its counts (3 -> 2.4)")
+
+b_env = dict(with_capped(build([WLIVE, WSAT, WST, WCAP])))
+seed_of = {"wlive": 3, "wsat": 5, "wst": 7, "wcap": 9}
+b_env["env_seed_rows"] = np.array([float(seed_of[u]) if t == "webshop" else float("nan")
+                                   for u, t in zip(b_env["uids"], b_env["task_names"])])
+b_env["goal_product_price_rows"] = np.array([12.5 if t == "webshop" else float("nan") for t in b_env["task_names"]])
+ctl_env = beta_ctl(beta_exclude_capped=True)
+_, m_env = ctl_env.apply(**b_env)
+re_ = {r["uid"]: r for r in ctl_env.last_group_records}
+check(all(re_[u]["env_seed"] == sd and type(re_[u]["env_seed"]) is int and re_[u]["goal_product_price"] == 12.5
+          for u, sd in seed_of.items()),
+      "records carry each group's env seed (int) and its goal product's price")
+check(re_["wcap"]["beta_fit_included"] is False and re_["wcap"]["in_model"] is True
+      and all(re_[u]["beta_fit_included"] is True for u in ("wlive", "wsat", "wst")),
+      "beta_fit_included: the capped group is complete (in_model) but was not in the Beta's input")
+check(all(re_[u]["goal_capped_known"] for u in seed_of) and m_env[f"{PW}/beta/groups_capped_known"] == 4.0,
+      "the capped flag was known for all four WebShop groups, and that is reported")
+
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

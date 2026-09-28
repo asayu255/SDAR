@@ -98,6 +98,11 @@ GOAL_ID_INFO = "goal_id"
 # ...and its price bound (the "price lower than" in the instruction; 1000000 when there is none). It is
 # drawn per worker seed, so one goal number can come with different bounds: the pair is the instruction.
 GOAL_PRICE_INFO = "goal_price_upper"
+# ...and the worker seed, which also drew the catalog's prices (engine.generate_product_prices), so one goal
+# number and bound can come with another price for its product: (env seed, goal number) is the environment.
+# Plus the goal product's price in it.
+ENV_SEED_INFO = "env_seed"
+GOAL_PRODUCT_PRICE_INFO = "goal_product_price"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 

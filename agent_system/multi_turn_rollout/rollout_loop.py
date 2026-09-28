@@ -1897,6 +1897,12 @@ class TrajectoryCollector:
                 # ...and its price bound, drawn per worker seed (the number and the bound are the instruction).
                 _gpu = _info.get('goal_price_upper', None)
                 rows[pos]['goal_price_upper'] = float('nan') if _gpu is None else float(_gpu)
+                # ...the worker seed (it drew the catalog's prices too: seed + goal number = the environment)
+                # and the goal product's price in it (NaN on the other tasks and where unknown).
+                _esd = _info.get('env_seed', None)
+                rows[pos]['env_seed'] = float('nan') if _esd is None else float(_esd)
+                _gpp = _info.get('goal_product_price', None)
+                rows[pos]['goal_product_price'] = float('nan') if _gpp is None else float(_gpp)
                 rows[pos]['progress_done_walkset'] = float(_info.get('progress_done_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))

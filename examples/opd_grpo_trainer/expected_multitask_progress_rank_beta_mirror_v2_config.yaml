@@ -20,10 +20,13 @@
 #     discounted_counts, 2026-09-28, user): C_kind <- (1 - alpha) C_kind + this step's groups,
 #     shares C / sum C, the pseudo-count over sum C (15, 27, 37, ... -> 75 groups), as MoPPS and
 #     Reinforce-Ada. The EMA path used 75 from the first step; the two agree in steady state.
-#   - each side's scores divided by max(this step's mean |s|, its discounted mean) (beta_denominator
-#     max_discounted, 2026-09-28, user): no step's mean push above m, smaller-than-typical gaps less;
-#     and every group's peak push held at L, the discounted largest outcome push in live groups
-#     (beta_cap max_outcome), a group over it scaled alone. Neither adds a constant.
+#   - each side's scores divided by max(this step's mean |s|, its discounted mean over recent training
+#     steps) (beta_denominator max_discounted, 2026-09-28, user): no step's mean push above m,
+#     smaller-than-typical gaps less; and every group's peak push held at L, the discounted (every
+#     training step) largest per-token base advantage in live groups (beta_cap max_outcome), a group
+#     over it scaled alone, padding copies included. Neither adds a scale coefficient.
+#   - (a) keeps ranking the capped WebShop groups (user): procedure shaping at the uncapped groups'
+#     m_f, not an imputation of their outcome signal (the Beta describes F(p | not capped)).
 #   - (code, not a key) ALFWorld's pick_two "placed" counts the most target objects in
 #     ONE receptacle at once, not every instance ever put down (progress.py).
 # Everything else is the beta-mirror lock verbatim; that header follows.

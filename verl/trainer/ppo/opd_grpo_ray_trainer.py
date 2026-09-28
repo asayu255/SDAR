@@ -656,6 +656,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             capped_rows=nt["goal_capped"] if "goal_capped" in nt else None,
             goal_rows=nt["goal_id"] if "goal_id" in nt else None,
             goal_price_rows=nt["goal_price_upper"] if "goal_price_upper" in nt else None,
+            env_seed_rows=nt["env_seed"] if "env_seed" in nt else None,
+            goal_product_price_rows=nt["goal_product_price"] if "goal_product_price" in nt else None,
             revisit_rows=nt["revisits"] if "revisits" in nt else None,
             done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
             doc_len_rows=self._document_lengths(nt, task_names),

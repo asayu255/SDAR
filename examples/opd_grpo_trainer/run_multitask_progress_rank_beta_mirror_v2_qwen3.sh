@@ -13,11 +13,11 @@
 #                            the pseudo-count weighs against the data actually collected (15, 27, 37, ...
 #                            groups -> 75), not 75 from the first step.
 #   algorithm.progress_rank.beta_denominator=max_discounted
-#                            each side divided by max(this step's mean |s|, its discounted mean): a step
-#                            with smaller-than-typical gaps pushed less than m, none more.
+#                            each side divided by max(this step's mean |s|, its discounted mean over recent
+#                            training steps): smaller-than-typical gaps pushed less than m, none more.
 #   algorithm.progress_rank.beta_cap=max_outcome
-#                            no trajectory pushed harder per token than the strongest recent outcome push
-#                            in live groups (discounted); a group over it is scaled down alone.
+#                            no trajectory pushed harder per token than L, the discounted largest per-token
+#                            base advantage in live groups; a group over it is scaled down alone.
 # and, in code, ALFWorld pick_two's "placed" counted as the objects in one receptacle at
 # once (agent_system/environments/progress.py).
 # Lock: expected_multitask_progress_rank_beta_mirror_v2_config.yaml (no waiver needed).
