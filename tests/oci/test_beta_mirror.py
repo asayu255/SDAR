@@ -26,6 +26,10 @@ WHAT IT PROTECTS.
   * beta_share_estimator=discounted_counts: the shares and the pseudo-count's weight come from discounted
     group counts (3 groups at the first step, not 3 / alpha), equal the EMA path in steady state, round-trip
     through the state, resume from an EMA-path state at its count; the v2 launcher and lock pin it.
+  * beta_denominator=max_discounted: a lone small-gap group is divided by the discounted mean (pushed less
+    than m), a large-gap step stays at m, never above; beta_cap=max_outcome scales only the group whose peak
+    exceeds L (the live groups' largest per-token advantage), keeping its zero-sum and order; both
+    references round-trip; the v2 launcher and lock pin both.
 No model and no GPU.
 """
 import json
@@ -281,8 +285,8 @@ state = half.state_dict()
 resumed = beta_ctl(beta_group_size=6)
 resumed.load_state_dict(state)
 new_r, m_r = resumed.apply(**build(steps[2]))
-check(state["version"] == 6 and state["beta_ab"]["alfworld"] is not None,
-      "the state carries the fitted (a, b) (since version 5; 6 adds the discounted counts)")
+check(state["version"] == 7 and state["beta_ab"]["alfworld"] is not None,
+      "the state carries the fitted (a, b) (since version 5; 6 adds the discounted counts, 7 the references)")
 check(torch.equal(new_r, outs[2][0]) and m_r[f"{P}/beta/a"] == outs[2][1][f"{P}/beta/a"],
       "a controller resumed from step 2's state reproduces step 3 exactly")
 old = beta_ctl()
@@ -541,7 +545,7 @@ ctl_r = beta_ctl(beta_share_estimator="discounted_counts")
 ctl_r.load_state_dict(json.loads(json.dumps(ctl_c.state_dict())))
 _, m_next = ctl_c.apply(**b_a)
 _, m_res = ctl_r.apply(**b_a)
-check(ctl_c.state_dict()["version"] == 6
+check(ctl_c.state_dict()["version"] == 7
       and all(m_next[f"{PW}/beta/{k}"] == m_res[f"{PW}/beta/{k}"] for k in ("n_eff", "q_f", "q_s", "m_f", "m_s")),
       "the counts round-trip through the (JSON) state: a resumed controller equals the continuous one")
 old = ctl_e2.state_dict()
@@ -571,6 +575,99 @@ check(c15.algorithm.progress_rank.beta_share_estimator == "discounted_counts"
       and check_expected_config(c15, LOCK2) == [] and len(check_expected_config(c15e, LOCK2)) == 1,
       "the v2 launcher sets discounted_counts, matches its lock, and the lock catches the EMA path")
 check(composed().algorithm.progress_rank.beta_share_estimator == "ema", "the beta-mirror (v1) launcher keeps the EMA path")
+
+print("16. beta_denominator=max_discounted (no step above m) and beta_cap=max_outcome (per-group guard)")
+WY = ("wy", "webshop", [(f"WY{i}", 6, 0.0, 5 if i < 3 else 1, 5, 0.0, 0, 0) for i in range(8)])   # mean|s| .375
+WX = ("wx", "webshop", [(f"WX{i}", 6, 0.0, 2 if i == 0 else 1, 5, 0.0, 0, 0) for i in range(8)])  # mean|s| .04375
+WSAT0 = ("wsat0", "webshop", [(f"WZ{i}", 4, 10.0, 5, 5, 0.0, 0, 1) for i in range(8)])            # no sat: equal turns
+
+
+def pushes(new, bb, uid):
+    """{trajectory: its push} for one group (every row of a trajectory gets the same push)."""
+    out = {}
+    for i in np.where(bb["uids"] == uid)[0]:
+        out[str(bb["tuids"][i])] = float(new[i, 0] - bb["advantages"][i, 0])
+    return out
+
+
+ctl_d, ctl_st = beta_ctl(beta_denominator="max_discounted"), beta_ctl()
+seq = [build([WLIVE, WSAT0, WY]), build([WLIVE, WSAT0, WX]), build([WLIVE, WSAT0, WY])]
+got, mean_st = [], []
+for j, bb in enumerate(seq):
+    new_d, md = ctl_d.apply(**bb)
+    new_s, ms = ctl_st.apply(**bb)
+    uid = "wx" if j == 1 else "wy"
+    pd, ps = pushes(new_d, bb, uid), pushes(new_s, bb, uid)
+    got.append((md[f"{PW}/beta/mean_push_over_m_a"], sum(abs(v) for v in pd.values()) / 8 / md[f"{PW}/beta/m_f"],
+                md[f"{PW}/beta/D_ref_a"], pd))
+    mean_st.append(sum(abs(v) for v in ps.values()) / 8 / ms[f"{PW}/beta/m_f"])
+D2, D3 = (0.8 * 3.0 + 0.35) / (0.8 * 8 + 8), (0.8 * 2.75 + 3.0) / (0.8 * 14.4 + 8)
+check(all(abs(x - 1.0) < 1e-5 for x in mean_st), "the step rule: every step's mean push is exactly m, the lone X included")
+check(abs(got[0][0] - 1.0) < 1e-12 and abs(got[1][2] - D2) < 1e-12 and abs(got[1][0] - 0.04375 / D2) < 1e-9
+      and abs(got[1][1] - 0.04375 / D2) < 1e-5,
+      f"max_discounted: step 1 at m; the lone one-step lead X at {0.04375 / D2:.3f} m (divided by the discounted "
+      f"mean {D2:.4f}, not its own .04375)")
+check(abs(got[2][2] - D3) < 1e-12 and abs(got[2][0] - 1.0) < 1e-12 and abs(got[2][1] - 1.0) < 1e-5,
+      "a step with larger gaps than the discounted mean stays at m, never above")
+sx = {r["uid"]: r for r in ctl_d.last_group_records}
+px = got[1][3]
+ratios = [px[t] / sc for t, sc in zip(sorted(px), [0.175] + [-0.025] * 7)]
+check(max(ratios) - min(ratios) < 1e-4 * max(abs(x) for x in ratios) and abs(sum(px.values())) < 1e-6,
+      "the group's pushes stay proportional to its scores: order and zero-sum kept")
+
+B0 = build([WLIVE, WSAT0, WY, WX])
+_, m0 = beta_ctl(beta_denominator="max_discounted").apply(**B0)
+c0 = m0[f"{PW}/beta/c_a"]
+Lx = 0.3 * c0                                   # between WX's peak (.175 c) and WY's (.5 c)
+WLIVE_L = ("wlive", "webshop", [(f"WL{i}", 4, 10.0 if i < 4 else 0.0, 5 if i < 4 else 3, 5, Lx if i < 4 else -Lx, 0, 1)
+                                for i in range(8)])
+B1 = build([WLIVE_L, WSAT0, WY, WX])
+ctl_cap = beta_ctl(beta_denominator="max_discounted", beta_cap="max_outcome")
+new1, m1 = ctl_cap.apply(**B1)
+py, pxx = pushes(new1, B1, "wy"), pushes(new1, B1, "wx")
+rc = {r["uid"]: r for r in ctl_cap.last_group_records}
+check(abs(m1[f"{PW}/beta/cap_L"] - Lx) < 1e-6 and abs(m1[f"{PW}/beta/c_a"] - c0) < 1e-12,
+      "L = the live group's largest per-token advantage (first step); the coefficient itself is unchanged")
+check(all(abs(v - 0.6 * c0 * sc) < 1e-5 for v, sc in zip([py[t] for t in sorted(py)], [0.5] * 3 + [-0.3] * 5))
+      and abs(sum(py.values())) < 1e-6,
+      "WY (peak .5 c > L) is scaled by L / peak = 0.6 as a whole: zero-sum and order kept")
+check(all(abs(pxx[t] - c0 * sc) < 1e-5 for t, sc in zip(sorted(pxx), [0.175] + [-0.025] * 7)),
+      "WX (peak .175 c < L) is untouched")
+check(m1[f"{PW}/beta/groups_capped_a"] == 1.0 and abs(m1[f"{PW}/beta/peak_over_L_a"] - 0.5 / 0.3) < 1e-5
+      and abs(m1[f"{PW}/top_push"] - Lx) < 1e-6 and abs(rc["wy"]["cap_scale"] - 0.6) < 1e-5
+      and rc["wx"]["cap_scale"] == 1.0 and rc["wlive"]["cap_scale"] is None,
+      "reported: one group scaled, peak/L 1.67 before, top push = L after; the records carry each factor")
+st = json.loads(json.dumps(ctl_cap.state_dict()))
+ctl_r2 = beta_ctl(beta_denominator="max_discounted", beta_cap="max_outcome")
+ctl_r2.load_state_dict(st)
+n_a, m_a = ctl_cap.apply(**B1)
+n_b, m_b = ctl_r2.apply(**B1)
+check(st["version"] == 7 and torch.equal(n_a, n_b)
+      and all(m_a[f"{PW}/beta/{k}"] == m_b[f"{PW}/beta/{k}"] for k in ("D_ref_a", "den_a", "cap_L", "c_a")),
+      "both references round-trip through the (JSON) state: resumed == continuous")
+for kw, what in (({"beta_denominator": "window"}, "an unknown denominator"), ({"beta_cap": "kappa"}, "an unknown cap")):
+    try:
+        beta_ctl(**kw)
+        check(False, f"{what} is refused")
+    except AssertionError:
+        check(True, f"{what} is refused")
+try:
+    pr.ProgressRankController(rho=0.1, beta_cap="max_outcome")
+    check(False, "beta_cap outside beta_mirror is refused")
+except AssertionError:
+    check(True, "beta_cap outside beta_mirror is refused")
+with initialize_config_dir(version_base=None, config_dir=os.path.join(REPO, "verl/trainer/config")):
+    c16 = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP2)))
+    c16d = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP2)) + [
+        "algorithm.progress_rank.beta_denominator=step", "algorithm.progress_rank.beta_cap=none"])
+inject_opd_grpo_config(c16)
+inject_opd_grpo_config(c16d)
+check(c16.algorithm.progress_rank.beta_denominator == "max_discounted"
+      and c16.algorithm.progress_rank.beta_cap == "max_outcome"
+      and check_expected_config(c16, LOCK2) == [] and len(check_expected_config(c16d, LOCK2)) == 2,
+      "the v2 launcher sets both, matches its lock, and the lock catches each default")
+check(composed().algorithm.progress_rank.beta_denominator == "step" and composed().algorithm.progress_rank.beta_cap == "none",
+      "the beta-mirror (v1) launcher keeps the step rule and no cap")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

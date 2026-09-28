@@ -542,6 +542,9 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 beta_exclude_capped=bool(cfg.get("beta_exclude_capped", False)),
                 # The Beta's input shares: the gate's EMAs (ema) or discounted group counts.
                 beta_share_estimator=str(cfg.get("beta_share_estimator", "ema") or "ema"),
+                # What each side's scores are divided by, and the per-group outlier guard.
+                beta_denominator=str(cfg.get("beta_denominator", "step") or "step"),
+                beta_cap=str(cfg.get("beta_cap", "none") or "none"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),

@@ -807,6 +807,15 @@ algorithm:
     # (C <- (1 - alpha) C + this step's), shares C / sum C, the pseudo-count over sum C, which grows
     # 15, 27, 37, ... -> 15 / alpha (MoPPS, Reinforce-Ada). The two agree in steady state.
     beta_share_estimator: ema
+    # What each side's scores are divided by. step (default): this step's mean |s| over the side's fired
+    # trajectories, so every step's mean push is exactly m and a lone group gets m whatever its gap.
+    # max_discounted: max(that, its discounted mean over recent steps, retention 1 - ema_alpha): smaller-
+    # than-typical gaps are pushed less than m, none more (m is the ceiling of a step's mean push).
+    beta_denominator: step
+    # none (default) or max_outcome: no trajectory pushed harder per token than L, the discounted mean of
+    # each step's largest per-token outcome advantage in the task's live groups; a group over it is scaled
+    # by L / its peak (zero-sum and order kept), the others untouched. An outlier guard.
+    beta_cap: none
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get
