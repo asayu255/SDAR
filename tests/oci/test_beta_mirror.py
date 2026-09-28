@@ -20,6 +20,9 @@ WHAT IT PROTECTS.
     real SearchEnv.step's tool calls, the loop carries them, the controller reports them): a rollout
     that hit the turn cap spent its last turn without one.
   * The launcher composes and passes its own lock; a group size other than the rollout count is refused.
+  * WebShop groups on goals the environment cannot pay (goal_capped): under beta_exclude_capped they are
+    out of the shares and the histogram exactly as if absent, by default they count; either way (a)
+    still ranks them, and the records and metrics say so.
 No model and no GPU.
 """
 import math
@@ -441,6 +444,47 @@ try:
     check(False, "beta_group_size 7 against env.rollout.n 8 is refused at launch")
 except AssertionError:
     check(True, "beta_group_size 7 against env.rollout.n 8 is refused at launch")
+
+print("13. WebShop goals the environment cannot pay: out of the shares and the histogram, still ranked")
+WLIVE = ("wlive", "webshop", [(f"WL{i}", 4, 10.0 if i < 4 else 0.0, 5 if i < 4 else 3, 5, 1.0 if i < 4 else -1.0, 0, 1)
+                              for i in range(8)])
+WSAT = ("wsat", "webshop", [(f"WS{i}", 4 + (i % 3), 10.0, 5, 5, 0.0, 0, 1) for i in range(8)])
+WST = ("wst", "webshop", [(f"WF{i}", 6, 0.0, 1 + (i % 3), 5, 0.0, 0, 0) for i in range(8)])
+# A capped goal: five rollouts bought the goal product with every option (k = K) and still failed.
+WCAP = ("wcap", "webshop", [(f"WC{i}", 5, 0.0, 5 if i < 5 else 4, 5, 0.0, 0, 1) for i in range(8)])
+
+
+def with_capped(bb):
+    bb = dict(bb)
+    bb["capped_rows"] = np.array([1.0 if u == "wcap" else (0.0 if t == "webshop" else float("nan"))
+                                  for u, t in zip(bb["uids"], bb["task_names"])])
+    return bb
+
+
+b_all, b_ref = with_capped(build([WLIVE, WSAT, WST, WCAP])), with_capped(build([WLIVE, WSAT, WST]))
+ctl_x, ctl_i, ctl_r = beta_ctl(beta_exclude_capped=True), beta_ctl(), beta_ctl(beta_exclude_capped=True)
+new_x, m_x = ctl_x.apply(**b_all)
+new_i, m_i = ctl_i.apply(**b_all)
+new_r, m_r = ctl_r.apply(**b_ref)
+PW = "progress_rank/webshop"
+check(ctl_x.gate_stuck_ema["webshop"] == ctl_r.gate_stuck_ema["webshop"]
+      and ctl_x.gate_sat_ema["webshop"] == ctl_r.gate_sat_ema["webshop"]
+      and ctl_x.beta_n_groups["webshop"] == ctl_r.beta_n_groups["webshop"] == 3.0
+      and all(m_x[f"{PW}/beta/{k}"] == m_r[f"{PW}/beta/{k}"] for k in ("q_f_raw", "q_s_raw", "a", "b", "m_f", "m_s")),
+      "beta_exclude_capped: shares and fit equal those of the same step without the capped group")
+check(ctl_i.beta_n_groups["webshop"] == 4.0 and ctl_i.gate_stuck_ema["webshop"] > ctl_x.gate_stuck_ema["webshop"],
+      "by default the capped group counts, as an all-fail group")
+check(m_x[f"{PW}/beta/hist_obs_k0"] == m_i[f"{PW}/beta/hist_obs_k0"] - 1.0,
+      "the success histogram leaves it out too")
+rx = {r["uid"]: r for r in ctl_x.last_group_records}
+icap = np.where(b_all["uids"] == "wcap")[0]
+check(rx["wcap"]["goal_capped"] and rx["wcap"]["verdict"] == "fired"
+      and float((new_x[icap] - b_all["advantages"][icap]).abs().sum()) > 0.0,
+      "(a) still ranks it: fired, its rows pushed (the correct procedure up)")
+check(not rx["wst"]["goal_capped"] and not rx["wlive"]["goal_capped"], "ordinary groups are not flagged")
+check(m_x[f"{PW}/beta/groups_capped"] == 1.0 and m_x[f"{PW}/beta/fired_a_capped"] == 1.0
+      and m_x[f"{PW}/beta/capped_excluded"] == 1.0 and m_i[f"{PW}/beta/capped_excluded"] == 0.0,
+      "reported: one capped group, (a) fired on it, excluded only under the switch")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

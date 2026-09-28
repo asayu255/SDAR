@@ -1886,6 +1886,10 @@ class TrajectoryCollector:
                 rows[pos]['committed'] = float('nan') if _cm is None else float(bool(_cm))
                 # Search's queries actually sent to the retriever so far (NaN on other tasks).
                 rows[pos]['searches'] = float(_info.get('searches', float('nan')))
+                # WebShop: the goal's correct purchase is capped below 1.0 by the environment (1/0;
+                # NaN on the other tasks and where it is unknown).
+                _gc = _info.get('goal_capped', None)
+                rows[pos]['goal_capped'] = float('nan') if _gc is None else float(bool(_gc))
                 rows[pos]['progress_done_walkset'] = float(_info.get('progress_done_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))

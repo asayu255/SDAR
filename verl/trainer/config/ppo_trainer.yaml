@@ -797,6 +797,10 @@ algorithm:
     scale_mode: budget_cap
     beta_pseudo_count: 1.0
     beta_group_size: 8
+    # Keep WebShop groups whose goal the environment cannot pay (its option-matching bug caps the correct
+    # purchase below 1.0: ~8% of training goals, 12/126 validation goals; flagged per row as goal_capped)
+    # out of the tied-group shares and the success histogram. Their rankings are untouched.
+    beta_exclude_capped: false
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

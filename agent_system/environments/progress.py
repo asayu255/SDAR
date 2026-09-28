@@ -86,6 +86,11 @@ REVISITS_INFO = "revisits"
 COMMITTED_INFO = "committed"
 PROGRESS_DONE_WALKSET_INFO = "progress_done_walkset"
 SEARCHES_INFO = "searches"
+# WebShop: the episode's goal cannot pay 1.0 even when bought correctly -- the environment's
+# option-matching bug, found by the worker at reset (envs.goal_capped); None when unknown. Carried on
+# every row so progress_rank can keep such groups out of the tied-group shares its Beta is fitted to
+# (algorithm.progress_rank.beta_exclude_capped). It changes no reward and no ranking.
+GOAL_CAPPED_INFO = "goal_capped"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 

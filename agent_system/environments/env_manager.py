@@ -53,7 +53,7 @@ from agent_system.environments.progress import (
     PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
     PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
     PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
-    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, RevisitCounter,
+    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, GOAL_CAPPED_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
@@ -1751,6 +1751,11 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # product -- WebshopProgress.bought is the goal product only, which is k's
         # business; committed asks whether the rollout decided at all.
         self._ws_bought = [False] * len(self.goals) if _progress_on(self.config) else []
+        # Goals whose correct purchase the environment caps below 1.0 (WebshopWorker.reset), carried on
+        # every row as goal_capped: progress_rank can keep them out of the tied-group shares its Beta is
+        # fitted to (beta_exclude_capped). (a) still ranks their groups; no reward changes.
+        self._goal_capped = ([(info or {}).get('goal_capped') for info in (infos or [])]
+                             if _progress_on(self.config) else [])
         # ProGPO's coverage, a shadow of (a)'s k: the simulator's page text as it
         # emitted it, BEFORE format_obs trims it for the prompt.
         self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
@@ -1809,10 +1814,12 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 _rv[i].step(act)
                 if i < len(_bt) and "buy now" in str(act or "").lower():
                     _bt[i] = True
+            _gc = getattr(self, "_goal_capped", None) or []
             for i, info in enumerate(infos):
                 if isinstance(info, dict):
                     info[COMMITTED_INFO] = bool(_bt[i]) if i < len(_bt) else False
                     info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
+                    info[GOAL_CAPPED_INFO] = _gc[i] if i < len(_gc) else None
         _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):

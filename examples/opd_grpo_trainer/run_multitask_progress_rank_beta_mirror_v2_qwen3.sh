@@ -4,6 +4,10 @@
 #   algorithm.progress_rank.sat_min_spread.<task>=0  sat fires on any turn gap
 #   algorithm.progress_rank.search_k=evidence_answered
 #                            Search k: 0 not seen / 1 seen, no answer / 2 seen and answered
+#   algorithm.progress_rank.beta_exclude_capped=True
+#                            WebShop groups whose goal the environment cannot pay (its option-matching
+#                            bug caps the correct purchase below 1.0; flagged per row as goal_capped) are
+#                            kept out of the tied-group shares the Beta is fitted to. (a) still ranks them.
 # and, in code, ALFWorld pick_two's "placed" counted as the objects in one receptacle at
 # once (agent_system/environments/progress.py).
 # Lock: expected_multitask_progress_rank_beta_mirror_v2_config.yaml (no waiver needed).
@@ -54,6 +58,7 @@ exec bash "$_HERE/run_multitask_progress_rank_qwen3.sh" \
   algorithm.progress_rank.sat_min_spread.webshop=0 \
   algorithm.progress_rank.sat_min_spread.search=0 \
   algorithm.progress_rank.search_k=evidence_answered \
+  algorithm.progress_rank.beta_exclude_capped=True \
   ++algorithm.opd.retire.enable=False \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4" \

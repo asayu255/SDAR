@@ -538,6 +538,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 scale_mode=str(cfg.get("scale_mode", "budget_cap") or "budget_cap"),
                 beta_pseudo_count=float(cfg.get("beta_pseudo_count", 1.0)),
                 beta_group_size=int(cfg.get("beta_group_size", 8)),
+                # Keep groups on goals the environment cannot pay out of the tied-group shares.
+                beta_exclude_capped=bool(cfg.get("beta_exclude_capped", False)),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),
@@ -646,6 +648,7 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             task_score_rows=nt["task_score"] if "task_score" in nt else None,
             committed_rows=nt["committed"] if "committed" in nt else None,
             search_count_rows=nt["searches"] if "searches" in nt else None,
+            capped_rows=nt["goal_capped"] if "goal_capped" in nt else None,
             revisit_rows=nt["revisits"] if "revisits" in nt else None,
             done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
             doc_len_rows=self._document_lengths(nt, task_names),

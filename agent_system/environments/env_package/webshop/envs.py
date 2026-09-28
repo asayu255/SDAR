@@ -28,6 +28,33 @@ WEBSHOP_JVM_OPTIONS = os.environ.get('SDAR_WEBSHOP_JVM_OPTIONS', '-Xmx512m -Xms6
 # Ray remote worker actor -----------------------------------------------------
 # -----------------------------------------------------------------------------
 
+def goal_capped(server, goal):
+    """True when the goal's OWN product, bought with exactly the goal's options, scores below 1.0.
+
+    WebShop's reward normalises the purchased option values by colour substring ('1877blue' ->
+    'blue', 'rectangular' -> 'tan', 'fashion black girl01' -> 'ash') but passes the goal's options
+    as (name, value) pairs that escape that normalisation, so on some goals even the correct
+    purchase cannot reach 1.0 and the binary reward is 0 for every rollout and every method:
+    about 8% of the training goals (50 of a 600-goal sample) and 12 of the 126 validation goals
+    (2026-09-27 census). Scored exactly as the environment's purchase page scores a purchase
+    (web_agent_text_env.done: get_reward with the product's price and the session's options).
+    None when the product is unknown or the reward cannot be computed.
+    """
+    try:
+        from web_agent_site.engine.goal import get_reward  # noqa: WPS433 (the worker put it on sys.path)
+
+        asin = (goal or {}).get('asin')
+        product = server.product_item_dict.get(asin)
+        if product is None:
+            return None
+        go = goal.get('goal_options')
+        options = dict(go) if isinstance(go, dict) else {f'option_{j}': v for j, v in enumerate(go or [])}
+        reward = get_reward(product, goal, price=server.product_prices.get(asin), options=options)
+        return bool(float(reward) < 1.0)
+    except Exception:  # noqa: BLE001 -- a flag for the statistics must never break a reset
+        return None
+
+
 class WebshopWorker:
     """Ray remote actor that replaces the worker function.
     Each actor hosts a *WebAgentTextEnv* instance.
@@ -118,6 +145,7 @@ class WebshopWorker:
                             ('asin', 'name', 'query', 'instruction_text',
                              'goal_options', 'price_upper')}
             info['session'] = str(self.env.session)
+            info['goal_capped'] = goal_capped(self.env.server, goal)
         except (AttributeError, KeyError, TypeError):
             pass
         return obs, info

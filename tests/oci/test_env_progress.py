@@ -183,7 +183,8 @@ class _WsEnvs:
 
     def reset(self):
         obs = ["WebShop [SEP] Instruction: [SEP] buy a black large bag [SEP] Search"] * 2
-        infos = [{"available_actions": landing, "goal": goal} for _ in range(2)]
+        # Row 0's goal is one the environment cannot pay (WebshopWorker.reset's goal_capped).
+        infos = [{"available_actions": landing, "goal": goal, "goal_capped": c} for c in (True, False)]
         return obs, infos
 
     def step(self, actions):
@@ -201,6 +202,8 @@ for on in (True, False):
     if on:
         check([i.get("progress_k") for i in infos] == [1, 1] and infos[0]["progress_total"] == 5,
               "the results page showing the product counts for both rows")
+        check([i.get("goal_capped") for i in infos] == [True, False],
+              "every row carries its goal's goal_capped from the worker's reset")
         _, _, _, infos = mgr.step(["click[b07abc1234]", "click[b09zzz0000]"])
         check([i.get("progress_k") for i in infos] == [2, 1], "only the row that opened the goal moves on")
         check([i.get("committed") for i in infos] == [False, False] and [i.get("revisits") for i in infos] == [0, 0],
@@ -209,7 +212,8 @@ for on in (True, False):
         check(infos[0]["revisits"] == 1 and infos[1]["committed"] is True and infos[0]["committed"] is False,
               "row 0 repeated a click (revisits 1); row 1's buy is the terminal action (committed), goal or not")
     else:
-        check(all("progress_k" not in i for i in infos), "off: nothing is written")
+        check(all("progress_k" not in i for i in infos) and all("goal_capped" not in i for i in infos),
+              "off: nothing is written")
 
 
 print("7. Search manager")

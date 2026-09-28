@@ -905,7 +905,7 @@ class ProgressRankController:
                  sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant",
                  sat_placebo: str = "none", sat_centring: str = "turn",
                  scale_mode: str = "budget_cap", beta_pseudo_count: float = 1.0,
-                 beta_group_size: int = 8):
+                 beta_group_size: int = 8, beta_exclude_capped: bool = False):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
         # The placebo arm: same firing, same mass, the ranking's content destroyed.
         assert sat_placebo in SAT_PLACEBO_MODES, (
@@ -974,6 +974,11 @@ class ProgressRankController:
         assert int(beta_group_size) >= 2, f"progress_rank.beta_group_size must be >= 2, got {beta_group_size}"
         self.beta_pseudo_count = float(beta_pseudo_count)
         self.beta_group_size = int(beta_group_size)
+        # Groups on goals the environment cannot pay (WebShop's option-matching bug; the rows'
+        # goal_capped) are kept out of the tied-group shares -- the Beta's input, and the gate's EMAs --
+        # and out of the success histogram: p = 0 there for every policy, so they are not part of the
+        # task's success-rate distribution. The rankings are untouched: (a) still ranks their groups.
+        self.beta_exclude_capped = bool(beta_exclude_capped)
         if self.scale_mode == "beta_mirror":
             assert self.sat_placebo == "none", "scale_mode=beta_mirror: the sat placebos size on the budget/cap rule"
             assert self.mixed_rho == 0.0, "scale_mode=beta_mirror: the mixed-group term has no beta_mirror strength"
@@ -1074,6 +1079,11 @@ class ProgressRankController:
         metrics[f"{pb}/share_correction"] = abs(bi["q_f"] - bi["q_f_raw"]) + abs(bi["q_s"] - bi["q_s_raw"])
         metrics[f"{pb}/fit_failed"] = float(not bi["ok"])
         metrics[f"{pb}/groups_not_G"] = float(bi["groups_not_G"])
+        # Groups on goals the environment cannot pay: how many, how many (a) fired on (it still ranks
+        # them), and whether they were kept out of the shares and the histogram (beta_exclude_capped).
+        metrics[f"{pb}/groups_capped"] = float(bi.get("groups_capped", 0))
+        metrics[f"{pb}/fired_a_capped"] = float(bi.get("fired_a_capped", 0))
+        metrics[f"{pb}/capped_excluded"] = float(bool(bi.get("capped_excluded", False)))
         for side, vd in (("a", verdicts), ("sat", sat_verdicts)):
             metrics[f"{pb}/groups_not_G_fired_{side}"] = float(sum(
                 1 for rec in vd.values() if rec["task"] == task and rec["verdict"] == GROUP_NOT_G
@@ -1202,7 +1212,7 @@ class ProgressRankController:
               coverage_rows=None, episode_lengths=None, turn_caps=None,
               alt_counts=None, task_score_rows=None, committed_rows=None,
               revisit_rows=None, done_walkset_rows=None, doc_len_rows=None,
-              gamefile_rows=None, search_count_rows=None) -> tuple:
+              gamefile_rows=None, search_count_rows=None, capped_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -1236,6 +1246,10 @@ class ProgressRankController:
         ``gamefile_rows``    per row, ALFWorld's game file; the records carry one per group
         ``search_count_rows`` per row, Search's queries actually sent to the retriever so far
                              (the env's tool calls; NaN on other tasks)
+        ``capped_rows``      per row, WebShop's goal_capped (1/0: the goal's correct purchase cannot
+                             pay 1.0; NaN elsewhere). The records carry it per group; under
+                             beta_exclude_capped the flagged groups are kept out of the tied-group
+                             shares and the success histogram (never out of the rankings).
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -1306,7 +1320,7 @@ class ProgressRankController:
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
                                "length": None, "task_score": None, "committed": None,
                                "revisits": None, "done_walkset": None, "doc_len": None,
-                               "gamefile": None, "searches": None}
+                               "gamefile": None, "searches": None, "capped": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -1320,6 +1334,10 @@ class ProgressRankController:
                 cm = _finite(committed_rows[i])
                 if cm is not None:
                     x["committed"] = bool(x["committed"]) or cm > 0.5
+            if capped_rows is not None:
+                cp = _finite(capped_rows[i])
+                if cp is not None:
+                    x["capped"] = bool(x["capped"]) or cp > 0.5
             if gamefile_rows is not None and x["gamefile"] is None:
                 gf = gamefile_rows[i]
                 if isinstance(gf, str) and gf:
@@ -1347,6 +1365,11 @@ class ProgressRankController:
             if not x["d_ok"]:
                 x["d"] = None
 
+        # Groups on goals the environment cannot pay (goal_capped on any of their rows).
+        capped_uids = {u for u, g in groups.items()
+                       if any((traj.get(str(tuids[i])) or {}).get("capped") for i in g["rows"] if real[i])}
+        share_skip = capped_uids if self.beta_exclude_capped else set()
+
         # The rows the cap is anchored on: successful trajectories in live groups,
         # judged by the environment's reward like "stuck" is.
         live_success = np.zeros(n, dtype=bool)
@@ -1370,7 +1393,7 @@ class ProgressRankController:
         shares: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for u, g in groups.items():
             task = str(g.get("task") or "")
-            if task not in self.tasks or u in not_g_uids:
+            if task not in self.tasks or u in not_g_uids or u in share_skip:
                 continue
             xs = [traj[t] for t in sorted({str(tuids[i]) for i in g["rows"] if real[i]}) if t in traj]
             if len(xs) < 2 or any(x["reward"] is None for x in xs):
@@ -1399,9 +1422,16 @@ class ProgressRankController:
             not_g: Dict[str, int] = defaultdict(int)
             for u in not_g_uids:
                 not_g[str(groups[u].get("task") or "")] += 1
+            capped_n: Dict[str, int] = defaultdict(int)
+            capped_fired: Dict[str, int] = defaultdict(int)
+            for u in capped_uids:
+                t_ = str(groups[u].get("task") or "")
+                capped_n[t_] += 1
+                if (verdicts.get(u) or {}).get("verdict") == FIRED:
+                    capped_fired[t_] += 1
             for u, g in groups.items():
                 task = str(g.get("task") or "")
-                if task not in self.tasks or u in not_g_uids:
+                if task not in self.tasks or u in not_g_uids or u in share_skip:
                     continue
                 xs = [traj[t] for t in sorted({str(tuids[i]) for i in g["rows"] if real[i]}) if t in traj]
                 if len(xs) != G or any(x["reward"] is None for x in xs):
@@ -1418,7 +1448,9 @@ class ProgressRankController:
                 a_, b_, res, ok = fit_beta_ends(q_f, q_s, group_size=G, init=self.beta_ab.get(task))
                 info = {"q_f_raw": float(qf_raw), "q_s_raw": float(qs_raw), "q_f": q_f, "q_s": q_s,
                         "n_eff": n_eff, "a": a_, "b": b_, "residual": res, "ok": ok,
-                        "hist": list(hist[task]), "groups_not_G": int(not_g[task])}
+                        "hist": list(hist[task]), "groups_not_G": int(not_g[task]),
+                        "groups_capped": int(capped_n[task]), "fired_a_capped": int(capped_fired[task]),
+                        "capped_excluded": bool(self.beta_exclude_capped)}
                 if ok:
                     self.beta_ab[task] = (a_, b_)
                     info["m_f"], info["m_s"] = beta_mirror_strengths(a_, b_, G)
@@ -1831,6 +1863,8 @@ class ProgressRankController:
                 "done_walkset": [x["done_walkset"] for x in xs],
                 "doc_len": [x["doc_len"] for x in xs],
                 "gamefile": next((x["gamefile"] for x in xs if x.get("gamefile")), None),
+                # WebShop: the goal's correct purchase cannot pay 1.0 (the environment's bug).
+                "goal_capped": uid in capped_uids,
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],

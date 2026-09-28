@@ -11,6 +11,11 @@
 #     fires on any turn gap; ALFWorld's 2 dropped the winners one turn apart.
 #   - Search ranked by search_k=evidence_answered: 0 not seen / 1 seen, no answer /
 #     2 seen and answered (K 2; was evidence, K 1).
+#   - WebShop groups on goals the environment cannot pay (the correct purchase is capped
+#     below 1.0 by its option-matching bug; ~8% of training goals, 12/126 validation goals)
+#     are kept out of the tied-group shares and the success histogram
+#     (beta_exclude_capped true, 2026-09-28, user). Their rankings are untouched: (a) still
+#     pushes the correct procedure there. No reward and no training goal changes.
 #   - (code, not a key) ALFWorld's pick_two "placed" counts the most target objects in
 #     ONE receptacle at once, not every instance ever put down (progress.py).
 # Everything else is the beta-mirror lock verbatim; that header follows.
@@ -326,6 +331,7 @@
 "algorithm.progress_rank.scale_mode": beta_mirror
 "algorithm.progress_rank.beta_pseudo_count": 1.0
 "algorithm.progress_rank.beta_group_size": 8
+"algorithm.progress_rank.beta_exclude_capped": true
 # ---- sat: turn ranking in all-success groups -----------------------------------
 "algorithm.progress_rank.sat_rho": 0.1
 "algorithm.progress_rank.sat_gate": false
