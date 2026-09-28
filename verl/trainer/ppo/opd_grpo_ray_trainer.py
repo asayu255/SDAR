@@ -540,6 +540,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 beta_group_size=int(cfg.get("beta_group_size", 8)),
                 # Keep groups on goals the environment cannot pay out of the tied-group shares.
                 beta_exclude_capped=bool(cfg.get("beta_exclude_capped", False)),
+                # The Beta's input shares: the gate's EMAs (ema) or discounted group counts.
+                beta_share_estimator=str(cfg.get("beta_share_estimator", "ema") or "ema"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),

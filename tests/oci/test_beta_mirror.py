@@ -23,6 +23,9 @@ WHAT IT PROTECTS.
   * WebShop groups on goals the environment cannot pay (goal_capped): under beta_exclude_capped they are
     out of the shares and the histogram exactly as if absent, by default they count; either way (a)
     still ranks them, and the records and metrics say so.
+  * beta_share_estimator=discounted_counts: the shares and the pseudo-count's weight come from discounted
+    group counts (3 groups at the first step, not 3 / alpha), equal the EMA path in steady state, round-trip
+    through the state, resume from an EMA-path state at its count; the v2 launcher and lock pin it.
 No model and no GPU.
 """
 import json
@@ -278,7 +281,8 @@ state = half.state_dict()
 resumed = beta_ctl(beta_group_size=6)
 resumed.load_state_dict(state)
 new_r, m_r = resumed.apply(**build(steps[2]))
-check(state["version"] == 5 and state["beta_ab"]["alfworld"] is not None, "version 5 carries the fitted (a, b)")
+check(state["version"] == 6 and state["beta_ab"]["alfworld"] is not None,
+      "the state carries the fitted (a, b) (since version 5; 6 adds the discounted counts)")
 check(torch.equal(new_r, outs[2][0]) and m_r[f"{P}/beta/a"] == outs[2][1][f"{P}/beta/a"],
       "a controller resumed from step 2's state reproduces step 3 exactly")
 old = beta_ctl()
@@ -507,6 +511,66 @@ rn = {r["uid"]: r for r in ctl_x.last_group_records}
 check(all(r["goal_id"] is None and r["goal_price_upper"] is None for r in rn.values()),
       "without the columns the records say None")
 check(json.dumps(rg["wcap"]["goal_id"]) == "6909", "and it is plain JSON")
+
+print("15. beta_share_estimator=discounted_counts: shares and their count from discounted group counts")
+WST2 = ("wst2", "webshop", [(f"WG{i}", 6, 0.0, 1 + (i % 2), 5, 0.0, 0, 0) for i in range(8)])
+b_a = build([WST, WST2, WSAT])            # stuck 2, saturated 1, other 0
+b_b = build([WLIVE, WSAT, WST])           # stuck 1, saturated 1, other 1
+ctl_c, ctl_e = beta_ctl(beta_share_estimator="discounted_counts"), beta_ctl()
+_, mc = ctl_c.apply(**b_a)
+_, me = ctl_e.apply(**b_a)
+check(mc[f"{PW}/beta/n_eff"] == 3.0 and me[f"{PW}/beta/n_eff"] == 15.0,
+      "step 1: the count is the step's 3 complete groups (the EMA path starts at 3 / alpha = 15)")
+check(abs(mc[f"{PW}/beta/q_f"] - 3 / 6) < 1e-12 and abs(mc[f"{PW}/beta/q_s"] - 2 / 6) < 1e-12
+      and abs(me[f"{PW}/beta/q_f"] - 11 / 18) < 1e-12,
+      "...so the pseudo-count weighs as 3 groups' worth: q_f = (2 + 1) / (3 + 3), not (15 * 2/3 + 1) / 18")
+_, mc = ctl_c.apply(**b_b)
+check(abs(mc[f"{PW}/beta/n_eff"] - 5.4) < 1e-12
+      and abs(mc[f"{PW}/beta/q_f"] - (0.8 * 2 + 1 + 1) / (5.4 + 3)) < 1e-12
+      and abs(mc[f"{PW}/beta/q_s"] - (0.8 * 1 + 1 + 1) / (5.4 + 3)) < 1e-12
+      and abs(mc[f"{PW}/beta/q_f_raw"] - 2.6 / 5.4) < 1e-12,
+      "step 2: C <- 0.8 C + this step's groups (stuck 2.6, saturated 1.8, other 1.0; count 5.4)")
+ctl_c2, ctl_e2 = beta_ctl(beta_share_estimator="discounted_counts"), beta_ctl()
+for _ in range(80):
+    _, mc2 = ctl_c2.apply(**b_a)
+    _, me2 = ctl_e2.apply(**b_a)
+check(abs(mc2[f"{PW}/beta/n_eff"] - 15.0) < 1e-6
+      and all(abs(mc2[f"{PW}/beta/{k}"] - me2[f"{PW}/beta/{k}"]) < 1e-6 for k in ("q_f", "q_s", "a", "b", "m_f", "m_s")),
+      "steady state: the count reaches 3 / alpha and the fit equals the EMA path's")
+ctl_r = beta_ctl(beta_share_estimator="discounted_counts")
+ctl_r.load_state_dict(json.loads(json.dumps(ctl_c.state_dict())))
+_, m_next = ctl_c.apply(**b_a)
+_, m_res = ctl_r.apply(**b_a)
+check(ctl_c.state_dict()["version"] == 6
+      and all(m_next[f"{PW}/beta/{k}"] == m_res[f"{PW}/beta/{k}"] for k in ("n_eff", "q_f", "q_s", "m_f", "m_s")),
+      "the counts round-trip through the (JSON) state: a resumed controller equals the continuous one")
+old = ctl_e2.state_dict()
+old.pop("beta_counts")
+old["version"] = 5
+ctl_o = beta_ctl(beta_share_estimator="discounted_counts")
+ctl_o.load_state_dict(old)
+_, m_o = ctl_o.apply(**b_a)
+check(abs(m_o[f"{PW}/beta/n_eff"] - (0.8 * 15.0 + 3.0)) < 1e-9
+      and abs(m_o[f"{PW}/beta/q_f"] - me2[f"{PW}/beta/q_f"]) < 1e-9,
+      "a state from the EMA path (no counts) resumes at that path's count, 15, and its shares")
+try:
+    beta_ctl(beta_share_estimator="window")
+    check(False, "an unknown estimator is refused")
+except AssertionError:
+    check(True, "an unknown estimator is refused")
+WRAP2 = "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh"
+with initialize_config_dir(version_base=None, config_dir=os.path.join(REPO, "verl/trainer/config")):
+    c15 = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP2)))
+    c15e = compose(config_name="ppo_trainer",
+                   overrides=list(_overrides(WRAP2)) + ["algorithm.progress_rank.beta_share_estimator=ema"])
+inject_opd_grpo_config(c15)
+inject_opd_grpo_config(c15e)
+LOCK2 = os.path.join(REPO, c15.trainer.expected_config)
+check(c15.algorithm.progress_rank.beta_share_estimator == "discounted_counts"
+      and LOCK2.endswith("expected_multitask_progress_rank_beta_mirror_v2_config.yaml")
+      and check_expected_config(c15, LOCK2) == [] and len(check_expected_config(c15e, LOCK2)) == 1,
+      "the v2 launcher sets discounted_counts, matches its lock, and the lock catches the EMA path")
+check(composed().algorithm.progress_rank.beta_share_estimator == "ema", "the beta-mirror (v1) launcher keeps the EMA path")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -16,6 +16,10 @@
 #     are kept out of the tied-group shares and the success histogram
 #     (beta_exclude_capped true, 2026-09-28, user). Their rankings are untouched: (a) still
 #     pushes the correct procedure there. No reward and no training goal changes.
+#   - the Beta's input shares from discounted group counts (beta_share_estimator
+#     discounted_counts, 2026-09-28, user): C_kind <- (1 - alpha) C_kind + this step's groups,
+#     shares C / sum C, the pseudo-count over sum C (15, 27, 37, ... -> 75 groups), as MoPPS and
+#     Reinforce-Ada. The EMA path used 75 from the first step; the two agree in steady state.
 #   - (code, not a key) ALFWorld's pick_two "placed" counts the most target objects in
 #     ONE receptacle at once, not every instance ever put down (progress.py).
 # Everything else is the beta-mirror lock verbatim; that header follows.
@@ -332,6 +336,7 @@
 "algorithm.progress_rank.beta_pseudo_count": 1.0
 "algorithm.progress_rank.beta_group_size": 8
 "algorithm.progress_rank.beta_exclude_capped": true
+"algorithm.progress_rank.beta_share_estimator": discounted_counts
 # ---- sat: turn ranking in all-success groups -----------------------------------
 "algorithm.progress_rank.sat_rho": 0.1
 "algorithm.progress_rank.sat_gate": false

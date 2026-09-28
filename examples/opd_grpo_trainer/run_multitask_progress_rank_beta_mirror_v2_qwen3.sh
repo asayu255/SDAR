@@ -8,6 +8,10 @@
 #                            WebShop groups whose goal the environment cannot pay (its option-matching
 #                            bug caps the correct purchase below 1.0; flagged per row as goal_capped) are
 #                            kept out of the tied-group shares the Beta is fitted to. (a) still ranks them.
+#   algorithm.progress_rank.beta_share_estimator=discounted_counts
+#                            the Beta's input shares from discounted group counts (MoPPS, Reinforce-Ada):
+#                            the pseudo-count weighs against the data actually collected (15, 27, 37, ...
+#                            groups -> 75), not 75 from the first step.
 # and, in code, ALFWorld pick_two's "placed" counted as the objects in one receptacle at
 # once (agent_system/environments/progress.py).
 # Lock: expected_multitask_progress_rank_beta_mirror_v2_config.yaml (no waiver needed).
@@ -59,6 +63,7 @@ exec bash "$_HERE/run_multitask_progress_rank_qwen3.sh" \
   algorithm.progress_rank.sat_min_spread.search=0 \
   algorithm.progress_rank.search_k=evidence_answered \
   algorithm.progress_rank.beta_exclude_capped=True \
+  algorithm.progress_rank.beta_share_estimator=discounted_counts \
   ++algorithm.opd.retire.enable=False \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=ngram" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=4" \

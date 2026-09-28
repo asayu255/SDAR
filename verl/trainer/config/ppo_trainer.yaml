@@ -801,6 +801,12 @@ algorithm:
     # purchase below 1.0: ~8% of training goals, 12/126 validation goals; flagged per row as goal_capped)
     # out of the tied-group shares and the success histogram. Their rankings are untouched.
     beta_exclude_capped: false
+    # How the Beta's input shares are kept. ema (default): the gate's EMAs, started at the first step's
+    # share, with the pseudo-count spread over (this step's groups) / ema_alpha from the first step on.
+    # discounted_counts: each kind's groups counted with the same retention 1 - ema_alpha
+    # (C <- (1 - alpha) C + this step's), shares C / sum C, the pseudo-count over sum C, which grows
+    # 15, 27, 37, ... -> 15 / alpha (MoPPS, Reinforce-Ada). The two agree in steady state.
+    beta_share_estimator: ema
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

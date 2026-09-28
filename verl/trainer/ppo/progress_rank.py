@@ -765,6 +765,11 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
 #      which under this mode count complete groups only -- are smoothed JOINTLY with the mixed share: a
 #      pseudo-count on each of the three kinds over n_eff = this step's complete groups / ema_alpha (a
 #      smoothing scale chosen here, not the EMA's statistical effective sample size n (2 - alpha) / alpha).
+#      beta_share_estimator=discounted_counts replaces both with discounted group counts (MoPPS 2507.04632,
+#      Reinforce-Ada): C_kind <- (1 - alpha) C_kind + this step's groups of that kind, shares C / sum C and
+#      the pseudo-count over sum C -- the data the shares rest on, which grows 15, 27, 37, ... -> 15 / alpha
+#      where the EMA path counts 15 / alpha from the first step (and weighs that step as a long history).
+#      The two agree in steady state; only the first ~10 steps differ.
 #      The joint form keeps q_f + q_s < 1, which an independent floor cannot ((1, 0) becomes (1, .01)).
 #      It does NOT make every pair solvable: any p on [0, 1] has q_f^(1/G) + q_s^(1/G) >= 1, so two
 #      small shares have no Beta (raw (0, 0) at n_eff 300 smooths to 1/303 each, .979 < 1). At G = 8 the
@@ -784,6 +789,7 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
 # of the satgate run). rho > 0 and sat_rho > 0 only switch the two sides on; their values, cap_kappa and
 # the E/S EMAs do not enter the strength (E and S are still kept for the reports).
 SCALE_MODES = ("budget_cap", "beta_mirror")
+BETA_SHARE_ESTIMATORS = ("ema", "discounted_counts")
 BETA_LOG_SHAPE_BOUND = 9.0
 BETA_FIT_TOL = 1e-8
 
@@ -905,7 +911,8 @@ class ProgressRankController:
                  sat_gate: bool = False, sat_turn_scale_mode: str = "task_constant",
                  sat_placebo: str = "none", sat_centring: str = "turn",
                  scale_mode: str = "budget_cap", beta_pseudo_count: float = 1.0,
-                 beta_group_size: int = 8, beta_exclude_capped: bool = False):
+                 beta_group_size: int = 8, beta_exclude_capped: bool = False,
+                 beta_share_estimator: str = "ema"):
         assert rho >= 0.0, f"progress_rank.rho must be >= 0, got {rho}"
         # The placebo arm: same firing, same mass, the ranking's content destroyed.
         assert sat_placebo in SAT_PLACEBO_MODES, (
@@ -979,6 +986,12 @@ class ProgressRankController:
         # and out of the success histogram: p = 0 there for every policy, so they are not part of the
         # task's success-rate distribution. The rankings are untouched: (a) still ranks their groups.
         self.beta_exclude_capped = bool(beta_exclude_capped)
+        # How the Beta's input shares are kept: the gate's EMAs with the pseudo-count over (this step's
+        # groups) / alpha (ema), or discounted group counts of the three kinds (discounted_counts; see
+        # SCALE_MODES above and _count_tied_groups).
+        assert beta_share_estimator in BETA_SHARE_ESTIMATORS, (
+            f"progress_rank.beta_share_estimator={beta_share_estimator!r}; expected one of {BETA_SHARE_ESTIMATORS}")
+        self.beta_share_estimator = str(beta_share_estimator)
         if self.scale_mode == "beta_mirror":
             assert self.sat_placebo == "none", "scale_mode=beta_mirror: the sat placebos size on the budget/cap rule"
             assert self.mixed_rho == 0.0, "scale_mode=beta_mirror: the mixed-group term has no beta_mirror strength"
@@ -990,15 +1003,19 @@ class ProgressRankController:
         # non-zero number of groups a step had (the effective count of the smoothing).
         self.beta_ab: Dict[str, Optional[tuple]] = {t: None for t in self.tasks}
         self.beta_n_groups: Dict[str, Optional[float]] = {t: None for t in self.tasks}
+        # Per task under discounted_counts: the discounted numbers of all-fail, all-success and other groups.
+        self.beta_counts: Dict[str, Optional[Dict[str, float]]] = {t: None for t in self.tasks}
 
     # --- persistence ------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"version": 5, "ema": dict(self.ema), "success_ema": dict(self.success_ema),
+        return {"version": 6, "ema": dict(self.ema), "success_ema": dict(self.success_ema),
                 "first_order": {t: list(v) for t, v in self.first_order.items()},
                 "gate_stuck_ema": dict(self.gate_stuck_ema), "gate_sat_ema": dict(self.gate_sat_ema),
                 "beta_ab": {t: (None if v is None else [float(v[0]), float(v[1])]) for t, v in self.beta_ab.items()},
-                "beta_n_groups": dict(self.beta_n_groups)}
+                "beta_n_groups": dict(self.beta_n_groups),
+                "beta_counts": {t: (None if v is None else {k: float(x) for k, x in v.items()})
+                                for t, v in self.beta_counts.items()}}
 
     def load_state_dict(self, state: dict) -> None:
         state = state or {}
@@ -1019,6 +1036,33 @@ class ProgressRankController:
             self.beta_ab[str(t)] = None if v is None else (float(v[0]), float(v[1]))
         for t, v in (state.get("beta_n_groups", {}) or {}).items():
             self.beta_n_groups[str(t)] = None if v is None else float(v)
+        # Version 5 and earlier carried no counts; discounted_counts then starts from the EMA shares at the
+        # EMA path's count (_count_tied_groups), so a resumed run continues where the saved one stood.
+        for t, v in (state.get("beta_counts", {}) or {}).items():
+            self.beta_counts[str(t)] = None if v is None else {str(k): float(x) for k, x in v.items()}
+
+    def _count_tied_groups(self, task: str, share: dict) -> None:
+        """discounted_counts: this step's complete groups added to the task's discounted counts.
+
+        C_kind <- (1 - alpha) C_kind + this step's groups of the kind (all-fail, all-success, the rest):
+        the discounted-count posterior of MoPPS and Reinforce-Ada with the pseudo-count kept fixed. Their
+        total is the data the shares rest on -- 15 groups at the first step, 27 at the second, ... ->
+        15 / alpha. A controller resumed from a state without counts (the EMA path's) starts from the EMA
+        shares at that path's count, (last step's groups) / alpha, before taking this step.
+        """
+        c = self.beta_counts.get(task)
+        if c is None:
+            es, ea = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
+            n_prev = self.beta_n_groups.get(task)
+            if es is not None and ea is not None and n_prev:
+                tot = float(n_prev) / self.alpha
+                c = {"stuck": es * tot, "saturated": ea * tot, "mixed": max(1.0 - es - ea, 0.0) * tot}
+            else:
+                c = {"stuck": 0.0, "saturated": 0.0, "mixed": 0.0}
+        keep = 1.0 - self.alpha
+        n, st, sa = float(share["n"]), float(share["stuck"]), float(share["saturated"])
+        self.beta_counts[task] = {"stuck": keep * c["stuck"] + st, "saturated": keep * c["saturated"] + sa,
+                                  "mixed": keep * c["mixed"] + (n - st - sa)}
 
     def observe_update(self, metrics: dict) -> Dict[str, float]:
         """After the actor update: the teacher term's first-order effect, remembered.
@@ -1419,6 +1463,8 @@ class ProgressRankController:
             if n_t:
                 st_share = shares[task]["stuck"] / n_t
                 sa_share = shares[task]["saturated"] / n_t
+                if self.beta_share_estimator == "discounted_counts":
+                    self._count_tied_groups(task, shares[task])
                 for store, val in ((self.gate_stuck_ema, st_share), (self.gate_sat_ema, sa_share)):
                     prev = store.get(task)
                     store[task] = val if prev is None else (1.0 - self.alpha) * prev + self.alpha * val
@@ -1452,12 +1498,21 @@ class ProgressRankController:
                     continue
                 hist[task][sum(1 for x in xs if x["won"])] += 1
             for task in self.tasks:
-                qf_raw, qs_raw = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
-                if qf_raw is None or qs_raw is None:
-                    continue
-                if shares[task]["n"]:
-                    self.beta_n_groups[task] = float(shares[task]["n"])
-                n_eff = float(self.beta_n_groups.get(task) or 0.0) / self.alpha
+                if self.beta_share_estimator == "discounted_counts":
+                    cnt = self.beta_counts.get(task) or {}
+                    tot = sum(cnt.values())
+                    if tot <= 0.0:
+                        continue
+                    qf_raw, qs_raw, n_eff = cnt["stuck"] / tot, cnt["saturated"] / tot, tot
+                    if shares[task]["n"]:
+                        self.beta_n_groups[task] = float(shares[task]["n"])
+                else:
+                    qf_raw, qs_raw = self.gate_stuck_ema.get(task), self.gate_sat_ema.get(task)
+                    if qf_raw is None or qs_raw is None:
+                        continue
+                    if shares[task]["n"]:
+                        self.beta_n_groups[task] = float(shares[task]["n"])
+                    n_eff = float(self.beta_n_groups.get(task) or 0.0) / self.alpha
                 q_f, q_s = regularize_tied_shares(qf_raw, qs_raw, n_eff=n_eff, pseudo_count=self.beta_pseudo_count)
                 a_, b_, res, ok = fit_beta_ends(q_f, q_s, group_size=G, init=self.beta_ab.get(task))
                 info = {"q_f_raw": float(qf_raw), "q_s_raw": float(qs_raw), "q_f": q_f, "q_s": q_s,
