@@ -1890,6 +1890,13 @@ class TrajectoryCollector:
                 # NaN on the other tasks and where it is unknown).
                 _gc = _info.get('goal_capped', None)
                 rows[pos]['goal_capped'] = float('nan') if _gc is None else float(bool(_gc))
+                # WebShop: the goal's number in the unshuffled goal list, the same on every worker
+                # (envs.goal_order); NaN on the other tasks and where it is unknown.
+                _gid = _info.get('goal_id', None)
+                rows[pos]['goal_id'] = float('nan') if _gid is None else float(_gid)
+                # ...and its price bound, drawn per worker seed (the number and the bound are the instruction).
+                _gpu = _info.get('goal_price_upper', None)
+                rows[pos]['goal_price_upper'] = float('nan') if _gpu is None else float(_gpu)
                 rows[pos]['progress_done_walkset'] = float(_info.get('progress_done_walkset', float('nan')))
                 # ProGPO's coverage D beside k, for the shadow comparison (never ranked by).
                 rows[pos]['coverage_d'] = float(_info.get('coverage_d', float('nan')))

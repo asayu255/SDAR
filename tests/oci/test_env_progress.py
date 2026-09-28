@@ -183,8 +183,10 @@ class _WsEnvs:
 
     def reset(self):
         obs = ["WebShop [SEP] Instruction: [SEP] buy a black large bag [SEP] Search"] * 2
-        # Row 0's goal is one the environment cannot pay (WebshopWorker.reset's goal_capped).
-        infos = [{"available_actions": landing, "goal": goal, "goal_capped": c} for c in (True, False)]
+        # Row 0's goal is one the environment cannot pay (WebshopWorker.reset's goal_capped); both carry
+        # their goal's number (WebshopWorker.reset's goal_id), 0 included.
+        infos = [{"available_actions": landing, "goal": goal, "goal_capped": c, "goal_id": n, "goal_price_upper": pu}
+                 for c, n, pu in ((True, 0, 40.0), (False, 4242, 1000000))]
         return obs, infos
 
     def step(self, actions):
@@ -204,6 +206,8 @@ for on in (True, False):
               "the results page showing the product counts for both rows")
         check([i.get("goal_capped") for i in infos] == [True, False],
               "every row carries its goal's goal_capped from the worker's reset")
+        check([i.get("goal_id") for i in infos] == [0, 4242] and [i.get("goal_price_upper") for i in infos] == [40.0, 1000000],
+              "...and its goal's number and price bound")
         _, _, _, infos = mgr.step(["click[b07abc1234]", "click[b09zzz0000]"])
         check([i.get("progress_k") for i in infos] == [2, 1], "only the row that opened the goal moves on")
         check([i.get("committed") for i in infos] == [False, False] and [i.get("revisits") for i in infos] == [0, 0],
@@ -212,8 +216,65 @@ for on in (True, False):
         check(infos[0]["revisits"] == 1 and infos[1]["committed"] is True and infos[0]["committed"] is False,
               "row 0 repeated a click (revisits 1); row 1's buy is the terminal action (committed), goal or not")
     else:
-        check(all("progress_k" not in i for i in infos) and all("goal_capped" not in i for i in infos),
-              "off: nothing is written")
+        check(all("progress_k" not in i for i in infos) and all("goal_capped" not in i for i in infos)
+              and all("goal_id" not in i and "goal_price_upper" not in i for i in infos), "off: nothing is written")
+
+
+print("6b. WebShop goal numbers: one goal, one number, on every worker seed")
+import random  # noqa: E402
+
+from agent_system.environments.env_package.webshop import envs as WS  # noqa: E402
+
+_rng_state = random.getstate()
+pool = [{"asin": f"B{j:05d}", "goal_options": {"size": str(j % 7)}, "price_upper": 10.0 + j}
+        for j in range(300)]                               # get_goals' order
+for seed in (0, 1, 1007):
+    goals = list(pool)
+    random.seed(seed)
+    random.shuffle(goals)                                  # SimServer.__init__
+    order = WS.goal_order(seed, len(goals))
+    check(all(goals[j] is pool[order[j]] for j in range(len(goals))),
+          f"seed {seed}: position j of the shuffled list holds unshuffled goal order[j]")
+random.setstate(_rng_state)
+WS.goal_order(5, 100)
+check(random.getstate() == _rng_state, "goal_order leaves the global RNG alone (the server's own draws are unchanged)")
+
+
+class _WsServer:
+    def __init__(self, goals):
+        self.goals, self.user_sessions, self.product_item_dict, self.product_prices = goals, {}, {}, {}
+
+
+class _WsTextEnv:
+    """WebAgentTextEnv's reset as far as the goal goes: an int index takes goals[idx], anything else draws."""
+    def __init__(self, goals):
+        self.server, self.session = _WsServer(goals), None
+
+    def reset(self, session=None):
+        self.session = str(session)
+        idx = session if isinstance(session, int) else 7
+        self.server.user_sessions[self.session] = {"goal": self.server.goals[idx], "done": False}
+        return "obs", {}
+
+    def get_available_actions(self):
+        return {"has_search_bar": True, "clickables": []}
+
+
+goals = list(pool)
+random.seed(3)
+random.shuffle(goals)
+random.setstate(_rng_state)
+w = WS.WebshopWorker.__new__(WS.WebshopWorker)
+w.env, w._goal_order = _WsTextEnv(goals), WS.goal_order(3, len(goals))
+_, winfo = w.reset(42)
+check(pool[winfo["goal_id"]] is goals[42] and winfo["goal"]["asin"] == goals[42]["asin"]
+      and winfo["goal_price_upper"] == goals[42]["price_upper"],
+      "reset reports the unshuffled number of the goal it was given, and its price bound")
+_, winfo = w.reset(np.int64(42))
+check(pool[winfo["goal_id"]] is goals[7], "a non-int index draws a goal: the number is the drawn goal's, found by the object")
+w._goal_order = None
+_, winfo = w.reset(42)
+check(winfo["goal_id"] is None and "goal" in winfo, "no order (a filtered or shared goal list): None, and the reset still works")
 
 
 print("7. Search manager")
@@ -267,8 +328,13 @@ tbl = record(True, [{"progress_k": 3, "progress_total": 6}, {}])
 check(tbl[0][0]["progress_k"] == 3.0 and tbl[0][0]["progress_total"] == 6.0, "on: the row carries k and K")
 check(np.isnan(tbl[1][0]["progress_k"]) and np.isnan(tbl[1][0]["progress_total"]),
       "a row whose task has no count gets NaN, so every row has the same columns")
+tbl = record(True, [{"goal_id": 4242, "goal_price_upper": 40.0}, {"goal_id": 0, "goal_price_upper": 1000000}])
+check(tbl[0][0]["goal_id"] == 4242.0 and tbl[1][0]["goal_id"] == 0.0 and tbl[0][0]["goal_price_upper"] == 40.0,
+      "WebShop rows carry the goal number (0 is a number) and its price bound")
+tbl = record(True, [{}, {}])
+check(np.isnan(tbl[0][0]["goal_id"]) and np.isnan(tbl[0][0]["goal_price_upper"]), "...NaN where the task has none")
 tbl = record(False, [{"progress_k": 3, "progress_total": 6}, {}])
-check("progress_k" not in tbl[0][0], "off: the batch keeps control's columns")
+check("progress_k" not in tbl[0][0] and "goal_id" not in tbl[0][0], "off: the batch keeps control's columns")
 
 print("9. ALFWorld milestones: by object type, in any order")
 

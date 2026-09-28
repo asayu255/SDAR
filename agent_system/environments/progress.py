@@ -91,6 +91,13 @@ SEARCHES_INFO = "searches"
 # every row so progress_rank can keep such groups out of the tied-group shares its Beta is fitted to
 # (algorithm.progress_rank.beta_exclude_capped). It changes no reward and no ranking.
 GOAL_CAPPED_INFO = "goal_capped"
+# WebShop: the episode's goal NUMBER, its position in the environment's unshuffled goal list
+# (envs.goal_order), the same on every worker; None when unknown. The session index a reset is given
+# names a different goal on every worker seed, so only this number finds the same goal in another group.
+GOAL_ID_INFO = "goal_id"
+# ...and its price bound (the "price lower than" in the instruction; 1000000 when there is none). It is
+# drawn per worker seed, so one goal number can come with different bounds: the pair is the instruction.
+GOAL_PRICE_INFO = "goal_price_upper"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
 

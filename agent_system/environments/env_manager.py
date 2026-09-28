@@ -53,7 +53,8 @@ from agent_system.environments.progress import (
     PROGRESS_K_WALKSET_INFO, PROGRESS_TOTAL_WALKSET_INFO, AlfworldWalkSet,
     PROGRESS_K_SEARCH_EVIDENCE_INFO, PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO,
     PROGRESS_K_SEARCH_ANSWERED_INFO, PROGRESS_TOTAL_SEARCH_ANSWERED_INFO, SEARCH_ANSWERED_INFO,
-    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, GOAL_CAPPED_INFO, RevisitCounter,
+    REVISITS_INFO, COMMITTED_INFO, PROGRESS_DONE_WALKSET_INFO, SEARCHES_INFO, GOAL_CAPPED_INFO, GOAL_ID_INFO,
+    GOAL_PRICE_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
@@ -1756,6 +1757,13 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # fitted to (beta_exclude_capped). (a) still ranks their groups; no reward changes.
         self._goal_capped = ([(info or {}).get('goal_capped') for info in (infos or [])]
                              if _progress_on(self.config) else [])
+        # ...and each goal's number (WebshopWorker.reset's goal_id: its position in the unshuffled goal
+        # list, the same on every worker), on every row, so the records can find the same goal again.
+        self._goal_id = ([(info or {}).get('goal_id') for info in (infos or [])]
+                         if _progress_on(self.config) else [])
+        # The goal's price bound beside it: drawn per worker seed, so the number alone is not the instruction.
+        self._goal_price = ([(info or {}).get('goal_price_upper') for info in (infos or [])]
+                            if _progress_on(self.config) else [])
         # ProGPO's coverage, a shadow of (a)'s k: the simulator's page text as it
         # emitted it, BEFORE format_obs trims it for the prompt.
         self._coverage = ([ObservationCoverage(o) for o in obs] if _progress_on(self.config) else [])
@@ -1815,11 +1823,15 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 if i < len(_bt) and "buy now" in str(act or "").lower():
                     _bt[i] = True
             _gc = getattr(self, "_goal_capped", None) or []
+            _gid = getattr(self, "_goal_id", None) or []
+            _gpr = getattr(self, "_goal_price", None) or []
             for i, info in enumerate(infos):
                 if isinstance(info, dict):
                     info[COMMITTED_INFO] = bool(_bt[i]) if i < len(_bt) else False
                     info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
                     info[GOAL_CAPPED_INFO] = _gc[i] if i < len(_gc) else None
+                    info[GOAL_ID_INFO] = _gid[i] if i < len(_gid) else None
+                    info[GOAL_PRICE_INFO] = _gpr[i] if i < len(_gpr) else None
         _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):

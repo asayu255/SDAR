@@ -649,6 +649,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             committed_rows=nt["committed"] if "committed" in nt else None,
             search_count_rows=nt["searches"] if "searches" in nt else None,
             capped_rows=nt["goal_capped"] if "goal_capped" in nt else None,
+            goal_rows=nt["goal_id"] if "goal_id" in nt else None,
+            goal_price_rows=nt["goal_price_upper"] if "goal_price_upper" in nt else None,
             revisit_rows=nt["revisits"] if "revisits" in nt else None,
             done_walkset_rows=nt["progress_done_walkset"] if "progress_done_walkset" in nt else None,
             doc_len_rows=self._document_lengths(nt, task_names),

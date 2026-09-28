@@ -25,6 +25,7 @@ WHAT IT PROTECTS.
     still ranks them, and the records and metrics say so.
 No model and no GPU.
 """
+import json
 import math
 import os
 import sys
@@ -485,6 +486,27 @@ check(not rx["wst"]["goal_capped"] and not rx["wlive"]["goal_capped"], "ordinary
 check(m_x[f"{PW}/beta/groups_capped"] == 1.0 and m_x[f"{PW}/beta/fired_a_capped"] == 1.0
       and m_x[f"{PW}/beta/capped_excluded"] == 1.0 and m_i[f"{PW}/beta/capped_excluded"] == 0.0,
       "reported: one capped group, (a) fired on it, excluded only under the switch")
+
+print("14. WebShop goal numbers reach the records, one per group")
+b_gid = dict(b_all)
+_gnum = {"wlive": 17, "wsat": 4242, "wst": 0, "wcap": 6909}
+b_gid["goal_rows"] = np.array([float(_gnum[u]) if t == "webshop" else float("nan")
+                               for u, t in zip(b_gid["uids"], b_gid["task_names"])])
+b_gid["goal_price_rows"] = np.array([30.0 + _gnum[u] if t == "webshop" else float("nan")
+                                     for u, t in zip(b_gid["uids"], b_gid["task_names"])])
+ctl_g = beta_ctl(beta_exclude_capped=True)
+new_g, m_g = ctl_g.apply(**b_gid)
+rg = {r["uid"]: r for r in ctl_g.last_group_records}
+check(all(rg[u]["goal_id"] == n and type(rg[u]["goal_id"]) is int for u, n in _gnum.items()),
+      "every WebShop group carries its goal's number as an int (0 included)")
+check(all(rg[u]["goal_price_upper"] == 30.0 + n for u, n in _gnum.items()), "...and the goal's price bound beside it")
+_same = lambda u, v: u == v or (isinstance(u, float) and isinstance(v, float) and u != u and v != v)
+check(torch.equal(new_g, new_x) and set(m_g) == set(m_x) and all(_same(m_g[k], m_x[k]) for k in m_x),
+      "the number changes no advantage and no metric")
+rn = {r["uid"]: r for r in ctl_x.last_group_records}
+check(all(r["goal_id"] is None and r["goal_price_upper"] is None for r in rn.values()),
+      "without the columns the records say None")
+check(json.dumps(rg["wcap"]["goal_id"]) == "6909", "and it is plain JSON")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)

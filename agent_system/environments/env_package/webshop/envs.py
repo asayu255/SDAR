@@ -55,6 +55,25 @@ def goal_capped(server, goal):
         return None
 
 
+def goal_order(seed, n):
+    """The goal number of each position in a worker's goal list: the goal's position UNSHUFFLED.
+
+    SimServer builds its goals in one fixed order (engine.goal.get_goals over the product file) and
+    then shuffles them with ``random.seed(seed); random.shuffle(goals)``, seeded by the worker's seed
+    (web_agent_text_env.SimServer.__init__). The session index a reset receives is a position in the
+    shuffled list, so it names a different goal on every seed -- and the workers of different groups
+    have different seeds. The same shuffle replayed on the positions 0..n-1 gives, for each position,
+    the goal's unshuffled number, which is the same on every worker. The price bound is drawn per seed
+    (get_goals samples it), so one number can carry a different "price lower than" in its instruction;
+    the product and the options are the same. Uses its own RNG, so the server's draws are untouched.
+    """
+    import random
+
+    order = list(range(int(n)))
+    random.Random(seed).shuffle(order)
+    return np.asarray(order, dtype=np.int32)
+
+
 class WebshopWorker:
     """Ray remote actor that replaces the worker function.
     Each actor hosts a *WebAgentTextEnv* instance.
@@ -80,6 +99,15 @@ class WebshopWorker:
 
         env_kwargs['seed'] = seed
         self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
+        # Every position's goal number (goal_order), for info['goal_id']. Reproducible only when the
+        # env's server built and shuffled the whole list itself: no shared server, no goal filter or limit.
+        self._goal_order = None
+        try:
+            if (env_kwargs.get('server') is None and env_kwargs.get('filter_goals') is None
+                    and env_kwargs.get('limit_goals', -1) == -1):
+                self._goal_order = goal_order(seed, len(self.env.server.goals))
+        except Exception:  # noqa: BLE001 -- a label for the records must never break a worker
+            self._goal_order = None
 
     def mem_stats(self):
         """Anonymous vs file-backed RSS of this worker, in MiB.
@@ -146,9 +174,28 @@ class WebshopWorker:
                              'goal_options', 'price_upper')}
             info['session'] = str(self.env.session)
             info['goal_capped'] = goal_capped(self.env.server, goal)
+            info['goal_id'] = self._goal_id(goal, idx)
+            info['goal_price_upper'] = goal.get('price_upper')
         except (AttributeError, KeyError, TypeError):
             pass
         return obs, info
+
+    def _goal_id(self, goal, idx):
+        """The goal number (goal_order) of the goal this session was given; None when it cannot be told."""
+        try:
+            order = getattr(self, '_goal_order', None)
+            if order is None:
+                return None
+            goals = self.env.server.goals
+            # SimServer.receive takes goals[idx] when the index is an int and the session holds that very
+            # object; any other index draws a goal, so then find the object itself.
+            if isinstance(idx, int) and 0 <= idx < len(goals) and goals[idx] is goal:
+                pos = idx
+            else:
+                pos = next((j for j, g in enumerate(goals) if g is goal), None)
+            return None if pos is None or pos >= len(order) else int(order[pos])
+        except Exception:  # noqa: BLE001 -- a label for the records must never break a reset
+            return None
     
     def render(self, mode_for_render):
         """Render the environment"""

@@ -1212,7 +1212,8 @@ class ProgressRankController:
               coverage_rows=None, episode_lengths=None, turn_caps=None,
               alt_counts=None, task_score_rows=None, committed_rows=None,
               revisit_rows=None, done_walkset_rows=None, doc_len_rows=None,
-              gamefile_rows=None, search_count_rows=None, capped_rows=None) -> tuple:
+              gamefile_rows=None, search_count_rows=None, capped_rows=None, goal_rows=None,
+              goal_price_rows=None) -> tuple:
         """Return ``(new_advantages, metrics)``; ``advantages`` is not modified.
 
         ``mask``             the response mask the actor's loss uses, (rows, resp)
@@ -1250,6 +1251,12 @@ class ProgressRankController:
                              pay 1.0; NaN elsewhere). The records carry it per group; under
                              beta_exclude_capped the flagged groups are kept out of the tied-group
                              shares and the success histogram (never out of the rankings).
+        ``goal_rows``        per row, WebShop's goal number (envs.goal_order: the goal's position in the
+                             environment's unshuffled goal list, the same on every worker; NaN
+                             elsewhere). The records carry one per group, so a later group on the
+                             same goal can be found.
+        ``goal_price_rows``  per row, that goal's price bound (drawn per worker seed, so the same number
+                             can come with another bound); the records carry it beside the number.
         None of these changes the advantage: they are read into metrics and records.
 
         The step's per-group records are left in ``self.last_group_records``.
@@ -1320,7 +1327,8 @@ class ProgressRankController:
                                "invalid": 0, "d": None, "d_ok": coverage_rows is not None,
                                "length": None, "task_score": None, "committed": None,
                                "revisits": None, "done_walkset": None, "doc_len": None,
-                               "gamefile": None, "searches": None, "capped": None}
+                               "gamefile": None, "searches": None, "capped": None, "goal": None,
+                               "goal_price": None}
             x["turns"] += 1
             if episode_lengths is not None:
                 ln = _finite(episode_lengths[i])
@@ -1338,6 +1346,12 @@ class ProgressRankController:
                 cp = _finite(capped_rows[i])
                 if cp is not None:
                     x["capped"] = bool(x["capped"]) or cp > 0.5
+            if goal_rows is not None and x["goal"] is None:
+                gv = _finite(goal_rows[i])
+                if gv is not None:
+                    x["goal"] = int(gv)
+            if goal_price_rows is not None and x["goal_price"] is None:
+                x["goal_price"] = _finite(goal_price_rows[i])
             if gamefile_rows is not None and x["gamefile"] is None:
                 gf = gamefile_rows[i]
                 if isinstance(gf, str) and gf:
@@ -1865,6 +1879,9 @@ class ProgressRankController:
                 "gamefile": next((x["gamefile"] for x in xs if x.get("gamefile")), None),
                 # WebShop: the goal's correct purchase cannot pay 1.0 (the environment's bug).
                 "goal_capped": uid in capped_uids,
+                # WebShop: the goal's number, the same on every worker (envs.goal_order).
+                "goal_id": next((x["goal"] for x in xs if x.get("goal") is not None), None),
+                "goal_price_upper": next((x["goal_price"] for x in xs if x.get("goal_price") is not None), None),
                 **{f"k_{name}": [prog.get(t, (0.0, 0.0))[0] for t in trajs] for name, prog in alt_prog.items()},
                 **{f"K_{name}": [prog.get(t, (0.0, 0.0))[1] for t in trajs] for name, prog in alt_prog.items()},
                 "score": [traj_score.get(t, 0.0) for t in trajs],

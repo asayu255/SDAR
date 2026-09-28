@@ -213,6 +213,9 @@ b.non_tensor_batch["progress_total_milestone"] = b.non_tensor_batch["progress_to
 b.non_tensor_batch["progress_k_arrive"] = np.array([7.0, 1.0, 5.0, 5.0, 1.0, 1.0], dtype=object)
 b.non_tensor_batch["progress_total_arrive"] = np.array([7.0] * n, dtype=object)
 b.non_tensor_batch["task_score"] = np.array([float("nan")] * n, dtype=object)
+# The goal columns as the rollout writes them (NaN outside WebShop); here the batch pretends they came from one.
+b.non_tensor_batch["goal_id"] = np.array([4242.0, 4242.0, 0.0, 0.0, 0.0, 0.0], dtype=object)
+b.non_tensor_batch["goal_price_upper"] = np.array([40.0, 40.0, 1000000.0, 1000000.0, 1000000.0, 1000000.0], dtype=object)
 before = b.batch["advantages"].clone()
 m7 = t._apply_progress_rank(b, t.config.algorithm.progress_rank)
 check(t._turn_caps(["alfworld", "webshop", "search"]) == {"alfworld": 50, "webshop": 15, "search": 4},
@@ -226,12 +229,16 @@ check("progress_rank/alfworld/alt_arrive/stuck_compared" in m7
 recs = {r["uid"]: r for r in t._progress_rank.last_group_records}
 check(recs["stuck"]["length"] == [50.0, 50.0] and recs["stuck"]["k_arrive"] == [5.0, 1.0],
       "the records carry the episode lengths and the other count")
+check(recs["live"]["goal_id"] == 4242 and recs["stuck"]["goal_id"] == 0 and recs["live"]["goal_price_upper"] == 40.0,
+      "...and the goal number and price bound, one per group")
 cfg2 = make_config()
 cfg2.algorithm.progress_rank.alfworld_k = "milestone_arrive"
 t2 = trainer(cfg2)
 t2._progress_rank = None
 m8 = t2._apply_progress_rank(make_batch(), t2.config.algorithm.progress_rank)
 check(not any("/alt_" in k for k in m8), "a batch without the other columns: nothing compared, nothing guessed")
+check(all(r["goal_id"] is None and r["goal_price_upper"] is None for r in t2._progress_rank.last_group_records),
+      "...and no goal columns: the records say None")
 b9 = make_batch()
 b9.non_tensor_batch["progress_k_milestone"] = b9.non_tensor_batch["progress_k"].copy()
 b9.non_tensor_batch["progress_total_milestone"] = b9.non_tensor_batch["progress_total"].copy()
