@@ -820,6 +820,14 @@ algorithm:
     # live groups; a group over it is scaled by L / its peak, padding copies included (zero-sum and order
     # kept), the others untouched. No cap before the task's first live group. An outlier guard.
     beta_cap: none
+    # What a side's mean push is sized to (scale_mode=beta_mirror). posterior (default): the Beta's m_f / m_s.
+    # mixed_outcome: the task's own live-group outcome signal M, both sides -- the discounted mean (every
+    # training step, retention 1 - ema_alpha) of |z| over the trajectories of the task's live groups, z the
+    # outcome-only advantage the base's GRPO gives them (episode reward on each turn row, mean and std over the
+    # group's rows, ddof 1; format penalty left out). A proxy difference in a tied group is then pushed as hard
+    # as an outcome difference is, the size published methods reach by shaping before the std normalisation.
+    # No push on a side before the task's first live group. beta_denominator and beta_cap apply unchanged.
+    beta_strength: posterior
     # MIXED GROUPS: the stuck-group ranking applied to the FAILURES of a group
     # whose outcome already separates them from its winners -- A_i += s_g * c_mix
     # * (k_i - mean k_fail) / K, zero-sum over the failures (the winners get

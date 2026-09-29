@@ -83,6 +83,8 @@ COMPOSED_SCRIPTS = [
     # Its v2 (the next-run recipe of 2026-09-27: no firing minimum, no sat spread minimum, search_k
     # evidence_answered), with its own lock.
     "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh",
+    # v2 with each side's mean push sized to the live groups' outcome signal (beta_strength mixed_outcome).
+    "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_mixed_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

@@ -545,6 +545,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # What each side's scores are divided by, and the per-group outlier guard.
                 beta_denominator=str(cfg.get("beta_denominator", "step") or "step"),
                 beta_cap=str(cfg.get("beta_cap", "none") or "none"),
+                # What sets a side's mean push: the Beta's m (posterior) or the live groups' outcome signal.
+                beta_strength=str(cfg.get("beta_strength", "posterior") or "posterior"),
                 # Mixed groups: the failures ranked among themselves (0 = off).
                 mixed_rho=float(cfg.get("mixed_rho", 0.0) or 0.0),
                 mixed_tasks=(list(cfg.get("mixed_tasks")) if cfg.get("mixed_tasks", None) else None),

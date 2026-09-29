@@ -30,6 +30,11 @@ WHAT IT PROTECTS.
     than m), a large-gap step stays at m, never above; beta_cap=max_outcome scales only the group whose peak
     exceeds L (the live groups' largest per-token advantage), keeping its zero-sum and order; both
     references round-trip; the v2 launcher and lock pin both.
+  * beta_strength=mixed_outcome: both sides' mean push over their fired trajectories is M, the discounted mean
+    |z| of the live groups' outcome-only advantages (rows' mean and std, ddof 1), computed by hand here; the
+    default posterior is exactly the old rule; no push before a task's first live group; M decays every
+    training step and round-trips through the state (version 8; a version-7 state loads); the mixed launcher
+    differs from v2's in that one key and matches its own lock.
 No model and no GPU.
 """
 import json
@@ -285,8 +290,8 @@ state = half.state_dict()
 resumed = beta_ctl(beta_group_size=6)
 resumed.load_state_dict(state)
 new_r, m_r = resumed.apply(**build(steps[2]))
-check(state["version"] == 7 and state["beta_ab"]["alfworld"] is not None,
-      "the state carries the fitted (a, b) (since version 5; 6 adds the discounted counts, 7 the references)")
+check(state["version"] == 8 and state["beta_ab"]["alfworld"] is not None,
+      "the state carries the fitted (a, b) (since version 5; 6 adds the discounted counts, 7 the references, 8 the live-group reference)")
 check(torch.equal(new_r, outs[2][0]) and m_r[f"{P}/beta/a"] == outs[2][1][f"{P}/beta/a"],
       "a controller resumed from step 2's state reproduces step 3 exactly")
 old = beta_ctl()
@@ -545,7 +550,7 @@ ctl_r = beta_ctl(beta_share_estimator="discounted_counts")
 ctl_r.load_state_dict(json.loads(json.dumps(ctl_c.state_dict())))
 _, m_next = ctl_c.apply(**b_a)
 _, m_res = ctl_r.apply(**b_a)
-check(ctl_c.state_dict()["version"] == 7
+check(ctl_c.state_dict()["version"] == 8
       and all(m_next[f"{PW}/beta/{k}"] == m_res[f"{PW}/beta/{k}"] for k in ("n_eff", "q_f", "q_s", "m_f", "m_s")),
       "the counts round-trip through the (JSON) state: a resumed controller equals the continuous one")
 old = ctl_e2.state_dict()
@@ -642,7 +647,7 @@ ctl_r2 = beta_ctl(beta_denominator="max_discounted", beta_cap="max_outcome")
 ctl_r2.load_state_dict(st)
 n_a, m_a = ctl_cap.apply(**B1)
 n_b, m_b = ctl_r2.apply(**B1)
-check(st["version"] == 7 and torch.equal(n_a, n_b)
+check(st["version"] == 8 and torch.equal(n_a, n_b)
       and all(m_a[f"{PW}/beta/{k}"] == m_b[f"{PW}/beta/{k}"] for k in ("D_ref_a", "den_a", "cap_L", "c_a")),
       "both references round-trip through the (JSON) state: resumed == continuous")
 for kw, what in (({"beta_denominator": "window"}, "an unknown denominator"), ({"beta_cap": "kappa"}, "an unknown cap")):
@@ -755,6 +760,137 @@ check(re_["wcap"]["beta_fit_included"] is False and re_["wcap"]["in_model"] is T
       "beta_fit_included: the capped group is complete (in_model) but was not in the Beta's input")
 check(all(re_[u]["goal_capped_known"] for u in seed_of) and m_env[f"{PW}/beta/groups_capped_known"] == 4.0,
       "the capped flag was known for all four WebShop groups, and that is reported")
+
+print("18. beta_strength=mixed_outcome: each side's mean push sized to the live groups' outcome signal M")
+
+
+def zbar(spec):
+    """By hand: the mean |z| over the trajectories of live groups ``[(rewards, turns), ...]``, each trajectory's
+    reward on each of its turn rows, the group's mean and std (ddof 1) over those rows. Returns (mean, count)."""
+    vals = []
+    for R, T in spec:
+        n_ = float(sum(T))
+        mu = sum(r * t for r, t in zip(R, T)) / n_
+        sd = math.sqrt(sum(t * (r - mu) ** 2 for r, t in zip(R, T)) / (n_ - 1.0))
+        vals += [abs(r - mu) / (sd + 1e-6) for r in R]
+    return sum(vals) / len(vals), len(vals)
+
+
+B18 = build([WLIVE, WSAT, WST])
+M1, n1 = zbar([([10.0] * 4 + [0.0] * 4, [4] * 8)])
+n_def, m_def = beta_ctl().apply(**B18)
+n_post, m_post = beta_ctl(beta_strength="posterior").apply(**B18)
+check(torch.equal(n_def, n_post) and not any("/beta/mix_" in k for k in m_def)
+      and abs(m_def[f"{PW}/beta/target_a"] - m_def[f"{PW}/beta/m_f"]) < 1e-12
+      and abs(m_def[f"{PW}/beta/target_sat"] - m_def[f"{PW}/beta/m_s"]) < 1e-12,
+      "posterior (the default) is exactly the old rule: targets m_f / m_s, no mix_ metrics")
+ctl_mx = beta_ctl(beta_strength="mixed_outcome")
+new_mx, m_mx = ctl_mx.apply(**B18)
+pa18, ps18 = pushes(new_mx, B18, "wst"), pushes(new_mx, B18, "wsat")
+check(abs(m_mx[f"{PW}/beta/mix_M"] - M1) < 1e-9 and abs(m_mx[f"{PW}/beta/mix_M_step"] - M1) < 1e-9
+      and m_mx[f"{PW}/beta/mix_n_traj"] == float(n1) and m_mx[f"{PW}/beta/mix_reference_available"] == 1.0,
+      f"M = the live group's mean |z| by hand ({M1:.5f}), its count and availability reported")
+check(abs(sum(abs(v) for v in pa18.values()) / 8 - M1) < 1e-5 and abs(sum(abs(v) for v in ps18.values()) / 8 - M1) < 1e-5
+      and abs(m_mx[f"{PW}/beta/mean_push_over_m_a"] - 1.0) < 1e-9 and abs(m_mx[f"{PW}/beta/mean_push_over_m_sat"] - 1.0) < 1e-9
+      and abs(m_mx[f"{PW}/beta/target_a"] - M1) < 1e-12 and abs(m_mx[f"{PW}/beta/target_sat"] - M1) < 1e-12,
+      "both sides' mean |push| over their fired trajectories is M (step rule, no cap); targets reported")
+pa_def = pushes(n_def, B18, "wst")
+ratio18 = (sum(abs(v) for v in pa18.values()) / 8) / (sum(abs(v) for v in pa_def.values()) / 8)
+check(abs(sum(pa18.values())) < 1e-5 and abs(ratio18 - M1 / m_def[f"{PW}/beta/m_f"]) < 1e-4
+      and all((pa18[t] > 0) == (pa_def[t] > 0) for t in pa18 if abs(pa_def[t]) > 1e-9),
+      f"(a) keeps its zero-sum and every sign; it is scaled by M / m_f = {ratio18:.2f} against the posterior arm")
+rmx = {r["uid"]: r for r in ctl_mx.last_group_records}
+check(abs(rmx["wst"]["beta_target"] - M1) < 1e-9 and abs(rmx["wsat"]["beta_target"] - M1) < 1e-9
+      and rmx["wlive"]["beta_target"] is None and rmx["wst"]["beta_m"] == m_mx[f"{PW}/beta/m_f"],
+      "records: beta_target = M on both fired sides, the Beta's m kept beside it")
+
+WLV2 = ("wlv2", "webshop", [(f"WV{i}", 2 if i < 3 else 6, 10.0 if i < 3 else 0.0, 5 if i < 3 else 2, 5,
+                              0.0, 0, 1) for i in range(8)])
+M2, n2 = zbar([([10.0] * 3 + [0.0] * 5, [2] * 3 + [6] * 5)])
+_, m_u = beta_ctl(beta_strength="mixed_outcome").apply(**build([WLV2, WSAT, WST]))
+check(abs(m_u[f"{PW}/beta/mix_M"] - M2) < 1e-9,
+      f"short wins and long losses: the rows weigh the statistics as in the base (M {M2:.4f})")
+
+b_nl = build([WSAT, WST])
+ctl_nl = beta_ctl(beta_strength="mixed_outcome")
+new_nl, m_nl = ctl_nl.apply(**b_nl)
+check(m_nl[f"{PW}/beta/mix_reference_available"] == 0.0 and f"{PW}/beta/mix_M" not in m_nl
+      and m_nl[f"{PW}/beta/c_a"] == 0.0 and m_nl[f"{PW}/beta/c_sat"] == 0.0 and torch.equal(new_nl, b_nl["advantages"]),
+      "before the task's first live group: no M and no push on either side, and it is reported")
+_, m_nl2 = ctl_nl.apply(**B18)
+check(abs(m_nl2[f"{PW}/beta/mix_M"] - M1) < 1e-9 and m_nl2[f"{PW}/beta/c_a"] > 0.0 and m_nl2[f"{PW}/beta/c_sat"] > 0.0,
+      "then M exists and both sides push")
+
+ctl_dc = beta_ctl(beta_strength="mixed_outcome")
+ctl_dc.apply(**B18)
+_, m_dc2 = ctl_dc.apply(**build([WLV2, WSAT, WST]))
+S2_, N2_ = 0.8 * M1 * n1 + M2 * n2, 0.8 * n1 + n2
+check(abs(m_dc2[f"{PW}/beta/mix_M"] - S2_ / N2_) < 1e-9 and abs(m_dc2[f"{PW}/beta/mix_M_step"] - M2) < 1e-9,
+      "M is the discounted mean over training steps (retention 0.8); this step's own value beside it")
+ctl_dc.apply(**build([WSAT, WST]))
+_, m_dc4 = ctl_dc.apply(**B18)
+S4_, N4_ = 0.8 * 0.8 * S2_ + M1 * n1, 0.8 * 0.8 * N2_ + n1
+check(abs(m_dc4[f"{PW}/beta/mix_M"] - S4_ / N4_) < 1e-9,
+      "a step without a live group still decays the sums (the clock is training steps)")
+
+st8 = json.loads(json.dumps(ctl_dc.state_dict()))
+ctl_r8 = beta_ctl(beta_strength="mixed_outcome")
+ctl_r8.load_state_dict(st8)
+x1, mx1 = ctl_dc.apply(**B18)
+x2, mx2 = ctl_r8.apply(**B18)
+check(st8["version"] == 8 and "beta_mix_ref" in st8 and torch.equal(x1, x2) and mx1[f"{PW}/beta/mix_M"] == mx2[f"{PW}/beta/mix_M"],
+      "the reference round-trips through the (JSON) state: resumed == continuous")
+st7 = dict(st8)
+st7.pop("beta_mix_ref")
+st7["version"] = 7
+ctl_r7 = beta_ctl(beta_strength="mixed_outcome")
+ctl_r7.load_state_dict(st7)
+_, m7 = ctl_r7.apply(**B18)
+check(abs(m7[f"{PW}/beta/mix_M"] - M1) < 1e-9, "a version-7 state (no reference) loads; M starts from the next step")
+try:
+    beta_ctl(beta_strength="full")
+    check(False, "an unknown strength is refused")
+except AssertionError:
+    check(True, "an unknown strength is refused")
+try:
+    pr.ProgressRankController(rho=0.1, beta_strength="mixed_outcome")
+    check(False, "beta_strength outside beta_mirror is refused")
+except AssertionError:
+    check(True, "beta_strength outside beta_mirror is refused")
+
+WRAP3 = "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_mixed_qwen3.sh"
+with initialize_config_dir(version_base=None, config_dir=os.path.join(REPO, "verl/trainer/config")):
+    c18 = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP3)))
+    c18p = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP3)) + [
+        "algorithm.progress_rank.beta_strength=posterior"])
+    c18v2 = compose(config_name="ppo_trainer", overrides=list(_overrides(WRAP2)))
+for c_ in (c18, c18p, c18v2):
+    inject_opd_grpo_config(c_)
+LOCK3 = os.path.join(REPO, c18.trainer.expected_config)
+check(c18.algorithm.progress_rank.beta_strength == "mixed_outcome"
+      and LOCK3.endswith("expected_multitask_progress_rank_beta_mirror_v2_mixed_config.yaml")
+      and check_expected_config(c18, LOCK3) == [] and len(check_expected_config(c18p, LOCK3)) == 1,
+      "the mixed launcher sets it, matches its own lock, and the lock catches the posterior default")
+check(c18v2.algorithm.progress_rank.beta_strength == "posterior" and check_expected_config(c18v2, LOCK2) == [],
+      "the v2 launcher keeps the posterior strength and still matches its lock")
+
+
+def _flat(d, pre=""):
+    out = {}
+    for k, v in d.items():
+        key = f"{pre}.{k}" if pre else str(k)
+        if isinstance(v, dict):
+            out.update(_flat(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+f3 = _flat(OmegaConf.to_container(c18, resolve=False))
+f2 = _flat(OmegaConf.to_container(c18v2, resolve=False))
+diff18 = sorted(k for k in set(f3) | set(f2) if f3.get(k) != f2.get(k))
+check(diff18 == ["algorithm.progress_rank.beta_strength", "trainer.expected_config"],
+      f"the composed configs of the two launchers differ only in {diff18}")
 
 print("ALL OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)
