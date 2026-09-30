@@ -17,7 +17,8 @@ What has to hold, and why each part is tested:
   reference's step returns were computed in the rollout's turn order before the padding, as that run
   computed them. Missing anchors or per-turn rewards: not emitted, and nothing labelled GiGPO.
 - The traj/<task>/* and think-block metrics equal what progress_rank reports on the same batch, and
-  are left to progress_rank when it is on (one writer per key).
+  are left to progress_rank when it is on (one writer per key); WebShop's failure progress carries the
+  count's name when progress_k holds the session count (webshop_k=session), in both writers.
 - The records-only shadow value table is its own object: built by the one builder, advanced once per
   step, never self._progress_value and never in the checkpoint, restored from the records' directory on
   a resume, held still on a grad_probe batch.
@@ -658,6 +659,36 @@ def test_the_traj_metrics_are_progress_ranks(tmp_path, stub_workers, monkeypatch
     both._reward_and_advantage(rollout_batch(61), m_both, timing_raw={})
     assert m_both["records/failed"] == 0.0
     assert {k: v for k, v in m_both.items() if k.startswith("traj/")} == traj_pr
+
+
+def test_the_webshop_failure_progress_names_its_count(tmp_path, stub_workers):
+    """traj/webshop/fail_progress is k / K of WebShop's failures with k = progress_k, and progress_k's
+    WebShop count is webshop_k's: the legacy count on every arm before 2026-09-30, the session count in
+    the 2x2's cells. Under session the key says so -- traj/webshop/fail_progress_session -- in the
+    records and on the controller's path alike, and nothing else moves: the same number from the same
+    column, every other traj/* key the same."""
+    key = "traj/webshop/fail_progress"
+    counters = {"alfworld_k": "milestone_arrive", "webshop_k": "session"}
+    legacy = make_trainer(trainer_config(tmp_path / "legacy", "grpo"))
+    session = make_trainer(trainer_config(tmp_path / "session", "grpo", progress_rank={"enable": False, **counters}))
+    m_leg, m_ses = {}, {}
+    legacy._reward_and_advantage(rollout_batch(63), m_leg, timing_raw={})
+    session._reward_and_advantage(rollout_batch(63), m_ses, timing_raw={})
+    assert m_leg["records/failed"] == 0.0 and m_ses["records/failed"] == 0.0
+    t_leg = {k: v for k, v in m_leg.items() if k.startswith("traj/")}
+    t_ses = {k: v for k, v in m_ses.items() if k.startswith("traj/")}
+    assert key in t_leg and key + "_session" not in t_leg
+    assert key not in t_ses and t_ses[key + "_session"] == t_leg[key]
+    assert {k: v for k, v in t_ses.items() if k != key + "_session"} == {k: v for k, v in t_leg.items() if k != key}
+    assert "traj/alfworld/fail_progress" in t_ses and "traj/search/fail_progress" in t_ses
+
+    # The controller's path (progress_rank on, rho 0) names it the same way: one name per count,
+    # whichever of the two writers reports it.
+    pr_cfg = {"enable": True, "rho": 0.0, "record_groups": False, **counters}
+    with_pr = make_trainer(trainer_config(tmp_path / "pr", "grpo", records=False, progress_rank=pr_cfg))
+    m_pr = {}
+    with_pr._reward_and_advantage(rollout_batch(63), m_pr, timing_raw={})
+    assert {k: v for k, v in m_pr.items() if k.startswith("traj/")} == t_ses
 
 
 def test_trajectory_summaries_are_the_controllers():

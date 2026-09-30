@@ -3,10 +3,13 @@
 (b) "token", the default: every term, the policy gradient included, is aggregated by the per-task
 token weights num_mini_batches / (D * T_d) (task_loss_weights.py), T_d the task's response tokens
 in the step. (a) "trajectory": the policy-gradient term alone takes num_mini_batches /
-(D * N_d * L_d), N_d the task's real trajectories and L_d a fixed reference length, so one step's
-update is
+(D * N_d * L_d), N_d the task's real trajectories and L_d a fixed reference length, so the mean
+optimizer step's policy gradient is
 
     g = (1/D) sum_d 1/(N_d L_d) sum_{i in d} sum_t A_it sum_u grad log pi(y_itu)
+
+and the step's summed update num_mini_batches * g, num_mini_batches = ceil(rows / mini-batch) moving
+with the sampled turn counts -- the part of the update neither normalisation fixes.
 
 WHAT IS CHECKED, THROUGH THE PRODUCTION CODE. attach_task_loss_weights on the driver side and
 DataParallelPPOActor.update_policy itself on the worker side -- select_keys, the mini/micro-batch
@@ -16,19 +19,26 @@ replaced: the model forward, by a table of per-token log-probs (so the gradient 
 on the table IS the gradient w.r.t. each per-token log-prob), and FSDP's average of the ranks'
 gradients, done here by hand on the per-step gradients the optimizer is handed. The table starts
 at the rollout's log-probs and the stand-in optimizer never moves it, so every mini-batch sits at
-ratio 1: the on-policy, pre-clip update the formula describes.
+ratio 1: the on-policy, pre-clip gradient the formula describes.
 
   * the mean optimizer-step policy gradient equals -(1/D) A_it / (N_d L_d) at every token under
     (a) and -(1/D) A_it / T_d under (b), to 1e-6, with adjust_batch's padding copies at exactly 0,
     uneven turn counts and response lengths, rows reordered after the weights are attached, one
     and two DP ranks and a short final mini-batch; the aggregated loss update_policy reports
     agrees with the same formula;
+  * the step's SUM is num_mini_batches times the formula, in both modes, on layouts whose turn
+    counts make the batch 2, 4 and 6 optimizer steps (task_loss/optimizer_steps reports the count
+    under (a)); and in a one-task toy whose objective has gradient 0, enumerated exactly, (a)'s mean
+    optimizer step has expectation 0 -- the guarantee -- while its step sum does not (towards the
+    episodes with more turns), and (b)'s mean optimizer step does not either (the ratio estimator);
   * switching (b) -> (a) moves the policy-gradient term and nothing else: with the advantages at
     zero the teacher-KL, reference-KL and entropy gradients are bitwise identical, and with them
     live the difference is exactly the two formulas' difference;
   * token mode never reads the policy-gradient column: a batch carrying it trains bit for bit as
     one without;
-  * the refusals, the geometry diagnostics' ratio, and the 2x2 launchers against their locks.
+  * the refusals (the launch's among them: inject_opd_grpo_config runs the config check), the
+    geometry diagnostics' ratio, and the 2x2 launchers against their locks, every lock pinning its
+    column.
 """
 
 import math
@@ -78,40 +88,57 @@ N_PAD = 3
 # and 40 is a multiple of MICRO * world for world 1 and 2, as adjust_batch makes it.
 MINI_GLOBAL = 12
 MICRO = 2
-N_REAL = sum(sum(v) for v in TURNS.values())
+
+
+def _n_real(turns=None):
+    return sum(sum(v) for v in (TURNS if turns is None else turns).values())
+
+
+N_REAL = _n_real()
 N_STEPS = math.ceil((N_REAL + N_PAD) / MINI_GLOBAL)
+# The same trajectories per task (N_d is fixed by the batch design, as on the cluster) with other turn
+# counts, so the batch becomes another number of optimizer steps: 17 + 3 = 20 rows are 2 steps, the
+# default 37 + 3 = 40 are 4, 64 + 4 = 68 are 6 (each total a multiple of MICRO * world for world 1, 2).
+LAYOUTS = {
+    "short": ({"alfworld": [2, 1, 3, 1], "webshop": [1, 2, 1, 1], "search": [1, 1, 1, 1, 1]}, 3),
+    "default": (TURNS, N_PAD),
+    "long": ({"alfworld": [9, 7, 8, 6], "webshop": [5, 6, 4, 5], "search": [3, 3, 2, 3, 3]}, 4),
+}
 
 
-def _step_batch(seed=0, *, zero_advantages=False):
-    """One step's batch after adjust_batch: real turn rows, then padding copies of three of them.
+def _step_batch(seed=0, *, zero_advantages=False, turns=None, n_pad=N_PAD):
+    """One step's batch after adjust_batch: real turn rows, then padding copies of ``n_pad`` of them.
 
     ``input_ids[:, 0]`` carries a row id, which is how the stand-in forward finds a row's
     log-probs after the batch has been reordered and split. A padding copy has its own id (its own
     table row, with its original's values), so its gradient can be seen to be exactly zero.
+    ``turns`` is the layout (TURNS unless given).
     """
+    turns = TURNS if turns is None else turns
+    n_real = _n_real(turns)
     rng = np.random.default_rng(seed)
     task, uid, tokens = [], [], []
     for name in ("alfworld", "webshop", "search"):
         lo, hi = TOKEN_RANGE[name]
-        for j, turns in enumerate(TURNS[name]):
-            for _ in range(turns):
+        for j, n_turns in enumerate(turns[name]):
+            for _ in range(n_turns):
                 task.append(name)
                 uid.append(f"{name}-{j}")
                 tokens.append(int(rng.integers(lo, hi + 1)))
-    assert len(task) == N_REAL
-    src = list(range(N_REAL)) + sorted(rng.choice(N_REAL, N_PAD, replace=False).tolist())
+    assert len(task) == n_real
+    src = list(range(n_real)) + sorted(rng.choice(n_real, n_pad, replace=False).tolist())
     bs = len(src)
 
     g = torch.Generator().manual_seed(seed)
     response_mask = torch.zeros(bs, RESP, dtype=torch.long)
     for i, s in enumerate(src):
         response_mask[i, : tokens[s]] = 1
-    real_lp = -0.2 - torch.rand(N_REAL, RESP, generator=g, dtype=torch.float64)
-    real_adv = torch.zeros(N_REAL, dtype=torch.float64) if zero_advantages else torch.randn(
-        N_REAL, generator=g, dtype=torch.float64)
-    real_teacher = -0.2 - torch.rand(N_REAL, RESP, generator=g, dtype=torch.float64)
-    real_ref = -0.2 - torch.rand(N_REAL, RESP, generator=g, dtype=torch.float64)
-    real_resp = torch.randint(0, 50, (N_REAL, RESP), generator=g)
+    real_lp = -0.2 - torch.rand(n_real, RESP, generator=g, dtype=torch.float64)
+    real_adv = torch.zeros(n_real, dtype=torch.float64) if zero_advantages else torch.randn(
+        n_real, generator=g, dtype=torch.float64)
+    real_teacher = -0.2 - torch.rand(n_real, RESP, generator=g, dtype=torch.float64)
+    real_ref = -0.2 - torch.rand(n_real, RESP, generator=g, dtype=torch.float64)
+    real_resp = torch.randint(0, 50, (n_real, RESP), generator=g)
     idx = torch.as_tensor(src)
 
     input_ids = torch.zeros(bs, PROMPT + RESP, dtype=torch.long)
@@ -138,11 +165,11 @@ def _step_batch(seed=0, *, zero_advantages=False):
     return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta)
 
 
-def _attach(batch, mode, metrics=None):
+def _attach(batch, mode, metrics=None, n_real=N_REAL):
     """The driver's call, with the two arguments read off an actor config as the trainer would."""
     actor_cfg = OmegaConf.create({"pg_loss_norm": mode, "pg_ref_tokens": dict(REF_TOKENS)})
     attach_task_loss_weights(
-        batch, n_real=N_REAL, mini_batch_size=MINI_GLOBAL,
+        batch, n_real=n_real, mini_batch_size=MINI_GLOBAL,
         metrics={} if metrics is None else metrics, **pg_loss_norm_kwargs(actor_cfg),
     )
     return batch
@@ -198,13 +225,14 @@ def _table_forward(module):
     return forward
 
 
-def _actor_cfg(world, mode, *, teacher_coef=0.0, entropy=0.0, ref_kl=None, **extra):
+def _actor_cfg(world, mode, *, teacher_coef=0.0, entropy=0.0, ref_kl=None, mini=MINI_GLOBAL, micro=MICRO,
+               ref_tokens=None, **extra):
     """The OPD+GRPO actor settings the path needs; per-task weighting on, top-k off."""
     return OmegaConf.create({
         "strategy": "fsdp",
         # The worker divides the global (prompt-count x n) mini-batch by the DP size.
-        "ppo_mini_batch_size": MINI_GLOBAL // world,
-        "ppo_micro_batch_size_per_gpu": MICRO,
+        "ppo_mini_batch_size": mini // world,
+        "ppo_micro_batch_size_per_gpu": micro,
         "use_dynamic_bsz": False,
         "ppo_max_token_len_per_gpu": 16384,
         "ppo_epochs": 1,
@@ -223,7 +251,7 @@ def _actor_cfg(world, mode, *, teacher_coef=0.0, entropy=0.0, ref_kl=None, **ext
         "teacher_kl_loss_coef": teacher_coef,
         "normalize_loss_by_task": True,
         "pg_loss_norm": mode,
-        "pg_ref_tokens": dict(REF_TOKENS),
+        "pg_ref_tokens": dict(REF_TOKENS if ref_tokens is None else ref_tokens),
         "ulysses_sequence_parallel_size": 1,
         "use_torch_compile": False,
         "use_remove_padding": False,
@@ -232,13 +260,14 @@ def _actor_cfg(world, mode, *, teacher_coef=0.0, entropy=0.0, ref_kl=None, **ext
     })
 
 
-def _update(batch, cfg, world, monkeypatch):
+def _update(batch, cfg, world, monkeypatch, n_steps=N_STEPS):
     """One training step on ``world`` DP ranks: every optimizer step's FSDP-averaged gradient.
 
     Each rank gets its contiguous chunk of the batch (the dp dispatch) and runs update_policy with
     torch.distributed reporting ``world`` ranks, so the actor multiplies the weights by
     world * grad_accum exactly as on the cluster; the ranks' per-step gradients are then averaged,
-    which is FSDP's part. Returns (per-step gradients over the table, per-rank metrics).
+    which is FSDP's part. ``n_steps``: the optimizer steps every rank must have taken. Returns
+    (per-step gradients over the table, per-rank metrics).
     """
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: world)
     # GPUMemoryLogger reads device memory around update_policy; there is none here.
@@ -254,8 +283,8 @@ def _update(batch, cfg, world, monkeypatch):
         actor._forward_micro_batch = _table_forward(module)
         metrics.append(actor.update_policy(shard))
         per_rank.append(opt.grads)
-    assert {len(g) for g in per_rank} == {N_STEPS}, [len(g) for g in per_rank]
-    steps = [sum(g[m] for g in per_rank) / world for m in range(N_STEPS)]
+    assert {len(g) for g in per_rank} == {n_steps}, [len(g) for g in per_rank]
+    steps = [sum(g[m] for g in per_rank) / world for m in range(n_steps)]
     return steps, metrics
 
 
@@ -267,18 +296,19 @@ def _by_row(batch, table_values):
 # --------------------------------------------------------------------------- #
 # The formula, from the step's own description (not from any weight column)
 # --------------------------------------------------------------------------- #
-def _formula_row_weights(batch, mode):
+def _formula_row_weights(batch, mode, turns=None):
     """w_i = 1 / (D N_d L_d) under (a), 1 / (D T_d) under (b), 0 on padding -- in the batch's order."""
+    turns = TURNS if turns is None else turns
     task = batch.non_tensor_batch["task_name"]
     uid = batch.non_tensor_batch["traj_uid"]
     real = ~batch.batch["is_padding_row"].numpy()
     tokens = batch.batch["response_mask"].sum(-1).to(torch.float64).numpy()
-    D = len(TURNS)
+    D = len(turns)
     w = np.zeros(len(batch))
-    for name in TURNS:
+    for name in turns:
         rows = (task == name) & real
         if mode == "trajectory":
-            n_traj = len(TURNS[name])
+            n_traj = len(turns[name])
             assert len(set(uid[rows].tolist())) == n_traj
             w[rows] = 1.0 / (D * n_traj * REF_TOKENS[name])
         else:
@@ -286,22 +316,23 @@ def _formula_row_weights(batch, mode):
     return torch.as_tensor(w)
 
 
-def _expected_pg_step_gradient(batch, mode):
+def _expected_pg_step_gradient(batch, mode, turns=None):
     """d(mean step loss)/d log pi(y_itu) = -w_i A_it on every generated token, in the batch's order."""
-    w = _formula_row_weights(batch, mode)
+    w = _formula_row_weights(batch, mode, turns)
     return -(w.unsqueeze(-1) * batch.batch["advantages"] * batch.batch["response_mask"])
 
 
-def _mark_padding(batch):
-    """The test's own record of which rows are the copies (rows >= N_REAL before the reorder)."""
-    batch.batch["is_padding_row"] = batch.batch["input_ids"][:, 0] >= N_REAL
+def _mark_padding(batch, n_real=N_REAL):
+    """The test's own record of which rows are the copies (rows >= n_real before the reorder)."""
+    batch.batch["is_padding_row"] = batch.batch["input_ids"][:, 0] >= n_real
     return batch
 
 
-def _prepared_marked(mode, **kw):
-    b = _step_batch(kw.pop("seed", 0), **kw)
-    _mark_padding(b)
-    return _balance(_attach(b, mode))
+def _prepared_marked(mode, *, seed=0, zero_advantages=False, turns=None, n_pad=N_PAD, metrics=None):
+    b = _step_batch(seed, zero_advantages=zero_advantages, turns=turns, n_pad=n_pad)
+    n_real = _n_real(turns)
+    _mark_padding(b, n_real)
+    return _balance(_attach(b, mode, metrics, n_real=n_real))
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +384,110 @@ def test_the_reported_policy_loss_is_the_formula(mode, world, monkeypatch):
     a_row = batch.batch["advantages"].sum(-1) / n_tok.clamp(min=1)
     want = float(-(w * a_row * n_tok).sum())
     assert got == pytest.approx(want, rel=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# The step's sum: num_mini_batches times the formula, and num_mini_batches moves
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("world", [1, 2])
+@pytest.mark.parametrize("mode", ["trajectory", "token"])
+def test_the_step_sum_is_the_formula_times_the_optimizer_steps(mode, world, monkeypatch):
+    """The same trajectories per task with other turn counts: 20, 40 and 68 rows become 2, 4 and 6
+    optimizer steps. The mean optimizer step is the formula every time; the step's summed gradient is
+    that many times the formula, in both modes -- a factor set by the sampled turn counts, which
+    task_loss_weights' docstring says the normalisation does not fix. task_loss/optimizer_steps
+    reports it under (a) and is not written under (b)."""
+    seen = set()
+    for name, (turns, n_pad) in LAYOUTS.items():
+        n_steps = math.ceil((_n_real(turns) + n_pad) / MINI_GLOBAL)
+        metrics = {}
+        batch = _prepared_marked(mode, seed=5, turns=turns, n_pad=n_pad, metrics=metrics)
+        steps, _ = _update(batch, _actor_cfg(world, mode), world, monkeypatch, n_steps=n_steps)
+        want = _expected_pg_step_gradient(batch, mode, turns)
+        assert float(want.abs().max()) > 0
+        step_sum = _by_row(batch, sum(steps))
+        assert torch.allclose(step_sum, n_steps * want, rtol=1e-6, atol=0.0), (
+            name, float((step_sum - n_steps * want).abs().max()))
+        assert torch.allclose(_by_row(batch, sum(steps) / n_steps), want, rtol=1e-6, atol=0.0), name
+        if mode == "trajectory":
+            assert metrics["task_loss/optimizer_steps"] == n_steps
+        else:
+            assert "task_loss/optimizer_steps" not in metrics
+        seen.add(n_steps)
+    assert seen == {2, 4, 6}
+
+
+# One task, one group of three: turn 0 picks a reply, "long" with probability sigma(phi) (phi = 0),
+# a 3-turn episode whose turns 1-2 are forced (log-prob 0), or "short", a 1-turn one. Every episode
+# wins, so the success objective does not depend on phi: its gradient is 0.
+TOY_L = {"alfworld": 2.0}
+# d log pi(reply) / d phi at phi = 0
+TOY_DPHI = {"long": 0.5, "short": -0.5}
+
+
+def _toy_batch(choices):
+    """The group's turn rows, one generated token each, A = 1/2 on every turn (R = 1 against a frozen
+    V = 1/2 at gamma = lambda = 1). Returns (batch, the row id of each trajectory's first turn)."""
+    rows = [(i, t) for i, c in enumerate(choices) for t in range(3 if c == "long" else 1)]
+    bs = len(rows)
+    input_ids = torch.zeros(bs, 2, dtype=torch.long)
+    input_ids[:, 0] = torch.arange(bs)
+    mask = torch.ones(bs, 1, dtype=torch.long)
+    old_lp = torch.tensor([[math.log(0.5) if t == 0 else 0.0] for _, t in rows], dtype=torch.float64)
+    tensors = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones(bs, 2, dtype=torch.long),
+        "position_ids": torch.arange(2).repeat(bs, 1),
+        "responses": torch.zeros(bs, 1, dtype=torch.long),
+        "response_mask": mask,
+        "old_log_probs": old_lp,
+        "advantages": 0.5 * mask.to(torch.float64),
+        "teacher_log_probs": old_lp.clone(),
+        "task_ids": torch.zeros(bs, dtype=torch.long),
+    }
+    non_tensors = {"task_name": np.array(["alfworld"] * bs, dtype=object),
+                   "traj_uid": np.array([f"toy-{i}" for i, _ in rows], dtype=object)}
+    meta = {"temperature": 1.0, "task_id_names": ["alfworld"], "multi_turn": False}
+    first = {i: r for r, (i, t) in enumerate(rows) if t == 0}
+    return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta), first
+
+
+def _toy_expectations(mode, mini, monkeypatch):
+    """E[d loss / d phi] of the mean optimizer step and of the step's sum, over the 8 equally likely
+    groups, each through attach_task_loss_weights and update_policy (at ratio 1: nothing moves)."""
+    import itertools
+
+    e_mean = e_sum = 0.0
+    for choices in itertools.product(("short", "long"), repeat=3):
+        batch, first = _toy_batch(choices)
+        attach_task_loss_weights(batch, n_real=len(batch), mini_batch_size=mini, metrics={},
+                                 pg_loss_norm=mode, pg_ref_tokens=dict(TOY_L))
+        n_steps = math.ceil(len(batch) / mini)
+        cfg = _actor_cfg(1, mode, mini=mini, micro=1, ref_tokens=TOY_L)
+        steps, _ = _update(batch, cfg, 1, monkeypatch, n_steps=n_steps)
+        # the chain rule to phi: only a turn-0 token depends on it
+        d_sum = sum(float(s[first[i], 0]) * TOY_DPHI[c] for s in steps for i, c in enumerate(choices))
+        e_sum += d_sum / 8
+        e_mean += d_sum / n_steps / 8
+    return e_mean, e_sum
+
+
+@pytest.mark.parametrize("mini", [1, 2])
+def test_the_guarantee_is_the_mean_optimizer_step(mini, monkeypatch):
+    """Exact expectations in the toy above, through the production code. (a): the mean optimizer
+    step's gradient is g = -(2n - 3) / 24 in phi (n the long replies), expectation 0 = the objective's
+    gradient -- what the normalisation guarantees. The step's sum is num_mini_batches * g, and
+    num_mini_batches = ceil((3 + 2n) / mini) grows with the long replies: expectation -1/8 at one row
+    per mini-batch, -1/16 at two, i.e. the update raises the long reply's log-odds although the
+    objective is flat -- the optimizer-step count the docstring leaves outside the guarantee.
+    (b), for contrast: its mean optimizer step is the ratio estimator, -(2n - 3) / (4 (3 + 2n)),
+    expectation 11/420 whatever the mini-batch -- the bias (a) removes."""
+    e_mean, e_sum = _toy_expectations("trajectory", mini, monkeypatch)
+    # the weights are float32 (5/6 and 7/6 round at 1e-8): zero to that, against terms of order 0.1
+    assert e_mean == pytest.approx(0.0, abs=1e-7)
+    assert e_sum == pytest.approx({1: -1 / 8, 2: -1 / 16}[mini], rel=1e-6)
+    b_mean, _ = _toy_expectations("token", mini, monkeypatch)
+    assert b_mean == pytest.approx(11 / 420, rel=1e-6)
 
 
 def test_switching_moves_the_policy_gradient_and_nothing_else(monkeypatch):
@@ -444,7 +579,9 @@ def test_token_mode_writes_what_it_always_wrote():
     )
     assert set(trj_metrics) - set(tok_metrics) == (
         {f"task_loss/pg_trajectories/{t}" for t in TURNS} | {f"task_loss/pg_weight_ratio/{t}" for t in TURNS}
+        | {"task_loss/optimizer_steps"}
     )
+    assert trj_metrics["task_loss/optimizer_steps"] == N_STEPS
     assert {k: tok_metrics[k] for k in tok_metrics} == {k: trj_metrics[k] for k in tok_metrics}
 
 
@@ -705,12 +842,12 @@ def test_each_lock_is_its_parent_plus_its_knob():
     }
     for lam in ("1.0", "0.9"):
         assert lock[("value", "trajectory", lam)] == {**lock[("value", "token", lam)], **traj}
-    assert lock[("grpo", "token", None)] == {
-        **lock[("value", "token", "1.0")],
-        "algorithm.adv_estimator": "grpo",
-        "actor_rollout_ref.actor.pg_loss_norm": "token",
-    }
+    assert lock[("grpo", "token", None)] == {**lock[("value", "token", "1.0")], "algorithm.adv_estimator": "grpo"}
     assert lock[("grpo", "trajectory", None)] == {**lock[("grpo", "token", None)], **traj}
+    # Every cell pins its column, the value arm's (b) locks included: the one key that decides which
+    # column a run is in can never be left to a default or a stray override.
+    for (_, norm, _), pins in lock.items():
+        assert pins["actor_rollout_ref.actor.pg_loss_norm"] == norm
 
 
 def test_the_two_trajnorm_locks_differ_only_in_lam():
@@ -741,6 +878,35 @@ def test_the_locks_catch(monkeypatch, cell, override):
     cfg = _injected(monkeypatch, cell, extra=extra)
     miss = check_expected_config(cfg, os.path.join(REPO, cfg.trainer.expected_config))
     assert len(miss) == 1, miss
+
+
+@pytest.mark.parametrize("lam", ["1.0", "0.9"])
+def test_the_value_arm_token_locks_catch_the_other_column(monkeypatch, lam):
+    """(a)'s two overrides reaching the value arm's (b) launcher -- copied from an (a) command line, or
+    arriving through a supervisor's arguments -- are one mismatch at launch, not a run named
+    progress_value_gae_lam* that trains under (a) for 300 steps."""
+    from verl.utils.expected_config import check_expected_config
+
+    cfg = _injected(monkeypatch, ("value", "token"), lam, extra=[
+        "actor_rollout_ref.actor.pg_loss_norm=trajectory",
+        "actor_rollout_ref.actor.pg_ref_tokens={alfworld:4650,webshop:2320,search:310}"])
+    assert cfg.trainer.expected_config.endswith(LOCKS[("value", "token", lam)])
+    miss = check_expected_config(cfg, os.path.join(REPO, cfg.trainer.expected_config))
+    assert [m[0] for m in miss] == ["actor_rollout_ref.actor.pg_loss_norm"], miss
+
+
+@pytest.mark.parametrize("extra,match", [
+    (["actor_rollout_ref.actor.pg_loss_norm=trajectory"], "pg_ref_tokens is unset"),
+    (["actor_rollout_ref.actor.pg_loss_norm=trajectory",
+      "actor_rollout_ref.actor.pg_ref_tokens={alfworld:4650,webshop:2320}"], "no entry for \\['search'\\]"),
+    (["actor_rollout_ref.actor.pg_loss_norm=trajectroy"], "expected one of"),
+])
+def test_the_launch_refuses_what_the_driver_would_refuse_after_a_rollout(monkeypatch, extra, match):
+    """inject_opd_grpo_config runs check_pg_loss_norm_config: a trajectory run without every task's L_d
+    (or a misspelt mode) stops while the config is composed, before the lock is even read -- not at
+    the driver's first attach_task_loss_weights after a rollout, and again at every supervisor restart."""
+    with pytest.raises(AssertionError, match=match):
+        _injected(monkeypatch, ("value", "token"), extra=extra)
 
 
 def test_each_cell_has_its_own_run_tag():

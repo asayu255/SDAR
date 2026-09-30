@@ -27,9 +27,22 @@
 #                                                    own session (no option over-count)
 #   algorithm.progress_value.*                       every key spelled out (= the defaults), so
 #                                                    this script is the arm's whole definition
+#   actor_rollout_ref.actor.pg_loss_norm=token       the policy gradient divided by the response
+#                                                    tokens each task brought to the step, like every
+#                                                    other term: the default and v2's, spelled out
+#                                                    because it is the 2x2's column (b) (below)
 # v2's other progress_rank keys (the Beta strength rule, sat) still reach the config and are not
 # read with progress_rank off; the lock does not pin them. The progress_rank launcher's banner
 # prints v2's rho -- ignore it.
+#
+# THE 2x2 (2026-09-30, the user: trajectory normalisation (a) is the paper's main one, the token
+# normalisation (b) the control beside it). One launcher and lock set per cell:
+#                         (b) token-normalised PG                     (a) trajectory-normalised PG
+#   OPD + GRPO            run_multitask_grpo_v2recipe_qwen3.sh        run_multitask_grpo_v2recipe_trajnorm_qwen3.sh
+#   progress_value_gae    THIS SCRIPT                                 run_multitask_progress_value_gae_trajnorm_qwen3.sh
+# The other three cells wrap this script (their "$@" comes after its keys, so the (a) cells'
+# pg_loss_norm=trajectory replaces the token here), and every cell's lock pins its column: a
+# trajectory override reaching THIS script's lock is refused at launch.
 #
 # ONE LOCK PER LAM, chosen by the value: LAM=1.0 -> expected_multitask_progress_value_gae_lam1.0_
 # config.yaml, LAM=0.9 -> ..._lam0.9_config.yaml; a LAM with no lock refuses to start. Each LAM
@@ -52,7 +65,10 @@
 # knob, moves them), and records/<task>/<kind>/<component>/{row,traj_sum,token}_* metrics of the
 # advantage, its value terms and the GRPO and GiGPO shadows on the same rollouts
 # (verl/trainer/ppo/rollout_records.py). The traj/* and think-block metrics progress_rank reported
-# come back with them. The wrappers of the 2x2 inherit them (and restate enable).
+# come back with them -- WebShop's failure progress as traj/webshop/fail_progress_session: progress_k's
+# WebShop count here is the session count (webshop_k=session), v2's and every earlier arm's the legacy
+# one, which is not recorded here, so the key names the count and is not comparable with theirs. The
+# wrappers of the 2x2 inherit them (and restate enable).
 #
 # WHAT TO WATCH (every step, per task): progress_value/<task>/fallback_share (1 on the first
 # step, then 0), calibration (mean V - mean target on the batch), a_rl_success / a_rl_failure,
@@ -76,6 +92,7 @@ exec bash "$_HERE/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh" \
   algorithm.adv_estimator=progress_value_gae \
   algorithm.gamma=1.0 \
   algorithm.lam="$LAM" \
+  actor_rollout_ref.actor.pg_loss_norm=token \
   algorithm.progress_rank.enable=False \
   algorithm.progress_rank.alfworld_k=milestone_arrive \
   algorithm.progress_rank.search_k=evidence_answered \

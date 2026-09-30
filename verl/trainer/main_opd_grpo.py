@@ -101,6 +101,21 @@ def inject_opd_grpo_config(config) -> None:
         from verl.trainer.ppo.opd_grpo_ray_trainer import check_progress_value_config
 
         check_progress_value_config(config)
+        # actor.pg_loss_norm, here too: a trajectory run needs the per-task weights on
+        # (normalize_loss_by_task, set above from algorithm.opd) and a fixed length for every task it
+        # trains. The driver refuses the same, but only after the first rollout -- and again after
+        # every supervisor restart. The run's tasks as progress_value_turn_caps reads them. A no-op
+        # under token, every arm before 2026-09-30.
+        from verl.trainer.ppo.metric_utils import normalize_task_name
+        from verl.trainer.ppo.task_loss_weights import check_pg_loss_norm_config
+
+        env = config.get("env", None) or {}
+        if str(env.get("env_name", "")).lower() == "multitask":
+            pg_tasks = [str(t) for t in env.multitask.tasks]
+        else:
+            only = normalize_task_name(env.get("env_name", None))
+            pg_tasks = [only] if only is not None else None
+        check_pg_loss_norm_config(config.actor_rollout_ref.actor, tasks=pg_tasks)
 
 
 def run_opd_grpo(config) -> None:

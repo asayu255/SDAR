@@ -780,7 +780,12 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         out.update(think_block_metrics(responses=batch.batch["responses"], mask=mask,
                                        task_names=task_names, real=real))
         out.update(self._write_progress_rank_groups(ctl.last_group_records, cfg))
-        return out
+        # traj/webshop/fail_progress reads progress_k, i.e. the WebShop count webshop_k chose: named
+        # when it is not the legacy count every earlier arm recorded there, as the records name it.
+        from agent_system.environments.progress import webshop_k_definition
+        from verl.trainer.ppo.progress_rank import name_webshop_k
+
+        return name_webshop_k(out, webshop_k_definition(self.config))
 
     @staticmethod
     def _document_lengths(nt, task_names):
@@ -1020,6 +1025,8 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             "floor_value": float((floor_cfg or {}).get("value", 0.0) if floor_cfg is not None else 0.0),
         }
         pr_cfg = alg.get("progress_rank", None)
+        from agent_system.environments.progress import webshop_k_definition
+
         res = rollout_records.compute_step_records(
             batch, step=step, cfg=rcfg, task_names=task_names,
             multi_turn=bool(self.config.actor_rollout_ref.rollout.multi_turn.enable),
@@ -1028,7 +1035,10 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             turn_caps=progress_value_turn_caps(self.config),
             # progress_rank reports traj/* and the think-block share itself when it is on: one writer
             # per key.
-            traj_metrics=not (pr_cfg is not None and bool(pr_cfg.get("enable", False))))
+            traj_metrics=not (pr_cfg is not None and bool(pr_cfg.get("enable", False))),
+            # which WebShop count progress_k holds, read as the environment managers read it: it names
+            # the WebShop key computed from k unless it is legacy (progress_rank.name_webshop_k)
+            webshop_k=webshop_k_definition(self.config))
         out.update(res.metrics)
         # Why a shadow was not emitted, said once per reason rather than every step.
         warned = getattr(self, "_rollout_records_warned", None)

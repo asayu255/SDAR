@@ -170,6 +170,8 @@ class WebshopWorker:
         0.85 among stagnant states). It reads the hidden goal, as k does -- the value's input only,
         never the policy's. Cached per (product, options) within an episode: most turns re-read the
         same page, and the type score parses text with spaCy. None when it cannot be computed.
+        What a saved value table's buynow cells mean: a change here is a change of
+        progress_value.FEATURE_SCHEMA_VERSION -- bump it.
         """
         asin = session.get('asin')
         if not asin:
@@ -204,6 +206,8 @@ class WebshopWorker:
         info['ws_state'] = before if done else self._session_state()
 
         # Redefine reward. We only use rule-based reward - win for 10, lose for 0.
+        # progress_value.REWARD_SCHEMA_VERSION names this rule (10 iff task_score == 1.0): a value
+        # table's targets count these wins, so change the string with any change here.
         if done and reward == 1.0:
             info['won'] = True
             reward = 10.0

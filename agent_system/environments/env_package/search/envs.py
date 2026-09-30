@@ -93,6 +93,9 @@ class SearchMultiProcessEnv(gym.Env):
 
         info = dict(out.get("metadata", {}))
         info["postprocessed_action"] = out.get("postprocessed_action")
+        # The reward is SearchEnv's compute_score: exact match (em_check), 1 or 0. progress_value.
+        # REWARD_SCHEMA_VERSION names it; a value table's targets count these wins, so change the string
+        # with any change to the scorer or to this rule.
         info["won"] = bool(done and reward >= 1.0)
         return obs, reward, done, info
 

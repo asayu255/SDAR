@@ -109,6 +109,13 @@ and the population each is over: records/<task>/<kind>/{groups, trajectories, ro
 progress_rank off, also the traj/<task>/* metrics and the think-block share progress_rank reports,
 through its own pure functions (trajectory_metrics, think_block_metrics) on a faithful copy of the
 per-trajectory summary its controller builds (trajectory_summaries; a test holds the two equal).
+traj/webshop/fail_progress is k / K of WebShop's failures with k = progress_k, whose WebShop count is
+the one algorithm.progress_rank.webshop_k chose: the legacy count on every arm before 2026-09-30, the
+session count in the 2x2's cells. Under any count but legacy the key names it
+(traj/webshop/fail_progress_session; progress_rank.name_webshop_k, the controller's path too), so it
+is never read against the older arms' legacy numbers -- on the same behaviour the session count can
+read lower (a required value replaced by another value of its option, a click the environment
+ignored), and the legacy count is not recorded when progress_k holds the session one.
 """
 
 import hashlib
@@ -431,18 +438,21 @@ def trajectory_summaries(*, real, tuids, task_names, episode_rewards, tokens, va
     return traj
 
 
-def trajectory_and_think_metrics(batch, *, task_names, real, mask, turn_caps=None) -> Dict[str, float]:
+def trajectory_and_think_metrics(batch, *, task_names, real, mask, turn_caps=None,
+                                 webshop_k: str = "legacy") -> Dict[str, float]:
     """traj/<task>/* and the think-block share, as ProgressRankController.apply reports them.
 
     Through progress_rank's pure functions (failed_groups, trajectory_progress, trajectory_metrics,
     think_block_metrics) on the inputs _apply_progress_rank hands the controller: the loss mask's
     tokens, progress_k / progress_total for the failures' k / K, and the per-trajectory summary
     (trajectory_summaries). The alternative-count comparisons (progress_rank/<task>/alt_*) are (a)'s
-    and are not reported here.
+    and are not reported here. ``webshop_k``: the count progress_k's WebShop rows hold
+    (algorithm.progress_rank.webshop_k), which names the WebShop key computed from k unless it is
+    legacy (progress_rank.name_webshop_k, as the trainer names the controller's).
     """
     from verl.trainer.ppo.progress_rank import (COVERAGE_D_KEY, PROGRESS_K_KEY, PROGRESS_TOTAL_KEY,
-                                                failed_groups, think_block_metrics, trajectory_metrics,
-                                                trajectory_progress)
+                                                failed_groups, name_webshop_k, think_block_metrics,
+                                                trajectory_metrics, trajectory_progress)
 
     nt = batch.non_tensor_batch
     n = len(batch)
@@ -463,6 +473,7 @@ def trajectory_and_think_metrics(batch, *, task_names, real, mask, turn_caps=Non
     out = trajectory_metrics(groups, traj, tuids=tuids, real=real,
                              tasks=list(dict.fromkeys(names[real].tolist())), traj_prog=traj_prog,
                              turn_caps=turn_caps, alt_prog=None, have_invalid="is_action_valid" in nt)
+    out = name_webshop_k(out, webshop_k)
     out.update(think_block_metrics(responses=batch.batch["responses"], mask=mask, task_names=task_names,
                                    real=real))
     return out
@@ -483,7 +494,7 @@ def compute_step_records(batch, *, step: int, cfg: RecordsConfig, task_names, mu
                          pg_loss_norm: str = "token", value=None, value_source: Optional[str] = None,
                          grpo_kwargs: Optional[Mapping[str, Any]] = None, penalty_coefs=None,
                          turn_caps: Optional[Mapping[str, float]] = None,
-                         traj_metrics: bool = True) -> StepRecords:
+                         traj_metrics: bool = True, webshop_k: str = "legacy") -> StepRecords:
     """This step's group records and records/* metrics (see the module docstring). Reads ``batch``.
 
     ``task_names``     per row, the canonical task (get_task_names, or the single-task env's)
@@ -497,6 +508,7 @@ def compute_step_records(batch, *, step: int, cfg: RecordsConfig, task_names, mu
                        (None: the run applies no penalty)
     ``turn_caps``      {task: H}, for traj/<task>/fail_at_cap
     ``traj_metrics``   report traj/* and the think-block share (off when progress_rank reports them)
+    ``webshop_k``      algorithm.progress_rank.webshop_k: the count progress_k's WebShop rows hold
     """
     tb, nt = batch.batch, batch.non_tensor_batch
     n = len(batch)
@@ -623,7 +635,7 @@ def compute_step_records(batch, *, step: int, cfg: RecordsConfig, task_names, mu
         metrics["records/shadow_gigpo/available"] = float(gg is not None)
     if traj_metrics:
         metrics.update(trajectory_and_think_metrics(batch, task_names=names, real=real, mask=mask,
-                                                    turn_caps=turn_caps))
+                                                    turn_caps=turn_caps, webshop_k=webshop_k))
 
     # ---- the records ----
     col = {c: _column(nt, c, n) for c in ("pv_k_before", "pv_k_after", "pv_stag_before", "pv_cap", "pv_term",

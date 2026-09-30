@@ -119,9 +119,12 @@ actor_rollout_ref:
     #               lengths. The default, and every arm before 2026-09-30.
     #   trajectory  divided by N_d * pg_ref_tokens[task]: the task's real trajectories in
     #               the step times a FIXED reference length. Turns and tokens are summed
-    #               inside a trajectory, never divided by its own length, so the on-policy,
-    #               pre-clip update estimates the gradient of one fixed objective. Needs
-    #               normalize_loss_by_task (the weight is a second column beside the token one).
+    #               inside a trajectory, never divided by its own length, so the MEAN
+    #               optimizer step's on-policy, pre-clip policy gradient estimates the
+    #               gradient of one fixed objective. How many optimizer steps a batch
+    #               becomes (its rows -- turns -- over ppo_mini_batch_size) still follows
+    #               the sampled lengths, as under token. Needs normalize_loss_by_task (the
+    #               weight is a second column beside the token one).
     # See verl/trainer/ppo/task_loss_weights.py.
     pg_loss_norm: token
     # trajectory only: {task: L_task}, the fixed reference response tokens per trajectory,

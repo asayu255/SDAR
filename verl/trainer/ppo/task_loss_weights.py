@@ -48,22 +48,49 @@ update's expectation is -0.0145.)
 where N_d is the number of the task's real trajectories in the step (distinct
 traj_uid over the rows before adjust_batch's padding) and L_d is a FIXED reference
 response length per task, tokens per trajectory (actor.pg_ref_tokens), never read
-off the batch. Summed as the actor sums every term -- over a trajectory's turn
-rows and over each turn's generated tokens, never divided by the trajectory's own
-length -- one step's update is
+off the batch. num_mini_batches is the token weight's own factor, the number of
+optimizer steps update_policy cuts the batch into. Summed as the actor sums every
+term -- over a trajectory's turn rows and over each turn's generated tokens, never
+divided by the trajectory's own length, with FSDP's average over the DP ranks and
+the division by gradient_accumulation undone exactly, so neither adds a factor --
+the step's policy-gradient loss at the rollout policy has the gradient
+num_mini_batches * g, where
 
     g = (1/D) sum_d 1/(N_d L_d) sum_{i in d} sum_t A_it sum_{u in turn t} grad log pi(y_itu)
 
-N_d is fixed by the batch design (prompts per task x the group size) and L_d by
-the config, so nothing in the denominator depends on what was sampled: this is
-the token weight with T_d replaced by N_d * L_d, and that replacement is the whole
+and the batch is taken in num_mini_batches optimizer steps, each with its own
+rows' part: the MEAN OPTIMIZER STEP carries exactly g. N_d is fixed by the batch
+design (prompts per task x the group size) and L_d by the config, so nothing in
+g's weights depends on what was sampled: (a) is the token weight with T_d replaced
+by N_d * L_d, the same num_mini_batches in both, and that replacement is the whole
 difference. What it buys is limited to what it says. With an advantage whose
 expectation is the objective's (the Monte Carlo return minus a baseline that does
-not depend on the trajectory), the ON-POLICY, PRE-CLIP update is an unbiased
-estimate of the gradient of the fixed objective (1/D) sum_d J_d / L_d; the clip,
-the later mini-batches' moved ratio, an approximate value under lambda < 1 and the
-teacher term are separate matters that this does not settle. A gamma^t prefix is
-the advantage's business (progress_value.prefix_discount), not this module's.
+not depend on the trajectory), g -- the mean optimizer step's ON-POLICY, PRE-CLIP
+policy gradient -- is an unbiased estimate of the gradient of the fixed objective
+(1/D) sum_d J_d / L_d. Under (b) the same mean optimizer step is the ratio
+estimator above.
+
+WHAT IT DOES NOT FIX: HOW MANY OPTIMIZER STEPS A BATCH BECOMES. num_mini_batches
+= ceil(rows / mini_batch_size), and a row is a turn, so it follows the episode
+lengths the policy sampled. Measured on beta-mirror v2's log: 115 (steps 1-10)
+down to 60 (steps 291-300), 36 to 123 in all, about 13% step to step around that
+trend, and -0.98 against ALFWorld's training success (-0.92 around the trends).
+The step's summed update, num_mini_batches * g, is therefore NOT a fixed multiple
+of g, and its expectation is not the objective's gradient up to a constant. The
+one-task toy in tests/trainer/test_pg_loss_norm.py (a 1-turn or a 3-turn episode
+at 1/2 each, every one a win, so the objective's gradient is 0) shows both halves:
+E[g] = 0, while the step's summed policy gradient at one row per mini-batch has
+expectation +1/8 along the log-odds of the 3-turn reply -- towards the episodes
+that bring more rows. That factor is the same in (b) and in every arm here: it is
+how many PPO iterations a batch is taken in, not how the batch is weighted, and it
+sits with the clip, the later mini-batches' moved ratio, an approximate value
+under lambda < 1 and the teacher term as matters this module does not settle.
+Fixing it would take a fixed number of optimizer steps per training step (a
+mini-batch that grows and shrinks with the batch); the (a) column would then run
+another optimizer schedule than the (b) column, and comparing them would compare
+schedules -- in effect learning rates -- as well. Not done; task_loss/optimizer_steps
+logs the count under trajectory. A gamma^t prefix is the advantage's business
+(progress_value.prefix_discount), not this module's.
 
 WHY A PER-TASK L_d AND NOT ONE CONSTANT. Moving the denominator from tokens to
 trajectories changes the policy gradient's size, and with it its size against the
@@ -157,7 +184,8 @@ def attach_task_loss_weights(
     Under ``pg_loss_norm="trajectory"`` the policy-gradient term gets a second
     column, ``TASK_PG_LOSS_WEIGHT_KEY`` = ``num_mini_batches / (num_tasks * N_task
     * L_task)`` on the task's real rows and 0 on the padding (see the module
-    docstring for what that is the gradient of). ``N_task`` counts TRAJECTORIES,
+    docstring for what that is the gradient of: the mean optimizer step's, while
+    num_mini_batches itself moves with the batch's rows). ``N_task`` counts TRAJECTORIES,
     the distinct ``traj_uid`` among the task's real rows, not rows: a row is one
     turn, so a row count would divide by the sampled episode lengths again, which
     is the dependence this mode exists to remove. A padding copy carries its
@@ -224,7 +252,11 @@ def attach_task_loss_weights(
     # mini-batch contributes exactly the sum of its rows' weighted losses however
     # many rows it has. num_mini_batches only sets the overall scale, so what it
     # has to equal is the number of optimizer steps the batch becomes -- which is
-    # what batch.split() produces, i.e. the ceiling.
+    # what batch.split() produces, i.e. the ceiling. It is a count of THIS batch's
+    # rows, which are turns: it keeps each optimizer step at the step objective's
+    # size (the mean optimizer step carries it), and the step as a whole carries it
+    # num_mini_batches times -- a number that moves with the sampled episode
+    # lengths, under either normalisation (module docstring, WHAT IT DOES NOT FIX).
     num_mini_batches = math.ceil(len(batch) / int(mini_batch_size))
 
     weights = torch.zeros(len(batch), dtype=torch.float32)
@@ -253,6 +285,10 @@ def attach_task_loss_weights(
     batch.batch[TASK_LOSS_WEIGHT_KEY] = weights
     if traj_pg:
         batch.batch[TASK_PG_LOSS_WEIGHT_KEY] = pg_weights
+        # How many optimizer steps this batch becomes: the factor between g (the mean optimizer
+        # step's policy gradient) and the step's summed update, which this normalisation does
+        # not fix (module docstring). Logged under trajectory only; token writes what it always did.
+        metrics[f"{metric_prefix}/optimizer_steps"] = num_mini_batches
     metrics[f"{metric_prefix}/padding_rows"] = len(batch) - n_real
 
 

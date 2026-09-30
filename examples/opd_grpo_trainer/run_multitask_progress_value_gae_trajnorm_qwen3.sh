@@ -17,6 +17,7 @@
 #       fixed reference length) instead of by the response tokens the task brought to the step;
 #       turns and tokens summed inside a trajectory, never divided by its own length. Only the
 #       policy gradient: the teacher KL keeps the token weights. verl/trainer/ppo/task_loss_weights.py.
+#       It replaces the token the script below spells out (this script's keys come after its).
 #   actor_rollout_ref.actor.pg_ref_tokens={alfworld:4650,webshop:2320,search:310}
 #       L_d: beta-mirror v2's (31e7f5e) mean response tokens per trajectory over steps 1-300 (v1
 #       gives 4690 / 1741 / 312), so each task's policy gradient keeps on average the size the
@@ -41,7 +42,9 @@
 # this step's mean tokens per trajectory over L_d: 1 where the two normalisations agree, and its
 # drift is how far the token normalisation would have moved the task's policy gradient),
 # task_loss/pg_trajectories/<task> (N_d: 120 = 15 prompts x 8 rollouts on this recipe),
-# actor/pg_loss_weighted.
+# actor/pg_loss_weighted, task_loss/optimizer_steps (the optimizer steps the batch became, rows / 60:
+# the mean optimizer step's policy gradient is what (a) fixes, and this count -- the same factor in
+# the (b) cells, 115 falling to 60 over v2's run -- is what it does not).
 set -euo pipefail
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAM="${LAM:-1.0}"

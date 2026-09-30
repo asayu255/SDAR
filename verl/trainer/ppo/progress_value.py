@@ -130,8 +130,12 @@ another objective, so the fingerprint names everything a cell and a target mean:
     k_definitions  {task: name}            which count k (and so stag) is: ALFWorld's
                                            alfworld_k, Search's search_k, WebShop's
                                            session count (WEBSHOP_K_DEFINITION)
-    feature_schema_version                 FEATURE_SCHEMA_VERSION: how a row becomes a cell
+    feature_schema_version                 FEATURE_SCHEMA_VERSION: how a row becomes a cell,
+                                           and what the environment writes into the columns
     reward_schema_version                  REWARD_SCHEMA_VERSION: what counts as a win
+
+Those names are what the fingerprint compares, so each is listed beside the code it names, in
+this module and in the environment, and that code points back to it (the constants below).
 
 API. Nothing here imports the trainer; the arrays are numpy (or anything
 np.asarray accepts).
@@ -245,24 +249,42 @@ DROP_BELOW = 1e-6
 # The format term's cut: an invalid indicator's std is 0 or >= 1/sqrt(m) for m rows.
 FORMAT_STD_MIN = 1e-6
 STATE_VERSION = 1
-# What a saved table's cells and targets MEAN beyond the configuration; both are in the fingerprint.
-# FEATURE_SCHEMA_VERSION: how a row becomes a cell and a parent -- the rem buckets as fractions of H
-# left and the stag buckets as lower edges (rem_bucket / stag_bucket), buynow's quarters
+# What a saved table's cells and targets MEAN beyond the configuration; all three are in the
+# fingerprint. The fingerprint holds these names, not the code: a change to what the code computes
+# moves nothing in it unless the name moves too, and a resumed table is then read under the new
+# meaning without an error. So each one lists the code it names, the environment's as well as this
+# module's, and every piece of that code points back here.
+#
+# FEATURE_SCHEMA_VERSION: how a row becomes a cell and a parent. Here: the rem buckets as fractions of
+# H left and the stag buckets as lower edges (rem_bucket / stag_bucket), buynow's quarters
 # (FEATURE_BINS), the ALFWorld type parse (alfworld_type), a missing value as a cell of its own
-# (_key_value), the parent (task, type, rem). BUMP IT with any change to that code: a table keyed the
-# old way would be read, without an error, as other states (test_the_feature_schema_is_pinned fails
-# first and says so).
+# (_key_value), the parent (task, type, rem) -- test_the_feature_schema_is_pinned. In the environment
+# (agent_system/environments), what fills the columns those read: pv_stag_before's rule
+# (progress.PvTracker.step: 0 once k rose, else one more); what the ALFWorld and Search counts behind
+# pv_k count (progress.AlfworldMilestones.k / k_arrive, search_progress / search_progress_answered --
+# k_definitions names WHICH count, this versions WHAT it counts); pv_buynow (env_package/webshop/envs.py
+# WebshopWorker._buy_now_score, through env_manager._ws_buy_now); and the current-state features a
+# configuration may key on (AlfworldMilestones.current_state's hold / inside / at,
+# WebshopProgress.on_goal / opts_now, the Search manager's evidence flag) --
+# tests/oci/test_progress_value_records.py, section 10. BUMP IT with any change on either side: a
+# table keyed the old way would be read, without an error, as other states.
 FEATURE_SCHEMA_VERSION = 1
 # REWARD_SCHEMA_VERSION: what the targets count as a win. R = 1 iff episode_rewards > 0, which is
 # ALFWorld's 10 on won (0 otherwise), WebShop's 10 iff the environment's task_score is 1.0, and Search's
 # exact match (1, else 0). A change to any of them -- a partial WebShop score, a substring match for
-# Search -- is another objective, and a table of it another table. Change the string with it.
+# Search -- is another objective, and a table of it another table. Change the string with it. The
+# code: env_package/alfworld/envs.py compute_reward, env_package/webshop/envs.py WebshopWorker.step
+# (its reward redefinition), and the Search environment's compute_score (skyrl_gym search/utils.py,
+# exact match by em_check) as env_package/search/envs.py takes it --
+# tests/oci/test_progress_value_records.py, section 10.
 REWARD_SCHEMA_VERSION = ("win_v1: R = episode_rewards > 0; alfworld 10/0 on won; "
                          "webshop 10 iff task_score == 1.0; search exact match 1/0")
 # The WebShop k of the pv_* columns: ALWAYS the session count (WebshopProgress.k_session: goal product
 # found + opened + best required options held + bought, read off the environment's session),
 # whatever algorithm.progress_rank.webshop_k puts into progress_k. Versioned like the schemas: a
-# change to what the session count counts is a change of k.
+# change to what the session count counts is a change of k. The code: progress.WebshopProgress
+# (k_session and _note_session, and found, which it shares with the legacy count) and the session
+# WebshopWorker._session_state ships -- tests/oci/test_progress_value_records.py, sections 2 and 10.
 WEBSHOP_K_DEFINITION = "session_v1"
 
 ALFWORLD_TYPES = ("pick_and_place_simple", "look_at_obj_in_light", "pick_clean_then_place_in_recep",

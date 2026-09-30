@@ -1,11 +1,11 @@
 # Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 1.0 with the TRAJECTORY-
 # NORMALISED policy gradient -- the 2x2's main cell -- launched by
 # run_multitask_progress_value_gae_trajnorm_qwen3.sh (the default LAM): the progress_value_gae
-# lam 1.0 lock below verbatim, with the policy gradient's normalisation changed (the block at
-# the end):
+# lam 1.0 lock below verbatim, with the policy gradient's normalisation changed -- that lock's
+# pg_loss_norm token pin replaced by the block at the end:
 #   - actor.pg_loss_norm trajectory: each task's policy gradient divided by N_d * L_d, its real
 #     trajectories in the step times a fixed reference length, instead of by the response tokens it
-#     brought to the step (token, what the parent runs). Only the policy gradient: the teacher KL
+#     brought to the step (token, what the parent pins). Only the policy gradient: the teacher KL
 #     keeps the token weights.
 #   - actor.pg_ref_tokens {alfworld: 4650, webshop: 2320, search: 310}: L_d, beta-mirror v2's mean
 #     response tokens per trajectory over steps 1-300, fixed.
@@ -38,6 +38,9 @@
 #   - the analysis records on (algorithm.progress_value.records, 2026-09-30): every step's group
 #     records and records/* metrics, with the GRPO and GiGPO shadows beside the advantage
 #     (verl/trainer/ppo/rollout_records.py). Observation only: nothing in training reads them.
+#   - actor.pg_loss_norm token pinned (the block at the end): the 2x2's column (b) -- the default,
+#     what v2 runs -- pinned so this cell cannot quietly run column (a); the _trajnorm locks replace
+#     that block.
 # One lock per lam: the launcher picks expected_multitask_progress_value_gae_lam$LAM_config.yaml,
 # so a lam without a lock refuses to start. The two locks differ only in algorithm.lam (and
 # the lines that describe it).
@@ -423,7 +426,10 @@
 # trajectory: the policy-gradient term aggregated per row by num_mini_batches / (D * N_d * L_d),
 # N_d the task's real trajectories in the step and L_d below, turns and tokens summed inside a
 # trajectory; the teacher KL (and every other term) keeps the token weights
-# (verl/trainer/ppo/task_loss_weights.py). The (b) cells run token, the default.
+# (verl/trainer/ppo/task_loss_weights.py). The (b) cells pin token, the default. num_mini_batches,
+# the optimizer steps the batch becomes (rows / ppo_mini_batch_size, rows = turns), is the (b)
+# cells' factor too and follows the sampled turn counts in both columns: what (a) fixes is the mean
+# optimizer step's policy gradient, not the step's sum (task_loss/optimizer_steps).
 "actor_rollout_ref.actor.pg_loss_norm": trajectory
 # L_d: beta-mirror v2's (31e7f5e) steps 1-300 mean response tokens per trajectory (v1: 4690 / 1741
 # / 312), so each task's policy gradient keeps on average the size the token normalisation gave it,

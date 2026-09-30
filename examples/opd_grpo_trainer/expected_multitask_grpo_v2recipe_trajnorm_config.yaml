@@ -12,14 +12,14 @@
 #
 # Expected effective config for OPD + GRPO ON THE VALUE ARM'S RECIPE with the TOKEN-normalised
 # policy gradient -- the 2x2's control cell -- launched by run_multitask_grpo_v2recipe_qwen3.sh:
-# the progress_value_gae lam 1.0 lock below verbatim, with two changes:
+# the progress_value_gae lam 1.0 lock below verbatim, with one change:
 #   - algorithm.adv_estimator grpo (its line below): outcome GRPO's group-relative advantages. The
 #     value arm's gamma, lam and progress_value keys stay pinned as they are: grpo reads none of
 #     them, progress_value.enable is the records' switch (the pv_* columns; nothing reaches the
 #     advantage), and the rest is the table config the records-only shadow of the value
 #     estimator is built with (algorithm.progress_value.records.shadow_value: its own table, never
 #     the checkpoint's). Their comments below describe the value arm.
-#   - actor.pg_loss_norm token pinned (the block at the end): the default, as on the parent.
+# Its actor.pg_loss_norm token pin (the block at the end) is the parent's: column (b), as there.
 # THE 2x2 (2026-09-30, the user: trajectory normalisation (a) is the paper's main one, the token
 # normalisation (b) the control beside it), one lock per cell (and per lam):
 #                        (b) token-normalised PG                  (a) trajectory-normalised PG
@@ -48,6 +48,9 @@
 #   - the analysis records on (algorithm.progress_value.records, 2026-09-30): every step's group
 #     records and records/* metrics, with the GRPO and GiGPO shadows beside the advantage
 #     (verl/trainer/ppo/rollout_records.py). Observation only: nothing in training reads them.
+#   - actor.pg_loss_norm token pinned (the block at the end): the 2x2's column (b) -- the default,
+#     what v2 runs -- pinned so this cell cannot quietly run column (a); the _trajnorm locks replace
+#     that block.
 # One lock per lam: the launcher picks expected_multitask_progress_value_gae_lam$LAM_config.yaml,
 # so a lam without a lock refuses to start. The two locks differ only in algorithm.lam (and
 # the lines that describe it).
@@ -433,7 +436,10 @@
 # trajectory: the policy-gradient term aggregated per row by num_mini_batches / (D * N_d * L_d),
 # N_d the task's real trajectories in the step and L_d below, turns and tokens summed inside a
 # trajectory; the teacher KL (and every other term) keeps the token weights
-# (verl/trainer/ppo/task_loss_weights.py). The (b) cells run token, the default.
+# (verl/trainer/ppo/task_loss_weights.py). The (b) cells pin token, the default. num_mini_batches,
+# the optimizer steps the batch becomes (rows / ppo_mini_batch_size, rows = turns), is the (b)
+# cells' factor too and follows the sampled turn counts in both columns: what (a) fixes is the mean
+# optimizer step's policy gradient, not the step's sum (task_loss/optimizer_steps).
 "actor_rollout_ref.actor.pg_loss_norm": trajectory
 # L_d: beta-mirror v2's (31e7f5e) steps 1-300 mean response tokens per trajectory (v1: 4690 / 1741
 # / 312), so each task's policy gradient keeps on average the size the token normalisation gave it,

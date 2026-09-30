@@ -60,12 +60,15 @@ PROGRESS_TOTAL_ARRIVE_INFO = "progress_total_arrive"
 PROGRESS_K_WALKSET_INFO = "progress_k_walkset"
 PROGRESS_TOTAL_WALKSET_INFO = "progress_total_walkset"
 ALFWORLD_K_DEFINITIONS = ("walkthrough", "milestone", "milestone_arrive", "walkthrough_set")
+# (Whichever of them alfworld_k names is also the value table's pv_k: what it counts is
+# progress_value.FEATURE_SCHEMA_VERSION's -- bump that with any change to a count's code.)
 # SEARCH, TWO COUNTS, both always recorded (see search_progress_answered):
 #   evidence           k = 1 once a returned result carried the answer          K = 1
 #   evidence_answered  0 not seen / 1 seen, no answer / 2 seen and answered     K = 2
 # plus the per-row flag "search_answered": has the rollout sent an <answer> the
 # environment took. The flag is what makes "pushed up yet never answered" countable.
 SEARCH_K_DEFINITIONS = ("evidence", "evidence_answered")
+# (Likewise the value table's Search pv_k: progress_value.FEATURE_SCHEMA_VERSION versions what they count.)
 PROGRESS_K_SEARCH_EVIDENCE_INFO = "progress_k_search_evidence"
 PROGRESS_TOTAL_SEARCH_EVIDENCE_INFO = "progress_total_search_evidence"
 PROGRESS_K_SEARCH_ANSWERED_INFO = "progress_k_search_answered"
@@ -300,6 +303,8 @@ class PvTracker:
             info["pv_env_done"] = int(bool(dones[i]))
             info["pv_won"] = int(bool(info.get("won", False)))
             info["pv_term"] = int(terms[i])
+            # The value table's stag: changing this rule changes what a saved table's cells mean --
+            # bump progress_value.FEATURE_SCHEMA_VERSION (tests/oci/test_progress_value_records.py, 10).
             self._stag[i] = 0 if after["k"] > before["k"] else self._stag[i] + 1
             self._before[i] = dict(after)
 
@@ -677,6 +682,8 @@ class AlfworldMilestones:
         if self._lamp_here if self.task_type == "look_at_obj_in_light" else (self.receptacle in self._here):
             self.arrived = True
 
+    # k and k_arrive are the value table's ALFWorld pv_k under alfworld_k=milestone / milestone_arrive:
+    # a change to what they count is a change of progress_value.FEATURE_SCHEMA_VERSION -- bump it.
     @property
     def k(self) -> int:
         if not self.total:
@@ -717,6 +724,8 @@ class AlfworldMilestones:
           at      standing at a target receptacle; with no receptacle target (look_at, where
                   parent_target is empty in every game), a lamp of the target type is here
         All 0 for a game without milestones (K = 0), whose state is never tracked.
+        Features a value-table configuration may key on: a change to any of them is a change of
+        progress_value.FEATURE_SCHEMA_VERSION -- bump it.
         """
         held = self._holding
         hold = int(held is not None and held[0] == self.object
@@ -899,6 +908,9 @@ class WebshopProgress:
                 self.session_bought = True
         self.session_best_options = max(self.session_best_options, self.opts_now)
 
+    # on_goal / opts_now are the pv_ongoal / pv_optnow features (progress_value.FEATURE_SCHEMA_VERSION),
+    # k_session is the value table's WebShop pv_k (progress_value.WEBSHOP_K_DEFINITION): a change to what
+    # they read moves the version named -- change it with the code.
     @property
     def on_goal(self) -> bool:
         """The session's product is the goal product now."""
@@ -925,6 +937,8 @@ class WebshopProgress:
             return 0
         return int(self.found) + int(self.opened) + self.best_options + int(self.bought)
 
+    # The value table's WebShop pv_k: progress_value.WEBSHOP_K_DEFINITION ("session_v1") names what this
+    # counts -- change the name with any change here or in _note_session.
     @property
     def k_session(self) -> int:
         if not self.total:
@@ -937,6 +951,8 @@ class WebshopProgress:
 
 # --- Search -------------------------------------------------------------- #
 
+# search_progress and search_progress_answered are the value table's Search pv_k under search_k: what they
+# count is progress_value.FEATURE_SCHEMA_VERSION's -- bump it with any change.
 def search_progress(evidence_seen: bool, target, *, answer_strings, is_yesno) -> Tuple[int, int]:
     """``(k, K)`` for one Search row: K is 1 when the question can be judged."""
     if not list(answer_strings(target)) or is_yesno(target):

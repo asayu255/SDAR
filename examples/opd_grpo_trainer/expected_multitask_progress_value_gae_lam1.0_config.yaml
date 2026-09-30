@@ -17,6 +17,9 @@
 #   - the analysis records on (algorithm.progress_value.records, 2026-09-30): every step's group
 #     records and records/* metrics, with the GRPO and GiGPO shadows beside the advantage
 #     (verl/trainer/ppo/rollout_records.py). Observation only: nothing in training reads them.
+#   - actor.pg_loss_norm token pinned (the block at the end): the 2x2's column (b) -- the default,
+#     what v2 runs -- pinned so this cell cannot quietly run column (a); the _trajnorm locks replace
+#     that block.
 # One lock per lam: the launcher picks expected_multitask_progress_value_gae_lam$LAM_config.yaml,
 # so a lam without a lock refuses to start. The two locks differ only in algorithm.lam (and
 # the lines that describe it).
@@ -397,3 +400,9 @@
 "algorithm.progress_value.records.shadow_gigpo": true
 "algorithm.progress_value.records.shadow_value": true
 "algorithm.progress_value.records.per_turn": true
+
+# ---- the policy-gradient normalisation: the 2x2's column (b) ------------------------
+# token, the default: each task's policy gradient divided by the response tokens the task brought
+# to the step, like every other term (verl/trainer/ppo/task_loss_weights.py). Pinned so this cell
+# cannot quietly become the other column.
+"actor_rollout_ref.actor.pg_loss_norm": token

@@ -14,6 +14,8 @@
 #       outcome GRPO: compute_advantage's grpo branch, the z-score within the prompt group of the
 #       rows' scores with the invalid-action penalty added, as on beta-mirror v2's parent arms.
 # Everything else is that script's, and so beta-mirror v2's recipe and host knobs:
+#   actor_rollout_ref.actor.pg_loss_norm=token, the (b) column, as that script spells it out (this
+#   cell's lock pins it too);
 #   progress_rank off, its counter keys kept (alfworld_k milestone_arrive, search_k
 #   evidence_answered, webshop_k session: the environment's own session count);
 #   progress_value.enable=True, RECORDS ONLY beside grpo -- the environment managers count and the

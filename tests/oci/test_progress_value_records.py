@@ -16,6 +16,11 @@ WHAT IT PROTECTS.
   * pv_term: 1 won, 2 the task's own terminal action failed (WebShop buy, Search answer), 3 out of
     turns -- the multitask cap (recorded before it overwrites the dones), the environment's own step
     limit (ALFWorld, Search), or the rollout loop's last turn with no done at all.
+  * The schema versions (section 10): a saved value table's fingerprint names versions, not code, so
+    what the environment's producers emit -- stagnation, every count behind pv_k, the state features,
+    the buy-now score, the rewards -- is pinned beside the version it is emitted under
+    (progress_value.FEATURE_SCHEMA_VERSION, WEBSHOP_K_DEFINITION, REWARD_SCHEMA_VERSION). A producer
+    that changes fails here until the version moves with it.
 No model, no GPU, no Ray, no WebShop index: fake environments throughout.
 """
 import json
@@ -261,6 +266,7 @@ def _fake_get_reward(product, goal, price, options, **kw):
 _goal_mod = types.ModuleType("web_agent_site.engine.goal")
 _goal_mod.get_reward = _fake_get_reward
 _saved = {m: sys.modules.get(m) for m in ("web_agent_site", "web_agent_site.engine", "web_agent_site.engine.goal")}
+GOLD_BUYNOW = None   # (landing, the turns, the purchase), pinned in section 10
 sys.modules.setdefault("web_agent_site", types.ModuleType("web_agent_site"))
 sys.modules.setdefault("web_agent_site.engine", types.ModuleType("web_agent_site.engine"))
 sys.modules["web_agent_site.engine.goal"] = _goal_mod
@@ -278,6 +284,7 @@ try:
     check(len(_calls) == 4, "cached per (product, options) within an episode: 4 distinct states, 4 calls")
     _, _, d3, info3 = wk.step("click[buy now]")
     check(d3 and info3["ws_state"]["buynow"] == 1.0, "the ending turn: the score of what was bought")
+    GOLD_BUYNOW = (rinfo["ws_state"]["buynow"], scores, info3["ws_state"]["buynow"])
 finally:
     for m, mod in _saved.items():
         if mod is None:
@@ -591,6 +598,91 @@ check([dict(r) for rows in off_rows for r in rows] == before, "and the timeout p
 rank_rows = record_turns(True, legacy, value=False)
 check(all(not any(k.startswith("pv_") for k in r) for rows in rank_rows for r in rows),
       "progress_rank alone: the rows carry no pv_* column even when the infos hold pv_* keys")
+
+print("10. the schema versions: what the environment emits under each one")
+# A saved value table's fingerprint (verl/trainer/ppo/progress_value.py) holds the NAMES of these
+# versions, not the code behind them, so a producer here could change what a saved table's cells and
+# targets mean with nothing in the fingerprint moving -- a resumed table would be read under the new
+# meaning without an error. What each producer emits is therefore pinned beside the version it is
+# emitted under. A producer that changes fails its line: bump the version named there and pin the new
+# values; the version checks at the end hold the versions to these values.
+import ast  # noqa: E402
+import importlib.util  # noqa: E402
+
+from verl.trainer.ppo import progress_value as PV  # noqa: E402
+
+FEATURE, WS_K, REWARD = "FEATURE_SCHEMA_VERSION", "WEBSHOP_K_DEFINITION", "REWARD_SCHEMA_VERSION"
+
+# The rewards. ALFWorld's compute_reward is read out of its module alone (the module imports the ALFWorld
+# engine, torchvision and ray); the Search scorer is loaded by path (its package builds the retriever
+# client); WebShop's is WebshopWorker.step on the fake environment of section 4, which scores the right
+# purchase 1.0 and any other 0.5.
+_alf_src = open(os.path.join(REPO, "agent_system/environments/env_package/alfworld/envs.py")).read()
+_alf_fn = next(n for n in ast.parse(_alf_src).body if isinstance(n, ast.FunctionDef) and n.name == "compute_reward")
+_alf_ns = {}
+exec(compile(ast.Module(body=[_alf_fn], type_ignores=[]), "alfworld/envs.py", "exec"), _alf_ns)
+_spec = importlib.util.spec_from_file_location("_search_scoring", os.path.join(
+    REPO, "agent_system/environments/env_package/search/third_party/skyrl_gym/envs/search/utils.py"))
+_scoring = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_scoring)
+_paris = {"target": ["Paris"]}
+wk = worker()
+wk.reset(3)
+for a in ("click[b07abc1234]", "click[black]", "click[large]"):
+    wk.step(a)
+_, r_right, d_right, i_right = wk.step("click[buy now]")
+wk = worker()
+wk.reset(3)
+for a in ("click[b07abc1234]", "click[black]"):
+    wk.step(a)
+_, r_part, d_part, i_part = wk.step("click[buy now]")
+
+GOLDEN = [
+    # (version, what, producer, emitted, pinned)
+    (FEATURE, "stag, WebShop envs 0 and 1", "PvTracker.step",
+     [col(legacy, "pv_stag_before", 0), col(legacy, "pv_stag_before", 1)], [[0, 0, 0, 0, 1, 2], [0, 1, 2, 3, 4, 0]]),
+    (FEATURE, "stag, ALFWorld env 1", "PvTracker.step", col(alf, "pv_stag_before", 1), [0, 1, 2, 3]),
+    (FEATURE, "ALFWorld k and K, milestone_arrive", "AlfworldMilestones.k_arrive",
+     [col(alf, "pv_k_after", 0), col(alf, "pv_K", 0)], [[0, 1, 2, 3], [3, 3, 3, 3]]),
+    (FEATURE, "ALFWorld k and K, milestone", "AlfworldMilestones.k",
+     [col(alf, "progress_k_milestone", 0), col(alf, "progress_total_milestone", 0)], [[0, 1, 1, 2], [2, 2, 2, 2]]),
+    (FEATURE, "Search k, evidence_answered, envs 0-2 and K", "search_progress_answered",
+     [col(srch, "pv_k_after", i) for i in range(3)] + [col(srch, "pv_K", 0)], [[1, 2], [0, 0], [1, 1], [2, 2]]),
+    (FEATURE, "Search k, evidence, envs 0-2", "search_progress",
+     [col(srch, "progress_k_search_evidence", i) for i in range(3)], [[1, 1], [0, 0], [1, 1]]),
+    (FEATURE, "hold / inside / at, ALFWorld env 0", "AlfworldMilestones.current_state",
+     [col(alf, "pv_hold_a", 0), col(alf, "pv_inside_a", 0), col(alf, "pv_at_a", 0)],
+     [[0, 1, 1, 0], [0, 0, 0, 1], [0, 0, 1, 1]]),
+    (FEATURE, "ongoal / optnow, WebShop env 0", "WebshopProgress.on_goal / opts_now",
+     [col(legacy, "pv_ongoal_a", 0), col(legacy, "pv_optnow_a", 0)], [[0, 1, 1, 1, 1, 1], [0, 0, 1, 0, 1, 1]]),
+    (FEATURE, "evid, Search envs 0-2", "SearchEnvironmentManager._note_returned",
+     [col(srch, "pv_evid_a", i) for i in range(3)], [[1, 1], [0, 0], [1, 1]]),
+    (FEATURE, "buy-now score: the landing page, five turns, the purchase", "WebshopWorker._buy_now_score",
+     list(GOLD_BUYNOW or ()), [0.0, [0.5, 0.75, 0.5, 0.75, 1.0], 1.0]),
+    (WS_K, "WebShop k and K, envs 0 and 1 (black -> white -> large holds ONE option)", "WebshopProgress.k_session",
+     [col(session, "pv_k_after", 0), col(session, "pv_k_after", 1), col(session, "pv_K", 0)],
+     [[1, 2, 3, 3, 3, 4], [0, 0, 0, 0, 1, 2], [5] * 6]),
+    (REWARD, "WebShop, the right purchase: done, reward, won, task_score", "WebshopWorker.step",
+     [d_right, r_right, i_right["won"], i_right["task_score"]], [True, 10.0, True, 1.0]),
+    (REWARD, "WebShop, a purchase the environment scores 0.5: done, reward, won, task_score", "WebshopWorker.step",
+     [d_part, r_part, i_part["won"], i_part["task_score"]], [True, 0, False, 0.5]),
+    (REWARD, "ALFWorld, won / not won", "alfworld/envs.py compute_reward",
+     [_alf_ns["compute_reward"]({"won": True}), _alf_ns["compute_reward"]({"won": False})], [10.0, 0.0]),
+    (REWARD, "Search, the answer / a longer one containing it / none", "skyrl_gym search compute_score",
+     [_scoring.compute_score("<answer> Paris </answer>", _paris),
+      _scoring.compute_score("<answer> Paris, France </answer>", _paris),
+      _scoring.compute_score("no answer at all", _paris)], [1, 0, 0]),
+]
+for version, what, producer, got, want in GOLDEN:
+    check(got == want, f"{what} ({producer}), pinned under progress_value.{version}"
+                       + ("" if got == want else f": emitted {got} -- bump {version} and pin the new values"))
+check(PV.FEATURE_SCHEMA_VERSION == 1,
+      "FEATURE_SCHEMA_VERSION is 1: the FEATURE values above are schema 1's; pin new ones when it moves")
+check(PV.WEBSHOP_K_DEFINITION == "session_v1",
+      "WEBSHOP_K_DEFINITION is session_v1: the WebShop k above is its count; pin a new one when it moves")
+check(PV.REWARD_SCHEMA_VERSION == ("win_v1: R = episode_rewards > 0; alfworld 10/0 on won; "
+                                   "webshop 10 iff task_score == 1.0; search exact match 1/0"),
+      "REWARD_SCHEMA_VERSION is win_v1: the rewards above are its; pin new ones when it moves")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

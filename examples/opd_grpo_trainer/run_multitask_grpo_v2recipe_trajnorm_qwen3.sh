@@ -29,7 +29,9 @@
 #   bash examples/opd_grpo_trainer/run_multitask_grpo_v2recipe_trajnorm_qwen3.sh
 #
 # WHAT TO WATCH: task_loss/pg_weight_ratio/<task> (T_d / (N_d L_d)), task_loss/pg_trajectories/<task>
-# (N_d, 120 on this recipe), actor/pg_loss_weighted.
+# (N_d, 120 on this recipe), actor/pg_loss_weighted, task_loss/optimizer_steps (rows / 60: the factor
+# between the mean optimizer step's policy gradient, which (a) fixes, and the step's sum, which it
+# does not).
 set -euo pipefail
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Kept by the scripts below (they only set RUN_TAG when unset).

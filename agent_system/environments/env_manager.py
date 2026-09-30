@@ -1065,7 +1065,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         """The progress line's only state: has a returned result carried the answer?
 
         Guarded for bare-number answers, which a passage can hold by accident --
-        see oci_layout.evidence_in_text.
+        see oci_layout.evidence_in_text. It is also Search's k (search_progress*) and the pv_evid
+        feature, so a change to this rule is a change of progress_value.FEATURE_SCHEMA_VERSION.
         """
         seen = getattr(self, "_evidence_seen", None)
         if seen is None:
@@ -1771,7 +1772,8 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 
 def _ws_buy_now(info):
     """The worker's buy-now score of the session in an info dict (WebshopWorker._buy_now_score):
-    after a purchase, the purchase's own score; NaN when the worker shipped none."""
+    after a purchase, the purchase's own score; NaN when the worker shipped none. The value table's
+    buynow feature: a change here or there is a change of progress_value.FEATURE_SCHEMA_VERSION."""
     state = (info or {}).get(WS_STATE_INFO) if isinstance(info, dict) else None
     value = state.get("buynow") if isinstance(state, dict) else None
     return float("nan") if value is None else float(value)

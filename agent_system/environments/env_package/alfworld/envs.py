@@ -45,6 +45,8 @@ def get_obs_image(env):
     image_tensors = torch.stack(image_tensors, dim=0)
     return image_tensors
 
+# progress_value.REWARD_SCHEMA_VERSION names this reward (10 on won, else 0): a value table's targets count
+# these wins, so change the string with any change here.
 def compute_reward(info, multi_modal=False):
     if multi_modal:
         reward = 10.0 * float(info['won']) + float(info['goal_condition_success_rate'])

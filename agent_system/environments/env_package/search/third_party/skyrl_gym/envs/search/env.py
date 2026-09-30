@@ -54,6 +54,7 @@ class SearchEnv(BaseTextEnv):
         if done:
             # Concat all chat history into a single string and compute reward
             chat_history_str = "".join([item["content"] for item in self.chat_history])
+            # Exact match. progress_value.REWARD_SCHEMA_VERSION names this scorer: change it with it.
             return compute_score(chat_history_str, self.ground_truth)
         else:
             # No reward for intermediate steps for Search tasks

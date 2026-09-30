@@ -159,7 +159,7 @@ __all__ = ["PROGRESS_K_KEY", "PROGRESS_TOTAL_KEY", "COVERAGE_D_KEY", "DEFAULT_MI
            "score_stuck_groups", "score_saturated_groups", "average_ranks", "spearman",
            "coverage_progress", "DEFAULT_SAT_TASKS", "DEFAULT_SAT_MIN_SPREAD",
            "DEFAULT_SAT_TURN_SCALE", "ProgressRankController", "group_status",
-           "trajectory_metrics", "FIRST_ORDER_WINDOW",
+           "trajectory_metrics", "WEBSHOP_K_KEYS", "name_webshop_k", "FIRST_ORDER_WINDOW",
            "think_block_metrics", "THINK_OPEN_IDS",
            "score_mixed_groups", "sign_preserving_scale", "FEW_FAILURES", "GROUP_NOT_G"]
 
@@ -753,6 +753,26 @@ def trajectory_metrics(groups: Dict[str, Dict], traj: Dict[str, dict], *, tuids,
         for key, v in cs.items():
             out[f"progress_rank/{task}/alt_{name}/{key}"] = float(v)
     return out
+
+
+# The traj/* key computed from k, per task. k is progress_k, and progress_k's WebShop count is the one
+# algorithm.progress_rank.webshop_k chose (agent_system/environments/progress.py): every arm before
+# 2026-09-30 recorded the legacy count, and the session count reads lower on the same behaviour
+# wherever the legacy one counted a replaced option value or a click the environment ignored. So
+# under any count but legacy the key carries the count's name, and one key never holds two counts.
+WEBSHOP_K_KEYS = ("traj/webshop/fail_progress",)
+
+
+def name_webshop_k(metrics: Dict[str, float], webshop_k: str) -> Dict[str, float]:
+    """``metrics`` with WebShop's k-derived keys suffixed by the count's name, unless it is legacy.
+
+    For every writer of trajectory_metrics' output: the controller's path (_apply_progress_rank) and
+    the records' (rollout_records.trajectory_and_think_metrics). Legacy returns ``metrics`` itself.
+    """
+    webshop_k = str(webshop_k or "legacy")
+    if webshop_k == "legacy":
+        return metrics
+    return {(f"{k}_{webshop_k}" if k in WEBSHOP_K_KEYS else k): v for k, v in metrics.items()}
 
 
 # --- scale_mode=beta_mirror: the two tied-group shares as a Beta over the task's success rates --- #
