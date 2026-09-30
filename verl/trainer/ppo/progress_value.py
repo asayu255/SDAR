@@ -22,9 +22,12 @@ WHY A TABLE OF COUNTED STATE AND NOT A CRITIC NETWORK. The offline check
 (~/scratch_keep/value_calib, val replays of the RL arms) found that a small table
 over (ALFWorld type, progress k, turns since k last rose, turns remaining),
 shrunk towards coarser tables, is calibrated and ranks states well (ALFWorld AUC
-0.86, WebShop 0.81, 0.84 with the score a purchase would get now), and holds
-from steps 100-150 to 200-300. The current-state features (ALFWorld hold / inside
-/ at, WebShop ongoal / optnow) added nothing there and are off by default. The first-hit
+0.86, WebShop 0.81), and holds from steps 100-150 to 200-300. The current-state
+features (ALFWorld hold / inside / at, WebShop ongoal / optnow) added nothing there
+and are off by default. WebShop's buy-now score (0.84 with it) is off by default
+too: it queries the environment's reward function mid-episode, an access to the
+evaluator the comparison arms do not have, so it is kept for an added experiment
+that separates that access from the value estimate. The first-hit
 value of a progress level alone overestimates stagnant and near-timeout states
 by +0.5-0.8. The buckets below are that check's (evaluate_features.py rb/sb).
 
@@ -236,7 +239,7 @@ FEATURE_BINS = {
 }
 DEFAULT_FEATURES: Dict[str, Tuple[str, ...]] = {
     "alfworld": ("type", "k", "stag", "rem"),
-    "webshop": ("k", "stag", "rem", "buynow"),
+    "webshop": ("k", "stag", "rem"),
     "search": ("k", "rem"),
 }
 # rem: bucket i is the first i with rem > f_i * H (6 bins: > 0.8H, > 0.6H, ... , the rest).
