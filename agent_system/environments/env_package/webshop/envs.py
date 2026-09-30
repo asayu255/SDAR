@@ -148,16 +148,47 @@ class WebshopWorker:
         and ``options`` the one value per option NAME the session holds for it -- the environment
         overwrites a name's value on every click, which the manager cannot tell from the clicks
         alone (a value does not say which option it belongs to). For the manager's session count
-        (progress.WebshopProgress); a few dozen bytes per step. None when it cannot be read.
+        (progress.WebshopProgress); a few dozen bytes per step. ``buynow`` is the score a purchase
+        would get now (_buy_now_score). None when the session cannot be read.
         """
         try:
             session = self.env.server.user_sessions[self.env.session]
             asin = session.get('asin')
             options = session.get('options') or {}
             return {'asin': str(asin).lower() if asin else None,
-                    'options': {str(n).lower(): str(v).lower() for n, v in dict(options).items()}}
+                    'options': {str(n).lower(): str(v).lower() for n, v in dict(options).items()},
+                    'buynow': self._buy_now_score(session)}
         except Exception:  # noqa: BLE001 -- a record for the statistics must never break a step
             return None
+
+    def _buy_now_score(self, session):
+        """What 'buy now' would pay at this moment: the environment's own purchase score of the open
+        product with the session's options (web_agent_text_env.done), 0.0 with no product open.
+
+        A feature of the value table's WebShop state (pv_buynow_*): on the offline check it carried
+        more than any other WebShop feature beside k and stagnation (AUC 0.81 -> 0.84, and 0.74 ->
+        0.85 among stagnant states). It reads the hidden goal, as k does -- the value's input only,
+        never the policy's. Cached per (product, options) within an episode: most turns re-read the
+        same page, and the type score parses text with spaCy. None when it cannot be computed.
+        """
+        asin = session.get('asin')
+        if not asin:
+            return 0.0
+        options = dict(session.get('options') or {})
+        key = (asin, tuple(sorted(options.items())))
+        cache = getattr(self, '_buy_now_cache', None)
+        if cache is None or cache[0] is not session.get('goal'):
+            cache = self._buy_now_cache = (session.get('goal'), {})
+        if key not in cache[1]:
+            try:
+                from web_agent_site.engine.goal import get_reward  # noqa: WPS433 (the worker put it on sys.path)
+
+                server = self.env.server
+                cache[1][key] = float(get_reward(server.product_item_dict[asin], session['goal'],
+                                                 price=server.product_prices.get(asin), options=options))
+            except Exception:  # noqa: BLE001 -- a feature for the value table must never break a step
+                cache[1][key] = None
+        return cache[1][key]
 
     def step(self, action):
         """Execute a step in the environment"""

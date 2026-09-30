@@ -37,6 +37,7 @@ dict to the rollout loop and from there to the trainer as columns.
 """
 
 import hashlib
+import math
 import re
 from collections import Counter
 from typing import Iterable, Optional, Tuple
@@ -150,8 +151,8 @@ WEBSHOP_K_DEFINITIONS = ("legacy", "session")
 # offline value check's (value_calib/replay_features.py feats()), read off AlfworldMilestones.
 PV_COLUMNS = ("pv_t", "pv_cap", "pv_k_before", "pv_k_after", "pv_K", "pv_stag_before",
               "pv_hold_b", "pv_hold_a", "pv_inside_b", "pv_inside_a", "pv_at_b", "pv_at_a",
-              "pv_ongoal_b", "pv_ongoal_a", "pv_optnow_b", "pv_optnow_a", "pv_evid_b", "pv_evid_a",
-              "pv_env_done", "pv_won", "pv_term")
+              "pv_ongoal_b", "pv_ongoal_a", "pv_optnow_b", "pv_optnow_a", "pv_buynow_b", "pv_buynow_a",
+              "pv_evid_b", "pv_evid_a", "pv_env_done", "pv_won", "pv_term")
 PV_TERM_RUNNING, PV_TERM_WON, PV_TERM_FAILED, PV_TERM_TIMEOUT = 0, 1, 2, 3
 # The multitask manager's flag: the task cap, not the environment, ended the episode this turn.
 # On the info dict only; pv_term = 3 is what reaches the row.
@@ -196,7 +197,7 @@ def webshop_k_definition(config) -> str:
 
 def progress_on(config) -> bool:
     """``algorithm.progress_rank.enable`` OR ``algorithm.progress_value.enable``: the managers
-    count, the loop records.
+    count, the loop records the progress_* columns (the pv_* ones only under progress_value_on).
 
     Off, nothing here runs and the batch has exactly control's columns. Either arm needs the
     counts, but only (a) ranks by them: the columns being present does NOT mean progress_rank is
@@ -210,6 +211,21 @@ def progress_on(config) -> bool:
             if cfg is not None and cfg.get("enable", False):
                 return True
         return False
+    except AttributeError:
+        return False
+
+
+def progress_value_on(config) -> bool:
+    """``algorithm.progress_value.enable``: the managers track, and the loop records, the pv_*
+    columns (PV_COLUMNS).
+
+    Narrower than progress_on: an (a) arm counts progress but carries no pv_* columns, so its batch
+    is exactly what it was before these records existed. The value table reads them; nothing else
+    does.
+    """
+    try:
+        cfg = (config.get("algorithm", {}) or {}).get("progress_value", None)
+        return bool(cfg is not None and cfg.get("enable", False))
     except AttributeError:
         return False
 
@@ -242,11 +258,23 @@ def pv_termination(done, won, committed) -> int:
     return PV_TERM_FAILED if committed else PV_TERM_TIMEOUT
 
 
+def _pv_number(value):
+    """A current-state feature as recorded: an int when integral (counts, flags), else the float
+    (WebShop's buy-now score); NaN when unknown."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not math.isfinite(v):
+        return float("nan")
+    return int(v) if v.is_integer() else v
+
+
 class PvTracker:
     """One manager's pv_* bookkeeping: each env's state before its next action, and its stagnation.
 
     A state is a dict with the count under "k" and the task's current-state features under their
-    column stems (ALFWorld hold/inside/at, WebShop ongoal/optnow, Search evid). The tracker starts
+    column stems (ALFWorld hold/inside/at, WebShop ongoal/optnow/buynow, Search evid). The tracker starts
     from the reset states, so turn 0's "before" is the reset and every later "before" is the
     previous turn's "after" -- the one rule the value's TD residual relies on.
     """
@@ -268,7 +296,7 @@ class PvTracker:
             info["pv_stag_before"] = int(self._stag[i])
             for stem, value in after.items():
                 if stem != "k":
-                    info[f"pv_{stem}_b"], info[f"pv_{stem}_a"] = int(before[stem]), int(value)
+                    info[f"pv_{stem}_b"], info[f"pv_{stem}_a"] = _pv_number(before[stem]), _pv_number(value)
             info["pv_env_done"] = int(bool(dones[i]))
             info["pv_won"] = int(bool(info.get("won", False)))
             info["pv_term"] = int(terms[i])

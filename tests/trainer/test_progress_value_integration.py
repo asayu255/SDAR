@@ -105,6 +105,9 @@ def rows_of(spec, rng):
         stems = {"alfworld": ("hold", "inside", "at"), "webshop": ("ongoal", "optnow"), "search": ("evid",)}[task]
         for stem in stems:
             row[f"pv_{stem}_b"], row[f"pv_{stem}_a"] = float(rng.integers(0, 2)), float(rng.integers(0, 2))
+        if task == "webshop":
+            # the purchase score of the open product: a continuous value in [0, 1]
+            row["pv_buynow_b"], row["pv_buynow_a"] = float(rng.random()), float(rng.random())
         rows.append(row)
         stag = 0 if k_after > k else stag + 1
         k = k_after

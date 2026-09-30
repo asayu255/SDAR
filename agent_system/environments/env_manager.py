@@ -57,6 +57,7 @@ from agent_system.environments.progress import (
     GOAL_PRICE_INFO, ENV_SEED_INFO, GOAL_PRODUCT_PRICE_INFO, RevisitCounter,
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
+    progress_value_on as _progress_value_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
     search_k_definition as _search_k_definition, search_progress_answered as _search_progress_answered,
     PvTracker, WS_STATE_INFO, pv_note_cap as _pv_note_cap, pv_termination as _pv_termination,
@@ -857,7 +858,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         # The progress-value records (progress.PV_COLUMNS): before any result has come back nothing
         # is seen and both counts are 0, whatever the question.
         self._pv = (PvTracker([{"k": 0, "evid": 0} for _ in range(n)], _turn_cap(self.config))
-                    if _progress_on(self.config) else None)
+                    if _progress_value_on(self.config) else None)
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
         self._probe_rows = [self._probe_new_row(i) for i in range(n)] if self._probe_dir else []
         if self._probe_rows and not getattr(self, "_probe_atexit", False):
@@ -1311,7 +1312,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # alfworld_k count as the counters above hold it (nothing done yet; the pointer at step 0)
         # and the milestones' current state (nothing held, nowhere yet).
         self._pv = None
-        if _progress_on(self.config):
+        if _progress_value_on(self.config):
             _kdef = _alfworld_k_definition(self.config)
             _k0 = {"milestone": [m.k for m in self._milestones],
                    "milestone_arrive": [m.k_arrive for m in self._milestones],
@@ -1768,6 +1769,14 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
         return postprocess_text_obs
 
 
+def _ws_buy_now(info):
+    """The worker's buy-now score of the session in an info dict (WebshopWorker._buy_now_score):
+    after a purchase, the purchase's own score; NaN when the worker shipped none."""
+    state = (info or {}).get(WS_STATE_INFO) if isinstance(info, dict) else None
+    value = state.get("buynow") if isinstance(state, dict) else None
+    return float("nan") if value is None else float(value)
+
+
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -1796,9 +1805,10 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 f"carries no {WS_STATE_INFO!r} (WebshopWorker.reset ships it)")
         # The progress-value records (progress.PV_COLUMNS), from the landing page: the session count
         # (the legacy one when no session is shipped) and the session's product and options.
-        self._pv = (PvTracker([{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now}
-                               for p in self._ws_progress], _turn_cap(self.config))
-                    if _progress_on(self.config) else None)
+        self._pv = (PvTracker([{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now,
+                                "buynow": _ws_buy_now(info)}
+                               for p, info in zip(self._ws_progress, infos or [])], _turn_cap(self.config))
+                    if _progress_value_on(self.config) else None)
         # Repeated actions (shadow column `revisits`): the same click or search again.
         self._revisit = [RevisitCounter() for _ in self.goals] if _progress_on(self.config) else []
         # The terminal action sent (shadow column `committed`): a "click[buy now]" on ANY
@@ -1905,7 +1915,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             _pv = getattr(self, "_pv", None)
             if _pv is not None:
                 _won = [bool((info or {}).get("won", False)) for info in infos]
-                _pv.step(infos, [{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now} for p in _wsp],
+                _pv.step(infos, [{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now,
+                                  "buynow": _ws_buy_now(infos[i])} for i, p in enumerate(_wsp)],
                          [p.total for p in _wsp], dones,
                          [_pv_termination(dones[i], _won[i], committed=bool(dones[i])) for i in range(len(_wsp))])
         _put_coverage(infos, _cov)
@@ -2294,7 +2305,7 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
             dones = np.asarray(dones).reshape(-1).astype(bool)
 
             self._task_steps[task] += 1
-            if _progress_on(self.config):
+            if _progress_value_on(self.config):
                 # The line below forces every env of the task done at its cap and so loses whether
                 # the environment itself ended the episode. The task manager has already recorded
                 # that (pv_env_done, pv_term); mark the rows the cap alone ends as out of turns.

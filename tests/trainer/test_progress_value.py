@@ -47,16 +47,16 @@ GAMEFILE_TWO = "json_2.1.1/train/pick_two_obj_and_place-Book-None-Desk-311/trial
 # --------------------------------------------------------------------------- #
 
 def trajectory(uid, tuid, T, reward, task="alfworld", *, k=None, k_after=None, stag=None, valid=None,
-               cap=None, gamefile=GAMEFILE, capped=None):
+               cap=None, gamefile=GAMEFILE, capped=None, buynow=None):
     return dict(uid=uid, tuid=tuid, T=T, reward=reward, task=task, k=k, k_after=k_after, stag=stag,
-                valid=valid, cap=cap, gamefile=gamefile, capped=capped)
+                valid=valid, cap=cap, gamefile=gamefile, capped=capped, buynow=buynow)
 
 
 def batch(specs):
     """Per-row columns, trajectory by trajectory, turns ascending (the rollout's order)."""
     cols = {c: [] for c in ("traj_uid", "uid", "pv_t", "pv_cap", "task_name", "episode_rewards",
                             "is_action_valid", "pv_k_before", "pv_k_after", "pv_stag_before", "gamefile",
-                            "goal_capped")}
+                            "goal_capped", "pv_buynow_b")}
     for s in specs:
         T = s["T"]
         k = s["k"] if s["k"] is not None else [0] * T
@@ -65,6 +65,9 @@ def batch(specs):
         valid = s["valid"] if s["valid"] is not None else [True] * T
         cap = s["cap"] if s["cap"] is not None else CAPS[s["task"]]
         capped = s["capped"] if s["capped"] is not None else (0.0 if s["task"] == "webshop" else float("nan"))
+        # WebShop's buy-now score: 0 (nothing open) unless given; NaN on the other tasks, as recorded.
+        buynow = (s["buynow"] if s["buynow"] is not None
+                  else [0.0 if s["task"] == "webshop" else float("nan")] * T)
         for t in range(T):
             cols["traj_uid"].append(s["tuid"])
             cols["uid"].append(s["uid"])
@@ -78,6 +81,7 @@ def batch(specs):
             cols["pv_stag_before"].append(float(stag[t]))
             cols["gamefile"].append(s["gamefile"] if s["task"] == "alfworld" else "")
             cols["goal_capped"].append(float(capped))
+            cols["pv_buynow_b"].append(float(buynow[t]))
     out = {}
     for c, v in cols.items():
         if c in ("traj_uid", "uid", "task_name", "gamefile"):
@@ -797,6 +801,18 @@ def test_current_state_features_are_read_from_their_columns():
     cols["pv_optnow_b"] = np.array([0.0, 0.0, 1.0])
     recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg)).records
     assert [r[0] for r in recs] == [("webshop", 0, 0, 0, 0), ("webshop", 1, 1, 0, 0), ("webshop", 2, 1, 1, 0)]
+
+
+def test_buynow_is_keyed_in_quarters():
+    """WebShop's default state includes the buy-now score, binned to 0..4 (the offline check's "bn");
+    a missing score is a cell of its own."""
+    assert pv.DEFAULT_FEATURES["webshop"] == ("k", "stag", "rem", "buynow")
+    cfg = config()
+    cols = batch([trajectory("w", "c", 5, 0.0, "webshop", k=[0, 1, 2, 2, 2], stag=[0, 0, 0, 1, 2],
+                             buynow=[0.0, 0.1, 0.4, 0.88, float("nan")])])
+    recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg)).records
+    assert [r[0][-1] for r in recs] == [0, 0, 2, 4, None]
+    assert [r[0][:3] for r in recs][:3] == [("webshop", 0, 0), ("webshop", 1, 0), ("webshop", 2, 0)]
 
 
 def test_metrics_by_hand():

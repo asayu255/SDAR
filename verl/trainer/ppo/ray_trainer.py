@@ -517,7 +517,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         assert "pv_t" in data.non_tensor_batch, (
             "adv_estimator=progress_value_gae but the batch has no pv_* columns. The environment "
             "managers and the rollout loop record them only while algorithm.progress_value.enable "
-            "(or algorithm.progress_rank.enable) is on, read off their own copy of the config.")
+            "is on, read off their own copy of the config.")
         # The columns by name, rows in the batch's own order -- balanced, adjust_batch's copies
         # included: the estimator puts every trajectory back together from traj_uid and pv_t.
         columns = dict(data.non_tensor_batch)

@@ -327,6 +327,7 @@ from verl import DataProto  # noqa: E402
 def record(on, infos):
     c = TrajectoryCollector.__new__(TrajectoryCollector)
     c._progress_rank_on = on
+    c._progress_value_on = on
     c._queue_row_for_prefetch = lambda *a: None
     batch = DataProto.from_single_dict({"input_ids": torch.zeros(2, 3, dtype=torch.long),
                                         "traj_uid": np.array(["a", "b"], dtype=object)})

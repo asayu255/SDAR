@@ -22,7 +22,9 @@ WHY A TABLE OF COUNTED STATE AND NOT A CRITIC NETWORK. The offline check
 (~/scratch_keep/value_calib, val replays of the RL arms) found that a small table
 over (ALFWorld type, progress k, turns since k last rose, turns remaining),
 shrunk towards coarser tables, is calibrated and ranks states well (ALFWorld AUC
-0.86, WebShop 0.81), and holds from steps 100-150 to 200-300; the first-hit
+0.86, WebShop 0.81, 0.84 with the score a purchase would get now), and holds
+from steps 100-150 to 200-300. The current-state features (ALFWorld hold / inside
+/ at, WebShop ongoal / optnow) added nothing there and are off by default. The first-hit
 value of a progress level alone overestimates stagnant and near-timeout states
 by +0.5-0.8. The buckets below are that check's (evaluate_features.py rb/sb).
 
@@ -131,8 +133,9 @@ order (after _balance_batch, adjust_batch's padding copies included):
     is_padding_row   optional (absent = no padding): True for adjust_batch's copies
     pv_k_before      when a task's features include k   (k_hist before the action)
     pv_stag_before   ...                        stag     (turns since k last rose)
-    pv_hold_b, pv_inside_b, pv_at_b, pv_ongoal_b, pv_optnow_b, pv_evid_b
-                     ... hold, inside, at, ongoal, optnow, evid (the state before the action)
+    pv_hold_b, pv_inside_b, pv_at_b, pv_ongoal_b, pv_optnow_b, pv_buynow_b, pv_evid_b
+                     ... hold, inside, at, ongoal, optnow, buynow, evid (the state before the
+                     action; buynow is keyed in quarters, FEATURE_BINS)
     gamefile         required when an ALFWorld row is present: its task type
     goal_capped      required when a WebShop row is present: 1 = the goal cannot pay
     pv_k_after       optional: only for the delta-on-progress-turns metrics
@@ -187,11 +190,18 @@ FEATURE_COLUMNS: Dict[str, Optional[str]] = {
     "at": "pv_at_b",
     "ongoal": "pv_ongoal_b",
     "optnow": "pv_optnow_b",
+    "buynow": "pv_buynow_b",
     "evid": "pv_evid_b",
+}
+# A feature whose recorded value is continuous, and the bin it is keyed on. buynow is WebShop's
+# purchase score of the open product in [0, 1], keyed in quarters (0, .25, .5, .75, 1 -> 0..4),
+# as in the offline check (ws_replay_features / evaluate_features "bn").
+FEATURE_BINS = {
+    "buynow": lambda v: int(round(4.0 * v)),
 }
 DEFAULT_FEATURES: Dict[str, Tuple[str, ...]] = {
     "alfworld": ("type", "k", "stag", "rem"),
-    "webshop": ("k", "stag", "rem"),
+    "webshop": ("k", "stag", "rem", "buynow"),
     "search": ("k", "rem"),
 }
 # rem: bucket i is the first i with rem > f_i * H (6 bins: > 0.8H, > 0.6H, ... , the rest).
@@ -638,6 +648,9 @@ def compute_progress_value_advantage(columns: Mapping[str, Any], table: Progress
                     vals.append(rem)
                 elif f == "stag":
                     vals.append(cfg.stag_bucket(feat_cols[PV_STAG_BEFORE][i]))
+                elif f in FEATURE_BINS:
+                    x = _finite(feat_cols[FEATURE_COLUMNS[f]][i])
+                    vals.append(None if x is None else FEATURE_BINS[f](x))
                 else:
                     vals.append(_key_value(feat_cols[FEATURE_COLUMNS[f]][i]))
             # A missing feature value is a cell of its own (None), still shrunk to its parent.

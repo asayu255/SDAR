@@ -84,6 +84,8 @@ check(P.progress_on(config(rank=False, value=True)), "progress_value.enable alon
 check(P.progress_on(config(rank=True, value=False)), "progress_rank.enable alone still does")
 check(not P.progress_on(config(rank=False, value=False)), "both off: off")
 check(not P.progress_on(OmegaConf.create({"algorithm": {"progress_value": {}}})), "a block without enable: off")
+check(P.progress_value_on(config(rank=False, value=True)) and not P.progress_value_on(config(rank=True, value=False)),
+      "the pv_* records follow progress_value.enable alone: an (a) arm does not get them")
 check(P.webshop_k_definition(config()) == "legacy", "webshop_k defaults to the legacy count")
 check(P.webshop_k_definition(config(webshop_k="session")) == "session", "webshop_k=session is read")
 try:
@@ -215,16 +217,22 @@ def worker():
 
 wk = worker()
 _, rinfo = wk.reset(3)
-check(rinfo["ws_state"] == {"asin": None, "options": {}}, "reset ships the landing session: no product, no options")
+def sess(state):
+    """The session part of a ws_state (asin, options); buynow is checked on its own below."""
+    return {k: state[k] for k in ("asin", "options")}
+
+
+check(sess(rinfo["ws_state"]) == {"asin": None, "options": {}}, "reset ships the landing session: no product, no options")
+check(rinfo["ws_state"]["buynow"] == 0.0, "...and nothing open to buy: a buy-now score of 0")
 turns = [wk.step(a) for a in ("search[black bag]", "click[b07abc1234]", "click[black]", "click[large]")]
-check(turns[1][3]["ws_state"] == {"asin": "b07abc1234", "options": {}}, "after a product click: its asin, lower-cased")
-check(turns[3][3]["ws_state"] == {"asin": "b07abc1234", "options": {"color": "black", "size": "large"}},
+check(sess(turns[1][3]["ws_state"]) == {"asin": "b07abc1234", "options": {}}, "after a product click: its asin, lower-cased")
+check(sess(turns[3][3]["ws_state"]) == {"asin": "b07abc1234", "options": {"color": "black", "size": "large"}},
       "after option clicks: one value per option name")
 _, reward, done, binfo = wk.step("click[buy now]")
 check(done and binfo["won"] and reward == 10.0, "the fake purchase of the right product and options wins")
 check(wk.env.session != "3" and wk.env.server.user_sessions[wk.env.session]["asin"] is None,
       "the environment has reset itself: the live session is a new one")
-check(binfo["ws_state"] == {"asin": "b07abc1234", "options": {"color": "black", "size": "large"}},
+check(sess(binfo["ws_state"]) == {"asin": "b07abc1234", "options": {"color": "black", "size": "large"}},
       "...yet the ending turn ships the session BEFORE the action -- the one that was bought")
 w = P.WebshopProgress(GOAL, landing, state=rinfo["ws_state"])
 pages = [results, item, item, item]
@@ -239,6 +247,43 @@ _, _, d2, info2 = wk.step("click [buy now]")
 check(not d2 and info2["ws_state"]["asin"] == "b07abc1234", "a malformed buy: no done, the session is untouched")
 wk.env.server.user_sessions.clear()
 check(wk._session_state() is None, "a session that cannot be read is None, never an exception in the step")
+
+# The buy-now score: the environment's own purchase score of the open product with the session's
+# options (get_reward, as web_agent_text_env.done calls it), cached per (product, options).
+_calls = []
+
+
+def _fake_get_reward(product, goal, price, options, **kw):
+    _calls.append((product["asin"], tuple(sorted(options.items()))))
+    return 0.5 + 0.25 * sum(options.get(n) == v for n, v in goal["goal_options"].items())
+
+
+_goal_mod = types.ModuleType("web_agent_site.engine.goal")
+_goal_mod.get_reward = _fake_get_reward
+_saved = {m: sys.modules.get(m) for m in ("web_agent_site", "web_agent_site.engine", "web_agent_site.engine.goal")}
+sys.modules.setdefault("web_agent_site", types.ModuleType("web_agent_site"))
+sys.modules.setdefault("web_agent_site.engine", types.ModuleType("web_agent_site.engine"))
+sys.modules["web_agent_site.engine.goal"] = _goal_mod
+try:
+    wk = worker()
+    wk.env.server.product_item_dict = {"B07ABC1234": {"asin": "B07ABC1234"}}
+    wk.env.server.product_prices = {"B07ABC1234": 10.0}
+    _, rinfo = wk.reset(3)
+    del _calls[:]   # the reset's goal_capped scores the goal once; count the steps' calls only
+    turns = [wk.step(a) for a in ("click[b07abc1234]", "click[black]", "click[white]", "click[black]",
+                                  "click[large]")]
+    scores = [t[3]["ws_state"]["buynow"] for t in turns]
+    check(rinfo["ws_state"]["buynow"] == 0.0 and scores == [0.5, 0.75, 0.5, 0.75, 1.0],
+          "buy-now score: 0 with nothing open, then the purchase score of the open product and options")
+    check(len(_calls) == 4, "cached per (product, options) within an episode: 4 distinct states, 4 calls")
+    _, _, d3, info3 = wk.step("click[buy now]")
+    check(d3 and info3["ws_state"]["buynow"] == 1.0, "the ending turn: the score of what was bought")
+finally:
+    for m, mod in _saved.items():
+        if mod is None:
+            sys.modules.pop(m, None)
+        else:
+            sys.modules[m] = mod
 
 print("5. WebShop manager: webshop_k, the pv_* chain, stagnation")
 from agent_system.environments.env_manager import (  # noqa: E402
@@ -323,6 +368,28 @@ except AssertionError:
 _, off = run_ws(config(rank=False, value=False, max_steps=15))
 check(all(not any(k.startswith("pv_") for k in i) and "progress_k" not in i for t in off for i in t),
       "both switches off: the manager writes nothing")
+_, rank_only = run_ws(config(rank=True, value=False, max_steps=15))
+check(all(not any(k.startswith("pv_") for k in i) and "progress_k" in i for t in rank_only for i in t),
+      "progress_rank alone: the manager counts (progress_k) but writes no pv_* keys")
+# The buy-now score the worker ships with the session: after on each turn, the previous turn's as
+# before, the landing page's 0 at t = 0; NaN where the worker shipped none.
+_bn = [0.0, 0.5, 0.75, 0.5, 1.0, 1.0]
+_script_bn = [[(pg, (dict(st, buynow=_bn[t]) if j == 0 else st), d, w) for j, (pg, st, d, w) in enumerate(turn)]
+              for t, turn in enumerate(WS_SCRIPT)]
+_saved_s0 = dict(S0)
+S0["buynow"] = 0.0
+try:
+    _, bn = run_ws(config(max_steps=15), script=_script_bn)
+finally:
+    S0.clear()
+    S0.update(_saved_s0)
+check(col(bn, "pv_buynow_a", 0) == _bn and col(bn, "pv_buynow_b", 0) == [0.0] + _bn[:-1],
+      "buy-now score: after = the shipped score, before = the previous turn's (0 on the landing page)")
+# env 1 ships no score except on the turns that replay S0 itself (the landing session, 0 while it
+# carried one)
+_want1 = [0.0 if turn[1][1] is S0 else None for turn in WS_SCRIPT]
+check(all((np.isnan(v) if w is None else v == w) for v, w in zip(col(bn, "pv_buynow_a", 1), _want1)),
+      "a session shipped without a score: NaN, never a guess")
 
 print("6. ALFWorld manager: the milestones' current state, and how an episode ends")
 
@@ -471,16 +538,17 @@ from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector, ma
 from verl import DataProto  # noqa: E402
 
 
-def collector(on):
+def collector(on, value=None):
     c = TrajectoryCollector.__new__(TrajectoryCollector)
     c._progress_rank_on = on
+    c._progress_value_on = on if value is None else value
     c._queue_row_for_prefetch = lambda *a: None
     return c
 
 
-def record_turns(on, turns, active=None):
+def record_turns(on, turns, active=None, value=None):
     """Record each turn's infos as the loop does; returns total_batch_list."""
-    c = collector(on)
+    c = collector(on, value)
     n = len(turns[0])
     tuids = np.array([f"t{i}" for i in range(n)], dtype=object)
     tbl, tinf = [[] for _ in range(n)], [[] for _ in range(n)]
@@ -520,6 +588,9 @@ check(set(off_rows[0][0]) == set(empty_off[0][0]) == {"input_ids", "traj_uid", "
 before = [dict(r) for rows in off_rows for r in rows]
 mark_pv_timeouts(off_rows)
 check([dict(r) for rows in off_rows for r in rows] == before, "and the timeout pass touches nothing then")
+rank_rows = record_turns(True, legacy, value=False)
+check(all(not any(k.startswith("pv_") for k in r) for rows in rank_rows for r in rows),
+      "progress_rank alone: the rows carry no pv_* column even when the infos hold pv_* keys")
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

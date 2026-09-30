@@ -938,6 +938,7 @@ class TrajectoryCollector:
     _oci_repl_dtype = torch.long
     _oci_group_n = 0
     _progress_rank_on = False
+    _progress_value_on = False
     _oci_store_doc_prompt = False
 
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -953,9 +954,13 @@ class TrajectoryCollector:
         self.tokenizer = tokenizer
         self.processor = processor
         from agent_system.environments.progress import progress_on as _progress_on
-        # The widened switch (progress_rank OR progress_value): the progress_* and pv_* columns are
-        # recorded for either arm. The name is the historical one, which tests set directly.
+        from agent_system.environments.progress import progress_value_on as _progress_value_on
+        # The widened switch (progress_rank OR progress_value): the progress_* columns are recorded
+        # for either arm. The name is the historical one, which tests set directly. The pv_* columns
+        # only for the value table (algorithm.progress_value.enable), so an (a) arm's batch is
+        # exactly what it was before they existed.
         self._progress_rank_on = _progress_on(config)
+        self._progress_value_on = _progress_value_on(config)
         # HOW WIDE THE REPLACEMENT COLUMN IS. The single-candidate arm's edit puts
         # back one boundary token (see OCI_REPL_WIDTH). The ten-slot layout's
         # document slot edits the prompt in two places at once and its foreign
@@ -1936,10 +1941,11 @@ class TrajectoryCollector:
                 # which only this list knows: the index gather_rollout_data gives as turn_step.
                 # Running out of turns with no done at all is marked after the loop
                 # (mark_pv_timeouts), since no single turn can tell it is the last.
-                for _c in PV_COLUMNS:
-                    _v = _info.get(_c, None)
-                    rows[pos][_c] = float('nan') if _v is None else float(_v)
-                rows[pos]['pv_t'] = float(len(total_batch_list[i]))
+                if self._progress_value_on:
+                    for _c in PV_COLUMNS:
+                        _v = _info.get(_c, None)
+                        rows[pos][_c] = float('nan') if _v is None else float(_v)
+                    rows[pos]['pv_t'] = float(len(total_batch_list[i]))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:
@@ -2229,7 +2235,7 @@ class TrajectoryCollector:
         # is still queued stays queued and the trainer scores it as usual.
         self._join_teacher_prefetch()
 
-        if self._progress_rank_on:
+        if self._progress_value_on:
             # A trajectory the loop stopped with no done (env.max_steps reached) ran out of turns.
             mark_pv_timeouts(total_batch_list)
 
