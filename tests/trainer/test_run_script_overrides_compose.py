@@ -87,6 +87,14 @@ COMPOSED_SCRIPTS = [
     # table's (progress_rank off), one lock per LAM picked by its value. Composed here at the
     # default LAM=1.0; tests/trainer/test_progress_value_integration.py composes LAM=0.9 too.
     "examples/opd_grpo_trainer/run_multitask_progress_value_gae_qwen3.sh",
+    # The 2x2 of 2026-09-30 around it (policy gradient normalised per token (b) or per trajectory
+    # (a), actor.pg_loss_norm): the value arm's (a) cell, a wrapper of the script above with one
+    # lock per LAM; OPD+GRPO on the same recipe (b), a wrapper of the script above with the
+    # advantage put back; and its (a) cell, a wrapper of that. Composed here at the default LAM;
+    # tests/trainer/test_pg_loss_norm.py composes every cell at every LAM against its lock.
+    "examples/opd_grpo_trainer/run_multitask_progress_value_gae_trajnorm_qwen3.sh",
+    "examples/opd_grpo_trainer/run_multitask_grpo_v2recipe_qwen3.sh",
+    "examples/opd_grpo_trainer/run_multitask_grpo_v2recipe_trajnorm_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement

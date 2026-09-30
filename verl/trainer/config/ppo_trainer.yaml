@@ -112,6 +112,24 @@ actor_rollout_ref:
     # 69% of the tokens and search near 4% -- a weighting nobody chose. Off by default;
     # see verl/trainer/ppo/task_loss_weights.py.
     normalize_loss_by_task: False
+    # How that per-task weighting normalises the POLICY-GRADIENT term (the teacher KL,
+    # reference KL, entropy and SDAR terms keep the token weights either way):
+    #   token       each task's policy gradient divided by the response tokens the task
+    #               brought to THIS step -- a denominator that depends on the sampled
+    #               lengths. The default, and every arm before 2026-09-30.
+    #   trajectory  divided by N_d * pg_ref_tokens[task]: the task's real trajectories in
+    #               the step times a FIXED reference length. Turns and tokens are summed
+    #               inside a trajectory, never divided by its own length, so the on-policy,
+    #               pre-clip update estimates the gradient of one fixed objective. Needs
+    #               normalize_loss_by_task (the weight is a second column beside the token one).
+    # See verl/trainer/ppo/task_loss_weights.py.
+    pg_loss_norm: token
+    # trajectory only: {task: L_task}, the fixed reference response tokens per trajectory,
+    # never read off the batch. At a run's own mean each task's policy gradient keeps the
+    # size token gave it on average, against the teacher term too; the 2026-09-30 launchers
+    # pin beta-mirror v2's steps 1-300 means {alfworld: 4650, webshop: 2320, search: 310}.
+    # null refuses trajectory: every task needs a length someone chose.
+    pg_ref_tokens: null
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
@@ -872,7 +890,10 @@ algorithm:
     # FROZEN WITHIN A STEP: the batch is scored against the table as the previous steps left it
     # and added only after (a baseline holding this batch would partly be each trajectory's own
     # outcome). The table is saved beside the checkpoint (global_step_N/progress_value_state.json)
-    # and a resume under another features / buckets / n0 / retention / gamma is refused.
+    # and a resume under another features / buckets / n0 / retention / gamma, other turn caps H
+    # (env.multitask.max_steps / env.max_steps), other k definitions (progress_rank.alfworld_k /
+    # search_k; WebShop is always the session count) or another feature / reward schema
+    # (progress_value.FEATURE_SCHEMA_VERSION / REWARD_SCHEMA_VERSION) is refused.
     #
     # enable IS THE SWITCH FOR THE RECORDS, not for the estimator: with it on (or with
     # progress_rank.enable) the environment managers count and the rollout loop writes the pv_*
@@ -881,8 +902,16 @@ algorithm:
     # refused at launch (opd_grpo_ray_trainer.check_progress_value_config). Beside another
     # estimator it only records: control's advantages, a wider batch.
     enable: False
+    # A RESUMED run of adv_estimator=progress_value_gae must find its table in the checkpoint it
+    # resumes from; without it the launch is refused (the table is written before the step is marked
+    # complete, so a checkpoint without one is incomplete or another arm's, and resuming on an empty
+    # table would silently change the baseline). True = an explicit WARM START, e.g. the arm started
+    # from another arm's checkpoint: the table starts empty, with a loud warning. A table that IS
+    # there is read and checked either way.
+    allow_missing_table: False
     # A_t *= gamma^t, the discounted objective's own policy-gradient weight, on the GAE term. Inert
-    # at gamma = 1.
+    # at gamma = 1. Required when gamma < 1 and eta > 0 (refused otherwise): without the prefix the
+    # update credits every turn as if the episode began there (GiGPO-style), a different method.
     prefix_discount: False
     # A = (1 - eta) (U_i - b) + eta A_t, U_i = gamma^T R and b the mean U of the group's OTHER
     # trajectories, each counted once (not once per turn: a long failure must not outweigh a short
@@ -934,6 +963,36 @@ algorithm:
     # rollouts all have the same R, which is where control applies it; all, to every group.
     format_scope: tied
     format_coef: 1.0
+    # ANALYSIS RECORDS (verl/trainer/ppo/rollout_records.py): per step, one JSON line per group
+    # (step, task, uid, group kind, goal, per trajectory its outcome, turns, tokens, termination and
+    # final k, and per turn the state, V, delta, the value terms, the advantage the actor reads, its
+    # tokens, valid flag and actual loss weights, and the shadows below), plus records/<task>/<kind>/
+    # <component>/{row,traj_sum,token}_* metrics -- the unit in every key -- and, with progress_rank
+    # off, the traj/* and think-block metrics progress_rank used to report. OBSERVATION ONLY: the
+    # batch, the row order, the advantages, the training value table and the RNG states are the same
+    # with it on or off. Needs enable above (the pv_* columns); runs beside progress_value_gae and
+    # beside grpo (records only). A failure costs the step's records, never the step (records/failed).
+    records:
+      enable: False
+      # Where step<N>.jsonl go (and the shadow table's state); null = <trainer.default_local_dir>/
+      # progress_value_groups.
+      dir: null
+      # The advantage outcome GRPO would give this batch: compute_advantage's grpo branch exactly, on
+      # token_level_rewards as the trainer left them (the invalid-action penalty already in them).
+      shadow_grpo: True
+      # OPD+GiGPO's estimator as that run (b2b393c) had it -- gamma 0.95, step_advantage_w 1.0,
+      # mean_std_norm, exact anchors, released statistics -- not algorithm.gigpo: episode term plus
+      # the z of the turn-ordered discounted step return within the uid group's identical anchors.
+      # Not emitted without anchor_obs or per-turn rewards.
+      shadow_gigpo: True
+      # Beside an estimator other than progress_value_gae: an observation-only value table of this
+      # config (built as the training one would be, its own object, saved under dir, never in the
+      # checkpoint) scores every batch, so the value estimator's advantage is recorded on the
+      # control's rollouts. Ignored in the progress_value_gae arm, which records its own result and
+      # never has its training table staged or committed by the records.
+      shadow_value: True
+      # The per-turn lists in each trajectory's record (off: groups and trajectories only).
+      per_turn: True
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

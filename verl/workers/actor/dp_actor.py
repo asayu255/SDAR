@@ -154,7 +154,7 @@ from verl.trainer.ppo.sign_weights import ROLE_NAMES as _CG_ROLE_NAMES
 
 # Columns of the per-task group bitmap (see OpdTaskDiagStats).
 PUSHBACK_MAX_GROUPS = 4096
-from verl.trainer.ppo.task_loss_weights import TASK_LOSS_WEIGHT_KEY
+from verl.trainer.ppo.task_loss_weights import PG_LOSS_NORMS, TASK_LOSS_WEIGHT_KEY, TASK_PG_LOSS_WEIGHT_KEY
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils import actor_capture, gpu_profiler
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
@@ -325,7 +325,9 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
     have been added to a differently-normalised number. This actor weights the
     policy-gradient, entropy and teacher-KL terms with the same row weights, so
     OPD+GRPO can run with the policy gradient on and the coefficients between the
-    terms keep meaning what they say.
+    terms keep meaning what they say. (actor.pg_loss_norm=trajectory gives the
+    policy gradient per-task weights of its own; see
+    :func:`check_pg_loss_norm_supported`.)
 
     Split out of ``update_policy`` so it can be tested without standing up FSDP.
     """
@@ -371,6 +373,101 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
             f"per-task loss normalisation weights the policy-gradient, entropy and "
             f"teacher-KL terms; {other} is set and would keep the plain token-mean"
         )
+
+
+# What reads the policy gradient AGAINST the teacher term with one row weight for
+# both, and acts on the loss or reports a table built that way. Each is refused
+# under pg_loss_norm=trajectory rather than silently mixing two normalisations;
+# none of them is on in the arms the switch was built for.
+_PG_NORM_TOKEN_ONLY = (
+    ("oci_sat.shaping", "the shaped term replaces the clipped ratio on the injected rows and "
+                        "was derived and tested against the token weight"),
+    ("oci_slots", "the ten-slot layout's special rows are shaped on the token-weighted branch"),
+    ("teacher_kl_pushback", "the gate weighs the teacher's push against the policy gradient's "
+                            "under one row weight and attenuates the loss with the answer"),
+    ("teacher_kl_cross_gate", "the gate builds its references from the policy gradient under "
+                              "the token weight and attenuates the loss with them"),
+    ("logit_precision", "the per-id fit reads the advantages with the token weights"),
+)
+
+
+def check_pg_loss_norm_supported(config, *, task_weighted: bool, has_pg_weights: bool,
+                                 pg_loss_coef: float, measure_terms: bool = False) -> bool:
+    """Whether the policy-gradient term takes its own row weights; refuse where it cannot.
+
+    ``actor.pg_loss_norm`` is "token" (the default: the policy gradient is
+    aggregated by the per-task token weights like every other term) or
+    "trajectory" (by ``TASK_PG_LOSS_WEIGHT_KEY``, the task's real trajectory count
+    times a fixed reference length; see ``verl/trainer/ppo/task_loss_weights.py``).
+    The second is a column beside the token weight, so it exists only on the
+    weighted path, and only the policy gradient reads it: the teacher KL, the
+    reference KL, the entropy bonus and SDAR keep the token weight.
+
+    Refused under "trajectory": no per-task weights at all, no policy gradient
+    (a pure-distillation run labelled with a normalisation it never used), a batch
+    the driver did not give the column, the grad probe's mass mode (it records one
+    row weight for both terms), teacher_kl_task_diag, and everything in
+    ``_PG_NORM_TOKEN_ONLY``. GSPO is already refused on the weighted path by
+    :func:`check_task_weighting_supported`. The one-weight geometry diagnostics are
+    not refused: they are handed the policy gradient's weight (see
+    :func:`pg_geometry_ratio`).
+
+    Split out of ``update_policy`` so it can be tested without standing up FSDP.
+    """
+    norm = str(config.get("pg_loss_norm", "token") or "token")
+    assert norm in PG_LOSS_NORMS, (
+        f"actor.pg_loss_norm={norm!r}; expected one of {PG_LOSS_NORMS}"
+    )
+    if norm == "token":
+        return False
+    assert task_weighted, (
+        "actor.pg_loss_norm=trajectory replaces the policy gradient's per-task token weight "
+        f"with its own; the batch carries no {TASK_LOSS_WEIGHT_KEY}, so set "
+        "algorithm.opd.normalize_loss_by_task=True"
+    )
+    assert pg_loss_coef != 0, (
+        "actor.pg_loss_norm=trajectory normalises the policy gradient, and pg_loss_coef is 0"
+    )
+    assert has_pg_weights, (
+        f"actor.pg_loss_norm=trajectory but the batch carries no {TASK_PG_LOSS_WEIGHT_KEY}; the "
+        "driver writes it in attach_task_loss_weights(..., **pg_loss_norm_kwargs(actor config)). "
+        "Training on without it would be the token normalisation under the other one's name."
+    )
+    assert not measure_terms, (
+        "actor.pg_loss_norm=trajectory with grad_probe.mode=mass: the mass probe records one row "
+        "weight per row for both terms, and the policy gradient no longer carries that weight"
+    )
+    for key, why in _PG_NORM_TOKEN_ONLY:
+        node = config
+        for part in key.split("."):
+            node = node.get(part, None) if node is not None else None
+        assert not (node is not None and bool(node.get("enable", False))), (
+            f"actor.pg_loss_norm=trajectory with {key}.enable: {why}"
+        )
+    assert not bool(config.get("teacher_kl_task_diag", False)), (
+        "actor.pg_loss_norm=trajectory with teacher_kl_task_diag: its alignment table carries "
+        "one row basis for the policy gradient and the teacher term"
+    )
+    return True
+
+
+def pg_geometry_ratio(pg_row_weight: torch.Tensor, token_row_weight: torch.Tensor) -> torch.Tensor:
+    """``(bs, 1)`` policy-gradient weight over token weight, for the one-weight diagnostics.
+
+    ``logit_gradient_terms``, ``opd_attribution_terms``, ``xtt_gradient_terms``
+    and the OPSD geometry take ONE row weight and put it on the teacher side and
+    the policy-gradient side alike, because under the token normalisation the loss
+    does. Under pg_loss_norm=trajectory the policy gradient carries its own
+    weight, so its per-token derivative is handed to them multiplied by this
+    ratio: times the shared row weight it is the policy gradient's own weight
+    again, and their norms, cosines and first-order columns stay those of the
+    objective the optimizer takes. 0 where the token weight is 0 -- adjust_batch's
+    padding, whose weights are both 0.
+    """
+    tok = token_row_weight.detach().to(torch.float64).reshape(-1, 1)
+    pg = pg_row_weight.detach().to(torch.float64).reshape(-1, 1)
+    live = tok > 0
+    return torch.where(live, pg / torch.where(live, tok, torch.ones_like(tok)), torch.zeros_like(tok))
 
 
 def _unwrap_module(module):
@@ -2941,6 +3038,21 @@ class DataParallelPPOActor(BasePPOActor):
             self.task_dp_world_size = (
                 torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
             )
+        # actor.pg_loss_norm=trajectory: the policy-gradient term aggregated by its
+        # own per-task weights (the task's real trajectory count times a fixed
+        # reference length, verl/trainer/ppo/task_loss_weights.py) while every other
+        # term keeps the token weights above. Under token, the default, the column is
+        # not even selected, so a batch that happens to carry it trains exactly as
+        # one that does not.
+        pg_traj_weighted = check_pg_loss_norm_supported(
+            self.config,
+            task_weighted=task_weighted,
+            has_pg_weights=TASK_PG_LOSS_WEIGHT_KEY in data.batch.keys(),
+            pg_loss_coef=pg_loss_coef,
+            measure_terms=measure_terms,
+        )
+        if pg_traj_weighted:
+            select_keys.append(TASK_PG_LOSS_WEIGHT_KEY)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -3804,6 +3916,13 @@ class DataParallelPPOActor(BasePPOActor):
                      attention_mask = data["attention_mask"]
                      task_ids = data.get("task_ids", None) if task_id_names else None
                      task_loss_weight = data[TASK_LOSS_WEIGHT_KEY] if task_weighted else None
+                     task_pg_loss_weight = data[TASK_PG_LOSS_WEIGHT_KEY] if pg_traj_weighted else None
+                     # For the diagnostics that put one row weight on both terms
+                     # (see pg_geometry_ratio); None under the token normalisation.
+                     _pg_geom_ratio = (
+                         pg_geometry_ratio(task_pg_loss_weight, task_loss_weight)
+                         if task_pg_loss_weight is not None else None
+                     )
                      if multi_turn:
                          response_mask = data["loss_mask"][:, -response_length:]
                      else:
@@ -4362,7 +4481,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                      # Under per-task normalisation every term is aggregated by the
                      # same row weights instead of by the token-mean, so the
-                     # coefficients between them keep meaning what they say. The
+                     # coefficients between them keep meaning what they say --
+                     # except the policy gradient under pg_loss_norm=trajectory,
+                     # which takes its own weights (pg_agg_scale below). The
                      # weights already carry the full normalisation, so the two
                      # divisions the sum has to survive are undone once here: FSDP
                      # averages gradients across the DP ranks, and the mini-batch
@@ -4370,6 +4491,15 @@ class DataParallelPPOActor(BasePPOActor):
                      task_agg_scale = None
                      if task_loss_weight is not None:
                          task_agg_scale = task_loss_weight * (
+                             self.task_dp_world_size * self.gradient_accumulation
+                         )
+                     # pg_loss_norm=trajectory: the policy gradient's own weights,
+                     # with the SAME undo of the two divisions -- they carry the full
+                     # normalisation exactly as the token weights do. None under the
+                     # token normalisation, where _task_agg serves every term.
+                     pg_agg_scale = None
+                     if task_pg_loss_weight is not None:
+                         pg_agg_scale = task_pg_loss_weight * (
                              self.task_dp_world_size * self.gradient_accumulation
                          )
 
@@ -4431,7 +4561,16 @@ class DataParallelPPOActor(BasePPOActor):
                                      )
                                      for _k, _v in _oci_diag.items():
                                          _defer(_k, _v)
-                             pg_term = _task_agg(pg_losses)
+                             # The one line pg_loss_norm changes. Under trajectory the
+                             # rows' clipped terms are summed over their tokens and
+                             # weighted by the trajectory weights; nothing is divided
+                             # by a row's or a trajectory's own length.
+                             pg_term = (
+                                 _task_agg(pg_losses) if pg_agg_scale is None
+                                 else agg_loss_by_task_weights(
+                                     loss_mat=pg_losses, loss_mask=response_mask, row_weights=pg_agg_scale
+                                 )
+                             )
                              # Reported unweighted so it stays comparable with runs
                              # that do not normalise per task; the weighted number is
                              # deferred separately below.
@@ -4463,6 +4602,12 @@ class DataParallelPPOActor(BasePPOActor):
                                  cliprange_high=clip_ratio_high,
                                  clip_ratio_c=clip_ratio_c,
                              ).detach()
+                             if _pg_geom_ratio is not None:
+                                 # The readers left under pg_loss_norm=trajectory (the
+                                 # geometry diagnostics; the gates that read this are
+                                 # refused) put the TOKEN weight on it, and the loss put
+                                 # the trajectory weight there instead.
+                                 xt_pg_grad_coef = xt_pg_grad_coef * _pg_geom_ratio.to(xt_pg_grad_coef.dtype)
                      else:
                          # Pure teacher-KL distillation: no policy-gradient signal.
                          # Take device/dtype from whichever tensor the forward
@@ -4577,6 +4722,9 @@ class DataParallelPPOActor(BasePPOActor):
                              cliprange_high=clip_ratio_high,
                              clip_ratio_c=clip_ratio_c,
                          ).detach() if xt_pg_grad_coef is None else xt_pg_grad_coef
+                         if xt_pg_grad_coef is None and _pg_geom_ratio is not None:
+                             # As for xt_pg_grad_coef above, which already carries it.
+                             _opsd_pgc = _opsd_pgc * _pg_geom_ratio.to(_opsd_pgc.dtype)
                          # A row whose document did not fit its prompt window was
                          # scored on the plain prompt; its gap is zero by
                          # construction and counting it would report a gate of

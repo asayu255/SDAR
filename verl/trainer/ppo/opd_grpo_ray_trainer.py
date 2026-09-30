@@ -28,6 +28,10 @@ quietly stops being true. So this subclass overrides only the two hooks
   ``compute_data_metrics`` instead of the advantage-free OPD variant.
 """
 
+import json
+import os
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -38,10 +42,17 @@ from verl.trainer.ppo.metric_utils import (
     compute_group_metrics,
     get_task_names,
 )
-from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer
+from verl.trainer.ppo.opd_ray_trainer import (
+    OPDRayTrainer,
+    _write_json_atomic,
+    progress_value_config,
+    progress_value_turn_caps,
+)
 from verl.trainer.ppo.ray_trainer import (
     GRPO_STAT_EXCLUDE_KEY,
     OCI_FLOOR_KEY,
+    _check_progress_value_caps,
+    _get_invalid_action_penalty_coef,
     _timer,
     apply_invalid_action_penalty,
     apply_kl_penalty,
@@ -75,7 +86,10 @@ def check_progress_value_config(config) -> bool:
 
     Called by inject_opd_grpo_config, so a bad combination fails in the first seconds of a launch
     (the progress_value keys are validated there too), and again by the trainer on every step.
+    The analysis records' own keys are checked here as well, beside any estimator
+    (check_rollout_records_config).
     """
+    check_rollout_records_config(config)
     alg = config.algorithm
     if alg.get("adv_estimator", None) != PROGRESS_VALUE_ESTIMATOR:
         return False
@@ -97,10 +111,36 @@ def check_progress_value_config(config) -> bool:
     assert not bool(alg.get("use_kl_in_reward", False)), (
         "adv_estimator=progress_value_gae with algorithm.use_kl_in_reward: the penalty would go into "
         "token_level_rewards, which this estimator never reads, and silently do nothing")
-    # The block's own values (features, buckets, n0, ...), checked now rather than at step 1.
-    from verl.trainer.ppo.progress_value import ProgressValueConfig
+    # The block's own values (features, buckets, n0, gamma < 1 without the gamma^t prefix, ...) and
+    # the turn caps and k definitions the table is built for, checked now rather than at step 1 --
+    # through the builder the trainer's table is made by, so what is checked is what will run.
+    progress_value_config(config)
+    return True
 
-    ProgressValueConfig.from_config(pv_cfg, gamma=float(alg.gamma), lam=float(alg.lam))
+
+def check_rollout_records_config(config) -> bool:
+    """True when the analysis records are on (algorithm.progress_value.records.enable); refuses what they cannot do.
+
+    The records (verl/trainer/ppo/rollout_records.py) read the pv_* columns, so they need
+    progress_value.enable. Beside an estimator other than progress_value_gae they also build a
+    records-only shadow value table (records.shadow_value), with the same builder as a training table
+    -- so a configuration that builder refuses (gamma < 1 without the gamma^t prefix, an unknown
+    feature, a counter the environment managers do not know) is refused here, at launch, rather than
+    leaving a run whose shadow never appears. Called from check_progress_value_config, beside any
+    estimator.
+    """
+    from verl.trainer.ppo.rollout_records import check_records_config
+
+    rcfg = check_records_config(config)
+    if not rcfg.enable:
+        return False
+    if config.algorithm.get("adv_estimator", None) != PROGRESS_VALUE_ESTIMATOR and rcfg.shadow_value:
+        try:
+            progress_value_config(config)
+        except AssertionError as e:
+            raise AssertionError(
+                "algorithm.progress_value.records.shadow_value: the records-only shadow value table cannot be "
+                f"built under this configuration ({e}); fix it, or set records.shadow_value=False") from e
     return True
 
 
@@ -458,6 +498,14 @@ class OPDGRPORayTrainer(OPDRayTrainer):
 
             batch = self._attach_advantage_reliability_columns(batch)
 
+        # ---- analysis records (algorithm.progress_value.records) ----
+        # LAST, once the advantages are what the actor will read (the value table already committed,
+        # progress_rank already added): one record per group and the records/* metrics of this step's
+        # advantages beside what GRPO and GiGPO would have given the same rollouts
+        # (verl/trainer/ppo/rollout_records.py). It reads the batch and writes nothing to it, and never
+        # touches the training value table. A no-op with records off.
+        self._rollout_records(batch, metrics, timing_raw, pv_kwargs)
+
         return batch, reward_extra_infos_dict
 
     # --- (a) ------------------------------------------------------------------ #
@@ -813,17 +861,16 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         The shared loop's _load_checkpoint reads global_step_N/progress_value_state.json into
         ``_progress_value_pending_state`` (opd_ray_trainer) and its _save_checkpoint writes this
         table there. A table saved under another configuration (features, buckets, n0, retention,
-        gamma) is refused by load_state_dict: its cells would be read as other states. _load_checkpoint
-        already refused it before the first rollout; the check here covers a pending state set any
-        other way.
+        gamma, the turn caps, the k definitions, the feature / reward schema) is refused by
+        load_state_dict: its cells would be read as other states. _load_checkpoint already refused
+        it before the first rollout, configured by the same builder (progress_value_config); the
+        check here covers a pending state set any other way.
         """
         table = getattr(self, "_progress_value", None)
         if table is None:
-            from verl.trainer.ppo.progress_value import ProgressValueConfig, ProgressValueTable
+            from verl.trainer.ppo.progress_value import ProgressValueTable
 
-            alg = self.config.algorithm
-            table = ProgressValueTable(ProgressValueConfig.from_config(
-                alg.get("progress_value", None), gamma=float(alg.gamma), lam=float(alg.lam)))
+            table = ProgressValueTable(progress_value_config(self.config))
             pending = getattr(self, "_progress_value_pending_state", None)
             if pending:
                 table.load_state_dict(pending)
@@ -837,27 +884,19 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         """compute_advantage's progress_value_* arguments, or {} when the estimator is another one."""
         if not check_progress_value_config(self.config):
             return {}
-        # The caps the environment managers run under: env.multitask.max_steps per task in a
-        # multitask run, env.max_steps in a single-task one. Read here rather than through
-        # _turn_caps, which takes the multitask caps whenever the (always present) env.multitask
-        # block is -- right for every multitask run, wrong for a single-task one with its own cap.
-        env = self.config.env
-        if str(env.get("env_name", "")).lower() == "multitask":
-            from agent_system.environments.env_manager import _get_multitask_task_max_steps
-
-            caps = _get_multitask_task_max_steps(self.config, [str(t) for t in env.multitask.tasks])
-        else:
-            from verl.trainer.ppo.metric_utils import normalize_task_name
-
-            only = normalize_task_name(env.get("env_name", None))
-            caps = {only: int(env.max_steps)} if only is not None and env.get("max_steps", None) else {}
+        table = self._progress_value_table()
+        # The caps the environment managers run under (opd_ray_trainer.progress_value_turn_caps:
+        # env.multitask.max_steps per task in a multitask run, env.max_steps in a single-task one),
+        # as the table was built for them: every row's pv_cap is checked against exactly the
+        # horizons the table's fingerprint names.
+        caps = dict(table.cfg.horizons)
         task_names = get_task_names(batch)
         if task_names is None:
             # A single-task run carries no task_name column; its one task is the env's.
             assert len(caps) == 1, "progress_value needs per-row task names or a single-task env.env_name"
             task_names = np.array(list(caps) * len(batch), dtype=object)
         return {
-            "progress_value_table": self._progress_value_table(),
+            "progress_value_table": table,
             # Checked against every row's pv_cap: the "turns remaining" feature is keyed on it.
             "progress_value_turn_caps": caps,
             "progress_value_task_names": task_names,
@@ -888,7 +927,216 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             assert table.commit(), "progress_value: compute_advantage staged no update for this batch"
         metrics = dict(out["result"].metrics)
         metrics["progress_value/table_updates"] = float(table.updates)
+        # A WebShop goal flagged as one the environment cannot pay, WON. The flag is what V = 0 and
+        # the exclusion from the table rest on, and it scores one purchase (the goal's own product
+        # with the goal's options), not every purchase: a win shows it wrong for that goal. Should be
+        # 0 on every step; loud when it is not.
+        won = metrics.get("progress_value/webshop/capped_won", 0.0)
+        if won > 0:
+            print(f"[progress_value] WARNING: {int(won)} WebShop trajectories on goal_capped goals WON at step "
+                  f"{int(getattr(self, 'global_steps', 0))}: goal_capped is not a proof the goal cannot pay "
+                  "(they were scored at V = 0 and kept out of the table)", flush=True)
         return metrics
+
+    # --- analysis records (algorithm.progress_value.records) --------------------------------- #
+
+    def _rollout_records(self, batch: DataProto, metrics: dict, timing_raw: dict, pv_kwargs: dict) -> None:
+        """This step's analysis records: one JSON line per group, and the records/* metrics.
+
+        OBSERVATION ONLY (verl/trainer/ppo/rollout_records.py): the batch is read and nothing is
+        written to it, no random number is drawn, and the training value table is never staged or
+        committed -- in the progress_value_gae arm the result compute_advantage computed is read. The
+        one state kept is the records-only shadow table's (_rollout_records_shadow_value), an object
+        of its own.
+
+        A FAILURE COSTS THE STEP'S RECORDS, NOT THE STEP. Nothing downstream reads them, so taking a
+        run down for one would trade the run for a diagnostic (the pure-OPD reward hook's reasoning):
+        the traceback is printed and records/failed is 1 (0 on every good step). Off, a no-op that
+        is not even timed.
+        """
+        from verl.trainer.ppo.rollout_records import RecordsConfig
+
+        rcfg = RecordsConfig.from_config(self.config)
+        if not rcfg.enable:
+            return
+        with _timer("records", timing_raw):
+            try:
+                out = self._rollout_records_step(batch, rcfg, pv_kwargs)
+            except Exception as e:  # a record is never worth the run
+                import traceback
+
+                traceback.print_exc()
+                print(f"[records] WARNING: step {int(getattr(self, 'global_steps', 0))}: the analysis records "
+                      f"failed ({e!r}); none are written for this step, and training is unaffected", flush=True)
+                out = {"records/failed": 1.0}
+        metrics.update(out)
+
+    def _rollout_records_step(self, batch: DataProto, rcfg, pv_kwargs: dict) -> dict:
+        """_rollout_records' work: the value columns' source, the shadows' arguments as this trainer
+        uses them, the computation, the file."""
+        from verl.trainer.ppo import rollout_records
+        from verl.trainer.ppo.task_loss_weights import pg_loss_norm_kwargs
+
+        step = int(getattr(self, "global_steps", 0))
+        alg, actor = self.config.algorithm, self.config.actor_rollout_ref.actor
+        out: dict = {}
+        task_names = get_task_names(batch)
+        if task_names is None:
+            # A single-task run carries no task_name column; its one task is the env's.
+            from verl.trainer.ppo.metric_utils import normalize_task_name
+
+            only = normalize_task_name(self.config.env.get("env_name", None))
+            assert only is not None, "the records need per-row task names or env.env_name"
+            task_names = np.array([only] * len(batch), dtype=object)
+
+        if pv_kwargs:
+            # The value arm: the result the step was scored with and the table committed from --
+            # read here, never staged or committed a second time.
+            value, source = pv_kwargs["progress_value_out"]["result"], "training"
+        elif rcfg.shadow_value:
+            value, shadow_metrics = self._rollout_records_shadow_value(batch, rcfg, task_names)
+            source = "shadow"
+            out.update(shadow_metrics)
+        else:
+            value, source = None, None
+
+        # GiGPO's step returns take the invalid-action penalty as this run's scores took it: per row,
+        # at the trainer's own coefficient (None when the run applies no penalty -- then its scores
+        # carry none either).
+        coefs = None
+        if actor.get("use_invalid_action_penalty", True):
+            names_col = batch.non_tensor_batch.get("task_name", None)
+            coef, by_task = actor.invalid_action_penalty_coef, actor.get("invalid_action_penalty_coef_by_task", None)
+            coefs = np.array([_get_invalid_action_penalty_coef(
+                SimpleNamespace(non_tensor_batch={} if names_col is None else {"task_name": names_col[i]}),
+                coef, by_task) for i in range(len(batch))], dtype=np.float64)
+        # compute_advantage's GRPO arguments, as _reward_and_advantage hands them over.
+        floor_cfg = alg.get("oci_floor", None)
+        grpo_kwargs = {
+            "norm_adv_by_std_in_grpo": alg.get("norm_adv_by_std_in_grpo", True),
+            "compute_mean_std_cross_steps": alg.get("compute_mean_std_cross_steps", True),
+            "exclude_mask": batch.batch.get(GRPO_STAT_EXCLUDE_KEY, None),
+            "floor_mask": batch.batch.get(OCI_FLOOR_KEY, None),
+            "floor_value": float((floor_cfg or {}).get("value", 0.0) if floor_cfg is not None else 0.0),
+        }
+        pr_cfg = alg.get("progress_rank", None)
+        res = rollout_records.compute_step_records(
+            batch, step=step, cfg=rcfg, task_names=task_names,
+            multi_turn=bool(self.config.actor_rollout_ref.rollout.multi_turn.enable),
+            pg_loss_norm=pg_loss_norm_kwargs(actor)["pg_loss_norm"],
+            value=value, value_source=source, grpo_kwargs=grpo_kwargs, penalty_coefs=coefs,
+            turn_caps=progress_value_turn_caps(self.config),
+            # progress_rank reports traj/* and the think-block share itself when it is on: one writer
+            # per key.
+            traj_metrics=not (pr_cfg is not None and bool(pr_cfg.get("enable", False))))
+        out.update(res.metrics)
+        # Why a shadow was not emitted, said once per reason rather than every step.
+        warned = getattr(self, "_rollout_records_warned", None)
+        if warned is None:
+            warned = self._rollout_records_warned = set()
+        for note in res.notes:
+            if note not in warned:
+                warned.add(note)
+                print(f"[records] {note}", flush=True)
+
+        # The file: one per step, so a step re-run after a resume replaces its own. Under
+        # trainer.grad_probe (whose step counter stands still) one per probe batch beside the probe's
+        # output, as progress_rank's group records do.
+        extra = {}
+        probe = self.config.trainer.get("grad_probe", None)
+        if probe is not None and bool(probe.get("enable", False)):
+            n = int((getattr(self, "_grad_probe_state", None) or {}).get("batches", 0)) + 1
+            path = os.path.join(f"{probe.get('out_path', 'grad_probe.json')}.pv_groups", f"b{n}.jsonl")
+            extra["batch"] = n
+        else:
+            path = os.path.join(self._rollout_records_dir(rcfg), f"step{step}.jsonl")
+        try:
+            rollout_records.write_jsonl_atomic(path, res.groups, extra)
+            out["records/write_failed"] = 0.0
+        except OSError as e:
+            print(f"[records] WARNING: group records not written to {path}: {e!r}", flush=True)
+            out["records/write_failed"] = 1.0
+        out["records/failed"] = 0.0
+        return out
+
+    def _rollout_records_dir(self, rcfg) -> str:
+        """records.dir, or <trainer.default_local_dir>/progress_value_groups."""
+        return rcfg.dir or os.path.join(str(self.config.trainer.default_local_dir), "progress_value_groups")
+
+    def _rollout_records_shadow_value(self, batch: DataProto, rcfg, task_names):
+        """``(result, metrics)``: the value estimator on this batch, from the records' OWN table.
+
+        Records-only arms (records.shadow_value beside an estimator other than progress_value_gae), so
+        the new estimator's advantage can be read on the control's rollouts. Everything the training
+        path does, on another object: the table is built by the one builder (progress_value_config),
+        the rows' pv_cap checked against its horizons, the batch scored against the table as the
+        previous steps left it and committed right after -- dropped instead on a grad_probe batch, as
+        _progress_value_commit drops it. Its metrics are the estimator's, under records/shadow_value/.
+
+        NOT self._progress_value, and never in the checkpoint: the shared loop saves that attribute as
+        the arm's value table, and a progress_value_gae arm started from this run's checkpoint would
+        then resume on a table it did not build, without saying so (a warm start is
+        allow_missing_table's decision). The state goes to <records dir>/shadow_value_state/
+        step<N>.json after each commit, and a run resumed at global_step_N restores step<N>.json.
+        """
+        from verl.trainer.ppo.progress_value import compute_progress_value_advantage
+
+        table = self._rollout_records_value_table(rcfg)
+        columns = dict(batch.non_tensor_batch)
+        pad = batch.batch.get(PADDING_ROW_KEY, None)
+        if pad is not None:
+            columns[PADDING_ROW_KEY] = pad.reshape(-1).to(torch.bool).cpu().numpy()
+        columns["task_name"] = np.asarray(task_names, dtype=object)
+        _check_progress_value_caps(columns, table.cfg, dict(table.cfg.horizons))
+        res = compute_progress_value_advantage(columns, table)
+        table.stage(res.records)
+        metrics = {"records/shadow_value/" + k[len("progress_value/"):]: v for k, v in res.metrics.items()}
+        probe = self.config.trainer.get("grad_probe", None)
+        if probe is not None and bool(probe.get("enable", False)):
+            table.discard()
+        else:
+            table.commit()
+            path = os.path.join(self._rollout_records_dir(rcfg), "shadow_value_state",
+                                f"step{int(getattr(self, 'global_steps', 0))}.json")
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _write_json_atomic(path, table.state_dict())
+                metrics["records/shadow_value/save_failed"] = 0.0
+            except OSError as e:
+                print(f"[records] WARNING: shadow value table not saved to {path}: {e!r}", flush=True)
+                metrics["records/shadow_value/save_failed"] = 1.0
+        metrics["records/shadow_value/table_updates"] = float(table.updates)
+        return res, metrics
+
+    def _rollout_records_value_table(self, rcfg):
+        """The records-only shadow table, built on first use; after a resume, restored from the records'
+        directory (global_steps is N + 1 on the first step after global_step_N, whose table is
+        shadow_value_state/step<N>.json). Missing or of another configuration, it starts empty, loudly:
+        a records-only shadow is not worth refusing a resume over, and its metrics show the restart
+        (records/shadow_value/table_updates, fallback_share)."""
+        table = getattr(self, "_rollout_records_value", None)
+        if table is None:
+            from verl.trainer.ppo.progress_value import ProgressValueTable
+
+            table = ProgressValueTable(progress_value_config(self.config))
+            step = int(getattr(self, "global_steps", 0))
+            if step > 1:
+                path = os.path.join(self._rollout_records_dir(rcfg), "shadow_value_state", f"step{step - 1}.json")
+                if not os.path.exists(path):
+                    print(f"[records] WARNING: no shadow value table for step {step - 1} at {path}; the "
+                          f"records-only shadow starts empty at step {step}", flush=True)
+                else:
+                    try:
+                        with open(path) as f:
+                            table.load_state_dict(json.load(f))
+                        print(f"[records] shadow value table restored from {path}: {table.updates} updates",
+                              flush=True)
+                    except (OSError, ValueError) as e:
+                        table = ProgressValueTable(progress_value_config(self.config))
+                        print(f"[records] WARNING: shadow value table {path} not restored ({e!r}); the "
+                              f"records-only shadow starts empty at step {step}", flush=True)
+            self._rollout_records_value = table
+        return table
 
     def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:
         """Per row: its advantage, and whether its prompt group carried any signal.

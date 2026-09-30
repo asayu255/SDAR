@@ -16,9 +16,19 @@ tests/trainer/test_progress_value.py's):
   records-only.
 - The table survives a checkpoint: saved beside global_step_N by the shared loop, restored on
   resume, and a restored table predicts exactly what the saved one did; a table saved under
-  another configuration is refused.
+  another configuration -- other turn caps H, other k definitions, another feature or reward
+  schema included -- is refused at the load, before the first rollout.
+- ONE builder (opd_ray_trainer.progress_value_config) configures the training table, the resume's
+  check and the launch check, reading the caps as the rows' pv_cap check does and the k
+  definitions as the environment managers do.
+- A resume that finds no table is an error, unless algorithm.progress_value.allow_missing_table
+  says it is a warm start (then loud, and empty); a fresh start and a records-only arm are not
+  resumes of a table.
+- A WebShop goal flagged unpayable that wins anyway is counted (progress_value/webshop/capped_won)
+  and warned about.
 - The launcher satisfies its lock at LAM=1.0 and LAM=0.9 (one lock each), and each lock catches
-  a change to the estimator, gamma, lam, the progress counters and every progress_value key.
+  a change to the estimator, gamma, lam, the progress counters and every progress_value key; a
+  gamma < 1 without the gamma^t prefix is refused at launch.
 
 No Ray, no workers, no GPU: the trainer is built with object.__new__, the model checkpoint and
 the reward / log-prob workers are stubbed, and the launcher is only parsed and composed.
@@ -42,9 +52,10 @@ from agent_system.environments.progress import PV_COLUMNS  # noqa: E402
 from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY, adjust_batch  # noqa: E402
 from verl import DataProto  # noqa: E402
 from verl.trainer.ppo import opd_grpo_ray_trainer as grpo_mod  # noqa: E402
+from verl.trainer.ppo import opd_ray_trainer as base_mod  # noqa: E402
 from verl.trainer.ppo import progress_value as pv  # noqa: E402
 from verl.trainer.ppo.opd_grpo_ray_trainer import OPDGRPORayTrainer, check_progress_value_config  # noqa: E402
-from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer  # noqa: E402
+from verl.trainer.ppo.opd_ray_trainer import OPDRayTrainer, progress_value_config  # noqa: E402
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, compute_advantage  # noqa: E402
 from verl.utils.dataset.rl_dataset import collate_fn  # noqa: E402
 
@@ -55,6 +66,9 @@ SCRIPT = "examples/opd_grpo_trainer/run_multitask_progress_value_gae_qwen3.sh"
 P, RLEN = 4, 6
 TASKS = ("alfworld", "webshop", "search")
 CAPS = {"alfworld": 50, "webshop": 15, "search": 4}
+# The k definitions trainer_config's run reads its counts with: its progress_rank block names
+# alfworld_k, search_k keeps its default, WebShop's pv k is always the session count.
+KDEFS = {"alfworld": "milestone_arrive", "search": "evidence", "webshop": "session_v1"}
 WIN = {"alfworld": 10.0, "webshop": 10.0, "search": 1.0}
 PENALTY = {"alfworld": 0.1, "webshop": 0.1, "search": 0.01}
 GAMEFILES = ("json_2.1.1/train/pick_and_place_simple-Book-None-Desk-310/trial_T1/game.tw-pddl",
@@ -173,7 +187,9 @@ def prior_table(cfg, seed=101):
 
 
 def pv_config(lam=1.0):
-    return pv.ProgressValueConfig.from_config({"enable": True}, gamma=1.0, lam=lam)
+    """The configuration trainer_config's table has, spelled out (not through the builder under test)."""
+    return pv.ProgressValueConfig.from_config({"enable": True}, gamma=1.0, lam=lam, horizons=CAPS,
+                                              k_definitions=KDEFS)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +383,10 @@ def test_records_only_and_the_launch_refusals(tmp_path, stub_workers):
         (trainer_config(tmp_path, use_kl_in_reward=True), "use_kl_in_reward"),
         (trainer_config(tmp_path, progress_value={"enable": True, "features": {"search": ["k", "bogus"]}}),
          "bogus"),
+        # gamma < 1 with the GAE term and no gamma^t prefix: not this objective's gradient.
+        (trainer_config(tmp_path, gamma=0.95), "prefix_discount"),
+        # a counter the environment managers do not know, through their own reader
+        (trainer_config(tmp_path, progress_rank={"enable": False, "alfworld_k": "bogus_k"}), "bogus_k"),
     ] + [(trainer_config(tmp_path, **{arm: {"enable": True}}), arm)
          for arm in ("oci_sat", "oci_floor", "oci_slots", "oci_rank")]
     for cfg, what in refused:
@@ -384,27 +404,122 @@ def test_the_subclass_still_overrides_only_the_objective_hooks():
     assert OPDGRPORayTrainer._save_checkpoint is OPDRayTrainer._save_checkpoint
 
 
+def test_a_capped_webshop_win_is_counted_and_warned(tmp_path, stub_workers, capsys):
+    """goal_capped says the environment cannot pay the goal; a win on one says the flag is not a proof.
+    Counted every step (0 is the expected value, and is reported) and printed when it is not 0."""
+    t = make_trainer(trainer_config(tmp_path))
+    metrics = {}
+    t._reward_and_advantage(rollout_batch(71)[0], metrics, timing_raw={})
+    assert metrics["progress_value/webshop/capped_won"] == 0.0
+    assert "goal_capped goals WON" not in capsys.readouterr().out
+
+    batch, specs = rollout_batch(72)
+    capped = next(s for s in specs if s["capped"])
+    rewards = np.array(batch.non_tensor_batch["episode_rewards"], dtype=object)
+    rewards[batch.non_tensor_batch["traj_uid"] == capped["tuid"]] = 10.0     # padding copies included
+    batch.non_tensor_batch["episode_rewards"] = rewards
+    metrics = {}
+    batch, _ = t._reward_and_advantage(batch, metrics, timing_raw={})
+    assert metrics["progress_value/webshop/capped_won"] == 1.0
+    out = capsys.readouterr().out
+    assert "[progress_value] WARNING: 1 WebShop trajectories on goal_capped goals WON" in out
+    # The rule itself is unchanged: the capped win is still scored at V = 0 -- at lam = 1 its GAE
+    # term is 2 (R - 0) on every token, and its group, mixed now, gets no format term.
+    mask = batch.batch["response_mask"].to(torch.float32)
+    for i in np.flatnonzero(batch.non_tensor_batch["traj_uid"] == capped["tuid"]):
+        assert torch.equal(batch.batch["advantages"][i], 2.0 * mask[i])
+
+
+# --------------------------------------------------------------------------- #
+# The one builder
+# --------------------------------------------------------------------------- #
+
+def test_the_builder_reads_the_caps_and_the_k_definitions_of_the_run(tmp_path):
+    cfg = progress_value_config(trainer_config(tmp_path))
+    assert cfg.horizons == CAPS and cfg.k_definitions == KDEFS
+    assert cfg.fingerprint() == pv_config().fingerprint()
+    # The caps are the ones every row's pv_cap is checked against: one reading for both.
+    assert base_mod.progress_value_turn_caps(trainer_config(tmp_path)) == CAPS
+
+    # Another cap and other counters reach the configuration. webshop_k picks what progress_k
+    # records; the pv_* k the table reads is the session count whatever it says.
+    other = trainer_config(tmp_path, progress_rank={"enable": False, "alfworld_k": "milestone",
+                                                    "search_k": "evidence_answered", "webshop_k": "legacy"})
+    other.env.multitask.max_steps.webshop = 20
+    cfg2 = progress_value_config(other)
+    assert cfg2.horizons == {**CAPS, "webshop": 20}
+    assert cfg2.k_definitions == {"alfworld": "milestone", "search": "evidence_answered", "webshop": "session_v1"}
+    # A run of two tasks: their caps and counters only.
+    two = trainer_config(tmp_path)
+    two.env.multitask.tasks = ["alfworld", "search"]
+    assert progress_value_config(two).horizons == {"alfworld": 50, "search": 4}
+    assert progress_value_config(two).k_definitions == {"alfworld": "milestone_arrive", "search": "evidence"}
+    # A single-task run: the env's own task and env.max_steps.
+    single = trainer_config(tmp_path)
+    single.env.env_name = "alfworld/AlfredTWEnv"
+    single.env.max_steps = 30
+    assert progress_value_config(single).horizons == {"alfworld": 30}
+    assert progress_value_config(single).k_definitions == {"alfworld": "milestone_arrive"}
+
+
+def test_every_table_is_configured_by_the_one_builder(tmp_path):
+    """The training table, the resume's check of a saved table and the launch check read the
+    configuration in one place, so the fingerprint a table is saved under is the one a resume
+    compares it with."""
+    import inspect
+
+    for fn in (OPDGRPORayTrainer._progress_value_table, OPDRayTrainer._load_checkpoint,
+               check_progress_value_config):
+        src = inspect.getsource(fn)
+        assert "progress_value_config(" in src and "ProgressValueConfig" not in src, fn.__name__
+    assert grpo_mod.progress_value_config is base_mod.progress_value_config
+
+    t = make_trainer(trainer_config(tmp_path))
+    batch, _ = rollout_batch(61)
+    kwargs = t._progress_value_kwargs(batch)
+    table = kwargs["progress_value_table"]
+    assert table.cfg.fingerprint() == progress_value_config(t.config).fingerprint() == pv_config().fingerprint()
+    # The rows' pv_cap check reads the horizons the table is fingerprinted with.
+    assert kwargs["progress_value_turn_caps"] == table.cfg.horizons == CAPS
+
+
 # --------------------------------------------------------------------------- #
 # The checkpoint
 # --------------------------------------------------------------------------- #
 
-def test_the_table_survives_a_checkpoint(tmp_path, monkeypatch, stub_workers, capsys):
-    # The model checkpoint under it (RayPPOTrainer's) is stubbed; the JSON is the shared loop's.
+def _run_and_save_at_40(tmp_path, monkeypatch, cfg=None):
+    """Two steps of the arm, saved at global_step_40 (the model checkpoint under it stubbed)."""
     monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", lambda self: None)
-    t = make_trainer(trainer_config(tmp_path))
+    t = make_trainer(cfg if cfg is not None else trainer_config(tmp_path))
     for seed in (31, 32):
         t._reward_and_advantage(rollout_batch(seed)[0], {}, timing_raw={})
     t.global_steps = 40
     t._pre_peek_dataloader_state = None
     t._save_checkpoint()
+    return t
+
+
+def _resume_at(monkeypatch, step):
+    """RayPPOTrainer._load_checkpoint as a resume of global_step_<step> (0: a fresh start) leaves it."""
+    def _load(self):
+        self.global_steps = step
+        return step
+
+    monkeypatch.setattr(RayPPOTrainer, "_load_checkpoint", _load)
+
+
+def test_the_table_survives_a_checkpoint(tmp_path, monkeypatch, stub_workers):
+    # The model checkpoint under it (RayPPOTrainer's) is stubbed; the JSON is the shared loop's.
+    t = _run_and_save_at_40(tmp_path, monkeypatch)
     path = tmp_path / "global_step_40" / OPDRayTrainer.PROGRESS_VALUE_STATE_FILE
     assert path.exists()
+    # Saved with what its cells mean: the run's turn caps, k definitions and schemas.
+    saved = json.loads(path.read_text())["fingerprint"]
+    assert saved["horizons"] == CAPS and saved["k_definitions"] == KDEFS
+    assert (saved["feature_schema_version"], saved["reward_schema_version"]) == (pv.FEATURE_SCHEMA_VERSION,
+                                                                                pv.REWARD_SCHEMA_VERSION)
 
-    def _resume_at_40(self):
-        self.global_steps = 40
-        return 40
-
-    monkeypatch.setattr(RayPPOTrainer, "_load_checkpoint", _resume_at_40)
+    _resume_at(monkeypatch, 40)
     r = make_trainer(trainer_config(tmp_path))
     r._load_checkpoint()
     restored = r._progress_value_table()
@@ -426,11 +541,93 @@ def test_the_table_survives_a_checkpoint(tmp_path, monkeypatch, stub_workers, ca
     grpo._load_checkpoint()
     assert grpo._progress_value_pending_state == json.loads(path.read_text())
 
-    # A resume that finds no table says so and starts empty (the group fallback).
-    fresh = make_trainer(trainer_config(tmp_path / "elsewhere"))
+
+@pytest.mark.parametrize("change,key", [
+    ("alfworld_cap", "horizons"),               # env.multitask.max_steps: the targets' H, rem's unit
+    ("webshop_cap", "horizons"),
+    ("alfworld_k", "k_definitions"),            # progress_rank.alfworld_k: what ALFWorld's k counts
+    ("search_k", "k_definitions"),
+    ("feature_schema", "feature_schema_version"),
+    ("reward_schema", "reward_schema_version"),
+])
+def test_a_resume_refuses_a_table_of_another_horizon_counter_or_schema(tmp_path, monkeypatch, stub_workers,
+                                                                       change, key):
+    """The review's audit: an H = 4 table read by an H = 40 run hit the same cells without an error. Now
+    every one of these is refused at the load, before the first rollout, naming the one key."""
+    _run_and_save_at_40(tmp_path, monkeypatch)
+    _resume_at(monkeypatch, 40)
+    schemas = (pv.FEATURE_SCHEMA_VERSION, pv.REWARD_SCHEMA_VERSION)
+    cfg = trainer_config(tmp_path)
+    if change == "alfworld_cap":
+        cfg.env.multitask.max_steps.alfworld = 40
+    elif change == "webshop_cap":
+        cfg.env.multitask.max_steps.webshop = 20
+    elif change == "alfworld_k":
+        cfg.algorithm.progress_rank.alfworld_k = "milestone"
+    elif change == "search_k":
+        cfg.algorithm.progress_rank.search_k = "evidence_answered"
+    elif change == "feature_schema":
+        monkeypatch.setattr(pv, "FEATURE_SCHEMA_VERSION", pv.FEATURE_SCHEMA_VERSION + 1)
+    else:
+        monkeypatch.setattr(pv, "REWARD_SCHEMA_VERSION", pv.REWARD_SCHEMA_VERSION + "; webshop partial score")
+    r = make_trainer(cfg)
+    with pytest.raises(ValueError, match=f"differs in \\['{key}'\\]"):
+        r._load_checkpoint()
+    # The unchanged run resumes (the refusal is the change's, not the file's).
+    monkeypatch.setattr(pv, "FEATURE_SCHEMA_VERSION", schemas[0])
+    monkeypatch.setattr(pv, "REWARD_SCHEMA_VERSION", schemas[1])
+    ok = make_trainer(trainer_config(tmp_path))
+    ok._load_checkpoint()
+    assert ok._progress_value_table().updates == 2
+
+
+def test_a_resume_without_its_table_is_refused_unless_it_is_a_warm_start(tmp_path, monkeypatch, stub_workers,
+                                                                        capsys):
+    """A resumed step with no table is an incomplete checkpoint or another arm's: scoring on an empty
+    table would silently change the baseline, so the load refuses. allow_missing_table=True is the
+    explicit warm start (the arm started from another arm's checkpoint): loud, and empty."""
+    _resume_at(monkeypatch, 40)
+    elsewhere = tmp_path / "another_arm"         # no global_step_40/progress_value_state.json there
+    with pytest.raises(FileNotFoundError, match="allow_missing_table=True") as err:
+        make_trainer(trainer_config(elsewhere))._load_checkpoint()
+    assert "progress_value_state.json" in str(err.value) and "global_step_40" in str(err.value)
+    # ...also through resume_path (the folder a resume_path names is the one looked in).
+    by_path = trainer_config(tmp_path)
+    by_path.trainer.resume_mode = "resume_path"
+    by_path.trainer.resume_from_path = str(elsewhere / "global_step_40")
+    with pytest.raises(FileNotFoundError, match="allow_missing_table"):
+        make_trainer(by_path)._load_checkpoint()
+
+    warm = make_trainer(trainer_config(elsewhere, progress_value={"enable": True, "allow_missing_table": True}))
+    warm._load_checkpoint()
+    assert "[progress_value] WARNING: WARM START" in capsys.readouterr().out
+    assert getattr(warm, "_progress_value_pending_state", None) is None
+    assert warm._progress_value_table().updates == 0 and not warm._progress_value.roots
+    # Its first step runs on the group fallback, and the table fills from there.
+    metrics = {}
+    warm._reward_and_advantage(rollout_batch(81)[0], metrics, timing_raw={})
+    assert all(metrics[f"progress_value/{task}/fallback_share"] == 1.0 for task in TASKS)
+    assert warm._progress_value.updates == 1
+
+    # Not a resume of a table: a records-only arm (no table to find) and a fresh start.
+    make_trainer(trainer_config(elsewhere, estimator="grpo"))._load_checkpoint()
+    _resume_at(monkeypatch, 0)
+    fresh = make_trainer(trainer_config(elsewhere))
     fresh._load_checkpoint()
-    assert "WARNING: no progress_value_state.json" in capsys.readouterr().out
-    assert fresh._progress_value_table().updates == 0 and not fresh._progress_value.roots
+    assert fresh.global_steps == 0 and getattr(fresh, "_progress_value_pending_state", None) is None
+
+
+def test_a_warm_start_still_reads_and_checks_a_table_that_is_there(tmp_path, monkeypatch, stub_workers):
+    """allow_missing_table excuses a MISSING table only: one that is there is restored, and refused
+    when it is another configuration's."""
+    t = _run_and_save_at_40(tmp_path, monkeypatch)
+    _resume_at(monkeypatch, 40)
+    warm = make_trainer(trainer_config(tmp_path, progress_value={"enable": True, "allow_missing_table": True}))
+    warm._load_checkpoint()
+    assert warm._progress_value_table().state_dict() == t._progress_value.state_dict()
+    with pytest.raises(ValueError, match="n0"):
+        make_trainer(trainer_config(tmp_path, progress_value={"enable": True, "allow_missing_table": True,
+                                                              "n0": 4.0}))._load_checkpoint()
 
 
 def _tracker(ckpt_dir):
@@ -543,7 +740,14 @@ def test_the_launcher_matches_its_lock_at_each_lam(monkeypatch, lam):
     assert alg.progress_value.enable and not alg.progress_rank.enable
     assert (alg.progress_rank.alfworld_k, alg.progress_rank.search_k, alg.progress_rank.webshop_k) == (
         "milestone_arrive", "evidence_answered", "session")
+    # A resume must find its table: no silent empty start.
+    assert alg.progress_value.allow_missing_table is False
     assert check_progress_value_config(cfg) is True
+    # The table this launch would build: the recipe's turn caps and the counters above.
+    built = progress_value_config(cfg)
+    assert built.horizons == dict(cfg.env.multitask.max_steps) == CAPS
+    assert built.k_definitions == {"alfworld": "milestone_arrive", "search": "evidence_answered",
+                                   "webshop": "session_v1"}
     # The recipe underneath is v2's: the teacher never retired, validation off during training.
     assert alg.opd.retire.enable is False and cfg.trainer.test_freq == -1
 
@@ -563,7 +767,7 @@ def test_the_two_locks_differ_only_in_lam(monkeypatch):
 
 CAUGHT = [
     "algorithm.adv_estimator=grpo",
-    "algorithm.gamma=0.99",
+    # (algorithm.gamma below 1 is refused at launch without the prefix: test_the_lock_catches_gamma)
     "algorithm.lam=0.95",
     "algorithm.progress_rank.alfworld_k=milestone",
     "algorithm.progress_rank.search_k=evidence",
@@ -578,6 +782,7 @@ CAUGHT = [
     "algorithm.progress_value.stag_buckets=[1,3,6,10]",
     "algorithm.progress_value.format_scope=all",
     "algorithm.progress_value.format_coef=0.5",
+    "algorithm.progress_value.allow_missing_table=True",
 ]
 
 
@@ -590,11 +795,23 @@ def test_the_lock_catches(monkeypatch, override):
     assert len(miss) == 1, miss
 
 
+def test_the_lock_catches_gamma(monkeypatch):
+    """A gamma below 1 starts only with the gamma^t prefix (test_the_launch_refuses); with it, the lock
+    still names both keys."""
+    from verl.utils.expected_config import check_expected_config
+
+    cfg = injected(monkeypatch, extra=["algorithm.gamma=0.99", "algorithm.progress_value.prefix_discount=True"])
+    miss = check_expected_config(cfg, os.path.join(REPO, cfg.trainer.expected_config))
+    assert sorted(m[0] for m in miss) == ["algorithm.gamma", "algorithm.progress_value.prefix_discount"], miss
+
+
 @pytest.mark.parametrize("override,what", [
     ("algorithm.progress_rank.enable=True", "progress_rank"),
     ("algorithm.progress_value.enable=False", "progress_value.enable"),
     ("algorithm.oci_floor.enable=True", "oci_floor"),
     ("algorithm.use_kl_in_reward=True", "use_kl_in_reward"),
+    # gamma < 1 with the GAE term and no gamma^t prefix is not this objective's gradient
+    ("algorithm.gamma=0.99", "prefix_discount"),
 ])
 def test_the_launch_refuses(monkeypatch, override, what):
     with pytest.raises(AssertionError, match=what):

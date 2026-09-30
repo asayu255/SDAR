@@ -12,8 +12,14 @@ What has to hold, and why each part is tested:
   out of the table update. A turn missing from a trajectory must fail loudly.
 - The table: frozen within a step (the batch is scored before it is added),
   discounted counts, the cell -> (task, type, rem) -> task shrinkage by hand,
-  WebShop goals the environment cannot pay (V = 0, no update), the empty-table
-  fallback, the JSON round trip and the configuration fingerprint.
+  WebShop goals the environment cannot pay (V = 0, no update, and a count of the
+  ones that won anyway), the empty-table fallback, the JSON round trip and the
+  configuration fingerprint -- the turn caps H, the k definitions and the
+  feature / reward schema versions included, and a trajectory off its task's
+  configured H refused.
+- gamma < 1 with the GAE term (eta > 0) needs the gamma^t prefix: without it the
+  update is not the start-state objective's gradient, so the configuration is
+  refused (the estimator tests at gamma < 1 run with the prefix, or eta = 0).
 - The format term: tied vs all, the control's GRPO z-score in a tied group, and
   exactly zero -- no float32 phantom -- in a uniform group.
 
@@ -38,6 +44,8 @@ _SPEC.loader.exec_module(pv)
 
 GAMMA_LAM = [(1.0, 1.0), (1.0, 0.9), (0.95, 1.0), (0.95, 0.9)]
 CAPS = {"alfworld": 50, "webshop": 15, "search": 4}
+# The counters a run's k is read with, as the trainer's builder names them (the launcher's).
+KDEFS = {"alfworld": "milestone_arrive", "webshop": "session_v1", "search": "evidence_answered"}
 GAMEFILE = "json_2.1.1/train/pick_and_place_simple-Book-None-Desk-310/trial_T2019_1/game.tw-pddl"
 GAMEFILE_TWO = "json_2.1.1/train/pick_two_obj_and_place-Book-None-Desk-311/trial_T2019_2/game.tw-pddl"
 
@@ -194,14 +202,17 @@ def test_gae_matches_the_closed_form(gamma, lam):
 @pytest.mark.parametrize("gamma,lam", GAMMA_LAM)
 def test_the_estimator_puts_the_closed_form_on_every_row(gamma, lam):
     # Rows carry k = a distinct index per turn; the stub table answers V by k, so V is known per row.
+    # Below gamma = 1 the GAE term runs only with its gamma^t prefix (the configuration refuses the
+    # rest), so the closed form is weighted by it; at gamma = 1 the prefix is 1.
     specs = [trajectory("g", "t1", 4, 10.0, k=[0, 1, 2, 3], valid=[1, 1, 1, 1]),
              trajectory("g", "t2", 3, 0.0, k=[4, 5, 6], valid=[1, 1, 1])]
     values = {0: 0.2, 1: 0.5, 2: 0.7, 3: 0.4, 4: 0.9, 5: 0.1, 6: 0.3}
-    cfg = config(gamma=gamma, lam=lam, features={"alfworld": ("k",)})
+    cfg = config(gamma=gamma, lam=lam, prefix_discount=gamma < 1.0, features={"alfworld": ("k",)})
     cols = batch(specs)
     res = pv.compute_progress_value_advantage(cols, StubTable(cfg, values))
     want = closed_form([0.2, 0.5, 0.7, 0.4], 1.0, gamma, lam) + closed_form([0.9, 0.1, 0.3], 0.0, gamma, lam)
-    np.testing.assert_allclose(res.a_rl, 2.0 * np.array(want), atol=1e-12)
+    prefix = gamma ** cols["pv_t"]
+    np.testing.assert_allclose(res.a_rl, 2.0 * np.array(want) * prefix, atol=1e-12)
     np.testing.assert_allclose(res.value, [values[k] for k in range(7)], atol=0)
     assert not res.a_fmt.any()                  # every turn valid: the format term is exactly zero
     np.testing.assert_array_equal(res.advantage, res.a_rl)
@@ -222,7 +233,8 @@ def test_the_deltas_telescope(gamma):
 @pytest.mark.parametrize("gamma", [1.0, 0.95])
 def test_lam_one_is_the_return_minus_the_value_for_any_table(gamma):
     # An arbitrary table: random targets thrown into the cells the batch visits, over several updates.
-    cfg = config(gamma=gamma, lam=1.0, n0=3.0, retention=0.7)
+    # Below gamma = 1 with the (required) prefix: gamma^t (gamma^(T-t) R - V) = gamma^T R - gamma^t V.
+    cfg = config(gamma=gamma, lam=1.0, n0=3.0, retention=0.7, prefix_discount=gamma < 1.0)
     table = pv.ProgressValueTable(cfg)
     rng = np.random.default_rng(1)
     cols = mixed_batch()
@@ -236,7 +248,7 @@ def test_lam_one_is_the_return_minus_the_value_for_any_table(gamma):
         T[tu] = T.get(tu, 0) + 1
     R = (cols["episode_rewards"] > 0).astype(float)
     want = np.array([gamma ** (T[tu] - t) for tu, t in zip(cols["traj_uid"], cols["pv_t"])]) * R - res.value
-    np.testing.assert_allclose(res.a_rl / cfg.adv_scale, want, atol=1e-12)
+    np.testing.assert_allclose(res.a_rl / cfg.adv_scale, want * gamma ** cols["pv_t"], atol=1e-12)
     # ... and the deltas of each trajectory telescope onto gamma^T R - V_0 through the estimator too.
     for tu in T:
         rows = np.flatnonzero(cols["traj_uid"] == tu)
@@ -246,21 +258,34 @@ def test_lam_one_is_the_return_minus_the_value_for_any_table(gamma):
 
 
 def test_prefix_discount_weights_the_gae_term_by_gamma_t():
-    cfg0 = config(gamma=0.9, lam=0.8)
-    cfg1 = config(gamma=0.9, lam=0.8, prefix_discount=True)
+    # Every turn's GAE term times gamma^t, against gae() of the same values -- the estimator itself
+    # refuses to run without the prefix at gamma < 1 (test_gamma_below_one_needs_the_prefix).
+    cfg = config(gamma=0.9, lam=0.8, prefix_discount=True)
     cols = mixed_batch()
-    r0 = pv.compute_progress_value_advantage(cols, trained_table(cfg0))
-    r1 = pv.compute_progress_value_advantage(cols, trained_table(cfg1))
-    np.testing.assert_allclose(r1.a_rl, r0.a_rl * 0.9 ** cols["pv_t"], atol=1e-12)
-    np.testing.assert_array_equal(r1.value, r0.value)
+    res = pv.compute_progress_value_advantage(cols, trained_table(cfg))
+    assert not res.fallback.any()
+    for tu in sorted(set(cols["traj_uid"])):
+        rows = np.flatnonzero(cols["traj_uid"] == tu)
+        rows = rows[np.argsort(cols["pv_t"][rows])]
+        _, a = pv.gae(res.value[rows], float(cols["episode_rewards"][rows[0]] > 0), 0.9, 0.8)
+        np.testing.assert_allclose(res.a_rl[rows], 2.0 * a * 0.9 ** np.arange(len(rows)), atol=1e-12)
+    # The values the table gives do not depend on the option: it acts on the advantage only.
+    no_prefix_values = pv.compute_progress_value_advantage(cols, trained_table(config(gamma=0.9, lam=0.8,
+                                                                                     eta=0.0))).value
+    np.testing.assert_array_equal(res.value, no_prefix_values)
+    # At gamma = 1 the prefix is 1: bit for bit the same with it or without it.
+    r0 = pv.compute_progress_value_advantage(cols, trained_table(config(lam=0.8)))
+    r1 = pv.compute_progress_value_advantage(cols, trained_table(config(lam=0.8, prefix_discount=True)))
+    np.testing.assert_array_equal(r1.a_rl, r0.a_rl)
 
 
 def test_eta_mixes_in_the_episode_term_with_a_trajectory_weighted_baseline():
     gamma, eta = 0.9, 0.5
     specs = [trajectory("g", "a", 2, 10.0), trajectory("g", "b", 5, 0.0), trajectory("g", "c", 1, 10.0)]
     cols = batch(specs)
-    cfg1 = config(gamma=gamma, lam=0.7)
-    cfgm = config(gamma=gamma, lam=0.7, eta=eta)
+    # gamma < 1: the GAE term carries its gamma^t prefix (required); U_i already carries gamma^T.
+    cfg1 = config(gamma=gamma, lam=0.7, prefix_discount=True)
+    cfgm = config(gamma=gamma, lam=0.7, eta=eta, prefix_discount=True)
     r1 = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg1))
     rm = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfgm))
     U = {"a": gamma ** 2, "b": 0.0, "c": gamma ** 1}
@@ -270,14 +295,20 @@ def test_eta_mixes_in_the_episode_term_with_a_trajectory_weighted_baseline():
     np.testing.assert_allclose(rm.a_rl, 2.0 * ((1 - eta) * ep + eta * r1.a_rl / 2.0), atol=1e-12)
     # eta = 1 (the default) is the single GAE, bit for bit
     r_default = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(config(gamma=gamma, lam=0.7,
-                                                                                         eta=1.0)))
+                                                                                         eta=1.0,
+                                                                                         prefix_discount=True)))
     np.testing.assert_array_equal(r_default.a_rl, r1.a_rl)
+    # eta = 0, the episode term alone, needs no prefix at gamma < 1: U_i = gamma^T R carries it.
+    r0 = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(config(gamma=gamma, lam=0.7, eta=0.0)))
+    np.testing.assert_allclose(r0.a_rl, 2.0 * ep, atol=1e-12)
 
 
 def test_adv_scale_is_a_fixed_multiplier():
     cols = mixed_batch()
-    r2 = pv.compute_progress_value_advantage(cols, trained_table(config(gamma=0.95, lam=0.9)))
-    r5 = pv.compute_progress_value_advantage(cols, trained_table(config(gamma=0.95, lam=0.9, adv_scale=5.0)))
+    r2 = pv.compute_progress_value_advantage(cols, trained_table(config(gamma=0.95, lam=0.9,
+                                                                        prefix_discount=True)))
+    r5 = pv.compute_progress_value_advantage(cols, trained_table(config(gamma=0.95, lam=0.9, adv_scale=5.0,
+                                                                        prefix_discount=True)))
     np.testing.assert_allclose(r5.a_rl, r2.a_rl * 2.5, atol=1e-12)
     np.testing.assert_allclose(r5.returns, r2.returns, atol=1e-12)
 
@@ -306,7 +337,7 @@ def test_every_row_is_the_same_whatever_the_row_order(gamma, lam):
 
 def test_the_empty_table_fallback_is_row_order_free_too():
     cols = mixed_batch()
-    cfg = config(gamma=0.95, lam=0.9)
+    cfg = config(gamma=0.95, lam=0.9, prefix_discount=True)
     ref = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg))
     shuf = permute(cols, np.random.default_rng(7).permutation(len(cols["traj_uid"])))
     res = pv.compute_progress_value_advantage(shuf, pv.ProgressValueTable(cfg))
@@ -315,7 +346,7 @@ def test_the_empty_table_fallback_is_row_order_free_too():
 
 
 def test_padding_copies_get_their_originals_values_and_count_nowhere():
-    cfg = config(gamma=0.95, lam=0.9, format_scope="all")
+    cfg = config(gamma=0.95, lam=0.9, prefix_discount=True, format_scope="all")
     cols = mixed_batch()
     ref = pv.compute_progress_value_advantage(cols, trained_table(cfg))
     # copies of an invalid turn (row 1) and of a success's turns: counted, they would move the format
@@ -376,6 +407,24 @@ def test_a_trajectory_longer_than_its_cap_raises():
         pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(config()))
 
 
+def test_a_trajectory_off_its_tasks_configured_horizon_raises():
+    """The horizons in the fingerprint are a statement about the table's data: a trajectory run under
+    another cap would add targets of another objective to cells keyed on fractions of another H."""
+    cfg = config(horizons=CAPS)
+    ok = mixed_batch()
+    pv.compute_progress_value_advantage(ok, pv.ProgressValueTable(cfg))
+    off = batch([trajectory("w", "c1", 3, 10.0, "webshop", cap=20), trajectory("w", "c2", 2, 0.0, "webshop",
+                                                                                cap=20)])
+    with pytest.raises(ValueError, match="the table's horizon for webshop is 15"):
+        pv.compute_progress_value_advantage(off, pv.ProgressValueTable(cfg))
+    # ...the same when the table has mass (the check is on the data, not on the fallback path)
+    with pytest.raises(ValueError, match="horizon"):
+        pv.compute_progress_value_advantage(off, trained_table(cfg))
+    # A task with no configured horizon is not checked (the configuration does not name one).
+    res = pv.compute_progress_value_advantage(off, pv.ProgressValueTable(config(horizons={"alfworld": 50})))
+    assert len(res.records) == 5
+
+
 @pytest.mark.parametrize("column,match", [("is_action_valid", "is_action_valid"),
                                           ("episode_rewards", "episode_rewards"), ("pv_cap", "pv_cap")])
 def test_a_non_finite_input_on_a_real_row_raises(column, match):
@@ -414,7 +463,7 @@ def test_an_unknown_task_raises():
 # --------------------------------------------------------------------------- #
 
 def test_the_table_is_frozen_within_a_step_and_updated_after_scoring():
-    cfg = config(gamma=0.95, lam=0.9)
+    cfg = config(gamma=0.95, lam=0.9, prefix_discount=True)
     table = pv.ProgressValueTable(cfg)
     cols = mixed_batch()
     first = pv.compute_progress_value_advantage(cols, table)
@@ -564,7 +613,7 @@ def test_alfworld_type_from_the_gamefile_path():
 # --------------------------------------------------------------------------- #
 
 def test_goal_capped_trajectories_have_zero_value_and_no_update():
-    cfg = config(gamma=0.95, lam=0.9, format_scope="tied")
+    cfg = config(gamma=0.95, lam=0.9, prefix_discount=True, format_scope="tied")
     specs = [trajectory("wc", "x1", 3, 0.0, "webshop", k=[0, 1, 2], capped=1.0, valid=[1, 0, 1]),
              trajectory("wc", "x2", 4, 0.0, "webshop", k=[0, 1, 1, 1], capped=1.0, valid=[1, 1, 1, 1]),
              trajectory("wo", "y1", 2, 10.0, "webshop", k=[0, 3], capped=0.0),
@@ -583,6 +632,36 @@ def test_goal_capped_trajectories_have_zero_value_and_no_update():
         # the format term still applies to them (a tied group with one invalid turn)
         assert res.a_fmt[capped].any()
         assert res.metrics["progress_value/webshop/capped_share"] == 0.5
+        assert res.metrics["progress_value/webshop/capped_won"] == 0.0
+
+
+def test_capped_won_counts_the_capped_trajectories_that_won():
+    """goal_capped scores one purchase (the goal's own product with the goal's options), so it is not a
+    proof: a capped trajectory that won is counted (a count of trajectories, not a share), and it still
+    gets V = 0 and no update -- the metric is the alarm, the rule is unchanged."""
+    cfg = config()
+    specs = [trajectory("wc", "x1", 3, 10.0, "webshop", k=[0, 1, 2], capped=1.0),
+             trajectory("wc", "x2", 4, 0.0, "webshop", k=[0, 1, 1, 1], capped=1.0),
+             trajectory("wd", "x3", 2, 10.0, "webshop", k=[0, 3], capped=1.0),
+             trajectory("wo", "y1", 2, 10.0, "webshop", k=[0, 3], capped=0.0),
+             trajectory("a", "z1", 2, 10.0)]
+    cols = batch(specs)
+    for table in (pv.ProgressValueTable(cfg), trained_table(cfg)):
+        res = pv.compute_progress_value_advantage(cols, table)
+        m = res.metrics
+        assert m["progress_value/webshop/capped_won"] == 2.0
+        assert m["progress_value/webshop/capped_share"] == 3 / 4
+        won_capped = np.isin(cols["traj_uid"], ["x1", "x3"])
+        assert (res.value[won_capped] == 0.0).all()
+        # lam = 1 with V = 0: A = R - 0 = 1 on every turn of a capped win, x adv_scale
+        assert (res.a_rl[won_capped] == 2.0).all()
+        # WebShop's update is y1's two rows: no capped trajectory is added, won or not.
+        assert sum(1 for cell, _, _ in res.records if cell[0] == "webshop") == 2
+        # WebShop's metric only: the flag exists on no other task.
+        assert "progress_value/alfworld/capped_won" not in m
+    # A batch with no WebShop rows reports no WebShop metric at all.
+    assert "progress_value/webshop/capped_won" not in pv.compute_progress_value_advantage(
+        batch([trajectory("a", "z1", 2, 10.0)]), pv.ProgressValueTable(cfg)).metrics
 
 
 VALUE_SIDE_METRICS = ("fallback_share", "missing_feature_share", "mean_v", "calibration", "mean_abs_a_rl",
@@ -593,7 +672,7 @@ def test_capped_rows_stay_out_of_the_value_side_metrics():
     """A capped goal's V, delta and A_rl are 0 by rule, not by the table: counted in, they pull every
     value-side mean towards 0 by the capped share and put fallback_share below 1 on an empty table.
     So the value-side metrics of a batch with a capped group are exactly those of the batch without it."""
-    cfg = config(gamma=0.95, lam=0.9)
+    cfg = config(gamma=0.95, lam=0.9, prefix_discount=True)
     payable = [trajectory("wo", "y1", 2, 10.0, "webshop", k=[0, 3], capped=0.0),
                trajectory("wo", "y2", 4, 0.0, "webshop", k=[0, 1, 1, 2], capped=0.0, valid=[1, 0, 1, 1]),
                trajectory("wp", "z1", 3, 0.0, "webshop", k=[0, 1, 2], capped=0.0),
@@ -722,10 +801,12 @@ def test_a_one_row_group_gets_no_format_term():
 # --------------------------------------------------------------------------- #
 
 def test_state_dict_round_trips_through_json():
-    cfg = config(gamma=0.95, lam=0.9, n0=4.0, retention=0.8)
+    cfg = config(gamma=0.95, lam=0.9, n0=4.0, retention=0.8, prefix_discount=True, horizons=CAPS,
+                 k_definitions=KDEFS)
     table = trained_table(cfg)
     state = json.loads(json.dumps(table.state_dict()))
-    fresh = pv.ProgressValueTable(config(gamma=0.95, lam=0.9, n0=4.0, retention=0.8))
+    fresh = pv.ProgressValueTable(config(gamma=0.95, lam=0.9, n0=4.0, retention=0.8, prefix_discount=True,
+                                         horizons=CAPS, k_definitions=KDEFS))
     fresh.load_state_dict(state)
     assert fresh.state_dict() == table.state_dict()
     assert fresh.updates == 3
@@ -740,22 +821,81 @@ def test_state_dict_round_trips_through_json():
     assert fresh.state_dict() == table.state_dict()
 
 
-@pytest.mark.parametrize("change", [dict(n0=5.0), dict(retention=0.5), dict(gamma=0.9),
-                                    dict(rem_buckets=(0.9, 0.5)), dict(stag_buckets=(1, 5)),
-                                    dict(features={"search": ("rem",)})])
-def test_a_table_saved_under_another_configuration_is_refused(change):
-    base = dict(gamma=0.95, lam=0.9, n0=4.0, retention=0.8)
-    state = json.loads(json.dumps(trained_table(config(**base)).state_dict()))
-    other = pv.ProgressValueTable(config(**{**base, **change}))
-    with pytest.raises(ValueError, match="another configuration"):
+SAVED_UNDER = dict(gamma=0.95, lam=0.9, n0=4.0, retention=0.8, prefix_discount=True, horizons=CAPS,
+                   k_definitions=KDEFS)
+
+
+@pytest.mark.parametrize("change,key", [
+    (dict(n0=5.0), "n0"), (dict(retention=0.5), "retention"), (dict(gamma=0.9), "gamma"),
+    (dict(rem_buckets=(0.9, 0.5)), "rem_buckets"), (dict(stag_buckets=(1, 5)), "stag_buckets"),
+    (dict(features={"search": ("rem",)}), "features"),
+    # The turn caps: the targets are success within H and rem is a fraction of H.
+    (dict(horizons={**CAPS, "alfworld": 40}), "horizons"),
+    (dict(horizons={"alfworld": 50, "webshop": 15}), "horizons"),       # a task's cap unknown
+    (dict(horizons={}), "horizons"),
+    # Which count k is: the same number means another state under another counter.
+    (dict(k_definitions={**KDEFS, "alfworld": "milestone"}), "k_definitions"),
+    (dict(k_definitions={**KDEFS, "search": "evidence"}), "k_definitions"),
+    (dict(k_definitions={**KDEFS, "webshop": "legacy"}), "k_definitions"),
+])
+def test_a_table_saved_under_another_configuration_is_refused(change, key):
+    state = json.loads(json.dumps(trained_table(config(**SAVED_UNDER)).state_dict()))
+    other = pv.ProgressValueTable(config(**{**SAVED_UNDER, **change}))
+    with pytest.raises(ValueError, match="another configuration") as err:
         other.load_state_dict(state)
+    # The error names exactly the key that differs.
+    assert f"differs in ['{key}']" in str(err.value)
+
+
+@pytest.mark.parametrize("name", ["FEATURE_SCHEMA_VERSION", "REWARD_SCHEMA_VERSION"])
+def test_a_table_saved_under_another_feature_or_reward_schema_is_refused(monkeypatch, name):
+    """A change to how a row becomes a cell (buckets' meaning, buynow's quarters, the type parse) or to
+    what counts as a win is invisible in the configuration; the schema versions carry it."""
+    state = json.loads(json.dumps(trained_table(config(**SAVED_UNDER)).state_dict()))
+    assert state["fingerprint"][name.lower()] == getattr(pv, name)
+    bumped = getattr(pv, name) + (1 if isinstance(getattr(pv, name), int) else "+partial")
+    monkeypatch.setattr(pv, name, bumped)
+    other = pv.ProgressValueTable(config(**SAVED_UNDER))
+    assert other.cfg.fingerprint()[name.lower()] == bumped
+    with pytest.raises(ValueError, match=f"differs in \\['{name.lower()}'\\]"):
+        other.load_state_dict(state)
+    # ...and a table saved under the bumped schema loads under it.
+    same = pv.ProgressValueTable(config(**SAVED_UNDER))
+    same.load_state_dict(json.loads(json.dumps(trained_table(config(**SAVED_UNDER)).state_dict())))
+    assert same.updates == 3
+
+
+def test_the_fingerprint_names_the_horizons_the_k_definitions_and_the_schemas():
+    fp = config(**SAVED_UNDER).fingerprint()
+    assert fp["horizons"] == CAPS and fp["k_definitions"] == KDEFS
+    assert fp["feature_schema_version"] == pv.FEATURE_SCHEMA_VERSION
+    assert fp["reward_schema_version"] == pv.REWARD_SCHEMA_VERSION
+    assert isinstance(pv.FEATURE_SCHEMA_VERSION, int) and "episode_rewards > 0" in pv.REWARD_SCHEMA_VERSION
+    assert pv.WEBSHOP_K_DEFINITION == "session_v1"
+    # JSON-stable: a caps mapping in another order or with float values is the same fingerprint.
+    same = config(**{**SAVED_UNDER, "horizons": {"search": 4.0, "webshop": 15, "alfworld": 50.0}})
+    assert json.dumps(same.fingerprint(), sort_keys=True) == json.dumps(fp, sort_keys=True)
+
+
+def test_a_table_saved_before_the_fingerprint_named_them_is_refused():
+    """A state from bec1dad (fingerprint without horizons, k definitions and schemas): nothing says what
+    its cells mean, so it is not read as if it were the configured table."""
+    state = json.loads(json.dumps(trained_table(config(**SAVED_UNDER)).state_dict()))
+    for k in ("horizons", "k_definitions", "feature_schema_version", "reward_schema_version"):
+        state["fingerprint"].pop(k)
+    with pytest.raises(ValueError, match="another configuration") as err:
+        pv.ProgressValueTable(config(**SAVED_UNDER)).load_state_dict(state)
+    assert "['feature_schema_version', 'horizons', 'k_definitions', 'reward_schema_version']" in str(err.value)
 
 
 def test_what_the_table_does_not_depend_on_is_not_in_the_fingerprint():
-    base = dict(gamma=0.95, lam=0.9)
+    # eta = 0 needs no prefix at gamma < 1 (the episode term carries gamma^T), so the two differ in
+    # prefix_discount too.
+    base = dict(gamma=0.95, lam=0.9, eta=0.0, horizons=CAPS, k_definitions=KDEFS)
     state = json.loads(json.dumps(trained_table(config(**base)).state_dict()))
     other = pv.ProgressValueTable(config(gamma=0.95, lam=0.5, eta=0.3, adv_scale=1.0, prefix_discount=True,
-                                         format_scope="all", format_coef=0.0))
+                                         format_scope="all", format_coef=0.0, horizons=CAPS,
+                                         k_definitions=KDEFS))
     other.load_state_dict(state)
     assert other.updates == 3
 
@@ -776,22 +916,47 @@ def test_loading_nothing_leaves_the_table_empty_and_a_bad_version_raises():
 def test_config_from_the_yaml_node():
     cfg = pv.ProgressValueConfig.from_config(
         {"n0": 4, "retention": None, "features": {"webshop": ["k", "ongoal", "optnow", "rem"]},
-         "format_scope": "all"}, gamma=0.95, lam=0.9)
+         "format_scope": "all", "prefix_discount": True, "allow_missing_table": True}, gamma=0.95, lam=0.9,
+        horizons=CAPS, k_definitions=KDEFS)
     assert cfg.n0 == 4.0 and cfg.retention == 0.9 and cfg.format_scope == "all"
     assert cfg.features["webshop"] == ("k", "ongoal", "optnow", "rem")
     assert cfg.features["alfworld"] == ("type", "k", "stag", "rem")      # untouched tasks keep the default
     assert (cfg.gamma, cfg.lam, cfg.eta, cfg.adv_scale, cfg.format_coef) == (0.95, 0.9, 1.0, 2.0, 1.0)
+    assert cfg.prefix_discount is True
+    # From outside the block, as passed; the trainer-side keys (allow_missing_table) are not the table's.
+    assert cfg.horizons == CAPS and cfg.k_definitions == KDEFS
     assert pv.required_columns(cfg, ["webshop"])[-4:] == ["pv_k_before", "pv_ongoal_b", "pv_optnow_b",
                                                           "goal_capped"]
-    assert pv.ProgressValueConfig.from_config(None, gamma=1.0, lam=1.0).features == pv.DEFAULT_FEATURES
+    bare = pv.ProgressValueConfig.from_config(None, gamma=1.0, lam=1.0)
+    assert bare.features == pv.DEFAULT_FEATURES and bare.horizons == {} and bare.k_definitions == {}
 
 
 @pytest.mark.parametrize("bad", [dict(format_scope="mixed"), dict(eta=1.5), dict(n0=0.0), dict(retention=0.0),
                                  dict(gamma=0.0), dict(features={"alfworld": ("k", "colour")}),
-                                 dict(rem_buckets=(0.2, 0.4)), dict(stag_buckets=(3, 1))])
+                                 dict(rem_buckets=(0.2, 0.4)), dict(stag_buckets=(3, 1)),
+                                 dict(horizons={"alfworld": 0}), dict(horizons={"webshop": 2.5}),
+                                 dict(horizons={"search": float("nan")}), dict(k_definitions={"alfworld": ""}),
+                                 dict(gamma=0.95)])
 def test_bad_config_raises(bad):
     with pytest.raises(AssertionError):
         config(**bad)
+
+
+def test_gamma_below_one_needs_the_prefix():
+    """The GAE term is the start-state discounted objective's gradient only with gamma^t on turn t; a
+    GAE term at gamma < 1 without it (GiGPO-style: every turn as if the episode began there) is another
+    method and is refused -- wherever the configuration comes from."""
+    for bad in (dict(gamma=0.95), dict(gamma=0.99, lam=0.9, eta=0.5)):
+        with pytest.raises(AssertionError, match="prefix_discount=True") as err:
+            config(**bad)
+        assert "start-state discounted objective" in str(err.value) and "GiGPO" in str(err.value)
+    with pytest.raises(AssertionError, match="prefix_discount"):
+        pv.ProgressValueConfig.from_config({"prefix_discount": False}, gamma=0.99, lam=1.0)
+    # Allowed: the prefix on; the episode term alone (eta = 0, U_i = gamma^T R carries the weight);
+    # gamma = 1, where the prefix is 1 either way (the launcher's).
+    assert config(gamma=0.95, prefix_discount=True).prefix_discount
+    assert config(gamma=0.95, eta=0.0).eta == 0.0
+    assert not config(gamma=1.0, lam=0.9).prefix_discount
 
 
 def test_current_state_features_are_read_from_their_columns():
@@ -813,6 +978,38 @@ def test_buynow_is_keyed_in_quarters():
     recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg)).records
     assert [r[0][-1] for r in recs] == [0, 0, 2, 4, None]
     assert [r[0][:3] for r in recs][:3] == [("webshop", 0, 0), ("webshop", 1, 0), ("webshop", 2, 0)]
+
+
+def test_the_feature_schema_is_pinned():
+    """FEATURE_SCHEMA_VERSION names THIS extraction. Change how a row becomes a cell or a parent (the
+    buckets' meaning, buynow's quarters, the type parse, a missing value's cell) and this fails: bump
+    FEATURE_SCHEMA_VERSION with the change and write the new cells here -- a table saved under the old
+    extraction would otherwise be read, without an error, as other states."""
+    nan = float("nan")
+    cols = batch([
+        # cap 5: rem 5, 4, 3, 2 -> buckets 0 | 1 | 2 | 3; stag 0, 1, 0, 25 -> 0 | 1 | 0 | 5
+        trajectory("a", "a1", 4, 10.0, k=[0, 0, 1, 1], stag=[0, 1, 0, 25], cap=5),
+        # no task type in the path, a missing k: their own cells
+        trajectory("b", "b1", 1, 0.0, k=[nan], stag=[0], cap=5, gamefile="no/type/here/game.tw-pddl"),
+        trajectory("s", "s1", 2, 1.0, "search", k=[0, 1]),
+        # buy-now 0.3 -> quarter 1, a missing score -> None
+        trajectory("w", "w1", 3, 0.0, "webshop", k=[0, 1, 2], stag=[0, 0, 0], buynow=[0.0, 0.3, nan]),
+    ])
+    recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(config())).records
+    ps = "pick_and_place_simple"
+    assert [(cell, parent) for cell, parent, _ in recs] == [
+        (("alfworld", ps, 0, 0, 0), ("alfworld", ps, 0)),
+        (("alfworld", ps, 0, 1, 1), ("alfworld", ps, 1)),
+        (("alfworld", ps, 1, 0, 2), ("alfworld", ps, 2)),
+        (("alfworld", ps, 1, 5, 3), ("alfworld", ps, 3)),
+        (("alfworld", "unknown", None, 0, 0), ("alfworld", "unknown", 0)),
+        (("search", 0, 0), ("search", "search", 0)),
+        (("search", 1, 1), ("search", "search", 1)),
+        (("webshop", 0, 0, 0, 0), ("webshop", "webshop", 0)),
+        (("webshop", 1, 0, 0, 1), ("webshop", "webshop", 0)),
+        (("webshop", 2, 0, 0, None), ("webshop", "webshop", 0)),
+    ]
+    assert pv.FEATURE_SCHEMA_VERSION == 1, "the cells above are schema 1's: update them with the version"
 
 
 def test_metrics_by_hand():

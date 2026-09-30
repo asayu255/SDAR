@@ -1,3 +1,24 @@
+# Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 0.9 with the TRAJECTORY-
+# NORMALISED policy gradient -- the 2x2's main cell -- launched by
+# run_multitask_progress_value_gae_trajnorm_qwen3.sh with LAM=0.9: the progress_value_gae
+# lam 0.9 lock below verbatim, with the policy gradient's normalisation changed (the block at
+# the end):
+#   - actor.pg_loss_norm trajectory: each task's policy gradient divided by N_d * L_d, its real
+#     trajectories in the step times a fixed reference length, instead of by the response tokens it
+#     brought to the step (token, what the parent runs). Only the policy gradient: the teacher KL
+#     keeps the token weights.
+#   - actor.pg_ref_tokens {alfworld: 4650, webshop: 2320, search: 310}: L_d, beta-mirror v2's mean
+#     response tokens per trajectory over steps 1-300, fixed.
+# THE 2x2 (2026-09-30, the user: trajectory normalisation (a) is the paper's main one, the token
+# normalisation (b) the control beside it), one lock per cell (and per lam):
+#                        (b) token-normalised PG                  (a) trajectory-normalised PG
+#   OPD + GRPO           expected_multitask_grpo_v2recipe_        expected_multitask_grpo_v2recipe_
+#                        config.yaml                              trajnorm_config.yaml
+#   progress_value_gae   expected_multitask_progress_value_gae_   expected_multitask_progress_value_gae_
+#                        lam{1.0,0.9}_config.yaml                 trajnorm_lam{1.0,0.9}_config.yaml
+# The two trajnorm locks differ only in algorithm.lam (and the lines that describe it).
+# Everything else is the progress_value_gae lam 0.9 lock verbatim; that header follows.
+#
 # Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 0.9, launched by
 # run_multitask_progress_value_gae_qwen3.sh with LAM=0.9: the beta-mirror v2 arm below with its
 # advantage REPLACED by the value table's (verl/trainer/ppo/progress_value.py):
@@ -397,3 +418,15 @@
 "algorithm.progress_value.records.shadow_gigpo": true
 "algorithm.progress_value.records.shadow_value": true
 "algorithm.progress_value.records.per_turn": true
+
+# ---- the policy-gradient normalisation: the 2x2's column (a) ------------------------
+# trajectory: the policy-gradient term aggregated per row by num_mini_batches / (D * N_d * L_d),
+# N_d the task's real trajectories in the step and L_d below, turns and tokens summed inside a
+# trajectory; the teacher KL (and every other term) keeps the token weights
+# (verl/trainer/ppo/task_loss_weights.py). The (b) cells run token, the default.
+"actor_rollout_ref.actor.pg_loss_norm": trajectory
+# L_d: beta-mirror v2's (31e7f5e) steps 1-300 mean response tokens per trajectory (v1: 4690 / 1741
+# / 312), so each task's policy gradient keeps on average the size the token normalisation gave it,
+# against the teacher term too; fixed, never read off the batch. Changing it rescales every task's
+# policy gradient: a different arm, edit here.
+"actor_rollout_ref.actor.pg_ref_tokens": {alfworld: 4650, webshop: 2320, search: 310}

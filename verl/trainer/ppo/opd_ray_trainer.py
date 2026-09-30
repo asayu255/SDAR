@@ -56,7 +56,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.trainer.ppo.reward import compute_reward
 from verl.trainer.ppo.sign_weights import SIGN_BASE_TASK
-from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights
+from verl.trainer.ppo.task_loss_weights import attach_task_loss_weights, pg_loss_norm_kwargs
 from verl.utils import gpu_profiler
 from verl.utils.metric import reduce_metrics
 
@@ -422,6 +422,58 @@ def _write_json_atomic(path: str, obj) -> None:
         except OSError:
             pass
         raise
+
+
+def progress_value_turn_caps(config) -> dict:
+    """``{task: H}``: the turn caps the environment managers run the trajectories under.
+
+    What every row's pv_cap must equal (ray_trainer._check_progress_value_caps) and the horizons a
+    value table is built for (progress_value_config) -- one reading for both, so the cap the rows are
+    checked against is the one the table is fingerprinted with. env.multitask.max_steps per task in a
+    multitask run, env.max_steps in a single-task one. Read here rather than through the GRPO
+    trainer's _turn_caps, which takes the multitask caps whenever the (always present) env.multitask
+    block is -- right for every multitask run, wrong for a single-task one with its own cap. {} when
+    no cap is known (a single-task run without env.max_steps).
+    """
+    env = config.env
+    if str(env.get("env_name", "")).lower() == "multitask":
+        from agent_system.environments.env_manager import _get_multitask_task_max_steps
+
+        return _get_multitask_task_max_steps(config, [str(t) for t in env.multitask.tasks])
+    from verl.trainer.ppo.metric_utils import normalize_task_name
+
+    only = normalize_task_name(env.get("env_name", None))
+    return {only: int(env.max_steps)} if only is not None and env.get("max_steps", None) else {}
+
+
+def progress_value_config(config):
+    """The run's value-table configuration (progress_value.ProgressValueConfig), from the full config.
+
+    THE ONE BUILDER. Every table the run makes or reads is configured here: the GRPO trainer's table
+    (_progress_value_table), the check of a saved table when a checkpoint is resumed
+    (_load_checkpoint), and the launch check (check_progress_value_config). Two copies of this
+    reading were how a resume could compare a saved table against a fingerprint the training table
+    would never have had.
+
+    Beyond algorithm.progress_value, gamma and lam, a table depends on two things read from
+    elsewhere in the config, and both are in its fingerprint:
+      horizons       progress_value_turn_caps: the H its targets' success is judged within and its
+                     turns-remaining buckets are fractions of
+      k_definitions  which count k (and so stag) is, per task of the run: ALFWorld's alfworld_k and
+                     Search's search_k through the very readers the environment managers count by
+                     (progress.alfworld_k_definition / search_k_definition), WebShop always the
+                     session count (progress_value.WEBSHOP_K_DEFINITION), whatever webshop_k says
+    """
+    from agent_system.environments.progress import alfworld_k_definition, search_k_definition
+    from verl.trainer.ppo.progress_value import WEBSHOP_K_DEFINITION, ProgressValueConfig
+
+    alg = config.algorithm
+    caps = progress_value_turn_caps(config)
+    kdefs = {"alfworld": alfworld_k_definition(config), "search": search_k_definition(config),
+             "webshop": WEBSHOP_K_DEFINITION}
+    return ProgressValueConfig.from_config(
+        alg.get("progress_value", None), gamma=float(alg.gamma), lam=float(alg.lam),
+        horizons=caps, k_definitions={task: kdefs[task] for task in caps if task in kdefs})
 
 
 class OPDRayTrainer(RayPPOTrainer):
@@ -792,10 +844,11 @@ class OPDRayTrainer(RayPPOTrainer):
         tracker alone (find_latest_ckpt_path). Written after it, (a)'s EMA,
         the retirement state and the value table could be missing from a step
         the tracker already names -- a kill in between, and the resumed run
-        scores its first steps on an empty value table with only a warning to
-        show for it. Written before, a kill anywhere leaves the tracker on the
-        previous complete step. Each file is also written atomically
-        (_write_json_atomic), so none can be found half-written.
+        restarts the EMA, or refuses to start for want of its value table
+        (_load_checkpoint), on every restart. Written before, a kill anywhere
+        leaves the tracker on the previous complete step. Each file is also
+        written atomically (_write_json_atomic), so none can be found
+        half-written.
         """
         self._save_progress_rank_state()
         pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
@@ -892,30 +945,47 @@ class OPDRayTrainer(RayPPOTrainer):
                 self._retirement_pending_state = json.load(f)
             print(f"[teacher-retirement] state restored from {rpath}: "
                   f"{self._retirement_pending_state.get('retired')}")
-        # Without the table a resumed run scores its first steps on the empty-table fallback
-        # (the group's other rollouts), refilling at the retention rate -- loud, but not fatal.
+        # The value table. A resumed progress_value_gae run without it would score its first steps
+        # on the empty-table fallback (the group's other rollouts) and refill at the retention rate:
+        # another baseline than the run had, from a checkpoint that is incomplete (the table is
+        # written before the tracker names the step, _save_checkpoint) or another arm's. So a
+        # missing table is an ERROR, unless algorithm.progress_value.allow_missing_table says this
+        # resume is a WARM START on purpose -- the arm started from another arm's checkpoint.
         vpath = os.path.join(folder, self.PROGRESS_VALUE_STATE_FILE)
+        value_arm = self.config.algorithm.get("adv_estimator", None) == "progress_value_gae"
         if os.path.exists(vpath):
             with open(vpath) as f:
                 self._progress_value_pending_state = json.load(f)
-            if self.config.algorithm.get("adv_estimator", None) == "progress_value_gae":
+            if value_arm:
                 # A table saved under another configuration (features, buckets, n0, retention,
-                # gamma -- an edited lock resumed under the same RUN_TAG) is refused HERE, before
-                # the first rollout: the table itself is built lazily at the first step's
-                # advantage, a whole rollout later, and a supervisor would pay that on every
-                # restart. load_state_dict raises the ValueError naming the keys that differ.
-                from verl.trainer.ppo.progress_value import ProgressValueConfig, ProgressValueTable
+                # gamma, the turn caps H, the k definitions -- an edited lock resumed under the same
+                # RUN_TAG) or another feature / reward schema is refused HERE, before the first
+                # rollout: the table itself is built lazily at the first step's advantage, a whole
+                # rollout later, and a supervisor would pay that on every restart. Configured by
+                # the same builder as the training table, so the fingerprint compared is the one
+                # the run's table has. load_state_dict raises the ValueError naming the keys.
+                from verl.trainer.ppo.progress_value import ProgressValueTable
 
-                alg = self.config.algorithm
-                ProgressValueTable(ProgressValueConfig.from_config(
-                    alg.get("progress_value", None), gamma=float(alg.gamma), lam=float(alg.lam),
-                )).load_state_dict(self._progress_value_pending_state)
+                ProgressValueTable(progress_value_config(self.config)).load_state_dict(
+                    self._progress_value_pending_state)
             print(f"[progress_value] table read from {vpath}: "
                   f"{self._progress_value_pending_state.get('updates')} updates, "
                   f"{len(self._progress_value_pending_state.get('cells', []))} cells", flush=True)
-        elif self.config.algorithm.get("adv_estimator", None) == "progress_value_gae":
-            print(f"[progress_value] WARNING: no {self.PROGRESS_VALUE_STATE_FILE} in {folder}; the value "
-                  "table restarts empty and the first steps are scored on the group fallback", flush=True)
+        elif value_arm:
+            pv_cfg = self.config.algorithm.get("progress_value", None) or {}
+            if not bool(pv_cfg.get("allow_missing_table", False)):
+                raise FileNotFoundError(
+                    f"progress_value: resuming step {self.global_steps} from {folder}, which has no "
+                    f"{self.PROGRESS_VALUE_STATE_FILE}. This arm writes its value table beside every "
+                    "checkpoint before the step is marked complete, so the checkpoint is incomplete or "
+                    "another arm's. Resume from a complete checkpoint of this run; to start the arm from "
+                    "another arm's checkpoint on purpose, set algorithm.progress_value.allow_missing_table="
+                    "True (a warm start: the table starts empty).")
+            print(f"[progress_value] WARNING: WARM START. No {self.PROGRESS_VALUE_STATE_FILE} in {folder} "
+                  f"(resuming step {self.global_steps}) and algorithm.progress_value.allow_missing_table=True: "
+                  "the value table starts EMPTY, the first steps are scored on the group fallback "
+                  "(progress_value/<task>/fallback_share 1) and it refills at the retention rate. Meant "
+                  "only for starting this arm from another arm's checkpoint.", flush=True)
         return out
 
     # ------------------------------------------------------------------ #
@@ -2514,6 +2584,10 @@ class OPDRayTrainer(RayPPOTrainer):
                                 * self.config.actor_rollout_ref.rollout.n
                             ),
                             metrics=metrics,
+                            # actor.pg_loss_norm / pg_ref_tokens: token (every existing arm) writes
+                            # only the token weights; trajectory adds the PG column the actor's
+                            # policy-gradient term is summed with (task_loss_weights.py).
+                            **pg_loss_norm_kwargs(self.config.actor_rollout_ref.actor),
                         )
 
                     if self.config.trainer.balance_batch:

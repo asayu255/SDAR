@@ -1,5 +1,24 @@
-# Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 0.9, launched by
-# run_multitask_progress_value_gae_qwen3.sh with LAM=0.9: the beta-mirror v2 arm below with its
+# Expected effective config for OPD + GRPO ON THE VALUE ARM'S RECIPE with the TOKEN-normalised
+# policy gradient -- the 2x2's control cell -- launched by run_multitask_grpo_v2recipe_qwen3.sh:
+# the progress_value_gae lam 1.0 lock below verbatim, with two changes:
+#   - algorithm.adv_estimator grpo (its line below): outcome GRPO's group-relative advantages. The
+#     value arm's gamma, lam and progress_value keys stay pinned as they are: grpo reads none of
+#     them, progress_value.enable is the records' switch (the pv_* columns; nothing reaches the
+#     advantage), and the rest is the table config the records-only shadow of the value
+#     estimator is built with (algorithm.progress_value.records.shadow_value: its own table, never
+#     the checkpoint's). Their comments below describe the value arm.
+#   - actor.pg_loss_norm token pinned (the block at the end): the default, as on the parent.
+# THE 2x2 (2026-09-30, the user: trajectory normalisation (a) is the paper's main one, the token
+# normalisation (b) the control beside it), one lock per cell (and per lam):
+#                        (b) token-normalised PG                  (a) trajectory-normalised PG
+#   OPD + GRPO           expected_multitask_grpo_v2recipe_        expected_multitask_grpo_v2recipe_
+#                        config.yaml                              trajnorm_config.yaml
+#   progress_value_gae   expected_multitask_progress_value_gae_   expected_multitask_progress_value_gae_
+#                        lam{1.0,0.9}_config.yaml                 trajnorm_lam{1.0,0.9}_config.yaml
+# Everything else is the progress_value_gae lam 1.0 lock verbatim; that header follows.
+#
+# Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 1.0, launched by
+# run_multitask_progress_value_gae_qwen3.sh (the default LAM): the beta-mirror v2 arm below with its
 # advantage REPLACED by the value table's (verl/trainer/ppo/progress_value.py):
 #   - adv_estimator progress_value_gae: V(z_t) from a table over the state before action t
 #     (ALFWorld: task type, k, turns since k rose, turns left; WebShop: k, stag, rem, the score
@@ -7,8 +26,8 @@
 #     frozen within a step; delta_t = gamma V(z_{t+1}) - V(z_t) with V(z_T) = R (won), GAE over
 #     the deltas, x adv_scale 2.0, plus the format term (the z-score of "invalid" over a group's
 #     turn rows, in groups whose rollouts all have the same R) at weight 1.0.
-#   - gamma 1.0 and lam 0.9: the TD residuals of the table carry part of the credit (bias for
-#     variance).
+#   - gamma 1.0 and lam 1.0: A_t = gamma^(T-t) R - V(z_t), so the table is only a baseline and a
+#     wrong table costs variance, not bias.
 #   - progress_rank off: no (a), no sat. Its counter choices stay pinned, because they are
 #     what the table's k counts: alfworld_k milestone_arrive, search_k evidence_answered (v2's),
 #     and webshop_k session (new: the environment's own session, no option over-count).
@@ -125,11 +144,11 @@
 # main_opd_grpo refuses to start without it set, and this lock is what says which
 # value the run was supposed to have.
 "actor_rollout_ref.actor.pg_loss_coef": 1.0
-# grpo on the parent arm, and required rather than incidental there: its policy gradient
-# reads group-relative advantages. THIS ARM REPLACES IT: progress_value_gae, the value table's
-# TD errors with GAE (verl/trainer/ppo/progress_value.py); gamma, lam and every
-# progress_value key are pinned at the end of this file.
-"algorithm.adv_estimator": progress_value_gae
+# grpo: THIS CELL PUTS IT BACK. The value arm replaced it with progress_value_gae; here the
+# policy gradient reads outcome GRPO's group-relative advantages again, and the gamma, lam and
+# progress_value keys pinned at the end of this file are the value arm's, read by nothing that
+# reaches the advantage (progress_value.enable is the records' switch beside grpo).
+"algorithm.adv_estimator": grpo
 # The env score is the only thing shaping the advantages: no reference-KL penalty
 # is mixed into the reward, and no reference-KL term is in the loss either.
 "algorithm.use_kl_in_reward": false
@@ -363,10 +382,10 @@
 
 # ---- progress_value_gae: the discount and the GAE lambda ---------------------------
 # The objective is J_H = E[gamma^T R] and the advantage A_t = sum_l (gamma lam)^l delta_{t+l}.
-# gamma 1.0: success within the cap, the length not penalised. lam 0.9: the TD residuals
-# carry part of the credit, a turn judged partly by the next states' values.
+# gamma 1.0: success within the cap, the length not penalised. lam 1.0: A_t = R - V(z_t),
+# the Monte Carlo return minus the table's value (the table a baseline only).
 "algorithm.gamma": 1.0
-"algorithm.lam": 0.9
+"algorithm.lam": 1.0
 # ---- progress_value_gae: the table and the advantage ------------------------------
 # Every key of the block, at its default (ppo_trainer.yaml says what each one is). enable is
 # the records' switch and the estimator's precondition (the trainer refuses the estimator
@@ -397,3 +416,9 @@
 "algorithm.progress_value.records.shadow_gigpo": true
 "algorithm.progress_value.records.shadow_value": true
 "algorithm.progress_value.records.per_turn": true
+
+# ---- the policy-gradient normalisation: the 2x2's column (b) ------------------------
+# token, the default: each task's policy gradient divided by the response tokens the task brought
+# to the step, like every other term (verl/trainer/ppo/task_loss_weights.py). Pinned so this cell
+# cannot quietly become the other column.
+"actor_rollout_ref.actor.pg_loss_norm": token

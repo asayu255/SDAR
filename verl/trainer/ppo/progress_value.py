@@ -65,14 +65,23 @@ WEBSHOP GOALS THE ENVIRONMENT CANNOT PAY (goal_capped == 1): their true value is
 0 under any policy, so V_t = 0, and they are kept out of the table update --
 counted in, they would drag down every winnable state they share a cell with.
 They are kept out of the value-side metrics too (see _metrics); capped_share
-says how many there were.
+says how many there were. The flag scores ONE purchase -- the goal's own
+product with exactly the goal's options (webshop envs.goal_capped) -- not every
+purchase a policy could make, so it is not a proof that no policy can win;
+capped_won counts the capped trajectories that DID win -- 0 if the flag is
+what it claims (the trainer prints a warning when it is not).
 
 OPTIONS (algorithm.progress_value):
 
     prefix_discount  A_t *= gamma^t: the discounted objective's own policy
                      gradient weight. Applied to the GAE term only: the episode
                      term below already carries gamma^T in U_i, which is
-                     gamma^t gamma^(T-t) R, the same weight.
+                     gamma^t gamma^(T-t) R, the same weight. REQUIRED when
+                     gamma < 1 and eta > 0 (ProgressValueConfig refuses the
+                     rest): the gradient of J_H from the start state weights
+                     turn t by gamma^t, and a GAE term without it credits every
+                     turn as if the episode began there -- a GiGPO-style update,
+                     which is another method, not this objective's gradient.
     eta              A = (1 - eta) (U_i - b_{g,-i}) + eta A_t with U_i = gamma^(T_i) R_i
                      and b_{g,-i} the mean of U over the OTHER trajectories of the
                      group, each trajectory counted once (NOT once per turn: a long
@@ -106,11 +115,31 @@ std x + 1e-5; the difference is below 1e-4 of the term.
 
     advantage = A_rl + format_coef * A_fmt       one scalar per row
 
+WHAT A SAVED TABLE IS A TABLE OF (ProgressValueConfig.fingerprint, checked by
+load_state_dict). A table resumed under another reading of its cells would be
+read as other states, and one whose targets counted another success is of
+another objective, so the fingerprint names everything a cell and a target mean:
+
+    features, rem_buckets, stag_buckets    the cell a row is keyed on
+    n0, retention                          how the counts were shrunk and discounted
+    gamma                                  the targets' discount
+    horizons       {task: H}               the turn caps the trajectories ran under:
+                                           the targets are success WITHIN H, and rem
+                                           is a fraction of H (a trajectory whose
+                                           pv_cap is not its task's H is refused)
+    k_definitions  {task: name}            which count k (and so stag) is: ALFWorld's
+                                           alfworld_k, Search's search_k, WebShop's
+                                           session count (WEBSHOP_K_DEFINITION)
+    feature_schema_version                 FEATURE_SCHEMA_VERSION: how a row becomes a cell
+    reward_schema_version                  REWARD_SCHEMA_VERSION: what counts as a win
+
 API. Nothing here imports the trainer; the arrays are numpy (or anything
 np.asarray accepts).
 
     cfg   = ProgressValueConfig.from_config(config.algorithm.progress_value,
-                                            gamma=config.algorithm.gamma, lam=config.algorithm.lam)
+                                            gamma=config.algorithm.gamma, lam=config.algorithm.lam,
+                                            horizons={task: H}, k_definitions={task: name})
+            # (the trainer's one builder: opd_ray_trainer.progress_value_config)
     table = ProgressValueTable(cfg)                  # once; table.load_state_dict(saved) on resume
     res   = compute_progress_value_advantage(columns, table)   # reads the table, changes nothing
     table.stage(res.records)                         # the update this batch owes
@@ -126,7 +155,8 @@ order (after _balance_batch, adjust_batch's padding copies included):
     traj_uid         trajectory id; its real rows must carry pv_t = 0..T-1 exactly
     uid              group id (the rollouts of one prompt)
     pv_t             0-based turn index of the row in its trajectory
-    pv_cap           the task's turn cap H (rem = pv_cap - pv_t)
+    pv_cap           the task's turn cap H (rem = pv_cap - pv_t); the configured horizon
+                     of the task, when the configuration names one
     task_name        the row's task, matched to the configured tasks by substring
     episode_rewards  the trajectory's environment reward; R = 1 iff > 0
     is_action_valid  bool / 0-1: the format term's indicator
@@ -147,8 +177,9 @@ the row's response tokens), ``a_rl``, ``a_fmt``, ``value`` (V(z_t)), ``returns``
 (a_rl / adv_scale + value), ``delta``, ``fallback`` (bool); ``records`` (the table
 update, for ``stage``) and ``metrics`` (keys ``progress_value/<task>/<name>``).
 It raises ValueError on a trajectory whose real rows do not carry pv_t = 0..T-1,
-a padding copy with no original, a trajectory longer than its cap, and a
-non-finite pv_t, pv_cap, episode_rewards or is_action_valid on a real row.
+a padding copy with no original, a trajectory longer than its cap, a trajectory
+whose cap is not its task's configured horizon, and a non-finite pv_t, pv_cap,
+episode_rewards or is_action_valid on a real row.
 """
 
 import json
@@ -214,6 +245,25 @@ DROP_BELOW = 1e-6
 # The format term's cut: an invalid indicator's std is 0 or >= 1/sqrt(m) for m rows.
 FORMAT_STD_MIN = 1e-6
 STATE_VERSION = 1
+# What a saved table's cells and targets MEAN beyond the configuration; both are in the fingerprint.
+# FEATURE_SCHEMA_VERSION: how a row becomes a cell and a parent -- the rem buckets as fractions of H
+# left and the stag buckets as lower edges (rem_bucket / stag_bucket), buynow's quarters
+# (FEATURE_BINS), the ALFWorld type parse (alfworld_type), a missing value as a cell of its own
+# (_key_value), the parent (task, type, rem). BUMP IT with any change to that code: a table keyed the
+# old way would be read, without an error, as other states (test_the_feature_schema_is_pinned fails
+# first and says so).
+FEATURE_SCHEMA_VERSION = 1
+# REWARD_SCHEMA_VERSION: what the targets count as a win. R = 1 iff episode_rewards > 0, which is
+# ALFWorld's 10 on won (0 otherwise), WebShop's 10 iff the environment's task_score is 1.0, and Search's
+# exact match (1, else 0). A change to any of them -- a partial WebShop score, a substring match for
+# Search -- is another objective, and a table of it another table. Change the string with it.
+REWARD_SCHEMA_VERSION = ("win_v1: R = episode_rewards > 0; alfworld 10/0 on won; "
+                         "webshop 10 iff task_score == 1.0; search exact match 1/0")
+# The WebShop k of the pv_* columns: ALWAYS the session count (WebshopProgress.k_session: goal product
+# found + opened + best required options held + bought, read off the environment's session),
+# whatever algorithm.progress_rank.webshop_k puts into progress_k. Versioned like the schemas: a
+# change to what the session count counts is a change of k.
+WEBSHOP_K_DEFINITION = "session_v1"
 
 ALFWORLD_TYPES = ("pick_and_place_simple", "look_at_obj_in_light", "pick_clean_then_place_in_recep",
                   "pick_heat_then_place_in_recep", "pick_cool_then_place_in_recep", "pick_two_obj_and_place")
@@ -284,6 +334,11 @@ class ProgressValueConfig:
     adv_scale: float = 2.0
     format_scope: str = "tied"
     format_coef: float = 1.0
+    # {task: H}, the turn caps the trajectories ran under, and {task: name}, which count k is: not
+    # keys of the block but read off the run's config by the trainer's builder
+    # (opd_ray_trainer.progress_value_config). Empty = unknown (no check, and so fingerprinted).
+    horizons: Dict[str, int] = field(default_factory=dict)
+    k_definitions: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         self.features = {str(t).lower(): tuple(str(f) for f in fs) for t, fs in dict(self.features).items()}
@@ -293,6 +348,15 @@ class ProgressValueConfig:
             setattr(self, name, float(getattr(self, name)))
         self.prefix_discount = bool(self.prefix_discount)
         self.format_scope = str(self.format_scope)
+        horizons = {}
+        for task, h in dict(self.horizons or {}).items():
+            v = _finite(h)
+            assert v is not None and v.is_integer() and v >= 1.0, (
+                f"progress_value horizons.{task}={h!r}: a turn cap is a positive integer")
+            horizons[str(task).lower()] = int(v)
+        self.horizons = horizons
+        self.k_definitions = {str(t).lower(): str(k) for t, k in dict(self.k_definitions or {}).items()}
+        assert all(self.k_definitions.values()), f"progress_value k_definitions={self.k_definitions}: empty name"
         for task, fs in self.features.items():
             assert fs, f"progress_value.features.{task} is empty; every task needs at least one feature"
             bad = [f for f in fs if f not in FEATURE_COLUMNS]
@@ -309,15 +373,29 @@ class ProgressValueConfig:
         assert 0.0 < self.gamma <= 1.0, f"algorithm.gamma={self.gamma}: must be in (0, 1]"
         assert 0.0 <= self.lam <= 1.0, f"algorithm.lam={self.lam}: must be in [0, 1]"
         assert 0.0 <= self.eta <= 1.0, f"progress_value.eta={self.eta}: must be in [0, 1]"
+        # The GAE term is the gradient of J_H = E[gamma^T R] FROM THE START STATE only with turn t
+        # weighted by gamma^t: the objective discounts the whole episode from turn 0, and the turn-t
+        # term of its gradient carries gamma^t. Without the prefix every turn is credited as if the
+        # episode began at it (GiGPO's step returns do exactly that) -- a legitimate update, but a
+        # different method, and not the one this estimator claims to be. The episode term (eta < 1)
+        # already carries gamma^T; at gamma = 1 the prefix is 1.
+        assert not (self.gamma < 1.0 and self.eta > 0.0 and not self.prefix_discount), (
+            f"algorithm.gamma={self.gamma} < 1 with progress_value.eta={self.eta} > 0 needs "
+            "progress_value.prefix_discount=True: the GAE term is the start-state discounted objective's "
+            "gradient only with the gamma^t weight on turn t. A no-prefix (GiGPO-style) update, every turn "
+            "credited as if the episode began there, would be a different method, not this objective's.")
         assert self.adv_scale > 0.0, f"progress_value.adv_scale={self.adv_scale}: must be > 0"
         assert self.format_scope in FORMAT_SCOPES, (
             f"progress_value.format_scope={self.format_scope!r}; expected one of {FORMAT_SCOPES}")
         assert self.format_coef >= 0.0, f"progress_value.format_coef={self.format_coef}: must be >= 0"
 
     @classmethod
-    def from_config(cls, cfg, *, gamma: float, lam: float) -> "ProgressValueConfig":
+    def from_config(cls, cfg, *, gamma: float, lam: float, horizons: Optional[Mapping[str, Any]] = None,
+                    k_definitions: Optional[Mapping[str, str]] = None) -> "ProgressValueConfig":
         """From the algorithm.progress_value node (a dict or DictConfig); a missing or null key keeps
-        its default, and ``features`` overrides the default feature list task by task."""
+        its default, and ``features`` overrides the default feature list task by task. ``horizons``
+        and ``k_definitions`` come from outside the block (the turn caps, progress_rank's counter
+        keys): the trainer reads them in one place, opd_ray_trainer.progress_value_config."""
         cfg = cfg or {}
 
         def get(key, default):
@@ -333,13 +411,24 @@ class ProgressValueConfig:
                    n0=get("n0", 8.0), retention=get("retention", 0.9), gamma=gamma, lam=lam,
                    prefix_discount=get("prefix_discount", False), eta=get("eta", 1.0),
                    adv_scale=get("adv_scale", 2.0), format_scope=get("format_scope", "tied"),
-                   format_coef=get("format_coef", 1.0))
+                   format_coef=get("format_coef", 1.0),
+                   horizons=dict(horizons or {}), k_definitions=dict(k_definitions or {}))
 
     def fingerprint(self) -> dict:
-        """What the table's contents depend on: a saved table under another of these is another table."""
+        """What the table's contents depend on: a saved table under another of these is another table.
+
+        The cells' keys (features, buckets) and how they were counted (n0, retention), the targets'
+        objective (gamma, the horizons H, the reward schema) and what the keyed values mean (the k
+        definitions, the feature schema). Not lam, eta, adv_scale, prefix_discount or the format
+        term: they act on the advantage computed FROM the table, never on what is in it.
+        """
         return {"features": {t: list(fs) for t, fs in sorted(self.features.items())},
                 "rem_buckets": list(self.rem_buckets), "stag_buckets": list(self.stag_buckets),
-                "n0": self.n0, "retention": self.retention, "gamma": self.gamma}
+                "n0": self.n0, "retention": self.retention, "gamma": self.gamma,
+                "horizons": dict(sorted(self.horizons.items())),
+                "k_definitions": dict(sorted(self.k_definitions.items())),
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                "reward_schema_version": REWARD_SCHEMA_VERSION}
 
     def task_of(self, name) -> str:
         """The configured task a raw task name belongs to (exact, else by substring, as normalize_task_name)."""
@@ -477,8 +566,10 @@ class ProgressValueTable:
 
     def load_state_dict(self, state: Optional[dict]) -> None:
         """Restore a saved table; None or {} leaves it empty. Raises ValueError when the saved table was
-        built under another configuration (features, buckets, n0, retention or gamma): its cells would
-        be read as other states, or its targets are of another objective."""
+        built under another configuration (features, buckets, n0, retention, gamma, the horizons, the k
+        definitions) or another feature / reward schema: its cells would be read as other states, or
+        its targets are of another objective. A table saved before the fingerprint named the horizons,
+        the k definitions and the schemas is refused the same way: nothing says what it is."""
         if not state:
             return
         if state.get("version") != STATE_VERSION:
@@ -618,6 +709,14 @@ def compute_progress_value_advantage(columns: Mapping[str, Any], table: Progress
         if any(r is None for r in rs):
             raise ValueError(f"progress_value: trajectory {tu} has a non-finite episode_rewards")
         task = tasks[rows[0]]
+        # The horizon the table is fingerprinted with is a statement about its data: a trajectory run
+        # under another cap would add targets of another objective (success within another H) to cells
+        # keyed on fractions of another H, and be scored by them. (The trainer checks every row's
+        # pv_cap against the same horizons before this; this holds for any caller.)
+        want = cfg.horizons.get(task)
+        if want is not None and cap != want:
+            raise ValueError(f"progress_value: trajectory {tu} ({task}) ran under the cap {cap:g}; the table's "
+                             f"horizon for {task} is {want}")
         if task == ALFWORLD:
             typ = alfworld_type(gamefiles[rows[0]])
         else:
@@ -737,8 +836,8 @@ def _metrics(trajs, present, table, columns, col, value, y_row, a_rl, a_fmt, del
     A_rl are 0 by rule, not by the table, and counted in they would pull every mean towards 0 by
     the capped share, make mean_v - calibration differ from the batch's mean target, and put
     fallback_share below 1 on a step the table had no mass. capped_share reports how many
-    trajectories that leaves out. rows, trajectories and mean_abs_a_fmt count every real row:
-    the format term does act on capped rows.
+    trajectories that leaves out, capped_won how many of them won (should be 0). rows,
+    trajectories and mean_abs_a_fmt count every real row: the format term does act on capped rows.
     """
     out: Dict[str, float] = {}
     k_before = col(PV_K_BEFORE) if PV_K_BEFORE in columns else None
@@ -756,6 +855,10 @@ def _metrics(trajs, present, table, columns, col, value, y_row, a_rl, a_fmt, del
         out[p + "trajectories"] = float(len(trs))
         if task == WEBSHOP:
             put(p + "capped_share", [float(tr.capped) for tr in trs])
+            # Capped trajectories that WON, a count: 0 if goal_capped is what it claims (no policy can
+            # win the goal); any win says the flag is not a proof, and the V = 0 and the exclusion from
+            # the table that rest on it are wrong for that goal. The trainer prints a warning on > 0.
+            out[p + "capped_won"] = float(sum(1 for tr in trs if tr.capped and tr.R > 0))
         # The rows the table scores (and is updated with): every real row but a capped trajectory's.
         scored = np.array([i for tr in trs if not tr.capped for i in tr.rows], dtype=np.int64)
         win = np.array([tr.R > 0 for tr in trs if not tr.capped for _ in tr.rows], dtype=bool)

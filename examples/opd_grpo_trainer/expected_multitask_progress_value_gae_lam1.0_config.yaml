@@ -14,6 +14,9 @@
 #     and webshop_k session (new: the environment's own session, no option over-count).
 #   - the (a)/sat strength keys v2 pins (rho, ema, cap, min_top_k, tasks, the Beta rule, sat,
 #     mixed) are NOT pinned: with progress_rank off nothing reads them.
+#   - the analysis records on (algorithm.progress_value.records, 2026-09-30): every step's group
+#     records and records/* metrics, with the GRPO and GiGPO shadows beside the advantage
+#     (verl/trainer/ppo/rollout_records.py). Observation only: nothing in training reads them.
 # One lock per lam: the launcher picks expected_multitask_progress_value_gae_lam$LAM_config.yaml,
 # so a lam without a lock refuses to start. The two locks differ only in algorithm.lam (and
 # the lines that describe it).
@@ -369,6 +372,10 @@
 # the records' switch and the estimator's precondition (the trainer refuses the estimator
 # without it, and refuses progress_rank, the OCI arms and use_kl_in_reward beside it).
 "algorithm.progress_value.enable": true
+# A resume must find the value table in the checkpoint it resumes from: a missing one is refused,
+# not an empty start (it would change the baseline, and the checkpoint is incomplete or another
+# arm's). True is a warm start from another arm's checkpoint -- a different run.
+"algorithm.progress_value.allow_missing_table": false
 "algorithm.progress_value.prefix_discount": false
 "algorithm.progress_value.eta": 1.0
 # A fixed unit conversion (1 / sigma of a Bernoulli at p = 1/2), not a normalisation.
@@ -380,3 +387,13 @@
 "algorithm.progress_value.stag_buckets": [1, 3, 6, 10, 20]
 "algorithm.progress_value.format_scope": tied
 "algorithm.progress_value.format_coef": 1.0
+# ---- analysis records (algorithm.progress_value.records) ----------------------------
+# Observation only (verl/trainer/ppo/rollout_records.py): every step's group records and
+# records/* metrics, with the GRPO and GiGPO shadows and, beside grpo, the value estimator's
+# (its own table, never the checkpoint's). Nothing in training reads them; pinned because the
+# 2x2's comparisons are read off them. records.dir is a host path and is not pinned.
+"algorithm.progress_value.records.enable": true
+"algorithm.progress_value.records.shadow_grpo": true
+"algorithm.progress_value.records.shadow_gigpo": true
+"algorithm.progress_value.records.shadow_value": true
+"algorithm.progress_value.records.per_turn": true

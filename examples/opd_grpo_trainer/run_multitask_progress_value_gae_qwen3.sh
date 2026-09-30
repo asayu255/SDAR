@@ -38,9 +38,28 @@
 #   bash examples/opd_grpo_trainer/run_multitask_progress_value_gae_qwen3.sh
 #   LAM=0.9 bash examples/opd_grpo_trainer/run_multitask_progress_value_gae_qwen3.sh
 #
+# RESUMING. The value table is saved beside every checkpoint (global_step_N/progress_value_state.json)
+# and a resume must find it: algorithm.progress_value.allow_missing_table=False is pinned, so a
+# checkpoint without the table (incomplete, or another arm's) refuses to start instead of scoring
+# on an empty table. A table saved under other turn caps, k definitions, table keys or feature /
+# reward schema is refused too. Starting this arm from another arm's checkpoint on purpose is a
+# warm start, allow_missing_table=True, which the lock refuses: a different run, so its own lock
+# (or EXPECTED_CONFIG_WAIVE=algorithm.progress_value.allow_missing_table, said out loud).
+#
+# ANALYSIS RECORDS (algorithm.progress_value.records, every key spelled out; observation only --
+# the batch, the advantages, the table and the RNG states are the same with them off): one JSON line
+# per group per step in <default_local_dir>/progress_value_groups/step<N>.jsonl (records.dir, a host
+# knob, moves them), and records/<task>/<kind>/<component>/{row,traj_sum,token}_* metrics of the
+# advantage, its value terms and the GRPO and GiGPO shadows on the same rollouts
+# (verl/trainer/ppo/rollout_records.py). The traj/* and think-block metrics progress_rank reported
+# come back with them. The wrappers of the 2x2 inherit them (and restate enable).
+#
 # WHAT TO WATCH (every step, per task): progress_value/<task>/fallback_share (1 on the first
 # step, then 0), calibration (mean V - mean target on the batch), a_rl_success / a_rl_failure,
-# failure_pos_share, mean_abs_a_fmt, table_cells / table_mass, delta_progress / delta_stagnant.
+# failure_pos_share, mean_abs_a_fmt, table_cells / table_mass, delta_progress / delta_stagnant;
+# progress_value/webshop/capped_won must stay 0 (a win on a goal flagged unpayable; warned);
+# records/failed must stay 0 (a failed record costs the step's records only; the traceback is
+# printed).
 set -euo pipefail
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAM="${LAM:-1.0}"
@@ -62,6 +81,7 @@ exec bash "$_HERE/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh" \
   algorithm.progress_rank.search_k=evidence_answered \
   algorithm.progress_rank.webshop_k=session \
   algorithm.progress_value.enable=True \
+  algorithm.progress_value.allow_missing_table=False \
   algorithm.progress_value.prefix_discount=False \
   algorithm.progress_value.eta=1.0 \
   algorithm.progress_value.adv_scale=2.0 \
@@ -74,4 +94,9 @@ exec bash "$_HERE/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh" \
   "algorithm.progress_value.stag_buckets=[1,3,6,10,20]" \
   algorithm.progress_value.format_scope=tied \
   algorithm.progress_value.format_coef=1.0 \
+  algorithm.progress_value.records.enable=True \
+  algorithm.progress_value.records.shadow_grpo=True \
+  algorithm.progress_value.records.shadow_gigpo=True \
+  algorithm.progress_value.records.shadow_value=True \
+  algorithm.progress_value.records.per_turn=True \
   "$@"
