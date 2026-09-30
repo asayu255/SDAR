@@ -719,6 +719,17 @@ algorithm:
     #                      unanswered say whether the pushed-up side leans to rollouts
     #                      that never answered.
     search_k: evidence
+    # Which WebShop count goes into progress_k (what (a) ranks by). Both are always kept.
+    #   legacy   the required option VALUES clicked on the goal product since it was opened --
+    #            what every run so far ranked by. It over-counts a value replaced by another value
+    #            of the same option: black -> white -> large on {color: black, size: large} counts
+    #            2 while the session holds 1 (the environment keeps one value per option NAME).
+    #   session  the same four steps read off the environment's own session, which the worker
+    #            ships every turn: the product open now, the most required (name, value) pairs it
+    #            held at once, and a buy the environment executed with the goal product open. An
+    #            action the environment ignored (a stray space in "click [buy now]") cannot count.
+    # progress_value's pv_* columns use the session count whatever this says.
+    webshop_k: legacy
     # SATURATED GROUPS: the same term for groups whose rollouts ALL won, ranked by
     # turn count instead of k -- A_i += c_sat * (mean T - T_i) / T_task, zero-sum
     # over the GRPO statistic's samples, c_sat = sat_rho * E / u_sat under the same
@@ -840,6 +851,84 @@ algorithm:
     # <default_local_dir>/progress_rank_groups), or beside a probe's payload.
     record_groups: True
     record_dir: null
+  progress_value:
+    # PROGRESS_VALUE_GAE (adv_estimator=progress_value_gae): A PER-TURN ADVANTAGE FROM A VALUE
+    # TABLE OF THE STATE, by TD errors and GAE. See verl/trainer/ppo/progress_value.py.
+    #
+    # THE OBJECTIVE. J_H = E[gamma^T R]: win within the task's turn cap H. R = 1 iff
+    # episode_rewards > 0 (the test progress_rank uses); a failure and a timeout both end at 0.
+    # V(z_t) = E[gamma^(T-t) R | z_t] for the state z_t BEFORE action t, read off a table, and
+    #     delta_t = gamma V(z_{t+1}) - V(z_t),  V(z_T) = R,   A_t = sum_l (gamma lam)^l delta_{t+l}
+    # with gamma = algorithm.gamma and lam = algorithm.lam above. At lam = 1, A_t = gamma^(T-t) R
+    # - V(z_t) whatever the table: the table is then only a baseline, and a wrong one costs
+    # variance, not bias.
+    #
+    # WHY A TABLE OF COUNTED STATE. The offline check (val replays of the RL arms) found a small
+    # table over (ALFWorld task type, progress k, turns since k last rose, turns remaining), shrunk
+    # towards coarser tables, calibrated and ranking states well (ALFWorld AUC 0.86, WebShop 0.81),
+    # and holding from steps 100-150 to 200-300. The first-hit value of a progress level alone
+    # overestimated stagnant and near-timeout states by +0.5-0.8.
+    #
+    # FROZEN WITHIN A STEP: the batch is scored against the table as the previous steps left it
+    # and added only after (a baseline holding this batch would partly be each trajectory's own
+    # outcome). The table is saved beside the checkpoint (global_step_N/progress_value_state.json)
+    # and a resume under another features / buckets / n0 / retention / gamma is refused.
+    #
+    # enable IS THE SWITCH FOR THE RECORDS, not for the estimator: with it on (or with
+    # progress_rank.enable) the environment managers count and the rollout loop writes the pv_*
+    # columns (agent_system/environments/progress.py, PV_COLUMNS). adv_estimator=progress_value_gae
+    # needs it on and runs alone -- progress_rank.enable, every OCI arm and use_kl_in_reward are
+    # refused at launch (opd_grpo_ray_trainer.check_progress_value_config). Beside another
+    # estimator it only records: control's advantages, a wider batch.
+    enable: False
+    # A_t *= gamma^t, the discounted objective's own policy-gradient weight, on the GAE term. Inert
+    # at gamma = 1.
+    prefix_discount: False
+    # A = (1 - eta) (U_i - b) + eta A_t, U_i = gamma^T R and b the mean U of the group's OTHER
+    # trajectories, each counted once (not once per turn: a long failure must not outweigh a short
+    # win in the baseline the win is judged against). 1.0 is the single GAE.
+    eta: 1.0
+    # A_rl = adv_scale * A. 2.0 = 1 / sigma of a Bernoulli at p = 1/2, so a p = 1/2 group gets the
+    # magnitude GRPO's z gives it. A FIXED unit conversion -- the same for every batch, group and
+    # task -- not a normalisation: dividing by a group's std would bring back the tied-group
+    # blow-up and make the unit depend on the batch.
+    adv_scale: 2.0
+    # The shrinkage: a cell's value is its parent's (task, type, rem), moved by as much data as the
+    # cell has, at strength n0; the parent is shrunk to the task's mean the same way. This is the
+    # Beta prior's only role here.
+    n0: 8.0
+    # Discounted counts: every (sum, count) is multiplied by this BEFORE a step's batch is added,
+    # so the table follows the policy with a memory of about 1 / (1 - retention) = 10 steps.
+    retention: 0.9
+    # The state each task's value is keyed on, before the action:
+    #   type    ALFWorld's task type (from the gamefile path); the task name on the other tasks
+    #   k       the progress count k_hist (pv_k_before): ALFWorld the alfworld_k count, WebShop
+    #           the session count, Search the search_k count (progress_rank's keys choose them)
+    #   stag    turns since k last rose, bucketed (stag_buckets)
+    #   rem     turns left, H - t, bucketed by the fraction of H (rem_buckets)
+    #   hold, inside, at   ALFWorld's state now: holding a target object (treated if the task
+    #           treats), most targets in one target receptacle, standing at a target receptacle
+    #   ongoal, optnow     WebShop's session now: the goal product open, required options held
+    #   evid    Search: a returned result has carried the answer
+    # The defaults are the offline check's tables; a task not listed keeps its default.
+    features:
+      alfworld: [type, k, stag, rem]
+      webshop: [k, stag, rem]
+      search: [k, rem]
+    # rem bucket i is the first i with H - t > rem_buckets[i] * H: > 0.8H, > 0.6H, > 0.4H, > 0.2H,
+    # > 0.1H, the rest. stag bucket = the number of edges <= stag: 0 | 1-2 | 3-5 | 6-9 | 10-19 | 20+.
+    # Both the offline check's (evaluate_features.py rb / sb).
+    rem_buckets: [0.8, 0.6, 0.4, 0.2, 0.1]
+    stag_buckets: [1, 3, 6, 10, 20]
+    # THE FORMAT TERM, kept out of delta (the -0.1 invalid-action penalty is not part of J_H, and
+    # inside the TD error it would push down every turn before the format is acquired). What
+    # control gets from it is the z-score of "invalid" over a group's turn rows wherever the
+    # outcome cancels; that is reproduced as a separate term:
+    #     x = 0 valid / -1 invalid,  A_fmt = (x - mean x) / std x  (float64; 0 in a uniform group)
+    # and advantage = A_rl + format_coef * A_fmt. format_scope tied applies it only to groups whose
+    # rollouts all have the same R, which is where control applies it; all, to every group.
+    format_scope: tied
+    format_coef: 1.0
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

@@ -58,7 +58,9 @@ from agent_system.environments.progress import (
     ObservationCoverage, WebshopProgress, advance_walkthrough,
     alfworld_k_definition as _alfworld_k_definition, progress_on as _progress_on,
     put_coverage as _put_coverage, put_progress as _put_progress, search_progress as _search_progress,
-    search_k_definition as _search_k_definition, search_progress_answered as _search_progress_answered)
+    search_k_definition as _search_k_definition, search_progress_answered as _search_progress_answered,
+    PvTracker, WS_STATE_INFO, pv_note_cap as _pv_note_cap, pv_termination as _pv_termination,
+    turn_cap as _turn_cap, webshop_k_definition as _webshop_k_definition)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +854,10 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._searches = [0] * n
         # Where each route-document row stands in its route (expert_flow only).
         self._route_ptr = [0] * n
+        # The progress-value records (progress.PV_COLUMNS): before any result has come back nothing
+        # is seen and both counts are 0, whatever the question.
+        self._pv = (PvTracker([{"k": 0, "evid": 0} for _ in range(n)], _turn_cap(self.config))
+                    if _progress_on(self.config) else None)
         self._probe_reset = int(getattr(self, "_probe_reset", -1)) + 1
         self._probe_rows = [self._probe_new_row(i) for i in range(n)] if self._probe_dir else []
         if self._probe_rows and not getattr(self, "_probe_atexit", False):
@@ -961,6 +967,18 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             for i, cov in enumerate(_cov[:len(next_obs)]):
                 cov.step(next_obs[i])
             _put_coverage(infos, _cov)
+            # The progress-value records: the search_k count and "evidence seen" before and after
+            # this turn. SearchEnv also ends an episode at its own max_turns, answer or not, so a
+            # done without an answer ran out of turns (pv_term 3), one with an answer failed (2).
+            _pv = getattr(self, "_pv", None)
+            if _pv is not None:
+                _seen = list(getattr(self, "_evidence_seen", None) or [False] * len(infos))
+                _won = [bool((info or {}).get("won", False)) for info in infos]
+                _pv.step(infos,
+                         [{"k": _prog[i][0], "evid": int(bool(_seen[i]))} for i in range(len(infos))],
+                         [p[1] for p in _prog], dones,
+                         [_pv_termination(dones[i], _won[i], committed=bool(_ans[i]) if i < len(_ans) else False)
+                          for i in range(len(infos))])
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
@@ -1289,6 +1307,17 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self._revisit = [RevisitCounter() for _ in text_obs] if _progress_on(self.config) else []
         # ProGPO's coverage, a shadow of (a)'s k, from the game's own opening text.
         self._coverage = ([ObservationCoverage(o) for o in text_obs] if _progress_on(self.config) else [])
+        # The progress-value records (progress.PV_COLUMNS), starting from the reset state: the
+        # alfworld_k count as the counters above hold it (nothing done yet; the pointer at step 0)
+        # and the milestones' current state (nothing held, nowhere yet).
+        self._pv = None
+        if _progress_on(self.config):
+            _kdef = _alfworld_k_definition(self.config)
+            _k0 = {"milestone": [m.k for m in self._milestones],
+                   "milestone_arrive": [m.k_arrive for m in self._milestones],
+                   "walkthrough_set": [w.k for w in self._walkset]}.get(_kdef, list(self._walk_ptr))
+            self._pv = PvTracker([dict(k=_k0[i], **self._milestones[i].current_state())
+                                  for i in range(len(text_obs))], _turn_cap(self.config))
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
@@ -1365,19 +1394,29 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     info[REVISITS_INFO] = int(_rv[i].revisits) if i < len(_rv) else 0
             _kdef = _alfworld_k_definition(self.config)
             if _kdef == "milestone":
-                _put_progress(infos, _mk, _mt)
+                _sel = (_mk, _mt)
             elif _kdef == "milestone_arrive":
                 # The milestones plus "arrived"; the base count stays in its own columns.
-                _put_progress(infos, _ak, _at)
+                _sel = (_ak, _at)
             elif _kdef == "walkthrough_set":
                 # The walkthrough as a set; the pointer and the milestones keep their columns.
-                _put_progress(infos, _wk, _wt)
+                _sel = (_wk, _wt)
             else:
-                _put_progress(infos, _ptrs, _totals)
+                _sel = (_ptrs, _totals)
+            _put_progress(infos, *_sel)
             _cov = getattr(self, "_coverage", None) or []
             for i, cov in enumerate(_cov[:len(text_obs)]):
                 cov.step(text_obs[i])
             _put_coverage(infos, _cov)
+            # The progress-value records: the alfworld_k count and the milestones' current state,
+            # before and after this turn. ALFWorld has no terminal action, so an episode the
+            # environment ends without a win hit TextWorld's own step limit (pv_term 3).
+            _pv = getattr(self, "_pv", None)
+            if _pv is not None:
+                _won = [bool((info or {}).get("won", False)) for info in infos]
+                _now = [m.current_state() for m in _ms] + [{"hold": 0, "inside": 0, "at": 0}] * len(_pad)
+                _pv.step(infos, [dict(k=_sel[0][i], **_now[i]) for i in range(len(actions))], _sel[1], dones,
+                         [_pv_termination(dones[i], _won[i], committed=False) for i in range(len(actions))])
 
         # add action_valid to infos
         for i, info in enumerate(infos):
@@ -1742,10 +1781,24 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # document slot needs them on every turn and reset is the only place
         # they appear.
         self.goals = [(info or {}).get('goal') for info in (infos or [])]
-        # (a)'s walk along the goal record, one per env, from the landing page on.
-        self._ws_progress = ([WebshopProgress(g, (info or {}).get('available_actions'))
+        # (a)'s walk along the goal record, one per env, from the landing page on -- and from the
+        # session the worker shipped with it (info['ws_state']), which the session count reads.
+        self._ws_progress = ([WebshopProgress(g, (info or {}).get('available_actions'),
+                                              state=(info or {}).get(WS_STATE_INFO))
                               for g, info in zip(self.goals, infos or [])]
                              if _progress_on(self.config) else [])
+        if self._ws_progress and _webshop_k_definition(self.config) == "session":
+            # The session count without a session would quietly be the legacy one (k_session's
+            # fallback); a run that asked for it must get it or stop here.
+            _missing = [j for j, info in enumerate(infos or []) if not isinstance((info or {}).get(WS_STATE_INFO), dict)]
+            assert not _missing, (
+                f"algorithm.progress_rank.webshop_k=session but the WebShop reset info of env(s) {_missing[:5]} "
+                f"carries no {WS_STATE_INFO!r} (WebshopWorker.reset ships it)")
+        # The progress-value records (progress.PV_COLUMNS), from the landing page: the session count
+        # (the legacy one when no session is shipped) and the session's product and options.
+        self._pv = (PvTracker([{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now}
+                               for p in self._ws_progress], _turn_cap(self.config))
+                    if _progress_on(self.config) else None)
         # Repeated actions (shadow column `revisits`): the same click or search again.
         self._revisit = [RevisitCounter() for _ in self.goals] if _progress_on(self.config) else []
         # The terminal action sent (shadow column `committed`): a "click[buy now]" on ANY
@@ -1818,8 +1871,13 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         _wsp = getattr(self, "_ws_progress", None) or []
         if _wsp:
             for i, act in enumerate(actions[:len(_wsp)]):
-                _wsp[i].step(act, (infos[i] or {}).get('available_actions'))
-            _put_progress(infos, [p.k for p in _wsp], [p.total for p in _wsp])
+                # The session snapshot and the environment's own done go in beside the action: the
+                # session count reads only those (the legacy count only the action and the page).
+                _wsp[i].step(act, (infos[i] or {}).get('available_actions'),
+                             state=(infos[i] or {}).get(WS_STATE_INFO), done=bool(dones[i]))
+            # webshop_k says which count (a) ranks by; legacy (the default) is what every run so far had.
+            _session_k = _webshop_k_definition(self.config) == "session"
+            _put_progress(infos, [p.k_session if _session_k else p.k for p in _wsp], [p.total for p in _wsp])
             # Shadows: the terminal action here is the purchase; and revisits.
             _rv = list(getattr(self, "_revisit", None) or [])
             _bt = getattr(self, "_ws_bought", None) or []
@@ -1841,6 +1899,15 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                     info[GOAL_PRICE_INFO] = _gpr[i] if i < len(_gpr) else None
                     info[ENV_SEED_INFO] = _esd[i] if i < len(_esd) else None
                     info[GOAL_PRODUCT_PRICE_INFO] = _gpp[i] if i < len(_gpp) else None
+            # The progress-value records: the session count and the session's state, before and
+            # after this turn. Only an executed buy ends WebShop, so a done that did not win is a
+            # failed purchase (pv_term 2); running out of turns is the cap's or the loop's to mark.
+            _pv = getattr(self, "_pv", None)
+            if _pv is not None:
+                _won = [bool((info or {}).get("won", False)) for info in infos]
+                _pv.step(infos, [{"k": p.k_session, "ongoal": int(p.on_goal), "optnow": p.opts_now} for p in _wsp],
+                         [p.total for p in _wsp], dones,
+                         [_pv_termination(dones[i], _won[i], committed=bool(dones[i])) for i in range(len(_wsp))])
         _put_coverage(infos, _cov)
         # add action_valid to infos
         for i, info in enumerate(infos):
@@ -2227,6 +2294,11 @@ class MultiTaskEnvironmentManager(EnvironmentManagerBase):
             dones = np.asarray(dones).reshape(-1).astype(bool)
 
             self._task_steps[task] += 1
+            if _progress_on(self.config):
+                # The line below forces every env of the task done at its cap and so loses whether
+                # the environment itself ended the episode. The task manager has already recorded
+                # that (pv_env_done, pv_term); mark the rows the cap alone ends as out of turns.
+                _pv_note_cap(infos, dones, self._task_steps[task] >= self.task_max_steps[task])
             if self._task_steps[task] >= self.task_max_steps[task]:
                 dones = np.ones(len(indices), dtype=bool)
 

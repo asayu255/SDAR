@@ -95,6 +95,12 @@ def inject_opd_grpo_config(config) -> None:
             assert n_roll is not None and int(n_roll) == g_size, (
                 f"progress_rank.scale_mode=beta_mirror: beta_group_size={g_size} but "
                 f"env.rollout.n={n_roll}; the Beta is fitted to groups of exactly that size")
+        # adv_estimator=progress_value_gae: its switch on, nothing beside it that moves a GRPO
+        # statistic, and its own keys valid -- here, not at the first step's advantage an hour in.
+        # A no-op for every other estimator.
+        from verl.trainer.ppo.opd_grpo_ray_trainer import check_progress_value_config
+
+        check_progress_value_config(config)
 
 
 def run_opd_grpo(config) -> None:

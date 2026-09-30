@@ -53,6 +53,56 @@ from agent_system.multi_turn_rollout.utils import PADDING_ROW_KEY
 
 from agent_system.multi_turn_rollout import compute_log_prob_with_prefetch
 
+PROGRESS_VALUE_ESTIMATOR = "progress_value_gae"
+# The arms that move a group's statistic or its rows. progress_value_gae has no group statistic
+# for them to move, so on its batch they would do nothing and still be reported as on.
+_OCI_ARMS = ("oci_sat", "oci_floor", "oci_slots", "oci_rank")
+
+
+def check_progress_value_config(config) -> bool:
+    """True when the run's advantages come from progress_value_gae; refuses what would not mean what it says.
+
+    ``algorithm.progress_value.enable`` is the switch for the RECORDS (the env managers count and the
+    rollout loop writes the pv_* columns); the estimator is ``algorithm.adv_estimator``. So:
+
+      * adv_estimator=progress_value_gae needs progress_value.enable -- without it no pv_* column is
+        recorded and the first step would find nothing to read -- and it runs ALONE: progress_rank
+        adds to outcome-GRPO advantages and asserts grpo itself, every OCI arm moves a GRPO group's
+        statistic this estimator does not have, and a KL-in-reward penalty would sit in
+        token_level_rewards, which this estimator never reads (R is episode_rewards > 0).
+      * progress_value.enable beside another estimator is records-only: the columns ride along and
+        nothing in the trainer reads them. False is returned and nothing is checked.
+
+    Called by inject_opd_grpo_config, so a bad combination fails in the first seconds of a launch
+    (the progress_value keys are validated there too), and again by the trainer on every step.
+    """
+    alg = config.algorithm
+    if alg.get("adv_estimator", None) != PROGRESS_VALUE_ESTIMATOR:
+        return False
+    pv_cfg = alg.get("progress_value", None)
+    assert pv_cfg is not None and bool(pv_cfg.get("enable", False)), (
+        "adv_estimator=progress_value_gae needs algorithm.progress_value.enable=True: it is what makes "
+        "the environment managers and the rollout loop record the pv_* columns the estimator reads")
+    pr_cfg = alg.get("progress_rank", None)
+    assert not (pr_cfg is not None and bool(pr_cfg.get("enable", False))), (
+        "adv_estimator=progress_value_gae and algorithm.progress_rank.enable are both on; (a) adds to "
+        "outcome-GRPO advantages, and the value arm is to be measured with nothing else changed. "
+        "The progress counters progress_rank's keys choose (alfworld_k, search_k, webshop_k) are "
+        "read with it off.")
+    for other in _OCI_ARMS:
+        ocfg = alg.get(other, None)
+        assert not (ocfg is not None and bool(ocfg.get("enable", False))), (
+            f"adv_estimator=progress_value_gae and algorithm.{other}.enable are both on; the OCI arms "
+            "move a GRPO group's statistic, which this estimator does not have")
+    assert not bool(alg.get("use_kl_in_reward", False)), (
+        "adv_estimator=progress_value_gae with algorithm.use_kl_in_reward: the penalty would go into "
+        "token_level_rewards, which this estimator never reads, and silently do nothing")
+    # The block's own values (features, buckets, n0, ...), checked now rather than at step 1.
+    from verl.trainer.ppo.progress_value import ProgressValueConfig
+
+    ProgressValueConfig.from_config(pv_cfg, gamma=float(alg.gamma), lam=float(alg.lam))
+    return True
+
 
 class OPDGRPORayTrainer(OPDRayTrainer):
     """Multitask trainer combining GRPO policy-gradient with per-task teacher-KL distillation."""
@@ -115,6 +165,14 @@ class OPDGRPORayTrainer(OPDRayTrainer):
 
         # ---- advantages (GRPO) ----
         with _timer("adv", timing_raw):
+            # ---- progress_value_gae: the value table the batch is scored against ----
+            # Empty unless it IS the estimator (progress_value.enable beside another one only
+            # records the pv_* columns). First, so a combination it refuses fails before any other
+            # arm touches the batch. The table is read inside compute_advantage and left with this
+            # batch's update staged; it is committed right after, once the batch has been scored
+            # (dropped instead on a grad_probe batch, which takes no step: _progress_value_commit).
+            pv_kwargs = self._progress_value_kwargs(batch)
+
             batch.batch["token_level_scores"] = reward_tensor
             if reward_extra_infos_dict:
                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -348,7 +406,10 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 # because the reward scales are not comparable across tasks.
                 oci_floor_value=float((oci_floor_cfg or {}).get("value", 0.0)
                                       if oci_floor_cfg is not None else 0.0),
+                **pv_kwargs,
             )
+            if pv_kwargs:
+                metrics.update(self._progress_value_commit(pv_kwargs["progress_value_out"]))
 
             # WHAT THE FLOOR ACTUALLY BOUGHT, read off the advantage column after
             # the fact. The arm's whole claim is that these rows go from exactly
@@ -743,6 +804,91 @@ class OPDGRPORayTrainer(OPDRayTrainer):
             print(f"[progress_rank] WARNING: group records not written to {path}: {e!r}", flush=True)
             return {"progress_rank/record_write_failed": 1.0}
         return {"progress_rank/record_write_failed": 0.0}
+
+    # --- progress_value_gae ------------------------------------------------------ #
+
+    def _progress_value_table(self):
+        """The value table, built on first use and restored from the checkpoint the run resumed from.
+
+        The shared loop's _load_checkpoint reads global_step_N/progress_value_state.json into
+        ``_progress_value_pending_state`` (opd_ray_trainer) and its _save_checkpoint writes this
+        table there. A table saved under another configuration (features, buckets, n0, retention,
+        gamma) is refused by load_state_dict: its cells would be read as other states. _load_checkpoint
+        already refused it before the first rollout; the check here covers a pending state set any
+        other way.
+        """
+        table = getattr(self, "_progress_value", None)
+        if table is None:
+            from verl.trainer.ppo.progress_value import ProgressValueConfig, ProgressValueTable
+
+            alg = self.config.algorithm
+            table = ProgressValueTable(ProgressValueConfig.from_config(
+                alg.get("progress_value", None), gamma=float(alg.gamma), lam=float(alg.lam)))
+            pending = getattr(self, "_progress_value_pending_state", None)
+            if pending:
+                table.load_state_dict(pending)
+                mass = {t: round(sn[1], 1) for t, sn in sorted(table.roots.items())}
+                print(f"[progress_value] table restored: {table.updates} updates, "
+                      f"{len(table.cells)} cells, mass {mass}", flush=True)
+            self._progress_value = table
+        return table
+
+    def _progress_value_kwargs(self, batch: DataProto) -> dict:
+        """compute_advantage's progress_value_* arguments, or {} when the estimator is another one."""
+        if not check_progress_value_config(self.config):
+            return {}
+        # The caps the environment managers run under: env.multitask.max_steps per task in a
+        # multitask run, env.max_steps in a single-task one. Read here rather than through
+        # _turn_caps, which takes the multitask caps whenever the (always present) env.multitask
+        # block is -- right for every multitask run, wrong for a single-task one with its own cap.
+        env = self.config.env
+        if str(env.get("env_name", "")).lower() == "multitask":
+            from agent_system.environments.env_manager import _get_multitask_task_max_steps
+
+            caps = _get_multitask_task_max_steps(self.config, [str(t) for t in env.multitask.tasks])
+        else:
+            from verl.trainer.ppo.metric_utils import normalize_task_name
+
+            only = normalize_task_name(env.get("env_name", None))
+            caps = {only: int(env.max_steps)} if only is not None and env.get("max_steps", None) else {}
+        task_names = get_task_names(batch)
+        if task_names is None:
+            # A single-task run carries no task_name column; its one task is the env's.
+            assert len(caps) == 1, "progress_value needs per-row task names or a single-task env.env_name"
+            task_names = np.array(list(caps) * len(batch), dtype=object)
+        return {
+            "progress_value_table": self._progress_value_table(),
+            # Checked against every row's pv_cap: the "turns remaining" feature is keyed on it.
+            "progress_value_turn_caps": caps,
+            "progress_value_task_names": task_names,
+            # compute_advantage leaves the full result here (metrics, per-row V and delta).
+            "progress_value_out": {},
+        }
+
+    def _progress_value_commit(self, out: dict) -> dict:
+        """Add the scored batch to the table and return the step's progress_value/* metrics.
+
+        Right after the advantages, so the step was scored against the table as the PREVIOUS steps
+        left it, and before the checkpoint that follows the actor update, which saves the table
+        with this step in it -- a run resumed from step N scores step N + 1 against exactly what an
+        uninterrupted run would have. The per-task metrics describe the table the batch was scored
+        against (before this commit).
+
+        EXCEPT UNDER trainer.grad_probe: a probe batch takes no optimizer step and the probe holds
+        the policy still while it reads it, so the table -- a parameter of the advantage -- is held
+        still too. The staged batch is dropped, and every probe batch is scored against the table
+        the checkpoint restored, as training step N + 1 would be; committed, batch k would be
+        scored against that table decayed k - 1 times plus the earlier probe batches.
+        """
+        table = self._progress_value_table()
+        probe = self.config.trainer.get("grad_probe", None)
+        if probe is not None and bool(probe.get("enable", False)):
+            assert table.discard(), "progress_value: compute_advantage staged no update for this batch"
+        else:
+            assert table.commit(), "progress_value: compute_advantage staged no update for this batch"
+        metrics = dict(out["result"].metrics)
+        metrics["progress_value/table_updates"] = float(table.updates)
+        return metrics
 
     def _attach_advantage_reliability_columns(self, batch: DataProto) -> DataProto:
         """Per row: its advantage, and whether its prompt group carried any signal.

@@ -115,6 +115,9 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    # A per-turn advantage from a value TABLE of the state, by TD errors and GAE
+    # (verl/trainer/ppo/progress_value.py). The table lives in the driver, so no critic.
+    PROGRESS_VALUE_GAE = "progress_value_gae"
 
 
 @dataclass
@@ -499,9 +502,81 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.PROGRESS_VALUE_GAE:
+        # One scalar per row from the value table's TD errors (progress_value.py), broadcast over
+        # the row's response tokens the way outcome GRPO's is. The table is only READ here: it is
+        # frozen within the step, and the update this batch owes is left staged on it
+        # (table.pending) for the caller to commit once the batch has been scored -- a baseline
+        # that already held this batch would partly be each trajectory's own outcome.
+        from verl.trainer.ppo.progress_value import compute_progress_value_advantage
+
+        table = kwargs.get("progress_value_table", None)
+        assert table is not None, (
+            "adv_estimator=progress_value_gae needs progress_value_table=<ProgressValueTable>; the "
+            "table is kept by the OPD+GRPO trainer (opd_grpo_ray_trainer), which passes it")
+        assert "pv_t" in data.non_tensor_batch, (
+            "adv_estimator=progress_value_gae but the batch has no pv_* columns. The environment "
+            "managers and the rollout loop record them only while algorithm.progress_value.enable "
+            "(or algorithm.progress_rank.enable) is on, read off their own copy of the config.")
+        # The columns by name, rows in the batch's own order -- balanced, adjust_batch's copies
+        # included: the estimator puts every trajectory back together from traj_uid and pv_t.
+        columns = dict(data.non_tensor_batch)
+        pad = data.batch.get(PADDING_ROW_KEY, None)
+        if pad is not None:
+            columns[PADDING_ROW_KEY] = pad.reshape(-1).to(torch.bool).cpu().numpy()
+        # The caller's task names win over the column: a single-task run carries none.
+        if kwargs.get("progress_value_task_names", None) is not None:
+            columns["task_name"] = np.asarray(kwargs["progress_value_task_names"], dtype=object)
+        _check_progress_value_caps(columns, table.cfg, kwargs.get("progress_value_turn_caps", None))
+        res = compute_progress_value_advantage(columns, table)
+        table.stage(res.records)
+        pv_mask = data.batch["response_mask"]
+        if multi_turn:
+            pv_mask = data.batch["loss_mask"][:, -pv_mask.size(1):]
+        pv_mask = pv_mask.to(torch.float32)
+        advantages = torch.as_tensor(res.advantage, dtype=torch.float32, device=pv_mask.device)
+        data.batch["advantages"] = advantages.unsqueeze(-1) * pv_mask
+        # A tensor of its own (GRPO hands back one tensor twice): V + A_rl / adv_scale -- with
+        # eta = 1 and no prefix_discount the lambda-return, gamma^(T-t) R at lam = 1. Only the
+        # metrics read it; the actor never ships 'returns'.
+        returns = torch.as_tensor(res.returns, dtype=torch.float32, device=pv_mask.device)
+        data.batch["returns"] = returns.unsqueeze(-1) * pv_mask
+        out = kwargs.get("progress_value_out", None)
+        if out is not None:
+            out["result"] = res
     else:
         raise NotImplementedError
     return data
+
+
+def _check_progress_value_caps(columns, cfg, turn_caps) -> None:
+    """Every real row's pv_cap against the trainer's own reading of the task caps.
+
+    The two are one number read in two places: the environment manager writes the cap it ran the
+    trajectory under (its env.max_steps, the task's own cap in a multitask run), and the trainer
+    reads env.multitask.max_steps / env.max_steps. The value table's "turns remaining" is keyed on
+    pv_cap, so a disagreement (an unset env.max_steps, a single-task cap above the environment's
+    own limit) would key every state on a horizon the trajectory did not have. A task the trainer
+    has no cap for is not checked.
+    """
+    if not turn_caps:
+        return
+    pad = columns.get(PADDING_ROW_KEY, None)
+    task_of = {}
+    bad = {}
+    for i, (name, cap) in enumerate(zip(columns["task_name"], columns["pv_cap"])):
+        if pad is not None and bool(pad[i]):
+            continue
+        key = str(name)
+        if key not in task_of:
+            task_of[key] = cfg.task_of(name)
+        want = turn_caps.get(task_of[key], None)
+        if want is not None and not float(cap) == float(want):
+            bad.setdefault(task_of[key], set()).add(str(cap))
+    if bad:
+        raise ValueError(
+            f"progress_value: pv_cap disagrees with the configured turn caps {dict(turn_caps)}: "
+            + "; ".join(f"{task} rows carry {sorted(caps)}" for task, caps in sorted(bad.items())))
 
 
 @contextmanager
@@ -647,7 +722,9 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            # Its V is a table of counts the driver keeps, not a network: nothing to train or place.
+            AdvantageEstimator.PROGRESS_VALUE_GAE,
         ]:
             self.use_critic = False
         else:

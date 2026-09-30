@@ -141,12 +141,36 @@ class WebshopWorker:
             pass
         return stats
 
+    def _session_state(self):
+        """The live session as the purchase reads it: ``{'asin', 'options'}``, lower-cased.
+
+        ``asin`` is the product open now (None on the landing and results pages, which clear it)
+        and ``options`` the one value per option NAME the session holds for it -- the environment
+        overwrites a name's value on every click, which the manager cannot tell from the clicks
+        alone (a value does not say which option it belongs to). For the manager's session count
+        (progress.WebshopProgress); a few dozen bytes per step. None when it cannot be read.
+        """
+        try:
+            session = self.env.server.user_sessions[self.env.session]
+            asin = session.get('asin')
+            options = session.get('options') or {}
+            return {'asin': str(asin).lower() if asin else None,
+                    'options': {str(n).lower(): str(v).lower() for n, v in dict(options).items()}}
+        except Exception:  # noqa: BLE001 -- a record for the statistics must never break a step
+            return None
+
     def step(self, action):
         """Execute a step in the environment"""
+        # THE SESSION BEFORE THE ACTION, taken now because WebAgentTextEnv.step resets itself when
+        # the episode ends: the reset clears user_sessions and opens a random new session, so after
+        # a purchase the live session is another episode's. The purchase reads the product and
+        # options without changing them, so on the ending turn the session before IS the one bought.
+        before = self._session_state()
         obs, reward, done, info = self.env.step(action)
         info = dict(info or {})  # make a *copy* so we can mutate safely
         info['available_actions'] = self.env.get_available_actions()
         info['task_score'] = reward
+        info['ws_state'] = before if done else self._session_state()
 
         # Redefine reward. We only use rule-based reward - win for 10, lose for 0.
         if done and reward == 1.0:
@@ -164,6 +188,9 @@ class WebshopWorker:
         info = dict(info or {})
         info['available_actions'] = self.env.get_available_actions()
         info['won'] = False
+        # The session the episode starts from (the landing page: no product, no options), so the
+        # manager's session count and the first turn's "before" start from the environment's own state.
+        info['ws_state'] = self._session_state()
         # THE GOAL RECORD, for the correct-document slot. The reward is defined
         # by this record -- the product to buy and the options its matcher checks
         # -- so the winning trajectory can be written from it. Only the worker

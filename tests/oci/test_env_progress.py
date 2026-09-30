@@ -8,8 +8,10 @@ WHAT IT PROTECTS.
     test), the results page is judged by what is on screen, and leaving the
     product clears its options.
   * Search: one step, and none at all for yes/no questions.
-  * Wiring: with algorithm.progress_rank off, the managers write nothing and the
-    rollout loop records nothing -- the batch keeps control's columns.
+  * Wiring: with algorithm.progress_rank and algorithm.progress_value both off, the
+    managers write nothing and the rollout loop records nothing -- the batch keeps
+    control's columns. Either one on turns the counting on (the pv_* records, which
+    progress_value reads, are tested in test_progress_value_records.py).
 No model, no retriever, no WebShop index: fake environments throughout.
 """
 import json
@@ -120,6 +122,11 @@ check(P.search_progress(True, {"target": []}, **kw) == (0, 0), "no answer: no pr
 print("4. the switch")
 check(P.progress_on(config(True)) and not P.progress_on(config(False)), "algorithm.progress_rank.enable")
 check(not P.progress_on(OmegaConf.create({"env": {}})), "absent means off")
+_pv_on = config(False)
+_pv_on.algorithm.progress_value = {"enable": True}
+check(P.progress_on(_pv_on), "algorithm.progress_value.enable turns it on too, with progress_rank off")
+_pv_on.algorithm.progress_value.enable = False
+check(not P.progress_on(_pv_on), "...and with both off it is off")
 
 print("5. ALFWorld manager")
 from agent_system.environments.env_manager import (  # noqa: E402

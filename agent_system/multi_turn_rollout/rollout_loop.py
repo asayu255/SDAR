@@ -36,6 +36,7 @@ from verl.trainer.ppo.privileged_notice import (
     parse_notice_config as _parse_notice_config,
 )
 from agent_system.environments.env_manager import OCI_PREFIX_KEY
+from agent_system.environments.progress import PV_COLUMNS, PV_TERM_RUNNING, PV_TERM_TIMEOUT
 from agent_system.environments.oci_layout import (
     OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on,
     rank_on as _oci_rank_on, rank_self_check_rows as _oci_rank_self_check_rows,
@@ -911,6 +912,23 @@ def _prompt_ids_from_tensors(input_ids_row, attention_mask_row):
     return input_ids_row[attention_mask_row.bool()].tolist()
 
 
+def mark_pv_timeouts(total_batch_list) -> None:
+    """pv_term 3 on the last turn of every trajectory that nothing ended.
+
+    The managers mark a turn their environment ended (won, failed, or its own step limit) and the
+    multitask manager a turn its cap ended, but a single-task run just stops at env.max_steps with
+    done still False -- and no turn can tell it is the last while it is being recorded. So once the
+    loop is over, a trajectory whose last recorded turn still reads "running" ran out of turns.
+    In place; rows without the column (the switch off) are left alone.
+    """
+    for rows in total_batch_list:
+        for row in reversed(rows):
+            if row.get('active_masks'):
+                if row.get('pv_term', None) == PV_TERM_RUNNING:
+                    row['pv_term'] = float(PV_TERM_TIMEOUT)
+                break
+
+
 class TrajectoryCollector:
     # Set by __init__ off the config; declared here so an instance built without
     # it -- tests construct one with __new__ to exercise a single method -- still
@@ -920,6 +938,7 @@ class TrajectoryCollector:
     _oci_repl_dtype = torch.long
     _oci_group_n = 0
     _progress_rank_on = False
+    _oci_store_doc_prompt = False
 
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
@@ -934,6 +953,8 @@ class TrajectoryCollector:
         self.tokenizer = tokenizer
         self.processor = processor
         from agent_system.environments.progress import progress_on as _progress_on
+        # The widened switch (progress_rank OR progress_value): the progress_* and pv_* columns are
+        # recorded for either arm. The name is the historical one, which tests set directly.
         self._progress_rank_on = _progress_on(config)
         # HOW WIDE THE REPLACEMENT COLUMN IS. The single-candidate arm's edit puts
         # back one boundary token (see OCI_REPL_WIDTH). The ten-slot layout's
@@ -1909,6 +1930,16 @@ class TrajectoryCollector:
                 # WebShop's continuous purchase score (envs.py keeps it beside the binary
                 # reward; 0 until the episode ends); NaN on the tasks that have none.
                 rows[pos]['task_score'] = float(_info.get('task_score', float('nan')))
+                # The progress-value records (progress.PV_COLUMNS): the managers write each env's
+                # state before and after this turn's action and how the environment saw the turn
+                # end; NaN on the tasks without them. pv_t is the row's place in its trajectory,
+                # which only this list knows: the index gather_rollout_data gives as turn_step.
+                # Running out of turns with no done at all is marked after the loop
+                # (mark_pv_timeouts), since no single turn can tell it is the last.
+                for _c in PV_COLUMNS:
+                    _v = _info.get(_c, None)
+                    rows[pos][_c] = float('nan') if _v is None else float(_v)
+                rows[pos]['pv_t'] = float(len(total_batch_list[i]))
             total_batch_list[i].append(rows[pos])
             total_infos[i].append(infos[i])
             if active_masks[i]:
@@ -2197,6 +2228,10 @@ class TrajectoryCollector:
         # collected here rather than left for the trainer to recompute. Whatever
         # is still queued stays queued and the trainer scores it as usual.
         self._join_teacher_prefetch()
+
+        if self._progress_rank_on:
+            # A trajectory the loop stopped with no done (env.max_steps reached) ran out of turns.
+            mark_pv_timeouts(total_batch_list)
 
         if _turn_records is not None:
             _print_turn_timing(

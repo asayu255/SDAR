@@ -401,6 +401,29 @@ def _oci_sample_dump(tokenizer, batch, cand_mask, *, n_groups=3, max_chars=2600)
     return out
 
 
+def _write_json_atomic(path: str, obj) -> None:
+    """json.dump to ``path`` through a temporary file in the same folder and os.replace.
+
+    A reader -- the resume after a kill, an out-of-memory kill or a full disk mid-write -- then
+    finds the previous file or the complete new one, never a truncated one: a truncated JSON
+    raises on every resume attempt, and a supervised run would crash-loop on it. A failed write
+    leaves no temporary file behind and raises.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class OPDRayTrainer(RayPPOTrainer):
     """Multitask on-policy distillation trainer with per-task teacher routing."""
 
@@ -763,12 +786,21 @@ class OPDRayTrainer(RayPPOTrainer):
         *next* step — so the checkpoint must record the pre-peek dataloader
         position; saving the live (post-peek) state would make a resumed run
         skip that batch entirely.
+
+        THE SIDECAR STATE GOES FIRST. The base save writes
+        latest_checkpointed_iteration.txt last, and a resume trusts that
+        tracker alone (find_latest_ckpt_path). Written after it, (a)'s EMA,
+        the retirement state and the value table could be missing from a step
+        the tracker already names -- a kill in between, and the resumed run
+        scores its first steps on an empty value table with only a warning to
+        show for it. Written before, a kill anywhere leaves the tracker on the
+        previous complete step. Each file is also written atomically
+        (_write_json_atomic), so none can be found half-written.
         """
+        self._save_progress_rank_state()
         pre_peek_state = getattr(self, "_pre_peek_dataloader_state", None)
         if pre_peek_state is None:
-            out = super()._save_checkpoint()
-            self._save_progress_rank_state()
-            return out
+            return super()._save_checkpoint()
         # Shadow the bound state_dict with the pre-peek snapshot for the
         # duration of the base save (which calls train_dataloader.state_dict()).
         self.train_dataloader.state_dict = lambda: pre_peek_state
@@ -776,7 +808,6 @@ class OPDRayTrainer(RayPPOTrainer):
             out = super()._save_checkpoint()
         finally:
             del self.train_dataloader.state_dict
-        self._save_progress_rank_state()
         return out
 
     # ---- (a)'s EMA travels with the checkpoint --------------------------- #
@@ -784,6 +815,7 @@ class OPDRayTrainer(RayPPOTrainer):
     # the objective hooks (tests/trainer/test_opd_grpo_arm.py): the checkpoint
     # belongs to the shared loop. A no-op unless a progress_rank controller
     # exists, which only the GRPO arm with algorithm.progress_rank.enable creates.
+    # progress_value_gae's value table travels the same way (PROGRESS_VALUE_STATE_FILE).
 
     RETIREMENT_STATE_FILE = "teacher_retirement_state.json"
 
@@ -816,20 +848,28 @@ class OPDRayTrainer(RayPPOTrainer):
         return ctl
 
     PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
+    # progress_value_gae's value table (verl/trainer/ppo/progress_value.py): the discounted counts
+    # every later step's baseline is read from. Same place and same reason as (a)'s EMA; a no-op
+    # unless the table exists, which only the GRPO arm with adv_estimator=progress_value_gae builds.
+    PROGRESS_VALUE_STATE_FILE = "progress_value_state.json"
 
     def _save_progress_rank_state(self):
         folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         ctl = getattr(self, "_progress_rank", None)
         if ctl is not None:
             os.makedirs(folder, exist_ok=True)
-            with open(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), "w") as f:
-                json.dump(ctl.state_dict(), f)
+            _write_json_atomic(os.path.join(folder, self.PROGRESS_RANK_STATE_FILE), ctl.state_dict())
         # Which teachers have retired, so a resume does not revive them.
         ret = getattr(self, "_retirement_ctl", None)
         if ret is not None:
             os.makedirs(folder, exist_ok=True)
-            with open(os.path.join(folder, self.RETIREMENT_STATE_FILE), "w") as f:
-                json.dump(ret.state_dict(), f)
+            _write_json_atomic(os.path.join(folder, self.RETIREMENT_STATE_FILE), ret.state_dict())
+        # The value table as the step left it: the subclass commits a step's batch right after
+        # scoring it, before the actor update this save follows, so the table here includes step N.
+        table = getattr(self, "_progress_value", None)
+        if table is not None:
+            os.makedirs(folder, exist_ok=True)
+            _write_json_atomic(os.path.join(folder, self.PROGRESS_VALUE_STATE_FILE), table.state_dict())
 
     def _load_checkpoint(self):
         out = super()._load_checkpoint()
@@ -852,6 +892,30 @@ class OPDRayTrainer(RayPPOTrainer):
                 self._retirement_pending_state = json.load(f)
             print(f"[teacher-retirement] state restored from {rpath}: "
                   f"{self._retirement_pending_state.get('retired')}")
+        # Without the table a resumed run scores its first steps on the empty-table fallback
+        # (the group's other rollouts), refilling at the retention rate -- loud, but not fatal.
+        vpath = os.path.join(folder, self.PROGRESS_VALUE_STATE_FILE)
+        if os.path.exists(vpath):
+            with open(vpath) as f:
+                self._progress_value_pending_state = json.load(f)
+            if self.config.algorithm.get("adv_estimator", None) == "progress_value_gae":
+                # A table saved under another configuration (features, buckets, n0, retention,
+                # gamma -- an edited lock resumed under the same RUN_TAG) is refused HERE, before
+                # the first rollout: the table itself is built lazily at the first step's
+                # advantage, a whole rollout later, and a supervisor would pay that on every
+                # restart. load_state_dict raises the ValueError naming the keys that differ.
+                from verl.trainer.ppo.progress_value import ProgressValueConfig, ProgressValueTable
+
+                alg = self.config.algorithm
+                ProgressValueTable(ProgressValueConfig.from_config(
+                    alg.get("progress_value", None), gamma=float(alg.gamma), lam=float(alg.lam),
+                )).load_state_dict(self._progress_value_pending_state)
+            print(f"[progress_value] table read from {vpath}: "
+                  f"{self._progress_value_pending_state.get('updates')} updates, "
+                  f"{len(self._progress_value_pending_state.get('cells', []))} cells", flush=True)
+        elif self.config.algorithm.get("adv_estimator", None) == "progress_value_gae":
+            print(f"[progress_value] WARNING: no {self.PROGRESS_VALUE_STATE_FILE} in {folder}; the value "
+                  "table restarts empty and the first steps are scored on the group fallback", flush=True)
         return out
 
     # ------------------------------------------------------------------ #

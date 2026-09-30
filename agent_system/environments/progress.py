@@ -38,6 +38,7 @@ dict to the rollout loop and from there to the trainer as columns.
 
 import hashlib
 import re
+from collections import Counter
 from typing import Iterable, Optional, Tuple
 
 PROGRESS_K_INFO = "progress_k"
@@ -105,6 +106,56 @@ ENV_SEED_INFO = "env_seed"
 GOAL_PRODUCT_PRICE_INFO = "goal_product_price"
 # ProGPO's D, as of the row's turn: distinct observations seen, the first included.
 COVERAGE_D_INFO = "coverage_d"
+# WebShop: the live session as the environment itself holds it, {'asin', 'options'}, shipped by
+# WebshopWorker.step/reset (see WebshopProgress, THE SESSION COUNT). Rides on the info dict only.
+WS_STATE_INFO = "ws_state"
+# WEBSHOP, TWO COUNTS (algorithm.progress_rank.webshop_k), both kept by WebshopProgress:
+#   legacy   the required option VALUES clicked on the goal product (the runs so far; over-counts a
+#            value replaced by another value of the same option)
+#   session  the required (name, value) pairs the session actually holds, read off the environment
+WEBSHOP_K_DEFINITIONS = ("legacy", "session")
+
+# --- The progress-value records (pv_*) ----------------------------------- #
+#
+# WHAT THEY ARE FOR. The progress_value_gae estimator (verl/trainer/ppo/progress_value.py) learns a
+# value V(z_t) of the state BEFORE each action and scores every turn by its TD residual. It needs,
+# per row, the state before and after the row's action, where the row stands in its trajectory and
+# how the trajectory ended -- none of which the progress_* columns carry (they hold the count AFTER
+# the action, and nothing says whether the last turn won, failed or ran out of turns). One value on
+# EVERY row, float NaN where the task has none, exactly as the progress_* columns.
+#
+#   pv_t            the row's 0-based turn in its trajectory (the rollout loop's, see _record_turn)
+#   pv_cap          the task's turn cap H: the manager's env.max_steps, which the multitask builder
+#                   sets to the task's own cap (alfworld 50, webshop 15, search 4)
+#   pv_k_before / pv_k_after   the historical count the value is keyed on: ALFWorld the alfworld_k
+#                   count, WebShop the SESSION count (below), Search the search_k count
+#   pv_K            that count's K
+#   pv_stag_before  turns since that count last went up, before the action (0 at t = 0 and right
+#                   after an increase)
+#   pv_hold_b/_a    ALFWorld: holding a target-type object, treated if the task treats
+#   pv_inside_b/_a  ALFWorld: most target objects inside one target receptacle NOW (can fall)
+#   pv_at_b/_a      ALFWorld: standing at a target receptacle (look_at: where a lamp of the type is)
+#   pv_ongoal_b/_a  WebShop: the session's product is the goal product
+#   pv_optnow_b/_a  WebShop: required options the session holds on it now
+#   pv_evid_b/_a    Search: a returned result has carried the answer
+#   pv_env_done     the environment's own done this turn, before the multitask cap overwrites it
+#   pv_won          info['won'] this turn
+#   pv_term         0 running; 1 won; 2 ended by the task's own terminal action and not won (WebShop's
+#                   buy, Search's answer); 3 ran out of turns (the multitask cap, the environment's
+#                   own step limit -- ALFWorld's TextWorld limit, Search's max_turns -- or the rollout
+#                   loop's last turn without any done)
+#
+# "Before" is the manager's own record of each env's last "after" (PvTracker), initialised from the
+# reset state, so turn t's before IS turn t-1's after by construction. The ALFWorld state is the
+# offline value check's (value_calib/replay_features.py feats()), read off AlfworldMilestones.
+PV_COLUMNS = ("pv_t", "pv_cap", "pv_k_before", "pv_k_after", "pv_K", "pv_stag_before",
+              "pv_hold_b", "pv_hold_a", "pv_inside_b", "pv_inside_a", "pv_at_b", "pv_at_a",
+              "pv_ongoal_b", "pv_ongoal_a", "pv_optnow_b", "pv_optnow_a", "pv_evid_b", "pv_evid_a",
+              "pv_env_done", "pv_won", "pv_term")
+PV_TERM_RUNNING, PV_TERM_WON, PV_TERM_FAILED, PV_TERM_TIMEOUT = 0, 1, 2, 3
+# The multitask manager's flag: the task cap, not the environment, ended the episode this turn.
+# On the info dict only; pv_term = 3 is what reaches the row.
+PV_CAP_FORCED_INFO = "pv_cap_forced"
 
 
 def alfworld_k_definition(config) -> str:
@@ -131,16 +182,115 @@ def search_k_definition(config) -> str:
     return name
 
 
-def progress_on(config) -> bool:
-    """``algorithm.progress_rank.enable``: the managers count, the loop records.
+def webshop_k_definition(config) -> str:
+    """``algorithm.progress_rank.webshop_k``: which WebShop count goes into progress_k."""
+    try:
+        cfg = (config.get("algorithm", {}) or {}).get("progress_rank", None) or {}
+        name = str(cfg.get("webshop_k", "legacy") or "legacy")
+    except AttributeError:
+        name = "legacy"
+    assert name in WEBSHOP_K_DEFINITIONS, (
+        f"algorithm.progress_rank.webshop_k={name!r}; expected one of {WEBSHOP_K_DEFINITIONS}")
+    return name
 
-    Off, nothing here runs and the batch has exactly control's columns.
+
+def progress_on(config) -> bool:
+    """``algorithm.progress_rank.enable`` OR ``algorithm.progress_value.enable``: the managers
+    count, the loop records.
+
+    Off, nothing here runs and the batch has exactly control's columns. Either arm needs the
+    counts, but only (a) ranks by them: the columns being present does NOT mean progress_rank is
+    on, so whatever acts on them gates on its own block's enable (the trainer's progress_rank hook
+    reads algorithm.progress_rank.enable itself).
     """
     try:
-        cfg = (config.get("algorithm", {}) or {}).get("progress_rank", None)
-        return bool(cfg is not None and cfg.get("enable", False))
+        algorithm = config.get("algorithm", {}) or {}
+        for block in ("progress_rank", "progress_value"):
+            cfg = algorithm.get(block, None)
+            if cfg is not None and cfg.get("enable", False):
+                return True
+        return False
     except AttributeError:
         return False
+
+
+def turn_cap(config) -> Optional[int]:
+    """``env.max_steps`` of a manager's config: the task's turn cap (pv_cap), None when unset.
+
+    The multitask builder hands each task manager a copy of the config with env.max_steps set to
+    that task's cap (env_manager._copy_config_for_task), and a single-task run's rollout loop stops
+    at env.max_steps, so in both cases it is the H the trajectory ran under.
+    """
+    try:
+        value = (config.get("env", {}) or {}).get("max_steps", None)
+        return None if value is None else int(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def pv_termination(done, won, committed) -> int:
+    """pv_term of one row as its environment saw it (the cap and the loop's end come later).
+
+    ``committed``: the environment ended the episode on the task's own terminal action -- WebShop
+    ends ONLY on a buy it executed, Search on an <answer> it took, ALFWorld never (its only ending
+    besides a win is TextWorld's step limit). A done without it is the environment's own turn limit.
+    """
+    if not done:
+        return PV_TERM_RUNNING
+    if won:
+        return PV_TERM_WON
+    return PV_TERM_FAILED if committed else PV_TERM_TIMEOUT
+
+
+class PvTracker:
+    """One manager's pv_* bookkeeping: each env's state before its next action, and its stagnation.
+
+    A state is a dict with the count under "k" and the task's current-state features under their
+    column stems (ALFWorld hold/inside/at, WebShop ongoal/optnow, Search evid). The tracker starts
+    from the reset states, so turn 0's "before" is the reset and every later "before" is the
+    previous turn's "after" -- the one rule the value's TD residual relies on.
+    """
+
+    def __init__(self, states, cap):
+        self._before = [dict(s) for s in states]
+        self._stag = [0] * len(self._before)
+        self.cap = cap
+
+    def step(self, infos, states, totals, dones, terms) -> None:
+        """Write this turn's pv_* keys into each info dict, in place, and move every env on."""
+        for i, info in enumerate(infos):
+            if not isinstance(info, dict) or i >= len(self._before) or i >= len(states):
+                continue
+            before, after = self._before[i], states[i]
+            info["pv_cap"] = float("nan") if self.cap is None else int(self.cap)
+            info["pv_K"] = int(totals[i])
+            info["pv_k_before"], info["pv_k_after"] = int(before["k"]), int(after["k"])
+            info["pv_stag_before"] = int(self._stag[i])
+            for stem, value in after.items():
+                if stem != "k":
+                    info[f"pv_{stem}_b"], info[f"pv_{stem}_a"] = int(before[stem]), int(value)
+            info["pv_env_done"] = int(bool(dones[i]))
+            info["pv_won"] = int(bool(info.get("won", False)))
+            info["pv_term"] = int(terms[i])
+            self._stag[i] = 0 if after["k"] > before["k"] else self._stag[i] + 1
+            self._before[i] = dict(after)
+
+
+def pv_note_cap(infos, env_dones, at_cap: bool) -> None:
+    """The multitask cap, recorded BEFORE it overwrites the environments' dones.
+
+    The task manager has already written the environment's own done (pv_env_done) and its verdict
+    (pv_term). A row the cap ends while its environment is still running ran out of turns: pv_term
+    3, and pv_cap_forced says the cap did it. A row whose environment ended on the cap turn keeps
+    the environment's own verdict -- a buy or an answer on the last turn is not a timeout.
+    """
+    for info, done in zip(infos, env_dones):
+        if not isinstance(info, dict):
+            continue
+        forced = bool(at_cap and not done)
+        info[PV_CAP_FORCED_INFO] = forced
+        if forced and info.get("pv_term", None) == PV_TERM_RUNNING:
+            info["pv_term"] = PV_TERM_TIMEOUT
 
 
 # ALFWorld's failure line (alfworld/agents/controller/base.py and oracle.py).
@@ -529,6 +679,24 @@ class AlfworldMilestones:
             return self.total_arrive
         return self.k + int(self.arrived)
 
+    def current_state(self) -> dict:
+        """Where the rollout stands NOW, for the pv_* columns (not historical: each can fall).
+
+        Exactly the offline value check's definitions (value_calib/replay_features.py feats()), so
+        a table fitted there reads these the same way:
+          hold    holding an object of the target type, treated if the task treats
+          inside  the most target objects inside one target receptacle instance at this moment
+          at      standing at a target receptacle; with no receptacle target (look_at, where
+                  parent_target is empty in every game), a lamp of the target type is here
+        All 0 for a game without milestones (K = 0), whose state is never tracked.
+        """
+        held = self._holding
+        hold = int(held is not None and held[0] == self.object
+                   and (not self.treatment or held[1] in self.treated))
+        inside = max((len(v) for v in self._inside.values()), default=0)
+        at = int(self.receptacle in self._here) if self.receptacle else int(self._lamp_here)
+        return {"hold": hold, "inside": inside, "at": at}
+
 
 # --- WebShop ------------------------------------------------------------- #
 
@@ -541,6 +709,13 @@ _WS_PREV = "< prev"
 
 
 def _ws_parse(action) -> Tuple[Optional[str], Optional[str]]:
+    # NOT QUITE THE ENVIRONMENT'S PARSE. This strips the action and its name; engine.parse_action
+    # does neither, and WebAgentTextEnv.step needs the name to be exactly 'click' / 'search'. So
+    # "click [buy now]" (a space before the bracket) moves this parse -- opened, an option, even
+    # bought -- while the environment does nothing, and "search [x]" clears the product here but
+    # not there. Kept as it is: the legacy count must stay what the runs so far recorded. The
+    # session count (WebshopProgress, THE SESSION COUNT) never reads the parse, only the session
+    # and the environment's own done, so it is immune.
     m = _WS_ACTION.match(str(action or "").strip())
     if m is None:
         return None, None
@@ -563,6 +738,30 @@ def webshop_goal_steps(goal) -> Tuple[str, list]:
     return asin, values
 
 
+def webshop_goal_pairs(goal) -> Optional[dict]:
+    """The goal's required options as ``{name: value}``, or None for a list-form goal.
+
+    Synthetic goals (human_goals=False, the runs' setting) carry goal_options as a mapping from the
+    product's option NAME to the value (engine/goal.py); human goals carry a bare list of values.
+    Lower-cased and stripped like webshop_goal_steps, and filtered the same way, so the pairs are
+    exactly the values K counts.
+    """
+    options = (goal or {}).get("goal_options") or {}
+    if not isinstance(options, dict):
+        return None
+    return {str(n).strip().lower(): str(v).strip().lower() for n, v in options.items() if str(v).strip()}
+
+
+def _ws_session(state) -> Optional[Tuple[Optional[str], dict]]:
+    """``(asin, {option name: value})`` of a shipped session snapshot, lower-cased; None if none."""
+    if not isinstance(state, dict):
+        return None
+    asin = state.get("asin")
+    options = state.get("options") or {}
+    return ((str(asin).strip().lower() or None) if asin else None,
+            {str(n).strip().lower(): str(v).strip().lower() for n, v in dict(options).items()})
+
+
 class WebshopProgress:
     """One episode's walk along the goal record, from actions and page states.
 
@@ -571,67 +770,141 @@ class WebshopProgress:
     K = 3 + number of required options -- the length of the document's own path
     (oci_layout.webshop_document_lines), so the two agree on what "all of it" is.
 
-    WHAT IS APPROXIMATE. Options are counted as the required VALUES clicked on the
-    goal product since it was opened; the session keeps one value per option
-    NAME, which this cannot see, so selecting a required value and then another
-    value of the same option still counts the first. Rare, and only ever an
-    over-count of one within a group whose ranking it shifts by one step.
+    WHAT IS APPROXIMATE (``k``, the legacy count). Options are counted as the required
+    VALUES clicked on the goal product since it was opened; the session keeps one value
+    per option NAME, which this cannot see, so selecting a required value and then another
+    value of the same option still counts the first: black -> white -> large on a goal of
+    {color: black, size: large} counts 2 while the session holds 1. The runs so far ranked
+    by this, so it stays exactly as it was.
+
+    THE SESSION COUNT (``k_session``, webshop_k = session). When the worker ships the
+    session itself (WebshopWorker.step's info['ws_state']: the product asin and the one
+    value per option name the purchase will read), the same four steps are read off it:
+      opened   the session's product was the goal product at some point
+      options  the most required (name, value) pairs the session held at once on the goal
+               product -- for a list-form goal, the required values matched against the
+               session's values as multisets, which still allows one value per name
+      bought   the environment ended the episode (its own done: only an executed buy ends
+               WebShop) with the goal product in the session
+    ``found`` is the same in both: a results page listing the goal product. Neither the
+    action text nor the parse is read, so what the environment ignored cannot count.
+    Without a snapshot (a worker that ships none) ``k_session`` falls back to ``k``.
+
+    ``on_goal`` and ``opts_now`` are the session's state NOW (after the last step): read
+    off the snapshot when there is one, else the legacy reconstruction from the clicks.
     """
 
-    def __init__(self, goal, avail=None):
+    def __init__(self, goal, avail=None, state=None):
         self.asin, self.options = webshop_goal_steps(goal)
+        self._pairs = webshop_goal_pairs(goal)
         self.total = (3 + len(self.options)) if self.asin else 0
         self.found = False
         self.opened = False
-        self.on_goal = False
+        self._legacy_on_goal = False
         self.selected = set()
         self.best_options = 0
         self.bought = False
+        # The session count's own state; _session stays None until a snapshot arrives.
+        self._session = None
+        self.session_opened = False
+        self.session_best_options = 0
+        self.session_bought = False
         self._avail = avail
         self._see(avail)
+        if state is not None:
+            self._note_session(state, done=False)
 
     def _see(self, avail) -> None:
         # On a results page the product links ARE clickables, in lowercase.
         if self.asin and self.asin in _ws_clickables(avail):
             self.found = True
 
-    def step(self, action, avail_after) -> None:
-        """Fold in one turn: the action taken, and the page it led to."""
+    def step(self, action, avail_after, state=None, done=None) -> None:
+        """Fold in one turn: the action taken, and the page it led to.
+
+        ``state`` and ``done``, when given: the session snapshot the worker shipped for this
+        turn (the session BEFORE the action on the turn the environment ended -- a purchase
+        reads the product and options without changing them, and the environment then resets
+        itself -- else after it) and the environment's own done. They move the session count
+        only; the legacy count below never sees them.
+        """
         before = _ws_clickables(self._avail)
         name, arg = _ws_parse(action)
         if name == "search" and arg:
             # The environment runs a search whatever page it is on, and a search
             # clears the session's product and options.
-            self.on_goal = False
+            self._legacy_on_goal = False
             self.selected = set()
         elif name == "click" and arg is not None and arg in before and arg != "search":
             if arg == self.asin:
-                self.on_goal = True
+                self._legacy_on_goal = True
                 self.opened = True
                 self.selected = set()
             elif arg == _WS_BACK:
-                self.on_goal = False
+                self._legacy_on_goal = False
                 self.selected = set()
             elif arg == _WS_PREV and _WS_BUY in before:
                 # "< Prev" from the ITEM page goes back to the results; from a
                 # description / features / reviews sub page (no buy button) it
                 # returns to the item page, which keeps the product.
-                self.on_goal = False
+                self._legacy_on_goal = False
                 self.selected = set()
             elif arg == _WS_BUY:
-                if self.on_goal:
+                if self._legacy_on_goal:
                     self.bought = True
-            elif self.on_goal and arg in self.options:
+            elif self._legacy_on_goal and arg in self.options:
                 self.selected.add(arg)
                 self.best_options = max(self.best_options, len(self.selected))
         self._avail = avail_after
         self._see(avail_after)
+        if state is not None:
+            self._note_session(state, done=bool(done))
+
+    def _note_session(self, state, done: bool) -> None:
+        snap = _ws_session(state)
+        if snap is None:
+            return
+        self._session = snap
+        if self.on_goal:
+            self.session_opened = True
+            if done:
+                self.session_bought = True
+        self.session_best_options = max(self.session_best_options, self.opts_now)
+
+    @property
+    def on_goal(self) -> bool:
+        """The session's product is the goal product now."""
+        if self._session is not None:
+            return bool(self.asin) and self._session[0] == self.asin
+        return self._legacy_on_goal
+
+    @property
+    def opts_now(self) -> int:
+        """Required options the session holds on the goal product now (0 off it)."""
+        if self._session is None:
+            return len(self.selected)
+        if not self.on_goal:
+            return 0
+        held = self._session[1]
+        if self._pairs is not None:
+            return sum(1 for n, v in self._pairs.items() if held.get(n) == v)
+        # A list-form goal names no option: match its values against the session's, one each.
+        return sum((Counter(self.options) & Counter(held.values())).values())
 
     @property
     def k(self) -> int:
         if not self.total:
             return 0
         return int(self.found) + int(self.opened) + self.best_options + int(self.bought)
+
+    @property
+    def k_session(self) -> int:
+        if not self.total:
+            return 0
+        if self._session is None:
+            return self.k
+        return (int(self.found) + int(self.session_opened) + self.session_best_options
+                + int(self.session_bought))
 
 
 # --- Search -------------------------------------------------------------- #

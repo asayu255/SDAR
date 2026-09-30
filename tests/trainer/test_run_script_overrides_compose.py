@@ -83,6 +83,10 @@ COMPOSED_SCRIPTS = [
     # Its v2 (the next-run recipe of 2026-09-27: no firing minimum, no sat spread minimum, search_k
     # evidence_answered), with its own lock.
     "examples/opd_grpo_trainer/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh",
+    # progress_value_gae: a wrapper of the v2 launcher with the advantage replaced by the value
+    # table's (progress_rank off), one lock per LAM picked by its value. Composed here at the
+    # default LAM=1.0; tests/trainer/test_progress_value_integration.py composes LAM=0.9 too.
+    "examples/opd_grpo_trainer/run_multitask_progress_value_gae_qwen3.sh",
 ]
 
 # Scripts that must COMPOSE but whose intent lock does not apply: a measurement
