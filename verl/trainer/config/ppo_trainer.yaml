@@ -939,15 +939,18 @@ algorithm:
     #           treats), most targets in one target receptacle, standing at a target receptacle
     #   ongoal, optnow     WebShop's session now: the goal product open, required options held
     #   buynow  WebShop: the score 'buy now' would get now (the env's own purchase score of the open
-    #           product with the session's options), keyed in quarters. It reads the hidden goal, as
-    #           k does -- the value's input, never the policy's.
+    #           product with the session's options), keyed in quarters. OFF by default: it queries
+    #           the reward function mid-episode, an access to the evaluator the comparison arms do
+    #           not have; kept for the added experiment that separates that access from the value.
     #   evid    Search: a returned result has carried the answer
-    # The defaults are the offline check's best tables (val replays, fit <= step 150, scored after;
-    # ALFWorld log loss / AUC 0.474 / 0.864, WebShop 0.440 / 0.843); the current-state features
-    # (hold, inside, at, ongoal, optnow) added nothing there. A task not listed keeps its default.
+    # The defaults are the offline check's tables (val replays, fit <= step 150, scored after;
+    # ALFWorld log loss / AUC 0.474 / 0.864, WebShop 0.487 / 0.805; 0.440 / 0.843 with buynow);
+    # the current-state features (hold, inside, at, ongoal, optnow) added nothing there. That check
+    # ran on the validation split, which is therefore a development set. A task not listed keeps
+    # its default.
     features:
       alfworld: [type, k, stag, rem]
-      webshop: [k, stag, rem, buynow]
+      webshop: [k, stag, rem]
       search: [k, rem]
     # rem bucket i is the first i with H - t > rem_buckets[i] * H: > 0.8H, > 0.6H, > 0.4H, > 0.2H,
     # > 0.1H, the rest. stag bucket = the number of edges <= stag: 0 | 1-2 | 3-5 | 6-9 | 10-19 | 20+.

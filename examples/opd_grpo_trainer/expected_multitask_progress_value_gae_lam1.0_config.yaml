@@ -2,8 +2,8 @@
 # run_multitask_progress_value_gae_qwen3.sh (the default LAM): the beta-mirror v2 arm below with its
 # advantage REPLACED by the value table's (verl/trainer/ppo/progress_value.py):
 #   - adv_estimator progress_value_gae: V(z_t) from a table over the state before action t
-#     (ALFWorld: task type, k, turns since k rose, turns left; WebShop: k, stag, rem, the score
-#     'buy now' would get now; Search: k, rem), shrunk cell -> (task, type, rem) -> task at n0 8, discounted counts at retention 0.9,
+#     (ALFWorld: task type, k, turns since k rose, turns left; WebShop: k, stag, rem -- the buy-now
+#     score is off, it queries the evaluator; Search: k, rem), shrunk cell -> (task, type, rem) -> task at n0 8, discounted counts at retention 0.9,
 #     frozen within a step; delta_t = gamma V(z_{t+1}) - V(z_t) with V(z_T) = R (won), GAE over
 #     the deltas, x adv_scale 2.0, plus the format term (the z-score of "invalid" over a group's
 #     turn rows, in groups whose rollouts all have the same R) at weight 1.0.
@@ -382,7 +382,7 @@
 "algorithm.progress_value.adv_scale": 2.0
 "algorithm.progress_value.n0": 8.0
 "algorithm.progress_value.retention": 0.9
-"algorithm.progress_value.features": {alfworld: [type, k, stag, rem], webshop: [k, stag, rem, buynow], search: [k, rem]}
+"algorithm.progress_value.features": {alfworld: [type, k, stag, rem], webshop: [k, stag, rem], search: [k, rem]}
 "algorithm.progress_value.rem_buckets": [0.8, 0.6, 0.4, 0.2, 0.1]
 "algorithm.progress_value.stag_buckets": [1, 3, 6, 10, 20]
 "algorithm.progress_value.format_scope": tied

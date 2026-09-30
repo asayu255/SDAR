@@ -4,8 +4,9 @@
 #
 #   J_H = E[gamma^T R]      win within the task's turn cap (R = 1 iff episode_rewards > 0)
 #   V(z_t)                  a table over the state BEFORE action t (ALFWorld: task type, progress
-#                           k, turns since k rose, turns left; WebShop: k, stag, rem, the score a
-#                           purchase would get now; Search: k, rem), shrunk cell -> (task, type, rem) -> task, discounted counts,
+#                           k, turns since k rose, turns left; WebShop: k, stag, rem -- the
+#                           buy-now score is off: it queries the evaluator; Search: k, rem),
+#                           shrunk cell -> (task, type, rem) -> task, discounted counts,
 #                           frozen within a step and saved beside the checkpoint
 #   delta_t = gamma V(z_{t+1}) - V(z_t), V(z_T) = R;   A_t = sum_l (gamma lam)^l delta_{t+l}
 #   advantage = 2.0 * A_t + the format term (the z-score of "invalid" over the group's turn rows,
@@ -88,7 +89,7 @@ exec bash "$_HERE/run_multitask_progress_rank_beta_mirror_v2_qwen3.sh" \
   algorithm.progress_value.n0=8.0 \
   algorithm.progress_value.retention=0.9 \
   "algorithm.progress_value.features.alfworld=[type,k,stag,rem]" \
-  "algorithm.progress_value.features.webshop=[k,stag,rem,buynow]" \
+  "algorithm.progress_value.features.webshop=[k,stag,rem]" \
   "algorithm.progress_value.features.search=[k,rem]" \
   "algorithm.progress_value.rem_buckets=[0.8,0.6,0.4,0.2,0.1]" \
   "algorithm.progress_value.stag_buckets=[1,3,6,10,20]" \

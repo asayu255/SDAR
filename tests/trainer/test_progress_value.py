@@ -969,10 +969,10 @@ def test_current_state_features_are_read_from_their_columns():
 
 
 def test_buynow_is_keyed_in_quarters():
-    """WebShop's default state includes the buy-now score, binned to 0..4 (the offline check's "bn");
-    a missing score is a cell of its own."""
-    assert pv.DEFAULT_FEATURES["webshop"] == ("k", "stag", "rem", "buynow")
-    cfg = config()
+    """The buy-now score is OFF by default (it queries the evaluator mid-episode); asked for, it is
+    binned to 0..4 (the offline check's "bn") and a missing score is a cell of its own."""
+    assert pv.DEFAULT_FEATURES["webshop"] == ("k", "stag", "rem")
+    cfg = config(features={**pv.DEFAULT_FEATURES, "webshop": ("k", "stag", "rem", "buynow")})
     cols = batch([trajectory("w", "c", 5, 0.0, "webshop", k=[0, 1, 2, 2, 2], stag=[0, 0, 0, 1, 2],
                              buynow=[0.0, 0.1, 0.4, 0.88, float("nan")])])
     recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg)).records
@@ -995,7 +995,9 @@ def test_the_feature_schema_is_pinned():
         # buy-now 0.3 -> quarter 1, a missing score -> None
         trajectory("w", "w1", 3, 0.0, "webshop", k=[0, 1, 2], stag=[0, 0, 0], buynow=[0.0, 0.3, nan]),
     ])
-    recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(config())).records
+    # buynow asked for explicitly (it is off by default) so that its quarters stay pinned
+    cfg = config(features={**pv.DEFAULT_FEATURES, "webshop": ("k", "stag", "rem", "buynow")})
+    recs = pv.compute_progress_value_advantage(cols, pv.ProgressValueTable(cfg)).records
     ps = "pick_and_place_simple"
     assert [(cell, parent) for cell, parent, _ in recs] == [
         (("alfworld", ps, 0, 0, 0), ("alfworld", ps, 0)),
