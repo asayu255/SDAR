@@ -520,6 +520,11 @@ algorithm:
     # task is oci_layout.DOC_SENTENCES. none leaves every block byte-identical.
     doc_sentence: none
     doc_sentence_b: none
+    # alfworld only, for the one-sentence probe: a second document row showing the SAME
+    # document with doc_sentence_b (the paired control), and the switch that drops the
+    # foreign slot. Defaults keep the ten-slot layout as it was.
+    doc_b: false
+    foreign_slot: true
     # SDAR's Search skill files for search_doc=sdar_skills ("" = the repo's skills/search).
     search_skills_dir: ""
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
