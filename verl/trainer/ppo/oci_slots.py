@@ -125,12 +125,14 @@ def check_config(config) -> None:
         "document has to be built and replay-verified first.")
     _search_doc = str(cfg.get("search_doc", "answer_only") or "answer_only")
     assert not (tasks == ["search"]
-                and _search_doc not in ("answer_rule", "progress_only", "expert_flow", "route_hint")), (
+                and _search_doc not in ("answer_rule", "progress_only", "expert_flow", "route_hint",
+                                    "route_line")), (
         f"algorithm.oci_slots.tasks=[search] with search_doc={_search_doc}: Search's reward "
         "reads only the final <answer> string and never checks that a search happened, so "
         "that document rescues a group by being copied. Use answer_rule (the answer under "
         "the rule that a returned result must carry it first), progress_only (no answer, "
-        "only the verdict) or route_hint (a verified route, no answer).")
+        "only the verdict), route_hint (a verified route, no answer) or route_line (its "
+        "pointer line alone).")
     _search_doc_b = str(cfg.get("search_doc_b", "none") or "none")
     assert _search_doc_b == "none" or tasks == ["search"], (
         f"algorithm.oci_slots.search_doc_b={_search_doc_b} with tasks={tasks}: the second "

@@ -565,9 +565,14 @@ def search_lead(template: str, target) -> str:
     answers = answer_strings(target)
     return template.replace("{answer}", answers[0] if answers else "")
 
-SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow", "route_hint")
+SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow", "route_hint",
+                    "route_line")
 # The modes whose document is a route with a pointer that moves as its queries are run.
-ROUTE_DOC_MODES = ("expert_flow", "route_hint")
+# route_line is route_hint with the block left out: only the pointer line goes into the
+# prompt. Measured 2026-10-01 at step 150: with the block in front of the prompt the
+# student stopped opening with <search> (0 of 84 document rows vs ~99% of plain rows) and
+# 35% answered without searching; route_line asks whether the block or the route did that.
+ROUTE_DOC_MODES = ("expert_flow", "route_hint", "route_line")
 
 
 def search_doc_mode(config, slot: str = "a") -> str:

@@ -184,6 +184,23 @@ try:
           "the probe record carries the variant, the position, the win, and a kept rule")
     os.environ.pop("SEARCH_PROBE_DUMP", None)
 
+    print("6. route_line: the pointer line alone")
+    m3 = manager(10, evidence_for={9}, search_doc="route_line")
+    t5 = m3.reset(KW * 10)[0]["text"]
+    check(ol.PLAN_HEADER not in t5[9] and "THIS IS A SEARCH ROUTE" not in t5[9]
+          and "Your next action is search 1 of 2: <search> closest airport Lewisburg West Virginia" in t5[9]
+          and t5[9].index("[Privileged Solution Path progress]") > t5[9].index("Your question:"),
+          "no block in front of the prompt; the pointer line sits inside it, after the question")
+    check(m3.document_block(9, slot="a") != "" and ANSWER not in t5[9],
+          "the row still counts as documented, and nothing names the answer")
+    acts3 = ["<think> go </think><search> white sulphur springs airport </search>"] * 10
+    acts3[9] = "<search> closest airport Lewisburg West Virginia </search>"
+    t6 = m3.step(acts3)[0]["text"]
+    acts3[9] = "<search> Greenbrier County airport </search>"
+    t7 = m3.step(acts3)[0]["text"]
+    check("Your next action is search 2 of 2" in t6[9] and "Doc 2 returned by your search 2 contains the answer"
+          in t7[9], "the pointer moves and names the place exactly as route_hint's does")
+
     m2 = manager(10, evidence_for={8, 9}, search_doc="answer_rule", search_doc_b="expert_flow")
     t3 = m2.reset(KW * 10)[0]["text"]
     acts2 = ["<think> go </think><search> closest airport Lewisburg West Virginia </search>"] * 10

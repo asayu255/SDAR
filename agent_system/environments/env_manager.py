@@ -912,8 +912,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _search_flow_document_lines(p.get("question"), p.get("ground_truth"),
                                             _slots_search_flow_path(getattr(self, "config", None))),
                 lead=_search_lead(SEARCH_FLOW_LEAD, p.get("ground_truth")))
-        if mode == "route_hint":
+        if mode in ("route_hint", "route_line"):
             # The verified route and no answer; '' for a question with no verified route.
+            # route_line builds the same block for its pointer and leaves it out of the prompt.
             return render_document(
                 _search_route_hint_document_lines(p.get("question"), p.get("ground_truth"),
                                                   _slots_search_flow_path(getattr(self, "config", None))),
@@ -1257,12 +1258,13 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _slot = "a" if _role == ROLE_DOC else "b"
                 _blk = self.document_block(i, slot=_slot)
                 if _blk:
-                    obs_i = _blk + obs_i
                     _mode = _slots_search_doc(self.config, slot=_slot)
+                    if _mode != "route_line":
+                        obs_i = _blk + obs_i
                     if _mode in _ROUTE_DOC_MODES:
                         _ptrs = getattr(self, "_route_ptr", None) or [0] * len(text_obs)
                         _where = None
-                        if _mode == "route_hint":
+                        if _mode in ("route_hint", "route_line"):
                             _wl = getattr(self, "_evidence_where", None) or []
                             _where = _wl[i] if i < len(_wl) else None
                         obs_i = _insert_search_guide(
