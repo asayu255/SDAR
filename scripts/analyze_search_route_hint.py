@@ -79,6 +79,10 @@ def row_stats(r, route_q):
             "answer_early": bool(r.get("answer_early")), "evidence_seen": bool(r.get("evidence_seen")),
             "query_names_answer": leak_q, "won_kept_rule": won(r) and not bool(r.get("answer_early")),
             "copied_route_share": (copied / len(qs)) if qs else None,
+            # The plain student opens with <search> almost always; a prompt that changes that
+            # has changed the row's behaviour, whatever it then scores.
+            "opens_with_search": str(((r.get("turns") or [{}])[0] or {}).get("action") or "").lstrip()
+                                 .startswith("<search>"),
             "turns": int(r.get("n_turns") or len(r.get("turns") or []))}
 
 
@@ -88,7 +92,7 @@ def summarise(stats):
         return {"rows": 0}
     out = {"rows": n}
     for key in ("won", "won_kept_rule", "answered", "answered_no_search", "answer_early",
-                "evidence_seen", "query_names_answer"):
+                "evidence_seen", "query_names_answer", "opens_with_search"):
         k = sum(1 for s in stats if s[key])
         out[key] = round(k / n, 3)
         if key in ("won", "won_kept_rule"):
