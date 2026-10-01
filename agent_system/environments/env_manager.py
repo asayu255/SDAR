@@ -892,8 +892,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
     def document_block(self, i: int, slot: str = "a") -> str:
         """The block for question ``i`` with this slot's sentence (doc_sentence[_b]), if any."""
-        return _with_doc_sentence(self._document_block_raw(i, slot),
-                                  _doc_sentence_text("search", getattr(self, "config", None), slot))
+        _cfg = getattr(self, "config", None)
+        return _with_doc_sentence(_with_doc_lead(self._document_block_raw(i, slot), _cfg, slot),
+                                  _doc_sentence_text("search", _cfg, slot))
 
     def _document_block_raw(self, i: int, slot: str = "a") -> str:
         """The block that answers question ``i``, or '' when it cannot be built.
@@ -2079,7 +2080,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         """
         goals = getattr(self, "goals", None) or []
         goal = goals[i] if i < len(goals) else None
-        return render_document(_webshop_document_lines(goal))
+        # doc_lead=short swaps the lead (default strict: byte-identical to before).
+        return _with_doc_lead(render_document(_webshop_document_lines(goal)), getattr(self, "config", None))
     
     def format_obs(self, text_obs):
         postprocess_text_obs = []

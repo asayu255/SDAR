@@ -407,11 +407,17 @@ def doc_lead_key(config, slot: str = "a") -> str:
 
 
 def with_doc_lead(block: str, config, slot: str = "a") -> str:
-    """The block with this row's lead: PLAN_LEAD swapped for the chosen one, nothing else touched."""
+    """The block with this row's lead: the strict lead swapped for its short form, nothing else
+    touched. Works for every task's block: alfworld and webshop share PLAN_LEAD, search's route
+    document has its own (SEARCH_ROUTE_HINT_LEAD; its short form is defined beside it)."""
     key = doc_lead_key(config, slot)
-    if not block or key == "strict" or PLAN_LEAD not in block:
+    if not block or key == "strict":
         return block
-    return block.replace(PLAN_LEAD, DOC_LEADS[key], 1)
+    for strict, short in ((PLAN_LEAD, DOC_LEADS[key]),
+                          (globals().get("SEARCH_ROUTE_HINT_LEAD"), globals().get("SEARCH_ROUTE_HINT_LEAD_SHORT"))):
+        if strict and short and strict in block:
+            return block.replace(strict, short, 1)
+    return block
 
 
 def render_document(lines, lead: str = PLAN_LEAD) -> str:
@@ -584,6 +590,14 @@ SEARCH_ROUTE_HINT_LEAD = (
     "queries below in order -- they name what has to be looked up -- and read what comes\n"
     "back. The answer itself is not given here: write it only from what a result returned\n"
     "inside <information> </information> says.\n"
+    "\n"
+    "The searches that lead to it:"
+)
+# Its short form (doc_lead=short; the user, 2026-10-01: the same shortening as alfworld's -- the
+# same message, no capitals, fewer words).
+SEARCH_ROUTE_HINT_LEAD_SHORT = (
+    "This is a verified search route for this question. Follow it: run its queries in\n"
+    "order, and answer only from what a returned result says.\n"
     "\n"
     "The searches that lead to it:"
 )

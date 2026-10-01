@@ -252,6 +252,12 @@ try:
     check(set(ol.DOC_SENTENCES) == {"alfworld", "webshop", "search"}
           and all(ANSWER not in v for d in ol.DOC_SENTENCES.values() for v in d.values()),
           "one explore and one efficiency sentence per task")
+    cfg9 = OmegaConf.create({"algorithm": {"oci_slots": {"doc_lead": "short", "doc_lead_b": "strict"}}})
+    short_a = ol.with_doc_lead(blk_b, cfg9, "a")
+    check(ol.SEARCH_ROUTE_HINT_LEAD_SHORT in short_a and ol.SEARCH_ROUTE_HINT_LEAD not in short_a
+          and ol.with_doc_lead(blk_b, cfg9, "b") == blk_b
+          and _re.findall(r"^\d+\. (.+)$", short_a, flags=_re.M) == _re.findall(r"^\d+\. (.+)$", blk_b, flags=_re.M),
+          "search: doc_lead=short swaps the route lead and nothing else; strict leaves the block as it was")
     check(all(set(d) == {"explore", "efficiency", "progress"} for d in ol.DOC_SENTENCES.values())
           and all("you have not" in d["progress"] for d in ol.DOC_SENTENCES.values()),
           "and the revised stuck-group sentence (progress) for every task")
