@@ -262,6 +262,65 @@ try:
           and all("you have not" in d["progress"] for d in ol.DOC_SENTENCES.values()),
           "and the revised stuck-group sentence (progress) for every task")
 
+    print("9. yes/no routes verified by titles")
+    YN_Q = "Are Hole and The Wolfhounds both rock bands?"
+    YN_FILE = os.path.join(tempfile.gettempdir(), f"route_hints_yn_{os.getpid()}.json")
+    json.dump({"flows": {"0": {"question": YN_Q, "answers": ["yes"], "hit": True, "kind": "yesno_titles",
+                               "queries": ["Hole (band)", "The Wolfhounds"],
+                               "expected_titles": ["Hole (band)", "The Wolfhounds"]}}}, open(YN_FILE, "w"))
+    try:
+        ol._SEARCH_FLOWS.clear(); ol._SEARCH_FLOW_TITLES.clear()
+        check(ol.search_route_hint_document_lines(YN_Q, {"target": ["yes"]}, YN_FILE)
+              == ["<search> Hole (band) </search>", "<search> The Wolfhounds </search>"],
+              "a yes/no question gets its route when the record carries the titles it is verified by")
+        check(ol.search_route_hint_document_lines("is it?", {"target": ["no"]}, YN_FILE) == [],
+              "and none without one")
+        RAW = ('<information>{"result": "Doc 1: \\"Hole (band)\\"\\nHole was an American rock band.\\n'
+               'Doc 2: Courtney\\nCourtney Love fronted Hole."}</information>')
+        check(ol.result_titles(RAW) == [(1, "hole band"), (2, "courtney")],
+              "titles are read off the escaped block, quoted or not")
+
+        class _YNEnvs:
+            is_train = True
+
+            def __init__(self):
+                self.n = self.group_n = 10
+
+            def reset(self, kwargs=None):
+                return [YN_Q] * 10, [{} for _ in range(10)]
+
+            def step(self, actions):
+                obs, infos = [], []
+                for a in actions:
+                    q = a.split("<search>")[1].split("</search>")[0].strip() if "<search>" in a else ""
+                    page = {"Hole (band)": "Hole (band)", "The Wolfhounds": "The Wolfhounds"}.get(q, "Seattle")
+                    obs.append('<information>{"result": "Doc 1: \\"Grunge\\"\\nGrunge.\\nDoc 2: \\"'
+                               + page + '\\"\\nA band from somewhere."}</information>')
+                    infos.append({"won": 0.0, "tool_calling": bool(q), "tool_input": [q] if q else [None]})
+                return obs, [0.0] * 10, [False] * 10, infos
+
+        cfgyn = OmegaConf.create({"env": {"history_length": 4, "rollout": {"n": 10}},
+                                  "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"],
+                                                              "search_doc": "route_hint", "search_doc_b": "none",
+                                                              "search_flow_path": YN_FILE, "doc_mode": "walkthrough_stepwise",
+                                                              "foreign_task": "webshop"}, "oci_rank": {"enable": False}}})
+        myn = SearchEnvironmentManager(_YNEnvs(), lambda acts: (list(acts), [1] * len(acts)), cfgyn)
+        tyn = myn.reset([{"question": YN_Q, "ground_truth": {"target": ["yes"]}}] * 10)[0]["text"]
+        check("Your next action is search 1 of 2: <search> Hole (band) </search>" in tyn[9],
+              "the yes/no row starts at the first title query")
+        t1 = myn.step(["<search> Hole (band) </search>"] * 10)[0]["text"]
+        check("Your next action is search 2 of 2: <search> The Wolfhounds </search>" in t1[9]
+              and "pages you need" not in t1[9], "one page back: the pointer names the second query")
+        t2 = myn.step(["<search> The Wolfhounds </search>"] * 10)[0]["text"]
+        line = [l for l in t2[9].splitlines() if "Privileged Solution Path progress" in l][0]
+        check("The pages you need are in your results: Doc 2 of your search 1 and Doc 2 of your search 2" in line
+              and " yes" not in line.lower().replace("your", ""),
+              "both pages back: the line says where each one is, never the verdict")
+        check("pages you need" not in t2[0], "a plain row sees nothing")
+    finally:
+        os.remove(YN_FILE)
+        ol._SEARCH_FLOWS.clear(); ol._SEARCH_FLOW_TITLES.clear()
+
     m2 = manager(10, evidence_for={8, 9}, search_doc="answer_rule", search_doc_b="expert_flow")
     t3 = m2.reset(KW * 10)[0]["text"]
     acts2 = ["<think> go </think><search> closest airport Lewisburg West Virginia </search>"] * 10

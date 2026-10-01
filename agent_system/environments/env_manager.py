@@ -37,6 +37,8 @@ from agent_system.environments.oci_layout import (
     search_route_hint_document_lines as _search_route_hint_document_lines,
     evidence_position as _evidence_position, ROUTE_DOC_MODES as _ROUTE_DOC_MODES,
     SEARCH_ROUTE_HINT_LEAD, sdar_skill_document as _sdar_skill_document,
+    search_flow_titles as _search_flow_titles, result_titles as _result_titles,
+    fold_text as _fold_text,
     with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
     doc_sentence_key as _doc_sentence_key, foreign_slot_on as _foreign_slot_on,
     with_doc_lead as _with_doc_lead,
@@ -849,6 +851,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._evidence_seen = [False] * n
         # Where it first came back, (search number, result number): route_hint's line names it.
         self._evidence_where = [None] * n
+        # yes/no routes are reached by titles: folded title -> (search number, result number).
+        self._titles_seen = [dict() for _ in range(n)]
         self._answer_early = [False] * n
         # Has the row sent an <answer> the environment took (the projected action,
         # which is what the env ends the episode on)? Read by search_k=evidence_answered
@@ -1104,12 +1108,38 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             return
         where = getattr(self, "_evidence_where", None)
         searches = getattr(self, "_searches", None) or []
+        tseen = getattr(self, "_titles_seen", None)
         for i, obs in enumerate(list(next_obs)[:len(seen)]):
             if not seen[i] and _evidence_in_text(obs, self._answers(i), self._question(i)):
                 seen[i] = True
                 if where is not None and i < len(where):
                     where[i] = (int(searches[i]) if i < len(searches) else 0,
                                 _evidence_position(obs, self._answers(i), self._question(i)))
+            want = self._expected_titles(i)
+            if want and tseen is not None and i < len(tseen):
+                s_no = int(searches[i]) if i < len(searches) else 0
+                for k, title in _result_titles(obs):
+                    if title in want and title not in tseen[i]:
+                        tseen[i][title] = (s_no, k)
+
+    def _expected_titles(self, i):
+        """Folded titles a yes/no route row must see, or None (any other row or question)."""
+        if not _is_yesno(self._answers(i)):
+            return None
+        titles = _search_flow_titles(_slots_search_flow_path(getattr(self, "config", None))).get(
+            _fold_text(self._question(i) or ""))
+        return [_fold_text(t) for t in titles] if titles else None
+
+    def _route_found(self, i):
+        """(found, where) for a route row: the answer string, or for a yes/no route every page."""
+        want = self._expected_titles(i)
+        if want:
+            seen = (getattr(self, "_titles_seen", None) or [{}] * (i + 1))[i]
+            if all(t in seen for t in want):
+                return True, [list(seen[t]) for t in want]
+            return False, None
+        wl = getattr(self, "_evidence_where", None) or []
+        return bool(self._evidence_seen[i]), (wl[i] if i < len(wl) else None)
 
     def _route_slot(self, i):
         """'a' / 'b' when row i wears a route document, else None."""
@@ -1132,7 +1162,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 continue
             lines = _block_lines(self.document_block(i, slot=slot))
             ptrs[i] = _advance_route(lines, ptrs[i], _search_query(text_actions[i]),
-                                     bool(self._evidence_seen[i]))
+                                     bool(self._route_found(i)[0]))
 
     @property
     def _probe_dir(self) -> str:
@@ -1284,13 +1314,11 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                         obs_i = _blk + obs_i
                     if _mode in _ROUTE_DOC_MODES:
                         _ptrs = getattr(self, "_route_ptr", None) or [0] * len(text_obs)
-                        _where = None
+                        _found, _where = bool(_seen[i]), None
                         if _mode in ("route_hint", "route_line"):
-                            _wl = getattr(self, "_evidence_where", None) or []
-                            _where = _wl[i] if i < len(_wl) else None
+                            _found, _where = self._route_found(i)
                         obs_i = _insert_search_guide(
-                            obs_i, _search_route_line(_block_lines(_blk), _ptrs[i], bool(_seen[i]),
-                                                      where=_where))
+                            obs_i, _search_route_line(_block_lines(_blk), _ptrs[i], _found, where=_where))
                     elif _mode in ("answer_rule", "progress_only"):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
             self._oci_plains.append(

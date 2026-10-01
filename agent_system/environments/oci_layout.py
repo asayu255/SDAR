@@ -888,6 +888,40 @@ def search_flow_document_lines(question, target, path) -> list:
     return [f"<search> {q} </search>" for q in queries]
 
 
+_SEARCH_FLOW_TITLES: dict = {}
+
+
+def search_flow_titles(path) -> dict:
+    """question -> the article titles a yes/no route is verified by (fill_routes.py, kind
+    yesno_titles). A yes/no answer is a judgement over two pages, never a string a passage
+    carries, so its route counts as reached when every one of these titles has come back."""
+    key = str(path or "")
+    if key not in _SEARCH_FLOW_TITLES:
+        table = {}
+        if key and os.path.exists(key):
+            blob = json.load(open(key))
+            for v in (blob.get("flows", blob) or {}).values():
+                if isinstance(v, dict) and v.get("hit") and v.get("expected_titles") and v.get("question"):
+                    table[fold_text(v["question"])] = [str(t) for t in v["expected_titles"]]
+        _SEARCH_FLOW_TITLES[key] = table
+    return _SEARCH_FLOW_TITLES[key]
+
+
+def result_titles(text) -> list:
+    """(k, folded title) of every "Doc k:" result in a returned block, in order.
+
+    The block is the environment's JSON string, so quotes and newlines arrive escaped
+    (Doc 1: \\"Title\\"\\n...); a title the corpus did not quote ends at the first newline."""
+    out = []
+    parts = re.split(r"Doc (\d+): ", str(text or ""))
+    for j in range(1, len(parts) - 1, 2):
+        body = parts[j + 1]
+        first = re.split(r"\\n|\n", body, maxsplit=1)[0]
+        title = first.replace('\\"', '"').strip().strip('"').strip()
+        out.append((int(parts[j]), fold_text(title)))
+    return out
+
+
 def search_route_hint_document_lines(question, target, path) -> list:
     """The verified route for route_hint: the queries, never the answer.
 
@@ -898,7 +932,8 @@ def search_route_hint_document_lines(question, target, path) -> list:
     """
     answers = answer_strings(target)
     queries = search_flows(path).get(fold_text(question), [])
-    if not queries or not answers or is_yesno(target):
+    # A yes/no question has a route only when it is verified by titles (search_flow_titles).
+    if not queries or not answers or (is_yesno(target) and not search_flow_titles(path).get(fold_text(question))):
         return []
     if any(contains_answer(q, target) and not contains_answer(question, target) for q in queries):
         return []
@@ -1033,6 +1068,11 @@ def search_route_line(lines, ptr: int, found: bool, where=None) -> str:
     if n == 0:
         return ""
     head = "[Privileged Solution Path progress]"
+    if found and isinstance(where, list):
+        # A yes/no route: every page it needs has come back -- say where, never the verdict.
+        places = " and ".join(f"Doc {int(d)} of your search {int(s)}" for s, d in where)
+        return (f"{head} The pages you need are in your results: {places}. Compare what they say "
+                "and write your answer inside <answer> </answer>.\n\n")
     if found and where:
         s, d = int(where[0] or 0), int(where[1] or 0)
         place = (f"Doc {d} returned by your search {s}" if s and d else
