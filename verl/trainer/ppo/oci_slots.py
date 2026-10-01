@@ -133,6 +133,9 @@ def check_config(config) -> None:
         "the rule that a returned result must carry it first), progress_only (no answer, "
         "only the verdict), route_hint (a verified route, no answer), route_line (its "
         "pointer line alone) or sdar_skills (SDAR's procedural skills).")
+    assert not (bool(cfg.get("doc_b", False)) and tasks != ["alfworld"]), (
+        f"algorithm.oci_slots.doc_b=True with tasks={tasks}: the repeated-document row is an "
+        "alfworld measurement (search has its own second document, search_doc_b).")
     _search_doc_b = str(cfg.get("search_doc_b", "none") or "none")
     assert _search_doc_b == "none" or tasks == ["search"], (
         f"algorithm.oci_slots.search_doc_b={_search_doc_b} with tasks={tasks}: the second "
@@ -161,7 +164,8 @@ def check_config(config) -> None:
         "re-draws the layout's slots; the two are not compatible.")
 
 
-def select_rollouts(batch, *, tasks: Sequence[str], group_n: int, second_doc: bool = False):
+def select_rollouts(batch, *, tasks: Sequence[str], group_n: int, second_doc: bool = False,
+                    foreign=None):
     """``(keep, injected, metrics)``: row masks over the batch as it left the rollout.
 
     ``keep`` is the eight trajectories per group that train; ``injected`` is the
@@ -173,11 +177,13 @@ def select_rollouts(batch, *, tasks: Sequence[str], group_n: int, second_doc: bo
     # Search has no foreign slot, so its groups are one row shorter in specials
     # and one longer in ordinary rollouts. The arm covers one task at a time, so
     # the layout is uniform across the batch's on-task rows.
-    foreign = all(has_foreign_slot(t) for t in tasks)
-    assert foreign or not any(has_foreign_slot(t) for t in tasks), (
-        f"algorithm.oci_slots.tasks={list(tasks)} mixes tasks that do and do not "
-        "spend a slot on another task's prompt; their groups would train different "
-        "numbers of trajectories")
+    # ``foreign`` is passed when the config dropped the slot (algorithm.oci_slots.foreign_slot).
+    if foreign is None:
+        foreign = all(has_foreign_slot(t) for t in tasks)
+        assert foreign or not any(has_foreign_slot(t) for t in tasks), (
+            f"algorithm.oci_slots.tasks={list(tasks)} mixes tasks that do and do not "
+            "spend a slot on another task's prompt; their groups would train different "
+            "numbers of trajectories")
     plain_n = used_per_group(group_n, foreign=foreign, second_doc=second_doc)
 
     uids = batch.non_tensor_batch.get("uid", None)

@@ -656,9 +656,21 @@ def search_flow_path(config) -> str:
     return str((slots_cfg(config) or {}).get("search_flow_path", "") or "")
 
 
+def slots_doc_b(config) -> bool:
+    """algorithm.oci_slots.doc_b: a second document row (alfworld) showing the SAME document
+    as the document row, with doc_sentence_b -- the paired control of a one-sentence nudge."""
+    return bool((slots_cfg(config) or {}).get("doc_b", False))
+
+
+def foreign_slot_on(config) -> bool:
+    """algorithm.oci_slots.foreign_slot (default true). False drops the foreign slot from the
+    tasks that have one, for a probe that only needs the document rows."""
+    return bool((slots_cfg(config) or {}).get("foreign_slot", True))
+
+
 def has_second_doc(config) -> bool:
     """Whether the layout generates the measurement-only variant row."""
-    return search_doc_mode(config, slot="b") != "none"
+    return search_doc_mode(config, slot="b") != "none" or slots_doc_b(config)
 
 
 def answer_strings(target) -> list:

@@ -2360,13 +2360,16 @@ class OPDRayTrainer(RayPPOTrainer):
                                                 select_rollouts)
 
         check_config(self.config)
-        from agent_system.environments.oci_layout import has_second_doc
+        from agent_system.environments.oci_layout import (foreign_slot_on, has_foreign_slot,
+                                                          has_second_doc)
 
+        _slot_tasks = list(cfg.get("tasks", ["alfworld"]) or ["alfworld"])
         keep, injected, slot_metrics = select_rollouts(
             batch,
-            tasks=list(cfg.get("tasks", ["alfworld"]) or ["alfworld"]),
+            tasks=_slot_tasks,
             group_n=int(self.config.env.rollout.n),
             second_doc=has_second_doc(self.config),
+            foreign=(all(has_foreign_slot(t) for t in _slot_tasks) and foreign_slot_on(self.config)),
         )
         metrics.update(slot_metrics)
         # Kept for the probe, which sees the batch only after this drop and so

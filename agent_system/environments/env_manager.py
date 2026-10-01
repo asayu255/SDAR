@@ -38,7 +38,8 @@ from agent_system.environments.oci_layout import (
     evidence_position as _evidence_position, ROUTE_DOC_MODES as _ROUTE_DOC_MODES,
     SEARCH_ROUTE_HINT_LEAD, sdar_skill_document as _sdar_skill_document,
     with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
-    doc_sentence_key as _doc_sentence_key,
+    doc_sentence_key as _doc_sentence_key, foreign_slot_on as _foreign_slot_on,
+    has_foreign_slot as _has_foreign_slot,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
@@ -1333,6 +1334,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.gamefile = parse_gamefile(infos)
         # walkthrough_stepwise: every slot starts at step 1 of its path.
         self._guide_ptr = [0] * len(text_obs)
+        # The probe's per-rollout record (ALFWORLD_PROBE_DUMP; off in training).
+        self._alf_probe_reset(len(text_obs))
         # (a)'s pointer. Separate from _guide_ptr, which walks the block a document
         # row is SHOWN and advances on the text alone; this one walks the game's
         # own walkthrough for every row and also requires the environment to have
@@ -1375,9 +1378,88 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 OCI_PLAIN_KEY: list(self._oci_plains),
                 OCI_DOC_KEY: list(self._oci_docs)}, infos
     
+    def _alf_role(self, i: int, envs=None) -> int:
+        """This slot's role under the configured layout: the foreign slot unless
+        algorithm.oci_slots.foreign_slot is off, the second document row when doc_b is on."""
+        return _slots_role(i, envs if envs is not None else getattr(self, "envs", None), self.config,
+                           foreign=_has_foreign_slot("alfworld") and _foreign_slot_on(self.config),
+                           second_doc=_slots_second_doc(self.config))
+
+    # --- the probe's per-rollout record (ALFWORLD_PROBE_DUMP) ---------------- #
+    # Off unless ALFWORLD_PROBE_DUMP names a directory: a measurement hook for the
+    # one-sentence probe, the counterpart of the Search manager's SEARCH_PROBE_DUMP.
+    # One JSON line per rollout: its slot role and sentence, every turn's projected
+    # action, whether it was admissible, whether the response held a closed think
+    # block, its length in characters, and the outcome.
+
+    @property
+    def _alf_probe_dir(self) -> str:
+        return os.environ.get("ALFWORLD_PROBE_DUMP", "").strip()
+
+    def _alf_probe_reset(self, n: int) -> None:
+        self._alf_probe_flush()
+        if not self._alf_probe_dir:
+            return
+        self._alf_probe_reset_n = int(getattr(self, "_alf_probe_reset_n", -1)) + 1
+        envs = getattr(self, "envs", None)
+        try:
+            g = int(getattr(envs, "group_n", 0)) or 1
+        except (TypeError, ValueError):
+            g = 1
+        gfs = list(getattr(self, "gamefile", None) or [])
+        rows = []
+        for i in range(n):
+            role = int(self._alf_role(i, envs))
+            slot = "a" if role == ROLE_DOC else ("b" if role == ROLE_DOC_B else None)
+            rows.append({"pid": os.getpid(), "reset": self._alf_probe_reset_n, "env": i, "group": i // g,
+                         "role": role, "gamefile": gfs[i] if i < len(gfs) else None,
+                         "sentence": _doc_sentence_key(self.config, slot) if slot else None,
+                         "turns": [], "won": None, "open": True})
+        self._alf_probe_rows = rows
+        if not getattr(self, "_alf_probe_atexit", False):
+            atexit.register(self._alf_probe_flush)
+            self._alf_probe_atexit = True
+
+    def _alf_probe_note(self, text_actions, actions, valids, dones, infos) -> None:
+        rows = getattr(self, "_alf_probe_rows", None)
+        if not rows:
+            return
+        for i, row in enumerate(rows):
+            if not row.get("open") or i >= len(actions):
+                continue
+            text = str(text_actions[i]) if i < len(text_actions) else ""
+            row["turns"].append({"action": str(actions[i]),
+                                 "valid": int(valids[i]) if i < len(valids) else None,
+                                 "think": "<think>" in text and "</think>" in text,
+                                 "chars": len(text)})
+            if bool(dones[i]):
+                info = infos[i] if i < len(infos) else {}
+                row["won"] = float((info or {}).get("won", 0.0)) if isinstance(info, dict) else None
+                self._alf_probe_write(i)
+
+    def _alf_probe_write(self, i: int) -> None:
+        rows = getattr(self, "_alf_probe_rows", None)
+        if not rows or i >= len(rows) or not rows[i].get("open"):
+            return
+        row = rows[i]
+        row["open"] = False
+        row["n_turns"] = len(row["turns"])
+        os.makedirs(self._alf_probe_dir, exist_ok=True)
+        path = os.path.join(self._alf_probe_dir, f"alfworld_rollouts.{os.getpid()}.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _alf_probe_flush(self) -> None:
+        """Write out rows the environment never marked done (the turn cap without a done)."""
+        rows = getattr(self, "_alf_probe_rows", None)
+        for i in range(len(rows or [])):
+            self._alf_probe_write(i)
+        self._alf_probe_rows = []
+
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+        self._alf_probe_note(text_actions, actions, valids, dones, infos)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
 
@@ -1389,7 +1471,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 # layout marks the document slot. reset() asserts the two are not
                 # both on, so at most one of these can be true for a given run.
                 if (_oci_candidate_row(i, _envs, self.config)
-                        or _slots_role(i, _envs, self.config) == ROLE_DOC):
+                        or self._alf_role(i, _envs) in (ROLE_DOC, ROLE_DOC_B)):
                     shown = self._oci_prefixes[i] if i < len(self._oci_prefixes) else ""
                     ptrs[i] = _advance_guide(_block_lines(shown), ptrs[i], act)
             self._guide_ptr = ptrs
@@ -1559,14 +1641,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # prompt the special slots' tokens are re-scored on.
             plain_obs = obs
             _gamefile = self.gamefile[i] if getattr(self, 'gamefile', None) else None
-            _role = _slots_role(i, _envs, self.config)
+            _role = self._alf_role(i, _envs)
             self._oci_roles.append(_role)
-            if _role == ROLE_DOC:
+            if _role in (ROLE_DOC, ROLE_DOC_B):
                 # This game's own solution path, and (stepwise) the one line that
                 # says which step it still owes -- the difference between 35% and
-                # 88-95% of stuck groups solved.
-                _oci_pre = _plan_block('alfworld', _gamefile, _slots_doc_mode(self.config),
-                                       admissible_actions[i])
+                # 88-95% of stuck groups solved. The second document row (doc_b) shows
+                # the same path; each row carries its own sentence (doc_sentence[_b]).
+                _oci_pre = _with_doc_sentence(
+                    _plan_block('alfworld', _gamefile, _slots_doc_mode(self.config), admissible_actions[i]),
+                    _doc_sentence_text("alfworld", self.config, "a" if _role == ROLE_DOC else "b"))
                 obs = _oci_pre + obs
                 if _oci_pre and _slots_doc_stepwise(self.config):
                     _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
@@ -1602,7 +1686,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # which is what every plain slot wants and what the single-candidate
             # arm wants too -- that one is stripped by its prefix instead.
             self._oci_plains.append(
-                plain_obs if (_role in (ROLE_DOC, ROLE_FOREIGN) and obs != plain_obs) else "")
+                plain_obs if (_role in (ROLE_DOC, ROLE_DOC_B, ROLE_FOREIGN) and obs != plain_obs) else "")
             # WHOLE DOCUMENT, NO PROGRESS LINE. The scorer does not act, so it
             # needs no pointer -- and the pointer only advances on an exact
             # action match, which an ordinary rollout does not give.
@@ -1642,18 +1726,20 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         total_infos = kwargs['total_infos']
         total_batch_list = kwargs['total_batch_list']
         _envs = getattr(self, 'envs', None)
-        roles = [_slots_role(i, _envs, self.config) for i in range(len(total_batch_list))]
-        if not any(r in (ROLE_DOC, ROLE_FOREIGN) for r in roles):
+        roles = [self._alf_role(i, _envs) for i in range(len(total_batch_list))]
+        if not any(r in (ROLE_DOC, ROLE_DOC_B, ROLE_FOREIGN) for r in roles):
             return super().success_evaluator(*args, **kwargs)
 
         plain = defaultdict(list)
-        special = {ROLE_DOC: defaultdict(list), ROLE_FOREIGN: defaultdict(list)}
+        special = {ROLE_DOC: defaultdict(list), ROLE_DOC_B: defaultdict(list), ROLE_FOREIGN: defaultdict(list)}
         for bs in range(len(total_batch_list)):
             self._process_batch(bs, total_batch_list, total_infos,
                                 special.get(roles[bs], plain))
         out = {key: np.array(value) for key, value in plain.items()}
         out["oci_doc_success_rate"] = np.array(special[ROLE_DOC]["success_rate"])
         out["oci_foreign_success_rate"] = np.array(special[ROLE_FOREIGN]["success_rate"])
+        if special[ROLE_DOC_B]["success_rate"]:
+            out["oci_doc_b_success_rate"] = np.array(special[ROLE_DOC_B]["success_rate"])
         return out
 
     def _process_gamefile(self, gamefile, won_value, success):
