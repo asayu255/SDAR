@@ -41,7 +41,7 @@ from agent_system.environments.oci_layout import (
     fold_text as _fold_text,
     with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
     doc_sentence_key as _doc_sentence_key, foreign_slot_on as _foreign_slot_on,
-    with_doc_lead as _with_doc_lead,
+    with_doc_lead as _with_doc_lead, doc_pointer_key as _doc_pointer_key,
     has_foreign_slot as _has_foreign_slot,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
@@ -56,6 +56,7 @@ from agent_system.environments.oci_layout import (
     alfworld_foreign_obs as _slots_foreign_alfworld_obs,
     slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
+from agent_system.environments.alf_pointer import AlfStatePointer, executed as _alf_executed
 from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
     PROGRESS_K_ARRIVE_INFO, PROGRESS_TOTAL_ARRIVE_INFO,
@@ -1364,6 +1365,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.gamefile = parse_gamefile(infos)
         # walkthrough_stepwise: every slot starts at step 1 of its path.
         self._guide_ptr = [0] * len(text_obs)
+        # The state pointer of each document row (alf_pointer.AlfStatePointer), built from the
+        # block it is shown on its first render, and kept for BOTH document rows: shown to a row
+        # whose doc_pointer is state, recorded as a shadow for a string row (the probe compares
+        # the two). _alf_shown: (line shown, state pointer's owed line) for the coming turn.
+        self._alf_sptr = [None] * len(text_obs)
+        self._alf_shown = [(None, None)] * len(text_obs)
         # The probe's per-rollout record (ALFWORLD_PROBE_DUMP; off in training).
         self._alf_probe_reset(len(text_obs))
         # (a)'s pointer. Separate from _guide_ptr, which walks the block a document
@@ -1415,6 +1422,20 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                            foreign=_has_foreign_slot("alfworld") and _foreign_slot_on(self.config),
                            second_doc=_slots_second_doc(self.config))
 
+    def _alf_state_pointer(self, i: int, lines):
+        """Row i's state pointer, built from the lines of the block it is shown."""
+        sps = getattr(self, "_alf_sptr", None)
+        if sps is None or i >= len(sps):
+            return None
+        if sps[i] is None:
+            sps[i] = AlfStatePointer(lines)
+        return sps[i]
+
+    def _alf_note_shown(self, i: int, shown, owed) -> None:
+        cur = getattr(self, "_alf_shown", None)
+        if cur is not None and i < len(cur):
+            cur[i] = (shown, owed)
+
     # --- the probe's per-rollout record (ALFWORLD_PROBE_DUMP) ---------------- #
     # Off unless ALFWORLD_PROBE_DUMP names a directory: a measurement hook for the
     # one-sentence probe, the counterpart of the Search manager's SEARCH_PROBE_DUMP.
@@ -1444,24 +1465,33 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             rows.append({"pid": os.getpid(), "reset": self._alf_probe_reset_n, "env": i, "group": i // g,
                          "role": role, "gamefile": gfs[i] if i < len(gfs) else None,
                          "sentence": _doc_sentence_key(self.config, slot) if slot else None,
+                         "pointer": _doc_pointer_key(self.config, slot) if slot else None,
                          "turns": [], "won": None, "open": True})
         self._alf_probe_rows = rows
         if not getattr(self, "_alf_probe_atexit", False):
             atexit.register(self._alf_probe_flush)
             self._alf_probe_atexit = True
 
-    def _alf_probe_note(self, text_actions, actions, valids, dones, infos) -> None:
+    def _alf_probe_note(self, text_actions, actions, valids, dones, infos, text_obs=None) -> None:
         rows = getattr(self, "_alf_probe_rows", None)
         if not rows:
             return
+        shown_all = getattr(self, "_alf_shown", None) or []
         for i, row in enumerate(rows):
             if not row.get("open") or i >= len(actions):
                 continue
             text = str(text_actions[i]) if i < len(text_actions) else ""
+            shown, owed = shown_all[i] if i < len(shown_all) else (None, None)
             row["turns"].append({"action": str(actions[i]),
                                  "valid": int(valids[i]) if i < len(valids) else None,
                                  "think": "<think>" in text and "</think>" in text,
-                                 "chars": len(text)})
+                                 "chars": len(text),
+                                 # did the game carry it out; the line this row was shown before
+                                 # it; the state pointer's owed line then (a shadow on string rows)
+                                 "executed": (bool(_alf_executed(text_obs[i]))
+                                              if text_obs is not None and i < len(text_obs) else None),
+                                 "shown": list(shown) if shown else None,
+                                 "state_owed": list(owed) if owed else None})
             if bool(dones[i]):
                 info = infos[i] if i < len(infos) else {}
                 row["won"] = float((info or {}).get("won", 0.0)) if isinstance(info, dict) else None
@@ -1489,7 +1519,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
-        self._alf_probe_note(text_actions, actions, valids, dones, infos)
+        self._alf_probe_note(text_actions, actions, valids, dones, infos, text_obs)
+        for i, sp in enumerate(getattr(self, "_alf_sptr", None) or []):
+            if sp is not None and i < len(actions):
+                sp.step(actions[i], text_obs[i])
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
 
@@ -1686,7 +1719,17 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 obs = _oci_pre + obs
                 if _oci_pre and _slots_doc_stepwise(self.config):
                     _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)
-                    obs = _insert_guide(obs, _guide_line(_block_lines(_oci_pre), _ptrs[i]))
+                    _lines = _block_lines(_oci_pre)
+                    _sp = self._alf_state_pointer(i, _lines)
+                    _owed = _sp.owed(admissible_actions[i]) if _sp is not None else None
+                    if _doc_pointer_key(self.config, _slot) == "state":
+                        _line = _sp.line(admissible_actions[i]) if _sp is not None else ""
+                        _shown = _owed
+                    else:
+                        _line = _guide_line(_lines, _ptrs[i])
+                        _shown = (_ptrs[i], _lines[_ptrs[i]]) if _ptrs[i] < len(_lines) else None
+                    obs = _insert_guide(obs, _line)
+                    self._alf_note_shown(i, _shown, _owed)
             elif _role == ROLE_FOREIGN:
                 _oci_pre = ""
                 _ftask = _slots_foreign_task(self.config)

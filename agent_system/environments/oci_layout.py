@@ -406,6 +406,21 @@ def doc_lead_key(config, slot: str = "a") -> str:
     return value
 
 
+DOC_POINTERS = ("string", "state")
+
+
+def doc_pointer_key(config, slot: str = "a") -> str:
+    """How the document row (slot a) or the second document row (b) is told its next step:
+    string (the line moves when the action string equals it, carried out or not; default) or
+    state (alf_pointer.AlfStatePointer: placed from what the game did; alfworld only)."""
+    cfg = slots_cfg(config) or {}
+    key = "doc_pointer" if slot == "a" else "doc_pointer_b"
+    value = str(cfg.get(key, "string") or "string")
+    if value not in DOC_POINTERS:
+        raise ValueError(f"algorithm.oci_slots.{key}={value!r}; expected one of {DOC_POINTERS}")
+    return value
+
+
 def with_doc_lead(block: str, config, slot: str = "a") -> str:
     """The block with this row's lead: the strict lead swapped for its short form, nothing else
     touched. Works for every task's block: alfworld and webshop share PLAN_LEAD, search's route

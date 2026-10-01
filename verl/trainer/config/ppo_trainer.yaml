@@ -531,6 +531,13 @@ algorithm:
     # too strong and too long.
     doc_lead: strict
     doc_lead_b: strict
+    # How each document row is told its next step (alfworld): string (the line moves when the
+    # action string equals it, even when the game answered "Nothing happens."; default) or
+    # state (agent_system/environments/alf_pointer.py: placed from what the game did, the
+    # rollout's own instance, mismatch -> no line). 2026-10-01 probe: half of the step-150
+    # document rows moved the string pointer with a refused action.
+    doc_pointer: string
+    doc_pointer_b: string
     # SDAR's Search skill files for search_doc=sdar_skills ("" = the repo's skills/search).
     search_skills_dir: ""
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:

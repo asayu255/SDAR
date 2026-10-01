@@ -108,7 +108,8 @@ else:
           "one record per rollout, with the sentence its row wore")
     check(by_role[ol.ROLE_DOC]["won"] == 1.0 and by_role[ol.ROLE_DOC]["n_turns"] == 2
           and by_role[ol.ROLE_DOC]["turns"][0]["action"] == walk[0]
-          and set(by_role[ol.ROLE_DOC]["turns"][0]) == {"action", "valid", "think", "chars"},
+          and set(by_role[ol.ROLE_DOC]["turns"][0]) >= {"action", "valid", "think", "chars",
+                                                        "executed", "shown", "state_owed"},
           "turns carry the projected action, admissibility, the think flag and the length; the win is read")
     os.environ.pop("ALFWORLD_PROBE_DUMP", None)
     batch_list = [[{"active_masks": True}] for _ in range(N)]
