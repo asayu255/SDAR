@@ -34,6 +34,9 @@ from agent_system.environments.oci_layout import (
     search_progress_line as _search_progress_line,
     search_doc_mode as _slots_search_doc, has_second_doc as _slots_second_doc,
     search_flow_document_lines as _search_flow_document_lines,
+    search_route_hint_document_lines as _search_route_hint_document_lines,
+    evidence_position as _evidence_position, ROUTE_DOC_MODES as _ROUTE_DOC_MODES,
+    SEARCH_ROUTE_HINT_LEAD,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
@@ -840,6 +843,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         # touches the reward, which stays exactly what control trains on.
         n = len(obs)
         self._evidence_seen = [False] * n
+        # Where it first came back, (search number, result number): route_hint's line names it.
+        self._evidence_where = [None] * n
         self._answer_early = [False] * n
         # Has the row sent an <answer> the environment took (the projected action,
         # which is what the env ends the episode on)? Read by search_k=evidence_answered
@@ -907,6 +912,12 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _search_flow_document_lines(p.get("question"), p.get("ground_truth"),
                                             _slots_search_flow_path(getattr(self, "config", None))),
                 lead=_search_lead(SEARCH_FLOW_LEAD, p.get("ground_truth")))
+        if mode == "route_hint":
+            # The verified route and no answer; '' for a question with no verified route.
+            return render_document(
+                _search_route_hint_document_lines(p.get("question"), p.get("ground_truth"),
+                                                  _slots_search_flow_path(getattr(self, "config", None))),
+                lead=SEARCH_ROUTE_HINT_LEAD)
         if mode in ("answer_rule", "progress_only"):
             show = mode == "answer_rule"
             return render_document(
@@ -1070,9 +1081,14 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         seen = getattr(self, "_evidence_seen", None)
         if seen is None:
             return
+        where = getattr(self, "_evidence_where", None)
+        searches = getattr(self, "_searches", None) or []
         for i, obs in enumerate(list(next_obs)[:len(seen)]):
             if not seen[i] and _evidence_in_text(obs, self._answers(i), self._question(i)):
                 seen[i] = True
+                if where is not None and i < len(where):
+                    where[i] = (int(searches[i]) if i < len(searches) else 0,
+                                _evidence_position(obs, self._answers(i), self._question(i)))
 
     def _route_slot(self, i):
         """'a' / 'b' when row i wears a route document, else None."""
@@ -1080,7 +1096,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         role = _slots_role(i, envs, self.config, foreign=False,
                            second_doc=_slots_second_doc(self.config))
         slot = "a" if role == ROLE_DOC else ("b" if role == ROLE_DOC_B else None)
-        if slot and _slots_search_doc(self.config, slot=slot) == "expert_flow":
+        if slot and _slots_search_doc(self.config, slot=slot) in _ROUTE_DOC_MODES:
             return slot
         return None
 
@@ -1170,6 +1186,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         row = rows[i]
         row["open"] = False
         row["evidence_seen"] = bool(self._evidence_seen[i])
+        _wl = getattr(self, "_evidence_where", None)
+        row["evidence_where"] = list(_wl[i]) if _wl is not None and i < len(_wl) and _wl[i] else None
         row["answer_early"] = bool(self._answer_early[i])
         ptrs = getattr(self, "_route_ptr", None)
         row["route_ptr"] = int(ptrs[i]) if ptrs is not None and i < len(ptrs) else None
@@ -1241,10 +1259,15 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 if _blk:
                     obs_i = _blk + obs_i
                     _mode = _slots_search_doc(self.config, slot=_slot)
-                    if _mode == "expert_flow":
+                    if _mode in _ROUTE_DOC_MODES:
                         _ptrs = getattr(self, "_route_ptr", None) or [0] * len(text_obs)
+                        _where = None
+                        if _mode == "route_hint":
+                            _wl = getattr(self, "_evidence_where", None) or []
+                            _where = _wl[i] if i < len(_wl) else None
                         obs_i = _insert_search_guide(
-                            obs_i, _search_route_line(_block_lines(_blk), _ptrs[i], bool(_seen[i])))
+                            obs_i, _search_route_line(_block_lines(_blk), _ptrs[i], bool(_seen[i]),
+                                                      where=_where))
                     elif _mode in ("answer_rule", "progress_only"):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
             self._oci_plains.append(

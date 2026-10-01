@@ -539,6 +539,23 @@ SEARCH_FLOW_LEAD = (
     "The searches that lead to it:"
 )
 
+# THE FOURTH DOCUMENT: THE ROUTE WITHOUT THE ANSWER (route_hint, 2026-10-01). expert_flow
+# prints the verified route AND the answer under the rule, and on the step-150 probe 46% of
+# its rescue rows on stuck groups wrote the answer before any result carried it -- what every
+# published search self-distillation that shows the teacher the answer reports (the student
+# stops searching: EviSD, SD-Search, SMEPO). This variant prints a route and never the
+# answer: the row is told what to look up and, once a result carries the answer, WHERE it is
+# (which search, which result), never what it says. Routes come from
+# data/qa_annotations/build_route_hints.py, verified at this retriever's top-3.
+SEARCH_ROUTE_HINT_LEAD = (
+    "THIS IS A SEARCH ROUTE THAT IS KNOWN TO REACH THE ANSWER TO THIS QUESTION. Run the\n"
+    "queries below in order -- they name what has to be looked up -- and read what comes\n"
+    "back. The answer itself is not given here: write it only from what a result returned\n"
+    "inside <information> </information> says.\n"
+    "\n"
+    "The searches that lead to it:"
+)
+
 
 def search_lead(template: str, target) -> str:
     """A lead with the first accepted answer written into its sentence.
@@ -548,7 +565,9 @@ def search_lead(template: str, target) -> str:
     answers = answer_strings(target)
     return template.replace("{answer}", answers[0] if answers else "")
 
-SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow")
+SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow", "route_hint")
+# The modes whose document is a route with a pointer that moves as its queries are run.
+ROUTE_DOC_MODES = ("expert_flow", "route_hint")
 
 
 def search_doc_mode(config, slot: str = "a") -> str:
@@ -736,6 +755,37 @@ def search_flow_document_lines(question, target, path) -> list:
     return [f"<search> {q} </search>" for q in queries]
 
 
+def search_route_hint_document_lines(question, target, path) -> list:
+    """The verified route for route_hint: the queries, never the answer.
+
+    The same file and the same refusals as search_flow_document_lines, with one
+    difference: a query may name an accepted answer when the QUESTION already names it
+    (a comparison question that names both candidates) -- the query then tells the row
+    nothing the prompt does not. build_route_hints.py applies the same rule.
+    """
+    answers = answer_strings(target)
+    queries = search_flows(path).get(fold_text(question), [])
+    if not queries or not answers or is_yesno(target):
+        return []
+    if any(contains_answer(q, target) and not contains_answer(question, target) for q in queries):
+        return []
+    return [f"<search> {q} </search>" for q in queries]
+
+
+def evidence_position(text, target, question=None) -> int:
+    """The number k of the first "Doc k:" result in a returned block that carries the answer.
+
+    0 when none does, or when the block cannot be split -- the caller then names only the
+    search. The per-result test is the one the progress line uses (evidence_in_text) on
+    the raw text the environment returned, so a block it calls seen is split the same way.
+    """
+    parts = re.split(r"Doc (\d+): ", str(text or ""))
+    for j in range(1, len(parts) - 1, 2):
+        if evidence_in_text(parts[j + 1], target, question):
+            return int(parts[j])
+    return 0
+
+
 def route_query_matches(row_query, route_line, min_share: float = 0.5) -> bool:
     """Did the row run this line of the route?
 
@@ -772,7 +822,7 @@ def advance_route(lines, ptr: int, row_query, found: bool) -> int:
     return ptr
 
 
-def search_route_line(lines, ptr: int, found: bool) -> str:
+def search_route_line(lines, ptr: int, found: bool, where=None) -> str:
     """The progress line for a route document: which step is owed, by name.
 
     The two-state line below was written for the two-line documents (search,
@@ -781,11 +831,21 @@ def search_route_line(lines, ptr: int, found: bool) -> str:
     the second query, the same loss of position ALFWorld's pointer fixed (35% ->
     88-95% of stuck groups). This names the next step the way _guide_line does.
     The answer step is named only once a result has carried the answer.
+
+    ``where`` (route_hint only) is (search number, result number) of the first result
+    that carried the answer; the line then says where it is, never what it says. A
+    result number of 0 names the search alone.
     """
     n = len(lines or [])
     if n == 0:
         return ""
     head = "[Privileged Solution Path progress]"
+    if found and where:
+        s, d = int(where[0] or 0), int(where[1] or 0)
+        place = (f"Doc {d} returned by your search {s}" if s and d else
+                 (f"A result returned by your search {s}" if s else "A result you received"))
+        return (f"{head} {place} contains the answer. Read it and write the answer it "
+                "gives inside <answer> </answer>.\n\n")
     if found:
         return (f"{head} A result you received contains the answer. "
                 "Now write it inside <answer> </answer>.\n\n")
