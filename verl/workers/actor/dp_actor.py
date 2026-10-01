@@ -4734,6 +4734,15 @@ class DataParallelPPOActor(BasePPOActor):
                                  if float(_mm.sum()) > 0:
                                      metrics[f"tied/kl_{_nm}"] = float((_val * _mm).sum() / _mm.sum())
                              metrics["tied/term"] = float(tied_term.detach())
+                             # How loose the teacher-indexed support is: the student's (and the teacher's)
+                             # probability outside the teacher's top-k, on the distilled tokens. The reverse
+                             # KL lumps the student's part into one bucket.
+                             _tok_on = _t_on.sum()
+                             if float(_tok_on) > 0:
+                                 _tail_s = (1.0 - student_topk_out.detach().exp().sum(-1)).clamp(min=0.0)
+                                 _tail_t = (1.0 - data["tied_topk_lp"].to(_t_loss.dtype).exp().sum(-1)).clamp(min=0.0)
+                                 metrics["tied/student_mass_outside_teacher_topk"] = float((_tail_s * _t_on).sum() / _tok_on)
+                                 metrics["tied/teacher_mass_outside_teacher_topk"] = float((_tail_t * _t_on).sum() / _tok_on)
 
                      if opsd_stats is not None and opsd_column and pg_loss_coef != 0:
                          # THE SAME TERM, NOT ADDED. Its gradient is parallel to

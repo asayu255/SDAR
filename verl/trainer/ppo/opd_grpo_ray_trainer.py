@@ -613,7 +613,10 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 live_z[task_of[u]] += live_abs_z([won[tuids[i]] for i in rows], [tuids[i] for i in rows])
         ctl = self._tied_controller(cfg)
         ctl.update(status, task_of, live_z)
-        wts = {t: ctl.weights(t) for t in ctl.tasks}
+        # The amount guard reads THIS batch's group counts per task (n_sat w_s <= n_live M).
+        n_live = {t: sum(1 for u, s_ in status.items() if s_ == "live" and task_of.get(u) == t) for t in ctl.tasks}
+        n_sat = {t: sum(1 for u, s_ in status.items() if s_ == "saturated" and task_of.get(u) == t) for t in ctl.tasks}
+        wts = {t: ctl.weights(t, n_live=n_live[t], n_sat=n_sat[t]) for t in ctl.tasks}
 
         match = batch.batch["tied_match"].reshape(-1).cpu().numpy()
         doc_ok = batch.batch["oci_doc_len"].reshape(-1).cpu().numpy() > 0

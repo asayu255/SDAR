@@ -15,8 +15,11 @@ normalize_loss_by_task). The per-token weights come from the task's group shares
          advantage (turn rows, mean and std with ddof 1, +1e-6) -- the push an average mixed-group token gets
     q_f, q_s, live   the discounted shares of stuck / saturated / live groups (same retention)
     w_f = M (1 - q_f)
-    w_s = M min(q_s, live / q_s)       the second term is the amount guard: the saturated side's total
-                                       (n_sat w_s) never exceeds the mixed groups' (n_live M)
+    w_s = M min(q_s, n_live / n_sat)   the second term is the amount guard, on THIS batch's group counts of
+                                       the task (the user, 2026-10-01: "そのバッチの群数で上限を計算する"):
+                                       the step's saturated groups never carry more weight in total
+                                       (n_sat w_s) than its mixed groups' (n_live M). With no mixed group in
+                                       the batch, w_s is 0.
 
 Nothing is distilled in a task before its first live group (M undefined). A row is distilled only when its
 group is stuck or saturated, the state pointer placed it (tied_match == 1), and its teacher prompt was
@@ -130,8 +133,12 @@ class TiedController:
         c = self.m_cnt.get(task, 0.0)
         return None if c <= 0 else self.m_sum[task] / c
 
-    def weights(self, task) -> Dict[str, float]:
-        """w_f, w_s and what they came from; both 0 before the task's first live group."""
+    def weights(self, task, n_live: Optional[int] = None, n_sat: Optional[int] = None) -> Dict[str, float]:
+        """w_f, w_s and what they came from; both 0 before the task's first live group.
+
+        ``n_live`` / ``n_sat``: this batch's live and saturated groups of the task, for the amount guard
+        (n_sat w_s <= n_live M). Required when the guard is on.
+        """
         q_f, q_s, live = self.shares(task)
         m = self.m(task)
         if m is None:
@@ -139,10 +146,15 @@ class TiedController:
                     "guard_bound": 0.0, "m_defined": 0.0}
         w_f = m * (1.0 - q_f)
         free = q_s
-        bound = (live / q_s) if q_s > 0 else float("inf")
-        w_s = m * (min(free, bound) if self.guard else free)
+        if self.guard:
+            if n_live is None or n_sat is None:
+                raise ValueError("tied_opsd: the amount guard needs this batch's n_live and n_sat")
+            bound = (float(n_live) / float(n_sat)) if n_sat > 0 else float("inf")
+        else:
+            bound = float("inf")
+        w_s = m * min(free, bound)
         return {"w_f": w_f, "w_s": w_s, "m": m, "q_f": q_f, "q_s": q_s, "live": live,
-                "guard_bound": float(self.guard and bound < free), "m_defined": 1.0}
+                "guard_bound": float(bound < free), "m_defined": 1.0}
 
     def state_dict(self) -> dict:
         return {"version": STATE_VERSION, "retention": self.retention, "guard": self.guard,

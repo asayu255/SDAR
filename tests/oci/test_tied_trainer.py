@@ -52,29 +52,40 @@ check(len(z) == 2 and abs(z[0] - want) < 1e-9 and abs(z[1] - want) < 1e-9, f"|z|
 
 print("2. weights")
 ctl = T.TiedController(["alfworld", "search"], retention=0.8, guard=True)
-w0 = ctl.weights("alfworld")
+w0 = ctl.weights("alfworld", n_live=0, n_sat=0)
 check(w0["w_f"] == 0 and w0["w_s"] == 0 and w0["m_defined"] == 0, "nothing before the first live group")
 ctl.update({"s1": "stuck", "s2": "stuck", "l1": "live", "t1": "saturated"},
            {"s1": "alfworld", "s2": "alfworld", "l1": "alfworld", "t1": "alfworld"}, {"alfworld": [0.8, 0.8]})
-w1 = ctl.weights("alfworld")
+w1 = ctl.weights("alfworld", n_live=1, n_sat=1)
 check(abs(w1["q_f"] - 0.5) < 1e-12 and abs(w1["q_s"] - 0.25) < 1e-12 and abs(w1["m"] - 0.8) < 1e-12
       and abs(w1["w_f"] - 0.8 * 0.5) < 1e-12 and abs(w1["w_s"] - 0.8 * 0.25) < 1e-12 and w1["guard_bound"] == 0,
-      f"one step: q_f 0.5, q_s 0.25, M 0.8 -> w_f 0.4, w_s 0.2 ({w1})")
+      f"one step: q_f 0.5, q_s 0.25, M 0.8 -> w_f 0.4, w_s 0.2 (batch: 1 live, 1 saturated; {w1})")
 ctl.update({f"t{i}": "saturated" for i in range(8)} | {"l9": "live"},
            {**{f"t{i}": "alfworld" for i in range(8)}, "l9": "alfworld"}, {"alfworld": [1.0, 1.0]})
-w2 = ctl.weights("alfworld")
+w2 = ctl.weights("alfworld", n_live=1, n_sat=8)
 n_all = 0.8 * 4 + 9
 q_s, live = (0.8 * 1 + 8) / n_all, (0.8 * 1 + 1) / n_all
 m = (0.8 * 1.6 + 2.0) / (0.8 * 2 + 2)
 check(abs(w2["q_s"] - q_s) < 1e-12 and abs(w2["m"] - m) < 1e-12
-      and abs(w2["w_s"] - m * min(q_s, live / q_s)) < 1e-12 and w2["guard_bound"] == 1,
-      f"discounted counts; the guard binds when q_s^2 > live ({w2['q_s']:.3f}^2 vs {w2['live']:.3f})")
+      and abs(w2["w_s"] - m * min(q_s, 1 / 8)) < 1e-12 and w2["guard_bound"] == 1,
+      f"discounted counts; the guard on THIS batch's counts binds: 8 saturated x w_s <= 1 live x M "
+      f"(w_s {w2['w_s']:.4f} = M/8)")
+w2b = ctl.weights("alfworld", n_live=6, n_sat=2)
+check(abs(w2b["w_s"] - m * q_s) < 1e-12 and w2b["guard_bound"] == 0, "the same shares, a batch with 6 live and 2 "
+      "saturated groups: free (M q_s)")
+w2c = ctl.weights("alfworld", n_live=0, n_sat=3)
+check(w2c["w_s"] == 0.0 and w2c["w_f"] > 0, "no live group in the batch: w_s 0, w_f unaffected")
+try:
+    ctl.weights("alfworld")
+    check(False, "the guard without the batch counts must refuse")
+except ValueError:
+    check(True, "the guard without the batch counts refuses")
 off = T.TiedController(["alfworld"], guard=False)
 off.load_state_dict({**ctl.state_dict(), "guard": False})
-check(abs(off.weights("alfworld")["w_s"] - m * q_s) < 1e-12, "guard off: w_s = M q_s")
+check(abs(off.weights("alfworld")["w_s"] - m * q_s) < 1e-12, "guard off: w_s = M q_s (no counts needed)")
 again = T.TiedController(["alfworld", "search"])
 again.load_state_dict(ctl.state_dict())
-check(again.weights("alfworld") == w2, "state_dict round-trips")
+check(again.weights("alfworld", n_live=1, n_sat=8) == w2, "state_dict round-trips")
 side, w = T.row_sides_and_weights(["s1", "t1", "l1", "s1"], ["alfworld"] * 4,
                                   {"s1": "stuck", "t1": "saturated", "l1": "live"}, {"alfworld": w2},
                                   eligible=[True, True, True, False])
