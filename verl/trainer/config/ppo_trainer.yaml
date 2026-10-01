@@ -525,6 +525,12 @@ algorithm:
     # foreign slot. Defaults keep the ten-slot layout as it was.
     doc_b: false
     foreign_slot: true
+    # The document block's lead for the document row / second document row: strict (the
+    # original five-line "FOLLOW IT EXACTLY" lead, default) or short (the same message in two
+    # plain sentences, oci_layout.PLAN_LEAD_SHORT). The user, 2026-10-01: the strict lead is
+    # too strong and too long.
+    doc_lead: strict
+    doc_lead_b: strict
     # SDAR's Search skill files for search_doc=sdar_skills ("" = the repo's skills/search).
     search_skills_dir: ""
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:

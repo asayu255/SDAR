@@ -39,6 +39,7 @@ from agent_system.environments.oci_layout import (
     SEARCH_ROUTE_HINT_LEAD, sdar_skill_document as _sdar_skill_document,
     with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
     doc_sentence_key as _doc_sentence_key, foreign_slot_on as _foreign_slot_on,
+    with_doc_lead as _with_doc_lead,
     has_foreign_slot as _has_foreign_slot,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
@@ -1648,9 +1649,11 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 # says which step it still owes -- the difference between 35% and
                 # 88-95% of stuck groups solved. The second document row (doc_b) shows
                 # the same path; each row carries its own sentence (doc_sentence[_b]).
+                _slot = "a" if _role == ROLE_DOC else "b"
                 _oci_pre = _with_doc_sentence(
-                    _plan_block('alfworld', _gamefile, _slots_doc_mode(self.config), admissible_actions[i]),
-                    _doc_sentence_text("alfworld", self.config, "a" if _role == ROLE_DOC else "b"))
+                    _with_doc_lead(_plan_block('alfworld', _gamefile, _slots_doc_mode(self.config),
+                                               admissible_actions[i]), self.config, _slot),
+                    _doc_sentence_text("alfworld", self.config, _slot))
                 obs = _oci_pre + obs
                 if _oci_pre and _slots_doc_stepwise(self.config):
                     _ptrs = getattr(self, "_guide_ptr", None) or [0] * len(text_obs)

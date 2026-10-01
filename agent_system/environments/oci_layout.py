@@ -382,6 +382,38 @@ PLAN_LEAD = (
 )
 
 
+# THE SHORT LEAD (the user, 2026-10-01: the lead above is "too strong and too long"; one line
+# was too short -- "shorten it without changing the tone much"). The same message -- a verified
+# correct path, take the next line at every step -- without the capitals and the stacked
+# prohibitions (COMPLETE AND OPTIMAL, MUST FOLLOW EXACTLY, DO NOT SEARCH ON YOUR OWN, DO NOT
+# DEVIATE, ... is wrong). Chosen per document row by doc_lead / doc_lead_b (strict =
+# PLAN_LEAD, the default, which every earlier measurement used).
+PLAN_LEAD_SHORT = (
+    "This is the verified correct solution path for this task. Follow it: at every\n"
+    "step, take the action given by the next line of this path.\n"
+    "\n"
+    "The full path that solves this task:"
+)
+DOC_LEADS = {"strict": PLAN_LEAD, "short": PLAN_LEAD_SHORT}
+
+
+def doc_lead_key(config, slot: str = "a") -> str:
+    cfg = slots_cfg(config) or {}
+    key = "doc_lead" if slot == "a" else "doc_lead_b"
+    value = str(cfg.get(key, "strict") or "strict")
+    if value not in DOC_LEADS:
+        raise ValueError(f"algorithm.oci_slots.{key}={value!r}; expected one of {tuple(DOC_LEADS)}")
+    return value
+
+
+def with_doc_lead(block: str, config, slot: str = "a") -> str:
+    """The block with this row's lead: PLAN_LEAD swapped for the chosen one, nothing else touched."""
+    key = doc_lead_key(config, slot)
+    if not block or key == "strict" or PLAN_LEAD not in block:
+        return block
+    return block.replace(PLAN_LEAD, DOC_LEADS[key], 1)
+
+
 def render_document(lines, lead: str = PLAN_LEAD) -> str:
     """The numbered block, or '' when there is no path to print.
 

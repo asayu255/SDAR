@@ -120,6 +120,24 @@ else:
           and succ["oci_doc_b_success_rate"].tolist() == [1.0],
           "the ordinary slots make success_rate; each document row gets its own key")
 
+    print("2b. the short lead (doc_lead / doc_lead_b)")
+    em._WRONG_PLAN_CACHE.clear()
+    c2 = cfg(doc_b=True, foreign_slot=False, doc_sentence="progress", doc_sentence_b="progress",
+             doc_lead="short", doc_lead_b="strict")
+    m2 = em.AlfWorldEnvironmentManager(FakeEnvs(), lambda acts, adm: (list(acts), [1] * len(acts)), c2)
+    t2, _ = m2.reset(kwargs=None)
+    a_txt, b_txt = t2["text"][5], t2["text"][4]
+    import re as _re
+    check(ol.PLAN_LEAD_SHORT in a_txt and "YOU MUST FOLLOW IT EXACTLY" not in a_txt
+          and "YOU MUST FOLLOW IT EXACTLY" in b_txt and ol.PLAN_LEAD_SHORT not in b_txt,
+          "the document row reads the short lead, the second document row the strict one")
+    check(_re.findall(r"^\d+\. (.+)$", a_txt, flags=_re.M) == _re.findall(r"^\d+\. (.+)$", b_txt, flags=_re.M)
+          and all(f"step 1 of {len(walk)}: {walk[0]}" in x for x in (a_txt, b_txt))
+          and ol.DOC_SENTENCES["alfworld"]["progress"] in a_txt,
+          "the numbered steps, the pointer and the sentence are the same under either lead")
+    check(ol.with_doc_lead("", c2) == "" and ol.doc_lead_key(cfg()) == "strict",
+          "no block passes through; the default lead is the strict one")
+
     print("3. the default layout is untouched")
     em._WRONG_PLAN_CACHE.clear()
 
