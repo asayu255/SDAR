@@ -252,6 +252,9 @@ try:
     check(set(ol.DOC_SENTENCES) == {"alfworld", "webshop", "search"}
           and all(ANSWER not in v for d in ol.DOC_SENTENCES.values() for v in d.values()),
           "one explore and one efficiency sentence per task")
+    check(all(set(d) == {"explore", "efficiency", "progress"} for d in ol.DOC_SENTENCES.values())
+          and all("you have not" in d["progress"] for d in ol.DOC_SENTENCES.values()),
+          "and the revised stuck-group sentence (progress) for every task")
 
     m2 = manager(10, evidence_for={8, 9}, search_doc="answer_rule", search_doc_b="expert_flow")
     t3 = m2.reset(KW * 10)[0]["text"]

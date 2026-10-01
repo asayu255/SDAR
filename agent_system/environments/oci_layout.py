@@ -570,12 +570,16 @@ DOC_SENTENCES = {
                     "have already taken."),
         "efficiency": ("Do not look again where you have already looked: do not revisit a receptacle "
                        "or repeat an action, and take or place the object as soon as you can."),
+        "progress": ("Follow the path above to the place you have not reached yet: take its next step "
+                     "now instead of returning to receptacles you have already checked."),
     },
     "webshop": {
         "explore": ("Look at products you have not opened yet: go back to the results or search with "
                     "different words, and do not buy until a product meets every requirement."),
         "efficiency": ("Do not reopen products or options you have already checked: as soon as a "
                        "product meets every requirement, select its options and buy it."),
+        "progress": ("Follow the path above to the product you have not opened yet: take its next step "
+                     "now instead of going back to pages or options you have already checked."),
     },
     "search": {
         "explore": ("Search for what you have not searched yet: if the results do not contain the fact "
@@ -583,9 +587,15 @@ DOC_SENTENCES = {
                     "a query."),
         "efficiency": ("Do not search again for what you have already found: as soon as a result "
                        "contains the fact you need, answer with it."),
+        "progress": ("Follow the route above to the result you have not found yet: run its next search "
+                     "now instead of repeating a query or answering before a result contains the fact."),
     },
 }
-DOC_SENTENCE_KEYS = ("none", "explore", "efficiency")
+# progress (the user, 2026-10-01): the stuck-group sentence revised after the probe -- the
+# explore sentence contradicted the document's "follow it exactly" lead and cost 16 pt in
+# stuck ALFWorld groups (more turns and repeats, almost no new places); progress points the
+# same way as the document instead: the place you have not reached yet IS the path's next step.
+DOC_SENTENCE_KEYS = ("none", "explore", "efficiency", "progress")
 
 
 def doc_sentence_key(config, slot: str = "a") -> str:
