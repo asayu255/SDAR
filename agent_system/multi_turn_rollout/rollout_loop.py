@@ -40,12 +40,17 @@ from agent_system.environments.progress import PV_COLUMNS, PV_TERM_RUNNING, PV_T
 from agent_system.environments.oci_layout import (
     OCI_DOC_KEY, OCI_PLAIN_KEY, OCI_ROLE_KEY, slots_on as _oci_slots_on,
     rank_on as _oci_rank_on, rank_self_check_rows as _oci_rank_self_check_rows,
-    document_render_on as _oci_doc_render_on)
+    document_render_on as _oci_doc_render_on,
+    OCI_DOC_S_KEY, TIED_MATCH_KEY, TIED_EVID_KEY, tied_on as _tied_on)
 
 # Width of the oci_plan_repl column. The replacement is the no-plan render's
 # boundary tokens, which is one "\n\n" on this template; 16 is slack, and a
 # row needing more is recorded as not strippable rather than truncated.
 OCI_REPL_WIDTH = 16
+# algorithm.tied_opsd: the saturated side's render differs from the stuck side's by one sentence
+# inside the document block, so its edit is recorded RELATIVE TO the stuck side's render, and is
+# small. 128 tokens holds either sentence with room to spare (they are 25-35 tokens).
+TIED_S_WIDTH = 128
 
 
 def _oci_render_edit(tokenizer, messages, plain_content, width, template_kwargs,
@@ -970,7 +975,7 @@ class TrajectoryCollector:
         # and token ids fit it; a row whose replacement does not fit is recorded
         # as not strippable, exactly as before.
         self._oci_repl_width = (int(config.data.max_prompt_length)
-                                if (_oci_slots_on(config) or _oci_doc_render_on(config))
+                                if (_oci_slots_on(config) or _oci_doc_render_on(config) or _tied_on(config))
                                 else OCI_REPL_WIDTH)
         self._oci_repl_dtype = (torch.long if self._oci_repl_width <= OCI_REPL_WIDTH
                                 else torch.int32)
@@ -1256,6 +1261,29 @@ class TrajectoryCollector:
                 oci_doc_off, oci_doc_len, _doc_repl = _edit_doc
                 oci_doc_repl_len = len(_doc_repl)
                 oci_doc_repl = list(_doc_repl) + [0] * (self._oci_repl_width - len(_doc_repl))
+        # algorithm.tied_opsd: the saturated side's render, as an edit of the stuck side's (the two
+        # differ by the block's last sentence), and the row's two flags. On every row (zeros / -1
+        # when the switch is off) so collate stacks them.
+        tied_s_off = tied_s_len = tied_s_repl_len = 0
+        tied_s_repl = [0] * TIED_S_WIDTH
+        _docs_s = obs.get(OCI_DOC_S_KEY, None)
+        _doc_s = (_docs_s[item] or "") if _docs_s is not None and _docs_s[item] else ""
+        if _doc_s and oci_doc_len > 0 and _doc_s != _oci_doc:
+            _msgs_f = [dict(_m) for _m in messages]
+            for _m in _msgs_f:
+                if _m.get("role") == "user":
+                    _m["content"] = _oci_doc
+                    break
+            _edit_s = _oci_render_edit(tokenizer, _msgs_f, _doc_s, TIED_S_WIDTH, apply_chat_template_kwargs,
+                                       prompt_window=int(self.config.data.max_prompt_length))
+            if _edit_s is not None:
+                tied_s_off, tied_s_len, _s_repl = _edit_s
+                tied_s_repl_len = len(_s_repl)
+                tied_s_repl = list(_s_repl) + [0] * (TIED_S_WIDTH - len(_s_repl))
+        _tm = obs.get(TIED_MATCH_KEY, None)
+        tied_match = int(_tm[item]) if _tm is not None and _tm[item] is not None else -1
+        _te = obs.get(TIED_EVID_KEY, None)
+        tied_evid = int(_te[item]) if _te is not None and _te[item] is not None else 0
         _oci_doc_prompt = ""
         if self._oci_store_doc_prompt and _oci_doc and _oci_doc != obs_content:
             # The same render _oci_render_edit compares against: this row's
@@ -1365,6 +1393,12 @@ class TrajectoryCollector:
             'oci_doc_len': torch.tensor(oci_doc_len, dtype=torch.long),
             'oci_doc_repl': torch.tensor(oci_doc_repl, dtype=self._oci_repl_dtype),
             'oci_doc_repl_len': torch.tensor(oci_doc_repl_len, dtype=torch.long),
+            'tied_s_off': torch.tensor(tied_s_off, dtype=torch.long),
+            'tied_s_len': torch.tensor(tied_s_len, dtype=torch.long),
+            'tied_s_repl': torch.tensor(tied_s_repl, dtype=torch.long),
+            'tied_s_repl_len': torch.tensor(tied_s_repl_len, dtype=torch.long),
+            'tied_match': torch.tensor(tied_match, dtype=torch.long),
+            'tied_evid': torch.tensor(tied_evid, dtype=torch.long),
             'oci_plan_repl_len': torch.tensor(oci_plan_repl_len, dtype=torch.long),
             # truncation=left cuts the head, which is where the offset is
             # measured from, so a truncated row's span no longer locates the
@@ -1443,6 +1477,12 @@ class TrajectoryCollector:
             'oci_doc_len': torch.tensor(0, dtype=torch.long),
             'oci_doc_repl': torch.zeros(self._oci_repl_width, dtype=self._oci_repl_dtype),
             'oci_doc_repl_len': torch.tensor(0, dtype=torch.long),
+            'tied_s_off': torch.tensor(0, dtype=torch.long),
+            'tied_s_len': torch.tensor(0, dtype=torch.long),
+            'tied_s_repl': torch.zeros(TIED_S_WIDTH, dtype=torch.long),
+            'tied_s_repl_len': torch.tensor(0, dtype=torch.long),
+            'tied_match': torch.tensor(-1, dtype=torch.long),
+            'tied_evid': torch.tensor(0, dtype=torch.long),
             'oci_plan_repl_len': torch.tensor(0, dtype=torch.long),
             'oci_plan_truncated': torch.tensor(0, dtype=torch.long),
             'oci_role': torch.tensor(0, dtype=torch.long),

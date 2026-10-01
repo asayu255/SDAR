@@ -42,6 +42,8 @@ from agent_system.environments.oci_layout import (
     with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
     doc_sentence_key as _doc_sentence_key, foreign_slot_on as _foreign_slot_on,
     with_doc_lead as _with_doc_lead, doc_pointer_key as _doc_pointer_key,
+    OCI_DOC_S_KEY, TIED_MATCH_KEY, TIED_EVID_KEY, tied_block as _tied_block,
+    tied_task_on as _tied_task_on, tied_webshop_query as _tied_webshop_query,
     has_foreign_slot as _has_foreign_slot,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
@@ -57,6 +59,8 @@ from agent_system.environments.oci_layout import (
     slot_role as _slots_role, slots_on as _slots_on)
 from agent_system.memory import SimpleMemory, SearchMemory
 from agent_system.environments.alf_pointer import AlfStatePointer, executed as _alf_executed
+from agent_system.environments.search_pointer import SearchStatePointer
+from agent_system.environments.webshop_pointer import WebshopStatePointer
 from agent_system.environments.progress import (
     PROGRESS_K_MILESTONE_INFO, PROGRESS_TOTAL_MILESTONE_INFO, AlfworldMilestones,
     PROGRESS_K_ARRIVE_INFO, PROGRESS_TOTAL_ARRIVE_INFO,
@@ -589,6 +593,16 @@ def _search_query(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+# WebShop's turn prompt: the tied-group teacher's progress line goes right before it, as in the other two.
+_WEBSHOP_GUIDE_ANCHOR = "Now it's your turn to take one action for the current step."
+
+
+def _insert_webshop_guide(obs: str, line: str) -> str:
+    if not line or obs.count(_WEBSHOP_GUIDE_ANCHOR) != 1:
+        return obs
+    return obs.replace(_WEBSHOP_GUIDE_ANCHOR, line + _WEBSHOP_GUIDE_ANCHOR, 1)
+
+
 def _insert_search_guide(obs: str, line: str) -> str:
     if not line or obs.count(_SEARCH_GUIDE_ANCHOR) != 1:
         return obs
@@ -869,6 +883,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._searches = [0] * n
         # Where each route-document row stands in its route (expert_flow only).
         self._route_ptr = [0] * n
+        # algorithm.tied_opsd: every row's state pointer on its question's route (search_pointer),
+        # built on first render from the route block.
+        self._srch_sptr = [None] * n
         # The progress-value records (progress.PV_COLUMNS): before any result has come back nothing
         # is seen and both counts are 0, whatever the question.
         self._pv = (PvTracker([{"k": 0, "evid": 0} for _ in range(n)], _turn_cap(self.config))
@@ -891,6 +908,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             OCI_ROLE_KEY: list(self._oci_roles),
             OCI_PLAIN_KEY: list(self._oci_plains),
             OCI_DOC_KEY: list(self._oci_docs),
+            OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+            TIED_MATCH_KEY: list(getattr(self, "_tied_match", [])),
+            TIED_EVID_KEY: list(getattr(self, "_tied_evid", [])),
         }
 
         return observations, infos
@@ -972,6 +992,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             rc.step(actions[i])
         self._note_returned(next_obs)
         self._note_route(text_actions)
+        for i, sp in enumerate(list(getattr(self, "_srch_sptr", None) or [])[:len(next_obs)]):
+            if sp is not None:
+                sp.observe(next_obs[i], query=_search_query(text_actions[i]) if i < len(text_actions) else None)
         self._probe_note_turn(text_actions, next_obs, rewards, dones, infos)
         if _progress_on(self.config):
             # (a)'s k for EVERY row, both counts: has a returned result carried the
@@ -1025,6 +1048,9 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             OCI_ROLE_KEY: list(self._oci_roles),
             OCI_PLAIN_KEY: list(self._oci_plains),
             OCI_DOC_KEY: list(self._oci_docs),
+            OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+            TIED_MATCH_KEY: list(getattr(self, "_tied_match", [])),
+            TIED_EVID_KEY: list(getattr(self, "_tied_evid", [])),
         }
 
         for i, info in enumerate(infos):
@@ -1097,6 +1123,23 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 sent = query is not None
             if sent:
                 counts[i] += 1
+
+    def _tied_route_block(self, i: int) -> str:
+        """Question i's verified route as a document block (strict lead; tied_block shortens it), or ''."""
+        problems = getattr(self, "problems", None) or []
+        p = problems[i] if i < len(problems) else {}
+        return render_document(
+            _search_route_hint_document_lines(p.get("question"), p.get("ground_truth"),
+                                              _slots_search_flow_path(getattr(self, "config", None))),
+            lead=SEARCH_ROUTE_HINT_LEAD)
+
+    def _search_state_pointer(self, i: int, lines):
+        sps = getattr(self, "_srch_sptr", None)
+        if sps is None or i >= len(sps):
+            return SearchStatePointer(lines, self._question(i) or "", titles=self._expected_titles(i))
+        if sps[i] is None:
+            sps[i] = SearchStatePointer(lines, self._question(i) or "", titles=self._expected_titles(i))
+        return sps[i]
 
     def _note_returned(self, next_obs) -> None:
         """The progress line's only state: has a returned result carried the answer?
@@ -1273,6 +1316,10 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         self._oci_roles = []
         self._oci_plains = []
         self._oci_docs = []
+        self._oci_docs_s = []
+        self._tied_match = []
+        self._tied_evid = []
+        _tied = _tied_task_on(self.config, "search")
         _envs = getattr(self, "envs", None)
         _rank = _doc_render_on(self.config) and "search" in _doc_render_tasks(self.config)
         _second = _slots_second_doc(self.config)
@@ -1324,9 +1371,31 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                         obs_i = _insert_search_guide(obs_i, _search_progress_line(bool(_seen[i])))
             self._oci_plains.append(
                 plain_obs if (_role in (ROLE_DOC, ROLE_DOC_B) and obs_i != plain_obs) else "")
-            # Whole document, no progress line: the rank scorer does not act.
-            _doc_blk = self.document_block(i) if _rank else ""
-            self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
+            if _tied:
+                # THE TIED-GROUP TEACHER'S TURN: the verified route (short lead, each side's sentence) in
+                # front of this prompt, and the state pointer's line: the search after the furthest one
+                # whose result has come back, or where the answer is once a result carries it.
+                _raw = self._tied_route_block(i)
+                _ev = 1 if bool(_seen[i]) else 0
+                if _raw:
+                    _lines = _block_lines(_raw)
+                    _sp = self._search_state_pointer(i, _lines)
+                    _found, _where = self._route_found(i)
+                    _ts = (getattr(self, "_titles_seen", None) or [{}] * (i + 1))[i]
+                    _line = _search_route_line(_lines, _sp.ptr(_found, titles_seen=set(_ts)), _found, where=_where)
+                    _body = _insert_search_guide(plain_obs, _line)
+                    self._oci_docs.append(_tied_block("search", _raw, "f") + _body)
+                    self._oci_docs_s.append(_tied_block("search", _raw, "s") + _body)
+                    self._tied_match.append(1 if _line else 0)
+                else:
+                    self._oci_docs.append("")
+                    self._oci_docs_s.append("")
+                    self._tied_match.append(-1)
+                self._tied_evid.append(_ev)
+            else:
+                # Whole document, no progress line: the rank scorer does not act.
+                _doc_blk = self.document_block(i) if _rank else ""
+                self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
 
             postprocess_text_obs.append(obs_i)
 
@@ -1413,7 +1482,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 OCI_PREFIX_KEY: list(self._oci_prefixes),
                 OCI_ROLE_KEY: list(self._oci_roles),
                 OCI_PLAIN_KEY: list(self._oci_plains),
-                OCI_DOC_KEY: list(self._oci_docs)}, infos
+                OCI_DOC_KEY: list(self._oci_docs),
+                OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+                TIED_MATCH_KEY: list(getattr(self, "_tied_match", []))}, infos
     
     def _alf_role(self, i: int, envs=None) -> int:
         """This slot's role under the configured layout: the foreign slot unless
@@ -1615,7 +1686,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                              OCI_PREFIX_KEY: list(self._oci_prefixes),
                              OCI_ROLE_KEY: list(self._oci_roles),
                              OCI_PLAIN_KEY: list(self._oci_plains),
-                             OCI_DOC_KEY: list(self._oci_docs)}
+                             OCI_DOC_KEY: list(self._oci_docs),
+                             OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+                             TIED_MATCH_KEY: list(getattr(self, "_tied_match", []))}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -1669,6 +1742,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # answer, so every row needs the conditioning. '' when the switch is off
         # or the document cannot be built.
         self._oci_docs = []
+        # algorithm.tied_opsd: the two teacher renders of every row and whether its state pointer placed it.
+        self._oci_docs_s = []
+        self._tied_match = []
+        _tied = _tied_task_on(self.config, "alfworld")
         _rank = (_doc_render_on(self.config)
                  and "alfworld" in _doc_render_tasks(self.config))
         _envs = getattr(self, 'envs', None)
@@ -1765,8 +1842,25 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # WHOLE DOCUMENT, NO PROGRESS LINE. The scorer does not act, so it
             # needs no pointer -- and the pointer only advances on an exact
             # action match, which an ordinary rollout does not give.
-            _doc_blk = self.document_block(i) if _rank else ""
-            self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
+            if _tied:
+                # THE TIED-GROUP TEACHER'S TURN: the walkthrough (short lead, each side's sentence) in front
+                # of exactly this prompt, and the state pointer's progress line before the turn prompt.
+                # Every row gets it: which side a row is on is known only when its group has finished.
+                _raw = self.document_block(i)
+                if _raw:
+                    _sp = self._alf_state_pointer(i, _block_lines(_raw))
+                    _line = _sp.line(admissible_actions[i]) if _sp is not None else ""
+                    _body = _insert_guide(plain_obs, _line)
+                    self._oci_docs.append(_tied_block("alfworld", _raw, "f") + _body)
+                    self._oci_docs_s.append(_tied_block("alfworld", _raw, "s") + _body)
+                    self._tied_match.append(1 if _line else 0)
+                else:
+                    self._oci_docs.append("")
+                    self._oci_docs_s.append("")
+                    self._tied_match.append(-1)
+            else:
+                _doc_blk = self.document_block(i) if _rank else ""
+                self._oci_docs.append(_doc_blk + plain_obs if _doc_blk else "")
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
@@ -2059,6 +2153,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         # across steps for a given episode seed.
                         'anchor': [f"{t} [SEP] {o}" for t, o in zip(self.tasks, obs)],
                         OCI_DOC_KEY: list(getattr(self, "_oci_docs", [])),
+                        OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+                        TIED_MATCH_KEY: list(getattr(self, "_tied_match", [])),
                         }
         self.pre_text_obs = obs
         self.memory.reset(batch_size = len(infos))
@@ -2081,6 +2177,8 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             'image': None,
             'anchor': next_obs.copy(),
             OCI_DOC_KEY: list(getattr(self, "_oci_docs", [])),
+            OCI_DOC_S_KEY: list(getattr(self, "_oci_docs_s", [])),
+            TIED_MATCH_KEY: list(getattr(self, "_tied_match", [])),
         }
         _wsp = getattr(self, "_ws_progress", None) or []
         if _wsp:
@@ -2154,6 +2252,15 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # doc_lead=short swaps the lead (default strict: byte-identical to before).
         return _with_doc_lead(render_document(_webshop_document_lines(goal)), getattr(self, "config", None))
     
+    def _ws_state_pointer(self, i: int, lines, goal):
+        sps = getattr(self, "_ws_sptr", None)
+        if sps is None or len(sps) <= i:
+            sps = list(sps or []) + [None] * (i + 1 - len(sps or []))
+            self._ws_sptr = sps
+        if sps[i] is None or sps[i].lines != list(lines):
+            sps[i] = WebshopStatePointer(lines, (goal or {}).get("asin"), (goal or {}).get("goal_options"))
+        return sps[i]
+
     def format_obs(self, text_obs):
         postprocess_text_obs = []
         for i in range(len(text_obs)):
@@ -2196,6 +2303,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         # asks for it or the record cannot be built. The prompt the policy is
         # given -- what this function returns -- is untouched either way.
         self._oci_docs = []
+        self._oci_docs_s = []
+        self._tied_match = []
+        _tied = _tied_task_on(self.config, "webshop")
         _doc = _doc_render_on(self.config) and "webshop" in _doc_render_tasks(self.config)
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
@@ -2232,8 +2342,29 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         available_actions=reformatted_available_actions
                     )
 
-            _blk = self.document_block(i) if _doc else ""
-            self._oci_docs.append(_blk + obs if _blk else "")
+            if _tied:
+                # THE TIED-GROUP TEACHER'S TURN: the purchase path (its search line the goal's own
+                # instruction; short lead, each side's sentence) in front of this prompt, and the state
+                # pointer's line, read off the page and the session.
+                _goals = getattr(self, "goals", None) or []
+                _goal = _goals[i] if i < len(_goals) else None
+                _lines = _webshop_document_lines(_goal, query=_tied_webshop_query(self.config)) if _goal else []
+                if _lines:
+                    _raw = render_document(_lines)
+                    _sp = self._ws_state_pointer(i, _lines, _goal)
+                    _info = infos[i] if isinstance(infos[i], dict) else {}
+                    _line = _sp.line(_info.get('available_actions'), _info.get(WS_STATE_INFO))
+                    _body = _insert_webshop_guide(obs, _line)
+                    self._oci_docs.append(_tied_block("webshop", _raw, "f") + _body)
+                    self._oci_docs_s.append(_tied_block("webshop", _raw, "s") + _body)
+                    self._tied_match.append(1 if _line else 0)
+                else:
+                    self._oci_docs.append("")
+                    self._oci_docs_s.append("")
+                    self._tied_match.append(-1)
+            else:
+                _blk = self.document_block(i) if _doc else ""
+                self._oci_docs.append(_blk + obs if _blk else "")
 
             postprocess_text_obs.append(obs)
 

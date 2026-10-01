@@ -1318,3 +1318,80 @@ def alfworld_foreign_obs(obs: str, real_task: str, gamefile) -> str:
         raise ValueError("the real goal sentence is not in this observation; the foreign "
                          "slot cannot be built from it")
     return obs.replace(real, alfworld_foreign_task(gamefile, real))
+
+
+# --- tied-group self-distillation (algorithm.tied_opsd) -------------------------------------- #
+#
+# The design of 2026-10-01 (artifact "停滞・飽和群の自己蒸留"): in a group whose eight rollouts all
+# failed (stuck) or all succeeded (saturated), GRPO's outcome signal is zero, and the student is
+# distilled toward ITSELF with this instance's correct document in front of the prompt. Nothing
+# here changes the prompt the policy is given: every row carries two more renders of its own turn,
+# for the teacher only --
+#   OCI_DOC_KEY    the document with the stuck side's sentence (progress), the short lead, and the
+#                  state pointer's progress line before the turn prompt
+#   OCI_DOC_S_KEY  the same with the saturated side's sentence (efficiency)
+# -- because which side a row is on is known only once its whole group has finished. Beside them,
+# TIED_MATCH_KEY says whether the state pointer placed the row (1), could not (0: the path has no
+# line for its state, a mismatched turn that is not distilled), or there is no document (-1), and
+# TIED_EVID_KEY (search) whether a returned result had carried the answer before this turn (the
+# answer is distilled only then).
+OCI_DOC_S_KEY = "oci_doc_s"
+TIED_MATCH_KEY = "tied_match"
+TIED_EVID_KEY = "tied_evidence"
+TIED_TASKS = ("alfworld", "webshop", "search")
+
+
+def tied_cfg(config):
+    """``algorithm.tied_opsd`` as a dict-like, or None. Works on a DictConfig, a plain dict, or a
+    SimpleNamespace whose ``algorithm`` is a dict (the CPU tests)."""
+    if config is None:
+        return None
+    alg = getattr(config, "algorithm", None)
+    if alg is None and isinstance(config, dict):
+        alg = config.get("algorithm")
+    if alg is None:
+        return None
+    try:
+        return alg.get("tied_opsd", None)
+    except AttributeError:
+        return getattr(alg, "tied_opsd", None)
+
+
+def tied_on(config) -> bool:
+    cfg = tied_cfg(config)
+    return bool(cfg is not None and cfg.get("enable", False))
+
+
+def tied_tasks(config) -> tuple:
+    if not tied_on(config):
+        return ()
+    want = list(tied_cfg(config).get("tasks", TIED_TASKS) or TIED_TASKS)
+    return tuple(t for t in TIED_TASKS if t in want)
+
+
+def tied_task_on(config, task) -> bool:
+    return str(task) in tied_tasks(config)
+
+
+def tied_webshop_query(config) -> str:
+    """The first line of WebShop's document: the goal's instruction (the design) or its title."""
+    q = str((tied_cfg(config) or {}).get("webshop_query", "instruction") or "instruction")
+    if q not in ("instruction", "name"):
+        raise ValueError(f"algorithm.tied_opsd.webshop_query={q!r}; expected 'instruction' or 'name'")
+    return q
+
+
+def tied_block(task, block: str, side: str) -> str:
+    """The document block the tied-group teacher reads for ``side`` ('f' stuck, 's' saturated):
+    the short lead in place of the strict one, and the side's sentence as the block's last line."""
+    if not block:
+        return ""
+    if side not in ("f", "s"):
+        raise ValueError(f"tied_block side={side!r}; expected 'f' or 's'")
+    out = block
+    for strict, short in ((PLAN_LEAD, PLAN_LEAD_SHORT), (SEARCH_ROUTE_HINT_LEAD, SEARCH_ROUTE_HINT_LEAD_SHORT)):
+        if strict in out:
+            out = out.replace(strict, short, 1)
+            break
+    sentence = DOC_SENTENCES.get(str(task), {}).get("progress" if side == "f" else "efficiency", "")
+    return with_doc_sentence(out, sentence)
