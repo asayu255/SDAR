@@ -218,6 +218,41 @@ try:
           "the document row reads SDAR's header and skills, no pointer, no answer")
     check(all(ol.SDAR_SKILL_HEADER not in t8[i] for i in range(9)), "the plain rows and the reserve see nothing")
 
+    print("8. the one-sentence nudges (doc_sentence / doc_sentence_b)")
+    cfg8 = OmegaConf.create({
+        "env": {"history_length": 4, "rollout": {"n": 10}},
+        "algorithm": {"oci_slots": {"enable": True, "tasks": ["search"], "search_doc": "route_hint",
+                                    "search_doc_b": "route_hint", "search_flow_path": FLOW_FILE,
+                                    "doc_sentence": "explore", "doc_sentence_b": "none",
+                                    "doc_mode": "walkthrough_stepwise", "foreign_task": "webshop"},
+                      "oci_rank": {"enable": False}},
+    })
+    m5 = SearchEnvironmentManager(_Envs(10, 10, {8, 9}), lambda acts: (list(acts), [1] * len(acts)), cfg8)
+    t9 = m5.reset(KW * 10)[0]["text"]
+    EXPLORE = ol.DOC_SENTENCES["search"]["explore"]
+    blk_a, blk_b = m5.document_block(9, slot="a"), m5.document_block(8, slot="b")
+    check(EXPLORE in t9[9] and EXPLORE not in t9[8] and all(EXPLORE not in t9[i] for i in range(8)),
+          "only the document row carries the exploration sentence; the second document row and the rest do not")
+    check(blk_a.index(EXPLORE) > blk_a.index("2. <search>") and blk_a.rstrip().endswith(ol.PLAN_FOOTER)
+          and ol.render_document(ol.search_route_hint_document_lines(QUESTION, TARGET, FLOW_FILE),
+                                 lead=ol.SEARCH_ROUTE_HINT_LEAD) == blk_b,
+          "it is the block's last line, after the numbered queries; the other row's block is unchanged")
+    import re as _re
+    check(_re.findall(r"^\d+\. (.+)$", blk_a, flags=_re.M) == _re.findall(r"^\d+\. (.+)$", blk_b, flags=_re.M),
+          "the numbered lines the pointer walks are identical with and without the sentence")
+    check("Your next action is search 1 of 2" in t9[9] and "Your next action is search 1 of 2" in t9[8],
+          "both rows still get the pointer line")
+    check(ol.with_doc_sentence("", EXPLORE) == "" and ol.with_doc_sentence(blk_b, "") == blk_b,
+          "no block or no sentence: unchanged")
+    try:
+        ol.doc_sentence_key(OmegaConf.create({"algorithm": {"oci_slots": {"doc_sentence": "exploit"}}}))
+        check(False, "an unknown sentence key is refused")
+    except ValueError:
+        check(True, "an unknown sentence key is refused")
+    check(set(ol.DOC_SENTENCES) == {"alfworld", "webshop", "search"}
+          and all(ANSWER not in v for d in ol.DOC_SENTENCES.values() for v in d.values()),
+          "one explore and one efficiency sentence per task")
+
     m2 = manager(10, evidence_for={8, 9}, search_doc="answer_rule", search_doc_b="expert_flow")
     t3 = m2.reset(KW * 10)[0]["text"]
     acts2 = ["<think> go </think><search> closest airport Lewisburg West Virginia </search>"] * 10

@@ -512,6 +512,16 @@ algorithm:
     # file of question -> queries, written and checked by
     # data/qa_annotations/verify_claude_flows.py (no query may name the answer).
     search_flow_path: ""
+    # One sentence added as the last line of the document block (inside the wrapper,
+    # after the numbered lines): explore | efficiency | none, for the document row
+    # (doc_sentence) and the second document row (doc_sentence_b). The user's design,
+    # 2026-10-01: the same document in stuck and saturated groups, plus an exploration
+    # sentence in stuck groups and an efficiency sentence in saturated ones; the text per
+    # task is oci_layout.DOC_SENTENCES. none leaves every block byte-identical.
+    doc_sentence: none
+    doc_sentence_b: none
+    # SDAR's Search skill files for search_doc=sdar_skills ("" = the repo's skills/search).
+    search_skills_dir: ""
     # Whose prompt the foreign slot is shown. Not a failure-INDUCING document:
     # five of those were measured on saturated groups and none reached 12%,
     # because a student that already knows what to do ignores a path it does not

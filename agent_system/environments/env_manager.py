@@ -37,6 +37,8 @@ from agent_system.environments.oci_layout import (
     search_route_hint_document_lines as _search_route_hint_document_lines,
     evidence_position as _evidence_position, ROUTE_DOC_MODES as _ROUTE_DOC_MODES,
     SEARCH_ROUTE_HINT_LEAD, sdar_skill_document as _sdar_skill_document,
+    with_doc_sentence as _with_doc_sentence, doc_sentence_text as _doc_sentence_text,
+    doc_sentence_key as _doc_sentence_key,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
@@ -887,6 +889,11 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         return observations, infos
 
     def document_block(self, i: int, slot: str = "a") -> str:
+        """The block for question ``i`` with this slot's sentence (doc_sentence[_b]), if any."""
+        return _with_doc_sentence(self._document_block_raw(i, slot),
+                                  _doc_sentence_text("search", getattr(self, "config", None), slot))
+
+    def _document_block_raw(self, i: int, slot: str = "a") -> str:
         """The block that answers question ``i``, or '' when it cannot be built.
 
         Same wrapper and numbering as the other two tasks.
@@ -1157,6 +1164,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 # "yes" is in any passage), so its slot ran plain and must not be
                 # scored as a rescue.
                 "variant": _slots_search_doc(self.config, slot=slot) if slot else None,
+                "sentence": _doc_sentence_key(self.config, slot) if slot else None,
                 "has_document": bool(self.document_block(i, slot=slot)) if slot else False,
                 # For the split the rescue rate has to be read in: a one-word or
                 # bare-number answer is both easier to write and easier to match

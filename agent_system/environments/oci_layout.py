@@ -557,6 +557,66 @@ SEARCH_ROUTE_HINT_LEAD = (
 )
 
 
+# THE ONE-SENTENCE NUDGES (the user's design, 2026-10-01): the same document in stuck and
+# saturated groups, plus one sentence -- exploration where nobody solved it (look where you
+# have not looked), efficiency where everybody did (do not look again where you have looked).
+# Written only from what the student can see -- its own actions and what came back -- never
+# the answer or where anything is; actions, not "think more/less", so the sentence does not
+# set the reasoning length. Text agreed with the user 2026-10-01.
+DOC_SENTENCES = {
+    "alfworld": {
+        "explore": ("Look where you have not looked yet: go to receptacles you have not visited or "
+                    "opened, not only the one named in the task, and do not repeat an action you "
+                    "have already taken."),
+        "efficiency": ("Do not look again where you have already looked: do not revisit a receptacle "
+                       "or repeat an action, and take or place the object as soon as you can."),
+    },
+    "webshop": {
+        "explore": ("Look at products you have not opened yet: go back to the results or search with "
+                    "different words, and do not buy until a product meets every requirement."),
+        "efficiency": ("Do not reopen products or options you have already checked: as soon as a "
+                       "product meets every requirement, select its options and buy it."),
+    },
+    "search": {
+        "explore": ("Search for what you have not searched yet: if the results do not contain the fact "
+                    "you need, send a different query that names a different entity, and do not repeat "
+                    "a query."),
+        "efficiency": ("Do not search again for what you have already found: as soon as a result "
+                       "contains the fact you need, answer with it."),
+    },
+}
+DOC_SENTENCE_KEYS = ("none", "explore", "efficiency")
+
+
+def doc_sentence_key(config, slot: str = "a") -> str:
+    """Which sentence the document row (slot a) or the second document row (b) carries."""
+    cfg = slots_cfg(config) or {}
+    key = "doc_sentence" if slot == "a" else "doc_sentence_b"
+    value = str(cfg.get(key, "none") or "none")
+    if value not in DOC_SENTENCE_KEYS:
+        raise ValueError(f"algorithm.oci_slots.{key}={value!r}; expected one of {DOC_SENTENCE_KEYS}")
+    return value
+
+
+def doc_sentence_text(task, config, slot: str = "a") -> str:
+    key = doc_sentence_key(config, slot)
+    return "" if key == "none" else DOC_SENTENCES.get(str(task), {}).get(key, "")
+
+
+def with_doc_sentence(block: str, sentence: str) -> str:
+    """The block with ``sentence`` as its last line, inside the wrapper.
+
+    After the numbered lines, so _block_lines (which reads only "N. ..." lines) and the
+    pointer walk exactly the same path; '' and an empty sentence pass through unchanged.
+    """
+    if not block or not sentence:
+        return block
+    i = block.rfind(PLAN_FOOTER)
+    if i < 0:
+        return block
+    return block[:i] + sentence.strip() + "\n" + block[i:]
+
+
 def search_lead(template: str, target) -> str:
     """A lead with the first accepted answer written into its sentence.
 
