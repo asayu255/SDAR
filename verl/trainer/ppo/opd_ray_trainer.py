@@ -1068,6 +1068,9 @@ class OPDRayTrainer(RayPPOTrainer):
             :data:`PrefetchedRow` beside the sign-plane keys when this arm caches
             them, which :meth:`compute_sign_weight_cache` unwraps.
         """
+        if not self.teacher_paths:
+            # algorithm.tied_opsd: no external teacher, nothing to score in the window.
+            return None
         by_task = {}
         for key, row in chunk:
             task = self._normalize_task_name(row.get("task_name"))

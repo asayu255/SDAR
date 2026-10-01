@@ -1,0 +1,438 @@
+# INTENT LOCK: algorithm.tied_opsd (run_multitask_tied_opsd_qwen3.sh), 2026-10-01.
+# = expected_multitask_grpo_v2recipe_config.yaml (the GRPO cell of the v2 recipe, below unchanged) with:
+#   - no external OPD teacher: teacher_paths {}, use_teacher_kl_loss false (main_opd_grpo turns it off);
+#   - algorithm.tied_opsd on with every key pinned, and actor.tied_opsd true;
+#   - Search's verified routes (algorithm.oci_slots.search_flow_path; the slot layout stays off).
+"algorithm.tied_opsd.enable": true
+"algorithm.tied_opsd.tasks": [alfworld, webshop, search]
+"algorithm.tied_opsd.topk": 20
+"algorithm.tied_opsd.refresh_every": 50
+"algorithm.tied_opsd.retention": 0.8
+"algorithm.tied_opsd.guard": true
+"algorithm.tied_opsd.webshop_query": instruction
+"actor_rollout_ref.actor.tied_opsd": true
+"algorithm.oci_slots.search_flow_path": /opt1/ohara/data/qa_annotations/route_hints_4500/route_hints_v2.json
+"algorithm.opd.teacher_paths": {}
+#
+# ---- the parent lock (expected_multitask_grpo_v2recipe_config.yaml), as it was -------------------
+# Expected effective config for OPD + GRPO ON THE VALUE ARM'S RECIPE with the TOKEN-normalised
+# policy gradient -- the 2x2's control cell -- launched by run_multitask_grpo_v2recipe_qwen3.sh:
+# the progress_value_gae lam 1.0 lock below verbatim, with two changes:
+#   - algorithm.adv_estimator grpo (its line below): outcome GRPO's group-relative advantages. The
+#     value arm's gamma, lam and progress_value keys stay pinned as they are: grpo reads none of
+#     them, progress_value.enable is the records' switch (the pv_* columns; nothing reaches the
+#     advantage), and the rest is the table config the records-only shadow of the value
+#     estimator is built with (algorithm.progress_value.records.shadow_value: its own table, never
+#     the checkpoint's). Their comments below describe the value arm.
+#   - actor.pg_loss_norm token pinned (the block at the end): the default, as on the parent.
+# THE 2x2 (2026-09-30, the user: trajectory normalisation (a) is the paper's main one, the token
+# normalisation (b) the control beside it), one lock per cell (and per lam):
+#                        (b) token-normalised PG                  (a) trajectory-normalised PG
+#   OPD + GRPO           expected_multitask_grpo_v2recipe_        expected_multitask_grpo_v2recipe_
+#                        config.yaml                              trajnorm_config.yaml
+#   progress_value_gae   expected_multitask_progress_value_gae_   expected_multitask_progress_value_gae_
+#                        lam{1.0,0.9}_config.yaml                 trajnorm_lam{1.0,0.9}_config.yaml
+# Everything else is the progress_value_gae lam 1.0 lock verbatim; that header follows.
+#
+# Expected effective config for the PROGRESS_VALUE_GAE arm at lam = 1.0, launched by
+# run_multitask_progress_value_gae_qwen3.sh (the default LAM): the beta-mirror v2 arm below with its
+# advantage REPLACED by the value table's (verl/trainer/ppo/progress_value.py):
+#   - adv_estimator progress_value_gae: V(z_t) from a table over the state before action t
+#     (ALFWorld: task type, k, turns since k rose, turns left; WebShop: k, stag, rem -- the buy-now
+#     score is off, it queries the evaluator; Search: k, rem), shrunk cell -> (task, type, rem) -> task at n0 8, discounted counts at retention 0.9,
+#     frozen within a step; delta_t = gamma V(z_{t+1}) - V(z_t) with V(z_T) = R (won), GAE over
+#     the deltas, x adv_scale 2.0, plus the format term (the z-score of "invalid" over a group's
+#     turn rows, in groups whose rollouts all have the same R) at weight 1.0.
+#   - gamma 1.0 and lam 1.0: A_t = gamma^(T-t) R - V(z_t), so the table is only a baseline and a
+#     wrong table costs variance, not bias.
+#   - progress_rank off: no (a), no sat. Its counter choices stay pinned, because they are
+#     what the table's k counts: alfworld_k milestone_arrive, search_k evidence_answered (v2's),
+#     and webshop_k session (new: the environment's own session, no option over-count).
+#   - the (a)/sat strength keys v2 pins (rho, ema, cap, min_top_k, tasks, the Beta rule, sat,
+#     mixed) are NOT pinned: with progress_rank off nothing reads them.
+#   - the analysis records on (algorithm.progress_value.records, 2026-09-30): every step's group
+#     records and records/* metrics, with the GRPO and GiGPO shadows beside the advantage
+#     (verl/trainer/ppo/rollout_records.py). Observation only: nothing in training reads them.
+# One lock per lam: the launcher picks expected_multitask_progress_value_gae_lam$LAM_config.yaml,
+# so a lam without a lock refuses to start. The two locks differ only in algorithm.lam (and
+# the lines that describe it).
+# Everything else is the beta-mirror v2 lock verbatim; that header follows.
+#
+# Expected effective config for the BETA-MIRROR V2 arm, launched by
+# run_multitask_progress_rank_beta_mirror_v2_qwen3.sh: the beta-mirror arm below with the
+# next-run recipe decided on 2026-09-27 (user):
+#   - no firing minimum for (a) on any task: min_top_k 0 everywhere (was ALFWorld 1,
+#     WebShop 2, Search 1). k are non-negative integers, so a group whose k differ always
+#     has top k >= 1: ALFWorld/Search's 1 never filtered, WebShop's 2 dropped 18.7% of its
+#     stuck groups (top k = 1, the goal product on a results page). (a) reinforces partial
+#     progress even when it came by chance.
+#   - no minimum turn spread for sat on any task: sat_min_spread 0 everywhere (was
+#     ALFWorld 2, WebShop 1, Search 1). A group of equal turns never fires anyway, so 0
+#     fires on any turn gap; ALFWorld's 2 dropped the winners one turn apart.
+#   - Search ranked by search_k=evidence_answered: 0 not seen / 1 seen, no answer /
+#     2 seen and answered (K 2; was evidence, K 1).
+#   - WebShop groups on goals the environment cannot pay (the correct purchase is capped
+#     below 1.0 by its option-matching bug; ~8% of training goals, 12/126 validation goals)
+#     are kept out of the tied-group shares and the success histogram
+#     (beta_exclude_capped true, 2026-09-28, user). Their rankings are untouched: (a) still
+#     pushes the correct procedure there. No reward and no training goal changes.
+#   - the Beta's input shares from discounted group counts (beta_share_estimator
+#     discounted_counts, 2026-09-28, user): C_kind <- (1 - alpha) C_kind + this step's groups,
+#     shares C / sum C, the pseudo-count over sum C (15, 27, 37, ... -> 75 groups), as MoPPS and
+#     Reinforce-Ada. The EMA path used 75 from the first step; the two agree in steady state.
+#   - each side's scores divided by max(this step's mean |s|, its discounted mean over recent training
+#     steps) (beta_denominator max_discounted, 2026-09-28, user): no step's mean push above m,
+#     smaller-than-typical gaps less; and every group's peak push held at L, the discounted (every
+#     training step) largest per-token base advantage in live groups (beta_cap max_outcome), a group
+#     over it scaled alone, padding copies included. Neither adds a scale coefficient.
+#   - (a) keeps ranking the capped WebShop groups (user): procedure shaping at the uncapped groups'
+#     m_f, not an imputation of their outcome signal (the Beta describes F(p | not capped)).
+#   - (code, not a key) ALFWorld's pick_two "placed" counts the most target objects in
+#     ONE receptacle at once, not every instance ever put down (progress.py).
+# Everything else is the beta-mirror lock verbatim; that header follows.
+#
+# Expected effective config for the BETA-MIRROR arm: (a) and sat sized by a per-task
+# Beta fitted to the tied-group shares (algorithm.progress_rank.scale_mode=beta_mirror),
+# launched by run_multitask_progress_rank_beta_mirror_qwen3.sh.
+#
+# The (a) lock (expected_multitask_progress_rank_config.yaml) verbatim below this
+# header, with ONE value changed -- alfworld_k is milestone_arrive, which the (a) lock
+# pins as milestone and the satgate launcher had to waive -- plus the arm's own keys
+# at the end:
+#   - the strength rule: scale_mode, the pseudo-count of the share smoothing, and the
+#     group size the Beta describes (it must equal env.rollout.n, pinned at 8 below;
+#     main_opd_grpo refuses a launch where the two differ);
+#   - sat: on, on all three tasks, no gate, ranked by turn count with the turn-weighted
+#     centring and the task-constant scale, no placebo;
+#   - mixed off, and the teacher never retired (algorithm.opd.retire.enable false,
+#     pinned so a copied launcher cannot quietly bring retirement back).
+# rho and sat_rho only switch the two sides on under beta_mirror; cap_kappa is pinned
+# by the (a) lock at its default and is not read in this mode.
+#
+# Expected effective config for the OPD + GRPO multitask run WITH
+# parameter-free cross-teacher KL weighting.
+#
+# This file is the machine-readable INTENT of the experiment. main_opd_grpo
+# validates the composed Hydra config against every key below AFTER its own
+# config injection (verl/utils/expected_config.py) and aborts on any mismatch,
+# so a wrong default / typo'd override / shadowed injection fails in seconds
+# instead of producing a mislabeled multi-hour run.
+#
+# Rules:
+#   - Keys are dotted paths into the composed config; values are the expected
+#     effective values.
+#   - Only SCIENTIFIC knobs live here (they define what the experiment *is*).
+#     Performance knobs (micro batch sizes, offload, prefix caching,
+#     max_model_len, gpu_memory_utilization, ...) are intentionally NOT listed
+#     so machine tuning never requires touching this file. $HOME-derived data
+#     paths are also not pinned (machine-dependent).
+#   - To change a setting intentionally: edit the run script AND this file in
+#     the same commit. A run-script-only edit will (by design) refuse to start.
+
+# ---- distillation loss (the knob that caused the original low_var_kl mishap) --
+"algorithm.opd.kl_loss_type": topk_kl
+"algorithm.opd.kl_loss_coef": 0.01
+"algorithm.opd.topk": 20
+# Per-task normalisation of the teacher-KL loss. The plain token-mean weights a
+# task by its share of response tokens, measured at 69/27/4% for
+# alfworld/webshop/search on this mixture purely because of the 50/15/4-turn
+# episode caps; the per-row weights in attach_task_loss_weights make it 1/3 each.
+# Data composition, batch sizes and step count are untouched, so this arm still
+# differs from the SFT and offline-KD arms in nothing but the loss -- which is
+# exactly why it is pinned: the three arms must agree on it or the comparison
+# confounds the objective with the task weighting.
+"algorithm.opd.normalize_loss_by_task": true
+# effective values after main_opd's injection into the actor config
+"actor_rollout_ref.actor.use_teacher_kl_loss": false  # tied_opsd: no external teacher KL
+"actor_rollout_ref.actor.teacher_kl_loss_type": topk_kl
+# 0.01, against 1.0 on every earlier arm. A 100x change to the teacher-KL term,
+# pinned here because it is the reason no existing run is a baseline for this
+# one: the arm REDISTRIBUTES that term, and at 1.0 the redistribution competes
+# with the policy gradient instead of shaping it. The control run carries the
+# same value and differs only in cross_teacher_kl_weight.enable.
+"actor_rollout_ref.actor.teacher_kl_loss_coef": 0.01
+"actor_rollout_ref.actor.teacher_kl_topk": 20
+"actor_rollout_ref.actor.normalize_loss_by_task": true
+
+# ---- the objective: GRPO policy gradient + per-task teacher KL ----------------
+# policy_loss = pg_loss * pg_loss_coef + teacher_kl_loss * teacher_kl_loss_coef.
+# pg_loss_coef is the single number this arm differs from the pure-OPD one by, so
+# it is the most important line in this file: at 0 the two arms are the same run.
+# main_opd_grpo refuses to start without it set, and this lock is what says which
+# value the run was supposed to have.
+"actor_rollout_ref.actor.pg_loss_coef": 1.0
+# grpo: THIS CELL PUTS IT BACK. The value arm replaced it with progress_value_gae; here the
+# policy gradient reads outcome GRPO's group-relative advantages again, and the gamma, lam and
+# progress_value keys pinned at the end of this file are the value arm's, read by nothing that
+# reaches the advantage (progress_value.enable is the records' switch beside grpo).
+"algorithm.adv_estimator": grpo
+# The env score is the only thing shaping the advantages: no reference-KL penalty
+# is mixed into the reward, and no reference-KL term is in the loss either.
+"algorithm.use_kl_in_reward": false
+"actor_rollout_ref.actor.use_kl_loss": false
+"actor_rollout_ref.actor.entropy_coeff": 0
+"actor_rollout_ref.actor.use_sdl_loss": false
+"actor_rollout_ref.actor.use_sdar_loss": false
+"actor_rollout_ref.actor.use_invalid_action_penalty": true
+"actor_rollout_ref.actor.invalid_action_penalty_coef": 0.1
+"actor_rollout_ref.actor.invalid_action_penalty_coef_by_task":
+  alfworld: 0.1
+  search: 0.01
+  webshop: 0.1
+
+# ---- teachers -------------------------------------------------------------------
+
+# ---- model / optimization -------------------------------------------------------
+"actor_rollout_ref.model.path": Qwen/Qwen3-1.7B
+"actor_rollout_ref.actor.optim.lr": 1.0e-6
+"actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.1
+"actor_rollout_ref.actor.ppo_mini_batch_size": 60
+# Throughput knobs that nonetheless sit on the GRADIENT path, so they are pinned
+# here even though the rule above exempts performance settings. ZeRO-2 is
+# arithmetic-neutral; no_sync_grad_accum reduces once per mini-batch instead of
+# once per micro-batch, which reorders the partial sums (same expectation,
+# different last bits). Neither may change silently between runs.
+"actor_rollout_ref.actor.fsdp_config.sharding_strategy": shard_grad_op
+"actor_rollout_ref.actor.no_sync_grad_accum": true
+# response_only_logits is pinned for the same reason. Restricting lm_head to the
+# response rows computes exactly the values the full projection did -- lm_head is
+# per-position, so selecting before or after it is the same arithmetic -- but the
+# GEMM changes shape, which moves the last bits like a micro-batch change does.
+# It also sits on both the student's gradient and the teacher's targets, so the
+# two must not diverge between compared runs.
+"actor_rollout_ref.actor.response_only_logits": true
+"actor_rollout_ref.ref.response_only_logits": true
+# student_indexed_topk is pinned because it is not a performance knob at all: it
+# decides which 20 tokens the coarse-grained KL is exact on. Reverse KL weights
+# by the student's mass and the term it drops is tail_s * KL(p_s|A-bar || p_t|A-bar),
+# so a support taken from the student covers the student's mass and a support
+# taken from the teacher does not. Both are lower bounds on the same full KL, so
+# the two settings are different (valid) objectives -- comparing arms across them
+# compares nothing. ref.student_indexed_topk follows the actor's value in
+# ppo_trainer.yaml and so is not listed separately.
+"actor_rollout_ref.actor.student_indexed_topk": true
+# enable_gradient_checkpointing sits on the gradient path even though it looks
+# like a pure memory knob: a recomputed forward and a stored one differ in their
+# last bits under autocast, the same class as no_sync_grad_accum. It is pinned
+# OFF on this arm, and that is a change from the control's ON.
+#
+# WHY IT IS AFFORDABLE HERE AND WAS NOT BEFORE. The measurement that pinned it ON
+# was on TWO GPUs: with it off, step 1 OOMed in its first micro-batch on a 94.97
+# GiB card, because the ~13 GB of activations it keeps had nowhere to go. This arm
+# runs on FOUR, which halves the actor/optimizer/teacher shards and halves each
+# engine's KV demand, so the update phase has roughly 10 GB more per card. It is
+# worth about a third of actor.bwd (~60 s a step). Untested in this combination:
+# if it OOMs, it OOMs at step 1 and the supervisor's first attempt shows it.
+# (Do not re-derive the headroom from perf/max_memory_*: both of those high-water
+# marks have printed values larger than the card, because vLLM's allocator pool is
+# counted by torch while its pages are mapped and unmapped underneath.)
+"actor_rollout_ref.model.enable_gradient_checkpointing": false
+# rollout.log_prob_micro_batch_size_per_gpu is pinned for a reason that only
+# half concerns log probs. This arm DOES run compute_log_prob (the policy
+# gradient needs old_log_prob), so the value sizes a real forward -- but that
+# part is throughput and would be exempt. What puts it in this file is its other
+# effect: it sets adjust_batch's divisor, lcm(rollout*2, rollout*2, actor*2). At
+# 16 that is 160 and step 1 threw away 116 rows to reach it; at 10 it is 20.
+# Which rows get dropped is data. It must also match the pure-OPD arm's value,
+# or the two arms are not training on the same rows.
+"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 10
+# ---- what bounds the training forward ----------------------------------------
+# 5, and at FOUR GPUS IT CANNOT BE 10. fsdp_workers asserts that the normalised
+# mini batch divides by it: ppo_mini_batch_size 60 / world 4 = 15 per GPU, and
+# 15 % 10 != 0, so a 10 dies in init_workers ("normalized ppo_mini_batch_size 15
+# should be divisible by ppo_micro_batch_size_per_gpu 10"). Measured here on
+# 2026-09-17, the restart's first attempt. The divisors of 15 are 1, 3, 5 and 15,
+# so the only step up from 5 is 15 -- three times the activations, on a run that
+# already has gradient checkpointing off (the update phase sits at 55-57 GB of
+# 97.9 with ~30 GB of that activations and cache), which is where an OOM would
+# come from. 15 is only worth trying with checkpointing back ON.
+"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 5
+
+# NOT pinned, and deliberately so:
+#   ref.fsdp_config.{param_offload,sharding_strategy} -- placement only,
+#     bit-identical, covered by the exemption above.
+#   rollout.return_rollout_log_probs -- True on this arm because the drift check
+#     (rollout_probs_diff) reads it, but it is a diagnostic: the sampled tokens
+#     and everything that reaches the loss are identical either way.
+#   rollout.disable_log_stats -- logging volume only.
+#   ROLLOUT_PREFETCH_TEACHER_{CHUNK,CHUNK_MAX,ADAPTIVE} -- these only decide how
+#     many already-final rows one prefetch call scores, so like the chunk size
+#     they cannot change a value.
+# Speculative decoding WOULD belong here (it sits on the sampling path, so it
+# must not differ silently between compared runs) but it cannot run on this stack
+# at all -- see the run script for why -- so there is nothing to pin.
+
+# ---- data -----------------------------------------------------------------------
+"data.train_batch_size": 45
+"data.val_batch_size": 126
+"data.seed": 1
+"data.max_prompt_length": 4096
+"data.max_response_length": 512
+"data.truncation": left
+"data.task_balance.enable": true
+"data.task_balance.per_task_batch_size": 15
+"data.task_balance.num_batches": 300
+"data.task_balance.tasks": [alfworld, search, webshop]
+"data.task_overrides.alfworld.max_prompt_length": 2048
+"data.task_overrides.alfworld.truncation": error
+"data.task_overrides.search.max_prompt_length": 4096
+"data.task_overrides.search.truncation": left
+"data.task_overrides.webshop.max_prompt_length": 4096
+"data.task_overrides.webshop.truncation": error
+"data.apply_chat_template_kwargs.enable_thinking": false
+
+# ---- environment ------------------------------------------------------------------
+"env.env_name": multitask
+"env.seed": 1
+"env.max_steps": 50
+"env.history_length": 4
+"env.rollout.n": 8
+"env.multitask.tasks": [alfworld, search, webshop]
+"env.multitask.max_steps.alfworld": 50
+"env.multitask.max_steps.search": 4
+"env.multitask.max_steps.webshop": 15
+"env.multitask.history_length.alfworld": 2
+"env.multitask.history_length.search": 4
+"env.multitask.history_length.webshop": 2
+# search only. Every search row carries its own question and ground_truth, so a
+# wider batch scores the same episodes; alfworld must NOT be widened -- its
+# games are drawn from a seeded cycle indexed by a row's position within its
+# manager, so changing its size plays different games, silently. Tasks not
+# named here keep data.val_batch_size, which is pinned at 126 above.
+"env.multitask.val_per_task_batch_size.search": 252
+# On an exhausted retry budget the client does NOT fail the run: the error text is
+# substituted for the retrieved document and becomes the <information> block the
+# model sees, with nothing in the metrics to say so. That makes the retry policy a
+# property of the DATA, which is why it is pinned here rather than left with the
+# performance knobs. max_retries: null retries a timeout / refused connection / 5xx
+# until the retriever answers, so no turn can be trained on an error string; 4xx and
+# malformed JSON still fail at once, since waiting cannot turn those into a document.
+#
+# timeout is generous but finite on purpose. null would also wait, but a connection
+# that dies without being closed (a retriever restart) then blocks forever with
+# nothing to detect it -- and the rollout's turn barrier waits on the slowest env, so
+# one dead socket stalls every trajectory in the step. A finite timeout turns that
+# into one more retry against the restarted server.
+"env.search.timeout": 600
+"env.search.max_retries": null
+
+# ---- rollout sampling / validation protocol ----------------------------------------
+"actor_rollout_ref.rollout.temperature": 1.0
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.alfworld.do_sample": true
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.temperature": 0
+"actor_rollout_ref.rollout.val_kwargs_by_task.search.do_sample": false
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.temperature": 0.4
+"actor_rollout_ref.rollout.val_kwargs_by_task.webshop.do_sample": true
+
+# ---- run identity ------------------------------------------------------------------
+"trainer.total_training_steps": 300
+"trainer.project_name": verl_agent_opd_grpo_cross_teacher_klw$RUN_TAG_SUFFIX
+# experiment_name is pinned as part of the run identity: renaming (or reusing a
+# name for a different config) requires touching this file next to the knobs.
+#
+# $RUN_TAG_SUFFIX on both names is the run script's RUN_TAG, resolved out of the
+# environment by load_expectations' os.path.expandvars. It is empty when the tag
+# is unset, so an untagged run pins exactly the name it always did. What the
+# suffix does NOT do is unpin the name: the base is still checked, so a typo
+# fails the run in seconds rather than after two hours in the wrong chart.
+"trainer.experiment_name": opd_grpo_multitask_cross_teacher_klw_control_qwen3_1.7b$RUN_TAG_SUFFIX
+# ---- cross-teacher sign agreement --------------------------------------------
+# THE CONTROL. Same code path, same seed, same rollouts, same 0.01 coefficient;
+# the weight is off. It is not an ablation -- it is the only run this arm can be
+# compared against, since the coefficient change alone rules out every earlier
+# result. Pinned false so a copy-paste cannot quietly turn it into a second
+# treatment arm.
+"algorithm.opd.cross_teacher_kl_weight.enable": false
+# The pre-RL policy every teacher's shift is relative to. It MUST be the exact
+# checkpoint all three were fine-tuned from: the cumulative RMS, the
+# corroboration and the reliability are all measured against it, so a different
+# base makes every number here mean something else. The resume sidecar refuses a
+# mismatch for the same reason.
+"algorithm.opd.cross_teacher_kl_weight.base_path": Qwen/Qwen3-1.7B
+# effective values after main_opd_grpo copies them onto the actor, which is where
+# the weight is actually built -- the driver only caches the models it reads.
+"actor_rollout_ref.actor.cross_teacher_kl_weight.enable": false
+"actor_rollout_ref.actor.cross_teacher_kl_weight.base_path": Qwen/Qwen3-1.7B
+
+# ---- (a): OFF; the progress counters its keys choose ------------------------------
+# No ranking of stuck or saturated groups: nothing is added to the advantage. The
+# counters are still read with it off -- the environment managers count for the pv_*
+# columns whenever algorithm.progress_value.enable is on (progress.progress_on) -- and they
+# decide what the value table's k is, so they are pinned. The strength keys the v2
+# launcher still passes (rho, the Beta rule, sat, the firing minimums) are not read with
+# progress_rank off and are not pinned here.
+"algorithm.progress_rank.enable": false
+# Which ALFWorld count k is: the task type's milestones plus "arrived" at the
+# target receptacle (milestone_arrive, bf19b1e), as on beta-mirror v2. Changing it is a
+# different arm: edit here.
+"algorithm.progress_rank.alfworld_k": milestone_arrive
+# Which Search count k is: evidence (K 1) or evidence_answered (K 2, the answer as a
+# second stage), v2's. Changing it is a different arm: edit here.
+"algorithm.progress_rank.search_k": evidence_answered
+# Which WebShop count goes into progress_k: session, read off the environment's own
+# session (the product open, the (name, value) pairs it holds, a buy it executed) rather
+# than the legacy clicked-values count, which over-counts a replaced option. The pv_*
+# columns the table reads use the session count either way; this pins what progress_k records.
+"algorithm.progress_rank.webshop_k": session
+# ---- speculative decoding (pinned although engine knobs are exempt) ----------
+# ON. It is not covered by the performance-knob exemption: it changes which
+# tokens are SAMPLED. Rejection sampling preserves the target distribution (the
+# n-gram proposer gives no draft probabilities, and training samples at
+# temperature 1.0 with no top_p/top_k), so this is the class of
+# enable_prefix_caching and enforce_eager=False, both already on here and in
+# xt1. Evidence it runs on this stack: the cross2 val-only run (tamago,
+# 2026-09-09) built the engine with these settings and finished. Expected gain,
+# from the 2026-09-08 profile: generation -15 to -30%, i.e. -8 to -17% a step.
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method": ngram
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens": 4
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_min": 2
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.prompt_lookup_max": 5
+"actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.acceptance_method": rejection_sampler
+"trainer.test_freq": -1
+
+# ---- off -------------------------------------------------------------------------
+"algorithm.opd.retire.enable": false
+
+# ---- progress_value_gae: the discount and the GAE lambda ---------------------------
+# The objective is J_H = E[gamma^T R] and the advantage A_t = sum_l (gamma lam)^l delta_{t+l}.
+# gamma 1.0: success within the cap, the length not penalised. lam 1.0: A_t = R - V(z_t),
+# the Monte Carlo return minus the table's value (the table a baseline only).
+"algorithm.gamma": 1.0
+"algorithm.lam": 1.0
+# ---- progress_value_gae: the table and the advantage ------------------------------
+# Every key of the block, at its default (ppo_trainer.yaml says what each one is). enable is
+# the records' switch and the estimator's precondition (the trainer refuses the estimator
+# without it, and refuses progress_rank, the OCI arms and use_kl_in_reward beside it).
+"algorithm.progress_value.enable": true
+# A resume must find the value table in the checkpoint it resumes from: a missing one is refused,
+# not an empty start (it would change the baseline, and the checkpoint is incomplete or another
+# arm's). True is a warm start from another arm's checkpoint -- a different run.
+"algorithm.progress_value.allow_missing_table": false
+"algorithm.progress_value.prefix_discount": false
+"algorithm.progress_value.eta": 1.0
+# A fixed unit conversion (1 / sigma of a Bernoulli at p = 1/2), not a normalisation.
+"algorithm.progress_value.adv_scale": 2.0
+"algorithm.progress_value.n0": 8.0
+"algorithm.progress_value.retention": 0.9
+"algorithm.progress_value.features": {alfworld: [type, k, stag, rem], webshop: [k, stag, rem], search: [k, rem]}
+"algorithm.progress_value.rem_buckets": [0.8, 0.6, 0.4, 0.2, 0.1]
+"algorithm.progress_value.stag_buckets": [1, 3, 6, 10, 20]
+"algorithm.progress_value.format_scope": tied
+"algorithm.progress_value.format_coef": 1.0
+# ---- analysis records (algorithm.progress_value.records) ----------------------------
+# Observation only (verl/trainer/ppo/rollout_records.py): every step's group records and
+# records/* metrics, with the GRPO and GiGPO shadows and, beside grpo, the value estimator's
+# (its own table, never the checkpoint's). Nothing in training reads them; pinned because the
+# 2x2's comparisons are read off them. records.dir is a host path and is not pinned.
+"algorithm.progress_value.records.enable": true
+"algorithm.progress_value.records.shadow_grpo": true
+"algorithm.progress_value.records.shadow_gigpo": true
+"algorithm.progress_value.records.shadow_value": true
+"algorithm.progress_value.records.per_turn": true
+
+# ---- the policy-gradient normalisation: the 2x2's column (b) ------------------------
+# token, the default: each task's policy gradient divided by the response tokens the task brought
+# to the step, like every other term (verl/trainer/ppo/task_loss_weights.py). Pinned so this cell
+# cannot quietly become the other column.
+"actor_rollout_ref.actor.pg_loss_norm": token
