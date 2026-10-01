@@ -201,6 +201,23 @@ try:
     check("Your next action is search 2 of 2" in t6[9] and "Doc 2 returned by your search 2 contains the answer"
           in t7[9], "the pointer moves and names the place exactly as route_hint's does")
 
+    print("7. sdar_skills: SDAR's own skill text")
+    from verl.trainer.ppo.rlsd_utils import SkillProvider
+    sp = SkillProvider(skills_dir=os.path.join(REPO, "skills", "search"))
+    for ds, q in (("nq", QUESTION), ("hotpotqa", "Which band was founded first, Hole or The Wolfhounds?")):
+        mine = ol.sdar_search_skill_text(ds, q, os.path.join(REPO, "skills", "search"))
+        check(mine and mine == sp.get_privileged_info_from_data_source(ds, q),
+              f"{ds}: the same skill text SDAR's SkillProvider gives")
+    check("### TASK: direct_retrieval" in ol.sdar_search_skill_text("nq", QUESTION)
+          and "### TASK: multi_hop_reasoning" in ol.sdar_search_skill_text("hotpotqa", "x"),
+          "nq gets direct_retrieval, hotpotqa multi_hop_reasoning, both after the general skills")
+    m4 = manager(10, evidence_for={9}, search_doc="sdar_skills")
+    t8 = m4.reset([{"question": QUESTION, "ground_truth": TARGET, "data_source": "nq"}] * 10)[0]["text"]
+    check(t8[9].startswith(ol.SDAR_SKILL_HEADER) and "### GENERAL SKILLS ###" in t8[9]
+          and "[Privileged Solution Path progress]" not in t8[9] and ANSWER not in t8[9],
+          "the document row reads SDAR's header and skills, no pointer, no answer")
+    check(all(ol.SDAR_SKILL_HEADER not in t8[i] for i in range(9)), "the plain rows and the reserve see nothing")
+
     m2 = manager(10, evidence_for={8, 9}, search_doc="answer_rule", search_doc_b="expert_flow")
     t3 = m2.reset(KW * 10)[0]["text"]
     acts2 = ["<think> go </think><search> closest airport Lewisburg West Virginia </search>"] * 10

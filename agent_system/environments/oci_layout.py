@@ -566,7 +566,7 @@ def search_lead(template: str, target) -> str:
     return template.replace("{answer}", answers[0] if answers else "")
 
 SEARCH_DOC_MODES = ("answer_only", "answer_rule", "progress_only", "expert_flow", "route_hint",
-                    "route_line")
+                    "route_line", "sdar_skills")
 # The modes whose document is a route with a pointer that moves as its queries are run.
 # route_line is route_hint with the block left out: only the pointer line goes into the
 # prompt. Measured 2026-10-01 at step 150: with the block in front of the prompt the
@@ -775,6 +775,66 @@ def search_route_hint_document_lines(question, target, path) -> list:
     if any(contains_answer(q, target) and not contains_answer(question, target) for q in queries):
         return []
     return [f"<search> {q} </search>" for q in queries]
+
+
+# THE SIXTH DOCUMENT: SDAR'S SKILLS (sdar_skills, 2026-10-01). Not a route and not the
+# answer: the procedural skill text SDAR's teacher reads for Search -- general_skills.md plus
+# the one type file SDAR picks from the data source -- under SDAR's own header, so the probe
+# measures what that document does to the student who reads it. The selection and the text
+# are verl/trainer/ppo/rlsd_utils.SkillProvider.get_privileged_info_from_data_source's
+# (tests/oci/test_search_route_hint.py checks the two agree); it is re-implemented here
+# because the environment workers must not import the trainer package.
+SDAR_SKILL_HEADER = "[Privileged Skill Information]\n"
+_SDAR_SKILLS: dict = {}
+
+
+def default_search_skills_dir() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "..", "skills", "search"))
+
+
+def sdar_search_skill_text(data_source, prompt_text, skills_dir=None) -> str:
+    """general_skills + the type skill SDAR routes this data source to ('' if no files)."""
+    d = str(skills_dir or default_search_skills_dir())
+    if d not in _SDAR_SKILLS:
+        files = {}
+        mp = os.path.join(d, "skill_mapping.json")
+        if os.path.exists(mp):
+            mapping = json.load(open(mp))
+            for name, fn in mapping.get("skill_files", {}).items():
+                path = os.path.join(d, fn)
+                if os.path.exists(path):
+                    files[name] = open(path).read().strip()
+            files["_task_to_skill"] = mapping.get("task_to_skill", {})
+        _SDAR_SKILLS[d] = files
+    files = _SDAR_SKILLS[d]
+    if not files:
+        return ""
+    ds = str(data_source or "")
+    task = None
+    if ds == "popqa":
+        task = "entity_attribute_lookup"
+    elif ds in ("nq", "triviaqa"):
+        task = "direct_retrieval"
+    elif ds == "hotpotqa":
+        task = "multi_hop_reasoning"
+    else:
+        low = str(prompt_text or "").lower()
+        if "which" in low and "or" in low and "for" not in low:
+            task = "compare"
+        elif ds in ("2wikimultihopqa", "musique", "bamboogle"):
+            task = "multi_hop_reasoning"
+    parts = [files.get("general_skills", "")]
+    name = files.get("_task_to_skill", {}).get(task) if task else None
+    if name and name in files:
+        parts.append(files[name])
+    return "\n\n".join(parts)
+
+
+def sdar_skill_document(data_source, prompt_text, skills_dir=None) -> str:
+    """The block a sdar_skills row reads: SDAR's header, the skills, a blank line."""
+    text = sdar_search_skill_text(data_source, prompt_text, skills_dir)
+    return f"{SDAR_SKILL_HEADER}{text}\n\n" if text else ""
 
 
 def evidence_position(text, target, question=None) -> int:

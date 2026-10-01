@@ -36,7 +36,7 @@ from agent_system.environments.oci_layout import (
     search_flow_document_lines as _search_flow_document_lines,
     search_route_hint_document_lines as _search_route_hint_document_lines,
     evidence_position as _evidence_position, ROUTE_DOC_MODES as _ROUTE_DOC_MODES,
-    SEARCH_ROUTE_HINT_LEAD,
+    SEARCH_ROUTE_HINT_LEAD, sdar_skill_document as _sdar_skill_document,
     search_flow_path as _slots_search_flow_path,
     advance_route as _advance_route, search_route_line as _search_route_line,
     contains_answer as _contains_answer, evidence_in_text as _evidence_in_text,
@@ -912,6 +912,16 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 _search_flow_document_lines(p.get("question"), p.get("ground_truth"),
                                             _slots_search_flow_path(getattr(self, "config", None))),
                 lead=_search_lead(SEARCH_FLOW_LEAD, p.get("ground_truth")))
+        if mode == "sdar_skills":
+            # SDAR's procedural skills for this question's data source; no route, no answer.
+            _cfg = getattr(self, "config", None)
+            _dir = ""
+            try:
+                _dir = str(((_cfg.get("algorithm", {}) or {}).get("oci_slots", {}) or {})
+                           .get("search_skills_dir", "") or "")
+            except AttributeError:
+                _dir = ""
+            return _sdar_skill_document(p.get("data_source"), p.get("question"), _dir or None)
         if mode in ("route_hint", "route_line"):
             # The verified route and no answer; '' for a question with no verified route.
             # route_line builds the same block for its pointer and leaves it out of the prompt.
