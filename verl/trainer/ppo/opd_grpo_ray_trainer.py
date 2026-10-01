@@ -657,17 +657,41 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                                               sb["tied_s_repl"], sb["tied_s_repl_len"], pad_id, rows=sat_rows)
             ok = ok1 & (~sat_rows | ok2)
             spliced_ok[rows] = ok
-            tensors = {"input_ids": ids2, "attention_mask": am2, "responses": sb["responses"]}
-            if pos2 is not None:
-                tensors["position_ids"] = pos2
-            tb = DataProto.from_dict(tensors=tensors)
-            tb.meta_info = {"topk_k": k, DataProtoConfig.auto_padding_key: True}
+            # THE SUPPORT, PER SIDE (the user, 2026-10-01): stuck rows on the TEACHER's top-k -- the forward half
+            # must reach the rare correct action, which the student's own top-k can leave in the residual --
+            # saturated rows on the STUDENT's top-k, the tight support for their reverse KL. The student's ids
+            # come from the actor as it is before this step's update; the teacher is then read at them.
             budget = int(getattr(self, "_post_rollout_token_budget", 0) or 0)
-            if budget > 0:
-                tb.meta_info.update({"use_dynamic_bsz": True, "max_token_len": budget})
-            out = self.self_teacher_wg.compute_ref_topk_log_prob(tb)
-            ids_full[rows] = out.batch["teacher_topk_ids"].to(torch.long).cpu()
-            lp_full[rows] = out.batch["teacher_topk_logprobs"].to(torch.float32).cpu()
+
+            def _teacher_batch(sel, extra=None):
+                t = torch.as_tensor(sel)
+                tensors = {"input_ids": ids2[t], "attention_mask": am2[t], "responses": sb["responses"][t]}
+                if pos2 is not None:
+                    tensors["position_ids"] = pos2[t]
+                tensors.update(extra or {})
+                tb = DataProto.from_dict(tensors=tensors)
+                tb.meta_info = {"topk_k": k, DataProtoConfig.auto_padding_key: True}
+                if budget > 0:
+                    tb.meta_info.update({"use_dynamic_bsz": True, "max_token_len": budget})
+                return tb
+
+            stuck_sel = ~sat_rows
+            if stuck_sel.any():
+                out = self.self_teacher_wg.compute_ref_topk_log_prob(_teacher_batch(stuck_sel))
+                ids_full[rows[stuck_sel]] = out.batch["teacher_topk_ids"].to(torch.long).cpu()
+                lp_full[rows[stuck_sel]] = out.batch["teacher_topk_logprobs"].to(torch.float32).cpu()
+            if sat_rows.any():
+                t_sat = torch.as_tensor(sat_rows)
+                plain = {"input_ids": sb["input_ids"][t_sat], "attention_mask": sb["attention_mask"][t_sat],
+                         "responses": sb["responses"][t_sat]}
+                if sb.get("position_ids", None) is not None:
+                    plain["position_ids"] = sb["position_ids"][t_sat]
+                pb = DataProto.from_dict(tensors=plain)
+                pb.meta_info = {"topk_k": k, DataProtoConfig.auto_padding_key: True}
+                sids = self.actor_rollout_wg.compute_actor_topk_ids(pb).batch["student_topk_ids"].to(torch.long).cpu()
+                out = self.self_teacher_wg.compute_ref_logprob_at_ids(_teacher_batch(sat_rows, {"gather_ids": sids}))
+                ids_full[rows[sat_rows]] = sids
+                lp_full[rows[sat_rows]] = out.batch["teacher_lp_at_ids"].to(torch.float32).cpu()
             w[rows[~ok]] = 0.0
 
         batch.batch["tied_w"] = torch.as_tensor(w, dtype=torch.float32)

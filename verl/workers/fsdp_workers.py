@@ -1219,6 +1219,51 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_actor_topk_ids(self, data: DataProto):
+        """algorithm.tied_opsd: the student's own top-k ids per response token, from the actor as it is BEFORE
+        this step's update (the saturated side's KL support). Same micro-batching as compute_log_prob."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        topk_k = int(data.meta_info.get("topk_k", 20))
+        data = data.to(get_torch_device().current_device())
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            _, topk_ids = self.actor.compute_topk_log_prob(data=data, topk_k=topk_k)
+            output = DataProto.from_dict(tensors={"student_topk_ids": topk_ids})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+        output = output.to("cpu")
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_ref_logprob_at_ids(self, data: DataProto):
+        """algorithm.tied_opsd: this (self-teacher) model's full-vocabulary log-probs at the ids in
+        data.batch['gather_ids'] (bs, response_length, k)."""
+        assert self._is_ref
+        data = data.to(get_torch_device().current_device())
+        data.meta_info.setdefault("micro_batch_size", self.config.ref.log_prob_micro_batch_size_per_gpu)
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info.setdefault("max_token_len", self.config.ref.log_prob_max_token_len_per_gpu)
+        data.meta_info.setdefault("use_dynamic_bsz", self.config.ref.log_prob_use_dynamic_bsz)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            lp = self.ref_policy.compute_logprob_at_ids(data=data, ids_key="gather_ids")
+            output = DataProto.from_dict(tensors={"teacher_lp_at_ids": lp})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+        output = output.to("cpu")
+        if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
+            self.ref_policy.actor_module._handle.reshard(True)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref

@@ -2443,6 +2443,40 @@ class DataParallelPPOActor(BasePPOActor):
         finally:
             handle.remove()
 
+    def compute_logprob_at_ids(self, data: DataProto, ids_key: str = "gather_ids") -> torch.Tensor:
+        """Full-vocabulary log-probs at GIVEN ids per response token: (bs, response_length, k).
+
+        algorithm.tied_opsd's saturated rows: the support is the student's own top-k (taken before the update),
+        and the self-teacher is read at exactly those ids on its document-conditioned prompt. Same micro-batching
+        as compute_topk_log_prob; the ids ride in the batch so the dynamic-batching reorder moves them with
+        their rows.
+        """
+        self.actor_module.eval()
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", ids_key]
+        batch = data.select(batch_keys=select_keys).batch
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        else:
+            micro_batches = batch.split(micro_batch_size)
+        out = []
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                _, _, lp = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=False,
+                                                     topk_ids=micro_batch[ids_key].long(), need_log_prob=False)
+            out.append(lp)
+        lp = torch.concat(out, dim=0)
+        if use_dynamic_bsz:
+            flat = list(itertools.chain.from_iterable(indices))
+            revert_indices = torch.tensor(get_reverse_idx(flat), dtype=torch.long)
+            lp = lp[revert_indices]
+        return lp
+
     def compute_topk_log_prob(
         self, data: DataProto, topk_k: int, return_hidden: bool = False, witness_micro_batches=None
     ):
@@ -4734,15 +4768,17 @@ class DataParallelPPOActor(BasePPOActor):
                                  if float(_mm.sum()) > 0:
                                      metrics[f"tied/kl_{_nm}"] = float((_val * _mm).sum() / _mm.sum())
                              metrics["tied/term"] = float(tied_term.detach())
-                             # How loose the teacher-indexed support is: the student's (and the teacher's)
-                             # probability outside the teacher's top-k, on the distilled tokens. The reverse
-                             # KL lumps the student's part into one bucket.
-                             _tok_on = _t_on.sum()
-                             if float(_tok_on) > 0:
-                                 _tail_s = (1.0 - student_topk_out.detach().exp().sum(-1)).clamp(min=0.0)
-                                 _tail_t = (1.0 - data["tied_topk_lp"].to(_t_loss.dtype).exp().sum(-1)).clamp(min=0.0)
-                                 metrics["tied/student_mass_outside_teacher_topk"] = float((_tail_s * _t_on).sum() / _tok_on)
-                                 metrics["tied/teacher_mass_outside_teacher_topk"] = float((_tail_t * _t_on).sum() / _tok_on)
+                             # How much probability each model puts outside the support, on the distilled
+                             # tokens, per side: stuck rows are scored on the teacher's top-k (the student's mass
+                             # outside it is lumped into one bucket), saturated rows on the student's own.
+                             _tail_s = (1.0 - student_topk_out.detach().exp().sum(-1)).clamp(min=0.0)
+                             _tail_t = (1.0 - data["tied_topk_lp"].to(_t_loss.dtype).exp().sum(-1)).clamp(min=0.0)
+                             for _nm, _sv in (("stuck", SIDE_STUCK), ("saturated", SIDE_SAT)):
+                                 _mm = _t_on * (_sd == _sv).to(_t_loss.dtype)
+                                 _n = _mm.sum()
+                                 if float(_n) > 0:
+                                     metrics[f"tied/{_nm}/student_mass_outside_support"] = float((_tail_s * _mm).sum() / _n)
+                                     metrics[f"tied/{_nm}/teacher_mass_outside_support"] = float((_tail_t * _mm).sum() / _n)
 
                      if opsd_stats is not None and opsd_column and pg_loss_coef != 0:
                          # THE SAME TERM, NOT ADDED. Its gradient is parallel to
