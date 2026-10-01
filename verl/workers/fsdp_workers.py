@@ -188,6 +188,12 @@ _GEN_PHASE_TIMING = os.environ.get("ROLLOUT_TURN_TIMING", "0").strip().lower() i
 _GEN_PHASES = ("to_device", "preprocess", "generate", "postprocess", "to_cpu")
 
 
+# algorithm.tied_opsd's self-teacher is a role="ref" worker colocated with the actor (create_colocated_worker_cls
+# puts every role of a resource pool in ONE process per GPU), so its weights are refreshed from the actor's in
+# that process: each worker files itself here and copy_weights_from_actor finds the actor beside it.
+_LOCAL_ROLE_WORKERS = []
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -226,6 +232,8 @@ class ActorRolloutRefWorker(Worker):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        import weakref as _weakref
+        _LOCAL_ROLE_WORKERS.append(_weakref.ref(self))
 
         self._is_offload_param = False
         self._is_offload_optimizer = False
@@ -1437,6 +1445,57 @@ class ActorRolloutRefWorker(Worker):
             else:
                 get_teacher_cache().register_lm_head(task, weight, slot=slot, n_tasks=n_tasks)
         self._teacher_lm_head_task = task
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def copy_weights_from_actor(self):
+        """algorithm.tied_opsd: overwrite this ref module's parameters with the colocated actor's.
+
+        Both modules are built by _build_model_optimizer from the same model and config (the ref differs
+        only in role), so under FSDP1 their FlatParameters are the same shards in the same order; the
+        copy is shard to shard on this rank, cast to the ref's dtype, no collective. Returns this rank's
+        (number of tensors, sum of |x| over the copied shards, the same sum read back from the ref) so the
+        driver can check every rank copied the same thing.
+        """
+        assert self._is_ref and not self._is_actor, "copy_weights_from_actor is for the self-teacher (role=ref)"
+        actors = [w() for w in _LOCAL_ROLE_WORKERS if w() is not None and w() is not self and w()._is_actor]
+        assert len(actors) == 1, f"expected one colocated actor worker in this process, found {len(actors)}"
+        actor = actors[0]
+        src, dst = actor.actor_module_fsdp, self.ref_module_fsdp
+        if getattr(actor, "_is_offload_param", False):
+            load_fsdp_model_to_gpu(src)
+        try:
+            sp, dp_ = list(src.parameters()), list(dst.parameters())
+            assert len(sp) == len(dp_), f"actor has {len(sp)} parameter tensors, the self-teacher {len(dp_)}"
+            total_src = total_dst = 0.0
+            with torch.no_grad():
+                for a, b in zip(sp, dp_):
+                    assert a.shape == b.shape, f"shard shapes differ: actor {tuple(a.shape)} vs teacher {tuple(b.shape)}"
+                    b.data.copy_(a.data.to(device=b.device, dtype=b.dtype))
+                    total_src += float(a.data.float().abs().sum())
+                    total_dst += float(b.data.float().abs().sum())
+        finally:
+            if getattr(actor, "_is_offload_param", False):
+                offload_fsdp_model_to_cpu(src)
+        return len(sp), total_src, total_dst
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_ref_from_actor_checkpoint(self, local_path: str):
+        """algorithm.tied_opsd on resume: load the self-teacher from the actor checkpoint it was copied at
+        (global_step_<k>/actor). The actor's own FSDPCheckpointManager wrote it as a SHARDED state dict per
+        rank; this rank reads its own file. Returns False when the file is missing (the caller falls back)."""
+        from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
+
+        assert self._is_ref and not self._is_actor
+        path = os.path.join(local_path, f"model_world_size_{torch.distributed.get_world_size()}"
+                                        f"_rank_{torch.distributed.get_rank()}.pt")
+        if not os.path.exists(path):
+            return False
+        state = torch.load(path, weights_only=False, map_location="cpu")
+        cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        with FSDP.state_dict_type(self.ref_module_fsdp, StateDictType.SHARDED_STATE_DICT, cfg):
+            self.ref_module_fsdp.load_state_dict(state)
+        del state
+        return True
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def register_teacher_lm_head(self, task: str, slot=None, n_tasks=None):

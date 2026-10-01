@@ -483,8 +483,16 @@ class OPDRayTrainer(RayPPOTrainer):
         super().__init__(*args, **kwargs)
         opd_cfg = self.config.algorithm.get("opd", {})
         teacher_paths = opd_cfg.get("teacher_paths", None)
+        # algorithm.tied_opsd distils toward the student's own copy and loads NO external teacher
+        # (the design's item 10): its teacher_paths is empty, and every teacher path below is a no-op.
+        _tied = bool((self.config.algorithm.get("tied_opsd", None) or {}).get("enable", False))
+        if _tied and teacher_paths is None:
+            teacher_paths = {}
         assert teacher_paths is not None, (
             "OPD requires algorithm.opd.teacher_paths.{alfworld,search,webshop}"
+        )
+        assert not (_tied and len(dict(teacher_paths))), (
+            "algorithm.tied_opsd runs without external teachers; set algorithm.opd.teacher_paths={}"
         )
         # Normalize to a plain {task_name: checkpoint_path} dict.
         self.teacher_paths = {
@@ -736,6 +744,19 @@ class OPDRayTrainer(RayPPOTrainer):
             )
             self.resource_pool_to_cls[teacher_pool][key] = teacher_cls
 
+        # algorithm.tied_opsd's self-teacher: the student's own model as a frozen role="ref" copy in the
+        # same pool (so it is colocated with the actor and refreshed from it in-process every
+        # tied_opsd.refresh_every steps; see ActorRolloutRefWorker.copy_weights_from_actor).
+        if bool((self.config.algorithm.get("tied_opsd", None) or {}).get("enable", False)):
+            self_cfg = copy.deepcopy(self.config.actor_rollout_ref)
+            with open_dict(self_cfg):
+                self_cfg.model.lora_rank = 0
+            self.resource_pool_to_cls[teacher_pool]["self_teacher"] = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self_cfg,
+                role="ref",
+            )
+
         # The base policy the teachers were fine-tuned from. Built exactly like a
         # teacher (same role="ref") but kept out of self.teacher_paths /
         # self.teacher_wg, because those are keyed by task and drive the routing: a
@@ -812,6 +833,10 @@ class OPDRayTrainer(RayPPOTrainer):
                 self.base_wg.register_teacher_lm_head(
                     SIGN_BASE_TASK, slot=n_teachers - 1, n_tasks=n_teachers
                 )
+
+        if "self_teacher" in all_wg:
+            self.self_teacher_wg = all_wg["self_teacher"]
+            self.self_teacher_wg.init_model()
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
@@ -901,6 +926,7 @@ class OPDRayTrainer(RayPPOTrainer):
         return ctl
 
     PROGRESS_RANK_STATE_FILE = "progress_rank_state.json"
+    TIED_STATE_FILE = "tied_opsd_state.json"
     # progress_value_gae's value table (verl/trainer/ppo/progress_value.py): the discounted counts
     # every later step's baseline is read from. Same place and same reason as (a)'s EMA; a no-op
     # unless the table exists, which only the GRPO arm with adv_estimator=progress_value_gae builds.
@@ -917,6 +943,13 @@ class OPDRayTrainer(RayPPOTrainer):
         if ret is not None:
             os.makedirs(folder, exist_ok=True)
             _write_json_atomic(os.path.join(folder, self.RETIREMENT_STATE_FILE), ret.state_dict())
+        # algorithm.tied_opsd's discounted shares and M, and which actor step its teacher was copied at.
+        tied = getattr(self, "_tied_ctl", None)
+        if tied is not None:
+            os.makedirs(folder, exist_ok=True)
+            _write_json_atomic(os.path.join(folder, self.TIED_STATE_FILE),
+                               {"controller": tied.state_dict(),
+                                "teacher_from": getattr(self, "_tied_teacher_from", None)})
         # The value table as the step left it: the subclass commits a step's batch right after
         # scoring it, before the actor update this save follows, so the table here includes step N.
         table = getattr(self, "_progress_value", None)
@@ -939,6 +972,11 @@ class OPDRayTrainer(RayPPOTrainer):
             with open(path) as f:
                 self._progress_rank_pending_state = json.load(f)
             print(f"[progress_rank] EMA restored from {path}: {self._progress_rank_pending_state}")
+        tpath = os.path.join(folder, self.TIED_STATE_FILE)
+        if os.path.exists(tpath):
+            with open(tpath) as f:
+                self._tied_pending_state = json.load(f)
+            print(f"[tied_opsd] state restored from {tpath}", flush=True)
         rpath = os.path.join(folder, self.RETIREMENT_STATE_FILE)
         if os.path.exists(rpath):
             with open(rpath) as f:
@@ -1354,6 +1392,9 @@ class OPDRayTrainer(RayPPOTrainer):
         ``_teacher_prefetch_chunk``); those are filled in here and excluded from
         the per-task calls below, so each row is scored exactly once either way.
         """
+        if not self.teacher_paths:
+            # algorithm.tied_opsd: no external teacher, nothing to route.
+            return
         task_names = batch.non_tensor_batch.get("task_name", None)
         assert task_names is not None, "OPD requires task_name on every sample for teacher routing"
         normalized = [self._normalize_task_name(t) for t in task_names]

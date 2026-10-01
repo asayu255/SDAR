@@ -358,9 +358,9 @@ def check_task_weighting_supported(config, *, use_teacher_kl_loss: bool, ulysses
         f"per-task loss normalisation is only derived for the vanilla policy loss; "
         f"got policy_loss.loss_mode={loss_mode!r}"
     )
-    assert use_teacher_kl_loss, (
+    assert use_teacher_kl_loss or bool(config.get("tied_opsd", False)), (
         "per-task loss normalisation is for the distillation loss, but "
-        "use_teacher_kl_loss is off"
+        "use_teacher_kl_loss is off (and algorithm.tied_opsd is not on)"
     )
     # use_sdar_loss is NOT refused: its branch aggregates the gated self-distillation
     # term by the same row weights as the policy gradient (see the SDAR block in
@@ -2649,6 +2649,12 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("old_log_probs")
         if multi_turn:
             select_keys.append("loss_mask")
+        # algorithm.tied_opsd: the self-teacher's top-k on stuck / saturated rows, the row weight, side and
+        # distilled-token marks the driver wrote (verl/trainer/ppo/tied_opsd.py). No external teacher.
+        tied_on = bool(self.config.get("tied_opsd", False))
+        if tied_on:
+            assert not use_teacher_kl_loss, "algorithm.tied_opsd runs without the external teacher KL"
+            select_keys += ["tied_w", "tied_side", "tied_tok", "tied_topk_ids", "tied_topk_lp"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
             if "kl_loss_coef" in data.batch:
@@ -3952,6 +3958,9 @@ class DataParallelPPOActor(BasePPOActor):
                              fwd_topk_k = int(self.config.get("teacher_kl_topk", 20))
                          else:
                              fwd_topk_ids = data["teacher_topk_ids"]
+                     if tied_on:
+                         # The student's full-vocabulary log-probs at the self-teacher's top-k ids.
+                         fwd_topk_ids = data["tied_topk_ids"]
                      # The sampled-token log-prob is dead weight in pure top-k
                      # distillation: the KL is built from the top-k gather, and every
                      # other consumer here (policy gradient, reference KL, sdl, sdar,
@@ -4702,6 +4711,29 @@ class DataParallelPPOActor(BasePPOActor):
                          policy_loss = policy_loss + sdar_term * sdar_coef
                          metrics.update(sdar_metrics)
                          metrics["sdar/coef"] = sdar_coef
+
+                     if tied_on:
+                         # algorithm.tied_opsd: stuck rows 0.5 forward + 0.5 reverse KL, saturated rows reverse
+                         # KL, on the teacher's top-k plus a tail bucket; per token x the row's weight (w_f or
+                         # w_s, 0 elsewhere) x the distilled-token mark; aggregated by the SAME per-task row
+                         # weights as the policy gradient (a sum over tokens over the task's reference).
+                         from verl.trainer.ppo.tied_opsd import SIDE_SAT, SIDE_STUCK, tied_token_loss
+
+                         assert task_agg_scale is not None, "algorithm.tied_opsd needs normalize_loss_by_task=true"
+                         _t_loss, _t_rkl, _t_fkl = tied_token_loss(
+                             student_topk_out, data["tied_topk_lp"], data["tied_side"])
+                         _t_w = data["tied_tok"].to(_t_loss.dtype) * data["tied_w"].reshape(-1, 1).to(_t_loss.dtype)
+                         tied_term = _task_agg(_t_loss * _t_w)
+                         policy_loss = policy_loss + tied_term
+                         with torch.no_grad():
+                             _t_on = (_t_w > 0).to(_t_loss.dtype)
+                             _sd = data["tied_side"].reshape(-1, 1)
+                             for _nm, _sv, _val in (("stuck", SIDE_STUCK, 0.5 * _t_fkl + 0.5 * _t_rkl),
+                                                    ("saturated", SIDE_SAT, _t_rkl)):
+                                 _mm = _t_on * (_sd == _sv).to(_t_loss.dtype)
+                                 if float(_mm.sum()) > 0:
+                                     metrics[f"tied/kl_{_nm}"] = float((_val * _mm).sum() / _mm.sum())
+                             metrics["tied/term"] = float(tied_term.detach())
 
                      if opsd_stats is not None and opsd_column and pg_loss_coef != 0:
                          # THE SAME TERM, NOT ADDED. Its gradient is parallel to

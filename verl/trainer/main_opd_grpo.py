@@ -83,6 +83,23 @@ def inject_opd_grpo_config(config) -> None:
             # source=document needs no second switch: oci_layout.document_render_on
             # turns the render on for this setting too, so (a) -- which refuses to
             # run beside the rank arm -- is not dragged in by it.
+        # algorithm.tied_opsd: the self-teacher's term replaces the external teacher entirely. The
+        # per-task row weights (normalize_loss_by_task) are what it is aggregated by, like the policy
+        # gradient, so they must be on; nothing else that distils or reshapes the tied groups may run.
+        tied = config.algorithm.get("tied_opsd", None)
+        if tied is not None and bool(tied.get("enable", False)):
+            config.actor_rollout_ref.actor.use_teacher_kl_loss = False
+            config.actor_rollout_ref.actor.use_sdar_loss = False
+            config.actor_rollout_ref.actor.tied_opsd = True
+            assert bool(config.actor_rollout_ref.actor.get("normalize_loss_by_task", False)), (
+                "algorithm.tied_opsd needs algorithm.opd.normalize_loss_by_task=true: its term is aggregated "
+                "by the policy gradient's per-task row weights")
+            assert not len(dict(config.algorithm.get("opd", {}).get("teacher_paths", None) or {})), (
+                "algorithm.tied_opsd loads no external teacher: set algorithm.opd.teacher_paths={}")
+            for other in ("opsd", "oci_rank", "oci_slots", "progress_rank", "oci_saturated"):
+                blk = config.algorithm.get(other, None)
+                assert blk is None or not bool(blk.get("enable", False)), (
+                    f"algorithm.tied_opsd runs on plain GRPO; algorithm.{other}.enable must be off")
         # progress_rank.scale_mode=beta_mirror fits a Beta to groups of beta_group_size rollouts
         # and keeps every group of another size out of the fit and the update, so the two numbers
         # must agree or no group would ever be inside the model. Checked here, in the first seconds

@@ -203,6 +203,15 @@ class OPDGRPORayTrainer(OPDRayTrainer):
                 else:
                     batch.batch["teacher_log_probs"] = lp
 
+        # ---- tied-group self-distillation (algorithm.tied_opsd) ----
+        # After old_log_prob, like the OPSD teacher above: the rows are in their final order and padding,
+        # and the group outcomes are known. Writes tied_{w,side,tok,topk_ids,topk_lp}; the actor adds the
+        # term (dp_actor, tied block). The advantages below are GRPO's, untouched.
+        tied_cfg = self.config.algorithm.get("tied_opsd", None)
+        if tied_cfg is not None and bool(tied_cfg.get("enable", False)):
+            with _timer("tied_teacher", timing_raw):
+                self._tied_opsd_columns(batch, tied_cfg, metrics)
+
         # ---- advantages (GRPO) ----
         with _timer("adv", timing_raw):
             # ---- progress_value_gae: the value table the batch is scored against ----
@@ -507,6 +516,183 @@ class OPDGRPORayTrainer(OPDRayTrainer):
         self._rollout_records(batch, metrics, timing_raw, pv_kwargs)
 
         return batch, reward_extra_infos_dict
+
+    # --- algorithm.tied_opsd ---------------------------------------------------- #
+
+    def _tied_controller(self, cfg):
+        ctl = getattr(self, "_tied_ctl", None)
+        if ctl is None:
+            from verl.trainer.ppo.tied_opsd import TIED_TASKS, TiedController
+
+            tasks = [t for t in TIED_TASKS if t in list(cfg.get("tasks", TIED_TASKS) or TIED_TASKS)]
+            ctl = TiedController(tasks, retention=float(cfg.get("retention", 0.8)),
+                                 guard=bool(cfg.get("guard", True)))
+            pending = getattr(self, "_tied_pending_state", None)
+            if pending:
+                ctl.load_state_dict(pending["controller"])
+                print(f"[tied_opsd] shares and M restored: {ctl.state_dict()}", flush=True)
+            self._tied_ctl = ctl
+        return ctl
+
+    def _tied_refresh_teacher(self, cfg, metrics: dict) -> None:
+        """The self-teacher holds the actor as it was after step k* = every*floor((step-1)/every).
+
+        Steps 1..every read the initial model (the teacher was built from the same path). At step every+1
+        the actor has finished step every, so it is copied in-process. On a resume the copy is read back
+        from that step's actor checkpoint; if it is gone, the current actor is copied and the metric
+        tied/teacher_restore_fallback says so.
+        """
+        every = int(cfg.get("refresh_every", 50))
+        step = int(getattr(self, "global_steps", 1) or 1)
+        want = every * ((step - 1) // every) if every > 0 else 0
+        have = getattr(self, "_tied_teacher_from", None)
+        refreshed, fallback = 0.0, 0.0
+        if have is None:
+            pending = getattr(self, "_tied_pending_state", None) or {}
+            have = 0
+            if want > 0:
+                if step - 1 == want:
+                    # Resumed exactly at a refresh boundary: the actor IS step `want`.
+                    self._tied_copy_actor()
+                else:
+                    folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{want}", "actor")
+                    ok = all(bool(x) for x in self.self_teacher_wg.load_ref_from_actor_checkpoint(folder))
+                    if not ok:
+                        self._tied_copy_actor()
+                        fallback = 1.0
+                        print(f"[tied_opsd] WARNING: no actor checkpoint at {folder}; the self-teacher copies the "
+                              f"CURRENT actor (step {step - 1}) instead of step {want}", flush=True)
+                    else:
+                        print(f"[tied_opsd] self-teacher restored from {folder} (pending state said "
+                              f"{pending.get('teacher_from')})", flush=True)
+                have, refreshed = want, 1.0
+        elif want != have:
+            self._tied_copy_actor()
+            have, refreshed = want, 1.0
+            if step - 1 != want:
+                fallback = 1.0
+        self._tied_teacher_from = have
+        metrics["tied/teacher_from_step"] = float(have)
+        metrics["tied/teacher_refreshed"] = refreshed
+        metrics["tied/teacher_restore_fallback"] = fallback
+
+    def _tied_copy_actor(self) -> None:
+        outs = self.self_teacher_wg.copy_weights_from_actor()
+        for n, a, b in outs:
+            assert abs(a - b) <= 1e-3 * max(1.0, abs(a)), f"self-teacher copy mismatch: {a} vs {b}"
+        print(f"[tied_opsd] self-teacher copied from the actor ({outs[0][0]} tensors per rank)", flush=True)
+
+    def _tied_opsd_columns(self, batch: DataProto, cfg, metrics: dict) -> None:
+        from collections import defaultdict
+
+        from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
+        from verl.trainer.ppo.tied_opsd import (SIDE_SAT, SIDE_STUCK, UNSCORED_LP, TokenMasker, apply_edit,
+                                                classify_groups, live_abs_z, row_sides_and_weights)
+
+        nt = batch.non_tensor_batch
+        n = len(batch)
+        k = int(cfg.get("topk", 20))
+        real = np.ones(n, dtype=bool)
+        pad = batch.batch.get(PADDING_ROW_KEY, None)
+        if pad is not None:
+            real &= ~pad.reshape(-1).to(torch.bool).cpu().numpy()
+        tasks = get_task_names(batch)
+        assert tasks is not None, "algorithm.tied_opsd needs per-row task names"
+        tasks = np.asarray([str(t) for t in tasks], dtype=object)
+        uids = np.asarray([str(u) for u in nt["uid"]], dtype=object)
+        tuids = np.asarray([str(t) for t in nt["traj_uid"]], dtype=object)
+        status, task_of, won = classify_groups(uids, tuids, tasks, nt["episode_rewards"], real)
+
+        rows_of = defaultdict(list)
+        for i in range(n):
+            if real[i]:
+                rows_of[uids[i]].append(i)
+        live_z = defaultdict(list)
+        for u, rows in rows_of.items():
+            if status.get(u) == "live":
+                live_z[task_of[u]] += live_abs_z([won[tuids[i]] for i in rows], [tuids[i] for i in rows])
+        ctl = self._tied_controller(cfg)
+        ctl.update(status, task_of, live_z)
+        wts = {t: ctl.weights(t) for t in ctl.tasks}
+
+        match = batch.batch["tied_match"].reshape(-1).cpu().numpy()
+        doc_ok = batch.batch["oci_doc_len"].reshape(-1).cpu().numpy() > 0
+        s_ok = batch.batch["tied_s_len"].reshape(-1).cpu().numpy() > 0
+        on_task = np.asarray([t in ctl.tasks for t in tasks], dtype=bool)
+        side, _ = row_sides_and_weights(uids, tasks, status, wts, eligible=np.ones(n, dtype=bool))
+        elig = real & on_task & (match == 1) & doc_ok & ((side != SIDE_SAT) | s_ok)
+        side, w = row_sides_and_weights(uids, tasks, status, wts, eligible=elig)
+
+        resp = batch.batch["responses"]
+        L = int(resp.shape[1])
+        resp_mask = batch.batch["attention_mask"][:, -L:].cpu()
+        evid = batch.batch["tied_evid"].reshape(-1).cpu().numpy()
+        if getattr(self, "_tied_masker", None) is None:
+            self._tied_masker = TokenMasker(self.tokenizer)
+        tok = torch.zeros((n, L), dtype=torch.float32)
+        resp_cpu = resp.cpu()
+        for i in np.nonzero(w > 0)[0]:
+            ln = int(resp_mask[i].sum())
+            tok[i, :ln] = torch.from_numpy(self._tied_masker.row(resp_cpu[i, :ln].tolist(), tasks[i], bool(evid[i])))
+        w[(tok.sum(-1) <= 0).numpy()] = 0.0
+
+        self._tied_refresh_teacher(cfg, metrics)
+
+        ids_full = torch.zeros((n, L, k), dtype=torch.long)
+        lp_full = torch.full((n, L, k), UNSCORED_LP, dtype=torch.float32)
+        rows = np.nonzero(w > 0)[0]
+        spliced_ok = np.zeros(n, dtype=bool)
+        if len(rows):
+            sub = batch.select_idxs(rows)
+            sb = sub.batch
+            pad_id = int(self.tokenizer.pad_token_id)
+            ids1, am1, pos1, ok1 = apply_edit(sb["input_ids"], sb["attention_mask"], sb.get("position_ids", None), L,
+                                              sb["oci_doc_off"], sb["oci_doc_len"], sb["oci_doc_repl"],
+                                              sb["oci_doc_repl_len"], pad_id)
+            sat_rows = side[rows] == SIDE_SAT
+            ids2, am2, pos2, ok2 = apply_edit(ids1, am1, pos1, L, sb["tied_s_off"], sb["tied_s_len"],
+                                              sb["tied_s_repl"], sb["tied_s_repl_len"], pad_id, rows=sat_rows)
+            ok = ok1 & (~sat_rows | ok2)
+            spliced_ok[rows] = ok
+            tensors = {"input_ids": ids2, "attention_mask": am2, "responses": sb["responses"]}
+            if pos2 is not None:
+                tensors["position_ids"] = pos2
+            tb = DataProto.from_dict(tensors=tensors)
+            tb.meta_info = {"topk_k": k, DataProtoConfig.auto_padding_key: True}
+            budget = int(getattr(self, "_post_rollout_token_budget", 0) or 0)
+            if budget > 0:
+                tb.meta_info.update({"use_dynamic_bsz": True, "max_token_len": budget})
+            out = self.self_teacher_wg.compute_ref_topk_log_prob(tb)
+            ids_full[rows] = out.batch["teacher_topk_ids"].to(torch.long).cpu()
+            lp_full[rows] = out.batch["teacher_topk_logprobs"].to(torch.float32).cpu()
+            w[rows[~ok]] = 0.0
+
+        batch.batch["tied_w"] = torch.as_tensor(w, dtype=torch.float32)
+        batch.batch["tied_side"] = torch.as_tensor(side, dtype=torch.long)
+        batch.batch["tied_tok"] = tok
+        batch.batch["tied_topk_ids"] = ids_full
+        batch.batch["tied_topk_lp"] = lp_full
+
+        for t in ctl.tasks:
+            for key, val in wts[t].items():
+                metrics[f"tied/{t}/{key}"] = float(val)
+            sel = real & (tasks == t)
+            stuck_rows = sel & (side == SIDE_STUCK)
+            sat_rows_all = sel & (side == SIDE_SAT)
+            tied_rows = stuck_rows | sat_rows_all
+            metrics[f"tied/{t}/rows_stuck"] = float(stuck_rows.sum())
+            metrics[f"tied/{t}/rows_saturated"] = float(sat_rows_all.sum())
+            metrics[f"tied/{t}/rows_distilled"] = float((sel & (w > 0)).sum())
+            metrics[f"tied/{t}/tokens_distilled"] = float(tok[torch.as_tensor(sel & (w > 0))].sum())
+            if tied_rows.any():
+                metrics[f"tied/{t}/mismatch_share"] = float((match[tied_rows] == 0).mean())
+                metrics[f"tied/{t}/no_document_share"] = float((match[tied_rows] < 0).mean())
+                metrics[f"tied/{t}/splice_fail_share"] = float(
+                    ((match[tied_rows] == 1) & ~(doc_ok[tied_rows] & ((side[tied_rows] != SIDE_SAT) | s_ok[tied_rows]))).mean())
+            groups = [u for u, tt in task_of.items() if tt == t]
+            for st in ("stuck", "saturated", "live"):
+                metrics[f"tied/{t}/groups_{st}"] = float(sum(1 for u in groups if status.get(u) == st))
+        metrics["tied/rows_scored"] = float(len(rows))
 
     # --- (a) ------------------------------------------------------------------ #
 

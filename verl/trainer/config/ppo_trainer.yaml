@@ -112,6 +112,8 @@ actor_rollout_ref:
     # 69% of the tokens and search near 4% -- a weighting nobody chose. Off by default;
     # see verl/trainer/ppo/task_loss_weights.py.
     normalize_loss_by_task: False
+    # Set by main_opd_grpo from algorithm.tied_opsd.enable; the actor reads the tied_* columns.
+    tied_opsd: False
     # How that per-task weighting normalises the POLICY-GRADIENT term (the teacher KL,
     # reference KL, entropy and SDAR terms keep the token weights either way):
     #   token       each task's policy gradient divided by the response tokens the task
@@ -1039,6 +1041,28 @@ algorithm:
   # against the model itself with the task's skill documents in the prompt
   # (the SDAR runs' teacher), aggregated by the per-task row weights. Off by
   # default; enabling it does not touch the external teacher's coefficient.
+  # Tied-group self-distillation (the 2026-10-01 design, "停滞・飽和群の自己蒸留";
+  # verl/trainer/ppo/tied_opsd.py). In a group whose G rollouts all failed (stuck) or all
+  # succeeded (saturated), the student is distilled toward a frozen copy of itself that reads the
+  # instance's correct document: stuck rows 0.5 forward + 0.5 reverse KL with the progress
+  # sentence, saturated rows reverse KL with the efficiency sentence, on the teacher's top-k plus
+  # a tail bucket, per distilled token weighted w_f = M (1 - q_f) / w_s = M min(q_s, live / q_s)
+  # (M: the mixed groups' discounted mean |z|; the min is the amount guard). Mixed groups: GRPO
+  # only. No external teacher (algorithm.opd.teacher_paths={}). Tags and special tokens are never
+  # distilled; on Search only queries and, after a result carried the answer, the answer.
+  tied_opsd:
+    enable: False
+    tasks: [alfworld, webshop, search]
+    topk: 20
+    # The self-teacher is the actor copied every refresh_every steps (steps 1..refresh_every:
+    # the initial model).
+    refresh_every: 50
+    # Discount of the group shares and of M (both discounted means).
+    retention: 0.8
+    # The amount guard on the saturated side.
+    guard: True
+    # WebShop's document searches the goal's instruction (or "name": its product title).
+    webshop_query: instruction
   opsd:
     enable: False
     coef: 0.01            # SDAR's sdar_coef
